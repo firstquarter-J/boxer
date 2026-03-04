@@ -92,6 +92,11 @@
   - 그 외에는 `Scanned:` 이벤트를 `시간: 명령` 타임라인으로 응답
 - 바코드 + 영상 개수 자연어 요청을 부분 지원:
   - 바코드를 `recordings.fullBarcode`로 조회해 row 수(`COUNT(*)`) 응답
+- 바코드 + 마지막 녹화 날짜 자연어 요청 지원:
+  - 바코드를 `recordings.fullBarcode`로 조회해 `MAX(recordedAt)` 응답
+- 바코드 + 특정 날짜 녹화 여부 자연어 요청 지원:
+  - 바코드 + 날짜(`오늘/어제/YYYY-MM-DD`)를 `recordings.recordedAt` 범위 조건으로 조회
+  - 날짜 해석은 KST(`Asia/Seoul`) 기준, DB 조회는 UTC 범위(`>= start_utc`, `< end_utc`)로 변환
 
 ## 아직 구현되지 않음 (중요)
 
@@ -218,7 +223,7 @@ LLM 변수:
 
 - `APP_USER_API_URL`
 - `APP_USER_API_TIMEOUT_SEC`
-- `MODEL_OWNER_USER_ID`, `MARK_USER_ID`, `DD_USER_ID`
+- `HYUN_USER_ID`, `MARK_USER_ID`, `DD_USER_ID`
 - `APP_USER_LOOKUP_ALLOWED_USER_IDS` (콤마 구분)
 - `COMPANY_SYSTEM_PROMPT` (선택)
 

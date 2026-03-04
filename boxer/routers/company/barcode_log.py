@@ -71,6 +71,62 @@ def _is_barcode_video_count_request(question: str, barcode: str | None) -> bool:
     return has_count_hint
 
 
+def _is_barcode_last_recorded_at_request(question: str, barcode: str | None) -> bool:
+    if not barcode:
+        return False
+    text = (question or "").strip()
+    lowered = text.lower()
+
+    if "로그" in text or re.search(r"\blog\b", lowered):
+        return False
+
+    has_video_hint = any(token in text for token in cs.VIDEO_HINT_TOKENS) or any(
+        token in lowered for token in cs.VIDEO_HINT_TOKENS
+    ) or any(token in text for token in ("녹화", "촬영"))
+    if not has_video_hint:
+        return False
+
+    has_last_hint = any(token in text for token in ("마지막", "최근", "최신")) or any(
+        token in lowered for token in ("last", "latest", "recent")
+    )
+    if not has_last_hint:
+        return False
+
+    has_date_hint = any(token in text for token in ("날짜", "일자", "언제", "기록")) or any(
+        token in lowered for token in ("date", "recordedat", "recorded at")
+    )
+    return has_date_hint
+
+
+def _is_barcode_video_recorded_on_date_request(question: str, barcode: str | None) -> bool:
+    if not barcode:
+        return False
+    if _is_barcode_last_recorded_at_request(question, barcode):
+        return False
+    if _is_barcode_video_count_request(question, barcode):
+        return False
+
+    text = (question or "").strip()
+    lowered = text.lower()
+
+    if "로그" in text or re.search(r"\blog\b", lowered):
+        return False
+
+    has_video_hint = any(token in text for token in cs.VIDEO_HINT_TOKENS) or any(
+        token in lowered for token in cs.VIDEO_HINT_TOKENS
+    ) or any(token in text for token in ("녹화", "촬영", "recordedAt"))
+    if not has_video_hint:
+        return False
+
+    has_date_token = bool(cs.LOG_DATE_PATTERN.search(text)) or ("오늘" in text) or any(
+        token in lowered for token in cs.YESTERDAY_HINTS
+    ) or ("today" in lowered) or ("금일" in text)
+    if not has_date_token:
+        return False
+
+    return True
+
+
 def _find_error_lines(lines: list[str]) -> list[tuple[int, str]]:
     matches: list[tuple[int, str]] = []
     for line_no, line in enumerate(lines, start=1):

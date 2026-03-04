@@ -1,7 +1,7 @@
 import os
 import re
 
-MODEL_OWNER_USER_ID = os.getenv("MODEL_OWNER_USER_ID", "").strip()
+HYUN_USER_ID = os.getenv("HYUN_USER_ID", "").strip()
 MARK_USER_ID = os.getenv("MARK_USER_ID", "").strip()
 DD_USER_ID = os.getenv("DD_USER_ID", "").strip()
 
@@ -15,7 +15,7 @@ if _raw_lookup_ids.strip():
 else:
     APP_USER_LOOKUP_ALLOWED_USER_IDS = {
         user_id
-        for user_id in (MODEL_OWNER_USER_ID, MARK_USER_ID)
+        for user_id in (HYUN_USER_ID, MARK_USER_ID)
         if user_id
     }
 
