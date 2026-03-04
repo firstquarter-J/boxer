@@ -2,11 +2,15 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Any
 from urllib import error, parse, request
 
+import boto3
 import pymysql
 from anthropic import Anthropic
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -48,12 +52,40 @@ DB_QUERY_TIMEOUT_SEC = int(os.getenv("DB_QUERY_TIMEOUT_SEC", "8"))
 DB_QUERY_MAX_ROWS = int(os.getenv("DB_QUERY_MAX_ROWS", "20"))
 DB_QUERY_MAX_SQL_CHARS = int(os.getenv("DB_QUERY_MAX_SQL_CHARS", "600"))
 DB_QUERY_MAX_RESULT_CHARS = int(os.getenv("DB_QUERY_MAX_RESULT_CHARS", "2500"))
+S3_QUERY_ENABLED = os.getenv("S3_QUERY_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+S3_ULTRASOUND_BUCKET = os.getenv("S3_ULTRASOUND_BUCKET", "")
+S3_LOG_BUCKET = os.getenv("S3_LOG_BUCKET", "")
+S3_QUERY_TIMEOUT_SEC = int(os.getenv("S3_QUERY_TIMEOUT_SEC", "8"))
+S3_QUERY_MAX_KEYS = int(os.getenv("S3_QUERY_MAX_KEYS", "20000"))
+S3_QUERY_MAX_ITEMS = int(os.getenv("S3_QUERY_MAX_ITEMS", "20"))
+S3_QUERY_MAX_RESULT_CHARS = int(os.getenv("S3_QUERY_MAX_RESULT_CHARS", "3500"))
+S3_LOG_TAIL_BYTES = int(os.getenv("S3_LOG_TAIL_BYTES", "50000"))
+S3_LOG_TAIL_LINES = int(os.getenv("S3_LOG_TAIL_LINES", "80"))
 DEFAULT_DB_QUERY = "SELECT NOW() AS now_time, DATABASE() AS db_name"
 BARCODE_PATTERN = re.compile(r"(?<!\d)(\d{11})(?!\d)")
 DB_WRITE_SQL_PATTERN = re.compile(
     r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace)\b",
     re.IGNORECASE,
 )
+S3_LOG_DATE_TOKEN_PATTERN = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
+S3_LOG_PATH_PATTERN = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9_-]*)/log-(20\d{2}-\d{2}-\d{2})\.log",
+    re.IGNORECASE,
+)
+S3_LOG_FILE_TOKEN_PATTERN = re.compile(r"^log-(20\d{2}-\d{2}-\d{2})\.log$", re.IGNORECASE)
+S3_DEVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,}$")
+S3_LOG_RESERVED_TOKENS = {
+    "s3",
+    "조회",
+    "확인",
+    "읽어줘",
+    "읽어",
+    "읽기",
+    "보여줘",
+    "로그",
+    "log",
+}
 COMMON_SYSTEM_PROMPT = (
     "You are Boxer, the internal assistant for Box and Humanscape. "
     "Language policy: reply in Korean by default; if the user asks in English, reply in English. "
@@ -98,6 +130,13 @@ def _validate_tokens() -> None:
             missing.append("BOX_DB_PASSWORD")
         if not BOX_DB_DATABASE or "REPLACE_ME" in BOX_DB_DATABASE:
             missing.append("BOX_DB_DATABASE")
+    if S3_QUERY_ENABLED:
+        if not AWS_REGION or "REPLACE_ME" in AWS_REGION:
+            missing.append("AWS_REGION")
+        if not S3_ULTRASOUND_BUCKET or "REPLACE_ME" in S3_ULTRASOUND_BUCKET:
+            missing.append("S3_ULTRASOUND_BUCKET")
+        if not S3_LOG_BUCKET or "REPLACE_ME" in S3_LOG_BUCKET:
+            missing.append("S3_LOG_BUCKET")
 
     if missing:
         raise RuntimeError(
@@ -233,6 +272,314 @@ def _format_reply_text(user_id: str | None, text: str) -> str:
     return f"<@{user_id}> {clean_text}"
 
 
+def _normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n...(truncated)"
+
+
+def _format_datetime(value: Any) -> str:
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M:%S %Z")
+    if value is None:
+        return "unknown"
+    return str(value)
+
+
+def _format_size(size: int | None) -> str:
+    if size is None:
+        return "unknown"
+    value = float(max(0, int(size)))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(value)} {units[index]}"
+    return f"{value:.1f} {units[index]}"
+
+
+def _build_s3_client() -> Any:
+    timeout_sec = max(1, S3_QUERY_TIMEOUT_SEC)
+    config = BotoConfig(
+        region_name=AWS_REGION,
+        connect_timeout=timeout_sec,
+        read_timeout=timeout_sec,
+        retries={"max_attempts": 2, "mode": "standard"},
+    )
+    return boto3.client("s3", region_name=AWS_REGION, config=config)
+
+
+def _create_db_connection(timeout_sec: int | None = None) -> Any:
+    actual_timeout = max(1, timeout_sec if timeout_sec is not None else DB_QUERY_TIMEOUT_SEC)
+    return pymysql.connect(
+        host=BOX_DB_HOST,
+        port=BOX_DB_PORT,
+        user=BOX_DB_USERNAME,
+        password=BOX_DB_PASSWORD,
+        database=BOX_DB_DATABASE,
+        connect_timeout=actual_timeout,
+        read_timeout=actual_timeout,
+        write_timeout=actual_timeout,
+        charset="utf8mb4",
+        autocommit=True,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+def _fetch_s3_device_log_lines(
+    s3_client: Any,
+    device_name: str,
+    log_date: str,
+) -> dict[str, Any]:
+    key = f"{device_name}/log-{log_date}.log"
+    try:
+        head_response = s3_client.head_object(Bucket=S3_LOG_BUCKET, Key=key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NotFound", "NoSuchKey"}:
+            return {
+                "found": False,
+                "device_name": device_name,
+                "key": key,
+                "content_length": 0,
+                "lines": [],
+            }
+        raise
+
+    content_length = int(head_response.get("ContentLength") or 0)
+    tail_bytes = max(1024, S3_LOG_TAIL_BYTES)
+    use_range = content_length > tail_bytes
+    get_params: dict[str, Any] = {
+        "Bucket": S3_LOG_BUCKET,
+        "Key": key,
+    }
+    if use_range:
+        range_start = max(0, content_length - tail_bytes)
+        get_params["Range"] = f"bytes={range_start}-{content_length - 1}"
+
+    get_response = s3_client.get_object(**get_params)
+    body = get_response["Body"].read()
+    text = body.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if use_range and lines:
+        # Range 조회 시 첫 줄이 잘릴 수 있어 제거
+        lines = lines[1:]
+
+    return {
+        "found": True,
+        "device_name": device_name,
+        "key": key,
+        "content_length": content_length,
+        "lines": lines,
+    }
+
+def _extract_s3_log_request(normalized_question: str) -> dict[str, str]:
+    path_match = S3_LOG_PATH_PATTERN.search(normalized_question)
+    if path_match:
+        device_name = path_match.group(1)
+        log_date = path_match.group(2)
+        return {"kind": "log", "device_name": device_name, "log_date": log_date}
+
+    tokens = [token.strip().strip("`'\",.()[]{}") for token in normalized_question.split()]
+    date_token = ""
+    for token in tokens:
+        if S3_LOG_DATE_TOKEN_PATTERN.match(token):
+            date_token = token
+            break
+        file_match = S3_LOG_FILE_TOKEN_PATTERN.match(token)
+        if file_match:
+            date_token = file_match.group(1)
+            break
+
+    if not date_token:
+        raise ValueError("로그 조회는 날짜가 필요해. 예: s3 로그 MB2-X00001 2026-03-04")
+    try:
+        datetime.strptime(date_token, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("날짜 형식은 YYYY-MM-DD로 입력해줘") from exc
+
+    device_name = ""
+    for token in tokens:
+        if not token:
+            continue
+        if token == date_token:
+            continue
+        lowered = token.lower()
+        if lowered in S3_LOG_RESERVED_TOKENS:
+            continue
+        if S3_LOG_FILE_TOKEN_PATTERN.match(token):
+            continue
+        if "/" in token:
+            prefix, suffix = token.split("/", 1)
+            if S3_LOG_FILE_TOKEN_PATTERN.match(suffix) and S3_DEVICE_NAME_PATTERN.match(prefix):
+                device_name = prefix
+                break
+        if S3_DEVICE_NAME_PATTERN.match(token):
+            device_name = token
+            break
+
+    if not device_name:
+        raise ValueError("장비명을 같이 입력해줘. 예: s3 로그 MB2-X00001 2026-03-04")
+
+    return {"kind": "log", "device_name": device_name, "log_date": date_token}
+
+
+def _extract_s3_request(question: str) -> dict[str, str] | None:
+    normalized = _normalize_spaces(question)
+    if not normalized:
+        return None
+
+    lowered = normalized.lower()
+    if not re.match(r"^s3(\s|$)", lowered):
+        return None
+
+    if "로그" in normalized or "log" in lowered:
+        return _extract_s3_log_request(normalized)
+
+    if any(keyword in normalized for keyword in ("초음파", "영상")) or "ultrasound" in lowered:
+        barcode = _extract_barcode(normalized)
+        if not barcode:
+            raise ValueError("영상 조회는 바코드(11자리 숫자)가 필요해. 예: s3 영상 43032748143")
+        return {"kind": "ultrasound", "barcode": barcode}
+
+    raise ValueError(
+        "지원 형식: s3 영상 <바코드> 또는 s3 로그 <장비명> <YYYY-MM-DD>"
+    )
+
+
+def _query_s3_ultrasound_by_barcode(s3_client: Any, barcode: str) -> str:
+    prefix = f"{barcode}/"
+    continuation_token = None
+    scanned_objects = 0
+    reached_scan_limit = False
+    video_objects: list[dict[str, Any]] = []
+    image_objects: list[dict[str, Any]] = []
+
+    while True:
+        params: dict[str, Any] = {
+            "Bucket": S3_ULTRASOUND_BUCKET,
+            "Prefix": prefix,
+            "MaxKeys": 1000,
+        }
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+
+        response = s3_client.list_objects_v2(**params)
+        contents = response.get("Contents") or []
+        for obj in contents:
+            scanned_objects += 1
+            key = str(obj.get("Key") or "")
+            lowered = key.lower()
+            if lowered.endswith(".mp4"):
+                video_objects.append(obj)
+            elif lowered.endswith((".jpg", ".jpeg")):
+                image_objects.append(obj)
+
+            if scanned_objects >= max(1, S3_QUERY_MAX_KEYS):
+                reached_scan_limit = True
+                break
+
+        if reached_scan_limit:
+            break
+        if not response.get("IsTruncated"):
+            break
+
+        continuation_token = response.get("NextContinuationToken")
+        if not continuation_token:
+            break
+
+    if scanned_objects == 0:
+        return (
+            f"S3 조회 결과가 없어. "
+            f"버킷 `{S3_ULTRASOUND_BUCKET}`에서 prefix `{prefix}`로 찾지 못했어"
+        )
+
+    def _last_modified_to_ts(obj: dict[str, Any]) -> float:
+        value = obj.get("LastModified")
+        if hasattr(value, "timestamp"):
+            return float(value.timestamp())
+        return 0.0
+
+    video_objects.sort(key=_last_modified_to_ts, reverse=True)
+    image_objects.sort(key=_last_modified_to_ts, reverse=True)
+
+    display_limit = max(1, min(50, S3_QUERY_MAX_ITEMS))
+    lines = [
+        "*S3 초음파 객체 조회 결과*",
+        f"• 버킷: `{S3_ULTRASOUND_BUCKET}`",
+        f"• 바코드: `{barcode}`",
+        f"• 영상(mp4): *{len(video_objects)}개*",
+        f"• 이미지(jpg/jpeg): *{len(image_objects)}개*",
+        f"• 스캔한 전체 객체 수: `{scanned_objects}`",
+    ]
+    if reached_scan_limit:
+        lines.append(
+            f"• 주의: 스캔 상한({max(1, S3_QUERY_MAX_KEYS)}개)에 도달해서 집계가 일부 누락될 수 있어"
+        )
+
+    lines.append("")
+    lines.append(f"*최근 영상 상위 {min(len(video_objects), display_limit)}개*")
+    if not video_objects:
+        lines.append("- 없음")
+    else:
+        for index, obj in enumerate(video_objects[:display_limit], start=1):
+            key = _display_value(obj.get("Key"), default="unknown")
+            size = _format_size(obj.get("Size"))
+            modified = _format_datetime(obj.get("LastModified"))
+            lines.append(f"{index}. `{key}` | `{size}` | `{modified}`")
+
+    lines.append("")
+    lines.append(f"*최근 이미지 상위 {min(len(image_objects), display_limit)}개*")
+    if not image_objects:
+        lines.append("- 없음")
+    else:
+        for index, obj in enumerate(image_objects[:display_limit], start=1):
+            key = _display_value(obj.get("Key"), default="unknown")
+            size = _format_size(obj.get("Size"))
+            modified = _format_datetime(obj.get("LastModified"))
+            lines.append(f"{index}. `{key}` | `{size}` | `{modified}`")
+
+    return _truncate_text("\n".join(lines), S3_QUERY_MAX_RESULT_CHARS)
+
+
+def _query_s3_device_log(s3_client: Any, device_name: str, log_date: str) -> str:
+    log_data = _fetch_s3_device_log_lines(s3_client, device_name, log_date)
+    if not log_data["found"]:
+        return f"S3 로그 파일을 찾지 못했어: `{log_data['key']}`"
+
+    lines = log_data["lines"]
+    if not lines:
+        return (
+            "*S3 로그 조회 결과*\n"
+            f"• 버킷: `{S3_LOG_BUCKET}`\n"
+            f"• 파일: `{log_data['key']}`\n"
+            "• 로그 내용이 비어 있어"
+        )
+
+    max_lines = max(1, min(500, S3_LOG_TAIL_LINES))
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    excerpt = _truncate_text("\n".join(lines), S3_QUERY_MAX_RESULT_CHARS)
+
+    response_lines = [
+        "*S3 로그 조회 결과*",
+        f"• 버킷: `{S3_LOG_BUCKET}`",
+        f"• 장비: `{device_name}`",
+        f"• 파일: `{log_data['key']}`",
+        f"• 파일 크기: `{_format_size(log_data['content_length'])}`",
+        f"• 표시 범위: 최근 `{len(lines)}줄`",
+        "```text",
+        excerpt,
+        "```",
+    ]
+    return "\n".join(response_lines)
+
+
 def _extract_db_query(question: str) -> str | None:
     normalized = question.strip()
     lowered = normalized.lower()
@@ -268,19 +615,7 @@ def _validate_readonly_sql(raw_sql: str) -> str:
 def _query_db(sql: str) -> str:
     rows_limit = max(1, min(200, DB_QUERY_MAX_ROWS))
     timeout_sec = max(1, DB_QUERY_TIMEOUT_SEC)
-    connection = pymysql.connect(
-        host=BOX_DB_HOST,
-        port=BOX_DB_PORT,
-        user=BOX_DB_USERNAME,
-        password=BOX_DB_PASSWORD,
-        database=BOX_DB_DATABASE,
-        connect_timeout=timeout_sec,
-        read_timeout=timeout_sec,
-        write_timeout=timeout_sec,
-        charset="utf8mb4",
-        autocommit=True,
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+    connection = _create_db_connection(timeout_sec)
 
     try:
         with connection.cursor() as cursor:
@@ -419,6 +754,13 @@ def create_app() -> App:
     app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
     logger = logging.getLogger(__name__)
     claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if LLM_PROVIDER == "claude" else None
+    s3_client: Any | None = None
+
+    def _get_s3_client() -> Any:
+        nonlocal s3_client
+        if s3_client is None:
+            s3_client = _build_s3_client()
+        return s3_client
 
     @app.event("app_mention")
     def handle_app_mention(event: dict[str, Any], say, client) -> None:
@@ -434,6 +776,71 @@ def create_app() -> App:
         if "ping" in text:
             say(text=_format_reply_text(user_id, "pong-ec2"), thread_ts=thread_ts)
             logger.info("Responded with pong-ec2 in thread_ts=%s", thread_ts)
+            return
+
+        try:
+            s3_request = _extract_s3_request(question)
+        except ValueError as exc:
+            say(
+                text=_format_reply_text(user_id, f"S3 조회 요청 형식 오류: {exc}"),
+                thread_ts=thread_ts,
+            )
+            return
+
+        if s3_request is not None:
+            if not S3_QUERY_ENABLED:
+                say(
+                    text=_format_reply_text(
+                        user_id,
+                        "S3 조회 기능이 꺼져 있어. .env에서 S3_QUERY_ENABLED=true로 설정해줘",
+                    ),
+                    thread_ts=thread_ts,
+                )
+                return
+
+            try:
+                client_s3 = _get_s3_client()
+                if s3_request["kind"] == "ultrasound":
+                    result_text = _query_s3_ultrasound_by_barcode(
+                        client_s3,
+                        s3_request["barcode"],
+                    )
+                    logger.info(
+                        "Responded with s3 ultrasound result in thread_ts=%s barcode=%s",
+                        thread_ts,
+                        s3_request["barcode"],
+                    )
+                else:
+                    result_text = _query_s3_device_log(
+                        client_s3,
+                        s3_request["device_name"],
+                        s3_request["log_date"],
+                    )
+                    logger.info(
+                        "Responded with s3 log result in thread_ts=%s device=%s date=%s",
+                        thread_ts,
+                        s3_request["device_name"],
+                        s3_request["log_date"],
+                    )
+                say(text=_format_reply_text(user_id, result_text), thread_ts=thread_ts)
+            except (BotoCoreError, ClientError):
+                logger.exception("S3 query failed")
+                say(
+                    text=_format_reply_text(
+                        user_id,
+                        "S3 조회 중 오류가 발생했어. 버킷 권한/리전/키 경로를 확인해줘",
+                    ),
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.exception("S3 query failed")
+                say(
+                    text=_format_reply_text(
+                        user_id,
+                        "S3 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
+                    ),
+                    thread_ts=thread_ts,
+                )
             return
 
         db_query = _extract_db_query(question)
@@ -582,7 +989,10 @@ def create_app() -> App:
             return
 
         say(
-            text=_format_reply_text(user_id, "현재는 ping 또는 LLM 질문에 응답해"),
+            text=_format_reply_text(
+                user_id,
+                "현재는 ping, s3 조회, db 조회 또는 LLM 질문에 응답해",
+            ),
             thread_ts=thread_ts,
         )
 

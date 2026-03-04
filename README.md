@@ -35,10 +35,13 @@
 - DB 조회 명령은 명시적 커맨드 형태만 지원:
   - `db 조회 ...` 또는 `db조회 ...`
 - DB 쿼리 실행은 읽기 전용으로 제한 (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH)
+- S3 조회 명령은 명시적 커맨드 형태만 지원:
+  - `s3 영상 <바코드>`
+  - `s3 로그 <장비명> <YYYY-MM-DD>`
 
 ## 아직 구현되지 않음 (중요)
 
-- 자연어 DB 의도 라우팅(예: `43032748143 영상 몇 개야?`)이 아직 완전 자동화되지 않음
+- 자연어 의도 라우팅은 아직 부분 구현 상태
 - 멀티 소스 조회 오케스트레이션(S3 + Notion + DB) 미완성
 - 근거 메타데이터 영구 저장 경로(table/index) 미확정
 
@@ -136,6 +139,15 @@ DB 조회 변수:
 - `BOX_DB_HOST`, `BOX_DB_PORT`, `BOX_DB_USERNAME`, `BOX_DB_PASSWORD`, `BOX_DB_DATABASE`
 - `DB_QUERY_TIMEOUT_SEC`, `DB_QUERY_MAX_ROWS`, `DB_QUERY_MAX_SQL_CHARS`, `DB_QUERY_MAX_RESULT_CHARS`
 
+S3 조회 변수:
+
+- `S3_QUERY_ENABLED=true`
+- `AWS_REGION`
+- `S3_ULTRASOUND_BUCKET`, `S3_LOG_BUCKET`
+- `S3_QUERY_TIMEOUT_SEC`, `S3_QUERY_MAX_KEYS`, `S3_QUERY_MAX_ITEMS`, `S3_QUERY_MAX_RESULT_CHARS`
+- `S3_LOG_TAIL_BYTES`, `S3_LOG_TAIL_LINES`
+- Access Key 방식일 때만 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` 사용
+
 3. 실행
 
 ```bash
@@ -154,6 +166,10 @@ python app.py
 - DB 명시적 조회 모드
   - `@Boxer db 조회`
   - `@Boxer db 조회 SELECT NOW() AS now_time`
+
+- S3 명시적 조회 모드
+  - `@Boxer s3 영상 43032748143`
+  - `@Boxer s3 로그 MB2-X00001 2026-03-04`
 
 ## 운영 로그
 
