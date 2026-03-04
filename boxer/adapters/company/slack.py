@@ -103,13 +103,15 @@ def create_app() -> App:
                     return
 
             try:
-                thread_context = _load_thread_context(
-                    client,
-                    logger,
-                    channel_id,
-                    thread_ts,
-                    current_ts,
-                )
+                thread_context = ""
+                if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
+                    thread_context = _load_thread_context(
+                        client,
+                        logger,
+                        channel_id,
+                        thread_ts,
+                        current_ts,
+                    )
                 synthesized_text = _synthesize_retrieval_answer(
                     question=question,
                     thread_context=thread_context,
@@ -119,6 +121,10 @@ def create_app() -> App:
                     system_prompt=cs.SYSTEM_PROMPT or None,
                 )
                 final_text = synthesized_text or fallback_text
+                if "다른 바코드" in final_text and "다른 바코드" not in fallback_text:
+                    final_text = fallback_text
+                if "다른 barcode" in final_text and "다른 barcode" not in fallback_text:
+                    final_text = fallback_text
                 reply(final_text)
                 logger.info(
                     "Responded with %s (%s) in thread_ts=%s",

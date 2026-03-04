@@ -32,9 +32,14 @@ LLM_SYNTHESIS_MASKING_ENABLED = os.getenv("LLM_SYNTHESIS_MASKING_ENABLED", "true
     "yes",
     "on",
 }
+LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT = os.getenv(
+    "LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT",
+    "false",
+).lower() in {"1", "true", "yes", "on"}
 RETRIEVAL_SYNTHESIS_SYSTEM_PROMPT = os.getenv(
     "RETRIEVAL_SYNTHESIS_SYSTEM_PROMPT",
     "You are a retrieval-grounded assistant. Answer briefly in Korean using only provided evidence. "
+    "Prioritize Evidence(JSON) over thread context. Do not add recommendations unless evidence explicitly supports them. "
     "If evidence is insufficient, clearly say what is missing.",
 )
 

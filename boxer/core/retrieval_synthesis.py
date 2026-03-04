@@ -115,7 +115,9 @@ def _build_retrieval_synthesis_input(
             "1) Answer in Korean.\n"
             "2) Use only evidence.\n"
             "3) If evidence is insufficient, say what is missing.\n"
-            "4) Do not claim actions or results not in evidence."
+            "4) Do not claim actions or results not in evidence.\n"
+            "5) Do not suggest using another barcode/service unless evidence explicitly says so.\n"
+            "6) For factual checks, start with direct yes/no and one-sentence reason."
         )
 
     return (
@@ -127,7 +129,9 @@ def _build_retrieval_synthesis_input(
         "1) Answer in Korean.\n"
         "2) Use only evidence.\n"
         "3) If evidence is insufficient, say what is missing.\n"
-        "4) Do not claim actions or results not in evidence."
+        "4) Do not claim actions or results not in evidence.\n"
+        "5) Do not suggest using another barcode/service unless evidence explicitly says so.\n"
+        "6) For factual checks, start with direct yes/no and one-sentence reason."
     )
 
 
