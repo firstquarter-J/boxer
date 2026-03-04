@@ -11,52 +11,19 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
 
 def _should_lookup_barcode(question: str, barcode: str) -> bool:
     normalized = (question or "").strip()
-    lowered = normalized.lower()
-    if normalized == barcode:
-        return True
+    lookup_keywords = ("유저 조회", "유저조회", "산모 조회", "산모조회")
+
+    non_profile_hints_ko = ("영상", "녹화", "촬영", "로그", "개수", "갯수", "최신", "마지막")
+    has_non_profile_hint = _contains_any(normalized, non_profile_hints_ko)
+    has_lookup_keyword = _contains_any(normalized, lookup_keywords)
+    if has_non_profile_hint and not has_lookup_keyword:
+        return False
 
     if normalized.startswith(barcode):
         suffix = normalized[len(barcode) :].strip()
-        if suffix in {
-            "",
-            "조회",
-            "조회해줘",
-            "확인",
-            "확인해줘",
-            "정보",
-            "정보줘",
-            "정보 알려줘",
-            "유저 정보",
-            "사용자 정보",
-        }:
-            return True
+        return suffix in lookup_keywords
 
-    if "바코드" in normalized or "barcode" in lowered:
-        return True
-
-    user_target_hints_ko = (
-        "유저",
-        "사용자",
-        "회원",
-        "고객",
-        "산모",
-        "아이",
-        "아기",
-        "앱유저",
-        "앱 유저",
-        "프로필",
-    )
-    user_target_hints_en = ("user", "app-user", "app user", "baby", "profile")
-    lookup_action_hints_ko = ("조회", "확인", "알려", "보여", "찾아", "검색", "정보")
-    lookup_action_hints_en = ("lookup", "find", "search", "info", "profile", "details")
-
-    has_user_target = _contains_any(normalized, user_target_hints_ko) or _contains_any(
-        lowered, user_target_hints_en
-    )
-    has_lookup_action = _contains_any(normalized, lookup_action_hints_ko) or _contains_any(
-        lowered, lookup_action_hints_en
-    )
-    return has_user_target and has_lookup_action
+    return has_lookup_keyword
 
 
 def _lookup_app_user_by_barcode(barcode: str) -> str:

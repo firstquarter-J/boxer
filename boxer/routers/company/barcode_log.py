@@ -162,7 +162,11 @@ def _is_barcode_last_recorded_at_request(question: str, barcode: str | None) -> 
     has_date_hint = any(token in text for token in ("날짜", "일자", "언제", "기록")) or any(
         token in lowered for token in ("date", "recordedat", "recorded at")
     )
-    return has_date_hint
+    if has_date_hint:
+        return True
+
+    # "최신 영상은?" 같은 문구는 날짜 단어가 없어도 마지막 녹화 시점 조회로 해석
+    return has_video_hint
 
 
 def _is_barcode_video_recorded_on_date_request(question: str, barcode: str | None) -> bool:
