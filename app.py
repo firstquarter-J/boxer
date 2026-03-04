@@ -126,6 +126,8 @@ SCAN_CODE_LABELS: dict[str, str] = {
     "C_CCLREC": "녹화 취소",
     "SPECIAL_TAKE_SNAP": "캡처/스냅샷",
 }
+VIDEO_HINT_TOKENS = ("영상", "비디오", "동영상", "recording")
+VIDEO_COUNT_HINT_TOKENS = ("몇 개", "몇개", "개수", "갯수", "수", "count")
 COMMON_SYSTEM_PROMPT = (
     "You are Boxer, the internal assistant for Box and Humanscape. "
     "Language policy: reply in Korean by default; if the user asks in English, reply in English. "
@@ -399,6 +401,27 @@ def _is_barcode_log_analysis_request(question: str, barcode: str | None) -> bool
     return True
 
 
+def _is_barcode_video_count_request(question: str, barcode: str | None) -> bool:
+    if not barcode:
+        return False
+    text = (question or "").strip()
+    lowered = text.lower()
+
+    if "로그" in text or re.search(r"\blog\b", lowered):
+        return False
+
+    has_video_hint = any(token in text for token in VIDEO_HINT_TOKENS) or any(
+        token in lowered for token in VIDEO_HINT_TOKENS
+    )
+    if not has_video_hint:
+        return False
+
+    has_count_hint = any(token in text for token in VIDEO_COUNT_HINT_TOKENS) or (
+        "몇" in text
+    )
+    return has_count_hint
+
+
 def _create_db_connection(timeout_sec: int | None = None) -> Any:
     actual_timeout = max(1, timeout_sec if timeout_sec is not None else DB_QUERY_TIMEOUT_SEC)
     return pymysql.connect(
@@ -413,6 +436,29 @@ def _create_db_connection(timeout_sec: int | None = None) -> Any:
         charset="utf8mb4",
         autocommit=True,
         cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def _query_recordings_count_by_barcode(barcode: str) -> str:
+    if not BOX_DB_HOST or not BOX_DB_USERNAME or not BOX_DB_PASSWORD or not BOX_DB_DATABASE:
+        raise RuntimeError("BOX DB 접속 정보가 비어 있어")
+
+    connection = _create_db_connection(DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS recordingCount FROM recordings WHERE fullBarcode = %s",
+                (barcode,),
+            )
+            row = cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+    count = int(row.get("recordingCount") or 0)
+    return (
+        "*바코드 영상 개수 조회 결과*\n"
+        f"• 바코드: `{barcode}`\n"
+        f"• recordings row 수: *{count}개*"
     )
 
 
@@ -1245,6 +1291,35 @@ def create_app() -> App:
                     text=_format_reply_text(
                         user_id,
                         "바코드 로그 분석 중 오류가 발생했어. 잠시 후 다시 시도해줘",
+                    ),
+                    thread_ts=thread_ts,
+                )
+            return
+
+        if _is_barcode_video_count_request(question, barcode):
+            try:
+                count_result = _query_recordings_count_by_barcode(barcode or "")
+                say(text=_format_reply_text(user_id, count_result), thread_ts=thread_ts)
+                logger.info(
+                    "Responded with barcode video count in thread_ts=%s barcode=%s",
+                    thread_ts,
+                    barcode,
+                )
+            except (pymysql.MySQLError, RuntimeError):
+                logger.exception("Barcode video count query failed")
+                say(
+                    text=_format_reply_text(
+                        user_id,
+                        "영상 개수 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
+                    ),
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.exception("Barcode video count query failed")
+                say(
+                    text=_format_reply_text(
+                        user_id,
+                        "영상 개수 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
                     ),
                     thread_ts=thread_ts,
                 )
