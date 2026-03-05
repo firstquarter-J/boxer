@@ -652,15 +652,11 @@ def _append_scan_events_section(lines: list[str], events: list[dict[str, Any]]) 
         return
     lines.append(f"• scanned 이벤트: *{len(events)}건*")
 
-    block_lines: list[str] = []
     for event in events:
         time_label = _display_value(event.get("time_label"), default="시간미상")
         label = _display_value(event.get("label"), default="기타 스캔")
         token = _display_value(event.get("token"), default="unknown")
-        block_lines.append(f"{time_label} | {label} | {token}")
-    lines.append("```")
-    lines.extend(block_lines)
-    lines.append("```")
+        lines.append(f"- {time_label}: {label} (`{token}`)")
 
 
 def _append_error_lines_section(
@@ -685,16 +681,12 @@ def _append_error_lines_section(
         if len(error_lines) > len(display_error_lines):
             lines.append(f"• 참고: error 라인이 많아서 최근 `{len(display_error_lines)}줄`만 표시해")
 
-    block_lines: list[str] = []
     for line_no, content in display_error_lines:
         time_label = _extract_time_label_from_line(content)
         sample = content.strip()
         if len(sample) > 220:
             sample = sample[:220] + "...(truncated)"
-        block_lines.append(f"{time_label} | [{line_no}] {sample}")
-    lines.append("```")
-    lines.extend(block_lines)
-    lines.append("```")
+        lines.append(f"- {time_label}: [{line_no}] {sample}")
 
 
 def _analyze_barcode_log_phase1_window(

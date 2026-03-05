@@ -102,6 +102,14 @@ def create_app() -> App:
             normalized_synth = synthesized or ""
             normalized_fallback = fallback_text or ""
             required_labels = ("매핑 장비", "병원", "병실")
+            required_bullets = ("• 바코드:", "• 날짜:", "• 매핑 장비:")
+
+            if normalized_fallback.startswith("*바코드 로그") and not normalized_synth.startswith("*바코드 로그"):
+                return True
+
+            for bullet in required_bullets:
+                if bullet in normalized_fallback and bullet not in normalized_synth:
+                    return True
 
             for label in required_labels:
                 if label in normalized_fallback and label not in normalized_synth:
