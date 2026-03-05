@@ -227,6 +227,31 @@ def create_app() -> App:
                 recordings_context = _load_recordings_context_by_barcode(barcode)
             return recordings_context
 
+        def _build_recordings_rows_evidence(context: dict[str, Any]) -> list[dict[str, Any]]:
+            rows = context.get("rows") or []
+            return [
+                {
+                    "seq": row.get("seq"),
+                    "hospitalSeq": row.get("hospitalSeq"),
+                    "hospitalRoomSeq": row.get("hospitalRoomSeq"),
+                    "hospitalName": row.get("hospitalName"),
+                    "roomName": row.get("roomName"),
+                    "deviceSeq": row.get("deviceSeq"),
+                    "recordedAt": row.get("recordedAt"),
+                    "createdAt": row.get("createdAt"),
+                }
+                for row in rows
+            ]
+
+        def _attach_recordings_context_to_evidence(
+            evidence: dict[str, Any],
+            context: dict[str, Any],
+        ) -> None:
+            evidence["recordingsSummary"] = context.get("summary")
+            evidence["recordingsContextLimit"] = context.get("limit")
+            evidence["recordingsHasMore"] = context.get("has_more")
+            evidence["recordingsRows"] = _build_recordings_rows_evidence(context)
+
         def _build_barcode_fallback_evidence() -> dict[str, Any] | None:
             if not barcode:
                 return None
@@ -251,20 +276,7 @@ def create_app() -> App:
                 evidence["warning"] = f"recordings 컨텍스트 조회 실패: {type(exc).__name__}"
                 return evidence
 
-            rows = context.get("rows") or []
-            evidence["recordingsSummary"] = context.get("summary")
-            evidence["recordingsContextLimit"] = context.get("limit")
-            evidence["recordingsHasMore"] = context.get("has_more")
-            evidence["recordingsRows"] = [
-                {
-                    "seq": row.get("seq"),
-                    "hospitalSeq": row.get("hospitalSeq"),
-                    "deviceSeq": row.get("deviceSeq"),
-                    "recordedAt": row.get("recordedAt"),
-                    "createdAt": row.get("createdAt"),
-                }
-                for row in rows
-            ]
+            _attach_recordings_context_to_evidence(evidence, context)
             return evidence
 
         if _is_barcode_log_analysis_request(question, barcode):
@@ -306,11 +318,9 @@ def create_app() -> App:
                         "date": log_date,
                         "mode": analysis_mode,
                     },
-                    "recordingsSummary": context.get("summary"),
-                    "recordingsContextLimit": context.get("limit"),
-                    "recordingsHasMore": context.get("has_more"),
                     "analysisResult": result_text,
                 }
+                _attach_recordings_context_to_evidence(evidence_payload, context)
                 _reply_with_retrieval_synthesis(
                     result_text,
                     evidence_payload,
@@ -340,11 +350,9 @@ def create_app() -> App:
                         "barcode": barcode,
                         "question": question,
                     },
-                    "recordingsSummary": context.get("summary"),
-                    "recordingsContextLimit": context.get("limit"),
-                    "recordingsHasMore": context.get("has_more"),
                     "queryResult": count_result,
                 }
+                _attach_recordings_context_to_evidence(evidence_payload, context)
                 _reply_with_retrieval_synthesis(
                     count_result,
                     evidence_payload,
@@ -372,11 +380,9 @@ def create_app() -> App:
                         "barcode": barcode,
                         "question": question,
                     },
-                    "recordingsSummary": context.get("summary"),
-                    "recordingsContextLimit": context.get("limit"),
-                    "recordingsHasMore": context.get("has_more"),
                     "queryResult": result_text,
                 }
+                _attach_recordings_context_to_evidence(evidence_payload, context)
                 _reply_with_retrieval_synthesis(
                     result_text,
                     evidence_payload,
@@ -404,11 +410,9 @@ def create_app() -> App:
                         "barcode": barcode,
                         "question": question,
                     },
-                    "recordingsSummary": context.get("summary"),
-                    "recordingsContextLimit": context.get("limit"),
-                    "recordingsHasMore": context.get("has_more"),
                     "queryResult": result_text,
                 }
+                _attach_recordings_context_to_evidence(evidence_payload, context)
                 _reply_with_retrieval_synthesis(
                     result_text,
                     evidence_payload,
@@ -439,11 +443,9 @@ def create_app() -> App:
                         "question": question,
                         "targetDate": target_date,
                     },
-                    "recordingsSummary": context.get("summary"),
-                    "recordingsContextLimit": context.get("limit"),
-                    "recordingsHasMore": context.get("has_more"),
                     "queryResult": result_text,
                 }
+                _attach_recordings_context_to_evidence(evidence_payload, context)
                 _reply_with_retrieval_synthesis(
                     result_text,
                     evidence_payload,

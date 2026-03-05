@@ -92,10 +92,20 @@ def _load_recordings_context_by_barcode(barcode: str) -> dict[str, Any]:
             summary = cursor.fetchone() or {}
 
             cursor.execute(
-                "SELECT seq, hospitalSeq, deviceSeq, recordedAt, createdAt "
-                "FROM recordings "
-                "WHERE fullBarcode = %s "
-                "ORDER BY COALESCE(recordedAt, createdAt) DESC, seq DESC "
+                "SELECT "
+                "r.seq, "
+                "r.hospitalSeq, "
+                "r.hospitalRoomSeq, "
+                "r.deviceSeq, "
+                "h.hospitalName AS hospitalName, "
+                "hr.roomName AS roomName, "
+                "r.recordedAt, "
+                "r.createdAt "
+                "FROM recordings r "
+                "LEFT JOIN hospitals h ON r.hospitalSeq = h.seq "
+                "LEFT JOIN hospital_rooms hr ON r.hospitalRoomSeq = hr.seq "
+                "WHERE r.fullBarcode = %s "
+                "ORDER BY COALESCE(r.recordedAt, r.createdAt) DESC, r.seq DESC "
                 "LIMIT %s",
                 (barcode, limit),
             )
