@@ -98,7 +98,9 @@ SCAN_FOCUSED_HINTS = (
 )
 
 SCANNED_TOKEN_PATTERN = re.compile(r"Scanned\s*:\s*([^\s]+)", re.IGNORECASE)
-LOG_LINE_TIME_PATTERN = re.compile(r"\b(\d{2}:\d{2}:\d{2})\b")
+LOG_LINE_TIME_PATTERN = re.compile(
+    r"(?<!\d)(\d{1,2}:\d{2}:\d{2})(?:[.,]\d{1,6})?(?!\d)"
+)
 SCAN_CODE_LABELS: dict[str, str] = {
     "C_STOPSESS": "녹화 중지",
     "C_PAUSE": "일시정지",
