@@ -287,37 +287,52 @@ def _query_all_recorded_dates_by_barcode(
     return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
 
 
-def _lookup_device_names_by_barcode(
+def _lookup_device_contexts_by_barcode(
     barcode: str,
     recordings_context: dict[str, Any] | None = None,
-) -> list[str]:
+) -> list[dict[str, Any]]:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
 
     context = recordings_context or _load_recordings_context_by_barcode(barcode)
-    pairs: list[tuple[Any, Any]] = []
-    seen_pairs: set[tuple[Any, Any]] = set()
+    pair_meta_map: dict[tuple[Any, Any], dict[str, Any]] = {}
     for row in context.get("rows") or []:
-        pair = (row.get("deviceSeq"), row.get("hospitalSeq"))
-        if pair in seen_pairs:
+        device_seq = row.get("deviceSeq")
+        hospital_seq = row.get("hospitalSeq")
+        if device_seq is None:
             continue
-        seen_pairs.add(pair)
-        pairs.append(pair)
+        pair = (device_seq, hospital_seq)
+        meta = pair_meta_map.get(pair)
+        if meta is None:
+            pair_meta_map[pair] = {
+                "deviceSeq": device_seq,
+                "hospitalSeq": hospital_seq,
+                "hospitalRoomSeq": row.get("hospitalRoomSeq"),
+                "hospitalName": row.get("hospitalName"),
+                "roomName": row.get("roomName"),
+            }
+            continue
 
-    if not pairs:
+        if not meta.get("hospitalName") and row.get("hospitalName"):
+            meta["hospitalName"] = row.get("hospitalName")
+        if not meta.get("roomName") and row.get("roomName"):
+            meta["roomName"] = row.get("roomName")
+        if not meta.get("hospitalRoomSeq") and row.get("hospitalRoomSeq"):
+            meta["hospitalRoomSeq"] = row.get("hospitalRoomSeq")
+
+    if not pair_meta_map:
         return []
 
-    names: list[str] = []
-    seen_names: set[str] = set()
+    items: list[dict[str, Any]] = []
+    seen_device_keys: set[tuple[str, str, str]] = set()
     limit = max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 2))
     connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
     try:
         with connection.cursor() as cursor:
-            for device_seq, hospital_seq in pairs:
-                if len(names) >= limit:
+            for pair, meta in pair_meta_map.items():
+                if len(items) >= limit:
                     break
-                if device_seq is None:
-                    continue
+                device_seq, hospital_seq = pair
 
                 selected_name = ""
                 if hospital_seq is not None:
@@ -345,11 +360,38 @@ def _lookup_device_names_by_barcode(
                     row = cursor.fetchone() or {}
                     selected_name = _display_value(row.get("deviceName"), default="")
 
-                if not selected_name or selected_name in seen_names:
+                if not selected_name:
                     continue
-                seen_names.add(selected_name)
-                names.append(selected_name)
+
+                hospital_name = _display_value(meta.get("hospitalName"), default="")
+                room_name = _display_value(meta.get("roomName"), default="")
+                dedupe_key = (selected_name, hospital_name, room_name)
+                if dedupe_key in seen_device_keys:
+                    continue
+                seen_device_keys.add(dedupe_key)
+
+                items.append(
+                    {
+                        "deviceName": selected_name,
+                        "deviceSeq": device_seq,
+                        "hospitalSeq": hospital_seq,
+                        "hospitalRoomSeq": meta.get("hospitalRoomSeq"),
+                        "hospitalName": meta.get("hospitalName"),
+                        "roomName": meta.get("roomName"),
+                    }
+                )
     finally:
         connection.close()
 
-    return names
+    return items
+
+
+def _lookup_device_names_by_barcode(
+    barcode: str,
+    recordings_context: dict[str, Any] | None = None,
+) -> list[str]:
+    items = _lookup_device_contexts_by_barcode(
+        barcode,
+        recordings_context=recordings_context,
+    )
+    return [str(item.get("deviceName")) for item in items if item.get("deviceName")]
