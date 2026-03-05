@@ -227,6 +227,46 @@ def create_app() -> App:
                 recordings_context = _load_recordings_context_by_barcode(barcode)
             return recordings_context
 
+        def _build_barcode_fallback_evidence() -> dict[str, Any] | None:
+            if not barcode:
+                return None
+
+            evidence: dict[str, Any] = {
+                "route": "llm_barcode_fallback",
+                "source": "box_db.recordings",
+                "request": {
+                    "barcode": barcode,
+                    "question": question,
+                },
+            }
+
+            if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+                evidence["warning"] = "DB 접속 정보(DB_*)가 없어 recordings 컨텍스트를 넣지 못했어"
+                return evidence
+
+            try:
+                context = _get_recordings_context()
+            except Exception as exc:
+                logger.exception("Failed to load recordings context for llm fallback barcode=%s", barcode)
+                evidence["warning"] = f"recordings 컨텍스트 조회 실패: {type(exc).__name__}"
+                return evidence
+
+            rows = context.get("rows") or []
+            evidence["recordingsSummary"] = context.get("summary")
+            evidence["recordingsContextLimit"] = context.get("limit")
+            evidence["recordingsHasMore"] = context.get("has_more")
+            evidence["recordingsRows"] = [
+                {
+                    "seq": row.get("seq"),
+                    "hospitalSeq": row.get("hospitalSeq"),
+                    "deviceSeq": row.get("deviceSeq"),
+                    "recordedAt": row.get("recordedAt"),
+                    "createdAt": row.get("createdAt"),
+                }
+                for row in rows
+            ]
+            return evidence
+
         if _is_barcode_log_analysis_request(question, barcode):
             if not s.S3_QUERY_ENABLED:
                 reply("로그 분석 기능이 꺼져 있어. .env에서 S3_QUERY_ENABLED=true로 설정해줘")
@@ -497,6 +537,39 @@ def create_app() -> App:
                 logger.info("Rejected claude call for user=%s", user_id)
                 return
             try:
+                fallback_evidence = _build_barcode_fallback_evidence()
+                if fallback_evidence is not None:
+                    synthesis_thread_context = ""
+                    if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
+                        synthesis_thread_context = _load_thread_context(
+                            client,
+                            logger,
+                            channel_id,
+                            thread_ts,
+                            current_ts,
+                        )
+                    answer = _synthesize_retrieval_answer(
+                        question=question,
+                        thread_context=synthesis_thread_context,
+                        evidence_payload=fallback_evidence,
+                        provider="claude",
+                        claude_client=claude_client,
+                        system_prompt=cs.SYSTEM_PROMPT or None,
+                    )
+                    if answer:
+                        reply(answer)
+                        logger.info(
+                            "Responded with claude answer using barcode evidence in thread_ts=%s barcode=%s",
+                            thread_ts,
+                            barcode,
+                        )
+                        return
+                    logger.warning(
+                        "Claude barcode evidence synthesis returned empty in thread_ts=%s barcode=%s",
+                        thread_ts,
+                        barcode,
+                    )
+
                 thread_context = _load_thread_context(
                     client,
                     logger,
@@ -523,6 +596,39 @@ def create_app() -> App:
                 reply("질문 내용을 같이 보내줘")
                 return
             try:
+                fallback_evidence = _build_barcode_fallback_evidence()
+                if fallback_evidence is not None:
+                    synthesis_thread_context = ""
+                    if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
+                        synthesis_thread_context = _load_thread_context(
+                            client,
+                            logger,
+                            channel_id,
+                            thread_ts,
+                            current_ts,
+                        )
+                    answer = _synthesize_retrieval_answer(
+                        question=question,
+                        thread_context=synthesis_thread_context,
+                        evidence_payload=fallback_evidence,
+                        provider="ollama",
+                        claude_client=None,
+                        system_prompt=cs.SYSTEM_PROMPT or None,
+                    )
+                    if answer:
+                        reply(answer)
+                        logger.info(
+                            "Responded with ollama answer using barcode evidence in thread_ts=%s barcode=%s",
+                            thread_ts,
+                            barcode,
+                        )
+                        return
+                    logger.warning(
+                        "Ollama barcode evidence synthesis returned empty in thread_ts=%s barcode=%s",
+                        thread_ts,
+                        barcode,
+                    )
+
                 thread_context = _load_thread_context(
                     client,
                     logger,
