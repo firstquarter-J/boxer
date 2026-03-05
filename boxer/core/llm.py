@@ -42,10 +42,14 @@ def _ask_ollama(question: str, system_prompt: str | None = None) -> str:
     try:
         with request.urlopen(req, timeout=s.OLLAMA_TIMEOUT_SEC) as response:
             body = response.read().decode("utf-8")
+    except TimeoutError as exc:
+        raise TimeoutError(f"Ollama API timed out after {s.OLLAMA_TIMEOUT_SEC}s") from exc
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
         raise RuntimeError(f"Ollama API HTTP {exc.code}: {detail[:200]}") from exc
     except error.URLError as exc:
+        if "timed out" in str(exc.reason).lower():
+            raise TimeoutError(f"Ollama API timed out after {s.OLLAMA_TIMEOUT_SEC}s") from exc
         raise RuntimeError(f"Ollama API connection failed: {exc.reason}") from exc
 
     try:

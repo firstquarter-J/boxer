@@ -74,6 +74,14 @@ def create_app() -> App:
             logger.info("Responded with pong-ec2 in thread_ts=%s", thread_ts)
             return
 
+        def _timeout_reply_text() -> str:
+            timeout_sec = max(1, s.OLLAMA_TIMEOUT_SEC)
+            return f"AI 응답이 {timeout_sec}초 내 완료되지 않아 타임아웃이 발생했어"
+
+        def _is_timeout_error(exc: Exception) -> bool:
+            lowered = str(exc).lower()
+            return "timeout" in lowered or "timed out" in lowered
+
         def _reply_with_retrieval_synthesis(
             fallback_text: str,
             evidence_payload: dict[str, Any],
@@ -132,6 +140,16 @@ def create_app() -> App:
                     "synthesized" if synthesized_text else "direct_fallback",
                     thread_ts,
                 )
+            except TimeoutError:
+                logger.warning("Retrieval synthesis timeout for route=%s", route_name)
+                reply(_timeout_reply_text())
+            except RuntimeError as exc:
+                if _is_timeout_error(exc):
+                    logger.warning("Retrieval synthesis timeout for route=%s", route_name)
+                    reply(_timeout_reply_text())
+                    return
+                logger.exception("Retrieval synthesis failed for route=%s", route_name)
+                reply(fallback_text)
             except Exception:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
                 reply(fallback_text)
@@ -492,6 +510,9 @@ def create_app() -> App:
                     answer = "답변을 생성하지 못했어. 다시 질문해줘"
                 reply(answer)
                 logger.info("Responded with claude answer in thread_ts=%s", thread_ts)
+            except TimeoutError:
+                logger.warning("Claude API timeout")
+                reply(_timeout_reply_text())
             except Exception:
                 logger.exception("Claude API call failed")
                 reply("AI 응답 중 오류가 발생했어. 잠시 후 다시 시도해줘")
@@ -515,6 +536,16 @@ def create_app() -> App:
                     answer = "답변을 생성하지 못했어. 다시 질문해줘"
                 reply(answer)
                 logger.info("Responded with ollama answer in thread_ts=%s", thread_ts)
+            except TimeoutError:
+                logger.warning("Ollama API timeout")
+                reply(_timeout_reply_text())
+            except RuntimeError as exc:
+                if _is_timeout_error(exc):
+                    logger.warning("Ollama API timeout")
+                    reply(_timeout_reply_text())
+                    return
+                logger.exception("Ollama API call failed")
+                reply("Ollama 응답 중 오류가 발생했어. 서버 연결 상태를 확인해줘")
             except Exception:
                 logger.exception("Ollama API call failed")
                 reply("Ollama 응답 중 오류가 발생했어. 서버 연결 상태를 확인해줘")
