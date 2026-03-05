@@ -370,6 +370,29 @@ def _events_in_session(events: list[dict[str, Any]], session: dict[str, Any]) ->
     ]
 
 
+def _events_in_sessions(events: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not sessions:
+        return []
+    return [
+        event
+        for event in events
+        if _line_in_any_session(int(event["line_no"]), sessions)
+    ]
+
+
+def _error_lines_in_sessions(
+    error_lines: list[tuple[int, str]],
+    sessions: list[dict[str, Any]],
+) -> list[tuple[int, str]]:
+    if not sessions:
+        return []
+    return [
+        (line_no, content)
+        for (line_no, content) in error_lines
+        if _line_in_any_session(line_no, sessions)
+    ]
+
+
 def _line_in_any_session(line_no: int, sessions: list[dict[str, Any]]) -> bool:
     for session in sessions:
         if int(session["start_line_no"]) <= line_no <= int(session["end_line_no"]):
@@ -459,7 +482,12 @@ def _append_scan_events_section(lines: list[str], events: list[dict[str, Any]]) 
         lines.append("- 없음")
         return
 
-    for event in events:
+    sample_limit = max(1, cs.LOG_SCAN_MAX_EVENTS)
+    display_events = events[-sample_limit:]
+    if len(events) > len(display_events):
+        lines.append(f"• 참고: scanned 이벤트가 많아서 최근 `{len(display_events)}건`만 표시해")
+
+    for event in display_events:
         time_label = _display_value(event.get("time_label"), default="시간미상")
         label = _display_value(event.get("label"), default="기타 스캔")
         token = _display_value(event.get("token"), default="unknown")
@@ -691,6 +719,8 @@ def _analyze_barcode_log_scan_events(
         )
         session_count = len(sessions)
         total_session_count += session_count
+        session_scoped_events = _events_in_sessions(events, sessions)
+        session_error_lines = _error_lines_in_sessions(error_lines, sessions)
 
         hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
         room_name = _display_value(device_context.get("roomName"), default="미확인")
@@ -700,8 +730,8 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"• 병실: `{room_name}`")
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
-        _append_scan_events_section(lines, events)
-        _append_error_lines_section(lines, error_lines)
+        _append_scan_events_section(lines, session_scoped_events)
+        _append_error_lines_section(lines, session_error_lines)
         lines.append(f"• 요청 바코드 녹화 세션: *{session_count}건*")
 
         if session_count == 0:
@@ -718,14 +748,14 @@ def _analyze_barcode_log_scan_events(
             f"• 세션 기준: `C_STOPSESS` 이후 `{max(0, cs.LOG_SESSION_SAFETY_LINES)}줄` 포함"
         )
 
-        session_events = _events_in_session(events, last_session)
-        lines.append(f"• 마지막 세션 스캔 이벤트: *{len(session_events)}건*")
+        last_session_events = _events_in_session(events, last_session)
+        lines.append(f"• 마지막 세션 스캔 이벤트: *{len(last_session_events)}건*")
 
-        if not session_events:
+        if not last_session_events:
             lines.append("• 타임라인: 없음")
             continue
 
-        for event in session_events:
+        for event in last_session_events:
             time_label = _display_value(event.get("time_label"), default="시간미상")
             label = _display_value(event.get("label"), default="기타 스캔")
             token = _display_value(event.get("token"), default="unknown")
@@ -824,11 +854,8 @@ def _analyze_barcode_log_errors(
         total_session_count += session_count
         error_lines = _find_error_lines(source_lines)
         total_error_lines += len(error_lines)
-        session_error_lines = [
-            (line_no, content)
-            for (line_no, content) in error_lines
-            if _line_in_any_session(line_no, sessions)
-        ]
+        session_scoped_events = _events_in_sessions(events, sessions)
+        session_error_lines = _error_lines_in_sessions(error_lines, sessions)
 
         hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
         room_name = _display_value(device_context.get("roomName"), default="미확인")
@@ -839,8 +866,8 @@ def _analyze_barcode_log_errors(
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
-        _append_scan_events_section(lines, events)
-        _append_error_lines_section(lines, error_lines)
+        _append_scan_events_section(lines, session_scoped_events)
+        _append_error_lines_section(lines, session_error_lines)
         lines.append(f"• 요청 바코드 녹화 세션: *{session_count}건*")
 
         if session_count == 0:
