@@ -663,6 +663,7 @@ def _extract_recording_sessions(
 
 def _append_session_state_summary(
     lines: list[str],
+    source_lines: list[str],
     sessions: list[dict[str, Any]],
     restart_events: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]] | None = None,
@@ -696,7 +697,7 @@ def _append_session_state_summary(
             stop_missing_count += 1
 
     if len(sessions) <= 1:
-        first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, sessions)
+        session = sessions[0]
         if reboot_count > 0:
             lines.append("• *종료 상태:* 마미박스 비정상 종료 (세션 중 재시작 감지)")
             lines.append("• *녹화 결과:* 정상 녹화 실패로 판단")
@@ -706,17 +707,27 @@ def _append_session_state_summary(
             lines.append("• *녹화 결과:* 정상 녹화 실패로 판단")
             return
         lines.append("• *종료 상태:* 정상 종료 (`C_STOPSESS` 확인)")
-        if first_ffmpeg_error is not None:
-            error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
-            elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
-            detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
-            if elapsed:
-                detail_parts.append(f"세션 시작 후 `{elapsed}`")
-            lines.append(f"• *녹화 결과:* 영상 손상 가능성 높음 ({', '.join(detail_parts)})")
-        elif session_error_lines:
-            lines.append(f"• *녹화 결과:* 이상 징후 있음 (error 라인 `{len(session_error_lines)}줄`)")
-        else:
-            lines.append("• *녹화 결과:* 정상 녹화로 판단")
+        recording_result, recovery_context = _build_session_recording_result_text(
+            source_lines,
+            session,
+            restart_events,
+            session_error_lines,
+        )
+        lines.append(f"• *녹화 결과:* {recording_result}")
+        if recovery_context is not None:
+            recovery_parts: list[str] = []
+            started_recording = recovery_context.get("startedRecording") if isinstance(recovery_context, dict) else None
+            spawned_recording = recovery_context.get("spawnedRecordingFfmpeg") if isinstance(recovery_context, dict) else None
+            if isinstance(started_recording, dict):
+                recovery_parts.append(
+                    f"Started recording `{_display_value(started_recording.get('timeLabel'), default='시간미상')}`"
+                )
+            if isinstance(spawned_recording, dict):
+                recovery_parts.append(
+                    f"RECORDING ffmpeg 시작 `{_display_value(spawned_recording.get('timeLabel'), default='시간미상')}`"
+                )
+            if recovery_parts:
+                lines.append(f"• 회복 신호: {', '.join(recovery_parts)}")
         return
 
     termination_parts: list[str] = []
@@ -734,9 +745,11 @@ def _append_session_state_summary(
         outcome_parts.append(f"정상 녹화 실패 *{stop_missing_count}건* (종료 스캔 없음)")
 
     ffmpeg_affected_count = 0
+    standby_recovered_count = 0
     for session in sessions:
+        session_error_subset = _error_lines_in_session(session_error_lines, session)
         session_ffmpeg_error = _find_first_ffmpeg_error_context(
-            _error_lines_in_session(session_error_lines, session),
+            session_error_subset,
             [session],
         )
         has_restart = any(
@@ -745,10 +758,21 @@ def _append_session_state_summary(
         )
         has_stop = session.get("stop_line_no") is not None
         if session_ffmpeg_error is not None and not has_restart and has_stop:
+            _, recovery_context = _build_session_recording_result_text(
+                source_lines,
+                session,
+                restart_events,
+                session_error_subset,
+            )
+            if recovery_context is not None:
+                standby_recovered_count += 1
+                continue
             ffmpeg_affected_count += 1
 
     if ffmpeg_affected_count > 0:
         outcome_parts.append(f"영상 손상 가능성 높음 *{ffmpeg_affected_count}건* (ffmpeg 오류)")
+    if standby_recovered_count > 0:
+        outcome_parts.append(f"회복 후 녹화 진행 흔적 있음 *{standby_recovered_count}건* (standby ffmpeg 오류)")
 
     if not termination_parts:
         lines.append("• *종료 상태:* 판단 불가")
@@ -830,6 +854,106 @@ def _find_first_ffmpeg_error_context(
             "elapsedFromSessionStart": elapsed,
         }
     return None
+
+
+def _find_recording_recovery_context(
+    lines: list[str],
+    session: dict[str, Any],
+    after_line_no: int | None = None,
+) -> dict[str, Any] | None:
+    start_line_no = int(session["start_line_no"])
+    end_line_no = int(session["end_line_no"])
+    cursor = max(start_line_no, int(after_line_no) + 1 if after_line_no is not None else start_line_no)
+
+    started_recording: dict[str, Any] | None = None
+    spawned_recording_ffmpeg: dict[str, Any] | None = None
+
+    for line_no in range(cursor, end_line_no + 1):
+        raw_line = lines[line_no - 1]
+        stripped = _strip_leading_log_timestamp(raw_line)
+        lowered = stripped.lower()
+        time_label = _extract_time_label_from_line(raw_line)
+
+        if started_recording is None and "started recording" in lowered:
+            started_recording = {
+                "lineNo": line_no,
+                "timeLabel": time_label,
+                "rawLine": stripped,
+            }
+
+        if spawned_recording_ffmpeg is None and "spawned recording ffmpeg" in lowered:
+            spawned_recording_ffmpeg = {
+                "lineNo": line_no,
+                "timeLabel": time_label,
+                "rawLine": stripped,
+            }
+
+        if started_recording is not None and spawned_recording_ffmpeg is not None:
+            break
+
+    if started_recording is None and spawned_recording_ffmpeg is None:
+        return None
+
+    primary = started_recording or spawned_recording_ffmpeg or {}
+    return {
+        "startedRecording": started_recording,
+        "spawnedRecordingFfmpeg": spawned_recording_ffmpeg,
+        "timeLabel": _display_value(primary.get("timeLabel"), default="시간미상"),
+    }
+
+
+def _build_session_recording_result_text(
+    source_lines: list[str],
+    session: dict[str, Any],
+    restart_events: list[dict[str, Any]],
+    session_error_lines: list[tuple[int, str]],
+) -> tuple[str, dict[str, Any] | None]:
+    has_restart = any(
+        int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
+        for event in restart_events
+    )
+    has_stop = session.get("stop_line_no") is not None
+    first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, [session])
+    has_standby_ffmpeg_error = any(
+        "ffmpeg" in content.lower() and "standby error" in content.lower()
+        for _, content in session_error_lines
+    )
+    recovery_context = (
+        _find_recording_recovery_context(
+            source_lines,
+            session,
+            after_line_no=int(first_ffmpeg_error.get("lineNo")) if isinstance(first_ffmpeg_error, dict) else None,
+        )
+        if has_standby_ffmpeg_error
+        else None
+    )
+
+    if has_restart:
+        return "정상 녹화 실패로 판단", recovery_context
+    if not has_stop:
+        return "정상 녹화 실패로 판단", recovery_context
+    if first_ffmpeg_error is not None:
+        error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
+        elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
+        if has_standby_ffmpeg_error and recovery_context is not None:
+            recovery_time = _display_value(recovery_context.get("timeLabel"), default="시간미상")
+            return (
+                f"초기 standby ffmpeg 오류 후 녹화 진행 재개 흔적 있음 (첫 오류 `{error_time}`, 회복 신호 `{recovery_time}`, 실제 영상 확인 필요)",
+                recovery_context,
+            )
+        if has_standby_ffmpeg_error:
+            detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
+            if elapsed:
+                detail_parts.append(f"세션 시작 후 `{elapsed}`")
+            return f"영상 손상 가능성 있음 ({', '.join(detail_parts)}, 실제 영상 확인 필요)", recovery_context
+
+        detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
+        if elapsed:
+            detail_parts.append(f"세션 시작 후 `{elapsed}`")
+        return f"영상 손상 가능성 높음 ({', '.join(detail_parts)})", recovery_context
+    if session_error_lines:
+        return f"이상 징후 있음 (error 라인 `{len(session_error_lines)}줄`)", recovery_context
+    return "정상 녹화로 판단", recovery_context
 
 
 def _events_in_sessions(events: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1087,6 +1211,7 @@ def _append_session_timing_summary(
 
 def _append_session_sections(
     lines: list[str],
+    source_lines: list[str],
     sessions: list[dict[str, Any]],
     scan_events: list[dict[str, Any]],
     motion_events: list[dict[str, Any]],
@@ -1094,7 +1219,7 @@ def _append_session_sections(
     error_lines: list[tuple[int, str]],
 ) -> None:
     if not sessions:
-        _append_session_state_summary(lines, sessions, restart_events, error_lines)
+        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines)
         _append_session_timing_summary(lines, sessions, error_lines)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
@@ -1102,7 +1227,7 @@ def _append_session_sections(
         return
 
     if len(sessions) <= 1:
-        _append_session_state_summary(lines, sessions, restart_events, error_lines)
+        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines)
         _append_session_timing_summary(lines, sessions, error_lines)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
@@ -1121,7 +1246,7 @@ def _append_session_sections(
 
         lines.append("")
         lines.append(f"*세션 {index}* (`{start_time}` ~ `{stop_time}`)")
-        _append_session_state_summary(lines, [session], session_restart_events, session_error_lines)
+        _append_session_state_summary(lines, source_lines, [session], session_restart_events, session_error_lines)
         _append_session_timing_summary(lines, [session], session_error_lines)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scan_events, session_motion_events)
@@ -1570,6 +1695,7 @@ def _analyze_barcode_log_phase1_window(
             lines.append(f"• 병실: `{room_name}`")
             _append_session_sections(
                 lines,
+                source_lines,
                 sessions,
                 session_events,
                 session_motion_events,
@@ -1718,6 +1844,7 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
         _append_session_sections(
             lines,
+            source_lines,
             sessions,
             session_scoped_events,
             session_motion_events,
@@ -1886,6 +2013,7 @@ def _analyze_barcode_log_errors(
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
         _append_session_sections(
             lines,
+            source_lines,
             sessions,
             session_scoped_events,
             session_motion_events,
