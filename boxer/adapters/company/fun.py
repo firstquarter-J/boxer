@@ -7,11 +7,12 @@ from anthropic import Anthropic
 from boxer.adapters.common.slack import MessagePayload, SlackMessageReplyFn
 from boxer.company import settings as cs
 from boxer.core import settings as s
-from boxer.core.llm import _ask_claude, _ask_ollama, _check_ollama_health
+from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
 
 ALLOWED_FUN_CHANNEL_ID = "C0621TL2HSB"
+FUN_OLLAMA_MODEL = "qwen2.5:1.5b"
 FUN_LLM_MAX_TOKENS = 48
-FUN_LLM_TIMEOUT_SEC = 8
+FUN_LLM_TIMEOUT_SEC = 60
 CLAUSE_SPLIT_RE = re.compile(r"[\n\r,.!?~]+")
 MENTION_RE = re.compile(r"<@[^>]+>")
 URL_RE = re.compile(r"https?://\S+")
@@ -110,20 +111,25 @@ def _generate_fun_reply(
 
     try:
         if provider == "ollama":
-            health = _check_ollama_health(timeout_sec=min(s.OLLAMA_HEALTH_TIMEOUT_SEC, 2))
+            health = _check_ollama_health(
+                timeout_sec=min(s.OLLAMA_HEALTH_TIMEOUT_SEC, 2),
+                model=FUN_OLLAMA_MODEL,
+            )
             if not health["ok"]:
                 logger.info("Fun reply unavailable: ollama (%s)", health["summary"])
                 return _build_fun_llm_unavailable_reply(str(health["summary"])), "unavailable_ollama", False
-            llm_text = _ask_ollama(
+            llm_text = _ask_ollama_chat(
                 prompt,
                 system_prompt=FUN_SYSTEM_PROMPT,
+                model=FUN_OLLAMA_MODEL,
                 timeout_sec=FUN_LLM_TIMEOUT_SEC,
                 max_tokens=FUN_LLM_MAX_TOKENS,
                 temperature=0.8,
+                think=False,
             )
             sanitized = _sanitize_fun_reply(llm_text)
             if sanitized:
-                return sanitized, "ollama", True
+                return sanitized, f"ollama:{FUN_OLLAMA_MODEL}", True
             return _build_fun_llm_unavailable_reply("빈 응답"), "unavailable_empty", False
 
         if provider == "claude" and claude_client is not None:
