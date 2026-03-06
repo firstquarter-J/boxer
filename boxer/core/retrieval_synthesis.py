@@ -151,6 +151,25 @@ def _compact_barcode_log_error_summary_payload(payload: Any) -> Any:
                 }
             )
 
+        compact_session_diagnostics = []
+        for item in (record.get("sessionDiagnostics") or [])[:6]:
+            if not isinstance(item, dict):
+                continue
+            compact_session_diagnostics.append(
+                {
+                    "index": item.get("index"),
+                    "startTime": item.get("startTime"),
+                    "stopTime": item.get("stopTime"),
+                    "severity": item.get("severity"),
+                    "finishDelay": item.get("finishDelay"),
+                    "postStopScanCount": item.get("postStopScanCount"),
+                    "postStopStopCount": item.get("postStopStopCount"),
+                    "postStopSnapCount": item.get("postStopSnapCount"),
+                    "postStopDeviceErrorCount": item.get("postStopDeviceErrorCount"),
+                    "displayText": item.get("displayText"),
+                }
+            )
+
         compact_records.append(
             {
                 "deviceName": record.get("deviceName"),
@@ -164,6 +183,7 @@ def _compact_barcode_log_error_summary_payload(payload: Any) -> Any:
                 "errorLineCount": record.get("errorLineCount"),
                 "errorGroups": compact_error_groups,
                 "errorLines": compact_error_lines,
+                "sessionDiagnostics": compact_session_diagnostics,
             }
         )
 
@@ -216,7 +236,8 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "15) ffmpeg 로그에 DTS/invalid dropping/non-monotonous dts/timestamp 이상이 보이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 명확히 적어.\n"
             "16) 세션 시작 시각과 첫 ffmpeg 오류 시각이 evidence에 있으면 근거 로그에 반드시 같이 적어.\n"
             "17) `C_STOPSESS`가 확인돼 종료는 정상이어도 ffmpeg 오류가 있으면 종료 상태와 녹화 결과를 분리해서 설명해.\n"
-            "18) `Standby error`만 있어도 영상 손상 가능성을 의심해야 한다. 이후 녹화 시작 흔적이 있어도 손상 가능성 판단을 제거하지 말고, 실제 영상 확인이 필요하다고 적어."
+            "18) `Standby error`만 있어도 영상 손상 가능성을 의심해야 한다. 이후 녹화 시작 흔적이 있어도 손상 가능성 판단을 제거하지 말고, 실제 영상 확인이 필요하다고 적어.\n"
+            "19) 다만 sessionDiagnostics에 종료 처리 지연, 종료 후 추가 스캔, 종료 후 장치 오류가 있으면 이 신호를 초기 standby error보다 더 강한 이상 징후로 우선 해석해."
         )
 
     if route != "barcode_log_analysis":

@@ -706,8 +706,10 @@ def _append_session_state_summary(
     sessions: list[dict[str, Any]],
     restart_events: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]] | None = None,
+    scan_events: list[dict[str, Any]] | None = None,
 ) -> None:
     session_error_lines = session_error_lines or []
+    scan_events = scan_events or []
 
     if not sessions and not restart_events:
         return
@@ -746,13 +748,18 @@ def _append_session_state_summary(
             lines.append("• *녹화 결과:* 정상 녹화 실패로 판단")
             return
         lines.append("• *종료 상태:* 정상 종료 (`C_STOPSESS` 확인)")
-        recording_result, recovery_context = _build_session_recording_result_text(
+        recording_result, recovery_context, post_stop_context = _build_session_recording_result_text(
             source_lines,
             session,
             restart_events,
             session_error_lines,
+            scan_events,
         )
         lines.append(f"• *녹화 결과:* {recording_result}")
+        if isinstance(post_stop_context, dict):
+            post_stop_text = str(post_stop_context.get("displayText") or "").strip()
+            if post_stop_text:
+                lines.append(f"• 종료 후 이상 징후: {post_stop_text}")
         if recovery_context is not None:
             recovery_parts: list[str] = []
             started_recording = recovery_context.get("startedRecording") if isinstance(recovery_context, dict) else None
@@ -784,11 +791,19 @@ def _append_session_state_summary(
         outcome_parts.append(f"정상 녹화 실패 *{stop_missing_count}건* (종료 스캔 없음)")
 
     ffmpeg_affected_count = 0
+    severe_post_stop_count = 0
     for session in sessions:
         session_error_subset = _error_lines_in_session(session_error_lines, session)
         session_ffmpeg_error = _find_first_ffmpeg_error_context(
             session_error_subset,
             [session],
+        )
+        _, _, post_stop_context = _build_session_recording_result_text(
+            source_lines,
+            session,
+            restart_events,
+            session_error_subset,
+            scan_events,
         )
         has_restart = any(
             int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
@@ -797,9 +812,13 @@ def _append_session_state_summary(
         has_stop = session.get("stop_line_no") is not None
         if session_ffmpeg_error is not None and not has_restart and has_stop:
             ffmpeg_affected_count += 1
+        if isinstance(post_stop_context, dict) and str(post_stop_context.get("severity") or "") == "high":
+            severe_post_stop_count += 1
 
-    if ffmpeg_affected_count > 0:
-        outcome_parts.append(f"영상 손상 가능성 의심 *{ffmpeg_affected_count}건* (ffmpeg 오류)")
+    if severe_post_stop_count > 0:
+        outcome_parts.append(f"영상 손상 가능성 높음 *{severe_post_stop_count}건* (종료 후 처리 이상)")
+    if ffmpeg_affected_count > severe_post_stop_count:
+        outcome_parts.append(f"영상 손상 가능성 의심 *{ffmpeg_affected_count - severe_post_stop_count}건* (ffmpeg 오류)")
 
     if not termination_parts:
         lines.append("• *종료 상태:* 판단 불가")
@@ -925,7 +944,140 @@ def _find_recording_recovery_context(
     return {
         "startedRecording": started_recording,
         "spawnedRecordingFfmpeg": spawned_recording_ffmpeg,
+        "recordingId": _extract_recording_id_from_recovery_events(started_recording, spawned_recording_ffmpeg),
         "timeLabel": _display_value(primary.get("timeLabel"), default="시간미상"),
+    }
+
+
+def _extract_recording_id_from_recovery_events(
+    started_recording: dict[str, Any] | None,
+    spawned_recording_ffmpeg: dict[str, Any] | None,
+) -> str | None:
+    candidates = [
+        str((started_recording or {}).get("rawLine") or "").strip(),
+        str((spawned_recording_ffmpeg or {}).get("rawLine") or "").strip(),
+    ]
+    patterns = (
+        r"started recording\s*:\s*([a-z0-9]+)",
+        r"/Videos/([a-z0-9]+)\.mp4",
+        r"/Videos/([a-z0-9]+)\.motion\.mp4",
+    )
+    for candidate in candidates:
+        lowered = candidate.lower()
+        for pattern in patterns:
+            matched = re.search(pattern, lowered, re.IGNORECASE)
+            if matched:
+                return matched.group(1)
+    return None
+
+
+def _find_session_post_stop_context(
+    lines: list[str],
+    scan_events: list[dict[str, Any]],
+    session: dict[str, Any],
+    recording_id: str | None,
+) -> dict[str, Any] | None:
+    stop_line_no = int(session.get("stop_line_no") or 0)
+    if stop_line_no <= 0:
+        return None
+
+    stop_time = _display_value(session.get("stop_time_label"), default="미확인")
+    upper_bound = min(len(lines), stop_line_no + 400)
+    finish_line_no: int | None = None
+    finish_time_label = "미확인"
+    finish_count = 0
+    recording_id_lower = (recording_id or "").lower().strip()
+
+    for line_no in range(stop_line_no + 1, upper_bound + 1):
+        raw_line = lines[line_no - 1]
+        lowered = _strip_leading_log_timestamp(raw_line).lower()
+        if recording_id_lower:
+            if f"finishrecording({recording_id_lower}" not in lowered:
+                continue
+        elif "finishrecording(" not in lowered:
+            continue
+
+        finish_count += 1
+        if finish_line_no is None:
+            finish_line_no = line_no
+            finish_time_label = _extract_time_label_from_line(raw_line)
+
+    finish_delay_seconds: int | None = None
+    finish_delay_label: str | None = None
+    stop_seconds = _time_label_to_seconds(stop_time)
+    finish_seconds = _time_label_to_seconds(finish_time_label)
+    if stop_seconds is not None and finish_seconds is not None:
+        finish_delay_seconds = finish_seconds - stop_seconds
+        finish_delay_label = _format_elapsed_seconds(finish_delay_seconds)
+
+    scan_upper_bound = finish_line_no or upper_bound
+    post_stop_scan_events = [
+        event
+        for event in scan_events
+        if stop_line_no < int(event.get("line_no") or 0) < scan_upper_bound
+    ]
+    post_stop_stop_count = sum(
+        1 for event in post_stop_scan_events if str(event.get("token") or "").strip().upper() == "C_STOPSESS"
+    )
+    post_stop_snap_count = sum(
+        1
+        for event in post_stop_scan_events
+        if str(event.get("token") or "").strip().upper() == "SPECIAL_TAKE_SNAP"
+    )
+
+    device_error_upper_bound = min(len(lines), (finish_line_no or upper_bound) + 80)
+    post_stop_device_errors: list[dict[str, Any]] = []
+    for line_no in range(stop_line_no + 1, device_error_upper_bound + 1):
+        raw_line = lines[line_no - 1]
+        stripped = _strip_leading_log_timestamp(raw_line)
+        lowered = stripped.lower()
+        explicit_level = _extract_explicit_log_level(raw_line)
+        has_device_error = (
+            (explicit_level in {"error", "fatal", "panic"} and (
+                "/dev/video0" in lowered or "no such file or directory" in lowered
+            ))
+            or "videodevice : error" in lowered
+            or "video device : error" in lowered
+            or "/dev/video0 has been removed" in lowered
+        )
+        if not has_device_error:
+            continue
+        post_stop_device_errors.append(
+            {
+                "lineNo": line_no,
+                "timeLabel": _extract_time_label_from_line(raw_line),
+                "rawLine": stripped,
+            }
+        )
+
+    abnormal_parts: list[str] = []
+    if finish_delay_seconds is not None and finish_delay_seconds >= 30 and finish_delay_label:
+        abnormal_parts.append(f"종료 처리 지연 `{finish_delay_label}`")
+    if len(post_stop_device_errors) > 0:
+        abnormal_parts.append(f"종료 후 장치 오류 `{len(post_stop_device_errors)}건`")
+    if finish_count > 1:
+        abnormal_parts.append(f"finishRecording 중복 `{finish_count}회`")
+
+    severity = "normal"
+    if abnormal_parts:
+        severity = "high"
+    elif finish_delay_seconds is not None and finish_delay_seconds >= 10:
+        severity = "suspect"
+
+    return {
+        "stopTimeLabel": stop_time,
+        "finishTimeLabel": finish_time_label,
+        "finishLineNo": finish_line_no,
+        "finishCount": finish_count,
+        "finishDelaySeconds": finish_delay_seconds,
+        "finishDelayLabel": finish_delay_label,
+        "postStopScanCount": len(post_stop_scan_events),
+        "postStopStopCount": post_stop_stop_count,
+        "postStopSnapCount": post_stop_snap_count,
+        "postStopDeviceErrorCount": len(post_stop_device_errors),
+        "postStopDeviceErrors": post_stop_device_errors,
+        "severity": severity,
+        "displayText": ", ".join(abnormal_parts),
     }
 
 
@@ -934,7 +1086,8 @@ def _build_session_recording_result_text(
     session: dict[str, Any],
     restart_events: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]],
-) -> tuple[str, dict[str, Any] | None]:
+    scan_events: list[dict[str, Any]] | None = None,
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
     has_restart = any(
         int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
         for event in restart_events
@@ -954,33 +1107,53 @@ def _build_session_recording_result_text(
         if has_standby_ffmpeg_error
         else None
     )
+    post_stop_context = (
+        _find_session_post_stop_context(
+            source_lines,
+            scan_events or [],
+            session,
+            str((recovery_context or {}).get("recordingId") or "").strip() or None,
+        )
+        if has_stop
+        else None
+    )
 
     if has_restart:
-        return "정상 녹화 실패로 판단", recovery_context
+        return "정상 녹화 실패로 판단", recovery_context, post_stop_context
     if not has_stop:
-        return "정상 녹화 실패로 판단", recovery_context
+        return "정상 녹화 실패로 판단", recovery_context, post_stop_context
     if first_ffmpeg_error is not None:
         error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
         elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
-        if has_standby_ffmpeg_error and recovery_context is not None:
-            recovery_time = _display_value(recovery_context.get("timeLabel"), default="시간미상")
+        if isinstance(post_stop_context, dict) and str(post_stop_context.get("severity") or "") == "high":
+            detail_parts = [f"첫 오류 `{error_time}`"]
+            if elapsed:
+                detail_parts.append(f"세션 시작 후 `{elapsed}`")
+            anomaly_text = str(post_stop_context.get("displayText") or "").strip()
+            if anomaly_text:
+                detail_parts.append(anomaly_text)
             return (
-                f"영상 손상 가능성 의심 (첫 오류 `{error_time}`, 녹화 시작 로그 `{recovery_time}` 확인, 실제 영상 확인 필요)",
+                f"영상 손상 가능성 높음 ({', '.join(detail_parts)})",
                 recovery_context,
+                post_stop_context,
             )
         if has_standby_ffmpeg_error:
             detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
             if elapsed:
                 detail_parts.append(f"세션 시작 후 `{elapsed}`")
-            return f"영상 손상 가능성 의심 ({', '.join(detail_parts)}, 실제 영상 확인 필요)", recovery_context
+            return (
+                f"영상 손상 가능성 의심 ({', '.join(detail_parts)}, 실제 영상 확인 필요)",
+                recovery_context,
+                post_stop_context,
+            )
 
         detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
         if elapsed:
             detail_parts.append(f"세션 시작 후 `{elapsed}`")
-        return f"영상 손상 가능성 의심 ({', '.join(detail_parts)})", recovery_context
+        return f"영상 손상 가능성 의심 ({', '.join(detail_parts)})", recovery_context, post_stop_context
     if session_error_lines:
-        return f"이상 징후 있음 (error 라인 `{len(session_error_lines)}줄`)", recovery_context
-    return "정상 녹화로 판단", recovery_context
+        return f"이상 징후 있음 (error 라인 `{len(session_error_lines)}줄`)", recovery_context, post_stop_context
+    return "정상 녹화로 판단", recovery_context, post_stop_context
 
 
 def _events_in_sessions(events: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1158,6 +1331,7 @@ def _build_error_groups(error_items: list[dict[str, Any]]) -> list[dict[str, Any
 
 def _build_log_analysis_record(
     *,
+    source_lines: list[str],
     device_name: str,
     hospital_name: str,
     room_name: str,
@@ -1166,6 +1340,7 @@ def _build_log_analysis_record(
     line_count: int,
     sessions: list[dict[str, Any]],
     session_scans: list[dict[str, Any]],
+    all_scan_events: list[dict[str, Any]],
     session_motions: list[dict[str, Any]],
     session_restarts: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]],
@@ -1176,6 +1351,30 @@ def _build_log_analysis_record(
     restart_items = _serialize_restart_events_for_evidence(session_restarts)
     error_items = _serialize_error_lines_for_evidence(session_error_lines)
     first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, sessions)
+    session_diagnostics: list[dict[str, Any]] = []
+    for index, session in enumerate(sessions, start=1):
+        session_error_subset = _error_lines_in_session(session_error_lines, session)
+        _, _, post_stop_context = _build_session_recording_result_text(
+            source_lines,
+            session,
+            session_restarts,
+            session_error_subset,
+            all_scan_events,
+        )
+        session_diagnostics.append(
+            {
+                "index": index,
+                "startTime": _display_value(session.get("start_time_label"), default="시간미상"),
+                "stopTime": _display_value(session.get("stop_time_label"), default="미확인"),
+                "severity": _display_value((post_stop_context or {}).get("severity"), default="normal"),
+                "finishDelay": _display_value((post_stop_context or {}).get("finishDelayLabel"), default=""),
+                "postStopScanCount": int((post_stop_context or {}).get("postStopScanCount") or 0),
+                "postStopStopCount": int((post_stop_context or {}).get("postStopStopCount") or 0),
+                "postStopSnapCount": int((post_stop_context or {}).get("postStopSnapCount") or 0),
+                "postStopDeviceErrorCount": int((post_stop_context or {}).get("postStopDeviceErrorCount") or 0),
+                "displayText": _display_value((post_stop_context or {}).get("displayText"), default=""),
+            }
+        )
     return {
         "deviceName": device_name,
         "hospitalName": hospital_name,
@@ -1202,6 +1401,7 @@ def _build_log_analysis_record(
         "errorLines": error_items,
         "errorGroups": _build_error_groups(error_items),
         "firstFfmpegError": first_ffmpeg_error,
+        "sessionDiagnostics": session_diagnostics,
     }
 
 
@@ -1246,7 +1446,7 @@ def _append_session_sections(
     error_lines: list[tuple[int, str]],
 ) -> None:
     if not sessions:
-        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines)
+        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines, scan_events)
         _append_session_timing_summary(lines, sessions, error_lines)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
@@ -1254,7 +1454,7 @@ def _append_session_sections(
         return
 
     if len(sessions) <= 1:
-        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines)
+        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines, scan_events)
         _append_session_timing_summary(lines, sessions, error_lines)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
@@ -1273,7 +1473,14 @@ def _append_session_sections(
 
         lines.append("")
         lines.append(f"*세션 {index}* (`{start_time}` ~ `{stop_time}`)")
-        _append_session_state_summary(lines, source_lines, [session], session_restart_events, session_error_lines)
+        _append_session_state_summary(
+            lines,
+            source_lines,
+            [session],
+            session_restart_events,
+            session_error_lines,
+            scan_events,
+        )
         _append_session_timing_summary(lines, [session], session_error_lines)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scan_events, session_motion_events)
@@ -1702,6 +1909,7 @@ def _analyze_barcode_log_phase1_window(
             room_name = _display_value(device_context.get("roomName"), default="미확인")
             analysis_records.append(
                 _build_log_analysis_record(
+                    source_lines=source_lines,
                     device_name=device_name,
                     hospital_name=hospital_name,
                     room_name=room_name,
@@ -1710,6 +1918,7 @@ def _analyze_barcode_log_phase1_window(
                     line_count=len(source_lines),
                     sessions=sessions,
                     session_scans=session_events,
+                    all_scan_events=events,
                     session_motions=session_motion_events,
                     session_restarts=session_restart_events,
                     session_error_lines=session_error_lines,
@@ -1724,9 +1933,9 @@ def _analyze_barcode_log_phase1_window(
                 lines,
                 source_lines,
                 sessions,
-                session_events,
-                session_motion_events,
-                session_restart_events,
+                events,
+                motion_events,
+                restart_events,
                 session_error_lines,
             )
 
@@ -1850,6 +2059,7 @@ def _analyze_barcode_log_scan_events(
         room_name = _display_value(device_context.get("roomName"), default="미확인")
         analysis_records.append(
             _build_log_analysis_record(
+                source_lines=source_lines,
                 device_name=device_name,
                 hospital_name=hospital_name,
                 room_name=room_name,
@@ -1858,6 +2068,7 @@ def _analyze_barcode_log_scan_events(
                 line_count=len(source_lines),
                 sessions=sessions,
                 session_scans=session_scoped_events,
+                all_scan_events=events,
                 session_motions=session_motion_events,
                 session_restarts=session_restart_events,
                 session_error_lines=session_error_lines,
@@ -1873,9 +2084,9 @@ def _analyze_barcode_log_scan_events(
             lines,
             source_lines,
             sessions,
-            session_scoped_events,
-            session_motion_events,
-            session_restart_events,
+            events,
+            motion_events,
+            restart_events,
             session_error_lines,
         )
         devices_with_session += 1
@@ -2018,6 +2229,7 @@ def _analyze_barcode_log_errors(
         room_name = _display_value(device_context.get("roomName"), default="미확인")
         analysis_records.append(
             _build_log_analysis_record(
+                source_lines=source_lines,
                 device_name=device_name,
                 hospital_name=hospital_name,
                 room_name=room_name,
@@ -2026,6 +2238,7 @@ def _analyze_barcode_log_errors(
                 line_count=len(source_lines),
                 sessions=sessions,
                 session_scans=session_scoped_events,
+                all_scan_events=events,
                 session_motions=session_motion_events,
                 session_restarts=session_restart_events,
                 session_error_lines=session_error_lines,
@@ -2042,9 +2255,9 @@ def _analyze_barcode_log_errors(
             lines,
             source_lines,
             sessions,
-            session_scoped_events,
-            session_motion_events,
-            session_restart_events,
+            events,
+            motion_events,
+            restart_events,
             session_error_lines,
         )
         devices_with_session += 1

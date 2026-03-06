@@ -414,7 +414,20 @@ def create_app() -> App:
             )
 
             error_groups = first_record.get("errorGroups") if isinstance(first_record, dict) else []
+            session_diagnostics = first_record.get("sessionDiagnostics") if isinstance(first_record, dict) else []
             top_group = error_groups[0] if isinstance(error_groups, list) and error_groups else {}
+            severe_session = (
+                next(
+                    (
+                        item
+                        for item in (session_diagnostics or [])
+                        if isinstance(item, dict) and str(item.get("severity") or "") == "high"
+                    ),
+                    None,
+                )
+                if isinstance(session_diagnostics, list)
+                else None
+            )
             top_component = str(top_group.get("component") or "미확인").strip() if isinstance(top_group, dict) else "미확인"
             top_signature = str(top_group.get("signature") or "미확인").strip() if isinstance(top_group, dict) else "미확인"
             top_count = int(top_group.get("count") or 0) if isinstance(top_group, dict) else 0
@@ -434,6 +447,8 @@ def create_app() -> App:
 
             if restart_count > 0:
                 cause_line = "• 핵심 원인: 세션 중 장비 재시작과 녹화 오류가 함께 보여 정상 녹화 실패 가능성이 높아"
+            elif isinstance(severe_session, dict):
+                cause_line = "• 핵심 원인: 초기 ffmpeg 오류보다 종료 처리 지연과 종료 후 장치 오류가 더 뚜렷해서 실제 영상 손상 가능성이 높아"
             elif is_standby_ffmpeg_error and all_closed_normally:
                 cause_line = "• 핵심 원인: standby ffmpeg 오류가 확인돼 영상 손상 가능성을 의심해야 하고 캡처보드 이상을 우선 점검해야 해"
             elif is_ffmpeg_timestamp_error:
@@ -453,6 +468,11 @@ def create_app() -> App:
                 impact_line = (
                     f"• 영향: `{date_label}` `{hospital_name}` `{room_name}` 장비 `{device_name}`에서 "
                     "세션 중 재시작이 확인돼 정상 녹화 실패 가능성이 높아"
+                )
+            elif isinstance(severe_session, dict):
+                impact_line = (
+                    f"• 영향: `{date_label}` `{hospital_name}` `{room_name}` 장비 `{device_name}`에서 "
+                    "종료 스캔은 확인됐지만 종료 처리 이상이 이어져 실제 영상 손상 가능성이 높아"
                 )
             elif abnormal_count > 0:
                 impact_line = (
@@ -486,6 +506,16 @@ def create_app() -> App:
                 if ffmpeg_error_elapsed:
                     time_parts.append(f"시작 후 `{ffmpeg_error_elapsed}`")
                 evidence_lines.append(f"- {', '.join(time_parts)}")
+            if isinstance(severe_session, dict):
+                severe_parts: list[str] = []
+                finish_delay = str(severe_session.get("finishDelay") or "").strip()
+                if finish_delay:
+                    severe_parts.append(f"종료 처리 지연 `{finish_delay}`")
+                post_stop_device_error_count = int(severe_session.get("postStopDeviceErrorCount") or 0)
+                if post_stop_device_error_count > 0:
+                    severe_parts.append(f"종료 후 장치 오류 `{post_stop_device_error_count}건`")
+                if severe_parts:
+                    evidence_lines.append(f"- {' , '.join(severe_parts).replace(' ,', ',')}")
             if top_count > 0 and top_signature != "미확인":
                 evidence_lines.append(f"- `{top_component}` `{top_signature}` `{top_count}회`")
             if evidence_lines:
