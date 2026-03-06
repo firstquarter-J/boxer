@@ -18,6 +18,7 @@ ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "700"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
 OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "300"))
+OLLAMA_HEALTH_TIMEOUT_SEC = int(os.getenv("OLLAMA_HEALTH_TIMEOUT_SEC", "2"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.0"))
 LLM_SYNTHESIS_ENABLED = os.getenv("LLM_SYNTHESIS_ENABLED", "true").lower() in {
     "1",

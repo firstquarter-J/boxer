@@ -1,4 +1,5 @@
 import json
+import time
 from urllib import error, request
 
 from anthropic import Anthropic
@@ -58,3 +59,71 @@ def _ask_ollama(question: str, system_prompt: str | None = None) -> str:
         raise RuntimeError("Ollama API returned invalid JSON") from exc
 
     return str(data.get("response", "")).strip()
+
+
+def _check_ollama_health(timeout_sec: int | None = None) -> dict[str, str | bool]:
+    actual_timeout = max(
+        1,
+        timeout_sec if timeout_sec is not None else s.OLLAMA_HEALTH_TIMEOUT_SEC,
+    )
+    started_at = time.monotonic()
+    req = request.Request(
+        url=f"{s.OLLAMA_BASE_URL}/api/tags",
+        headers={"Content-Type": "application/json"},
+        method="GET",
+    )
+
+    try:
+        with request.urlopen(req, timeout=actual_timeout) as response:
+            body = response.read().decode("utf-8")
+    except TimeoutError:
+        return {
+            "ok": False,
+            "summary": f"응답 없음 ({actual_timeout}초 초과)",
+        }
+    except error.HTTPError as exc:
+        return {
+            "ok": False,
+            "summary": f"HTTP {exc.code}",
+        }
+    except error.URLError as exc:
+        reason = str(exc.reason).strip() or "connection failed"
+        if "timeout" in reason.lower() or "timed out" in reason.lower():
+            return {
+                "ok": False,
+                "summary": f"응답 없음 ({actual_timeout}초 초과)",
+            }
+        return {
+            "ok": False,
+            "summary": f"연결 실패 ({reason})",
+        }
+
+    latency_ms = int((time.monotonic() - started_at) * 1000)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "summary": f"응답 오류 (invalid json, {latency_ms}ms)",
+        }
+
+    models = data.get("models")
+    installed_names: list[str] = []
+    if isinstance(models, list):
+        installed_names = [
+            str(item.get("name") or "").strip()
+            for item in models
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+
+    configured_model = (s.OLLAMA_MODEL or "").strip()
+    if configured_model and configured_model not in installed_names:
+        return {
+            "ok": False,
+            "summary": f"서버 연결됨, 실행 모델 확인 필요 ({latency_ms}ms)",
+        }
+
+    return {
+        "ok": True,
+        "summary": f"정상 ({latency_ms}ms)",
+    }

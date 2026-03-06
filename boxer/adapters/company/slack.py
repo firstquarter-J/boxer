@@ -11,7 +11,7 @@ from boxer.adapters.common.slack import MentionPayload, SlackReplyFn, create_sla
 from boxer.company import settings as cs
 from boxer.company.utils import _extract_barcode
 from boxer.core import settings as s
-from boxer.core.llm import _ask_claude, _ask_ollama
+from boxer.core.llm import _ask_claude, _ask_ollama, _check_ollama_health
 from boxer.core.retrieval_synthesis import _synthesize_retrieval_answer
 from boxer.core.thread_context import _build_model_input, _load_thread_context
 from boxer.core.utils import _validate_tokens
@@ -76,8 +76,23 @@ def create_app() -> App:
         thread_ts = payload["thread_ts"]
 
         if "ping" in text:
-            reply("pong-ec2")
-            logger.info("Responded with pong-ec2 in thread_ts=%s", thread_ts)
+            provider = (s.LLM_PROVIDER or "").lower().strip()
+            if provider == "ollama":
+                health = _check_ollama_health()
+                reply(f"🏓 pong\n• llm: {health['summary']}")
+                logger.info(
+                    "Responded with ping health in thread_ts=%s provider=ollama ok=%s",
+                    thread_ts,
+                    health["ok"],
+                )
+                return
+            if provider == "claude":
+                reply("🏓 pong\n• llm: claude api 사용 중")
+                logger.info("Responded with ping health in thread_ts=%s provider=claude", thread_ts)
+                return
+
+            reply("🏓 pong\n• llm: 미설정")
+            logger.info("Responded with ping health in thread_ts=%s provider=none", thread_ts)
             return
 
         def _timeout_reply_text() -> str:
