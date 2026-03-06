@@ -20,6 +20,11 @@ _MOTION_STOP_STATUS_PATTERN = re.compile(
     r"Motion detected:\s*(true|false)\s*,\s*Error:\s*(true|false)",
     re.IGNORECASE,
 )
+_RESTART_START_PATTERN = re.compile(r"mommybox starting", re.IGNORECASE)
+_RESTART_APP_VERSION_PATTERN = re.compile(r"app version:\s*(.+)$", re.IGNORECASE)
+_RESTART_NODE_VERSION_PATTERN = re.compile(r"node\.js version:\s*(.+)$", re.IGNORECASE)
+_RESTART_PLATFORM_PATTERN = re.compile(r"platform:\s*(.+)$", re.IGNORECASE)
+_RESTART_START_TIME_PATTERN = re.compile(r"start time:\s*(.+)$", re.IGNORECASE)
 _HOSPITAL_SCOPE_PATTERN = re.compile(
     r"병원명\s*[:=]?\s*(.+?)(?=\s+(?:병실명|진료실명|날짜|로그|분석)\b|$)"
 )
@@ -415,6 +420,50 @@ def _extract_motion_events_with_line_no(lines: list[str]) -> list[dict[str, Any]
     return events
 
 
+def _extract_restart_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    latest_time_label: str | None = None
+
+    for line_no, line in enumerate(lines, start=1):
+        line_time_label = _extract_time_label_from_line(line)
+        if line_time_label != "시간미상":
+            latest_time_label = line_time_label
+
+        stripped = _strip_leading_log_timestamp(line)
+        if not _RESTART_START_PATTERN.search(stripped):
+            continue
+
+        time_label = line_time_label
+        if time_label == "시간미상" and latest_time_label:
+            time_label = latest_time_label
+
+        details: dict[str, str] = {}
+        for follow_index in range(line_no + 1, min(len(lines), line_no + 8) + 1):
+            follow_line = lines[follow_index - 1]
+            follow_stripped = _strip_leading_log_timestamp(follow_line)
+            for key, pattern in (
+                ("appVersion", _RESTART_APP_VERSION_PATTERN),
+                ("nodeVersion", _RESTART_NODE_VERSION_PATTERN),
+                ("platform", _RESTART_PLATFORM_PATTERN),
+                ("startTime", _RESTART_START_TIME_PATTERN),
+            ):
+                matched = pattern.search(follow_stripped)
+                if matched and key not in details:
+                    details[key] = matched.group(1).strip()
+
+        events.append(
+            {
+                "line_no": line_no,
+                "time_label": time_label,
+                "label": "장비 재시작 감지",
+                "raw_line": stripped,
+                "details": details,
+            }
+        )
+
+    return events
+
+
 def _summarize_motion_session(
     motion_events: list[dict[str, Any]],
 ) -> dict[str, str]:
@@ -648,6 +697,21 @@ def _serialize_motion_events_for_evidence(motion_events: list[dict[str, Any]]) -
     return items
 
 
+def _serialize_restart_events_for_evidence(restart_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for event in sorted(restart_events, key=lambda item: int(item.get("line_no") or 0)):
+        items.append(
+            {
+                "lineNo": int(event.get("line_no") or 0),
+                "timeLabel": _display_value(event.get("time_label"), default="시간미상"),
+                "label": _display_value(event.get("label"), default="장비 재시작 감지"),
+                "rawLine": _display_value(event.get("raw_line"), default=""),
+                "details": event.get("details") or {},
+            }
+        )
+    return items
+
+
 def _serialize_error_lines_for_evidence(error_lines: list[tuple[int, str]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for line_no, content in error_lines:
@@ -711,11 +775,13 @@ def _build_log_analysis_record(
     sessions: list[dict[str, Any]],
     session_scans: list[dict[str, Any]],
     session_motions: list[dict[str, Any]],
+    session_restarts: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]],
 ) -> dict[str, Any]:
     closure = _session_closure_counts(sessions)
     scan_items = _serialize_scan_events_for_evidence(session_scans)
     motion_items = _serialize_motion_events_for_evidence(session_motions)
+    restart_items = _serialize_restart_events_for_evidence(session_restarts)
     error_items = _serialize_error_lines_for_evidence(session_error_lines)
     return {
         "deviceName": device_name,
@@ -728,6 +794,9 @@ def _build_log_analysis_record(
         "scanEventCount": len(scan_items),
         "scanEvents": scan_items,
         "motionEvents": motion_items,
+        "restartEventCount": len(restart_items),
+        "restartDetected": len(restart_items) > 0,
+        "restartEvents": restart_items,
         "errorLineCount": len(error_items),
         "errorLines": error_items,
         "errorGroups": _build_error_groups(error_items),
@@ -746,12 +815,14 @@ def _build_log_analysis_payload(
     total_sessions = 0
     total_abnormal = 0
     total_scan_events = 0
+    total_restart_events = 0
     for record in records:
         all_error_items.extend(record.get("errorLines") or [])
         sessions = record.get("sessions") or {}
         total_sessions += int(sessions.get("sessionCount") or 0)
         total_abnormal += int(sessions.get("abnormalCount") or 0)
         total_scan_events += int(record.get("scanEventCount") or 0)
+        total_restart_events += int(record.get("restartEventCount") or 0)
 
     return {
         "route": "barcode_log_error_summary",
@@ -767,6 +838,7 @@ def _build_log_analysis_payload(
             "sessionCount": total_sessions,
             "abnormalSessionCount": total_abnormal,
             "scanEventCount": total_scan_events,
+            "restartEventCount": total_restart_events,
             "errorLineCount": len(all_error_items),
             "errorGroupCount": len(_build_error_groups(all_error_items)),
         },
@@ -974,6 +1046,34 @@ def _append_error_lines_section(
     lines.append("```")
 
 
+def _append_restart_events_section(
+    lines: list[str],
+    restart_events: list[dict[str, Any]],
+) -> None:
+    if not restart_events:
+        return
+
+    lines.append(f"• 세션 중 재시작 감지: *{len(restart_events)}건* (정상 녹화 실패로 판단)")
+
+    rows: list[str] = []
+    for event in sorted(restart_events, key=lambda item: int(item.get("line_no") or 0)):
+        time_label = _display_value(event.get("time_label"), default="시간미상")
+        raw_line = _display_value(event.get("raw_line"), default="Mommybox Starting")
+        details = event.get("details") or {}
+        detail_parts: list[str] = []
+        if details.get("appVersion"):
+            detail_parts.append(f"App Version {details['appVersion']}")
+        if details.get("startTime"):
+            detail_parts.append(f"Start Time {details['startTime']}")
+        detail_text = f" | {' | '.join(detail_parts)}" if detail_parts else ""
+        rows.append(f"{time_label:>8}  {raw_line}{detail_text}")
+
+    lines.append("")
+    lines.append("```")
+    lines.extend(rows)
+    lines.append("```")
+
+
 def _analyze_barcode_log_phase1_window(
     s3_client: Any,
     barcode: str,
@@ -1086,6 +1186,7 @@ def _analyze_barcode_log_phase1_window(
             source_lines = log_data["lines"]
             events = _extract_scan_events_with_line_no(source_lines)
             motion_events = _extract_motion_events_with_line_no(source_lines)
+            restart_events = _extract_restart_events_with_line_no(source_lines)
             sessions = _extract_recording_sessions(
                 source_lines,
                 barcode,
@@ -1108,6 +1209,11 @@ def _analyze_barcode_log_phase1_window(
                 for event in motion_events
                 if _line_in_any_session(int(event["line_no"]), sessions)
             ]
+            session_restart_events = [
+                event
+                for event in restart_events
+                if _line_in_any_session(int(event["line_no"]), sessions)
+            ]
             raw_session_error_lines = [
                 (line_no, content)
                 for (line_no, content) in error_lines
@@ -1128,6 +1234,7 @@ def _analyze_barcode_log_phase1_window(
                     sessions=sessions,
                     session_scans=session_events,
                     session_motions=session_motion_events,
+                    session_restarts=session_restart_events,
                     session_error_lines=session_error_lines,
                 )
             )
@@ -1138,6 +1245,7 @@ def _analyze_barcode_log_phase1_window(
             lines.append(f"• 병실: `{room_name}`")
             lines.append(f"• 요청 바코드 녹화 세션: *{len(sessions)}건*")
             _append_session_closure_status(lines, sessions)
+            _append_restart_events_section(lines, session_restart_events)
             _append_scan_events_section(lines, session_events, session_motion_events)
             _append_error_lines_section(
                 lines,
@@ -1249,6 +1357,7 @@ def _analyze_barcode_log_scan_events(
         logs_found_any += 1
         events = _extract_scan_events_with_line_no(source_lines)
         motion_events = _extract_motion_events_with_line_no(source_lines)
+        restart_events = _extract_restart_events_with_line_no(source_lines)
         error_lines = _find_error_lines(source_lines)
         sessions = _extract_recording_sessions(
             source_lines,
@@ -1260,6 +1369,7 @@ def _analyze_barcode_log_scan_events(
         total_session_count += session_count
         session_scoped_events = _events_in_sessions(events, sessions)
         session_motion_events = _events_in_sessions(motion_events, sessions)
+        session_restart_events = _events_in_sessions(restart_events, sessions)
         raw_session_error_lines = _error_lines_in_sessions(error_lines, sessions)
         session_error_lines = raw_session_error_lines
 
@@ -1283,6 +1393,7 @@ def _analyze_barcode_log_scan_events(
                 sessions=sessions,
                 session_scans=session_scoped_events,
                 session_motions=session_motion_events,
+                session_restarts=session_restart_events,
                 session_error_lines=session_error_lines,
             )
         )
@@ -1293,6 +1404,7 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
         _append_session_closure_status(lines, sessions)
+        _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         _append_error_lines_section(
             lines,
@@ -1425,6 +1537,7 @@ def _analyze_barcode_log_errors(
         logs_found_any += 1
         events = _extract_scan_events_with_line_no(source_lines)
         motion_events = _extract_motion_events_with_line_no(source_lines)
+        restart_events = _extract_restart_events_with_line_no(source_lines)
         sessions = _extract_recording_sessions(
             source_lines,
             barcode,
@@ -1436,6 +1549,7 @@ def _analyze_barcode_log_errors(
         error_lines = _find_error_lines(source_lines)
         session_scoped_events = _events_in_sessions(events, sessions)
         session_motion_events = _events_in_sessions(motion_events, sessions)
+        session_restart_events = _events_in_sessions(restart_events, sessions)
         raw_session_error_lines = _error_lines_in_sessions(error_lines, sessions)
         session_error_lines = raw_session_error_lines
         total_session_error_lines += len(session_error_lines)
@@ -1460,6 +1574,7 @@ def _analyze_barcode_log_errors(
                 sessions=sessions,
                 session_scans=session_scoped_events,
                 session_motions=session_motion_events,
+                session_restarts=session_restart_events,
                 session_error_lines=session_error_lines,
             )
         )
@@ -1471,6 +1586,7 @@ def _analyze_barcode_log_errors(
         lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
         _append_session_closure_status(lines, sessions)
+        _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         _append_error_lines_section(
             lines,

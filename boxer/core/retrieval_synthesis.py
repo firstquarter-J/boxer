@@ -114,7 +114,8 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "9) Use only the provided evidence. If something is inferred, explicitly write '추정:'.\n"
             "10) Keep it concise and operational. Prefer 4~8 bullet lines total.\n"
             "11) In '근거 로그', cite compactly with time/component/message, not full long blocks.\n"
-            "12) In '권장 조치', suggest practical checks that an operator can do immediately."
+            "12) In '권장 조치', suggest practical checks that an operator can do immediately.\n"
+            "13) If restartEvents exist during the session, treat reboot/restart during recording as a primary cause candidate and mention it clearly."
         )
 
     if route != "barcode_log_analysis":
