@@ -157,6 +157,11 @@ def create_app() -> App:
             evidence_payload: dict[str, Any],
             route_name: str,
         ) -> None:
+            if route_name == "barcode log analysis":
+                reply(fallback_text)
+                logger.info("Responded with %s (direct, preserve format)", route_name)
+                return
+
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if not s.LLM_SYNTHESIS_ENABLED or not question:
                 reply(fallback_text)

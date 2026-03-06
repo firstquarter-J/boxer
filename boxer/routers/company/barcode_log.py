@@ -700,10 +700,7 @@ def _append_scan_events_section(
         lines.append("• scanned 이벤트: 없음")
         return
 
-    if ordered_motions:
-        lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건* (모션 포함)")
-    else:
-        lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")
+    lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")
 
     timeline_rows: list[str] = []
     for _, time_label, label, detail in sorted(timeline, key=lambda item: item[0]):
