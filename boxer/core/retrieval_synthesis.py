@@ -100,6 +100,23 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
         return ""
 
     route = str(evidence_payload.get("route") or "").strip().lower()
+    if route == "barcode_log_error_summary":
+        return (
+            "\n"
+            "7) This is a barcode log error interpretation task. Do not restate the full raw logs.\n"
+            "8) Answer in this exact section order:\n"
+            "   - *에러 분석*\n"
+            "   - • 핵심 원인:\n"
+            "   - • 영향:\n"
+            "   - • 근거 로그:\n"
+            "   - • 권장 조치:\n"
+            "   - • 확실도:\n"
+            "9) Use only the provided evidence. If something is inferred, explicitly write '추정:'.\n"
+            "10) Keep it concise and operational. Prefer 4~8 bullet lines total.\n"
+            "11) In '근거 로그', cite compactly with time/component/message, not full long blocks.\n"
+            "12) In '권장 조치', suggest practical checks that an operator can do immediately."
+        )
+
     if route != "barcode_log_analysis":
         return ""
 
@@ -190,6 +207,8 @@ def _synthesize_retrieval_answer(
     provider: str,
     claude_client: Anthropic | None,
     system_prompt: str | None = None,
+    max_tokens: int | None = None,
+    ollama_timeout_sec: int | None = None,
 ) -> str:
     normalized_provider = (provider or "").lower().strip()
     if not normalized_provider:
@@ -213,12 +232,15 @@ def _synthesize_retrieval_answer(
             claude_client,
             user_input,
             system_prompt=prompt,
+            max_tokens=max_tokens,
         )
 
     if normalized_provider == "ollama":
         return _ask_ollama(
             user_input,
             system_prompt=prompt,
+            max_tokens=max_tokens,
+            timeout_sec=ollama_timeout_sec,
         )
 
     return ""

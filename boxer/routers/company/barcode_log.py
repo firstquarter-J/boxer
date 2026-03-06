@@ -578,6 +578,203 @@ def _error_lines_in_sessions(
     ]
 
 
+def _session_closure_counts(sessions: list[dict[str, Any]]) -> dict[str, int | bool]:
+    normal_count = sum(1 for session in sessions if session.get("stop_line_no") is not None)
+    abnormal_count = max(0, len(sessions) - normal_count)
+    return {
+        "sessionCount": len(sessions),
+        "normalCount": normal_count,
+        "abnormalCount": abnormal_count,
+        "allClosedNormally": abnormal_count == 0 and len(sessions) > 0,
+    }
+
+
+def _parse_structured_log_line(line: str) -> dict[str, str]:
+    stripped = _strip_leading_log_timestamp(line)
+    raw_match = re.match(r"^\[\s*([^\]]+?)\s*\]\s+\[\s*([^\]]+?)\s*\]\s*(.*)$", stripped)
+    if raw_match:
+        return {
+            "component": raw_match.group(1).strip(),
+            "level": raw_match.group(2).strip().lower(),
+            "message": raw_match.group(3).strip(),
+            "raw": stripped,
+        }
+
+    normalized_match = re.match(r"^\[([^\]]+)\]\s+([A-Za-z]+):\s*(.*)$", stripped)
+    if normalized_match:
+        return {
+            "component": normalized_match.group(1).strip(),
+            "level": normalized_match.group(2).strip().lower(),
+            "message": normalized_match.group(3).strip(),
+            "raw": stripped,
+        }
+
+    return {
+        "component": "",
+        "level": "",
+        "message": stripped,
+        "raw": stripped,
+    }
+
+
+def _serialize_scan_events_for_evidence(scan_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for event in sorted(scan_events, key=lambda item: int(item.get("line_no") or 0)):
+        items.append(
+            {
+                "lineNo": int(event.get("line_no") or 0),
+                "timeLabel": _display_value(event.get("time_label"), default="시간미상"),
+                "token": _display_value(event.get("token"), default=""),
+                "rawLine": _display_value(event.get("raw_line"), default=""),
+            }
+        )
+    return items
+
+
+def _serialize_motion_events_for_evidence(motion_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for event in sorted(motion_events, key=lambda item: int(item.get("line_no") or 0)):
+        row: dict[str, Any] = {
+            "lineNo": int(event.get("line_no") or 0),
+            "timeLabel": _display_value(event.get("time_label"), default="시간미상"),
+            "eventType": _display_value(event.get("event_type"), default=""),
+            "label": _display_value(event.get("label"), default=""),
+        }
+        if event.get("motion_detected") is not None:
+            row["motionDetected"] = bool(event.get("motion_detected"))
+        if event.get("error") is not None:
+            row["error"] = bool(event.get("error"))
+        items.append(row)
+    return items
+
+
+def _serialize_error_lines_for_evidence(error_lines: list[tuple[int, str]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for line_no, content in error_lines:
+        parsed = _parse_structured_log_line(content)
+        items.append(
+            {
+                "lineNo": int(line_no),
+                "timeLabel": _extract_time_label_from_line(content),
+                "component": parsed["component"],
+                "level": parsed["level"],
+                "message": parsed["message"],
+                "raw": parsed["raw"],
+            }
+        )
+    return items
+
+
+def _build_error_groups(error_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in error_items:
+        component = str(item.get("component") or "").strip()
+        message = str(item.get("message") or item.get("raw") or "").strip()
+        key = (component, message)
+        existing = groups.get(key)
+        if existing is None:
+            groups[key] = {
+                "component": component or "unknown",
+                "signature": message,
+                "count": 1,
+                "firstTime": _display_value(item.get("timeLabel"), default="시간미상"),
+                "lastTime": _display_value(item.get("timeLabel"), default="시간미상"),
+                "levels": [str(item.get("level") or "").strip()],
+                "sampleLines": [str(item.get("raw") or "").strip()],
+            }
+            continue
+
+        existing["count"] = int(existing["count"]) + 1
+        existing["lastTime"] = _display_value(item.get("timeLabel"), default="시간미상")
+        level = str(item.get("level") or "").strip()
+        if level and level not in existing["levels"]:
+            existing["levels"].append(level)
+        raw = str(item.get("raw") or "").strip()
+        if raw and raw not in existing["sampleLines"] and len(existing["sampleLines"]) < 3:
+            existing["sampleLines"].append(raw)
+
+    ordered = sorted(
+        groups.values(),
+        key=lambda item: (-int(item["count"]), str(item["component"]), str(item["signature"])),
+    )
+    return ordered[:12]
+
+
+def _build_log_analysis_record(
+    *,
+    device_name: str,
+    hospital_name: str,
+    room_name: str,
+    log_key: str,
+    log_date: str,
+    line_count: int,
+    sessions: list[dict[str, Any]],
+    session_scans: list[dict[str, Any]],
+    session_motions: list[dict[str, Any]],
+    session_error_lines: list[tuple[int, str]],
+) -> dict[str, Any]:
+    closure = _session_closure_counts(sessions)
+    scan_items = _serialize_scan_events_for_evidence(session_scans)
+    motion_items = _serialize_motion_events_for_evidence(session_motions)
+    error_items = _serialize_error_lines_for_evidence(session_error_lines)
+    return {
+        "deviceName": device_name,
+        "hospitalName": hospital_name,
+        "roomName": room_name,
+        "date": log_date,
+        "logKey": log_key,
+        "lineCount": int(line_count),
+        "sessions": closure,
+        "scanEventCount": len(scan_items),
+        "scanEvents": scan_items,
+        "motionEvents": motion_items,
+        "errorLineCount": len(error_items),
+        "errorLines": error_items,
+        "errorGroups": _build_error_groups(error_items),
+    }
+
+
+def _build_log_analysis_payload(
+    *,
+    mode: str,
+    barcode: str,
+    request_date: str | None,
+    date_range: str | None,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    all_error_items: list[dict[str, Any]] = []
+    total_sessions = 0
+    total_abnormal = 0
+    total_scan_events = 0
+    for record in records:
+        all_error_items.extend(record.get("errorLines") or [])
+        sessions = record.get("sessions") or {}
+        total_sessions += int(sessions.get("sessionCount") or 0)
+        total_abnormal += int(sessions.get("abnormalCount") or 0)
+        total_scan_events += int(record.get("scanEventCount") or 0)
+
+    return {
+        "route": "barcode_log_error_summary",
+        "source": "box_db+s3",
+        "request": {
+            "mode": mode,
+            "barcode": barcode,
+            "date": request_date,
+            "dateRange": date_range,
+        },
+        "summary": {
+            "recordCount": len(records),
+            "sessionCount": total_sessions,
+            "abnormalSessionCount": total_abnormal,
+            "scanEventCount": total_scan_events,
+            "errorLineCount": len(all_error_items),
+            "errorGroupCount": len(_build_error_groups(all_error_items)),
+        },
+        "records": records,
+        "errorGroups": _build_error_groups(all_error_items),
+    }
+
+
 def _append_session_summaries(
     lines: list[str],
     barcode: str,
@@ -782,29 +979,43 @@ def _analyze_barcode_log_phase1_window(
     barcode: str,
     recordings_context: dict[str, Any],
     max_days: int,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     title = "*바코드 로그 분석 결과 (1차 자동 범위)*"
     summary = recordings_context.get("summary") or {}
     recording_count = int(summary.get("recordingCount") or 0)
     if recording_count <= 0:
-        return _build_phase2_scope_request_message(
+        result_text = _build_phase2_scope_request_message(
             barcode,
             "recordings 데이터가 없어 자동 범위를 계산할 수 없어",
             title,
         )
+        return result_text, _build_log_analysis_payload(
+            mode="phase1_window",
+            barcode=barcode,
+            request_date=None,
+            date_range=None,
+            records=[],
+        )
 
     date_window = _extract_phase1_date_window(recordings_context)
     if date_window is None:
-        return _build_phase2_scope_request_message(
+        result_text = _build_phase2_scope_request_message(
             barcode,
             "마지막 recordedAt 정보를 찾지 못했어",
             title,
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="phase1_window",
+            barcode=barcode,
+            request_date=None,
+            date_range=None,
+            records=[],
         )
     start_date, end_date = date_window
     day_span = (end_date - start_date).days + 1
     bounded_max_days = max(1, max_days)
     if day_span > bounded_max_days:
-        return _build_phase2_scope_request_message(
+        result_text = _build_phase2_scope_request_message(
             barcode,
             (
                 f"1차 범위가 `{day_span}일`(시작 `{start_date:%Y-%m-%d}`)이라 "
@@ -812,16 +1023,30 @@ def _analyze_barcode_log_phase1_window(
             ),
             title,
         )
+        return result_text, _build_log_analysis_payload(
+            mode="phase1_window",
+            barcode=barcode,
+            request_date=None,
+            date_range=f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}",
+            records=[],
+        )
 
     device_contexts = _lookup_device_contexts_by_barcode(
         barcode,
         recordings_context=recordings_context,
     )
     if not device_contexts:
-        return _build_phase2_scope_request_message(
+        result_text = _build_phase2_scope_request_message(
             barcode,
             "장비 매핑 정보를 찾지 못했어",
             title,
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="phase1_window",
+            barcode=barcode,
+            request_date=None,
+            date_range=f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}",
+            records=[],
         )
 
     max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
@@ -832,6 +1057,7 @@ def _analyze_barcode_log_phase1_window(
     found_log_files = 0
     matched_scope_count = 0
     total_sessions = 0
+    analysis_records: list[dict[str, Any]] = []
     lines = [
         title,
         f"• 바코드: `{barcode}`",
@@ -891,6 +1117,20 @@ def _analyze_barcode_log_phase1_window(
 
             hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
             room_name = _display_value(device_context.get("roomName"), default="미확인")
+            analysis_records.append(
+                _build_log_analysis_record(
+                    device_name=device_name,
+                    hospital_name=hospital_name,
+                    room_name=room_name,
+                    log_key=str(log_data["key"]),
+                    log_date=date_label,
+                    line_count=len(source_lines),
+                    sessions=sessions,
+                    session_scans=session_events,
+                    session_motions=session_motion_events,
+                    session_error_lines=session_error_lines,
+                )
+            )
 
             lines.append("")
             lines.append(f"*장비 `{device_name}` | 날짜 `{date_label}`*")
@@ -906,13 +1146,20 @@ def _analyze_barcode_log_phase1_window(
             )
 
     if found_log_files == 0:
-        return (
+        result_text = (
             f"{title}\n"
             f"• 바코드: `{barcode}`\n"
             f"• 분석 범위(KST): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)\n"
             f"• 매핑 장비: `{len(device_contexts)}개`\n"
             "• 확인한 로그 파일: `0개`\n"
             "*요약*: 범위 내 로그 파일을 찾지 못했어"
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="phase1_window",
+            barcode=barcode,
+            request_date=None,
+            date_range=f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}",
+            records=[],
         )
 
     lines.append("")
@@ -925,7 +1172,14 @@ def _analyze_barcode_log_phase1_window(
         lines.append("*요약*: 범위 내 로그는 확인했지만 요청 바코드 세션은 찾지 못했어")
 
     max_result_chars = max(s.S3_QUERY_MAX_RESULT_CHARS, 38000)
-    return _truncate_text("\n".join(lines), max_result_chars)
+    result_text = _truncate_text("\n".join(lines), max_result_chars)
+    return result_text, _build_log_analysis_payload(
+        mode="phase1_window",
+        barcode=barcode,
+        request_date=None,
+        date_range=f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}",
+        records=analysis_records,
+    )
 
 
 def _analyze_barcode_log_scan_events(
@@ -934,7 +1188,7 @@ def _analyze_barcode_log_scan_events(
     log_date: str,
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     all_device_contexts = device_contexts
     if all_device_contexts is None:
         all_device_contexts = _lookup_device_contexts_by_barcode(
@@ -943,11 +1197,18 @@ def _analyze_barcode_log_scan_events(
         )
 
     if not all_device_contexts:
-        return (
+        result_text = (
             "*바코드 로그 스캔 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
             "• recordings/devices에서 매핑된 장비명을 찾지 못했어"
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="scan",
+            barcode=barcode,
+            request_date=log_date,
+            date_range=None,
+            records=[],
         )
 
     max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
@@ -957,6 +1218,7 @@ def _analyze_barcode_log_scan_events(
     logs_found_any = 0
     logs_with_session = 0
     devices_with_session = 0
+    analysis_records: list[dict[str, Any]] = []
 
     lines = [
         "*바코드 로그 스캔 분석 결과*",
@@ -1010,6 +1272,20 @@ def _analyze_barcode_log_scan_events(
 
         hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
         room_name = _display_value(device_context.get("roomName"), default="미확인")
+        analysis_records.append(
+            _build_log_analysis_record(
+                device_name=device_name,
+                hospital_name=hospital_name,
+                room_name=room_name,
+                log_key=str(log_data["key"]),
+                log_date=log_date,
+                line_count=len(source_lines),
+                sessions=sessions,
+                session_scans=session_scoped_events,
+                session_motions=session_motion_events,
+                session_error_lines=session_error_lines,
+            )
+        )
 
         lines.append(f"• 파일: `{log_data['key']}`")
         lines.append(f"• 병원: `{hospital_name}`")
@@ -1028,7 +1304,7 @@ def _analyze_barcode_log_scan_events(
         devices_with_session += 1
 
     if logs_found_any == 0:
-        return (
+        result_text = (
             "*바코드 로그 스캔 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
@@ -1036,9 +1312,16 @@ def _analyze_barcode_log_scan_events(
             "• 확인한 로그 파일: `0개`\n"
             "*요약*: 요청 날짜의 로그 파일을 찾지 못했어"
         )
+        return result_text, _build_log_analysis_payload(
+            mode="scan",
+            barcode=barcode,
+            request_date=log_date,
+            date_range=None,
+            records=[],
+        )
 
     if logs_with_session == 0:
-        return (
+        result_text = (
             "*바코드 로그 스캔 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
@@ -1046,6 +1329,13 @@ def _analyze_barcode_log_scan_events(
             f"• 확인한 로그 파일: `{logs_found_any}개`\n"
             "• 요청 바코드 세션이 확인된 장비: `0개`\n"
             f"*요약*: 로그 파일은 확인했지만 요청 바코드 `{barcode}` 세션은 찾지 못했어"
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="scan",
+            barcode=barcode,
+            request_date=log_date,
+            date_range=None,
+            records=[],
         )
 
     lines.append("")
@@ -1057,7 +1347,14 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"*요약*: 로그 파일은 확인했지만 요청 바코드 `{barcode}` 세션은 찾지 못했어")
 
     max_result_chars = max(s.S3_QUERY_MAX_RESULT_CHARS, 38000)
-    return _truncate_text("\n".join(lines), max_result_chars)
+    result_text = _truncate_text("\n".join(lines), max_result_chars)
+    return result_text, _build_log_analysis_payload(
+        mode="scan",
+        barcode=barcode,
+        request_date=log_date,
+        date_range=None,
+        records=analysis_records,
+    )
 
 
 def _analyze_barcode_log_errors(
@@ -1066,7 +1363,7 @@ def _analyze_barcode_log_errors(
     log_date: str,
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     all_device_contexts = device_contexts
     if all_device_contexts is None:
         all_device_contexts = _lookup_device_contexts_by_barcode(
@@ -1075,11 +1372,18 @@ def _analyze_barcode_log_errors(
         )
 
     if not all_device_contexts:
-        return (
+        result_text = (
             "*바코드 로그 에러 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
             "• recordings/devices에서 매핑된 장비명을 찾지 못했어"
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="error",
+            barcode=barcode,
+            request_date=log_date,
+            date_range=None,
+            records=[],
         )
 
     max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
@@ -1091,6 +1395,7 @@ def _analyze_barcode_log_errors(
     logs_with_session = 0
     total_session_count = 0
     devices_with_session = 0
+    analysis_records: list[dict[str, Any]] = []
     lines = [
         "*바코드 로그 에러 분석 결과*",
         f"• 바코드: `{barcode}`",
@@ -1144,6 +1449,20 @@ def _analyze_barcode_log_errors(
 
         hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
         room_name = _display_value(device_context.get("roomName"), default="미확인")
+        analysis_records.append(
+            _build_log_analysis_record(
+                device_name=device_name,
+                hospital_name=hospital_name,
+                room_name=room_name,
+                log_key=str(log_data["key"]),
+                log_date=log_date,
+                line_count=len(source_lines),
+                sessions=sessions,
+                session_scans=session_scoped_events,
+                session_motions=session_motion_events,
+                session_error_lines=session_error_lines,
+            )
+        )
 
         lines.append(f"• 파일: `{log_data['key']}`")
         lines.append(f"• 병원: `{hospital_name}`")
@@ -1163,7 +1482,7 @@ def _analyze_barcode_log_errors(
         devices_with_session += 1
 
     if logs_found_any == 0:
-        return (
+        result_text = (
             "*바코드 로그 에러 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
@@ -1171,9 +1490,16 @@ def _analyze_barcode_log_errors(
             "• 확인한 로그 파일: `0개`\n"
             "*요약*: 요청 날짜의 로그 파일을 찾지 못했어"
         )
+        return result_text, _build_log_analysis_payload(
+            mode="error",
+            barcode=barcode,
+            request_date=log_date,
+            date_range=None,
+            records=[],
+        )
 
     if logs_with_session == 0:
-        return (
+        result_text = (
             "*바코드 로그 에러 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
@@ -1181,6 +1507,13 @@ def _analyze_barcode_log_errors(
             f"• 확인한 로그 파일: `{logs_found_any}개`\n"
             "• 요청 바코드 세션이 확인된 장비: `0개`\n"
             f"*요약*: 로그 파일은 확인했지만 요청 바코드 `{barcode}` 세션은 찾지 못했어"
+        )
+        return result_text, _build_log_analysis_payload(
+            mode="error",
+            barcode=barcode,
+            request_date=log_date,
+            date_range=None,
+            records=[],
         )
 
     lines.append("")
@@ -1193,4 +1526,11 @@ def _analyze_barcode_log_errors(
         lines.append("*요약*: 요청 바코드 세션 구간에서 error 패턴 라인을 찾지 못했어")
 
     max_result_chars = max(s.S3_QUERY_MAX_RESULT_CHARS, 38000)
-    return _truncate_text("\n".join(lines), max_result_chars)
+    result_text = _truncate_text("\n".join(lines), max_result_chars)
+    return result_text, _build_log_analysis_payload(
+        mode="error",
+        barcode=barcode,
+        request_date=log_date,
+        date_range=None,
+        records=analysis_records,
+    )

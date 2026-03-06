@@ -380,6 +380,76 @@ def create_app() -> App:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
                 reply(fallback_text)
 
+        def _reply_with_barcode_log_error_summary(summary_payload: dict[str, Any] | None) -> None:
+            if not isinstance(summary_payload, dict):
+                return
+
+            summary = summary_payload.get("summary")
+            if not isinstance(summary, dict):
+                return
+
+            error_line_count = int(summary.get("errorLineCount") or 0)
+            if error_line_count <= 0:
+                return
+
+            provider = (s.LLM_PROVIDER or "").lower().strip()
+            if not s.LLM_SYNTHESIS_ENABLED or provider not in {"claude", "ollama"}:
+                return
+
+            if provider == "ollama":
+                health = _check_ollama_health()
+                if not health["ok"]:
+                    logger.warning(
+                        "Skipped barcode log error summary synthesis because ollama is unavailable=%s",
+                        health["summary"],
+                    )
+                    return
+            if provider == "claude":
+                if claude_client is None:
+                    return
+                if not cs.HYUN_USER_ID or user_id != cs.HYUN_USER_ID:
+                    logger.info(
+                        "Skipped barcode log error summary synthesis because claude is not allowed for user=%s",
+                        user_id,
+                    )
+                    return
+
+            try:
+                thread_context = ""
+                if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
+                    thread_context = _load_thread_context(
+                        client,
+                        logger,
+                        channel_id,
+                        thread_ts,
+                        current_ts,
+                    )
+                synthesized_text = _synthesize_retrieval_answer(
+                    question="위 바코드 로그의 에러를 운영 관점에서 분석해줘",
+                    thread_context=thread_context,
+                    evidence_payload=summary_payload,
+                    provider=provider,
+                    claude_client=claude_client,
+                    system_prompt=cs.SYSTEM_PROMPT or None,
+                    max_tokens=450,
+                    ollama_timeout_sec=min(90, max(30, s.OLLAMA_TIMEOUT_SEC)),
+                )
+                final_text = (synthesized_text or "").strip()
+                if not final_text:
+                    logger.warning("Barcode log error summary synthesis returned empty text")
+                    return
+                reply(final_text, mention_user=False)
+                logger.info("Responded with barcode log error summary synthesis in thread_ts=%s", thread_ts)
+            except TimeoutError:
+                logger.warning("Barcode log error summary synthesis timed out")
+            except RuntimeError as exc:
+                if _is_timeout_error(exc):
+                    logger.warning("Barcode log error summary synthesis timed out")
+                    return
+                logger.exception("Barcode log error summary synthesis failed")
+            except Exception:
+                logger.exception("Barcode log error summary synthesis failed")
+
         try:
             s3_request = _extract_s3_request(question)
         except ValueError as exc:
@@ -545,6 +615,7 @@ def create_app() -> App:
                 log_date, has_requested_date = _extract_log_date_with_presence(question)
                 analysis_mode = "phase1_window"
                 context = _get_recordings_context()
+                log_analysis_payload: dict[str, Any] | None = None
                 summary = context.get("summary") or {}
                 recording_count = int(summary.get("recordingCount") or 0)
                 has_device_mapping = _has_recordings_device_mapping(context)
@@ -582,7 +653,7 @@ def create_app() -> App:
                                 used_manual_scope = True
                                 analysis_mode = f"{base_mode}_manual_scope"
                                 if base_mode == "error":
-                                    result_text = _analyze_barcode_log_errors(
+                                    result_text, log_analysis_payload = _analyze_barcode_log_errors(
                                         _get_s3_client(),
                                         barcode or "",
                                         log_date,
@@ -590,7 +661,7 @@ def create_app() -> App:
                                         device_contexts=manual_device_contexts,
                                     )
                                 else:
-                                    result_text = _analyze_barcode_log_scan_events(
+                                    result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
                                         _get_s3_client(),
                                         barcode or "",
                                         log_date,
@@ -600,21 +671,21 @@ def create_app() -> App:
                     else:
                         analysis_mode = base_mode
                         if base_mode == "error":
-                            result_text = _analyze_barcode_log_errors(
+                            result_text, log_analysis_payload = _analyze_barcode_log_errors(
                                 _get_s3_client(),
                                 barcode or "",
                                 log_date,
                                 recordings_context=context,
                             )
                         else:
-                            result_text = _analyze_barcode_log_scan_events(
+                            result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
                                 _get_s3_client(),
                                 barcode or "",
                                 log_date,
                                 recordings_context=context,
                             )
                 else:
-                    result_text = _analyze_barcode_log_phase1_window(
+                    result_text, log_analysis_payload = _analyze_barcode_log_phase1_window(
                         _get_s3_client(),
                         barcode or "",
                         recordings_context=context,
@@ -648,12 +719,15 @@ def create_app() -> App:
                     },
                     "analysisResult": result_text,
                 }
+                if log_analysis_payload is not None:
+                    evidence_payload["errorSummaryEvidence"] = log_analysis_payload
                 _attach_recordings_context_to_evidence(evidence_payload, context)
                 _reply_with_retrieval_synthesis(
                     result_text,
                     evidence_payload,
                     route_name="barcode log analysis",
                 )
+                _reply_with_barcode_log_error_summary(log_analysis_payload)
             except ValueError as exc:
                 reply(f"로그 분석 요청 형식 오류: {exc}")
             except (BotoCoreError, ClientError, pymysql.MySQLError, RuntimeError):
