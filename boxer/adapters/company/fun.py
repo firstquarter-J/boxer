@@ -20,13 +20,20 @@ EDGE_FILLER_RE = re.compile(r"^(또|진짜|완전|아니|근데|그럼|와|헐)\
 TRAILING_ENDING_RE = re.compile(r"(이네|이야|인가요|인가|인데|네요|네요|이냐|이군)$")
 TRAILING_PARTICLE_RE = re.compile(r"(은|는|이|가|을|를|도|만|이나|나|랑|과|와|임|야|냐|네|군|지)$")
 FUN_REPLY_SANITIZE_RE = re.compile(r"\s+")
+FUN_BAD_REPLY_RE = re.compile(
+    r"(okay|let'?s|the user|i think|저는|나는|제가|설명|해설|안녕하세요|반갑|도와|죄송|미안)",
+    re.IGNORECASE,
+)
 FUN_SYSTEM_PROMPT = (
-    "너는 슬랙 채널에서 DD를 유쾌하게 놀리는 한 줄 멘트 생성기야. "
-    "사용자 문장에 들어 있는 '모대'의 맥락을 읽고, DD에게 짧고 장난스럽게 받아쳐. "
-    "반말 한국어 한 문장만 출력해. "
-    "욕설, 비하, 성적 표현, 개인정보, 과한 조롱은 금지. "
-    "설명, 해설, 따옴표, 이모지, 줄바꿈, 멘션 표기는 금지. "
-    "가능하면 '모대'를 살린 말장난으로 답해."
+    "너는 슬랙에서 DD를 가볍게 놀리는 짧은 한국어 구절 생성기야. "
+    "입력 문장에 들어 있는 '모대'의 맥락만 써서, 유쾌한 반문형 답글의 앞부분만 만들어. "
+    "출력 규칙: "
+    "1) 반드시 한국어 짧은 구절만 출력. "
+    "2) 길이 4~14자 정도. "
+    "3) 절대 '모대'나 '?'를 직접 쓰지 마. "
+    "4) 원문의 핵심 단어를 살릴 것. "
+    "5) 영어, 설명, 해설, 자기소개, 따옴표, 이모지, 멘션 금지. "
+    "6) 욕설, 비하, 성적 표현 금지."
 )
 
 
@@ -87,16 +94,44 @@ def _sanitize_fun_reply(text: str) -> str:
     return cleaned
 
 
+def _finalize_fun_reply(source_text: str, generated_text: str) -> str:
+    cleaned = _sanitize_fun_reply(generated_text)
+    if not cleaned:
+        return ""
+    if FUN_BAD_REPLY_RE.search(cleaned):
+        return ""
+
+    cleaned = re.split(r"(?:,|\.|!|;|:| 그런데 | 근데 | 하지만 | 그래서 )", cleaned, maxsplit=1)[0].strip()
+    cleaned = cleaned.replace("모대", " ").replace("?", " ").strip()
+    cleaned = cleaned.rstrip("!~. ")
+
+    topic = _extract_fun_topic(source_text) or ""
+    compact_topic = topic.replace(" ", "")
+    compact_cleaned = cleaned.replace(" ", "")
+    if topic and compact_topic not in compact_cleaned:
+        cleaned = f"{topic} {cleaned}".strip()
+
+    cleaned = FUN_REPLY_SANITIZE_RE.sub(" ", cleaned).strip()
+    if len(cleaned) < 2 or len(cleaned) > 18:
+        return ""
+    return f"{cleaned} 모대?"
+
+
 def _build_fun_llm_prompt(text: str) -> str:
     topic = _extract_fun_topic(text) or "없음"
     return (
         f"원문: {text.strip()}\n"
         f"추출 토픽: {topic}\n"
+        "예시:\n"
+        "- 밥도 잘 먹지모대? -> 밥도 잘 먹지\n"
+        "- 연애모대 -> 연애도 쉽지\n"
+        "- 로그인도 모대 -> 로그인도 버벅\n"
         "출력 규칙:\n"
         "- DD를 살짝 놀리는 톤\n"
-        "- 한 문장만\n"
-        "- 30자 안팎\n"
-        "- '모대' 뉘앙스를 살릴 것"
+        "- 4~14자 정도의 짧은 구절만\n"
+        "- 모대, 물음표, 따옴표 쓰지 마\n"
+        "- 영어/설명/자기소개 금지\n"
+        "출력:"
     )
 
 
@@ -124,12 +159,12 @@ def _generate_fun_reply(
                 model=FUN_OLLAMA_MODEL,
                 timeout_sec=FUN_LLM_TIMEOUT_SEC,
                 max_tokens=FUN_LLM_MAX_TOKENS,
-                temperature=0.8,
+                temperature=0.5,
                 think=False,
             )
-            sanitized = _sanitize_fun_reply(llm_text)
-            if sanitized:
-                return sanitized, f"ollama:{FUN_OLLAMA_MODEL}", True
+            finalized = _finalize_fun_reply(text, llm_text)
+            if finalized:
+                return finalized, f"ollama:{FUN_OLLAMA_MODEL}", True
             return _build_fun_llm_unavailable_reply("빈 응답"), "unavailable_empty", False
 
         if provider == "claude" and claude_client is not None:
@@ -139,9 +174,9 @@ def _generate_fun_reply(
                 system_prompt=FUN_SYSTEM_PROMPT,
                 max_tokens=FUN_LLM_MAX_TOKENS,
             )
-            sanitized = _sanitize_fun_reply(llm_text)
-            if sanitized:
-                return sanitized, "claude", True
+            finalized = _finalize_fun_reply(text, llm_text)
+            if finalized:
+                return finalized, "claude", True
             return _build_fun_llm_unavailable_reply("빈 응답"), "unavailable_empty", False
     except TimeoutError:
         logger.warning("Fun reply LLM timeout")
