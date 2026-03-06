@@ -682,13 +682,15 @@ def _extract_recording_sessions(
                 "start_time_label": time_label,
                 "stop_line_no": None,
                 "stop_time_label": None,
+                "stop_token": None,
                 "end_line_no": len(lines),
             }
             continue
 
-        if upper_token == "C_STOPSESS" and active is not None:
+        if upper_token in cs.SESSION_STOP_TOKENS and active is not None:
             active["stop_line_no"] = line_no
             active["stop_time_label"] = time_label
+            active["stop_token"] = upper_token
             active["end_line_no"] = min(len(lines), line_no + safe_extra)
             sessions.append(active)
             active = None
@@ -698,6 +700,13 @@ def _extract_recording_sessions(
         sessions.append(active)
 
     return sessions
+
+
+def _format_session_stop_marker(session: dict[str, Any]) -> str:
+    token = str(session.get("stop_token") or "").strip().upper()
+    if not token:
+        return "종료 스캔"
+    return f"`{token}`"
 
 
 def _append_session_state_summary(
@@ -747,7 +756,7 @@ def _append_session_state_summary(
             lines.append("• *종료 상태:* 비정상 종료 (종료 스캔 없음)")
             lines.append("• *녹화 결과:* 정상 녹화 실패로 판단")
             return
-        lines.append("• *종료 상태:* 정상 종료 (`C_STOPSESS` 확인)")
+        lines.append(f"• *종료 상태:* 정상 종료 ({_format_session_stop_marker(session)} 확인)")
         recording_result, recovery_context, post_stop_context = _build_session_recording_result_text(
             source_lines,
             session,

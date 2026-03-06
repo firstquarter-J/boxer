@@ -103,11 +103,13 @@ LOG_LINE_TIME_PATTERN = re.compile(
 )
 SCAN_CODE_LABELS: dict[str, str] = {
     "C_STOPSESS": "녹화 중지",
+    "SPECIAL_RECORD_START_STOP": "녹화 시작/종료",
     "C_PAUSE": "일시정지",
     "C_RESUME": "재개",
     "C_CCLREC": "녹화 취소",
     "SPECIAL_TAKE_SNAP": "캡처/스냅샷",
 }
+SESSION_STOP_TOKENS = {"C_STOPSESS", "SPECIAL_RECORD_START_STOP"}
 
 VIDEO_HINT_TOKENS = ("영상", "비디오", "동영상", "recording")
 VIDEO_COUNT_HINT_TOKENS = ("몇 개", "몇개", "개수", "갯수", "수", "count")
