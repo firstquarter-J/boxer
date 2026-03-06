@@ -15,7 +15,11 @@ _KOREAN_YMD_PATTERN = re.compile(
     r"(?<!\d)(\d{2,4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일(?!\d)"
 )
 _NUMERIC_MD_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*[./]\s*(\d{1,2})(?!\d)")
+_NUMERIC_MD_DASH_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*-\s*(\d{1,2})(?!\d)")
 _KOREAN_MD_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일(?!\d)")
+_COMPACT_YYYYMMDD_PATTERN = re.compile(r"(?<!\d)(20\d{2}|19\d{2})(\d{2})(\d{2})(?!\d)")
+_COMPACT_YYMMDD_PATTERN = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)")
+_COMPACT_MMDD_PATTERN = re.compile(r"(?<!\d)(\d{2})(\d{2})(?!\d)")
 _MOTION_STOP_STATUS_PATTERN = re.compile(
     r"Motion detected:\s*(true|false)\s*,\s*Error:\s*(true|false)",
     re.IGNORECASE,
@@ -76,6 +80,10 @@ def _parse_explicit_date_expression(text: str) -> tuple[bool, str | None]:
         ("numeric_ymd", _NUMERIC_YMD_PATTERN),
         ("korean_md", _KOREAN_MD_PATTERN),
         ("numeric_md", _NUMERIC_MD_PATTERN),
+        ("numeric_md_dash", _NUMERIC_MD_DASH_PATTERN),
+        ("compact_yyyymmdd", _COMPACT_YYYYMMDD_PATTERN),
+        ("compact_yymmdd", _COMPACT_YYMMDD_PATTERN),
+        ("compact_mmdd", _COMPACT_MMDD_PATTERN),
     ):
         matched = pattern.search(text)
         if matched:
@@ -92,10 +100,38 @@ def _parse_explicit_date_expression(text: str) -> tuple[bool, str | None]:
         day = int(matched.group(3))
         return True, _try_format_date(year, month, day)
 
+    if kind == "compact_yyyymmdd":
+        year = int(matched.group(1))
+        month = int(matched.group(2))
+        day = int(matched.group(3))
+        return True, _try_format_date(year, month, day)
+
+    if kind == "compact_yymmdd":
+        year = _normalize_year(int(matched.group(1)))
+        month = int(matched.group(2))
+        day = int(matched.group(3))
+        return True, _try_format_date(year, month, day)
+
     local_year = _current_local_date().year
     month = int(matched.group(1))
     day = int(matched.group(2))
     return True, _try_format_date(local_year, month, day)
+
+
+def _looks_like_unparsed_date_token(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+
+    patterns = (
+        r"(?<!\d)\d{1,2}\s*-\s*\d{1,2}(?!\d)",
+        r"(?<!\d)\d{4}(?!\d)",
+        r"(?<!\d)\d{6}(?!\d)",
+        r"(?<!\d)\d{8}(?!\d)",
+        r"\d{1,2}\s*월",
+        r"\d{1,2}\s*[./]\s*\d{1,2}",
+    )
+    return any(re.search(pattern, stripped) for pattern in patterns)
 
 
 def _extract_relative_day_offset(text: str, lowered: str) -> int | None:
@@ -126,7 +162,7 @@ def _extract_log_date_with_presence(question: str) -> tuple[str, bool]:
     has_explicit_date, parsed_explicit_date = _parse_explicit_date_expression(text)
     if has_explicit_date:
         if parsed_explicit_date is None:
-            raise ValueError("날짜 형식을 확인해줘. 예: 2026-03-03, 26.03.03, 3/3, 3월 3일")
+            raise ValueError("날짜 형식을 확인해줘. 예: 2026-03-03, 26.03.03, 3/3, 3월 3일, 02-20, 260220")
         return parsed_explicit_date, True
 
     base_date = _current_local_date()
@@ -134,6 +170,9 @@ def _extract_log_date_with_presence(question: str) -> tuple[str, bool]:
     if relative_offset is not None:
         base_date = base_date + timedelta(days=relative_offset)
         return base_date.strftime("%Y-%m-%d"), True
+
+    if _looks_like_unparsed_date_token(text):
+        raise ValueError("날짜 형식을 확인해줘. 예: 2026-03-03, 26.03.03, 3/3, 3월 3일, 02-20, 260220")
     return base_date.strftime("%Y-%m-%d"), False
 
 
@@ -727,7 +766,7 @@ def _append_session_state_summary(
                     f"RECORDING ffmpeg 시작 `{_display_value(spawned_recording.get('timeLabel'), default='시간미상')}`"
                 )
             if recovery_parts:
-                lines.append(f"• 회복 신호: {', '.join(recovery_parts)}")
+                lines.append(f"• 녹화 시작 로그: {', '.join(recovery_parts)}")
         return
 
     termination_parts: list[str] = []
@@ -745,7 +784,6 @@ def _append_session_state_summary(
         outcome_parts.append(f"정상 녹화 실패 *{stop_missing_count}건* (종료 스캔 없음)")
 
     ffmpeg_affected_count = 0
-    standby_recovered_count = 0
     for session in sessions:
         session_error_subset = _error_lines_in_session(session_error_lines, session)
         session_ffmpeg_error = _find_first_ffmpeg_error_context(
@@ -758,21 +796,10 @@ def _append_session_state_summary(
         )
         has_stop = session.get("stop_line_no") is not None
         if session_ffmpeg_error is not None and not has_restart and has_stop:
-            _, recovery_context = _build_session_recording_result_text(
-                source_lines,
-                session,
-                restart_events,
-                session_error_subset,
-            )
-            if recovery_context is not None:
-                standby_recovered_count += 1
-                continue
             ffmpeg_affected_count += 1
 
     if ffmpeg_affected_count > 0:
-        outcome_parts.append(f"영상 손상 가능성 높음 *{ffmpeg_affected_count}건* (ffmpeg 오류)")
-    if standby_recovered_count > 0:
-        outcome_parts.append(f"회복 후 녹화 진행 흔적 있음 *{standby_recovered_count}건* (standby ffmpeg 오류)")
+        outcome_parts.append(f"영상 손상 가능성 의심 *{ffmpeg_affected_count}건* (ffmpeg 오류)")
 
     if not termination_parts:
         lines.append("• *종료 상태:* 판단 불가")
@@ -938,19 +965,19 @@ def _build_session_recording_result_text(
         if has_standby_ffmpeg_error and recovery_context is not None:
             recovery_time = _display_value(recovery_context.get("timeLabel"), default="시간미상")
             return (
-                f"초기 standby ffmpeg 오류 후 녹화 진행 재개 흔적 있음 (첫 오류 `{error_time}`, 회복 신호 `{recovery_time}`, 실제 영상 확인 필요)",
+                f"영상 손상 가능성 의심 (첫 오류 `{error_time}`, 녹화 시작 로그 `{recovery_time}` 확인, 실제 영상 확인 필요)",
                 recovery_context,
             )
         if has_standby_ffmpeg_error:
             detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
             if elapsed:
                 detail_parts.append(f"세션 시작 후 `{elapsed}`")
-            return f"영상 손상 가능성 있음 ({', '.join(detail_parts)}, 실제 영상 확인 필요)", recovery_context
+            return f"영상 손상 가능성 의심 ({', '.join(detail_parts)}, 실제 영상 확인 필요)", recovery_context
 
         detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
         if elapsed:
             detail_parts.append(f"세션 시작 후 `{elapsed}`")
-        return f"영상 손상 가능성 높음 ({', '.join(detail_parts)})", recovery_context
+        return f"영상 손상 가능성 의심 ({', '.join(detail_parts)})", recovery_context
     if session_error_lines:
         return f"이상 징후 있음 (error 라인 `{len(session_error_lines)}줄`)", recovery_context
     return "정상 녹화로 판단", recovery_context

@@ -216,7 +216,7 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "15) ffmpeg 로그에 DTS/invalid dropping/non-monotonous dts/timestamp 이상이 보이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 명확히 적어.\n"
             "16) 세션 시작 시각과 첫 ffmpeg 오류 시각이 evidence에 있으면 근거 로그에 반드시 같이 적어.\n"
             "17) `C_STOPSESS`가 확인돼 종료는 정상이어도 ffmpeg 오류가 있으면 종료 상태와 녹화 결과를 분리해서 설명해.\n"
-            "18) 다만 `Standby error`만 있고 이후 녹화 시작 흔적이 있으면 손상 확정처럼 말하지 말고 '실제 영상 확인 필요' 수준으로 낮춰."
+            "18) `Standby error`만 있어도 영상 손상 가능성을 의심해야 한다. 이후 녹화 시작 흔적이 있어도 손상 가능성 판단을 제거하지 말고, 실제 영상 확인이 필요하다고 적어."
         )
 
     if route != "barcode_log_analysis":

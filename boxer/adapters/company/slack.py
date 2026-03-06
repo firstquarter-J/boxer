@@ -435,7 +435,7 @@ def create_app() -> App:
             if restart_count > 0:
                 cause_line = "• 핵심 원인: 세션 중 장비 재시작과 녹화 오류가 함께 보여 정상 녹화 실패 가능성이 높아"
             elif is_standby_ffmpeg_error and all_closed_normally:
-                cause_line = "• 핵심 원인: 초기 standby ffmpeg 오류가 있었지만 세션은 정상 종료돼 실제 영상 영향 확인이 필요해"
+                cause_line = "• 핵심 원인: standby ffmpeg 오류가 확인돼 영상 손상 가능성을 의심해야 하고 캡처보드 이상을 우선 점검해야 해"
             elif is_ffmpeg_timestamp_error:
                 cause_line = "• 핵심 원인: ffmpeg DTS/타임스탬프 이상이 확인돼 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심해"
             elif top_signature != "미확인" and top_count >= 2:
@@ -462,7 +462,7 @@ def create_app() -> App:
             elif is_standby_ffmpeg_error and all_closed_normally:
                 impact_line = (
                     f"• 영향: `{date_label}` `{hospital_name}` `{room_name}` 장비 `{device_name}`에서 "
-                    f"standby ffmpeg 오류 `{error_line_count}줄`이 있었지만 종료 스캔은 정상 확인돼 실제 영상 확인이 필요해"
+                    f"standby ffmpeg 오류 `{error_line_count}줄`이 있어 종료 스캔은 정상이어도 영상 손상 가능성을 의심해야 해"
                 )
             elif is_ffmpeg_error and all_closed_normally:
                 impact_line = (
