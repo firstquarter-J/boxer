@@ -575,23 +575,38 @@ def _extract_recording_sessions(
     return sessions
 
 
-def _append_session_closure_status(lines: list[str], sessions: list[dict[str, Any]]) -> None:
-    if not sessions:
+def _append_session_state_summary(
+    lines: list[str],
+    sessions: list[dict[str, Any]],
+    restart_events: list[dict[str, Any]],
+) -> None:
+    if not sessions and not restart_events:
         return
 
     normal_count = sum(1 for session in sessions if session.get("stop_line_no") is not None)
     abnormal_count = len(sessions) - normal_count
-    if abnormal_count <= 0:
-        lines.append("• 종료 상태: 모든 세션 정상 종료 (`C_STOPSESS` 확인)")
+    restart_count = len(restart_events)
+
+    if abnormal_count <= 0 and restart_count <= 0:
+        lines.append("• 세션 상태: 모든 세션 정상 종료 (`C_STOPSESS` 확인)")
         return
 
-    if normal_count <= 0:
-        lines.append(f"• 종료 상태: 정상 종료되지 않은 세션 *{abnormal_count}건* (`C_STOPSESS` 없음)")
-        return
+    status_parts: list[str] = []
+    if normal_count > 0:
+        status_parts.append(f"정상 종료 *{normal_count}건*")
+    if abnormal_count > 0:
+        status_parts.append(f"정상 종료되지 않은 세션 *{abnormal_count}건* (`C_STOPSESS` 없음)")
+    if restart_count > 0:
+        status_parts.append(f"세션 중 재시작 *{restart_count}건*")
 
-    lines.append(
-        f"• 종료 상태: 정상 종료 *{normal_count}건*, 정상 종료되지 않은 세션 *{abnormal_count}건* (`C_STOPSESS` 없음)"
-    )
+    if abnormal_count > 0 and restart_count > 0:
+        conclusion = "종료 스캔 누락 또는 재시작으로 정상 녹화가 마무리되지 못했을 가능성이 높아"
+    elif abnormal_count > 0:
+        conclusion = "종료 스캔 없이 마무리됐을 가능성이 있어"
+    else:
+        conclusion = "재시작으로 정상 녹화 실패로 판단해"
+
+    lines.append(f"• 세션 상태: {', '.join(status_parts)} -> {conclusion}")
 
 
 def _events_in_session(events: list[dict[str, Any]], session: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1053,7 +1068,7 @@ def _append_restart_events_section(
     if not restart_events:
         return
 
-    lines.append(f"• 세션 중 재시작 감지: *{len(restart_events)}건* (정상 녹화 실패로 판단)")
+    lines.append(f"• 재시작 로그: *{len(restart_events)}건*")
 
     rows: list[str] = []
     for event in sorted(restart_events, key=lambda item: int(item.get("line_no") or 0)):
@@ -1243,7 +1258,7 @@ def _analyze_barcode_log_phase1_window(
             lines.append(f"*장비 `{device_name}` | 날짜 `{date_label}`*")
             lines.append(f"• 병원: `{hospital_name}`")
             lines.append(f"• 병실: `{room_name}`")
-            _append_session_closure_status(lines, sessions)
+            _append_session_state_summary(lines, sessions, session_restart_events)
             _append_restart_events_section(lines, session_restart_events)
             _append_scan_events_section(lines, session_events, session_motion_events)
             _append_error_lines_section(
@@ -1391,7 +1406,7 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"• 병실: `{room_name}`")
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
-        _append_session_closure_status(lines, sessions)
+        _append_session_state_summary(lines, sessions, session_restart_events)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         _append_error_lines_section(
@@ -1559,7 +1574,7 @@ def _analyze_barcode_log_errors(
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
-        _append_session_closure_status(lines, sessions)
+        _append_session_state_summary(lines, sessions, session_restart_events)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         _append_error_lines_section(
