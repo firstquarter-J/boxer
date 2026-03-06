@@ -10,6 +10,7 @@ from boxer.core.utils import _display_value, _format_size, _truncate_text
 from boxer.routers.company.box_db import (
     _load_recordings_rows_on_date_by_barcode,
     _lookup_device_contexts_by_barcode,
+    _lookup_device_contexts_by_hospital_seqs,
 )
 from boxer.routers.company.s3_domain import _fetch_s3_device_log_lines
 
@@ -60,6 +61,49 @@ def _current_local_date() -> datetime.date:
             return datetime.now(ZoneInfo("Asia/Seoul")).date()
         except Exception:
             return datetime.utcnow().date()
+
+
+def _dedupe_device_contexts_by_name(device_contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen_device_names: set[str] = set()
+    for device_context in device_contexts:
+        device_name = _display_value(device_context.get("deviceName"), default="")
+        if not device_name or device_name in seen_device_names:
+            continue
+        seen_device_names.add(device_name)
+        items.append(device_context)
+    return items
+
+
+def _expand_device_contexts_to_recordings_hospital_scope(
+    recordings_context: dict[str, Any] | None,
+    existing_device_contexts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if recordings_context is None:
+        return []
+
+    hospital_seqs: list[int] = []
+    for row in recordings_context.get("rows") or []:
+        hospital_seq = row.get("hospitalSeq")
+        if hospital_seq is None:
+            continue
+        try:
+            hospital_seqs.append(int(hospital_seq))
+        except (TypeError, ValueError):
+            continue
+
+    expanded_contexts = _lookup_device_contexts_by_hospital_seqs(hospital_seqs)
+    existing_names = {
+        _display_value(item.get("deviceName"), default="")
+        for item in existing_device_contexts
+        if _display_value(item.get("deviceName"), default="")
+    }
+    additional_contexts = [
+        item
+        for item in expanded_contexts
+        if _display_value(item.get("deviceName"), default="") not in existing_names
+    ]
+    return _dedupe_device_contexts_by_name(additional_contexts)
 
 
 def _normalize_year(raw_year: int) -> int:
@@ -1558,7 +1602,9 @@ def _append_session_timing_summary(
     lines: list[str],
     sessions: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]],
+    restart_events: list[dict[str, Any]] | None = None,
 ) -> None:
+    restart_events = restart_events or []
     if not sessions:
         return
 
@@ -1566,6 +1612,13 @@ def _append_session_timing_summary(
         start_time = _display_value(sessions[0].get("start_time_label"), default="미확인")
         if start_time != "미확인":
             lines.append(f"• 세션 시작: `{start_time}`")
+
+    has_restart = any(
+        _find_session_for_line(int(event.get("line_no") or 0), sessions) is not None
+        for event in restart_events
+    )
+    if has_restart:
+        return
 
     first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, sessions)
     if not first_ffmpeg_error:
@@ -1607,7 +1660,7 @@ def _append_session_sections(
             diagnostic_scan_events,
             recordings_on_date_count,
         )
-        _append_session_timing_summary(lines, sessions, error_lines)
+        _append_session_timing_summary(lines, sessions, error_lines, restart_events)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
         _append_error_lines_section(lines, error_lines, show_all=True)
@@ -1623,7 +1676,7 @@ def _append_session_sections(
             diagnostic_scan_events,
             recordings_on_date_count,
         )
-        _append_session_timing_summary(lines, sessions, error_lines)
+        _append_session_timing_summary(lines, sessions, error_lines, restart_events)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
         _append_error_lines_section(lines, error_lines, show_all=True)
@@ -1650,7 +1703,7 @@ def _append_session_sections(
             diagnostic_scan_events,
             recordings_on_date_count if len(sessions) == 1 else None,
         )
-        _append_session_timing_summary(lines, [session], session_error_lines)
+        _append_session_timing_summary(lines, [session], session_error_lines, session_restart_events)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scan_events, session_motion_events)
         _append_error_lines_section(lines, session_error_lines, show_all=True)
@@ -2203,105 +2256,117 @@ def _analyze_barcode_log_scan_events(
     if omitted_device_count > 0:
         lines.append(f"• 참고: 장비가 많아서 상위 `{len(target_device_contexts)}개`만 분석했어")
 
-    for device_context in target_device_contexts:
-        device_name = str(device_context.get("deviceName") or "")
-        if not device_name:
-            continue
-        device_seq = device_context.get("deviceSeq")
-        recordings_on_date_rows = (
-            _load_recordings_rows_on_date_by_barcode(
-                barcode,
+    def _analyze_device_context_batch(device_context_batch: list[dict[str, Any]]) -> None:
+        nonlocal total_session_count, logs_found_any, logs_with_session, devices_with_session
+
+        for device_context in device_context_batch:
+            device_name = str(device_context.get("deviceName") or "")
+            if not device_name:
+                continue
+            device_seq = device_context.get("deviceSeq")
+            recordings_on_date_rows = (
+                _load_recordings_rows_on_date_by_barcode(
+                    barcode,
+                    log_date,
+                    device_seq=int(device_seq) if device_seq is not None else None,
+                )
+                if barcode and recordings_context is not None
+                else []
+            )
+            recordings_on_date_statuses = sorted(
+                {
+                    _display_value(row.get("streamingStatus"), default="미확인")
+                    for row in recordings_on_date_rows
+                }
+            )
+
+            log_data = _fetch_s3_device_log_lines(
+                s3_client,
+                device_name,
                 log_date,
-                device_seq=int(device_seq) if device_seq is not None else None,
+                tail_only=False,
             )
-            if barcode and recordings_context is not None
-            else []
-        )
-        recordings_on_date_statuses = sorted(
-            {
-                _display_value(row.get("streamingStatus"), default="미확인")
-                for row in recordings_on_date_rows
-            }
-        )
 
-        log_data = _fetch_s3_device_log_lines(
-            s3_client,
-            device_name,
-            log_date,
-            tail_only=False,
-        )
+            if not log_data["found"]:
+                continue
 
-        if not log_data["found"]:
-            # 요청한 정책: 로그가 없는 장비는 응답에서 제외
-            continue
+            source_lines = log_data["lines"]
+            logs_found_any += 1
+            events = _extract_scan_events_with_line_no(source_lines)
+            motion_events = _extract_motion_events_with_line_no(source_lines)
+            restart_events = _extract_restart_events_with_line_no(source_lines)
+            error_lines = _find_error_lines(source_lines)
+            sessions = _extract_recording_sessions(
+                source_lines,
+                barcode,
+                cs.LOG_SESSION_SAFETY_LINES,
+                scan_events=events,
+            )
+            session_count = len(sessions)
+            total_session_count += session_count
+            session_scoped_events = _events_in_sessions(events, sessions)
+            session_motion_events = _events_in_sessions(motion_events, sessions)
+            session_restart_events = _events_in_sessions(restart_events, sessions)
+            session_error_lines = _error_lines_in_sessions(error_lines, sessions)
 
-        source_lines = log_data["lines"]
-        logs_found_any += 1
-        events = _extract_scan_events_with_line_no(source_lines)
-        motion_events = _extract_motion_events_with_line_no(source_lines)
-        restart_events = _extract_restart_events_with_line_no(source_lines)
-        error_lines = _find_error_lines(source_lines)
-        sessions = _extract_recording_sessions(
-            source_lines,
-            barcode,
-            cs.LOG_SESSION_SAFETY_LINES,
-            scan_events=events,
-        )
-        session_count = len(sessions)
-        total_session_count += session_count
-        session_scoped_events = _events_in_sessions(events, sessions)
-        session_motion_events = _events_in_sessions(motion_events, sessions)
-        session_restart_events = _events_in_sessions(restart_events, sessions)
-        raw_session_error_lines = _error_lines_in_sessions(error_lines, sessions)
-        session_error_lines = raw_session_error_lines
+            if session_count == 0:
+                continue
 
-        if session_count == 0:
-            continue
+            logs_with_session += 1
+            lines.append("")
+            lines.append(f"• 매핑 장비: `{device_name}`")
 
-        logs_with_session += 1
-        lines.append("")
-        lines.append(f"• 매핑 장비: `{device_name}`")
+            hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
+            room_name = _display_value(device_context.get("roomName"), default="미확인")
+            analysis_records.append(
+                _build_log_analysis_record(
+                    source_lines=source_lines,
+                    device_name=device_name,
+                    hospital_name=hospital_name,
+                    room_name=room_name,
+                    log_key=str(log_data["key"]),
+                    log_date=log_date,
+                    line_count=len(source_lines),
+                    sessions=sessions,
+                    session_scans=session_scoped_events,
+                    all_scan_events=events,
+                    session_motions=session_motion_events,
+                    session_restarts=session_restart_events,
+                    session_error_lines=session_error_lines,
+                    recordings_on_date_count=len(recordings_on_date_rows),
+                    recordings_on_date_statuses=recordings_on_date_statuses,
+                )
+            )
 
-        hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
-        room_name = _display_value(device_context.get("roomName"), default="미확인")
-        analysis_records.append(
-            _build_log_analysis_record(
-                source_lines=source_lines,
-                device_name=device_name,
-                hospital_name=hospital_name,
-                room_name=room_name,
-                log_key=str(log_data["key"]),
-                log_date=log_date,
-                line_count=len(source_lines),
-                sessions=sessions,
-                session_scans=session_scoped_events,
-                all_scan_events=events,
-                session_motions=session_motion_events,
-                session_restarts=session_restart_events,
-                session_error_lines=session_error_lines,
+            lines.append(f"• 파일: `{log_data['key']}`")
+            lines.append(f"• 병원: `{hospital_name}`")
+            lines.append(f"• 병실: `{room_name}`")
+            lines.append(f"• 날짜: `{log_date}`")
+            lines.append(f"• DB 영상 기록(날짜 기준): `{len(recordings_on_date_rows)}개`")
+            lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
+            _append_session_sections(
+                lines,
+                source_lines,
+                sessions,
+                session_scoped_events,
+                session_motion_events,
+                session_restart_events,
+                session_error_lines,
+                diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
-                recordings_on_date_statuses=recordings_on_date_statuses,
             )
-        )
+            devices_with_session += 1
 
-        lines.append(f"• 파일: `{log_data['key']}`")
-        lines.append(f"• 병원: `{hospital_name}`")
-        lines.append(f"• 병실: `{room_name}`")
-        lines.append(f"• 날짜: `{log_date}`")
-        lines.append(f"• DB 영상 기록(날짜 기준): `{len(recordings_on_date_rows)}개`")
-        lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
-        _append_session_sections(
-            lines,
-            source_lines,
-            sessions,
-            session_scoped_events,
-            session_motion_events,
-            session_restart_events,
-            session_error_lines,
-            diagnostic_scan_events=events,
-            recordings_on_date_count=len(recordings_on_date_rows),
+    _analyze_device_context_batch(target_device_contexts)
+
+    if logs_with_session == 0:
+        expanded_device_contexts = _expand_device_contexts_to_recordings_hospital_scope(
+            recordings_context,
+            target_device_contexts,
         )
-        devices_with_session += 1
+        if expanded_device_contexts:
+            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비로 확장 검색했어")
+            _analyze_device_context_batch(expanded_device_contexts[: max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))])
 
     if logs_found_any == 0:
         result_text = (
@@ -2393,107 +2458,119 @@ def _analyze_barcode_log_errors(
     if omitted_device_count > 0:
         lines.append(f"• 참고: 장비가 많아서 상위 `{len(target_device_contexts)}개`만 분석했어")
 
-    for device_context in target_device_contexts:
-        device_name = str(device_context.get("deviceName") or "")
-        if not device_name:
-            continue
-        device_seq = device_context.get("deviceSeq")
-        recordings_on_date_rows = (
-            _load_recordings_rows_on_date_by_barcode(
-                barcode,
+    def _analyze_device_context_batch(device_context_batch: list[dict[str, Any]]) -> None:
+        nonlocal total_session_error_lines, logs_found_any, logs_with_session, total_session_count, devices_with_session
+
+        for device_context in device_context_batch:
+            device_name = str(device_context.get("deviceName") or "")
+            if not device_name:
+                continue
+            device_seq = device_context.get("deviceSeq")
+            recordings_on_date_rows = (
+                _load_recordings_rows_on_date_by_barcode(
+                    barcode,
+                    log_date,
+                    device_seq=int(device_seq) if device_seq is not None else None,
+                )
+                if barcode and recordings_context is not None
+                else []
+            )
+            recordings_on_date_statuses = sorted(
+                {
+                    _display_value(row.get("streamingStatus"), default="미확인")
+                    for row in recordings_on_date_rows
+                }
+            )
+
+            log_data = _fetch_s3_device_log_lines(
+                s3_client,
+                device_name,
                 log_date,
-                device_seq=int(device_seq) if device_seq is not None else None,
+                tail_only=False,
             )
-            if barcode and recordings_context is not None
-            else []
-        )
-        recordings_on_date_statuses = sorted(
-            {
-                _display_value(row.get("streamingStatus"), default="미확인")
-                for row in recordings_on_date_rows
-            }
-        )
 
-        log_data = _fetch_s3_device_log_lines(
-            s3_client,
-            device_name,
-            log_date,
-            tail_only=False,
-        )
+            if not log_data["found"]:
+                continue
 
-        if not log_data["found"]:
-            # 요청한 정책: 로그가 없는 장비는 응답에서 제외
-            continue
+            source_lines = log_data["lines"]
+            logs_found_any += 1
+            events = _extract_scan_events_with_line_no(source_lines)
+            motion_events = _extract_motion_events_with_line_no(source_lines)
+            restart_events = _extract_restart_events_with_line_no(source_lines)
+            sessions = _extract_recording_sessions(
+                source_lines,
+                barcode,
+                cs.LOG_SESSION_SAFETY_LINES,
+                scan_events=events,
+            )
+            session_count = len(sessions)
+            total_session_count += session_count
+            error_lines = _find_error_lines(source_lines)
+            session_scoped_events = _events_in_sessions(events, sessions)
+            session_motion_events = _events_in_sessions(motion_events, sessions)
+            session_restart_events = _events_in_sessions(restart_events, sessions)
+            session_error_lines = _error_lines_in_sessions(error_lines, sessions)
+            total_session_error_lines += len(session_error_lines)
 
-        source_lines = log_data["lines"]
-        logs_found_any += 1
-        events = _extract_scan_events_with_line_no(source_lines)
-        motion_events = _extract_motion_events_with_line_no(source_lines)
-        restart_events = _extract_restart_events_with_line_no(source_lines)
-        sessions = _extract_recording_sessions(
-            source_lines,
-            barcode,
-            cs.LOG_SESSION_SAFETY_LINES,
-            scan_events=events,
-        )
-        session_count = len(sessions)
-        total_session_count += session_count
-        error_lines = _find_error_lines(source_lines)
-        session_scoped_events = _events_in_sessions(events, sessions)
-        session_motion_events = _events_in_sessions(motion_events, sessions)
-        session_restart_events = _events_in_sessions(restart_events, sessions)
-        raw_session_error_lines = _error_lines_in_sessions(error_lines, sessions)
-        session_error_lines = raw_session_error_lines
-        total_session_error_lines += len(session_error_lines)
+            if session_count == 0:
+                continue
 
-        if session_count == 0:
-            continue
+            logs_with_session += 1
+            lines.append("")
+            lines.append(f"• 매핑 장비: `{device_name}`")
 
-        logs_with_session += 1
-        lines.append("")
-        lines.append(f"• 매핑 장비: `{device_name}`")
+            hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
+            room_name = _display_value(device_context.get("roomName"), default="미확인")
+            analysis_records.append(
+                _build_log_analysis_record(
+                    source_lines=source_lines,
+                    device_name=device_name,
+                    hospital_name=hospital_name,
+                    room_name=room_name,
+                    log_key=str(log_data["key"]),
+                    log_date=log_date,
+                    line_count=len(source_lines),
+                    sessions=sessions,
+                    session_scans=session_scoped_events,
+                    all_scan_events=events,
+                    session_motions=session_motion_events,
+                    session_restarts=session_restart_events,
+                    session_error_lines=session_error_lines,
+                    recordings_on_date_count=len(recordings_on_date_rows),
+                    recordings_on_date_statuses=recordings_on_date_statuses,
+                )
+            )
 
-        hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
-        room_name = _display_value(device_context.get("roomName"), default="미확인")
-        analysis_records.append(
-            _build_log_analysis_record(
-                source_lines=source_lines,
-                device_name=device_name,
-                hospital_name=hospital_name,
-                room_name=room_name,
-                log_key=str(log_data["key"]),
-                log_date=log_date,
-                line_count=len(source_lines),
-                sessions=sessions,
-                session_scans=session_scoped_events,
-                all_scan_events=events,
-                session_motions=session_motion_events,
-                session_restarts=session_restart_events,
-                session_error_lines=session_error_lines,
+            lines.append(f"• 파일: `{log_data['key']}`")
+            lines.append(f"• 병원: `{hospital_name}`")
+            lines.append(f"• 병실: `{room_name}`")
+            lines.append(f"• 날짜: `{log_date}`")
+            lines.append(f"• DB 영상 기록(날짜 기준): `{len(recordings_on_date_rows)}개`")
+            lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
+            lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
+            _append_session_sections(
+                lines,
+                source_lines,
+                sessions,
+                session_scoped_events,
+                session_motion_events,
+                session_restart_events,
+                session_error_lines,
+                diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
-                recordings_on_date_statuses=recordings_on_date_statuses,
             )
-        )
+            devices_with_session += 1
 
-        lines.append(f"• 파일: `{log_data['key']}`")
-        lines.append(f"• 병원: `{hospital_name}`")
-        lines.append(f"• 병실: `{room_name}`")
-        lines.append(f"• 날짜: `{log_date}`")
-        lines.append(f"• DB 영상 기록(날짜 기준): `{len(recordings_on_date_rows)}개`")
-        lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
-        lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
-        _append_session_sections(
-            lines,
-            source_lines,
-            sessions,
-            session_scoped_events,
-            session_motion_events,
-            session_restart_events,
-            session_error_lines,
-            diagnostic_scan_events=events,
-            recordings_on_date_count=len(recordings_on_date_rows),
+    _analyze_device_context_batch(target_device_contexts)
+
+    if logs_with_session == 0:
+        expanded_device_contexts = _expand_device_contexts_to_recordings_hospital_scope(
+            recordings_context,
+            target_device_contexts,
         )
-        devices_with_session += 1
+        if expanded_device_contexts:
+            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비로 확장 검색했어")
+            _analyze_device_context_batch(expanded_device_contexts[: max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))])
 
     if logs_found_any == 0:
         result_text = (
