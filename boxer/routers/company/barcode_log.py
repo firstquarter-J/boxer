@@ -706,10 +706,10 @@ def _append_session_state_summary(
     sessions: list[dict[str, Any]],
     restart_events: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]] | None = None,
-    scan_events: list[dict[str, Any]] | None = None,
+    diagnostic_scan_events: list[dict[str, Any]] | None = None,
 ) -> None:
     session_error_lines = session_error_lines or []
-    scan_events = scan_events or []
+    diagnostic_scan_events = diagnostic_scan_events or []
 
     if not sessions and not restart_events:
         return
@@ -753,7 +753,7 @@ def _append_session_state_summary(
             session,
             restart_events,
             session_error_lines,
-            scan_events,
+            diagnostic_scan_events,
         )
         lines.append(f"• *녹화 결과:* {recording_result}")
         if isinstance(post_stop_context, dict):
@@ -803,7 +803,7 @@ def _append_session_state_summary(
             session,
             restart_events,
             session_error_subset,
-            scan_events,
+            diagnostic_scan_events,
         )
         has_restart = any(
             int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
@@ -982,7 +982,21 @@ def _find_session_post_stop_context(
         return None
 
     stop_time = _display_value(session.get("stop_time_label"), default="미확인")
-    upper_bound = min(len(lines), stop_line_no + 400)
+    next_barcode_line_no: int | None = None
+    for event in scan_events:
+        event_line_no = int(event.get("line_no") or 0)
+        if event_line_no <= stop_line_no:
+            continue
+        token = str(event.get("token") or "").strip()
+        if cs.BARCODE_PATTERN.fullmatch(token):
+            next_barcode_line_no = event_line_no
+            break
+
+    upper_bound = min(
+        len(lines),
+        stop_line_no + max(1, cs.LOG_POST_STOP_MAX_LINES),
+        (next_barcode_line_no - 1) if next_barcode_line_no else len(lines),
+    )
     finish_line_no: int | None = None
     finish_time_label = "미확인"
     finish_count = 0
@@ -1010,7 +1024,7 @@ def _find_session_post_stop_context(
         finish_delay_seconds = finish_seconds - stop_seconds
         finish_delay_label = _format_elapsed_seconds(finish_delay_seconds)
 
-    scan_upper_bound = finish_line_no or upper_bound
+    scan_upper_bound = min(finish_line_no or upper_bound, upper_bound)
     post_stop_scan_events = [
         event
         for event in scan_events
@@ -1025,7 +1039,7 @@ def _find_session_post_stop_context(
         if str(event.get("token") or "").strip().upper() == "SPECIAL_TAKE_SNAP"
     )
 
-    device_error_upper_bound = min(len(lines), (finish_line_no or upper_bound) + 80)
+    device_error_upper_bound = min(len(lines), max(finish_line_no or upper_bound, upper_bound))
     post_stop_device_errors: list[dict[str, Any]] = []
     for line_no in range(stop_line_no + 1, device_error_upper_bound + 1):
         raw_line = lines[line_no - 1]
@@ -1444,9 +1458,18 @@ def _append_session_sections(
     motion_events: list[dict[str, Any]],
     restart_events: list[dict[str, Any]],
     error_lines: list[tuple[int, str]],
+    diagnostic_scan_events: list[dict[str, Any]] | None = None,
 ) -> None:
+    diagnostic_scan_events = diagnostic_scan_events or scan_events
     if not sessions:
-        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines, scan_events)
+        _append_session_state_summary(
+            lines,
+            source_lines,
+            sessions,
+            restart_events,
+            error_lines,
+            diagnostic_scan_events,
+        )
         _append_session_timing_summary(lines, sessions, error_lines)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
@@ -1454,7 +1477,14 @@ def _append_session_sections(
         return
 
     if len(sessions) <= 1:
-        _append_session_state_summary(lines, source_lines, sessions, restart_events, error_lines, scan_events)
+        _append_session_state_summary(
+            lines,
+            source_lines,
+            sessions,
+            restart_events,
+            error_lines,
+            diagnostic_scan_events,
+        )
         _append_session_timing_summary(lines, sessions, error_lines)
         _append_restart_events_section(lines, restart_events)
         _append_scan_events_section(lines, scan_events, motion_events)
@@ -1479,7 +1509,7 @@ def _append_session_sections(
             [session],
             session_restart_events,
             session_error_lines,
-            scan_events,
+            diagnostic_scan_events,
         )
         _append_session_timing_summary(lines, [session], session_error_lines)
         _append_restart_events_section(lines, session_restart_events)
@@ -1933,10 +1963,11 @@ def _analyze_barcode_log_phase1_window(
                 lines,
                 source_lines,
                 sessions,
-                events,
-                motion_events,
-                restart_events,
+                session_events,
+                session_motion_events,
+                session_restart_events,
                 session_error_lines,
+                diagnostic_scan_events=events,
             )
 
     if found_log_files == 0:
@@ -2084,10 +2115,11 @@ def _analyze_barcode_log_scan_events(
             lines,
             source_lines,
             sessions,
-            events,
-            motion_events,
-            restart_events,
+            session_scoped_events,
+            session_motion_events,
+            session_restart_events,
             session_error_lines,
+            diagnostic_scan_events=events,
         )
         devices_with_session += 1
 
@@ -2255,10 +2287,11 @@ def _analyze_barcode_log_errors(
             lines,
             source_lines,
             sessions,
-            events,
-            motion_events,
-            restart_events,
+            session_scoped_events,
+            session_motion_events,
+            session_restart_events,
             session_error_lines,
+            diagnostic_scan_events=events,
         )
         devices_with_session += 1
 
