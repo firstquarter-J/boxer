@@ -342,10 +342,32 @@ def _is_barcode_all_recorded_dates_request(question: str, barcode: str | None) -
             "녹화마다",
         )
     )
+    has_date_list_phrase = any(
+        token in text
+        for token in (
+            "날짜 목록",
+            "날짜 리스트",
+            "일자 목록",
+            "일자 리스트",
+            "날짜별 목록",
+            "일자별 목록",
+            "영상 날짜",
+            "영상 날짜 목록",
+            "영상 날짜별 목록",
+            "영상별 날짜",
+            "영상별 날짜 목록",
+            "비디오 날짜",
+            "비디오 날짜 목록",
+            "녹화 날짜",
+            "녹화 날짜 목록",
+            "촬영 날짜",
+            "촬영 날짜 목록",
+        )
+    )
     has_date_hint = any(token in text for token in ("날짜", "일자", "목록", "리스트")) or any(
         token in lowered for token in ("date", "dates", "list")
     )
-    return has_date_hint and (has_all_hint or has_per_video_hint)
+    return has_date_hint and (has_all_hint or has_per_video_hint or has_date_list_phrase)
 
 
 def _find_error_lines(lines: list[str]) -> list[tuple[int, str]]:

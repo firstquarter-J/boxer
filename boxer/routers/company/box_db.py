@@ -192,20 +192,27 @@ def _query_recordings_list_by_barcode(
         recorded_at = row.get("recordedAt")
         created_at = row.get("createdAt")
         time_label = "미확인"
-        time_key = "recordedAt"
         if isinstance(recorded_at, datetime):
             time_label = _format_recorded_at_local(recorded_at)
-            time_key = "recordedAt"
         elif isinstance(created_at, datetime):
             time_label = _format_recorded_at_local(created_at)
-            time_key = "createdAt"
 
         hospital_name = _display_value(row.get("hospitalName"), default="미확인")
         room_name = _display_value(row.get("roomName"), default="미확인")
         streaming_status = _display_value(row.get("streamingStatus"), default="미확인")
-        lines.append(
-            f"- {index}. {time_key}(KST): `{time_label}` | streamingStatus: `{streaming_status}` | 병원: `{hospital_name}` | 병실: `{room_name}`"
+        lines.extend(
+            [
+                f"- {index}.",
+                f"  날짜(KST): `{time_label}`",
+                f"  병원: `{hospital_name}`",
+                f"  병실: `{room_name}`",
+                f"  streamingStatus: `{streaming_status}`",
+                "",
+            ]
         )
+
+    if lines and lines[-1] == "":
+        lines.pop()
 
     if has_more:
         lines.append(f"• 참고: 최근 `{limit}개`만 표시했고 이전 영상은 생략했어")
