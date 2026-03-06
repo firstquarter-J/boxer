@@ -53,6 +53,136 @@ from boxer.routers.common.db import _query_db, _validate_readonly_sql
 from boxer.routers.common.s3 import _build_s3_client
 
 
+def _split_barcode_log_reply(reply_text: str, max_chars: int = 3000) -> list[str]:
+    text = (reply_text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    def _extract_blocks(raw_text: str) -> list[str]:
+        blocks: list[str] = []
+        lines = raw_text.splitlines()
+        index = 0
+        while index < len(lines):
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+            if index >= len(lines):
+                break
+
+            if lines[index].strip() == "```":
+                code_lines = [lines[index]]
+                index += 1
+                while index < len(lines):
+                    code_lines.append(lines[index])
+                    if lines[index].strip() == "```":
+                        index += 1
+                        break
+                    index += 1
+                blocks.append("\n".join(code_lines).strip())
+                continue
+
+            paragraph: list[str] = []
+            while index < len(lines) and lines[index].strip() and lines[index].strip() != "```":
+                paragraph.append(lines[index])
+                index += 1
+            blocks.append("\n".join(paragraph).strip())
+        return [block for block in blocks if block]
+
+    def _continuation_prefix(prefix: str) -> str:
+        if "• error 라인:" in prefix:
+            return "• error 라인 (계속)"
+        if "• scanned 이벤트:" in prefix:
+            return "• scanned 이벤트 (계속)"
+        return ""
+
+    def _split_lines_block(block: str, limit: int) -> list[str]:
+        rows = block.splitlines()
+        chunks: list[str] = []
+        current_rows: list[str] = []
+        for row in rows:
+            candidate_rows = current_rows + [row]
+            candidate = "\n".join(candidate_rows).strip()
+            if current_rows and len(candidate) > limit:
+                chunks.append("\n".join(current_rows).strip())
+                current_rows = [row]
+                continue
+            current_rows = candidate_rows
+        if current_rows:
+            chunks.append("\n".join(current_rows).strip())
+        return [chunk for chunk in chunks if chunk]
+
+    def _render_fenced_chunk(prefix: str, code_lines: list[str]) -> str:
+        fenced = "```\n" + "\n".join(code_lines) + "\n```"
+        if prefix:
+            return f"{prefix}\n\n{fenced}".strip()
+        return fenced
+
+    def _split_block(block: str, limit: int) -> list[str]:
+        if len(block) <= limit:
+            return [block]
+
+        first_fence_index = block.find("```")
+        last_fence_index = block.rfind("```")
+        if first_fence_index != -1 and last_fence_index > first_fence_index:
+            prefix = block[:first_fence_index].strip()
+            code_body = block[first_fence_index + 3 : last_fence_index].strip("\n")
+            code_lines = code_body.splitlines()
+            if not code_lines:
+                return [block]
+
+            chunks: list[str] = []
+            current_lines: list[str] = []
+            current_prefix = prefix
+            continuation = _continuation_prefix(prefix)
+
+            for line in code_lines:
+                candidate = _render_fenced_chunk(current_prefix, current_lines + [line])
+                if current_lines and len(candidate) > limit:
+                    chunks.append(_render_fenced_chunk(current_prefix, current_lines))
+                    current_lines = [line]
+                    current_prefix = continuation
+                    continue
+                current_lines.append(line)
+
+            if current_lines:
+                chunks.append(_render_fenced_chunk(current_prefix, current_lines))
+            return chunks
+
+        return _split_lines_block(block, limit)
+
+    blocks = _extract_blocks(text)
+    merged_blocks: list[str] = []
+    index = 0
+    while index < len(blocks):
+        block = blocks[index]
+        if index + 1 < len(blocks) and blocks[index + 1].startswith("```"):
+            if "• scanned 이벤트:" in block or "• error 라인:" in block:
+                merged_blocks.append(f"{block}\n\n{blocks[index + 1]}")
+                index += 2
+                continue
+        merged_blocks.append(block)
+        index += 1
+
+    chunks: list[str] = []
+    current = ""
+    for block in merged_blocks:
+        for piece in _split_block(block, max_chars):
+            if not current:
+                current = piece
+                continue
+            candidate = f"{current}\n\n{piece}"
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            chunks.append(current)
+            current = piece
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def create_app() -> App:
     cs.apply_legacy_db_compat(s)
     _validate_tokens(include_llm=True, include_data_sources=True)
@@ -158,8 +288,17 @@ def create_app() -> App:
             route_name: str,
         ) -> None:
             if route_name == "barcode log analysis":
-                reply(fallback_text)
-                logger.info("Responded with %s (direct, preserve format)", route_name)
+                chunks = _split_barcode_log_reply(fallback_text)
+                if not chunks:
+                    reply(fallback_text)
+                else:
+                    for index, chunk in enumerate(chunks):
+                        reply(chunk, mention_user=index == 0)
+                logger.info(
+                    "Responded with %s (direct, preserve format, chunks=%s)",
+                    route_name,
+                    max(1, len(chunks)),
+                )
                 return
 
             provider = (s.LLM_PROVIDER or "").lower().strip()

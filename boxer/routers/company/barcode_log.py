@@ -26,6 +26,22 @@ _HOSPITAL_SCOPE_PATTERN = re.compile(
 _ROOM_SCOPE_PATTERN = re.compile(
     r"(?:병실명|진료실명)\s*[:=]?\s*(.+?)(?=\s+(?:날짜|로그|분석)\b|$)"
 )
+_RAW_LOG_COMPONENT_PATTERN = re.compile(
+    r"^\[[^\]]+\]\s+\[\s*([^\]]+?)\s*\]\s+\[[^\]]+\]",
+    re.IGNORECASE,
+)
+_RAW_LOG_LEVEL_PATTERN = re.compile(
+    r"^\[[^\]]+\]\s+\[[^\]]+\]\s+\[\s*([A-Za-z]+)\s*\]",
+    re.IGNORECASE,
+)
+_NORMALIZED_LOG_COMPONENT_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[_ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\[([^\]]+)\]\s+[A-Za-z]+:",
+    re.IGNORECASE,
+)
+_NORMALIZED_LOG_LEVEL_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[_ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\[[^\]]+\]\s+([A-Za-z]+):",
+    re.IGNORECASE,
+)
 _TODAY_HINTS = ("오늘", "금일", "today")
 _DAY_BEFORE_YESTERDAY_HINTS = ("그제", "엊그제", "day before yesterday")
 _TOMORROW_HINTS = ("내일", "tomorrow")
@@ -274,12 +290,41 @@ def _is_barcode_all_recorded_dates_request(question: str, barcode: str | None) -
 def _find_error_lines(lines: list[str]) -> list[tuple[int, str]]:
     matches: list[tuple[int, str]] = []
     for line_no, line in enumerate(lines, start=1):
-        lowered = line.lower()
-        if "low growth rate detected:" in lowered:
-            continue
-        if any(keyword in lowered for keyword in cs.LOG_ERROR_KEYWORDS):
+        if _is_actual_error_line(line):
             matches.append((line_no, line))
     return matches
+
+
+def _extract_explicit_log_level(line: str) -> str:
+    for pattern in (_RAW_LOG_LEVEL_PATTERN, _NORMALIZED_LOG_LEVEL_PATTERN):
+        matched = pattern.search(line or "")
+        if matched:
+            return matched.group(1).strip().lower()
+    return ""
+
+
+def _extract_log_component(line: str) -> str:
+    for pattern in (_RAW_LOG_COMPONENT_PATTERN, _NORMALIZED_LOG_COMPONENT_PATTERN):
+        matched = pattern.search(line or "")
+        if matched:
+            return matched.group(1).strip().lower()
+    return ""
+
+
+def _is_actual_error_line(line: str) -> bool:
+    lowered = (line or "").lower()
+    if "low growth rate detected:" in lowered:
+        return False
+
+    component = _extract_log_component(line)
+    if "ffmpeg" in component:
+        return True
+
+    explicit_level = _extract_explicit_log_level(line)
+    if explicit_level:
+        return explicit_level in {"error", "fatal", "panic"}
+
+    return any(token in lowered for token in ("traceback", "unhandled exception", "fatal error", "panic:"))
 
 
 def _is_error_focused_request(question: str) -> bool:
