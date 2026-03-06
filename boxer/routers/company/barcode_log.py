@@ -26,16 +26,8 @@ _HOSPITAL_SCOPE_PATTERN = re.compile(
 _ROOM_SCOPE_PATTERN = re.compile(
     r"(?:병실명|진료실명)\s*[:=]?\s*(.+?)(?=\s+(?:날짜|로그|분석)\b|$)"
 )
-_RAW_LOG_COMPONENT_PATTERN = re.compile(
-    r"^\[[^\]]+\]\s+\[\s*([^\]]+?)\s*\]\s+\[[^\]]+\]",
-    re.IGNORECASE,
-)
 _RAW_LOG_LEVEL_PATTERN = re.compile(
     r"^\[[^\]]+\]\s+\[[^\]]+\]\s+\[\s*([A-Za-z]+)\s*\]",
-    re.IGNORECASE,
-)
-_NORMALIZED_LOG_COMPONENT_PATTERN = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[_ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\[([^\]]+)\]\s+[A-Za-z]+:",
     re.IGNORECASE,
 )
 _NORMALIZED_LOG_LEVEL_PATTERN = re.compile(
@@ -303,22 +295,10 @@ def _extract_explicit_log_level(line: str) -> str:
     return ""
 
 
-def _extract_log_component(line: str) -> str:
-    for pattern in (_RAW_LOG_COMPONENT_PATTERN, _NORMALIZED_LOG_COMPONENT_PATTERN):
-        matched = pattern.search(line or "")
-        if matched:
-            return matched.group(1).strip().lower()
-    return ""
-
-
 def _is_actual_error_line(line: str) -> bool:
     lowered = (line or "").lower()
     if "low growth rate detected:" in lowered:
         return False
-
-    component = _extract_log_component(line)
-    if "ffmpeg" in component:
-        return True
 
     explicit_level = _extract_explicit_log_level(line)
     if explicit_level:
@@ -344,17 +324,18 @@ def _extract_time_label_from_line(line: str) -> str:
     return "시간미상"
 
 
-def _parse_scanned_event(line: str) -> tuple[str, str] | None:
+def _strip_leading_log_timestamp(line: str) -> str:
+    text = (line or "").strip()
+    text = re.sub(r"^\[\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\]\s*", "", text)
+    text = re.sub(r"^\d{4}-\d{2}-\d{2}[_ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s*", "", text)
+    return text.strip()
+
+
+def _parse_scanned_event(line: str) -> str | None:
     matched = cs.SCANNED_TOKEN_PATTERN.search(line)
     if not matched:
         return None
-    token = matched.group(1).strip().strip("`'\",;:()[]{}")
-    upper_token = token.upper()
-    if upper_token in cs.SCAN_CODE_LABELS:
-        return token, cs.SCAN_CODE_LABELS[upper_token]
-    if re.fullmatch(r"\d{11}", token):
-        return token, "녹화 시작 바코드 스캔"
-    return token, f"기타 스캔 ({token})"
+    return matched.group(1).strip().strip("`'\",;:()[]{}")
 
 
 def _extract_scan_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
@@ -368,7 +349,7 @@ def _extract_scan_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
         parsed = _parse_scanned_event(line)
         if not parsed:
             continue
-        token, label = parsed
+        token = parsed
         time_label = line_time_label
         if time_label == "시간미상" and latest_time_label:
             time_label = latest_time_label
@@ -376,8 +357,8 @@ def _extract_scan_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
             {
                 "line_no": line_no,
                 "time_label": time_label,
-                "label": label,
                 "token": token,
+                "raw_line": _strip_leading_log_timestamp(line),
             }
         )
     return events
@@ -725,9 +706,8 @@ def _append_scan_events_section(
     timeline: list[tuple[int, str, str, str]] = []
     for event in ordered_scans:
         time_label = _display_value(event.get("time_label"), default="시간미상")
-        label = _display_value(event.get("label"), default="기타 스캔")
-        token = _display_value(event.get("token"), default="unknown")
-        timeline.append((int(event.get("line_no") or 0), time_label, label, token))
+        raw_line = _display_value(event.get("raw_line"), default="Scanned 이벤트")
+        timeline.append((int(event.get("line_no") or 0), time_label, raw_line, ""))
 
     for event in ordered_motions:
         time_label = _display_value(event.get("time_label"), default="시간미상")
