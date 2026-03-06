@@ -154,6 +154,33 @@ def _is_barcode_video_count_request(question: str, barcode: str | None) -> bool:
     return has_count_hint
 
 
+def _is_barcode_video_list_request(question: str, barcode: str | None) -> bool:
+    if not barcode:
+        return False
+    if _is_barcode_video_count_request(question, barcode):
+        return False
+
+    text = (question or "").strip()
+    lowered = text.lower()
+
+    if "로그" in text or re.search(r"\blog\b", lowered):
+        return False
+
+    has_video_hint = any(token in text for token in cs.VIDEO_HINT_TOKENS) or any(
+        token in lowered for token in cs.VIDEO_HINT_TOKENS
+    )
+    if not has_video_hint:
+        return False
+
+    has_list_hint = any(token in text for token in ("목록", "리스트")) or any(
+        token in lowered for token in ("list", "items")
+    )
+    has_all_date_hint = any(token in text for token in ("모든", "전체", "전부", "다")) and any(
+        token in text for token in ("날짜", "일자")
+    )
+    return has_list_hint and not has_all_date_hint
+
+
 def _is_barcode_last_recorded_at_request(question: str, barcode: str | None) -> bool:
     if not barcode:
         return False
@@ -471,6 +498,25 @@ def _extract_recording_sessions(
     return sessions
 
 
+def _append_session_closure_status(lines: list[str], sessions: list[dict[str, Any]]) -> None:
+    if not sessions:
+        return
+
+    normal_count = sum(1 for session in sessions if session.get("stop_line_no") is not None)
+    abnormal_count = len(sessions) - normal_count
+    if abnormal_count <= 0:
+        lines.append("• 종료 상태: 모든 세션 정상 종료 (`C_STOPSESS` 확인)")
+        return
+
+    if normal_count <= 0:
+        lines.append(f"• 종료 상태: 정상 종료되지 않은 세션 *{abnormal_count}건* (`C_STOPSESS` 없음)")
+        return
+
+    lines.append(
+        f"• 종료 상태: 정상 종료 *{normal_count}건*, 정상 종료되지 않은 세션 *{abnormal_count}건* (`C_STOPSESS` 없음)"
+    )
+
+
 def _events_in_session(events: list[dict[str, Any]], session: dict[str, Any]) -> list[dict[str, Any]]:
     start_line_no = int(session["start_line_no"])
     end_line_no = int(session["end_line_no"])
@@ -654,25 +700,26 @@ def _append_scan_events_section(
     ordered_scans = sorted(scan_events, key=lambda item: int(item.get("line_no") or 0))
     ordered_motions = sorted((motion_events or []), key=lambda item: int(item.get("line_no") or 0))
 
-    timeline: list[tuple[int, str, str]] = []
+    timeline: list[tuple[int, str, str, str]] = []
     for event in ordered_scans:
         time_label = _display_value(event.get("time_label"), default="시간미상")
         label = _display_value(event.get("label"), default="기타 스캔")
         token = _display_value(event.get("token"), default="unknown")
-        timeline.append((int(event.get("line_no") or 0), time_label, f"{label} (`{token}`)"))
+        timeline.append((int(event.get("line_no") or 0), time_label, label, token))
 
     for event in ordered_motions:
         time_label = _display_value(event.get("time_label"), default="시간미상")
         label = _display_value(event.get("label"), default="모션 이벤트")
+        detail = ""
         if event.get("event_type") == "motion_stop":
             motion_detected = event.get("motion_detected")
             error_flag = event.get("error")
             if motion_detected is not None and error_flag is not None:
-                label = (
-                    f"{label} (motionDetected={str(bool(motion_detected)).lower()}, "
-                    f"error={str(bool(error_flag)).lower()})"
+                detail = (
+                    f"motionDetected={str(bool(motion_detected)).lower()}, "
+                    f"error={str(bool(error_flag)).lower()}"
                 )
-        timeline.append((int(event.get("line_no") or 0), time_label, label))
+        timeline.append((int(event.get("line_no") or 0), time_label, label, detail))
 
     if not timeline:
         lines.append("• scanned 이벤트: 없음")
@@ -683,8 +730,16 @@ def _append_scan_events_section(
     else:
         lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")
 
-    for _, time_label, text in sorted(timeline, key=lambda item: item[0]):
-        lines.append(f"- {time_label}: {text}")
+    timeline_rows: list[str] = []
+    for _, time_label, label, detail in sorted(timeline, key=lambda item: item[0]):
+        base = f"{time_label:>8}  {label}"
+        if detail:
+            base = f"{base} | {detail}"
+        timeline_rows.append(base)
+
+    lines.append("```")
+    lines.extend(timeline_rows)
+    lines.append("```")
 
 
 def _append_error_lines_section(
@@ -837,6 +892,7 @@ def _analyze_barcode_log_phase1_window(
             lines.append(f"• 병원: `{hospital_name}`")
             lines.append(f"• 병실: `{room_name}`")
             lines.append(f"• 요청 바코드 녹화 세션: *{len(sessions)}건*")
+            _append_session_closure_status(lines, sessions)
             _append_scan_events_section(lines, session_events, session_motion_events)
             if len(raw_session_error_lines) != len(session_error_lines):
                 lines.append(
@@ -960,6 +1016,7 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"• 병실: `{room_name}`")
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
+        _append_session_closure_status(lines, sessions)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         if len(raw_session_error_lines) != len(session_error_lines):
             lines.append(
@@ -1099,6 +1156,7 @@ def _analyze_barcode_log_errors(
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
+        _append_session_closure_status(lines, sessions)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         if len(raw_session_error_lines) != len(session_error_lines):
             lines.append(
