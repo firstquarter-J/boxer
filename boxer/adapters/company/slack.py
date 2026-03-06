@@ -400,6 +400,18 @@ def create_app() -> App:
             restart_events = first_record.get("restartEvents") if isinstance(first_record, dict) else []
             restart_event = restart_events[0] if isinstance(restart_events, list) and restart_events else {}
             restart_time = str(restart_event.get("time") or "시간미상").strip() if isinstance(restart_event, dict) else "시간미상"
+            first_session_start_time = str(first_record.get("firstSessionStartTime") or "미확인").strip() or "미확인"
+            first_ffmpeg_error = first_record.get("firstFfmpegError") if isinstance(first_record, dict) else {}
+            ffmpeg_error_time = (
+                str(first_ffmpeg_error.get("timeLabel") or "시간미상").strip()
+                if isinstance(first_ffmpeg_error, dict)
+                else "시간미상"
+            )
+            ffmpeg_error_elapsed = (
+                str(first_ffmpeg_error.get("elapsedFromSessionStart") or "").strip()
+                if isinstance(first_ffmpeg_error, dict)
+                else ""
+            )
 
             error_groups = first_record.get("errorGroups") if isinstance(first_record, dict) else []
             top_group = error_groups[0] if isinstance(error_groups, list) and error_groups else {}
@@ -409,6 +421,10 @@ def create_app() -> App:
             top_signature_lower = top_signature.lower()
             top_component_lower = top_component.lower()
             is_ffmpeg_error = "ffmpeg" in top_signature_lower or "ffmpeg" in top_component_lower
+            is_ffmpeg_timestamp_error = any(
+                token in top_signature_lower
+                for token in ("invalid dropping", "non-monotonous dts", "dts ", "timestamp")
+            )
 
             abnormal_count = int(summary.get("abnormalSessionCount") or 0)
             error_line_count = int(summary.get("errorLineCount") or 0)
@@ -416,6 +432,8 @@ def create_app() -> App:
 
             if restart_count > 0:
                 cause_line = "• 핵심 원인: 세션 중 장비 재시작과 녹화 오류가 함께 보여 정상 녹화 실패 가능성이 높아"
+            elif is_ffmpeg_timestamp_error:
+                cause_line = "• 핵심 원인: ffmpeg DTS/타임스탬프 이상이 확인돼 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심해"
             elif top_signature != "미확인" and top_count >= 2:
                 cause_line = f"• 핵심 원인: `{top_component}`에서 `{top_signature}` 오류가 반복돼 녹화 실패 가능성이 높아"
             elif top_signature != "미확인" and top_count == 1:
@@ -432,6 +450,13 @@ def create_app() -> App:
             evidence_lines: list[str] = []
             if restart_count > 0:
                 evidence_lines.append(f"- `{restart_time}` 장비 재시작 감지 (`Mommybox Starting...`)")
+            if is_ffmpeg_error and ffmpeg_error_time != "시간미상":
+                time_parts: list[str] = [f"첫 ffmpeg 오류 `{ffmpeg_error_time}`"]
+                if first_session_start_time != "미확인":
+                    time_parts.append(f"세션 시작 `{first_session_start_time}`")
+                if ffmpeg_error_elapsed:
+                    time_parts.append(f"시작 후 `{ffmpeg_error_elapsed}`")
+                evidence_lines.append(f"- {', '.join(time_parts)}")
             if top_count > 0 and top_signature != "미확인":
                 evidence_lines.append(f"- `{top_component}` `{top_signature}` `{top_count}회`")
             if evidence_lines:
@@ -439,7 +464,9 @@ def create_app() -> App:
                 lines.extend(evidence_lines)
 
             action_lines: list[str] = []
-            if is_ffmpeg_error:
+            if is_ffmpeg_timestamp_error:
+                action_lines.append("- 캡처보드 케이블 체결 상태와 장치 교체 테스트를 가장 먼저 진행")
+            elif is_ffmpeg_error:
                 action_lines.append("- 캡처보드 연결 상태와 입력 신호를 가장 먼저 점검")
             if restart_count > 0:
                 action_lines.append("- 전원 차단/전원 버튼 오입력 여부 확인")

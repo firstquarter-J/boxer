@@ -726,6 +726,69 @@ def _events_in_session(events: list[dict[str, Any]], session: dict[str, Any]) ->
     ]
 
 
+def _find_session_for_line(line_no: int, sessions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for session in sessions:
+        if int(session["start_line_no"]) <= int(line_no) <= int(session["end_line_no"]):
+            return session
+    return None
+
+
+def _time_label_to_seconds(label: str) -> int | None:
+    try:
+        hour, minute, second = [int(part) for part in str(label).strip().split(":")]
+    except (TypeError, ValueError):
+        return None
+    if hour < 0 or minute < 0 or minute >= 60 or second < 0 or second >= 60:
+        return None
+    return hour * 3600 + minute * 60 + second
+
+
+def _format_elapsed_seconds(total_seconds: int | None) -> str | None:
+    if total_seconds is None or total_seconds < 0:
+        return None
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}시간 {minutes}분 {seconds}초"
+    if minutes > 0:
+        return f"{minutes}분 {seconds}초"
+    return f"{seconds}초"
+
+
+def _find_first_ffmpeg_error_context(
+    error_lines: list[tuple[int, str]],
+    sessions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for line_no, content in error_lines:
+        parsed = _parse_structured_log_line(content)
+        raw = str(parsed.get("raw") or content or "").strip()
+        if "ffmpeg" not in raw.lower():
+            continue
+
+        error_time = _extract_time_label_from_line(content)
+        session = _find_session_for_line(line_no, sessions)
+        session_start_time = _display_value(
+            session.get("start_time_label") if isinstance(session, dict) else None,
+            default="미확인",
+        )
+        elapsed = None
+        start_seconds = _time_label_to_seconds(session_start_time)
+        error_seconds = _time_label_to_seconds(error_time)
+        if start_seconds is not None and error_seconds is not None:
+            elapsed = _format_elapsed_seconds(error_seconds - start_seconds)
+
+        return {
+            "lineNo": int(line_no),
+            "timeLabel": error_time,
+            "component": parsed.get("component") or "unknown",
+            "message": parsed.get("message") or raw,
+            "raw": raw,
+            "sessionStartTime": session_start_time,
+            "elapsedFromSessionStart": elapsed,
+        }
+    return None
+
+
 def _events_in_sessions(events: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not sessions:
         return []
@@ -905,6 +968,7 @@ def _build_log_analysis_record(
     motion_items = _serialize_motion_events_for_evidence(session_motions)
     restart_items = _serialize_restart_events_for_evidence(session_restarts)
     error_items = _serialize_error_lines_for_evidence(session_error_lines)
+    first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, sessions)
     return {
         "deviceName": device_name,
         "hospitalName": hospital_name,
@@ -913,6 +977,14 @@ def _build_log_analysis_record(
         "logKey": log_key,
         "lineCount": int(line_count),
         "sessions": closure,
+        "firstSessionStartTime": _display_value(
+            sessions[0].get("start_time_label") if sessions else None,
+            default="미확인",
+        ),
+        "lastSessionStopTime": _display_value(
+            sessions[-1].get("stop_time_label") if sessions else None,
+            default="미확인",
+        ),
         "scanEventCount": len(scan_items),
         "scanEvents": scan_items,
         "motionEvents": motion_items,
@@ -922,7 +994,39 @@ def _build_log_analysis_record(
         "errorLineCount": len(error_items),
         "errorLines": error_items,
         "errorGroups": _build_error_groups(error_items),
+        "firstFfmpegError": first_ffmpeg_error,
     }
+
+
+def _append_session_timing_summary(
+    lines: list[str],
+    sessions: list[dict[str, Any]],
+    session_error_lines: list[tuple[int, str]],
+) -> None:
+    if not sessions:
+        return
+
+    if len(sessions) == 1:
+        start_time = _display_value(sessions[0].get("start_time_label"), default="미확인")
+        if start_time != "미확인":
+            lines.append(f"• 세션 시작: `{start_time}`")
+
+    first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, sessions)
+    if not first_ffmpeg_error:
+        return
+
+    error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
+    session_start_time = _display_value(first_ffmpeg_error.get("sessionStartTime"), default="미확인")
+    elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
+
+    detail_parts: list[str] = []
+    if session_start_time != "미확인":
+        detail_parts.append(f"세션 시작 `{session_start_time}`")
+    if elapsed:
+        detail_parts.append(f"시작 후 `{elapsed}`")
+
+    detail_suffix = f" ({', '.join(detail_parts)})" if detail_parts else ""
+    lines.append(f"• 첫 ffmpeg 에러: `{error_time}`{detail_suffix}")
 
 
 def _build_log_analysis_payload(
@@ -1366,6 +1470,7 @@ def _analyze_barcode_log_phase1_window(
             lines.append(f"• 병원: `{hospital_name}`")
             lines.append(f"• 병실: `{room_name}`")
             _append_session_state_summary(lines, sessions, session_restart_events)
+            _append_session_timing_summary(lines, sessions, session_error_lines)
             _append_restart_events_section(lines, session_restart_events)
             _append_scan_events_section(lines, session_events, session_motion_events)
             _append_error_lines_section(
@@ -1514,6 +1619,7 @@ def _analyze_barcode_log_scan_events(
         lines.append(f"• 날짜: `{log_date}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
         _append_session_state_summary(lines, sessions, session_restart_events)
+        _append_session_timing_summary(lines, sessions, session_error_lines)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         _append_error_lines_section(
@@ -1682,6 +1788,7 @@ def _analyze_barcode_log_errors(
         lines.append(f"• 파일 크기: `{_format_size(log_data['content_length'])}`")
         lines.append(f"• 분석 범위: 전체 `{len(source_lines)}줄`")
         _append_session_state_summary(lines, sessions, session_restart_events)
+        _append_session_timing_summary(lines, sessions, session_error_lines)
         _append_restart_events_section(lines, session_restart_events)
         _append_scan_events_section(lines, session_scoped_events, session_motion_events)
         _append_error_lines_section(

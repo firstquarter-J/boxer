@@ -212,7 +212,9 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "11) 6줄 안팎으로 짧게 끝내. 장황한 설명 금지.\n"
             "12) '근거 로그'는 시간/컴포넌트/핵심 메시지만 짧게 적어.\n"
             "13) restartEvents가 있으면 세션 중 재시작을 1차 원인 후보로 명확히 적어.\n"
-            "14) ffmpeg 관련 오류가 보이면 '권장 조치'의 1순위는 캡처보드 연결 상태와 입력 신호 점검으로 적어."
+            "14) ffmpeg 관련 오류가 보이면 '권장 조치'의 1순위는 캡처보드 연결 상태와 입력 신호 점검으로 적어.\n"
+            "15) ffmpeg 로그에 DTS/invalid dropping/non-monotonous dts/timestamp 이상이 보이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 명확히 적어.\n"
+            "16) 세션 시작 시각과 첫 ffmpeg 오류 시각이 evidence에 있으면 근거 로그에 반드시 같이 적어."
         )
 
     if route != "barcode_log_analysis":
