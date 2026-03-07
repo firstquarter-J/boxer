@@ -388,7 +388,8 @@ def _query_recordings_on_date_by_barcode(
             "*바코드 날짜별 녹화 여부 조회 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{target_date}`\n"
-            "• 결과: recordedAt 기준 녹화 기록이 없어"
+            "• 결과: 날짜 기준 recordings DB row가 없어",
+            "• 참고: 실제 녹화 시도가 있었더라도 영상 손상 또는 업로드/DB 기록 생성 실패 가능성은 별도 로그 확인이 필요해",
         ]
         if has_more:
             lines.append(
