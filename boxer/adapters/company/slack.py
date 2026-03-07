@@ -37,6 +37,11 @@ from boxer.routers.company.barcode_log import (
     _is_scan_focused_request,
 )
 from boxer.routers.company.db_query import _extract_db_query, _format_db_query_result
+from boxer.routers.company.device_file_probe import (
+    _build_device_file_scope_request_message,
+    _is_barcode_device_file_probe_request,
+    _locate_barcode_file_candidates,
+)
 from boxer.routers.company.box_db import (
     _load_recordings_context_by_barcode,
     _lookup_device_contexts_by_hospital_room,
@@ -893,6 +898,68 @@ def create_app() -> App:
             return evidence
 
         is_phase2_scope_followup = bool(barcode and has_phase2_scope and phase2_has_requested_date)
+
+        if _is_barcode_device_file_probe_request(question, barcode):
+            if not s.S3_QUERY_ENABLED:
+                reply("파일 확인 대상 세션 조회를 위해 S3_QUERY_ENABLED=true가 필요해")
+                return
+            if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+                reply("파일 확인 대상 세션 조회를 위해 DB 접속 정보(DB_*)가 필요해")
+                return
+
+            try:
+                log_date, has_requested_date = _extract_log_date_with_presence(question)
+                if not has_requested_date:
+                    reply("파일 확인 대상 세션 조회는 날짜가 필요해. 예: `48194663047 2026-03-06 파일 있나`")
+                    return
+
+                context = _get_recordings_context()
+                summary = context.get("summary") or {}
+                recording_count = int(summary.get("recordingCount") or 0)
+                has_device_mapping = _has_recordings_device_mapping(context)
+                manual_device_contexts = None
+
+                if phase2_hospital_name and phase2_room_name:
+                    manual_device_contexts = _lookup_device_contexts_by_hospital_room(
+                        phase2_hospital_name,
+                        phase2_room_name,
+                    )
+                    if not manual_device_contexts:
+                        reply(_build_device_file_scope_request_message(
+                            barcode or "",
+                            "입력한 병원명/병실명으로 장비를 찾지 못했어. MDA 표시 이름과 정확히 일치하게 입력해줘",
+                        ))
+                        return
+                elif recording_count <= 0 or not has_device_mapping:
+                    reply(_build_device_file_scope_request_message(
+                        barcode or "",
+                        "recordings 장비 매핑이 없어 2차 입력이 필요해",
+                    ))
+                    return
+
+                result_text, probe_payload = _locate_barcode_file_candidates(
+                    _get_s3_client(),
+                    barcode or "",
+                    log_date,
+                    recordings_context=context,
+                    device_contexts=manual_device_contexts,
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with device file candidate lookup in thread_ts=%s barcode=%s records=%s",
+                    thread_ts,
+                    barcode,
+                    int(((probe_payload.get("summary") or {}).get("recordCount") or 0)),
+                )
+            except ValueError as exc:
+                reply(f"파일 확인 대상 세션 조회 요청 형식 오류: {exc}")
+            except (BotoCoreError, ClientError, pymysql.MySQLError, RuntimeError):
+                logger.exception("Device file candidate lookup failed")
+                reply("파일 확인 대상 세션 조회 중 오류가 발생했어. S3/DB 설정을 확인해줘")
+            except Exception:
+                logger.exception("Device file candidate lookup failed")
+                reply("파일 확인 대상 세션 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
 
         if _is_barcode_log_analysis_request(question, barcode) or is_phase2_scope_followup:
             if not s.S3_QUERY_ENABLED:
