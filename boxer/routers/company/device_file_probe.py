@@ -1,5 +1,7 @@
 import shlex
 import socket
+import tempfile
+from pathlib import PurePosixPath
 from typing import Any
 
 try:
@@ -8,6 +10,7 @@ except ImportError:  # pragma: no cover - runtime guard
     paramiko = None
 
 from boxer.company import settings as cs
+from boxer.core import settings as s
 from boxer.core.utils import _display_value, _truncate_text
 from boxer.routers.company.barcode_log import (
     _build_phase2_scope_request_message,
@@ -22,6 +25,7 @@ from boxer.routers.company.barcode_log import (
 from boxer.routers.company.box_db import (
     _lookup_device_contexts_by_barcode,
 )
+from boxer.routers.common.s3 import _build_s3_client
 from boxer.routers.company.mda_graphql import (
     _open_mda_device_ssh,
     _get_mda_device_agent_ssh,
@@ -37,6 +41,14 @@ _DEVICE_FILE_ID_HINTS = (
     "파일 id",
     "파일 아이디",
     "파일아이디",
+)
+
+_DEVICE_FILE_DOWNLOAD_HINTS = (
+    "다운로드",
+    "받아줘",
+    "받아 줘",
+    "내려받아",
+    "복구",
 )
 
 _DEVICE_FILE_REMOTE_HINTS = (
@@ -56,11 +68,7 @@ _DEVICE_FILE_REMOTE_HINTS = (
     "장비에 파일",
     "디바이스 파일",
     "로컬 파일",
-    "다운로드",
-    "받아줘",
-    "받아 줘",
-    "내려받아",
-    "복구",
+    *_DEVICE_FILE_DOWNLOAD_HINTS,
 )
 _DEVICE_FILE_PROBE_HINTS = _DEVICE_FILE_ID_HINTS + _DEVICE_FILE_REMOTE_HINTS
 
@@ -77,6 +85,12 @@ def _should_probe_device_files(question: str) -> bool:
     text = (question or "").strip()
     lowered = text.lower()
     return any(hint in text or hint in lowered for hint in _DEVICE_FILE_REMOTE_HINTS)
+
+
+def _should_download_device_files(question: str) -> bool:
+    text = (question or "").strip()
+    lowered = text.lower()
+    return any(hint in text or hint in lowered for hint in _DEVICE_FILE_DOWNLOAD_HINTS)
 
 
 def _is_device_file_probe_allowed(user_id: str | None) -> bool:
@@ -97,6 +111,14 @@ def _build_device_file_probe_config_message() -> str:
     )
 
 
+def _build_device_file_download_config_message() -> str:
+    return (
+        "장비 파일 다운로드 설정이 부족해. "
+        "MDA_GRAPHQL_URL, MDA_GRAPHQL_BEARER_TOKEN, DEVICE_SSH_PASSWORD, "
+        "S3_ULTRASOUND_BUCKET(또는 DEVICE_FILE_DOWNLOAD_BUCKET)이 필요해"
+    )
+
+
 def _display_device_probe_reason(reason: str | None) -> str:
     normalized = str(reason or "").strip().lower()
     if normalized in {"agent_ssh_not_ready", "novalidconnectionserror", "timeout", "oerror"}:
@@ -111,6 +133,12 @@ def _display_device_probe_reason(reason: str | None) -> str:
         return "DEVICE_SSH_PASSWORD 설정이 없어 장비 파일 확인 불가"
     if normalized == "paramiko_missing":
         return "paramiko 설치가 없어 장비 파일 확인 불가"
+    if normalized == "missing_download_bucket":
+        return "다운로드 버킷 설정이 없어 장비 파일 다운로드 불가"
+    if normalized == "s3_upload_failed":
+        return "S3 업로드 실패"
+    if normalized == "presigned_url_failed":
+        return "presigned URL 생성 실패"
     if normalized.startswith("ssh_exit_"):
         return f"장비 파일 확인 명령 실패 ({normalized})"
     if not normalized:
@@ -118,40 +146,16 @@ def _display_device_probe_reason(reason: str | None) -> str:
     return normalized
 
 
-def _find_device_files_by_file_id(
-    host: str,
-    port: int,
-    file_id: str,
-) -> dict[str, Any]:
-    if not host or not port or not file_id:
-        return {
-            "ok": False,
-            "reason": "missing_input",
-            "files": [],
-        }
-
-    if not cs.DEVICE_SSH_PASSWORD:
-        return {
-            "ok": False,
-            "reason": "missing_password",
-            "files": [],
-        }
-
-    pattern = f"*{file_id}*.mp4"
-    search_paths = cs.DEVICE_FILE_SEARCH_PATHS or [
-        "/home/mommytalk/AppData/Videos",
-        "/home/mommytalk/AppData/TrashCan",
-    ]
-    path_args = " ".join(shlex.quote(path) for path in search_paths)
-    remote_cmd = (
-        f"find {path_args} -type f -name {shlex.quote(pattern)} 2>/dev/null | sort -u"
-    )
-
+def _connect_device_ssh_client(host: str, port: int) -> Any:
     if paramiko is None:
         return {
             "ok": False,
             "reason": "paramiko_missing",
-            "files": [],
+        }
+    if not cs.DEVICE_SSH_PASSWORD:
+        return {
+            "ok": False,
+            "reason": "missing_password",
         }
 
     client = paramiko.SSHClient()
@@ -168,6 +172,63 @@ def _find_device_files_by_file_id(
             look_for_keys=False,
             allow_agent=False,
         )
+    except paramiko.AuthenticationException:
+        client.close()
+        return {
+            "ok": False,
+            "reason": "ssh_auth_failed",
+        }
+    except (
+        paramiko.SSHException,
+        paramiko.ssh_exception.NoValidConnectionsError,
+        socket.timeout,
+        TimeoutError,
+        OSError,
+    ) as exc:
+        client.close()
+        return {
+            "ok": False,
+            "reason": type(exc).__name__.lower(),
+        }
+
+    return {
+        "ok": True,
+        "client": client,
+    }
+
+
+def _find_device_files_by_file_id(
+    host: str,
+    port: int,
+    file_id: str,
+) -> dict[str, Any]:
+    if not host or not port or not file_id:
+        return {
+            "ok": False,
+            "reason": "missing_input",
+            "files": [],
+        }
+
+    pattern = f"*{file_id}*.mp4"
+    search_paths = cs.DEVICE_FILE_SEARCH_PATHS or [
+        "/home/mommytalk/AppData/Videos",
+        "/home/mommytalk/AppData/TrashCan",
+    ]
+    path_args = " ".join(shlex.quote(path) for path in search_paths)
+    remote_cmd = (
+        f"find {path_args} -type f -name {shlex.quote(pattern)} 2>/dev/null | sort -u"
+    )
+
+    connection = _connect_device_ssh_client(host, int(port))
+    if not connection.get("ok"):
+        return {
+            "ok": False,
+            "reason": connection.get("reason"),
+            "files": [],
+        }
+
+    client = connection["client"]
+    try:
         _, stdout, stderr = client.exec_command(
             remote_cmd,
             timeout=max(1, cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC),
@@ -175,12 +236,6 @@ def _find_device_files_by_file_id(
         exit_status = stdout.channel.recv_exit_status()
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
         stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
-    except paramiko.AuthenticationException:
-        return {
-            "ok": False,
-            "reason": "ssh_auth_failed",
-            "files": [],
-        }
     except (
         paramiko.SSHException,
         paramiko.ssh_exception.NoValidConnectionsError,
@@ -209,6 +264,96 @@ def _find_device_files_by_file_id(
         "ok": True,
         "reason": "ok",
         "files": files,
+    }
+
+
+def _build_device_download_s3_key(file_name: str) -> str:
+    prefix = (s.DEVICE_FILE_DOWNLOAD_PREFIX or "").strip().strip("/")
+    if prefix:
+        return f"{prefix}/{file_name}"
+    return file_name
+
+
+def _download_device_files_to_s3(
+    host: str,
+    port: int,
+    remote_files: list[str],
+) -> dict[str, Any]:
+    bucket = (s.DEVICE_FILE_DOWNLOAD_BUCKET or "").strip()
+    if not bucket:
+        return {
+            "ok": False,
+            "reason": "missing_download_bucket",
+            "downloads": [],
+        }
+
+    connection = _connect_device_ssh_client(host, int(port))
+    if not connection.get("ok"):
+        return {
+            "ok": False,
+            "reason": connection.get("reason"),
+            "downloads": [],
+        }
+
+    client = connection["client"]
+    s3_client = _build_s3_client()
+    downloads: list[dict[str, Any]] = []
+    try:
+        sftp = client.open_sftp()
+        try:
+            for remote_path in remote_files:
+                file_name = PurePosixPath(_display_value(remote_path, default="")).name
+                if not file_name:
+                    continue
+                key = _build_device_download_s3_key(file_name)
+                temp_path = ""
+                try:
+                    with tempfile.NamedTemporaryFile(prefix="device-file-", suffix=f"-{file_name}", delete=False) as tmp_file:
+                        temp_path = tmp_file.name
+                    sftp.get(remote_path, temp_path)
+                    s3_client.upload_file(temp_path, bucket, key)
+                    presigned_url = s3_client.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": bucket, "Key": key},
+                        ExpiresIn=max(60, s.DEVICE_FILE_DOWNLOAD_PRESIGNED_EXPIRES_SEC),
+                    )
+                    downloads.append(
+                        {
+                            "ok": True,
+                            "fileName": file_name,
+                            "key": key,
+                            "url": presigned_url,
+                        }
+                    )
+                except Exception as exc:
+                    reason = "s3_upload_failed"
+                    if "presigned" in type(exc).__name__.lower():
+                        reason = "presigned_url_failed"
+                    downloads.append(
+                        {
+                            "ok": False,
+                            "fileName": file_name,
+                            "key": key,
+                            "reason": reason,
+                        }
+                    )
+                finally:
+                    if temp_path:
+                        try:
+                            import os
+
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+    return {
+        "ok": any(item.get("ok") for item in downloads),
+        "reason": "ok" if any(item.get("ok") for item in downloads) else "s3_upload_failed",
+        "downloads": downloads,
     }
 
 
@@ -317,6 +462,7 @@ def _build_session_file_candidate_entry(
             default="",
         ),
         "probe": None,
+        "download": None,
     }
 
 
@@ -406,10 +552,28 @@ def _render_file_candidate_result(
                     found_files = probe.get("files") or []
                     lines.append(f"• 장비 파일 확인: `{len(found_files)}개`")
                     for found_file in found_files:
-                        lines.append(f"  - `{_display_value(found_file, default='')}`")
+                        file_name = PurePosixPath(_display_value(found_file, default="")).name
+                        lines.append(f"  - `{file_name}`")
                 else:
                     reason = _display_device_probe_reason(probe.get("reason"))
                     lines.append(f"• 장비 파일 확인: 실패 ({reason})")
+
+            download = session.get("download") if isinstance(session.get("download"), dict) else None
+            if download:
+                if download.get("ok"):
+                    download_items = [
+                        item
+                        for item in (download.get("downloads") or [])
+                        if isinstance(item, dict) and item.get("ok") and item.get("url")
+                    ]
+                    lines.append(f"• 다운로드 링크: `{len(download_items)}개` (1시간)")
+                    for item in download_items:
+                        file_name = _display_value(item.get("fileName"), default="파일")
+                        url = _display_value(item.get("url"), default="")
+                        lines.append(f"  - <{url}|{file_name}>")
+                else:
+                    reason = _display_device_probe_reason(download.get("reason"))
+                    lines.append(f"• 다운로드 준비: 실패 ({reason})")
 
         record_probe = record.get("deviceProbe") if isinstance(record.get("deviceProbe"), dict) else None
         if record_probe:
@@ -429,6 +593,7 @@ def _locate_barcode_file_candidates(
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
     probe_remote_files: bool = False,
+    download_remote_files: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     all_device_contexts = device_contexts
     if all_device_contexts is None:
@@ -529,6 +694,23 @@ def _locate_barcode_file_candidates(
             for session in record.get("sessions") or []:
                 file_id = str(session.get("fileId") or "").strip()
                 session["probe"] = results_by_file_id.get(file_id)
+                probe = session.get("probe") if isinstance(session.get("probe"), dict) else None
+                if download_remote_files and probe and probe.get("ok"):
+                    agent_ssh = device_probe.get("agentSsh") if isinstance(device_probe, dict) else None
+                    if isinstance(agent_ssh, dict):
+                        host = str(agent_ssh.get("host") or "").strip()
+                        port = int(agent_ssh.get("port") or 0)
+                        remote_files = [
+                            _display_value(item, default="")
+                            for item in (probe.get("files") or [])
+                            if _display_value(item, default="")
+                        ]
+                        if host and port and remote_files:
+                            session["download"] = _download_device_files_to_s3(
+                                host,
+                                port,
+                                remote_files,
+                            )
 
     result_text = _render_file_candidate_result(
         barcode=barcode,
@@ -546,6 +728,7 @@ def _locate_barcode_file_candidates(
             "date": log_date,
             "usedExpandedScope": used_expanded_scope,
             "probeRemoteFiles": probe_remote_files,
+            "downloadRemoteFiles": download_remote_files,
         },
         "summary": {
             "recordCount": len(records),

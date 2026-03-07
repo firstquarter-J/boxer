@@ -38,12 +38,14 @@ from boxer.routers.company.barcode_log import (
 )
 from boxer.routers.company.db_query import _extract_db_query, _format_db_query_result
 from boxer.routers.company.device_file_probe import (
+    _build_device_file_download_config_message,
     _build_device_file_probe_config_message,
     _build_device_file_probe_permission_message,
     _build_device_file_scope_request_message,
     _is_device_file_probe_allowed,
     _is_barcode_device_file_probe_request,
     _locate_barcode_file_candidates,
+    _should_download_device_files,
     _should_probe_device_files,
 )
 from boxer.routers.company.box_db import (
@@ -912,11 +914,15 @@ def create_app() -> App:
                 return
 
             probe_remote_files = _should_probe_device_files(question)
+            download_remote_files = _should_download_device_files(question)
             if probe_remote_files and not _is_device_file_probe_allowed(user_id):
                 reply(_build_device_file_probe_permission_message())
                 return
             if probe_remote_files and (not cs.MDA_GRAPHQL_URL or not cs.MDA_GRAPHQL_BEARER_TOKEN or not cs.DEVICE_SSH_PASSWORD):
                 reply(_build_device_file_probe_config_message())
+                return
+            if download_remote_files and not s.DEVICE_FILE_DOWNLOAD_BUCKET:
+                reply(_build_device_file_download_config_message())
                 return
 
             try:
@@ -956,6 +962,7 @@ def create_app() -> App:
                     recordings_context=context,
                     device_contexts=manual_device_contexts,
                     probe_remote_files=probe_remote_files,
+                    download_remote_files=download_remote_files,
                 )
                 reply(result_text)
                 logger.info(
