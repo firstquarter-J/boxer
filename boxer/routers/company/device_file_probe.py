@@ -97,6 +97,27 @@ def _build_device_file_probe_config_message() -> str:
     )
 
 
+def _display_device_probe_reason(reason: str | None) -> str:
+    normalized = str(reason or "").strip().lower()
+    if normalized in {"agent_ssh_not_ready", "novalidconnectionserror", "timeout", "oerror"}:
+        return "장비 SSH 연결 준비 실패 (장비 오프라인 또는 네트워크 불안정 가능)"
+    if normalized == "ssh_auth_failed":
+        return "장비 SSH 인증 실패"
+    if normalized == "file_id_missing":
+        return "fileId가 없어 장비 파일 확인 불가"
+    if normalized == "missing_device_name":
+        return "장비명이 없어 장비 파일 확인 불가"
+    if normalized == "missing_password":
+        return "DEVICE_SSH_PASSWORD 설정이 없어 장비 파일 확인 불가"
+    if normalized == "paramiko_missing":
+        return "paramiko 설치가 없어 장비 파일 확인 불가"
+    if normalized.startswith("ssh_exit_"):
+        return f"장비 파일 확인 명령 실패 ({normalized})"
+    if not normalized:
+        return "장비 파일 확인 실패"
+    return normalized
+
+
 def _find_device_files_by_file_id(
     host: str,
     port: int,
@@ -208,6 +229,7 @@ def _probe_device_files_for_record(record: dict[str, Any]) -> dict[str, Any]:
             "sshReason": "agent_ssh_not_ready",
             "opened": wait_result.get("opened"),
             "pollCount": wait_result.get("pollCount"),
+            "reusedExisting": bool(wait_result.get("reusedExisting")),
         }
 
     def build_results(current_agent_ssh: dict[str, Any]) -> list[dict[str, Any]]:
@@ -260,6 +282,7 @@ def _probe_device_files_for_record(record: dict[str, Any]) -> dict[str, Any]:
         },
         "opened": wait_result.get("opened"),
         "pollCount": wait_result.get("pollCount"),
+        "reusedExisting": bool(wait_result.get("reusedExisting")),
         "results": results,
     }
 
@@ -385,20 +408,14 @@ def _render_file_candidate_result(
                     for found_file in found_files:
                         lines.append(f"  - `{_display_value(found_file, default='')}`")
                 else:
-                    reason = _display_value(probe.get("reason"), default="unknown")
-                    lines.append(f"• 장비 파일 확인: 실패 (`{reason}`)")
+                    reason = _display_device_probe_reason(probe.get("reason"))
+                    lines.append(f"• 장비 파일 확인: 실패 ({reason})")
 
         record_probe = record.get("deviceProbe") if isinstance(record.get("deviceProbe"), dict) else None
         if record_probe:
-            if record_probe.get("sshReady"):
-                agent_ssh = record_probe.get("agentSsh") if isinstance(record_probe.get("agentSsh"), dict) else {}
+            if not record_probe.get("sshReady"):
                 lines.append(
-                    "• 장비 SSH: "
-                    f"`{_display_value(agent_ssh.get('host'), default='미확인')}:{_display_value(agent_ssh.get('port'), default='미확인')}`"
-                )
-            else:
-                lines.append(
-                    f"• 장비 SSH: 실패 (`{_display_value(record_probe.get('sshReason'), default='unknown')}`)"
+                    f"• 장비 파일 확인: 실패 ({_display_device_probe_reason(record_probe.get('sshReason'))})"
                 )
 
     return _truncate_text("\n".join(lines), 38000)

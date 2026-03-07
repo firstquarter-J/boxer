@@ -237,6 +237,16 @@ def _wait_for_mda_device_agent_ssh(
     )
 
     current_state = _get_mda_device_agent_ssh(device_name)
+    current_agent_ssh = ((current_state or {}).get("agentSsh") or {}) if isinstance(current_state, dict) else {}
+    if current_agent_ssh.get("host") and current_agent_ssh.get("port"):
+        return {
+            "opened": None,
+            "device": current_state,
+            "pollCount": 0,
+            "ready": True,
+            "reusedExisting": True,
+        }
+
     host_to_use = (
         _display_value(((current_state or {}).get("agentSsh") or {}).get("host"), default="")
         or (host or cs.MDA_SSH_OPEN_HOST).strip()
@@ -257,6 +267,7 @@ def _wait_for_mda_device_agent_ssh(
                 "device": last_state,
                 "pollCount": poll_count,
                 "ready": True,
+                "reusedExisting": False,
             }
 
         if poll_count % actual_resend_every == 0:
@@ -267,4 +278,5 @@ def _wait_for_mda_device_agent_ssh(
         "device": last_state,
         "pollCount": poll_count,
         "ready": False,
+        "reusedExisting": False,
     }
