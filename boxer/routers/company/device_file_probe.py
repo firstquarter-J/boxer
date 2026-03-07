@@ -1,6 +1,11 @@
 import shlex
-import subprocess
+import socket
 from typing import Any
+
+try:
+    import paramiko
+except ImportError:  # pragma: no cover - runtime guard
+    paramiko = None
 
 from boxer.company import settings as cs
 from boxer.core.utils import _display_value, _truncate_text
@@ -18,6 +23,7 @@ from boxer.routers.company.box_db import (
     _lookup_device_contexts_by_barcode,
 )
 from boxer.routers.company.mda_graphql import (
+    _open_mda_device_ssh,
     _get_mda_device_agent_ssh,
     _is_mda_graphql_configured,
     _wait_for_mda_device_agent_ssh,
@@ -119,49 +125,62 @@ def _find_device_files_by_file_id(
     remote_cmd = (
         f"find {path_args} -type f -name {shlex.quote(pattern)} 2>/dev/null | sort -u"
     )
-    command = [
-        "sshpass",
-        "-p",
-        cs.DEVICE_SSH_PASSWORD,
-        "ssh",
-        "-p",
-        str(port),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        f"ConnectTimeout={max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC)}",
-        f"{cs.DEVICE_SSH_USER}@{host}",
-        remote_cmd,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=max(1, cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+
+    if paramiko is None:
         return {
             "ok": False,
-            "reason": "timeout",
-            "files": [],
-        }
-    except FileNotFoundError:
-        return {
-            "ok": False,
-            "reason": "sshpass_missing",
+            "reason": "paramiko_missing",
             "files": [],
         }
 
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    files = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if completed.returncode not in (0, 1):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host,
+            port=int(port),
+            username=cs.DEVICE_SSH_USER,
+            password=cs.DEVICE_SSH_PASSWORD,
+            timeout=max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC),
+            banner_timeout=max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC),
+            auth_timeout=max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC),
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        _, stdout, stderr = client.exec_command(
+            remote_cmd,
+            timeout=max(1, cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC),
+        )
+        exit_status = stdout.channel.recv_exit_status()
+        stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
+        stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
+    except paramiko.AuthenticationException:
         return {
             "ok": False,
-            "reason": f"ssh_exit_{completed.returncode}",
-            "stderr": stderr[:300],
+            "reason": "ssh_auth_failed",
+            "files": [],
+        }
+    except (
+        paramiko.SSHException,
+        paramiko.ssh_exception.NoValidConnectionsError,
+        socket.timeout,
+        TimeoutError,
+        OSError,
+    ) as exc:
+        return {
+            "ok": False,
+            "reason": type(exc).__name__.lower(),
+            "files": [],
+        }
+    finally:
+        client.close()
+
+    files = [line.strip() for line in stdout_text.splitlines() if line.strip()]
+    if exit_status not in (0, 1):
+        return {
+            "ok": False,
+            "reason": f"ssh_exit_{exit_status}",
+            "stderr": stderr_text[:300],
             "files": files,
         }
 
@@ -191,34 +210,52 @@ def _probe_device_files_for_record(record: dict[str, Any]) -> dict[str, Any]:
             "pollCount": wait_result.get("pollCount"),
         }
 
-    host = str(agent_ssh.get("host") or "").strip()
-    port = agent_ssh.get("port")
-    results: list[dict[str, Any]] = []
-    for session in record.get("sessions") or []:
-        file_id = str(session.get("fileId") or "").strip()
-        if not file_id:
-            results.append(
+    def build_results(current_agent_ssh: dict[str, Any]) -> list[dict[str, Any]]:
+        host = str(current_agent_ssh.get("host") or "").strip()
+        port = current_agent_ssh.get("port")
+        built: list[dict[str, Any]] = []
+        for session in record.get("sessions") or []:
+            file_id = str(session.get("fileId") or "").strip()
+            if not file_id:
+                built.append(
+                    {
+                        "fileId": "",
+                        "ok": False,
+                        "reason": "file_id_missing",
+                        "files": [],
+                    }
+                )
+                continue
+            built.append(
                 {
-                    "fileId": "",
-                    "ok": False,
-                    "reason": "file_id_missing",
-                    "files": [],
+                    "fileId": file_id,
+                    **_find_device_files_by_file_id(host, int(port), file_id),
                 }
             )
-            continue
-        results.append(
-            {
-                "fileId": file_id,
-                **_find_device_files_by_file_id(host, int(port), file_id),
-            }
-        )
+        return built
+
+    results = build_results(agent_ssh)
+    should_retry = any(
+        item.get("reason") in {"novalidconnectionserror", "timeout", "oerror"}
+        for item in results
+        if isinstance(item, dict) and not item.get("ok")
+    )
+
+    if should_retry:
+        _open_mda_device_ssh(device_name)
+        wait_result = _wait_for_mda_device_agent_ssh(device_name)
+        device_info = wait_result.get("device") if isinstance(wait_result, dict) else {}
+        retried_agent_ssh = (device_info or {}).get("agentSsh") if isinstance(device_info, dict) else None
+        if wait_result.get("ready") and isinstance(retried_agent_ssh, dict):
+            agent_ssh = retried_agent_ssh
+            results = build_results(agent_ssh)
 
     return {
         "sshReady": True,
         "sshReason": "ready",
         "agentSsh": {
-            "host": host,
-            "port": int(port),
+            "host": _display_value(agent_ssh.get("host"), default=""),
+            "port": int(agent_ssh.get("port") or 0),
             "status": _display_value(agent_ssh.get("status"), default=""),
         },
         "opened": wait_result.get("opened"),
