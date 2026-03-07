@@ -986,14 +986,23 @@ def _find_recording_recovery_context(
     end_line_no = int(session["end_line_no"])
     cursor = max(start_line_no, int(after_line_no) + 1 if after_line_no is not None else start_line_no)
 
+    added_recording: dict[str, Any] | None = None
     started_recording: dict[str, Any] | None = None
     spawned_recording_ffmpeg: dict[str, Any] | None = None
+    spawned_motion_ffmpeg: dict[str, Any] | None = None
 
     for line_no in range(cursor, end_line_no + 1):
         raw_line = lines[line_no - 1]
         stripped = _strip_leading_log_timestamp(raw_line)
         lowered = stripped.lower()
         time_label = _extract_time_label_from_line(raw_line)
+
+        if added_recording is None and "addrecording(" in lowered:
+            added_recording = {
+                "lineNo": line_no,
+                "timeLabel": time_label,
+                "rawLine": stripped,
+            }
 
         if started_recording is None and "started recording" in lowered:
             started_recording = {
@@ -1009,30 +1018,49 @@ def _find_recording_recovery_context(
                 "rawLine": stripped,
             }
 
+        if spawned_motion_ffmpeg is None and "spawned motion ffmpeg" in lowered:
+            spawned_motion_ffmpeg = {
+                "lineNo": line_no,
+                "timeLabel": time_label,
+                "rawLine": stripped,
+            }
+
         if started_recording is not None and spawned_recording_ffmpeg is not None:
             break
 
-    if started_recording is None and spawned_recording_ffmpeg is None:
+    if added_recording is None and started_recording is None and spawned_recording_ffmpeg is None and spawned_motion_ffmpeg is None:
         return None
 
-    primary = started_recording or spawned_recording_ffmpeg or {}
+    primary = started_recording or added_recording or spawned_recording_ffmpeg or spawned_motion_ffmpeg or {}
     return {
+        "addedRecording": added_recording,
         "startedRecording": started_recording,
         "spawnedRecordingFfmpeg": spawned_recording_ffmpeg,
-        "fileId": _extract_file_id_from_recovery_events(started_recording, spawned_recording_ffmpeg),
+        "spawnedMotionFfmpeg": spawned_motion_ffmpeg,
+        "fileId": _extract_file_id_from_recovery_events(
+            added_recording,
+            started_recording,
+            spawned_recording_ffmpeg,
+            spawned_motion_ffmpeg,
+        ),
         "timeLabel": _display_value(primary.get("timeLabel"), default="시간미상"),
     }
 
 
 def _extract_file_id_from_recovery_events(
+    added_recording: dict[str, Any] | None,
     started_recording: dict[str, Any] | None,
     spawned_recording_ffmpeg: dict[str, Any] | None,
+    spawned_motion_ffmpeg: dict[str, Any] | None = None,
 ) -> str | None:
     candidates = [
+        str((added_recording or {}).get("rawLine") or "").strip(),
         str((started_recording or {}).get("rawLine") or "").strip(),
         str((spawned_recording_ffmpeg or {}).get("rawLine") or "").strip(),
+        str((spawned_motion_ffmpeg or {}).get("rawLine") or "").strip(),
     ]
     patterns = (
+        r"addrecording\(([a-z0-9]+)\)",
         r"started recording\s*:\s*([a-z0-9]+)",
         r"/Videos/([a-z0-9]+)\.mp4",
         r"/Videos/([a-z0-9]+)\.motion\.mp4",

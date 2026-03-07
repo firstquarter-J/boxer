@@ -59,21 +59,22 @@ def _build_session_file_candidate_entry(
     recovery_context = _find_recording_recovery_context(
         source_lines,
         session,
-        after_line_no=int(first_ffmpeg_error.get("lineNo"))
-        if isinstance(first_ffmpeg_error, dict)
-        else None,
     )
 
+    added_recording = (recovery_context or {}).get("addedRecording") or {}
     started_recording = (recovery_context or {}).get("startedRecording") or {}
     spawned_recording = (recovery_context or {}).get("spawnedRecordingFfmpeg") or {}
+    spawned_motion = (recovery_context or {}).get("spawnedMotionFfmpeg") or {}
 
     return {
         "startTime": _display_value(session.get("start_time_label"), default="시간미상"),
         "stopTime": _display_value(session.get("stop_time_label"), default="미확인"),
         "stopToken": _display_value(session.get("stop_token"), default=""),
         "fileId": _display_value((recovery_context or {}).get("fileId"), default=""),
+        "addedRecordingTime": _display_value(added_recording.get("timeLabel"), default=""),
         "startedRecordingTime": _display_value(started_recording.get("timeLabel"), default=""),
         "spawnedRecordingTime": _display_value(spawned_recording.get("timeLabel"), default=""),
+        "spawnedMotionTime": _display_value(spawned_motion.get("timeLabel"), default=""),
         "firstFfmpegErrorTime": _display_value(
             (first_ffmpeg_error or {}).get("timeLabel"),
             default="",
@@ -142,14 +143,20 @@ def _render_file_candidate_result(
             file_id = _display_value(session.get("fileId"), default="미추출")
             lines.append(f"• fileId: `{file_id}`")
 
+            added_time = _display_value(session.get("addedRecordingTime"), default="")
             started_time = _display_value(session.get("startedRecordingTime"), default="")
             spawned_time = _display_value(session.get("spawnedRecordingTime"), default="")
+            spawned_motion_time = _display_value(session.get("spawnedMotionTime"), default="")
             first_ffmpeg_error_time = _display_value(session.get("firstFfmpegErrorTime"), default="")
             start_logs: list[str] = []
+            if added_time:
+                start_logs.append(f"addRecording `{added_time}`")
             if started_time:
                 start_logs.append(f"Started recording `{started_time}`")
             if spawned_time:
                 start_logs.append(f"RECORDING ffmpeg 시작 `{spawned_time}`")
+            if spawned_motion_time and not spawned_time:
+                start_logs.append(f"MOTION ffmpeg 시작 `{spawned_motion_time}`")
             if start_logs:
                 lines.append(f"• fileId 근거 로그: {', '.join(start_logs)}")
             if first_ffmpeg_error_time:
