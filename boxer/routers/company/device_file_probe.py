@@ -151,14 +151,14 @@ def _build_device_file_probe_permission_message() -> str:
 def _build_device_file_probe_config_message() -> str:
     return (
         "장비 파일 존재 확인 설정이 부족해. "
-        "MDA_GRAPHQL_URL, MDA_GRAPHQL_BEARER_TOKEN, DEVICE_SSH_PASSWORD가 필요해"
+        "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD가 필요해"
     )
 
 
 def _build_device_file_download_config_message() -> str:
     return (
         "장비 파일 다운로드 설정이 부족해. "
-        "MDA_GRAPHQL_URL, MDA_GRAPHQL_BEARER_TOKEN, DEVICE_SSH_PASSWORD, "
+        "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD, "
         "S3_ULTRASOUND_BUCKET(또는 DEVICE_FILE_DOWNLOAD_BUCKET)이 필요해"
     )
 

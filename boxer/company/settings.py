@@ -2,6 +2,10 @@ import os
 import re
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 HYUN_USER_ID = os.getenv("HYUN_USER_ID", "").strip()
 MARK_USER_ID = os.getenv("MARK_USER_ID", "").strip()
 DD_USER_ID = os.getenv("DD_USER_ID", "").strip()
@@ -24,7 +28,7 @@ APP_USER_API_URL = os.getenv("APP_USER_API_URL", "").strip()
 APP_USER_API_TIMEOUT_SEC = int(os.getenv("APP_USER_API_TIMEOUT_SEC", "8"))
 
 MDA_GRAPHQL_URL = os.getenv("MDA_GRAPHQL_URL", "").strip()
-MDA_GRAPHQL_BEARER_TOKEN = os.getenv("MDA_GRAPHQL_BEARER_TOKEN", "").strip()
+MDA_ADMIN_USER_PASSWORD = os.getenv("MDA_ADMIN_USER_PASSWORD", "").strip()
 MDA_SSH_OPEN_HOST = os.getenv("MDA_SSH_OPEN_HOST", "remotes.mmtalkbox.com").strip()
 MDA_GRAPHQL_ORIGIN = os.getenv("MDA_GRAPHQL_ORIGIN", "https://mda.kr.mmtalkbox.com").strip()
 MDA_GRAPHQL_REFERER = os.getenv("MDA_GRAPHQL_REFERER", "https://mda.kr.mmtalkbox.com/").strip()
@@ -76,32 +80,6 @@ MOMMYBOX_REF_LEGACY_PATH = os.getenv(
     "MOMMYBOX_REF_LEGACY_PATH",
     str(Path(MOMMYBOX_REFERENCE_ROOT) / "legacy"),
 ).strip()
-
-
-def apply_legacy_db_compat(core_settings: object) -> None:
-    legacy_host = os.getenv("BOX_DB_HOST", "").strip()
-    legacy_port = os.getenv("BOX_DB_PORT", "").strip()
-    legacy_username = os.getenv("BOX_DB_USERNAME", "").strip()
-    legacy_password = os.getenv("BOX_DB_PASSWORD", "").strip()
-    legacy_database = os.getenv("BOX_DB_DATABASE", "").strip()
-
-    if not getattr(core_settings, "DB_HOST", "") and legacy_host:
-        setattr(core_settings, "DB_HOST", legacy_host)
-    if not getattr(core_settings, "DB_USERNAME", "") and legacy_username:
-        setattr(core_settings, "DB_USERNAME", legacy_username)
-    if not getattr(core_settings, "DB_PASSWORD", "") and legacy_password:
-        setattr(core_settings, "DB_PASSWORD", legacy_password)
-    if not getattr(core_settings, "DB_DATABASE", "") and legacy_database:
-        setattr(core_settings, "DB_DATABASE", legacy_database)
-
-    db_port_env = os.getenv("DB_PORT", "").strip()
-    if not db_port_env and legacy_port:
-        try:
-            parsed = int(legacy_port)
-            if parsed > 0:
-                setattr(core_settings, "DB_PORT", parsed)
-        except ValueError:
-            return
 
 BARCODE_PATTERN = re.compile(r"(?<!\d)(\d{11})(?!\d)")
 S3_LOG_DATE_TOKEN_PATTERN = re.compile(r"^20\d{2}-\d{2}-\d{2}$")

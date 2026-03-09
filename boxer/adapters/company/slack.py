@@ -232,7 +232,6 @@ def _extract_latest_barcode_from_thread_context(thread_context: str) -> str | No
 
 
 def create_app() -> App:
-    cs.apply_legacy_db_compat(s)
     _validate_tokens(include_llm=True, include_data_sources=True)
     claude_client = Anthropic(api_key=s.ANTHROPIC_API_KEY) if s.LLM_PROVIDER == "claude" else None
     s3_client: Any | None = None
@@ -1003,7 +1002,11 @@ def create_app() -> App:
             if probe_remote_files and not _is_device_file_probe_allowed(user_id):
                 reply(_build_device_file_probe_permission_message())
                 return
-            if probe_remote_files and (not cs.MDA_GRAPHQL_URL or not cs.MDA_GRAPHQL_BEARER_TOKEN or not cs.DEVICE_SSH_PASSWORD):
+            if probe_remote_files and (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
                 reply(_build_device_file_probe_config_message())
                 return
             if download_remote_files and not s.DEVICE_FILE_DOWNLOAD_BUCKET:

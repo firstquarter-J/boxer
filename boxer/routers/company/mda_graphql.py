@@ -6,6 +6,20 @@ from urllib import error, request
 from boxer.company import settings as cs
 from boxer.core.utils import _display_value
 
+_mda_access_token_cache: str | None = None
+
+_ADMIN_USER_QUERY = """
+query AdminUser($userPassword: String!) {
+  adminUser(userPassword: $userPassword) {
+    seq
+    userEmail
+    enabledFlag
+    superFlag
+    accessToken
+  }
+}
+"""
+
 _SSH_ORDER_MUTATION = """
 mutation SshOrder($deviceName: String!, $action: String!, $host: String!) {
   sshOrder(deviceName: $deviceName, action: $action, host: $host) {
@@ -44,17 +58,18 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
 
 
 def _is_mda_graphql_configured() -> bool:
-    return bool(cs.MDA_GRAPHQL_URL and cs.MDA_GRAPHQL_BEARER_TOKEN)
+    return bool(cs.MDA_GRAPHQL_URL and cs.MDA_ADMIN_USER_PASSWORD)
 
 
-def _execute_mda_graphql(
+def _execute_mda_graphql_request(
     query: str,
     variables: dict[str, Any],
     *,
     timeout_sec: int | None = None,
+    auth_token: str | None = None,
 ) -> dict[str, Any]:
-    if not _is_mda_graphql_configured():
-        raise RuntimeError("MDA GraphQL 설정(MDA_GRAPHQL_URL, MDA_GRAPHQL_BEARER_TOKEN)이 없어")
+    if not cs.MDA_GRAPHQL_URL:
+        raise RuntimeError("MDA GraphQL 설정(MDA_GRAPHQL_URL)이 없어")
 
     actual_timeout = max(1, timeout_sec if timeout_sec is not None else cs.MDA_API_TIMEOUT_SEC)
     body = json.dumps(
@@ -63,17 +78,20 @@ def _execute_mda_graphql(
             "variables": variables,
         }
     ).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/graphql-response+json,application/json;q=0.9",
+        "Origin": cs.MDA_GRAPHQL_ORIGIN,
+        "Referer": cs.MDA_GRAPHQL_REFERER,
+        "User-Agent": cs.MDA_GRAPHQL_USER_AGENT,
+    }
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
     req = request.Request(
         url=cs.MDA_GRAPHQL_URL,
         data=body,
-        headers={
-            "Authorization": f"Bearer {cs.MDA_GRAPHQL_BEARER_TOKEN}",
-            "Content-Type": "application/json",
-            "Accept": "application/graphql-response+json,application/json;q=0.9",
-            "Origin": cs.MDA_GRAPHQL_ORIGIN,
-            "Referer": cs.MDA_GRAPHQL_REFERER,
-            "User-Agent": cs.MDA_GRAPHQL_USER_AGENT,
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -106,14 +124,66 @@ def _execute_mda_graphql(
     return data
 
 
+def _get_mda_access_token(*, force_refresh: bool = False) -> str:
+    global _mda_access_token_cache
+
+    if not _is_mda_graphql_configured():
+        raise RuntimeError("MDA GraphQL 설정(MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD)이 없어")
+
+    if _mda_access_token_cache and not force_refresh:
+        return _mda_access_token_cache
+
+    data = _execute_mda_graphql_request(
+        _ADMIN_USER_QUERY,
+        {
+            "userPassword": cs.MDA_ADMIN_USER_PASSWORD,
+        },
+    )
+    result = data.get("adminUser")
+    if not isinstance(result, dict):
+        raise RuntimeError("MDA adminUser 응답 형식이 올바르지 않아")
+
+    enabled_flag = bool(result.get("enabledFlag"))
+    super_flag = bool(result.get("superFlag"))
+    access_token = str(result.get("accessToken") or "").strip()
+    if not enabled_flag or not super_flag or not access_token:
+        raise RuntimeError("MDA adminUser 인증 결과가 유효하지 않아")
+
+    _mda_access_token_cache = access_token
+    return access_token
+
+
+def _execute_mda_graphql(
+    query: str,
+    variables: dict[str, Any],
+    *,
+    timeout_sec: int | None = None,
+) -> dict[str, Any]:
+    token = _get_mda_access_token()
+    try:
+        return _execute_mda_graphql_request(
+            query,
+            variables,
+            timeout_sec=timeout_sec,
+            auth_token=token,
+        )
+    except RuntimeError as exc:
+        if "Unauthorized" not in str(exc):
+            raise
+        token = _get_mda_access_token(force_refresh=True)
+        return _execute_mda_graphql_request(
+            query,
+            variables,
+            timeout_sec=timeout_sec,
+            auth_token=token,
+        )
+
+
 def _normalize_agent_ssh(agent_ssh: Any) -> dict[str, Any] | None:
     if not isinstance(agent_ssh, dict):
         return None
 
     host = str(agent_ssh.get("host") or "").strip()
-    if not host:
-        host = ""
-
     port_raw = agent_ssh.get("port")
     port: int | None = None
     if isinstance(port_raw, int):
