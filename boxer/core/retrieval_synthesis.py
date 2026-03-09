@@ -238,7 +238,8 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "15) ffmpeg timestamp/DTS/PTS/invalid dropping 계열이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 적어.\n"
             "16) Endpoint/Uploader/JWT/getaddrinfo EAI_AGAIN 계열만 있으면 녹화 실패 원인으로 단정하지 말고 통신/업로드 이상으로 설명해.\n"
             "17) evidence에 DB 영상 기록이 있으면 업로드 최종 성공 근거로 같이 해석해.\n"
-            "18) 8줄 안팎으로 짧게 끝내. 장황한 설명 금지."
+            "18) evidence에 날짜 기준 DB 영상 기록이 없고 ffmpeg 오류나 stalled 신호가 있으면 `녹화 & 업로드 실패로 판단`이라고 적어.\n"
+            "19) 8줄 안팎으로 짧게 끝내. 장황한 설명 금지."
         )
     if route == "barcode_log_error_summary":
         return (
@@ -265,6 +266,7 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "20) `Couldn't renew JWT`, `Send Status: Failed`, `sendScreenShotBase64`, `sendCurrentFrameSnapBase64`, `sendDailyLog`, `Uploader ... couldn't be sent`, `getaddrinfo EAI_AGAIN` 같은 Endpoint/Uploader 통신 오류는 그것만으로 녹화 실패 원인이라고 판단하지 마.\n"
             "21) 위 통신 오류만 있고 종료 스캔/녹화 흐름이 정상이라면, 녹화 실패가 아니라 상태 전송/스크린샷/업로드 통신 오류로 설명해.\n"
             "22) evidence에 날짜 기준 DB 영상 기록(recordingsOnDateCount)이 있으면 반드시 같이 해석해. DB 영상 기록이 있으면 업로드 최종 성공 근거로 보고, 없으면 업로드 실패 가능성을 언급해.\n"
+            "23) 날짜 기준 DB 영상 기록이 없고 stalled/ffmpeg 오류가 함께 있으면 `녹화 & 업로드 실패로 판단`이라고 적어.\n"
         )
 
     if route != "barcode_log_analysis":

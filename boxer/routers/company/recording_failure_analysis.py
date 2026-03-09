@@ -248,6 +248,17 @@ def _record_has_ffmpeg_timestamp_error(record: dict[str, Any]) -> bool:
     return any(any(token in candidate for token in tokens) for candidate in candidates)
 
 
+def _record_has_recording_stall_error(record: dict[str, Any]) -> bool:
+    candidates: list[str] = []
+    groups = record.get("errorGroups") if isinstance(record.get("errorGroups"), list) else []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        candidates.append(_normalize_signature(group.get("signature")))
+    tokens = ("recording may be stalled", "recording critically stalled", "stalled")
+    return any(any(token in candidate for token in tokens) for candidate in candidates)
+
+
 def _record_has_device_busy_error(record: dict[str, Any]) -> bool:
     groups = record.get("errorGroups") if isinstance(record.get("errorGroups"), list) else []
     tokens = ("device or resource busy", "/dev/video0", "no such file or directory", "videodevice : error")
@@ -293,6 +304,8 @@ def _classify_record(record: dict[str, Any]) -> list[str]:
         tags.add("ffmpeg_error")
     if _record_has_ffmpeg_timestamp_error(record):
         tags.add("ffmpeg_timestamp_error")
+    if _record_has_recording_stall_error(record):
+        tags.add("recording_stalled")
     if _record_has_device_busy_error(record):
         tags.add("device_busy")
     if _record_has_high_post_stop_anomaly(record):
@@ -642,6 +655,10 @@ def _describe_recording_outcome(record: dict[str, Any]) -> str:
     recordings_on_date_count = int(record.get("recordingsOnDateCount") or 0)
     if "restart_detected" in tags:
         return "정상 녹화 실패로 판단"
+    if recordings_on_date_count <= 0 and (
+        "ffmpeg_error" in tags or "recording_stalled" in tags or "finish_anomaly" in tags
+    ):
+        return "녹화 & 업로드 실패로 판단"
     if "finish_anomaly" in tags:
         return "영상 손상 가능성 높음"
     if "stop_missing" in tags:
@@ -664,9 +681,16 @@ def _build_cause_line(record: dict[str, Any]) -> str:
     top_signature = _display_value(top_group.get("signature"), default="미확인")
     top_count = int(top_group.get("count") or 0)
     recordings_on_date_count = int(record.get("recordingsOnDateCount") or 0)
+    has_stall = "recording_stalled" in tags
 
     if "restart_detected" in tags:
         return "세션 중 장비 재시작이 확인돼 정상 녹화 실패로 판단해"
+    if recordings_on_date_count <= 0 and ("ffmpeg_error" in tags or has_stall or "finish_anomaly" in tags):
+        if has_stall and "ffmpeg_error" in tags:
+            return "녹화 중 파일 증가율 저하(stall)와 ffmpeg 종료가 함께 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해"
+        if has_stall:
+            return "녹화 중 파일 증가율 저하(stall)가 반복됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해"
+        return "ffmpeg 오류가 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해"
     if "finish_anomaly" in tags:
         return "초기 ffmpeg 오류보다 종료 처리 지연과 종료 후 장치 오류가 더 뚜렷해서 실제 영상 손상 가능성이 높아"
     if "status_network_error" in tags and "ffmpeg_error" not in tags:
@@ -745,6 +769,8 @@ def _build_operational_evidence_lines(record: dict[str, Any]) -> list[str]:
 def _build_action_lines(record: dict[str, Any]) -> list[str]:
     tags = set(record.get("classificationTags") or [])
     actions: list[str] = []
+    if "recording_stalled" in tags:
+        actions.append("- 장비 저장 경로 쓰기 상태와 파일 증가율 저하 원인을 먼저 확인")
     if "ffmpeg_timestamp_error" in tags or "ffmpeg_error" in tags or "device_busy" in tags:
         actions.append("- 캡처보드 케이블 체결 상태와 입력 신호를 가장 먼저 점검")
     if "restart_detected" in tags:

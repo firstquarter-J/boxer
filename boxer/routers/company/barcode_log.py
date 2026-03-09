@@ -1243,6 +1243,20 @@ def _build_session_recording_result_text(
     if first_ffmpeg_error is not None:
         error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
         elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
+        if recordings_on_date_count == 0:
+            detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
+            if elapsed:
+                detail_parts.append(f"세션 시작 후 `{elapsed}`")
+            if isinstance(post_stop_context, dict):
+                anomaly_text = str(post_stop_context.get("displayText") or "").strip()
+                if anomaly_text:
+                    detail_parts.append(anomaly_text)
+            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+            return (
+                f"녹화 & 업로드 실패로 판단 ({', '.join(detail_parts)})",
+                recovery_context,
+                post_stop_context,
+            )
         if isinstance(post_stop_context, dict) and str(post_stop_context.get("severity") or "") == "high":
             detail_parts = [f"첫 오류 `{error_time}`"]
             if elapsed:

@@ -554,6 +554,14 @@ def create_app() -> App:
                 token in top_signature_lower
                 for token in ("invalid dropping", "non-monotonous dts", "dts ", "timestamp")
             )
+            is_recording_stalled = any(
+                isinstance(group, dict)
+                and any(
+                    token in str(group.get("signature") or "").strip().lower()
+                    for token in ("recording may be stalled", "recording critically stalled", "stalled")
+                )
+                for group in error_groups
+            )
 
             abnormal_count = int(summary.get("abnormalSessionCount") or 0)
             error_line_count = int(summary.get("errorLineCount") or 0)
@@ -562,6 +570,13 @@ def create_app() -> App:
 
             if restart_count > 0:
                 cause_line = "• 핵심 원인: 세션 중 장비 재시작이 확인돼 정상 녹화 실패로 판단해"
+            elif recordings_on_date_count <= 0 and (is_ffmpeg_error or is_recording_stalled or isinstance(severe_session, dict)):
+                if is_recording_stalled and is_ffmpeg_error:
+                    cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)와 ffmpeg 종료가 함께 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해"
+                elif is_recording_stalled:
+                    cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)가 반복됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해"
+                else:
+                    cause_line = "• 핵심 원인: ffmpeg 오류가 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해"
             elif all_network_side_effect_errors and all_closed_normally and not isinstance(severe_session, dict):
                 if recordings_on_date_count > 0:
                     cause_line = "• 핵심 원인: JWT 갱신/상태 전송/업로드용 서버 통신 오류가 반복됐어. 하지만 날짜 기준 DB 영상 기록이 확인돼 녹화 실패 원인이라기보다 네트워크/DNS 통신 이상으로 봐야 해"
@@ -588,6 +603,11 @@ def create_app() -> App:
                 impact_line = (
                     f"• 영향: `{date_label}` `{hospital_name}` `{room_name}` 장비 `{device_name}`에서 "
                     "세션 중 재시작이 확인돼 정상 녹화 실패로 판단해"
+                )
+            elif recordings_on_date_count <= 0 and (is_ffmpeg_error or is_recording_stalled or isinstance(severe_session, dict)):
+                impact_line = (
+                    f"• 영향: `{date_label}` `{hospital_name}` `{room_name}` 장비 `{device_name}`에서 "
+                    f"날짜 기준 DB 영상 기록이 없고 error 라인 `{error_line_count}줄`이 확인돼 녹화 & 업로드 실패로 판단해"
                 )
             elif all_network_side_effect_errors and all_closed_normally and not isinstance(severe_session, dict):
                 if recordings_on_date_count > 0:
