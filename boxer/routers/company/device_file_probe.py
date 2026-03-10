@@ -1,13 +1,25 @@
+import base64
+import json
+import hashlib
+import hmac
+import re
 import shlex
 import socket
 import tempfile
+from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
+from zoneinfo import ZoneInfo
 
 try:
     import paramiko
 except ImportError:  # pragma: no cover - runtime guard
     paramiko = None
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - runtime guard
+    requests = None
 
 from boxer.company import settings as cs
 from boxer.core import settings as s
@@ -68,7 +80,18 @@ _DEVICE_FILE_DOWNLOAD_HINTS = (
     "받아줘",
     "받아 줘",
     "내려받아",
+)
+
+_DEVICE_FILE_RECOVERY_HINTS = (
+    "영상 복구",
+    "영상복구",
+    "파일 복구",
+    "파일복구",
     "복구",
+    "복구해",
+    "복구 해",
+    "복구해줘",
+    "복구 해줘",
 )
 
 _DEVICE_FILE_REMOTE_HINTS = (
@@ -99,6 +122,7 @@ _DEVICE_FILE_REMOTE_HINTS = (
     "디바이스 파일",
     "로컬 파일",
     *_DEVICE_FILE_DOWNLOAD_HINTS,
+    *_DEVICE_FILE_RECOVERY_HINTS,
 )
 _DEVICE_FILE_PROBE_HINTS = _DEVICE_FILE_ID_HINTS + _DEVICE_FILE_REMOTE_HINTS
 
@@ -123,12 +147,20 @@ def _should_download_device_files(question: str) -> bool:
     return any(hint in text or hint in lowered for hint in _DEVICE_FILE_DOWNLOAD_HINTS)
 
 
+def _should_recover_device_files(question: str) -> bool:
+    text = (question or "").strip()
+    lowered = text.lower()
+    return any(hint in text or hint in lowered for hint in _DEVICE_FILE_RECOVERY_HINTS)
+
+
 def _should_render_compact_device_file_list(question: str) -> bool:
     text = (question or "").strip()
     lowered = text.lower()
     if any(hint in text or hint in lowered for hint in _DEVICE_FILE_ID_HINTS):
         return False
     if any(hint in text or hint in lowered for hint in _DEVICE_FILE_DOWNLOAD_HINTS):
+        return False
+    if any(hint in text or hint in lowered for hint in _DEVICE_FILE_RECOVERY_HINTS):
         return False
     return any(hint in text or hint in lowered for hint in _DEVICE_FILE_LIST_HINTS)
 
@@ -138,6 +170,8 @@ def _should_render_compact_file_id_result(question: str) -> bool:
     lowered = text.lower()
     if any(hint in text or hint in lowered for hint in _DEVICE_FILE_DOWNLOAD_HINTS):
         return False
+    if any(hint in text or hint in lowered for hint in _DEVICE_FILE_RECOVERY_HINTS):
+        return False
     return any(hint in text or hint in lowered for hint in _DEVICE_FILE_ID_HINTS)
 
 
@@ -145,6 +179,12 @@ def _should_render_compact_device_download_result(question: str) -> bool:
     text = (question or "").strip()
     lowered = text.lower()
     return any(hint in text or hint in lowered for hint in _DEVICE_FILE_DOWNLOAD_HINTS)
+
+
+def _should_render_compact_device_recovery_result(question: str) -> bool:
+    text = (question or "").strip()
+    lowered = text.lower()
+    return any(hint in text or hint in lowered for hint in _DEVICE_FILE_RECOVERY_HINTS)
 
 
 def _is_device_file_probe_allowed(user_id: str | None) -> bool:
@@ -169,7 +209,15 @@ def _build_device_file_download_config_message() -> str:
     return (
         "장비 파일 다운로드 설정이 부족해. "
         "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD, "
-        "S3_ULTRASOUND_BUCKET(또는 DEVICE_FILE_DOWNLOAD_BUCKET)이 필요해"
+        "DEVICE_FILE_DOWNLOAD_BUCKET이 필요해"
+    )
+
+
+def _build_device_file_recovery_config_message() -> str:
+    return (
+        "장비 영상 복구 설정이 부족해. "
+        "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD, "
+        "BOX_UPLOADER_BASE_URL이 필요해"
     )
 
 
@@ -189,6 +237,16 @@ def _display_device_probe_reason(reason: str | None) -> str:
         return "paramiko 설치가 없어 장비 파일 확인 불가"
     if normalized == "missing_download_bucket":
         return "다운로드 버킷 설정이 없어 장비 파일 다운로드 불가"
+    if normalized == "requests_missing":
+        return "requests 설치가 없어 업로더 전송 불가"
+    if normalized == "recording_file_missing":
+        return "본편 mp4 파일이 없어 업로더 전송 불가"
+    if normalized == "missing_recorded_at":
+        return "recordedAt 계산 실패로 업로더 전송 불가"
+    if normalized == "uploader_request_failed":
+        return "업로더 전송 실패"
+    if normalized.startswith("uploader_http_"):
+        return f"업로더 HTTP 오류 ({normalized.split('_')[-1]})"
     if normalized == "s3_upload_failed":
         return "S3 업로드 실패"
     if normalized == "presigned_url_failed":
@@ -326,6 +384,248 @@ def _build_device_download_s3_key(file_name: str) -> str:
     if prefix:
         return f"{prefix}/{file_name}"
     return file_name
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _build_uploader_bearer_token(device_name: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"deviceName": device_name}
+    signing_input = (
+        f"{_b64url_encode(json.dumps(header, separators=(',', ':')).encode('utf-8'))}."
+        f"{_b64url_encode(json.dumps(payload, separators=(',', ':')).encode('utf-8'))}"
+    )
+    signature = hmac.new(
+        (cs.UPLOADER_JWT_SECRET or "").encode("utf-8"),
+        signing_input.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{signing_input}.{_b64url_encode(signature)}"
+
+
+def _build_uploader_recorded_at_ms(log_date: str, *time_labels: str) -> str:
+    for time_label in time_labels:
+        normalized = _display_value(time_label, default="").strip()
+        if not normalized:
+            continue
+        try:
+            dt = datetime.strptime(f"{log_date} {normalized}", "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=ZoneInfo("Asia/Seoul")
+            )
+        except ValueError:
+            continue
+        return str(int(dt.timestamp() * 1000))
+    return ""
+
+
+def _normalize_recovery_file_base(file_base: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", _display_value(file_base, default=""))
+
+
+def _build_uploader_targets(remote_files: list[str]) -> list[dict[str, str]]:
+    targets: list[dict[str, str]] = []
+    seen_file_ids: set[str] = set()
+
+    for remote_path in remote_files:
+        normalized_path = _display_value(remote_path, default="").strip()
+        if not normalized_path:
+            continue
+
+        original_name = PurePosixPath(normalized_path).name
+        lowered_name = original_name.lower()
+        file_id = ""
+        upload_name = original_name
+
+        if lowered_name.endswith(".motion.mp4"):
+            file_base = _normalize_recovery_file_base(original_name[: -len(".motion.mp4")])
+            if not file_base:
+                continue
+            file_id = f"{file_base}motion"
+            upload_name = f"{file_id}.mp4"
+        else:
+            segmented_match = re.match(r"^(?P<base>.+)\.(?P<segment>\d+)\.mp4$", original_name, re.IGNORECASE)
+            if segmented_match:
+                file_base = _normalize_recovery_file_base(segmented_match.group("base"))
+                segment = segmented_match.group("segment")
+                if not file_base:
+                    continue
+                file_id = f"{file_base}{segment}"
+                upload_name = f"{file_id}.mp4"
+            elif lowered_name.endswith(".mp4"):
+                file_base = _normalize_recovery_file_base(original_name[:-4])
+                if not file_base:
+                    continue
+                file_id = file_base
+                upload_name = f"{file_id}.mp4"
+
+        if not file_id or file_id in seen_file_ids:
+            continue
+        seen_file_ids.add(file_id)
+        targets.append(
+            {
+                "remotePath": normalized_path,
+                "fileId": file_id,
+                "uploadName": upload_name,
+                "sourceName": original_name,
+            }
+        )
+
+    return targets
+
+
+def _upload_device_files_to_uploader(
+    host: str,
+    port: int,
+    remote_files: list[str],
+    *,
+    barcode: str,
+    device_name: str,
+    file_id: str,
+    log_date: str,
+    started_time: str,
+    added_time: str,
+    spawned_time: str,
+    session_start_time: str,
+) -> dict[str, Any]:
+    if requests is None:
+        return {
+            "ok": False,
+            "reason": "requests_missing",
+            "uploads": [],
+        }
+
+    uploader_base_url = (cs.BOX_UPLOADER_BASE_URL or "").strip().rstrip("/")
+    uploader_path = (cs.BOX_UPLOADER_RECORDING_PATH or "").strip()
+    if not uploader_base_url or not uploader_path:
+        return {
+            "ok": False,
+            "reason": "missing_uploader_config",
+            "uploads": [],
+        }
+
+    targets = _build_uploader_targets(remote_files)
+    if not targets:
+        return {
+            "ok": False,
+            "reason": "recording_file_missing",
+            "uploads": [],
+        }
+
+    recorded_at_ms = _build_uploader_recorded_at_ms(
+        log_date,
+        started_time,
+        added_time,
+        spawned_time,
+        session_start_time,
+    )
+    if not recorded_at_ms:
+        return {
+            "ok": False,
+            "reason": "missing_recorded_at",
+            "uploads": [],
+        }
+
+    connection = _connect_device_ssh_client(host, int(port))
+    if not connection.get("ok"):
+        return {
+            "ok": False,
+            "reason": connection.get("reason"),
+            "uploads": [],
+        }
+
+    client = connection["client"]
+    uploads: list[dict[str, Any]] = []
+    temp_paths: list[str] = []
+    upload_url = f"{uploader_base_url}{uploader_path}"
+
+    try:
+        sftp = client.open_sftp()
+        try:
+            token = _build_uploader_bearer_token(device_name)
+            for target in targets:
+                upload_name = target["uploadName"]
+                with tempfile.NamedTemporaryFile(
+                    prefix="device-upload-",
+                    suffix=f"-{upload_name}",
+                    delete=False,
+                ) as tmp_file:
+                    local_temp_path = tmp_file.name
+                temp_paths.append(local_temp_path)
+                sftp.get(target["remotePath"], local_temp_path)
+
+                with open(local_temp_path, "rb") as recording_fp:
+                    response = requests.post(
+                        upload_url,
+                        headers={"Authorization": f"Bearer {token}"},
+                        data={
+                            "deviceName": device_name,
+                            "barcode": barcode,
+                            "fileId": target["fileId"],
+                            "recordedAt": recorded_at_ms,
+                        },
+                        files={
+                            "recording": (upload_name, recording_fp, "video/mp4"),
+                        },
+                        timeout=max(1, cs.BOX_UPLOADER_TIMEOUT_SEC),
+                    )
+
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+
+                status = _display_value(payload.get("status"), default="")
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                item_ok = response.status_code < 400 and status in {"success", "alreadyExists"}
+                item_reason = "ok" if item_ok else (
+                    f"uploader_http_{response.status_code}"
+                    if response.status_code >= 400
+                    else "uploader_request_failed"
+                )
+                uploads.append(
+                    {
+                        "ok": item_ok,
+                        "reason": item_reason,
+                        "status": status or "unknown",
+                        "fileNames": [upload_name],
+                        "sourceFileName": target["sourceName"],
+                        "uploadedFileId": target["fileId"],
+                        "ultrasoundSeq": _display_value(data.get("ultrasoundSeq"), default=""),
+                        "mdaUrl": f"https://mda.kr.mmtalkbox.com/cs?search={barcode}",
+                        "message": _display_value(payload.get("message"), default=""),
+                    }
+                )
+        finally:
+            sftp.close()
+    except requests.RequestException:
+        return {
+            "ok": False,
+            "reason": "uploader_request_failed",
+            "uploads": [],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": type(exc).__name__.lower(),
+            "uploads": [],
+        }
+    finally:
+        client.close()
+        for temp_path in temp_paths:
+            try:
+                import os
+
+                os.remove(temp_path)
+            except OSError:
+                pass
+    any_success = any(item.get("ok") for item in uploads)
+    return {
+        "ok": any_success,
+        "reason": "ok" if any_success else "uploader_request_failed",
+        "uploads": uploads,
+    }
 
 
 def _download_device_files_to_s3(
@@ -531,6 +831,7 @@ def _render_file_candidate_result(
     compact_file_list: bool = False,
     compact_file_id: bool = False,
     compact_download: bool = False,
+    compact_recovery: bool = False,
 ) -> str:
     if logs_found_any == 0:
         return (
@@ -626,7 +927,7 @@ def _render_file_candidate_result(
 
     if compact_download:
         lines = [
-            "*장비 파일 다운로드 결과*",
+            "*장비 영상 다운로드 결과*",
             f"• 바코드: `{barcode}`",
             f"• 날짜: `{log_date}`",
         ]
@@ -642,8 +943,7 @@ def _render_file_candidate_result(
 
             file_names: list[str] = []
             seen_files: set[str] = set()
-            download_items: list[dict[str, str]] = []
-            seen_downloads: set[str] = set()
+            download_items: list[dict[str, Any]] = []
             download_failures: list[str] = []
 
             for session in record.get("sessions") or []:
@@ -658,16 +958,13 @@ def _render_file_candidate_result(
                 download = session.get("download") if isinstance(session.get("download"), dict) else None
                 if not download:
                     continue
-                if download.get("ok"):
-                    for item in download.get("downloads") or []:
-                        if not isinstance(item, dict) or not item.get("ok") or not item.get("url"):
-                            continue
-                        file_name = _display_value(item.get("fileName"), default="파일")
-                        url = _display_value(item.get("url"), default="")
-                        dedupe_key = f"{file_name}|{url}"
-                        if url and dedupe_key not in seen_downloads:
-                            seen_downloads.add(dedupe_key)
-                            download_items.append({"fileName": file_name, "url": url})
+                download_entries = [
+                    item
+                    for item in (download.get("downloads") or [])
+                    if isinstance(item, dict)
+                ]
+                if download_entries:
+                    download_items.extend(download_entries)
                 else:
                     failure_reason = _display_device_probe_reason(download.get("reason"))
                     if failure_reason not in download_failures:
@@ -686,14 +983,106 @@ def _render_file_candidate_result(
                 else:
                     lines.append("• 장비 파일 목록: `0개`")
 
-            if download_items:
-                lines.append(f"• 다운로드 링크: `{len(download_items)}개` (1시간)")
-                for item in download_items:
-                    lines.append(f"  - 🎣 <{item['url']}|{item['fileName']}>")
+            successful_items = [item for item in download_items if item.get("ok")]
+            if successful_items:
+                lines.append(f"• 다운로드 링크: `{len(successful_items)}개` (1시간)")
+                for item in successful_items:
+                    file_name = _display_value(item.get("fileName"), default="파일")
+                    url = _display_value(item.get("url"), default="")
+                    if url:
+                        lines.append(f"  - 🎣 <{url}|{file_name}>")
+                    else:
+                        lines.append(f"  - 🎣 `{file_name}`")
             elif download_failures:
                 lines.append(f"• 다운로드 준비: 실패 ({', '.join(download_failures)})")
             else:
                 lines.append("• 다운로드 링크: `0개`")
+
+        return _truncate_text("\n".join(lines), 38000)
+
+    if compact_recovery:
+        lines = [
+            "*장비 영상 복구 결과*",
+            f"• 바코드: `{barcode}`",
+            f"• 날짜: `{log_date}`",
+        ]
+        if used_expanded_scope:
+            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+
+        for record in records:
+            lines.append("")
+            lines.append(f"• 장비: `{_display_value(record.get('deviceName'), default='미확인')}`")
+            lines.append(f"• 병원: `{_display_value(record.get('hospitalName'), default='미확인')}`")
+            lines.append(f"• 병실: `{_display_value(record.get('roomName'), default='미확인')}`")
+            lines.append(f"• 날짜: `{log_date}`")
+
+            file_names: list[str] = []
+            seen_files: set[str] = set()
+            upload_items: list[dict[str, Any]] = []
+            seen_uploads: set[str] = set()
+            upload_failures: list[str] = []
+
+            for session in record.get("sessions") or []:
+                probe = session.get("probe") if isinstance(session.get("probe"), dict) else None
+                if probe and probe.get("ok"):
+                    for found_file in probe.get("files") or []:
+                        file_name = PurePosixPath(_display_value(found_file, default="")).name
+                        if file_name and file_name not in seen_files:
+                            seen_files.add(file_name)
+                            file_names.append(file_name)
+
+                upload = session.get("upload") if isinstance(session.get("upload"), dict) else None
+                if not upload:
+                    continue
+                upload_entries = [
+                    item
+                    for item in (upload.get("uploads") or [])
+                    if isinstance(item, dict)
+                ]
+                if upload_entries:
+                    for item in upload_entries:
+                        for file_name in item.get("fileNames") or []:
+                            normalized_name = _display_value(file_name, default="")
+                            if not normalized_name:
+                                continue
+                            dedupe_key = f"{normalized_name}|{_display_value(item.get('status'), default='')}"
+                            if dedupe_key not in seen_uploads:
+                                seen_uploads.add(dedupe_key)
+                                upload_items.append(
+                                    {
+                                        "fileName": normalized_name,
+                                        "status": _display_value(item.get("status"), default="unknown"),
+                                        "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
+                                    }
+                                )
+                else:
+                    failure_reason = _display_device_probe_reason(upload.get("reason"))
+                    if failure_reason not in upload_failures:
+                        upload_failures.append(failure_reason)
+
+            if file_names:
+                lines.append(f"• 장비 파일 목록: `{len(file_names)}개`")
+                for file_name in file_names:
+                    lines.append(f"  - `{file_name}`")
+            else:
+                record_probe = record.get("deviceProbe") if isinstance(record.get("deviceProbe"), dict) else None
+                if record_probe and not record_probe.get("sshReady"):
+                    lines.append(
+                        f"• 장비 파일 확인: 실패 ({_display_device_probe_reason(record_probe.get('sshReason'))})"
+                    )
+                else:
+                    lines.append("• 장비 파일 목록: `0개`")
+
+            if upload_items:
+                lines.append(f"• 복구 업로드 결과: `{len(upload_items)}개`")
+                for item in upload_items:
+                    status = _display_value(item.get("status"), default="unknown")
+                    lines.append(f"  - `{item['fileName']}` | `{status}`")
+                lines.append(f"• MDA URL: 🎣 <https://mda.kr.mmtalkbox.com/cs?search={barcode}|열기>")
+            elif upload_failures:
+                lines.append(f"• 복구 업로드: 실패 ({', '.join(upload_failures)})")
+            else:
+                lines.append("• 복구 업로드 결과: `0개`")
 
         return _truncate_text("\n".join(lines), 38000)
 
@@ -758,22 +1147,24 @@ def _render_file_candidate_result(
                     reason = _display_device_probe_reason(probe.get("reason"))
                     lines.append(f"• 장비 파일 확인: 실패 ({reason})")
 
-            download = session.get("download") if isinstance(session.get("download"), dict) else None
-            if download:
-                if download.get("ok"):
-                    download_items = [
-                        item
-                        for item in (download.get("downloads") or [])
-                        if isinstance(item, dict) and item.get("ok") and item.get("url")
-                    ]
-                    lines.append(f"• 다운로드 링크: `{len(download_items)}개` (1시간)")
-                    for item in download_items:
-                        file_name = _display_value(item.get("fileName"), default="파일")
-                        url = _display_value(item.get("url"), default="")
-                        lines.append(f"  - 🎣 <{url}|{file_name}>")
+            upload = session.get("upload") if isinstance(session.get("upload"), dict) else None
+            if upload:
+                upload_items = [
+                    item
+                    for item in (upload.get("uploads") or [])
+                    if isinstance(item, dict)
+                ]
+                if upload_items:
+                    lines.append(f"• 복구 업로드 결과: `{len(upload_items)}개`")
+                    for item in upload_items:
+                        file_names = [name for name in (item.get("fileNames") or []) if _display_value(name, default="")]
+                        joined_names = ", ".join(f"`{_display_value(name, default='')}`" for name in file_names) or "`파일`"
+                        status = _display_value(item.get("status"), default="unknown")
+                        lines.append(f"  - {joined_names} | `{status}`")
+                    lines.append(f"• MDA URL: 🎣 <https://mda.kr.mmtalkbox.com/cs?search={barcode}|열기>")
                 else:
-                    reason = _display_device_probe_reason(download.get("reason"))
-                    lines.append(f"• 다운로드 준비: 실패 ({reason})")
+                    reason = _display_device_probe_reason(upload.get("reason"))
+                    lines.append(f"• 복구 업로드: 실패 ({reason})")
 
         record_probe = record.get("deviceProbe") if isinstance(record.get("deviceProbe"), dict) else None
         if record_probe:
@@ -797,6 +1188,8 @@ def _locate_barcode_file_candidates(
     compact_file_list: bool = False,
     compact_file_id: bool = False,
     compact_download: bool = False,
+    recover_remote_files: bool = False,
+    compact_recovery: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     all_device_contexts = device_contexts
     if all_device_contexts is None:
@@ -914,6 +1307,30 @@ def _locate_barcode_file_candidates(
                                 port,
                                 remote_files,
                             )
+                if recover_remote_files and probe and probe.get("ok"):
+                    agent_ssh = device_probe.get("agentSsh") if isinstance(device_probe, dict) else None
+                    if isinstance(agent_ssh, dict):
+                        host = str(agent_ssh.get("host") or "").strip()
+                        port = int(agent_ssh.get("port") or 0)
+                        remote_files = [
+                            _display_value(item, default="")
+                            for item in (probe.get("files") or [])
+                            if _display_value(item, default="")
+                        ]
+                        if host and port and remote_files:
+                            session["upload"] = _upload_device_files_to_uploader(
+                                host,
+                                port,
+                                remote_files,
+                                barcode=barcode,
+                                device_name=_display_value(record.get("deviceName"), default=""),
+                                file_id=file_id,
+                                log_date=log_date,
+                                started_time=_display_value(session.get("startedRecordingTime"), default=""),
+                                added_time=_display_value(session.get("addedRecordingTime"), default=""),
+                                spawned_time=_display_value(session.get("spawnedRecordingTime"), default=""),
+                                session_start_time=_display_value(session.get("startTime"), default=""),
+                            )
 
     result_text = _render_file_candidate_result(
         barcode=barcode,
@@ -925,6 +1342,7 @@ def _locate_barcode_file_candidates(
         compact_file_list=compact_file_list,
         compact_file_id=compact_file_id,
         compact_download=compact_download,
+        compact_recovery=compact_recovery,
     )
     payload = {
         "route": "device_file_candidate_lookup",
@@ -935,9 +1353,11 @@ def _locate_barcode_file_candidates(
             "usedExpandedScope": used_expanded_scope,
             "probeRemoteFiles": probe_remote_files,
             "downloadRemoteFiles": download_remote_files,
+            "recoverRemoteFiles": recover_remote_files,
             "compactFileList": compact_file_list,
             "compactFileId": compact_file_id,
             "compactDownload": compact_download,
+            "compactRecovery": compact_recovery,
         },
         "summary": {
             "recordCount": len(records),

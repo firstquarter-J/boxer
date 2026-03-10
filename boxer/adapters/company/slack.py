@@ -48,15 +48,18 @@ from boxer.routers.company.device_file_probe import (
     _build_device_file_download_config_message,
     _build_device_file_probe_config_message,
     _build_device_file_probe_permission_message,
+    _build_device_file_recovery_config_message,
     _build_device_file_scope_request_message,
     _is_device_file_probe_allowed,
     _is_barcode_device_file_probe_request,
     _locate_barcode_file_candidates,
     _should_download_device_files,
     _should_probe_device_files,
+    _should_recover_device_files,
     _should_render_compact_file_id_result,
     _should_render_compact_device_download_result,
     _should_render_compact_device_file_list,
+    _should_render_compact_device_recovery_result,
 )
 from boxer.routers.company.recording_failure_analysis import (
     _build_recording_failure_analysis_evidence,
@@ -272,6 +275,114 @@ def _extract_latest_barcode_from_thread_context(thread_context: str) -> str | No
     return None
 
 
+def _collect_device_download_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for record in payload.get("records") or []:
+        if not isinstance(record, dict):
+            continue
+
+        file_names: list[str] = []
+        seen_files: set[str] = set()
+        download_links: list[dict[str, str]] = []
+        seen_links: set[tuple[str, str]] = set()
+
+        for session in record.get("sessions") or []:
+            if not isinstance(session, dict):
+                continue
+
+            probe = session.get("probe") if isinstance(session.get("probe"), dict) else None
+            if probe and probe.get("ok"):
+                for found_file in probe.get("files") or []:
+                    file_name = str(found_file or "").strip().split("/")[-1]
+                    if file_name and file_name not in seen_files:
+                        seen_files.add(file_name)
+                        file_names.append(file_name)
+
+            download = session.get("download") if isinstance(session.get("download"), dict) else None
+            if not download:
+                continue
+            for item in download.get("downloads") or []:
+                if not isinstance(item, dict) or not item.get("ok"):
+                    continue
+                file_name = str(item.get("fileName") or "").strip()
+                url = str(item.get("url") or "").strip()
+                if not file_name or not url:
+                    continue
+                dedupe_key = (file_name, url)
+                if dedupe_key in seen_links:
+                    continue
+                seen_links.add(dedupe_key)
+                download_links.append({"fileName": file_name, "url": url})
+
+        if not download_links:
+            continue
+
+        records.append(
+            {
+                "deviceName": str(record.get("deviceName") or "").strip() or "미확인",
+                "hospitalName": str(record.get("hospitalName") or "").strip() or "미확인",
+                "roomName": str(record.get("roomName") or "").strip() or "미확인",
+                "fileNames": file_names,
+                "downloadLinks": download_links,
+            }
+        )
+
+    return records
+
+
+def _render_device_download_dm_text(
+    barcode: str,
+    log_date: str,
+    records: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "*장비 영상 다운로드 결과*",
+        f"• 바코드: `{barcode}`",
+        f"• 날짜: `{log_date}`",
+    ]
+    for record in records:
+        lines.append("")
+        lines.append(f"• 장비: `{record['deviceName']}`")
+        lines.append(f"• 병원: `{record['hospitalName']}`")
+        lines.append(f"• 병실: `{record['roomName']}`")
+        file_names = record.get("fileNames") or []
+        lines.append(f"• 장비 파일 목록: `{len(file_names)}개`")
+        for file_name in file_names:
+            lines.append(f"  - `{file_name}`")
+        download_links = record.get("downloadLinks") or []
+        lines.append(f"• 다운로드 링크: `{len(download_links)}개` (1시간)")
+        for item in download_links:
+            lines.append(f"  - 🎣 <{item['url']}|{item['fileName']}>")
+    return "\n".join(lines)
+
+
+def _render_device_download_thread_notice(
+    barcode: str,
+    log_date: str,
+    records: list[dict[str, Any]],
+    *,
+    used_expanded_scope: bool = False,
+) -> str:
+    lines = [
+        "*장비 영상 다운로드 결과*",
+        f"• 바코드: `{barcode}`",
+        f"• 날짜: `{log_date}`",
+    ]
+    if used_expanded_scope:
+        lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+    for record in records:
+        lines.append("")
+        lines.append(f"• 장비: `{record['deviceName']}`")
+        lines.append(f"• 병원: `{record['hospitalName']}`")
+        lines.append(f"• 병실: `{record['roomName']}`")
+        file_names = record.get("fileNames") or []
+        lines.append(f"• 장비 파일 목록: `{len(file_names)}개`")
+        for file_name in file_names:
+            lines.append(f"  - `{file_name}`")
+        lines.append(f"• 다운로드 링크: DM으로 보냈어 (`{len(record.get('downloadLinks') or [])}개`)")
+    return "\n".join(lines)
+
+
 def create_app() -> App:
     _validate_tokens(include_llm=True, include_data_sources=True)
     claude_client = Anthropic(api_key=s.ANTHROPIC_API_KEY) if s.LLM_PROVIDER == "claude" else None
@@ -330,6 +441,20 @@ def create_app() -> App:
         def _is_timeout_error(exc: Exception) -> bool:
             lowered = str(exc).lower()
             return "timeout" in lowered or "timed out" in lowered
+
+        def _send_dm_message(target_user_id: str | None, message_text: str) -> bool:
+            if not target_user_id or not (message_text or "").strip():
+                return False
+            try:
+                response = client.conversations_open(users=[target_user_id])
+                dm_channel = ((response or {}).get("channel") or {}).get("id")
+                if not dm_channel:
+                    return False
+                client.chat_postMessage(channel=dm_channel, text=message_text)
+                return True
+            except Exception:
+                logger.exception("Failed to send DM to user=%s", target_user_id)
+                return False
 
         def _contains_ymd(text_value: str) -> bool:
             return bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b", text_value or ""))
@@ -1128,9 +1253,11 @@ def create_app() -> App:
 
             probe_remote_files = _should_probe_device_files(question)
             download_remote_files = _should_download_device_files(question)
+            recover_remote_files = _should_recover_device_files(question)
             compact_file_id = _should_render_compact_file_id_result(question)
             compact_file_list = _should_render_compact_device_file_list(question)
             compact_download = _should_render_compact_device_download_result(question)
+            compact_recovery = _should_render_compact_device_recovery_result(question)
             if probe_remote_files and not _is_device_file_probe_allowed(user_id):
                 reply(_build_device_file_probe_permission_message())
                 return
@@ -1141,8 +1268,22 @@ def create_app() -> App:
             ):
                 reply(_build_device_file_probe_config_message())
                 return
-            if download_remote_files and not s.DEVICE_FILE_DOWNLOAD_BUCKET:
+            if download_remote_files and (
+                not s.DEVICE_FILE_DOWNLOAD_BUCKET
+                or not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
                 reply(_build_device_file_download_config_message())
+                return
+            if recover_remote_files and (
+                not cs.BOX_UPLOADER_BASE_URL
+                or not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+                or not cs.UPLOADER_JWT_SECRET
+            ):
+                reply(_build_device_file_recovery_config_message())
                 return
 
             try:
@@ -1183,11 +1324,36 @@ def create_app() -> App:
                     device_contexts=manual_device_contexts,
                     probe_remote_files=probe_remote_files,
                     download_remote_files=download_remote_files,
+                    recover_remote_files=recover_remote_files,
                     compact_file_list=compact_file_list,
                     compact_file_id=compact_file_id,
                     compact_download=compact_download,
+                    compact_recovery=compact_recovery,
                 )
-                reply(result_text)
+                if download_remote_files:
+                    download_records = _collect_device_download_records(probe_payload)
+                    if download_records:
+                        dm_text = _render_device_download_dm_text(
+                            barcode or "",
+                            log_date,
+                            download_records,
+                        )
+                        if _send_dm_message(user_id, dm_text):
+                            thread_notice = _render_device_download_thread_notice(
+                                barcode or "",
+                                log_date,
+                                download_records,
+                                used_expanded_scope=bool(
+                                    ((probe_payload.get("request") or {}).get("usedExpandedScope"))
+                                ),
+                            )
+                            reply(thread_notice)
+                        else:
+                            reply(result_text)
+                    else:
+                        reply(result_text)
+                else:
+                    reply(result_text)
                 logger.info(
                     "Responded with device file candidate lookup in thread_ts=%s barcode=%s records=%s",
                     thread_ts,

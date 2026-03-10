@@ -48,11 +48,21 @@ DEVICE_SSH_COMMAND_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_COMMAND_TIMEOUT_SEC",
 DEVICE_FILE_SEARCH_PATHS = [
     item.strip()
     for item in os.getenv(
-        "DEVICE_FILE_SEARCH_PATHS",
-        "/home/mommytalk/AppData/Videos,/home/mommytalk/AppData/TrashCan",
+    "DEVICE_FILE_SEARCH_PATHS",
+    "/home/mommytalk/AppData/Videos,/home/mommytalk/AppData/TrashCan",
     ).split(",")
     if item.strip()
 ]
+BOX_UPLOADER_BASE_URL = os.getenv(
+    "BOX_UPLOADER_BASE_URL",
+    "https://stream.kr.mmtalkbox.com",
+).strip().rstrip("/")
+BOX_UPLOADER_RECORDING_PATH = os.getenv(
+    "BOX_UPLOADER_RECORDING_PATH",
+    "/recording/upload-v4",
+).strip()
+BOX_UPLOADER_TIMEOUT_SEC = int(os.getenv("BOX_UPLOADER_TIMEOUT_SEC", "120"))
+UPLOADER_JWT_SECRET = os.getenv("UPLOADER_JWT_SECRET", "").strip()
 
 _raw_device_file_probe_ids = os.getenv("DEVICE_FILE_PROBE_ALLOWED_USER_IDS", "")
 if _raw_device_file_probe_ids.strip():
