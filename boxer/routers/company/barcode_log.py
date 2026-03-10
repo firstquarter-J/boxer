@@ -58,6 +58,38 @@ _TODAY_HINTS = ("오늘", "금일", "today")
 _DAY_BEFORE_YESTERDAY_HINTS = ("그제", "엊그제", "day before yesterday")
 _TOMORROW_HINTS = ("내일", "tomorrow")
 _CAPTURE_HINT_TOKENS = ("캡처", "capture", "captures", "capturedat", "스냅샷", "snapshot")
+_HOSPITAL_QUERY_HINT_TOKENS = (
+    "병원 조회",
+    "병원 목록",
+    "병원 개수",
+    "병원 몇",
+    "병원 수",
+    "병원 있나",
+    "병원 있는지",
+    "병원 유무",
+    "병원 생성일",
+    "병원 생성연도",
+    "생성된 병원",
+    "hospitals",
+)
+_ROOMS_QUERY_HINT_TOKENS = (
+    "병실 조회",
+    "병실 목록",
+    "병실 개수",
+    "병실 몇",
+    "병실 수",
+    "병실 있나",
+    "병실 있는지",
+    "병실 유무",
+    "진료실 조회",
+    "진료실 목록",
+    "진료실 개수",
+    "진료실 몇",
+    "진료실 수",
+    "진료실 있나",
+    "진료실 있는지",
+    "hospital_rooms",
+)
 
 
 def _current_local_date() -> datetime.date:
@@ -321,6 +353,82 @@ def _is_ultrasound_capture_filter_query_request(
             hospital_room_seq is not None,
         )
     )
+
+
+def _is_hospitals_filter_query_request(
+    question: str,
+    *,
+    target_date: str | None,
+    target_year: int | None,
+    hospital_name: str | None,
+    hospital_seq: int | None,
+) -> bool:
+    text = (question or "").strip()
+    lowered = text.lower()
+    has_hospital_hint = any(token in text for token in _HOSPITAL_QUERY_HINT_TOKENS) or "hospital" in lowered
+    has_media_hint = any(
+        token in text
+        for token in (
+            "영상",
+            "비디오",
+            "녹화",
+            "recording",
+            "캡처",
+            "capture",
+            "스냅샷",
+            "로그",
+            "fileid",
+            "파일",
+        )
+    )
+    has_scope = any(
+        (
+            target_date is not None,
+            target_year is not None,
+            hospital_name,
+            hospital_seq is not None,
+        )
+    )
+    return has_scope and has_hospital_hint and not has_media_hint
+
+
+def _is_hospital_rooms_filter_query_request(
+    question: str,
+    *,
+    hospital_name: str | None,
+    room_name: str | None,
+    hospital_seq: int | None,
+    hospital_room_seq: int | None,
+) -> bool:
+    text = (question or "").strip()
+    lowered = text.lower()
+    has_room_hint = any(token in text for token in _ROOMS_QUERY_HINT_TOKENS) or "room" in lowered
+    has_media_hint = any(
+        token in text
+        for token in (
+            "영상",
+            "비디오",
+            "녹화",
+            "recording",
+            "캡처",
+            "capture",
+            "스냅샷",
+            "snapshot",
+            "로그",
+            "fileid",
+            "파일",
+        )
+    )
+    has_scope = any(
+        (
+            hospital_name,
+            room_name,
+            hospital_seq is not None,
+            hospital_room_seq is not None,
+        )
+    )
+    has_hospital_context = any((hospital_name, hospital_seq is not None, hospital_room_seq is not None))
+    return has_scope and has_hospital_context and has_room_hint and not has_media_hint
 
 
 def _is_barcode_video_count_request(question: str, barcode: str | None) -> bool:

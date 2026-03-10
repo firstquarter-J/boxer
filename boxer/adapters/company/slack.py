@@ -36,6 +36,8 @@ from boxer.routers.company.barcode_log import (
     _is_barcode_video_recorded_on_date_request,
     _is_barcode_video_count_request,
     _is_error_focused_request,
+    _is_hospitals_filter_query_request,
+    _is_hospital_rooms_filter_query_request,
     _is_recordings_filter_query_request,
     _is_scan_focused_request,
     _is_ultrasound_capture_filter_query_request,
@@ -66,6 +68,8 @@ from boxer.routers.company.box_db import (
     _load_recordings_context_by_barcode,
     _lookup_device_contexts_by_hospital_room,
     _query_all_recorded_dates_by_barcode,
+    _query_hospitals_by_filters,
+    _query_hospital_rooms_by_filters,
     _query_last_recorded_at_by_barcode,
     _query_recordings_count_by_barcode,
     _query_recordings_detail_by_barcode,
@@ -1422,6 +1426,76 @@ def create_app() -> App:
         structured_target_year = _extract_year_filter(question)
         structured_hospital_name, structured_room_name = _extract_hospital_room_scope(question)
         structured_hospital_seq, structured_hospital_room_seq = _extract_capture_seq_filters(question)
+
+        if _is_hospitals_filter_query_request(
+            question,
+            target_date=structured_target_date,
+            target_year=structured_target_year,
+            hospital_name=structured_hospital_name,
+            hospital_seq=structured_hospital_seq,
+        ):
+            try:
+                if structured_date_error is not None:
+                    raise structured_date_error
+                result_text = _query_hospitals_by_filters(
+                    hospital_name=structured_hospital_name,
+                    hospital_seq=structured_hospital_seq,
+                    target_date=structured_target_date,
+                    target_year=structured_target_year,
+                    count_only=_is_generic_count_or_existence_request(question),
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with hospitals filters in thread_ts=%s date=%s year=%s hospital=%s hospitalSeq=%s",
+                    thread_ts,
+                    structured_target_date,
+                    structured_target_year,
+                    structured_hospital_name,
+                    structured_hospital_seq,
+                )
+            except ValueError as exc:
+                reply(f"병원 조회 요청 형식 오류: {exc}")
+            except (pymysql.MySQLError, RuntimeError):
+                logger.exception("Hospitals filters query failed")
+                reply("병원 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘")
+            except Exception:
+                logger.exception("Hospitals filters query failed")
+                reply("병원 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_hospital_rooms_filter_query_request(
+            question,
+            hospital_name=structured_hospital_name,
+            room_name=structured_room_name,
+            hospital_seq=structured_hospital_seq,
+            hospital_room_seq=structured_hospital_room_seq,
+        ):
+            try:
+                result_text = _query_hospital_rooms_by_filters(
+                    hospital_name=structured_hospital_name,
+                    room_name=structured_room_name,
+                    hospital_seq=structured_hospital_seq,
+                    hospital_room_seq=structured_hospital_room_seq,
+                    count_only=_is_generic_count_or_existence_request(question),
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with hospital rooms filters in thread_ts=%s hospital=%s room=%s hospitalSeq=%s hospitalRoomSeq=%s",
+                    thread_ts,
+                    structured_hospital_name,
+                    structured_room_name,
+                    structured_hospital_seq,
+                    structured_hospital_room_seq,
+                )
+            except ValueError as exc:
+                reply(f"병실 조회 요청 형식 오류: {exc}")
+            except (pymysql.MySQLError, RuntimeError):
+                logger.exception("Hospital rooms filters query failed")
+                reply("병실 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘")
+            except Exception:
+                logger.exception("Hospital rooms filters query failed")
+                reply("병실 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
 
         if _is_ultrasound_capture_filter_query_request(
             question,

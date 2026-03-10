@@ -1052,6 +1052,261 @@ def _query_ultrasound_captures_by_filters(
     return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
 
 
+def _query_hospitals_by_filters(
+    *,
+    hospital_name: str | None = None,
+    hospital_seq: int | None = None,
+    target_date: str | None = None,
+    target_year: int | None = None,
+    count_only: bool = False,
+) -> str:
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    normalized_hospital_name = str(hospital_name or "").strip() or None
+    if hospital_seq is not None:
+        hospital_seq = int(hospital_seq)
+
+    if not any((normalized_hospital_name, hospital_seq is not None, target_date, target_year is not None)):
+        raise ValueError("병원 조회는 병원명, hospitalSeq, 날짜, 연도 중 최소 1개 조건이 필요해")
+
+    where_clauses: list[str] = []
+    params: list[object] = []
+    if normalized_hospital_name:
+        where_clauses.append("h.hospitalName = %s")
+        params.append(normalized_hospital_name)
+    if hospital_seq is not None:
+        where_clauses.append("h.seq = %s")
+        params.append(hospital_seq)
+    if target_date:
+        utc_start, utc_end = _local_date_to_utc_range(target_date)
+        where_clauses.append("h.createdAt >= %s")
+        where_clauses.append("h.createdAt < %s")
+        params.extend([utc_start, utc_end])
+    elif target_year is not None:
+        utc_start, utc_end = _local_year_to_utc_range(target_year)
+        where_clauses.append("h.createdAt >= %s")
+        where_clauses.append("h.createdAt < %s")
+        params.extend([utc_start, utc_end])
+
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
+    limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS hospitalCount "
+                "FROM hospitals h "
+                f"WHERE {where_sql}",
+                tuple(params),
+            )
+            summary = cursor.fetchone() or {}
+            total_count = int(summary.get("hospitalCount") or 0)
+
+            rows: list[dict[str, Any]] = []
+            if not count_only and total_count > 0:
+                cursor.execute(
+                    "SELECT "
+                    "h.seq, "
+                    "h.hospitalName, "
+                    "h.regionAlias, "
+                    "h.province, "
+                    "h.city, "
+                    "h.telephone, "
+                    "h.activeFlag, "
+                    "h.isTest, "
+                    "h.isMaternity, "
+                    "h.externalVisible, "
+                    "h.createdAt, "
+                    "h.updatedAt, "
+                    "h.deletedAt "
+                    "FROM hospitals h "
+                    f"WHERE {where_sql} "
+                    "ORDER BY h.createdAt DESC, h.seq DESC "
+                    "LIMIT %s",
+                    tuple([*params, limit]),
+                )
+                rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    lines = ["*병원 조회 결과*"]
+    if normalized_hospital_name:
+        lines.append(f"• 병원: `{normalized_hospital_name}`")
+    if hospital_seq is not None:
+        lines.append(f"• hospitalSeq: `{hospital_seq}`")
+    if target_date:
+        lines.append(f"• 병원 생성일(KST): `{target_date}`")
+    elif target_year is not None:
+        lines.append(f"• 병원 생성연도(KST): `{target_year}`")
+    lines.append(f"• hospitals row 수: *{total_count}개*")
+
+    if count_only:
+        return "\n".join(lines)
+
+    if total_count <= 0:
+        lines.append("• 결과: 조건에 맞는 병원 기록이 없어")
+        return "\n".join(lines)
+
+    lines.append("• 병원 목록(최근 생성순):")
+    for index, row in enumerate(rows, start=1):
+        region_parts = [
+            str(row.get("province") or "").strip(),
+            str(row.get("city") or "").strip(),
+        ]
+        region = " ".join(part for part in region_parts if part).strip() or _display_value(
+            row.get("regionAlias"),
+            default="미확인",
+        )
+        deleted_at = _display_value(row.get("deletedAt"), default="")
+        status_parts = [
+            f"activeFlag={_display_value(row.get('activeFlag'), default='미확인')}",
+            f"isTest={_display_value(row.get('isTest'), default='미확인')}",
+            f"isMaternity={_display_value(row.get('isMaternity'), default='미확인')}",
+            f"externalVisible={_display_value(row.get('externalVisible'), default='미확인')}",
+        ]
+        if deleted_at:
+            status_parts.append(f"deletedAt={deleted_at}")
+        lines.extend(
+            [
+                f"- {index}.",
+                f"  hospitalSeq: `{_display_value(row.get('seq'), default='미확인')}`",
+                f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
+                f"  지역: `{region}`",
+                f"  전화번호: `{_display_value(row.get('telephone'), default='미확인')}`",
+                f"  병원 생성일(KST): `{_format_recorded_at_local(row.get('createdAt'))}`",
+                f"  updatedAt(KST): `{_format_recorded_at_local(row.get('updatedAt'))}`",
+                f"  상태: `{' | '.join(status_parts)}`",
+                "",
+            ]
+        )
+
+    if lines and lines[-1] == "":
+        lines.pop()
+    if total_count > len(rows):
+        lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 병원은 생략했어")
+    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+
+
+def _query_hospital_rooms_by_filters(
+    *,
+    hospital_name: str | None = None,
+    room_name: str | None = None,
+    hospital_seq: int | None = None,
+    hospital_room_seq: int | None = None,
+    count_only: bool = False,
+) -> str:
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    normalized_hospital_name = str(hospital_name or "").strip() or None
+    normalized_room_name = str(room_name or "").strip() or None
+    if hospital_seq is not None:
+        hospital_seq = int(hospital_seq)
+    if hospital_room_seq is not None:
+        hospital_room_seq = int(hospital_room_seq)
+
+    if not any((normalized_hospital_name, hospital_seq is not None, hospital_room_seq is not None)):
+        raise ValueError("병실 조회는 병원명, hospitalSeq, hospitalRoomSeq 중 최소 1개 조건이 필요해")
+
+    where_clauses: list[str] = []
+    params: list[object] = []
+    if normalized_hospital_name:
+        where_clauses.append("h.hospitalName = %s")
+        params.append(normalized_hospital_name)
+    if normalized_room_name:
+        where_clauses.append("hr.roomName = %s")
+        params.append(normalized_room_name)
+    if hospital_seq is not None:
+        where_clauses.append("hr.hospitalSeq = %s")
+        params.append(hospital_seq)
+    if hospital_room_seq is not None:
+        where_clauses.append("hr.seq = %s")
+        params.append(hospital_room_seq)
+
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
+    limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS roomCount "
+                "FROM hospital_rooms hr "
+                "LEFT JOIN hospitals h ON hr.hospitalSeq = h.seq "
+                f"WHERE {where_sql}",
+                tuple(params),
+            )
+            summary = cursor.fetchone() or {}
+            total_count = int(summary.get("roomCount") or 0)
+
+            rows: list[dict[str, Any]] = []
+            if not count_only and total_count > 0:
+                cursor.execute(
+                    "SELECT "
+                    "hr.seq, "
+                    "hr.hospitalSeq, "
+                    "hr.roomName, "
+                    "hr.doctorName, "
+                    "hr.memo, "
+                    "hr.activeFlag, "
+                    "hr.createdAt, "
+                    "hr.updatedAt, "
+                    "h.hospitalName AS hospitalName "
+                    "FROM hospital_rooms hr "
+                    "LEFT JOIN hospitals h ON hr.hospitalSeq = h.seq "
+                    f"WHERE {where_sql} "
+                    "ORDER BY hr.createdAt DESC, hr.seq DESC "
+                    "LIMIT %s",
+                    tuple([*params, limit]),
+                )
+                rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    lines = ["*병실 조회 결과*"]
+    if normalized_hospital_name:
+        lines.append(f"• 병원: `{normalized_hospital_name}`")
+    if normalized_room_name:
+        lines.append(f"• 병실: `{normalized_room_name}`")
+    if hospital_seq is not None:
+        lines.append(f"• hospitalSeq: `{hospital_seq}`")
+    if hospital_room_seq is not None:
+        lines.append(f"• hospitalRoomSeq: `{hospital_room_seq}`")
+    lines.append(f"• hospital_rooms row 수: *{total_count}개*")
+
+    if count_only:
+        return "\n".join(lines)
+
+    if total_count <= 0:
+        lines.append("• 결과: 조건에 맞는 병실 기록이 없어")
+        return "\n".join(lines)
+
+    lines.append("• 병실 목록(최근 생성순):")
+    for index, row in enumerate(rows, start=1):
+        status = _display_value(row.get("activeFlag"), default="미확인")
+        lines.extend(
+            [
+                f"- {index}.",
+                f"  hospitalRoomSeq: `{_display_value(row.get('seq'), default='미확인')}`",
+                f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
+                f"  병실: `{_display_value(row.get('roomName'), default='미확인')}`",
+                f"  담당의: `{_display_value(row.get('doctorName'), default='미확인')}`",
+                f"  병실 생성일(KST): `{_format_recorded_at_local(row.get('createdAt'))}`",
+                f"  updatedAt(KST): `{_format_recorded_at_local(row.get('updatedAt'))}`",
+                f"  상태: `activeFlag={status}`",
+                "",
+            ]
+        )
+
+    if lines and lines[-1] == "":
+        lines.pop()
+    if total_count > len(rows):
+        lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 병실은 생략했어")
+    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+
+
 def _lookup_device_contexts_by_barcode(
     barcode: str,
     recordings_context: dict[str, Any] | None = None,
