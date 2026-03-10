@@ -2,6 +2,7 @@ import base64
 import json
 import hashlib
 import hmac
+import os
 import re
 import shlex
 import socket
@@ -93,6 +94,35 @@ _DEVICE_FILE_RECOVERY_HINTS = (
     "복구해줘",
     "복구 해줘",
 )
+
+_TEMP_FILE_PREFIXES = ("device-file-", "device-upload-")
+
+
+def _ensure_device_temp_dir() -> str:
+    temp_dir = (cs.DEVICE_FILE_TEMP_DIR or "").strip() or "/tmp/boxer-device-files"
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def _cleanup_device_temp_dir() -> None:
+    temp_dir = (cs.DEVICE_FILE_TEMP_DIR or "").strip()
+    if not temp_dir or not os.path.isdir(temp_dir):
+        return
+    retention_sec = max(0, int(cs.DEVICE_FILE_TEMP_RETENTION_SEC))
+    now = datetime.now().timestamp()
+    try:
+        for entry in os.scandir(temp_dir):
+            if not entry.is_file():
+                continue
+            if not entry.name.startswith(_TEMP_FILE_PREFIXES):
+                continue
+            if retention_sec <= 0 or now - entry.stat().st_mtime >= retention_sec:
+                try:
+                    os.remove(entry.path)
+                except OSError:
+                    pass
+    except OSError:
+        return
 
 _DEVICE_FILE_REMOTE_HINTS = (
     "파일 있",
@@ -539,6 +569,8 @@ def _upload_device_files_to_uploader(
     uploads: list[dict[str, Any]] = []
     temp_paths: list[str] = []
     upload_url = f"{uploader_base_url}{uploader_path}"
+    temp_dir = _ensure_device_temp_dir()
+    _cleanup_device_temp_dir()
 
     try:
         sftp = client.open_sftp()
@@ -549,6 +581,7 @@ def _upload_device_files_to_uploader(
                 with tempfile.NamedTemporaryFile(
                     prefix="device-upload-",
                     suffix=f"-{upload_name}",
+                    dir=temp_dir,
                     delete=False,
                 ) as tmp_file:
                     local_temp_path = tmp_file.name
@@ -615,11 +648,10 @@ def _upload_device_files_to_uploader(
         client.close()
         for temp_path in temp_paths:
             try:
-                import os
-
                 os.remove(temp_path)
             except OSError:
                 pass
+        _cleanup_device_temp_dir()
     any_success = any(item.get("ok") for item in uploads)
     return {
         "ok": any_success,
@@ -652,6 +684,8 @@ def _download_device_files_to_s3(
     client = connection["client"]
     s3_client = _build_s3_client()
     downloads: list[dict[str, Any]] = []
+    temp_dir = _ensure_device_temp_dir()
+    _cleanup_device_temp_dir()
     try:
         sftp = client.open_sftp()
         try:
@@ -662,7 +696,12 @@ def _download_device_files_to_s3(
                 key = _build_device_download_s3_key(file_name)
                 temp_path = ""
                 try:
-                    with tempfile.NamedTemporaryFile(prefix="device-file-", suffix=f"-{file_name}", delete=False) as tmp_file:
+                    with tempfile.NamedTemporaryFile(
+                        prefix="device-file-",
+                        suffix=f"-{file_name}",
+                        dir=temp_dir,
+                        delete=False,
+                    ) as tmp_file:
                         temp_path = tmp_file.name
                     sftp.get(remote_path, temp_path)
                     s3_client.upload_file(temp_path, bucket, key)
@@ -694,8 +733,6 @@ def _download_device_files_to_s3(
                 finally:
                     if temp_path:
                         try:
-                            import os
-
                             os.remove(temp_path)
                         except OSError:
                             pass
@@ -703,6 +740,7 @@ def _download_device_files_to_s3(
             sftp.close()
     finally:
         client.close()
+        _cleanup_device_temp_dir()
 
     return {
         "ok": any(item.get("ok") for item in downloads),

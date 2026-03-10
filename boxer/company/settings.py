@@ -45,6 +45,8 @@ DEVICE_SSH_USER = os.getenv("DEVICE_SSH_USER", "mommytalk").strip()
 DEVICE_SSH_PASSWORD = os.getenv("DEVICE_SSH_PASSWORD", "").strip()
 DEVICE_SSH_CONNECT_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_CONNECT_TIMEOUT_SEC", "8"))
 DEVICE_SSH_COMMAND_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_COMMAND_TIMEOUT_SEC", "20"))
+DEVICE_FILE_TEMP_DIR = os.getenv("DEVICE_FILE_TEMP_DIR", "/tmp/boxer-device-files").strip()
+DEVICE_FILE_TEMP_RETENTION_SEC = int(os.getenv("DEVICE_FILE_TEMP_RETENTION_SEC", "86400"))
 DEVICE_FILE_SEARCH_PATHS = [
     item.strip()
     for item in os.getenv(
