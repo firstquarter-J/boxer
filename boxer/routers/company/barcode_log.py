@@ -959,6 +959,10 @@ _SESSION_PROGRESS_SIGNAL_HINTS = (
     "spawned recording ffmpeg",
     "addrecording(",
 )
+_IGNORED_SCAN_HINTS = (
+    "ignoring scan",
+    "ignore period",
+)
 
 
 def _session_has_progress_signals_between(
@@ -974,6 +978,16 @@ def _session_has_progress_signals_between(
     for line in lines[start_index:end_index]:
         lowered = str(line or "").lower()
         if any(hint in lowered for hint in _SESSION_PROGRESS_SIGNAL_HINTS):
+            return True
+    return False
+
+
+def _duplicate_scan_was_ignored(lines: list[str], duplicate_line_no: int) -> bool:
+    start_index = max(0, duplicate_line_no - 1)
+    end_index = min(len(lines), duplicate_line_no + 5)
+    for line in lines[start_index:end_index]:
+        lowered = str(line or "").lower()
+        if any(hint in lowered for hint in _IGNORED_SCAN_HINTS):
             return True
     return False
 
@@ -999,6 +1013,9 @@ def _should_merge_same_barcode_rescan(
     elapsed = duplicate_seconds - start_seconds
     if elapsed < 0 or elapsed > _DUPLICATE_BARCODE_RESCAN_MAX_SECONDS:
         return False
+
+    if _duplicate_scan_was_ignored(lines, duplicate_line_no):
+        return True
 
     if _session_has_progress_signals_between(lines, start_line_no, duplicate_line_no):
         return False
