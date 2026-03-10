@@ -2145,6 +2145,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         normalized = re.sub(r"(?<!\d)\d{11}(?!\d)", "", normalized)
         normalized = re.sub(r"\s+\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*$", "", normalized)
         normalized = re.sub(r"\s+\d{1,2}\s*월\s*\d{1,2}\s*일\s*$", "", normalized)
+        normalized = re.sub(r"\s+\d{2,4}\s*년(?:도)?\s*$", "", normalized)
         normalized = re.sub(r"(?<!\d)\d{4}(?!\d)\s*$", "", normalized)
         normalized = re.sub(r"^\s*병원(?:명)?\s*[:=]?\s*", "", normalized)
         normalized = re.sub(r"^\s*(?:병실(?:명)?|진료실명)\s*[:=]?\s*", "", normalized)
@@ -2156,6 +2157,8 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
             normalized,
             flags=re.IGNORECASE,
         )
+        if re.search(r"(?:병원|의원|클리닉|센터).+\s+병원$", normalized):
+            normalized = re.sub(r"\s+병원$", "", normalized)
         return normalized.strip()
 
     def _is_scope_noise(value: str) -> bool:
@@ -2164,7 +2167,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
             return True
         return bool(
             re.fullmatch(
-                r"(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)(?:\s+(?:개수|갯수|수|조회|목록))?",
+                r"(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운|\d{2,4}\s*년(?:도)?)(?:\s+(?:개수|갯수|수|조회|목록))?",
                 cleaned,
                 flags=re.IGNORECASE,
             )
@@ -2192,6 +2195,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         _COMPACT_MMDD_PATTERN,
     ):
         fallback_text = pattern.sub(" ", fallback_text)
+    fallback_text = _YEAR_ONLY_PATTERN.sub(" ", fallback_text)
     fallback_text = re.sub(r"(?<!\d)\d{11}(?!\d)", " ", fallback_text)
     fallback_text = re.sub(r"\b(?:로그|분석)\b", " ", fallback_text)
     fallback_text = re.sub(
@@ -2233,6 +2237,7 @@ def _extract_leading_hospital_scope(question: str) -> str | None:
 
     candidate = " ".join(match.group(1).split()).strip().strip("`'\"")
     candidate = re.sub(r"(?<!\d)\d{11}(?!\d)", " ", candidate)
+    candidate = _YEAR_ONLY_PATTERN.sub(" ", candidate)
     candidate = _KOREAN_YMD_PATTERN.sub(" ", candidate)
     candidate = _NUMERIC_YMD_PATTERN.sub(" ", candidate)
     candidate = _KOREAN_MD_PATTERN.sub(" ", candidate)
