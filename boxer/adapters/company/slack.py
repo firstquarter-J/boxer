@@ -159,13 +159,12 @@ def _render_notion_playbook_section(playbooks: list[dict[str, Any]] | None) -> s
     lines = ["*참고 플레이북*"]
     for item in items[:3]:
         title = str(item.get("title") or "").strip() or "제목 미상"
-        url = str(item.get("url") or "").strip()
         matched_keywords = [
             str(keyword).strip()
             for keyword in (item.get("matchedKeywords") or [])
             if str(keyword).strip()
         ]
-        line = f"- <{url}|{title}>" if url else f"- `{title}`"
+        line = f"- {title}"
         if matched_keywords:
             line += f" (`{', '.join(matched_keywords[:3])}`)"
         lines.append(line)
