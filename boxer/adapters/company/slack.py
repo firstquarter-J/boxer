@@ -101,19 +101,23 @@ from boxer.routers.company.s3_domain import (
     _query_s3_ultrasound_by_barcode,
 )
 from boxer.routers.common.db import _query_db, _validate_readonly_sql
-from boxer.routers.common.notion import _select_notion_references
+from boxer.routers.common.notion import _is_notion_configured, _select_notion_references
 from boxer.routers.common.s3 import _build_s3_client
 
 _NOTION_DOC_QUERY_TOKENS = (
     "마미박스",
+    "박스",
     "베이비매직",
     "299버전",
+    "299",
     "캡처보드",
     "바코드 스캐너",
     "프로비저닝",
     "오디오",
     "사운드케이블",
     "스피커",
+    "메모리",
+    "패치",
 )
 
 
@@ -2507,6 +2511,10 @@ def create_app() -> App:
 
         if _looks_like_notion_doc_question(question):
             try:
+                if not _is_notion_configured():
+                    logger.warning("Notion doc query skipped because notion is not configured in runtime")
+                    reply("관련 문서를 찾지 못했어. 증상이나 키워드를 조금 더 구체적으로 말해줘")
+                    return
                 evidence_payload = {
                     "route": "notion_playbook_qa",
                     "source": "notion",
