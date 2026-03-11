@@ -101,8 +101,20 @@ from boxer.routers.company.s3_domain import (
     _query_s3_ultrasound_by_barcode,
 )
 from boxer.routers.common.db import _query_db, _validate_readonly_sql
-from boxer.routers.common.notion import _select_notion_playbooks
+from boxer.routers.common.notion import _select_notion_references
 from boxer.routers.common.s3 import _build_s3_client
+
+_NOTION_DOC_QUERY_TOKENS = (
+    "마미박스",
+    "베이비매직",
+    "299버전",
+    "캡처보드",
+    "바코드 스캐너",
+    "프로비저닝",
+    "오디오",
+    "사운드케이블",
+    "스피커",
+)
 
 
 def _rewrite_phase2_scope_request_message(
@@ -169,6 +181,52 @@ def _append_notion_playbook_section(
     if not normalized_text:
         return section
     return f"{normalized_text}\n\n{section}"
+
+
+def _looks_like_notion_doc_question(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+    return any(token in text for token in _NOTION_DOC_QUERY_TOKENS)
+
+
+def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] | None) -> str:
+    items = [item for item in (references or []) if isinstance(item, dict)]
+    lines = ["*문서 기반 답변*", f"• 질문: `{(question or '').strip() or '미확인'}`"]
+    if not items:
+        lines.append("• 관련 문서를 찾지 못했어")
+        return "\n".join(lines)
+
+    primary_title = str(items[0].get("title") or "").strip() or "제목 미상"
+    lines.append(f"• 기준 문서: `{primary_title}`")
+    if len(items) > 1:
+        secondary_titles = [
+            f"`{str(item.get('title') or '').strip()}`"
+            for item in items[1:3]
+            if str(item.get("title") or "").strip()
+        ]
+        if secondary_titles:
+            lines.append(f"• 함께 본 문서: {', '.join(secondary_titles)}")
+
+    preview_fragments: list[str] = []
+    for item in items[:2]:
+        for raw_line in item.get("previewLines") or []:
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            if line == str(item.get("title") or "").strip():
+                continue
+            if line.startswith("- page_id="):
+                continue
+            preview_fragments.append(line)
+            if len(preview_fragments) >= 3:
+                break
+        if len(preview_fragments) >= 3:
+            break
+
+    if preview_fragments:
+        lines.append(f"• 문서 근거: {' / '.join(preview_fragments[:3])}")
+    return "\n".join(lines)
 
 
 def _split_barcode_log_reply(reply_text: str, max_chars: int = 3000) -> list[str]:
@@ -730,6 +788,8 @@ def create_app() -> App:
         ) -> None:
             notion_playbooks = _attach_notion_playbooks_to_evidence(evidence_payload)
             fallback_with_playbooks = _append_notion_playbook_section(fallback_text, notion_playbooks)
+            evidence_route = str(evidence_payload.get("route") or "").strip().lower()
+            prefer_fallback_on_timeout = evidence_route == "notion_playbook_qa"
 
             if route_name == "barcode log analysis":
                 chunks = _split_barcode_log_reply(fallback_with_playbooks)
@@ -816,11 +876,11 @@ def create_app() -> App:
                 )
             except TimeoutError:
                 logger.warning("Retrieval synthesis timeout for route=%s", route_name)
-                reply(_timeout_reply_text())
+                reply(fallback_with_playbooks if prefer_fallback_on_timeout else _timeout_reply_text())
             except RuntimeError as exc:
                 if _is_timeout_error(exc):
                     logger.warning("Retrieval synthesis timeout for route=%s", route_name)
-                    reply(_timeout_reply_text())
+                    reply(fallback_with_playbooks if prefer_fallback_on_timeout else _timeout_reply_text())
                     return
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
                 reply(fallback_with_playbooks)
@@ -1514,36 +1574,10 @@ def create_app() -> App:
             if not isinstance(evidence_payload, dict):
                 return []
 
-            route = str(evidence_payload.get("route") or "").strip().lower()
-            if route not in {
-                "barcode_log_analysis",
-                "barcode_log_error_summary_session",
-                "recording_failure_analysis",
-            }:
-                return []
-
             existing = evidence_payload.get("notionPlaybooks")
             if isinstance(existing, list) and existing:
                 return [item for item in existing if isinstance(item, dict)]
-
-            try:
-                playbooks = _select_notion_playbooks(
-                    question,
-                    evidence_payload=evidence_payload,
-                    max_results=3,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to load notion playbooks for route=%s thread_ts=%s",
-                    route,
-                    thread_ts,
-                    exc_info=True,
-                )
-                return []
-
-            if playbooks:
-                evidence_payload["notionPlaybooks"] = playbooks
-            return playbooks
+            return []
 
         def _build_barcode_fallback_evidence() -> dict[str, Any] | None:
             if not barcode:
@@ -2470,6 +2504,47 @@ def create_app() -> App:
                 logger.exception("DB query failed")
                 reply("DB 조회 중 오류가 발생했어. 연결 정보와 네트워크 상태를 확인해줘")
             return
+
+        if _looks_like_notion_doc_question(question):
+            try:
+                evidence_payload = {
+                    "route": "notion_playbook_qa",
+                    "source": "notion",
+                    "request": {
+                        "question": question,
+                    },
+                }
+                notion_references = _select_notion_references(
+                    question,
+                    evidence_payload=evidence_payload,
+                    max_results=3,
+                )
+                if notion_references:
+                    evidence_payload["notionPlaybooks"] = notion_references
+                    evidence_payload["notionReferences"] = notion_references
+                    fallback_text = _build_notion_doc_fallback(question, notion_references)
+                    _reply_with_retrieval_synthesis(
+                        fallback_text,
+                        evidence_payload,
+                        route_name="notion playbook qa",
+                    )
+                    logger.info(
+                        "Responded with notion doc answer in thread_ts=%s refs=%s",
+                        thread_ts,
+                        len(notion_references),
+                    )
+                    return
+                reply("관련 운영 문서를 찾지 못했어. 증상이나 키워드를 조금 더 구체적으로 말해줘")
+                logger.info("No notion references matched in thread_ts=%s question=%s", thread_ts, question)
+                return
+            except TimeoutError:
+                logger.warning("Notion doc answer timeout")
+                reply(_timeout_reply_text())
+                return
+            except Exception:
+                logger.exception("Notion doc answer failed")
+                reply("문서 기반 답변 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+                return
 
         if s.LLM_PROVIDER == "claude" and claude_client:
             if not question:

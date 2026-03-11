@@ -239,8 +239,7 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "16) Endpoint/Uploader/JWT/getaddrinfo EAI_AGAIN 계열만 있으면 녹화 실패 원인으로 단정하지 말고 통신/업로드 이상으로 설명해.\n"
             "17) evidence에 DB 영상 기록이 있으면 업로드 최종 성공 근거로 같이 해석해.\n"
             "18) evidence에 날짜 기준 DB 영상 기록이 없고 ffmpeg 오류나 stalled 신호가 있으면 `녹화 & 업로드 실패로 판단`이라고 적어.\n"
-            "19) evidence에 notionPlaybooks/notion references가 있으면 마지막에 `참고 플레이북` 섹션을 추가하고 그 항목만 인용해.\n"
-            "20) 8줄 안팎으로 짧게 끝내. 장황한 설명 금지."
+            "19) 8줄 안팎으로 짧게 끝내. 장황한 설명 금지."
         )
     if route == "barcode_log_error_summary":
         return (
@@ -288,8 +287,24 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "16) ffmpeg timestamp/DTS/PTS/invalid dropping 계열이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 적어.\n"
             "17) Endpoint/Uploader/JWT/getaddrinfo EAI_AGAIN 계열만 있으면 녹화 실패 원인으로 단정하지 말고 통신/업로드 이상으로 설명해.\n"
             "18) 조치는 한 줄에 `/`로 이어서 최대 3개만 적어.\n"
-            "19) evidence에 notionPlaybooks/notion references가 있으면 마지막에 `참고 플레이북` 섹션을 추가하고 그 항목만 인용해.\n"
-            "20) 4줄로 끝내. 장황한 설명 금지."
+            "19) 4줄로 끝내. 장황한 설명 금지."
+        )
+    if route == "notion_playbook_qa":
+        return (
+            "\n"
+            "7) 이 작업은 Notion 운영 문서 기반 질의응답이다.\n"
+            "8) 아래 형식 그대로만 답해:\n"
+            "   *문서 기반 답변*\n"
+            "   • 요약:\n"
+            "   • 핵심 내용:\n"
+            "   • 운영 포인트:\n"
+            "9) 반드시 한국어만 사용해. 영어 설명, 자기 사고 과정, 중간 추론, 검토 문장은 절대 쓰지 마.\n"
+            "10) evidence의 notionPlaybooks/notionReferences/plainText/previewLines만 사용해. 문서에 없는 내용 추측 금지.\n"
+            "11) kind=`overview` 문서가 있으면 마미박스 전체 개요 질문으로 보고 서비스 범위와 문서 영역을 먼저 요약해.\n"
+            "12) 해결법/대처법 질문이면 기준 문서의 증상, 핵심 점검, 우선 조치를 먼저 짧게 정리해.\n"
+            "13) 질문과 정확히 맞는 문구가 없으면 `문서 기준 확인 필요`라고 적어.\n"
+            "14) `참고 플레이북` 섹션은 시스템이 뒤에 붙이니 네가 직접 만들지 마.\n"
+            "15) 6줄 안팎으로 짧게 끝내."
         )
 
     if route != "barcode_log_analysis":
@@ -312,8 +327,7 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
         "9) The scanned count must count only real scanned tokens (exclude motion entries from the count).\n"
         "10) Do not collapse scanned events into only summary counts.\n"
         "11) If error lines exist in evidence, render them under 'error 라인' as one compact code-block timeline with time labels in chronological order. Do not summarize away individual lines.\n"
-        "12) Never omit the date in barcode log analysis answers.\n"
-        "13) If evidence contains notionPlaybook/notion references, include a '참고 플레이북' section and cite only those references."
+        "12) Never omit the date in barcode log analysis answers."
     )
     if not is_error_mode:
         return common_rules

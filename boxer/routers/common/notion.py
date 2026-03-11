@@ -24,6 +24,15 @@ _NOTION_INDEX_CACHE: dict[str, Any] = {
     "entries": [],
 }
 _NOTION_PAGE_CACHE: dict[str, dict[str, Any]] = {}
+_NOTION_OVERVIEW_QUERY_TOKENS = ("설명", "소개", "뭐야", "무엇", "개요", "알려줘")
+_NOTION_OVERVIEW_SECTION_TITLES = (
+    "마미박스 장애 대응",
+    "베이비매직",
+    "마미박스 가이드",
+    "마미박스 설치",
+    "마미박스 설정",
+    "마미박스 장비 구성",
+)
 _LOW_SIGNAL_NOTION_TERMS = {
     "가이드",
     "기록",
@@ -65,6 +74,14 @@ _NOTION_QUERY_EXPANSIONS = (
     },
 )
 _NOTION_PLAYBOOK_TOPIC_RULES = (
+    {
+        "tokens": ("설명", "소개", "개요", "뭐야", "무엇", "대해"),
+        "titles": (
+            "마미박스 프로세스 순서",
+            "마미박스 버전별 운용 장비 목록",
+            "마미박스 장비 캡처보드",
+        ),
+    },
     {
         "tokens": ("ffmpeg", "sigterm", "stall", "stalled", "thumbnail", "recording", "녹화", "업로드"),
         "titles": (
@@ -547,6 +564,58 @@ def _load_notion_page_content_cached(page_id: str) -> dict[str, Any]:
     return payload
 
 
+def _is_notion_overview_query(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+    if not any(token in text for token in ("마미박스", "베이비매직")):
+        return False
+    return any(token in text for token in _NOTION_OVERVIEW_QUERY_TOKENS)
+
+
+def _build_notion_overview_reference(root_page_id: str) -> dict[str, Any]:
+    payload = _load_notion_page_content_cached(root_page_id)
+    lines = [str(line or "").strip() for line in (payload.get("lines") or [])]
+    preview_lines = [str(payload.get("title") or "").strip() or "마미박스 운영 문서"]
+    seen_sections: set[str] = set()
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line not in _NOTION_OVERVIEW_SECTION_TITLES or line in seen_sections:
+            continue
+        seen_sections.add(line)
+        summary = ""
+        for next_line in lines[index + 1 : index + 6]:
+            candidate = next_line.strip()
+            if not candidate or candidate in _NOTION_OVERVIEW_SECTION_TITLES:
+                if candidate in _NOTION_OVERVIEW_SECTION_TITLES:
+                    break
+                continue
+            if candidate in {"문서 사용 순서", "RAG 인덱스"}:
+                continue
+            if candidate.startswith("- page_id=") or candidate.startswith("- ") or candidate.startswith("1. "):
+                continue
+            summary = candidate
+            break
+        preview_lines.append(f"{line}: {summary}" if summary else line)
+        if len(preview_lines) >= 6:
+            break
+
+    return {
+        "pageId": _normalize_notion_id(root_page_id),
+        "title": str(payload.get("title") or "").strip() or "마미박스 운영 문서",
+        "section": "루트",
+        "kind": "overview",
+        "priority": "high",
+        "keywords": ["마미박스", "운영", "문서", "개요"],
+        "matchedKeywords": ["마미박스", "개요"],
+        "score": 100,
+        "url": payload.get("url") or "",
+        "previewLines": preview_lines,
+        "plainText": "\n".join(preview_lines[:8]).strip(),
+    }
+
+
 def _select_notion_playbooks(
     question: str,
     *,
@@ -622,3 +691,46 @@ def _select_notion_playbooks(
             break
 
     return selected
+
+
+def _select_notion_references(
+    question: str,
+    *,
+    evidence_payload: dict[str, Any] | None = None,
+    root_page_id: str | None = None,
+    max_results: int = 3,
+) -> list[dict[str, Any]]:
+    if not _is_notion_configured():
+        return []
+
+    target_root_page_id = root_page_id or s.NOTION_TEST_PAGE_ID
+    if not target_root_page_id:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    seen_page_ids: set[str] = set()
+
+    if _is_notion_overview_query(question):
+        overview_reference = _build_notion_overview_reference(target_root_page_id)
+        overview_page_id = _normalize_notion_id(str(overview_reference.get("pageId") or ""))
+        seen_page_ids.add(overview_page_id)
+        selected.append(overview_reference)
+
+    playbooks = _select_notion_playbooks(
+        question,
+        evidence_payload=evidence_payload,
+        root_page_id=target_root_page_id,
+        max_results=max(1, max_results),
+    )
+    for item in playbooks:
+        if not isinstance(item, dict):
+            continue
+        page_id = _normalize_notion_id(str(item.get("pageId") or ""))
+        if page_id in seen_page_ids:
+            continue
+        seen_page_ids.add(page_id)
+        selected.append(item)
+        if len(selected) >= max(1, max_results):
+            break
+
+    return selected[: max(1, max_results)]
