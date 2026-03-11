@@ -757,7 +757,7 @@ def _render_device_download_thread_notice(
         lines.append(f"• 다운로드 링크: DM으로 보냈어 (`{len(record.get('downloadLinks') or [])}개`)")
     if activity_logged:
         lines.append("")
-        lines.append("• 다운로드 내역: 저장되었습니다")
+        lines.append("• 다운로드 내역 기록되었습니다. 🎣 <https://mda.kr.mmtalkbox.com/cs|CS 처리내역 엿보기>")
     return "\n".join(lines)
 
 
