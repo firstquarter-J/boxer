@@ -239,7 +239,8 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "16) Endpoint/Uploader/JWT/getaddrinfo EAI_AGAIN 계열만 있으면 녹화 실패 원인으로 단정하지 말고 통신/업로드 이상으로 설명해.\n"
             "17) evidence에 DB 영상 기록이 있으면 업로드 최종 성공 근거로 같이 해석해.\n"
             "18) evidence에 날짜 기준 DB 영상 기록이 없고 ffmpeg 오류나 stalled 신호가 있으면 `녹화 & 업로드 실패로 판단`이라고 적어.\n"
-            "19) 8줄 안팎으로 짧게 끝내. 장황한 설명 금지."
+            "19) evidence에 notionPlaybooks/notion references가 있으면 마지막에 `참고 플레이북` 섹션을 추가하고 그 항목만 인용해.\n"
+            "20) 8줄 안팎으로 짧게 끝내. 장황한 설명 금지."
         )
     if route == "barcode_log_error_summary":
         return (
@@ -287,7 +288,8 @@ def _build_route_specific_rules(evidence_payload: Any) -> str:
             "16) ffmpeg timestamp/DTS/PTS/invalid dropping 계열이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 적어.\n"
             "17) Endpoint/Uploader/JWT/getaddrinfo EAI_AGAIN 계열만 있으면 녹화 실패 원인으로 단정하지 말고 통신/업로드 이상으로 설명해.\n"
             "18) 조치는 한 줄에 `/`로 이어서 최대 3개만 적어.\n"
-            "19) 4줄로 끝내. 장황한 설명 금지."
+            "19) evidence에 notionPlaybooks/notion references가 있으면 마지막에 `참고 플레이북` 섹션을 추가하고 그 항목만 인용해.\n"
+            "20) 4줄로 끝내. 장황한 설명 금지."
         )
 
     if route != "barcode_log_analysis":

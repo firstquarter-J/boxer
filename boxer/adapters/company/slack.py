@@ -101,6 +101,7 @@ from boxer.routers.company.s3_domain import (
     _query_s3_ultrasound_by_barcode,
 )
 from boxer.routers.common.db import _query_db, _validate_readonly_sql
+from boxer.routers.common.notion import _select_notion_playbooks
 from boxer.routers.common.s3 import _build_s3_client
 
 
@@ -132,6 +133,42 @@ def _is_generic_count_or_existence_request(question: str) -> bool:
     return any(token in text for token in cs.VIDEO_COUNT_HINT_TOKENS) or any(
         token in text for token in ("있나", "있어", "있는지", "유무", "존재", "몇")
     ) or any(token in lowered for token in ("count",))
+
+
+def _render_notion_playbook_section(playbooks: list[dict[str, Any]] | None) -> str:
+    items = [item for item in (playbooks or []) if isinstance(item, dict)]
+    if not items:
+        return ""
+
+    lines = ["*참고 플레이북*"]
+    for item in items[:3]:
+        title = str(item.get("title") or "").strip() or "제목 미상"
+        url = str(item.get("url") or "").strip()
+        matched_keywords = [
+            str(keyword).strip()
+            for keyword in (item.get("matchedKeywords") or [])
+            if str(keyword).strip()
+        ]
+        line = f"- <{url}|{title}>" if url else f"- `{title}`"
+        if matched_keywords:
+            line += f" (`{', '.join(matched_keywords[:3])}`)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _append_notion_playbook_section(
+    text: str,
+    playbooks: list[dict[str, Any]] | None,
+) -> str:
+    section = _render_notion_playbook_section(playbooks)
+    normalized_text = (text or "").strip()
+    if not section:
+        return normalized_text
+    if "참고 플레이북" in normalized_text:
+        return normalized_text
+    if not normalized_text:
+        return section
+    return f"{normalized_text}\n\n{section}"
 
 
 def _split_barcode_log_reply(reply_text: str, max_chars: int = 3000) -> list[str]:
@@ -691,10 +728,13 @@ def create_app() -> App:
             *,
             max_tokens: int | None = None,
         ) -> None:
+            notion_playbooks = _attach_notion_playbooks_to_evidence(evidence_payload)
+            fallback_with_playbooks = _append_notion_playbook_section(fallback_text, notion_playbooks)
+
             if route_name == "barcode log analysis":
-                chunks = _split_barcode_log_reply(fallback_text)
+                chunks = _split_barcode_log_reply(fallback_with_playbooks)
                 if not chunks:
-                    reply(fallback_text)
+                    reply(fallback_with_playbooks)
                 else:
                     for index, chunk in enumerate(chunks):
                         reply(chunk, mention_user=index == 0)
@@ -707,17 +747,17 @@ def create_app() -> App:
 
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if not s.LLM_SYNTHESIS_ENABLED or not question:
-                reply(fallback_text)
+                reply(fallback_with_playbooks)
                 logger.info("Responded with %s (direct)", route_name)
                 return
             if provider not in {"claude", "ollama"}:
-                reply(fallback_text)
+                reply(fallback_with_playbooks)
                 logger.info("Responded with %s (direct, unsupported provider=%s)", route_name, provider)
                 return
             if provider == "ollama":
                 health = _check_ollama_health()
                 if not health["ok"]:
-                    reply(fallback_text)
+                    reply(fallback_with_playbooks)
                     logger.warning(
                         "Responded with %s (direct, ollama unavailable=%s)",
                         route_name,
@@ -726,11 +766,11 @@ def create_app() -> App:
                     return
             if provider == "claude":
                 if claude_client is None:
-                    reply(fallback_text)
+                    reply(fallback_with_playbooks)
                     logger.info("Responded with %s (direct, claude client unavailable)", route_name)
                     return
                 if not cs.HYUN_USER_ID or user_id != cs.HYUN_USER_ID:
-                    reply(fallback_text)
+                    reply(fallback_with_playbooks)
                     logger.info(
                         "Responded with %s (direct, claude synthesis not allowed for user=%s)",
                         route_name,
@@ -757,15 +797,16 @@ def create_app() -> App:
                     system_prompt=cs.SYSTEM_PROMPT or None,
                     max_tokens=max_tokens,
                 )
-                final_text = synthesized_text or fallback_text
+                final_text = synthesized_text or fallback_with_playbooks
                 if "다른 바코드" in final_text and "다른 바코드" not in fallback_text:
-                    final_text = fallback_text
+                    final_text = fallback_with_playbooks
                 if "다른 barcode" in final_text and "다른 barcode" not in fallback_text:
-                    final_text = fallback_text
+                    final_text = fallback_with_playbooks
                 if _needs_barcode_log_fallback(final_text, fallback_text, route_name):
-                    final_text = fallback_text
+                    final_text = fallback_with_playbooks
                 if _needs_recording_failure_analysis_fallback(final_text, fallback_text, route_name):
-                    final_text = fallback_text
+                    final_text = fallback_with_playbooks
+                final_text = _append_notion_playbook_section(final_text, notion_playbooks)
                 reply(final_text)
                 logger.info(
                     "Responded with %s (%s) in thread_ts=%s",
@@ -782,10 +823,10 @@ def create_app() -> App:
                     reply(_timeout_reply_text())
                     return
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
-                reply(fallback_text)
+                reply(fallback_with_playbooks)
             except Exception:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
-                reply(fallback_text)
+                reply(fallback_with_playbooks)
 
         def _iter_barcode_log_error_summary_sessions(summary_payload: dict[str, Any]) -> list[dict[str, Any]]:
             request = summary_payload.get("request") if isinstance(summary_payload, dict) else {}
@@ -1167,13 +1208,35 @@ def create_app() -> App:
                 return
 
             fallback_text = _build_barcode_log_error_summary_fallback(summary_payload)
+
+            def _build_rendered_fallback_sections() -> list[str]:
+                sections: list[str] = []
+                for session_entry in interesting_entries:
+                    session_payload = _build_barcode_log_error_summary_session_payload(summary_payload, session_entry)
+                    if not session_payload:
+                        continue
+                    fallback_section = "\n".join(_build_barcode_log_error_session_section(session_entry)).strip()
+                    if not fallback_section:
+                        continue
+                    session_playbooks = _attach_notion_playbooks_to_evidence(session_payload)
+                    sections.append(_append_notion_playbook_section(fallback_section, session_playbooks))
+                return sections
+
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if not s.LLM_SYNTHESIS_ENABLED or not question:
-                reply(fallback_text, mention_user=False)
+                rendered_sections = _build_rendered_fallback_sections()
+                final_text = fallback_text
+                if rendered_sections:
+                    final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                reply(final_text, mention_user=False)
                 logger.info("Responded with barcode log error summary (direct)")
                 return
             if provider not in {"claude", "ollama"}:
-                reply(fallback_text, mention_user=False)
+                rendered_sections = _build_rendered_fallback_sections()
+                final_text = fallback_text
+                if rendered_sections:
+                    final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                reply(final_text, mention_user=False)
                 logger.info(
                     "Responded with barcode log error summary (direct, unsupported provider=%s)",
                     provider,
@@ -1182,7 +1245,11 @@ def create_app() -> App:
             if provider == "ollama":
                 health = _check_ollama_health()
                 if not health["ok"]:
-                    reply(fallback_text, mention_user=False)
+                    rendered_sections = _build_rendered_fallback_sections()
+                    final_text = fallback_text
+                    if rendered_sections:
+                        final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                    reply(final_text, mention_user=False)
                     logger.warning(
                         "Responded with barcode log error summary (direct, ollama unavailable=%s)",
                         health["summary"],
@@ -1190,11 +1257,19 @@ def create_app() -> App:
                     return
             if provider == "claude":
                 if claude_client is None:
-                    reply(fallback_text, mention_user=False)
+                    rendered_sections = _build_rendered_fallback_sections()
+                    final_text = fallback_text
+                    if rendered_sections:
+                        final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                    reply(final_text, mention_user=False)
                     logger.info("Responded with barcode log error summary (direct, claude client unavailable)")
                     return
                 if not cs.HYUN_USER_ID or user_id != cs.HYUN_USER_ID:
-                    reply(fallback_text, mention_user=False)
+                    rendered_sections = _build_rendered_fallback_sections()
+                    final_text = fallback_text
+                    if rendered_sections:
+                        final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                    reply(final_text, mention_user=False)
                     logger.info(
                         "Responded with barcode log error summary (direct, claude synthesis not allowed for user=%s)",
                         user_id,
@@ -1219,6 +1294,8 @@ def create_app() -> App:
                     fallback_section = "\n".join(_build_barcode_log_error_session_section(session_entry)).strip()
                     if not fallback_section:
                         continue
+                    session_playbooks = _attach_notion_playbooks_to_evidence(session_payload)
+                    fallback_section = _append_notion_playbook_section(fallback_section, session_playbooks)
                     synthesized_text = _synthesize_retrieval_answer(
                         question=question,
                         thread_context=thread_context,
@@ -1231,6 +1308,7 @@ def create_app() -> App:
                     final_section = synthesized_text or fallback_section
                     if _needs_barcode_log_error_summary_session_fallback(final_section, session_payload):
                         final_section = fallback_section
+                    final_section = _append_notion_playbook_section(final_section, session_playbooks)
                     rendered_sections.append(final_section)
 
                 final_text = "*세션별 에러 분석*"
@@ -1246,17 +1324,33 @@ def create_app() -> App:
                 )
             except TimeoutError:
                 logger.warning("Barcode log error summary timeout")
-                reply(fallback_text, mention_user=False)
+                rendered_sections = _build_rendered_fallback_sections()
+                final_text = fallback_text
+                if rendered_sections:
+                    final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                reply(final_text, mention_user=False)
             except RuntimeError as exc:
                 if _is_timeout_error(exc):
                     logger.warning("Barcode log error summary timeout")
-                    reply(fallback_text, mention_user=False)
+                    rendered_sections = _build_rendered_fallback_sections()
+                    final_text = fallback_text
+                    if rendered_sections:
+                        final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                    reply(final_text, mention_user=False)
                     return
                 logger.exception("Barcode log error summary synthesis failed")
-                reply(fallback_text, mention_user=False)
+                rendered_sections = _build_rendered_fallback_sections()
+                final_text = fallback_text
+                if rendered_sections:
+                    final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                reply(final_text, mention_user=False)
             except Exception:
                 logger.exception("Barcode log error summary synthesis failed")
-                reply(fallback_text, mention_user=False)
+                rendered_sections = _build_rendered_fallback_sections()
+                final_text = fallback_text
+                if rendered_sections:
+                    final_text = "*세션별 에러 분석*\n\n" + "\n\n".join(rendered_sections)
+                reply(final_text, mention_user=False)
 
         try:
             s3_request = _extract_s3_request(question)
@@ -1413,6 +1507,43 @@ def create_app() -> App:
         def _has_recordings_device_mapping(context: dict[str, Any]) -> bool:
             rows = context.get("rows") or []
             return any(row.get("deviceSeq") is not None for row in rows)
+
+        def _attach_notion_playbooks_to_evidence(
+            evidence_payload: dict[str, Any] | None,
+        ) -> list[dict[str, Any]]:
+            if not isinstance(evidence_payload, dict):
+                return []
+
+            route = str(evidence_payload.get("route") or "").strip().lower()
+            if route not in {
+                "barcode_log_analysis",
+                "barcode_log_error_summary_session",
+                "recording_failure_analysis",
+            }:
+                return []
+
+            existing = evidence_payload.get("notionPlaybooks")
+            if isinstance(existing, list) and existing:
+                return [item for item in existing if isinstance(item, dict)]
+
+            try:
+                playbooks = _select_notion_playbooks(
+                    question,
+                    evidence_payload=evidence_payload,
+                    max_results=3,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load notion playbooks for route=%s thread_ts=%s",
+                    route,
+                    thread_ts,
+                    exc_info=True,
+                )
+                return []
+
+            if playbooks:
+                evidence_payload["notionPlaybooks"] = playbooks
+            return playbooks
 
         def _build_barcode_fallback_evidence() -> dict[str, Any] | None:
             if not barcode:
