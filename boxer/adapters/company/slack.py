@@ -10,6 +10,7 @@ from slack_bolt import App
 
 from boxer.adapters.common.slack import MentionPayload, SlackReplyFn, create_slack_app
 from boxer.adapters.company.fun import handle_fun_message
+from boxer.company.notion_links import select_company_notion_doc_links
 from boxer.company import settings as cs
 from boxer.company.utils import _extract_barcode
 from boxer.core import settings as s
@@ -110,6 +111,23 @@ _NOTION_DOC_QUERY_TOKENS = (
     "박스",
     "베이비매직",
     "babymagic",
+    "바이오스",
+    "bios",
+    "초기화",
+    "데스크탑 모드",
+    "데스크탑",
+    "네트워크 환경",
+    "네트워크 설정",
+    "설정 스크립트",
+    "음량",
+    "볼륨",
+    "dvi",
+    "qr 코드북",
+    "qr코드",
+    "커스텀 크롭",
+    "크롭",
+    "진단기",
+    "원격 음성",
     "299버전",
     "299",
     "캡처보드",
@@ -219,6 +237,36 @@ def _append_notion_playbook_section(
     return f"{normalized_text}\n\n{section}"
 
 
+def _render_company_notion_doc_section(docs: list[dict[str, Any]] | None) -> str:
+    items = [item for item in (docs or []) if isinstance(item, dict)]
+    if not items:
+        return ""
+
+    lines = ["*함께 참고할 문서*"]
+    for item in items[:3]:
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not title or not url:
+            continue
+        lines.append(f"- <{url}|{title}>")
+    return "\n".join(lines)
+
+
+def _append_company_notion_doc_section(
+    text: str,
+    docs: list[dict[str, Any]] | None,
+) -> str:
+    section = _render_company_notion_doc_section(docs)
+    normalized_text = (text or "").strip()
+    if not section:
+        return normalized_text
+    if "함께 참고할 문서" in normalized_text:
+        return normalized_text
+    if not normalized_text:
+        return section
+    return f"{normalized_text}\n\n{section}"
+
+
 def _looks_like_notion_doc_question(question: str) -> bool:
     text = (question or "").strip()
     if not text:
@@ -282,22 +330,14 @@ def _needs_notion_doc_security_refusal(text: str, route_name: str) -> bool:
 
 def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] | None) -> str:
     items = [item for item in (references or []) if isinstance(item, dict)]
-    lines = ["*문서 기반 답변*", f"• 질문: `{(question or '').strip() or '미확인'}`"]
+    lines = ["*문서 기반 답변*"]
     if not items:
-        lines.append("• 관련 문서를 찾지 못했어")
+        lines.append("• 한줄 요약: 관련 문서를 찾지 못했어")
+        lines.append("• 먼저 볼 것: 증상이나 키워드를 조금 더 구체적으로 알려줘")
+        lines.append("• 바로 할 일: 관련 문서 제목이나 장애 증상을 같이 말해줘")
         return "\n".join(lines)
 
     primary_title = str(items[0].get("title") or "").strip() or "제목 미상"
-    lines.append(f"• 기준 문서: `{primary_title}`")
-    if len(items) > 1:
-        secondary_titles = [
-            f"`{str(item.get('title') or '').strip()}`"
-            for item in items[1:3]
-            if str(item.get("title") or "").strip()
-        ]
-        if secondary_titles:
-            lines.append(f"• 함께 본 문서: {', '.join(secondary_titles)}")
-
     preview_fragments: list[str] = []
     for item in items[:2]:
         for raw_line in item.get("previewLines") or []:
@@ -314,9 +354,45 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         if len(preview_fragments) >= 3:
             break
 
-    if preview_fragments:
-        lines.append(f"• 문서 근거: {' / '.join(preview_fragments[:3])}")
+    secondary_titles = [
+        str(item.get("title") or "").strip()
+        for item in items[1:3]
+        if str(item.get("title") or "").strip()
+    ]
+    summary_line = preview_fragments[0] if preview_fragments else f"`{primary_title}` 기준으로 확인해"
+    inspect_line = preview_fragments[1] if len(preview_fragments) > 1 else f"`{primary_title}` 문서를 먼저 봐"
+    action_fragments = preview_fragments[2:4]
+    action_line = " / ".join(action_fragments) if action_fragments else "문서 기준 확인 필요"
+    note_line = (
+        ", ".join(f"`{title}`" for title in secondary_titles)
+        if secondary_titles
+        else f"`{primary_title}` 기준으로 우선 점검해"
+    )
+    lines.append(f"• 한줄 요약: {summary_line}")
+    lines.append(f"• 먼저 볼 것: {inspect_line}")
+    lines.append(f"• 바로 할 일: {action_line}")
+    lines.append(f"• 참고 메모: {note_line}")
     return "\n".join(lines)
+
+
+def _needs_notion_doc_fallback(text: str, route_name: str) -> bool:
+    if route_name != "notion playbook qa":
+        return False
+
+    normalized = (text or "").strip()
+    if not normalized:
+        return True
+    if normalized == _build_notion_doc_security_refusal():
+        return False
+    if not normalized.startswith("*문서 기반 답변*"):
+        return True
+
+    required_bullets = (
+        "• 한줄 요약:",
+        "• 먼저 볼 것:",
+        "• 바로 할 일:",
+    )
+    return any(bullet not in normalized for bullet in required_bullets)
 
 
 def _split_barcode_log_reply(reply_text: str, max_chars: int = 3000) -> list[str]:
@@ -877,14 +953,29 @@ def create_app() -> App:
             max_tokens: int | None = None,
         ) -> None:
             notion_playbooks = _attach_notion_playbooks_to_evidence(evidence_payload)
-            fallback_with_playbooks = _append_notion_playbook_section(fallback_text, notion_playbooks)
             evidence_route = str(evidence_payload.get("route") or "").strip().lower()
+            company_notion_docs: list[dict[str, str]] = []
+            if evidence_route == "notion_playbook_qa":
+                company_notion_docs = select_company_notion_doc_links(
+                    question,
+                    notion_playbooks=notion_playbooks,
+                    max_results=3,
+                )
+                fallback_with_references = _append_company_notion_doc_section(
+                    fallback_text,
+                    company_notion_docs,
+                )
+            else:
+                fallback_with_references = _append_notion_playbook_section(
+                    fallback_text,
+                    notion_playbooks,
+                )
             prefer_fallback_on_timeout = evidence_route == "notion_playbook_qa"
 
             if route_name == "barcode log analysis":
-                chunks = _split_barcode_log_reply(fallback_with_playbooks)
+                chunks = _split_barcode_log_reply(fallback_with_references)
                 if not chunks:
-                    reply(fallback_with_playbooks)
+                    reply(fallback_with_references)
                 else:
                     for index, chunk in enumerate(chunks):
                         reply(chunk, mention_user=index == 0)
@@ -897,17 +988,17 @@ def create_app() -> App:
 
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if not s.LLM_SYNTHESIS_ENABLED or not question:
-                reply(fallback_with_playbooks)
+                reply(fallback_with_references)
                 logger.info("Responded with %s (direct)", route_name)
                 return
             if provider not in {"claude", "ollama"}:
-                reply(fallback_with_playbooks)
+                reply(fallback_with_references)
                 logger.info("Responded with %s (direct, unsupported provider=%s)", route_name, provider)
                 return
             if provider == "ollama":
                 health = _check_ollama_health()
                 if not health["ok"]:
-                    reply(fallback_with_playbooks)
+                    reply(fallback_with_references)
                     logger.warning(
                         "Responded with %s (direct, ollama unavailable=%s)",
                         route_name,
@@ -916,11 +1007,11 @@ def create_app() -> App:
                     return
             if provider == "claude":
                 if claude_client is None:
-                    reply(fallback_with_playbooks)
+                    reply(fallback_with_references)
                     logger.info("Responded with %s (direct, claude client unavailable)", route_name)
                     return
                 if not cs.HYUN_USER_ID or user_id != cs.HYUN_USER_ID:
-                    reply(fallback_with_playbooks)
+                    reply(fallback_with_references)
                     logger.info(
                         "Responded with %s (direct, claude synthesis not allowed for user=%s)",
                         route_name,
@@ -947,17 +1038,21 @@ def create_app() -> App:
                     system_prompt=cs.SYSTEM_PROMPT or None,
                     max_tokens=max_tokens,
                 )
-                final_text = synthesized_text or fallback_with_playbooks
+                final_text = synthesized_text or fallback_with_references
                 if "다른 바코드" in final_text and "다른 바코드" not in fallback_text:
-                    final_text = fallback_with_playbooks
+                    final_text = fallback_with_references
                 if "다른 barcode" in final_text and "다른 barcode" not in fallback_text:
-                    final_text = fallback_with_playbooks
+                    final_text = fallback_with_references
                 if _needs_barcode_log_fallback(final_text, fallback_text, route_name):
-                    final_text = fallback_with_playbooks
+                    final_text = fallback_with_references
                 if _needs_recording_failure_analysis_fallback(final_text, fallback_text, route_name):
-                    final_text = fallback_with_playbooks
+                    final_text = fallback_with_references
+                if _needs_notion_doc_fallback(final_text, route_name):
+                    final_text = fallback_with_references
                 if _needs_notion_doc_security_refusal(final_text, route_name):
                     final_text = _build_notion_doc_security_refusal()
+                elif evidence_route == "notion_playbook_qa":
+                    final_text = _append_company_notion_doc_section(final_text, company_notion_docs)
                 else:
                     final_text = _append_notion_playbook_section(final_text, notion_playbooks)
                 reply(final_text)
@@ -969,17 +1064,17 @@ def create_app() -> App:
                 )
             except TimeoutError:
                 logger.warning("Retrieval synthesis timeout for route=%s", route_name)
-                reply(fallback_with_playbooks if prefer_fallback_on_timeout else _timeout_reply_text())
+                reply(fallback_with_references if prefer_fallback_on_timeout else _timeout_reply_text())
             except RuntimeError as exc:
                 if _is_timeout_error(exc):
                     logger.warning("Retrieval synthesis timeout for route=%s", route_name)
-                    reply(fallback_with_playbooks if prefer_fallback_on_timeout else _timeout_reply_text())
+                    reply(fallback_with_references if prefer_fallback_on_timeout else _timeout_reply_text())
                     return
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
-                reply(fallback_with_playbooks)
+                reply(fallback_with_references)
             except Exception:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
-                reply(fallback_with_playbooks)
+                reply(fallback_with_references)
 
         def _iter_barcode_log_error_summary_sessions(summary_payload: dict[str, Any]) -> list[dict[str, Any]]:
             request = summary_payload.get("request") if isinstance(summary_payload, dict) else {}
