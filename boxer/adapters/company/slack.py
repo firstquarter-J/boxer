@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from typing import Any
@@ -66,6 +67,7 @@ from boxer.routers.company.device_file_probe import (
     _should_render_compact_device_file_list,
     _should_render_compact_device_recovery_result,
 )
+from boxer.routers.company.mda_graphql import _create_mda_activity_log
 from boxer.routers.company.recording_failure_analysis import (
     _build_cause_line,
     _build_recording_failure_analysis_evidence,
@@ -329,6 +331,9 @@ def _collect_device_download_records(payload: dict[str, Any]) -> list[dict[str, 
         records.append(
             {
                 "deviceName": str(record.get("deviceName") or "").strip() or "미확인",
+                "deviceSeq": record.get("deviceSeq"),
+                "hospitalSeq": record.get("hospitalSeq"),
+                "hospitalRoomSeq": record.get("hospitalRoomSeq"),
                 "hospitalName": str(record.get("hospitalName") or "").strip() or "미확인",
                 "roomName": str(record.get("roomName") or "").strip() or "미확인",
                 "fileNames": file_names,
@@ -337,6 +342,101 @@ def _collect_device_download_records(payload: dict[str, Any]) -> list[dict[str, 
         )
 
     return records
+
+
+def _build_device_download_activity_input(
+    *,
+    record: dict[str, Any],
+    barcode: str,
+    log_date: str,
+    question: str,
+    user_id: str,
+    channel_id: str,
+    thread_ts: str,
+) -> dict[str, Any]:
+    device_name = str(record.get("deviceName") or "").strip() or "미확인"
+    hospital_name = str(record.get("hospitalName") or "").strip() or "미확인"
+    room_name = str(record.get("roomName") or "").strip() or "미확인"
+    file_names = [str(item).strip() for item in (record.get("fileNames") or []) if str(item).strip()]
+    download_links = [
+        item
+        for item in (record.get("downloadLinks") or [])
+        if isinstance(item, dict) and str(item.get("fileName") or "").strip() and str(item.get("url") or "").strip()
+    ]
+
+    detail_log = {
+        "source": "boxer_slack_device_download",
+        "barcode": barcode,
+        "logDate": log_date,
+        "question": question,
+        "slackUserId": user_id,
+        "slackChannelId": channel_id,
+        "slackThreadTs": thread_ts,
+        "deviceName": device_name,
+        "deviceSeq": record.get("deviceSeq"),
+        "hospitalSeq": record.get("hospitalSeq"),
+        "hospitalRoomSeq": record.get("hospitalRoomSeq"),
+        "hospitalName": hospital_name,
+        "roomName": room_name,
+        "fileNames": file_names,
+        "downloadFileNames": [
+            str(item.get("fileName") or "").strip()
+            for item in download_links
+        ],
+        "downloadLinkCount": len(download_links),
+    }
+
+    return {
+        "activityType": "recording.download",
+        "barcode": barcode or None,
+        "hospitalSeq": record.get("hospitalSeq"),
+        "hospitalRoomSeq": record.get("hospitalRoomSeq"),
+        "deviceSeq": record.get("deviceSeq"),
+        "targetEntityType": "Device" if record.get("deviceSeq") is not None else None,
+        "targetEntitySeq": record.get("deviceSeq"),
+        "reason": "Boxer Slack 다운로드 링크 전송 성공",
+        "description": (
+            f"Boxer Slack 다운로드 링크 전송 완료: 병원명 [{hospital_name}], "
+            f"병실명 [{room_name}], 장비명 [{device_name}], 파일 {len(download_links)}개"
+        ),
+        "detailLog": json.dumps(detail_log, ensure_ascii=False, separators=(",", ":")),
+    }
+
+
+def _log_device_download_activity(
+    *,
+    records: list[dict[str, Any]],
+    barcode: str,
+    log_date: str,
+    question: str,
+    user_id: str,
+    channel_id: str,
+    thread_ts: str,
+    logger: logging.Logger,
+) -> None:
+    if not records:
+        return
+
+    for record in records:
+        try:
+            _create_mda_activity_log(
+                _build_device_download_activity_input(
+                    record=record,
+                    barcode=barcode,
+                    log_date=log_date,
+                    question=question,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to create activity log for device download barcode=%s device=%s",
+                barcode,
+                record.get("deviceName"),
+                exc_info=True,
+            )
 
 
 def _render_device_download_dm_text(
@@ -1449,6 +1549,16 @@ def create_app() -> App:
                                 ),
                             )
                             reply(thread_notice)
+                            _log_device_download_activity(
+                                records=download_records,
+                                barcode=barcode or "",
+                                log_date=log_date,
+                                question=question,
+                                user_id=user_id,
+                                channel_id=channel_id,
+                                thread_ts=thread_ts,
+                                logger=logger,
+                            )
                         else:
                             failure_notice = _render_device_download_dm_failure_notice(
                                 barcode or "",

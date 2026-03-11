@@ -30,6 +30,16 @@ mutation SshOrder($deviceName: String!, $action: String!, $host: String!) {
 }
 """
 
+_CREATE_ACTIVITY_LOG_MUTATION = """
+mutation CreateActivityLog($input: ActivityLogCreateInput!) {
+  createActivityLog(input: $input) {
+    affected
+    status
+    message
+  }
+}
+"""
+
 _PAGINATED_DEVICES_QUERY = """
 query PaginatedDevices($listOptions: DeviceListOptions!) {
   paginatedDevices(listOptions: $listOptions) {
@@ -282,6 +292,35 @@ def _open_mda_device_ssh(
         "status": _display_value(result.get("status"), default=""),
         "message": _display_value(result.get("message"), default=""),
         "host": actual_host,
+    }
+
+
+def _create_mda_activity_log(input_payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_input = {
+        key: value
+        for key, value in (input_payload or {}).items()
+        if value is not None and value != ""
+    }
+    if not normalized_input:
+        raise RuntimeError("activity log 입력이 비어 있어")
+
+    data = _execute_mda_graphql(
+        _CREATE_ACTIVITY_LOG_MUTATION,
+        {
+            "input": normalized_input,
+        },
+    )
+    result = data.get("createActivityLog")
+    if not isinstance(result, dict):
+        raise RuntimeError("createActivityLog 응답 형식이 올바르지 않아")
+    if result.get("status") is False:
+        raise RuntimeError(
+            f"createActivityLog 실패: {_display_value(result.get('message'), default='unknown error')}"
+        )
+    return {
+        "affected": result.get("affected"),
+        "status": bool(result.get("status", True)),
+        "message": _display_value(result.get("message"), default=""),
     }
 
 

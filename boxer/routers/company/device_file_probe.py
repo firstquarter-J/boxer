@@ -1303,6 +1303,9 @@ def _locate_barcode_file_candidates(
             records.append(
                 {
                     "deviceName": device_name,
+                    "deviceSeq": device_context.get("deviceSeq"),
+                    "hospitalSeq": device_context.get("hospitalSeq"),
+                    "hospitalRoomSeq": device_context.get("hospitalRoomSeq"),
                     "hospitalName": _display_value(device_context.get("hospitalName"), default="미확인"),
                     "roomName": _display_value(device_context.get("roomName"), default="미확인"),
                     "logKey": _display_value(log_data.get("key"), default="미확인"),
