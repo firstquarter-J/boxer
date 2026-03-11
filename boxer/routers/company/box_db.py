@@ -215,6 +215,70 @@ def _to_utc_datetime(value: object) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _lookup_hospital_seq_by_name(hospital_name: str) -> int | None:
+    normalized_name = str(hospital_name or "").strip()
+    if not normalized_name:
+        return None
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT seq FROM hospitals WHERE hospitalName = %s ORDER BY seq DESC LIMIT 2",
+                (normalized_name,),
+            )
+            rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    if len(rows) != 1:
+        return None
+    try:
+        return int((rows[0] or {}).get("seq"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _lookup_hospital_room_seq_by_name(
+    room_name: str,
+    *,
+    hospital_seq: int | None = None,
+) -> int | None:
+    normalized_name = str(room_name or "").strip()
+    if not normalized_name:
+        return None
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    where_clauses = ["roomName = %s"]
+    params: list[object] = [normalized_name]
+    if hospital_seq is not None:
+        where_clauses.append("hospitalSeq = %s")
+        params.append(int(hospital_seq))
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT seq FROM hospital_rooms "
+                f"WHERE {' AND '.join(where_clauses)} "
+                "ORDER BY seq DESC LIMIT 2",
+                tuple(params),
+            )
+            rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    if len(rows) != 1:
+        return None
+    try:
+        return int((rows[0] or {}).get("seq"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _context_limit() -> int:
     return max(1, min(200, cs.RECORDINGS_CONTEXT_LIMIT))
 
@@ -849,10 +913,21 @@ def _query_recordings_by_filters(
     normalized_barcode = str(barcode or "").strip() or None
     normalized_hospital_name = str(hospital_name or "").strip() or None
     normalized_room_name = str(room_name or "").strip() or None
+    resolved_hospital_seq = hospital_seq
+    resolved_hospital_room_seq = hospital_room_seq
     if hospital_seq is not None:
         hospital_seq = int(hospital_seq)
+        resolved_hospital_seq = hospital_seq
     if hospital_room_seq is not None:
         hospital_room_seq = int(hospital_room_seq)
+        resolved_hospital_room_seq = hospital_room_seq
+    if resolved_hospital_seq is None and normalized_hospital_name:
+        resolved_hospital_seq = _lookup_hospital_seq_by_name(normalized_hospital_name)
+    if resolved_hospital_room_seq is None and normalized_room_name and resolved_hospital_seq is not None:
+        resolved_hospital_room_seq = _lookup_hospital_room_seq_by_name(
+            normalized_room_name,
+            hospital_seq=resolved_hospital_seq,
+        )
 
     if not any(
         (
@@ -882,25 +957,25 @@ def _query_recordings_by_filters(
         where_clauses.append("r.recordedAt >= %s")
         where_clauses.append("r.recordedAt < %s")
         params.extend([utc_start, utc_end])
-    if normalized_hospital_name:
+    if resolved_hospital_seq is None and normalized_hospital_name:
         where_clauses.append("h.hospitalName = %s")
         params.append(normalized_hospital_name)
-    if normalized_room_name:
+    if normalized_room_name and resolved_hospital_room_seq is None:
         where_clauses.append("hr.roomName = %s")
         params.append(normalized_room_name)
-    if hospital_seq is not None:
+    if resolved_hospital_seq is not None:
         where_clauses.append("r.hospitalSeq = %s")
-        params.append(hospital_seq)
-    if hospital_room_seq is not None:
+        params.append(resolved_hospital_seq)
+    if resolved_hospital_room_seq is not None:
         where_clauses.append("r.hospitalRoomSeq = %s")
-        params.append(hospital_room_seq)
+        params.append(resolved_hospital_room_seq)
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
     limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
     count_join_clauses: list[str] = []
-    if normalized_hospital_name or normalized_room_name:
+    if normalized_hospital_name and resolved_hospital_seq is None:
         count_join_clauses.append("LEFT JOIN hospitals h ON r.hospitalSeq = h.seq")
-    if normalized_room_name:
+    if normalized_room_name and resolved_hospital_room_seq is None:
         count_join_clauses.append("LEFT JOIN hospital_rooms hr ON r.hospitalRoomSeq = hr.seq")
     count_join_sql = (" " + " ".join(count_join_clauses)) if count_join_clauses else ""
 
@@ -1011,10 +1086,21 @@ def _query_ultrasound_captures_by_filters(
     normalized_barcode = str(barcode or "").strip() or None
     normalized_hospital_name = str(hospital_name or "").strip() or None
     normalized_room_name = str(room_name or "").strip() or None
+    resolved_hospital_seq = hospital_seq
+    resolved_hospital_room_seq = hospital_room_seq
     if hospital_seq is not None:
         hospital_seq = int(hospital_seq)
+        resolved_hospital_seq = hospital_seq
     if hospital_room_seq is not None:
         hospital_room_seq = int(hospital_room_seq)
+        resolved_hospital_room_seq = hospital_room_seq
+    if resolved_hospital_seq is None and normalized_hospital_name:
+        resolved_hospital_seq = _lookup_hospital_seq_by_name(normalized_hospital_name)
+    if resolved_hospital_room_seq is None and normalized_room_name and resolved_hospital_seq is not None:
+        resolved_hospital_room_seq = _lookup_hospital_room_seq_by_name(
+            normalized_room_name,
+            hospital_seq=resolved_hospital_seq,
+        )
 
     if not any(
         (
@@ -1044,25 +1130,25 @@ def _query_ultrasound_captures_by_filters(
         where_clauses.append("uc.capturedAt >= %s")
         where_clauses.append("uc.capturedAt < %s")
         params.extend([utc_start, utc_end])
-    if normalized_hospital_name:
+    if resolved_hospital_seq is None and normalized_hospital_name:
         where_clauses.append("h.hospitalName = %s")
         params.append(normalized_hospital_name)
-    if normalized_room_name:
+    if normalized_room_name and resolved_hospital_room_seq is None:
         where_clauses.append("hr.roomName = %s")
         params.append(normalized_room_name)
-    if hospital_seq is not None:
+    if resolved_hospital_seq is not None:
         where_clauses.append("uc.hospitalSeq = %s")
-        params.append(hospital_seq)
-    if hospital_room_seq is not None:
+        params.append(resolved_hospital_seq)
+    if resolved_hospital_room_seq is not None:
         where_clauses.append("uc.hospitalRoomSeq = %s")
-        params.append(hospital_room_seq)
+        params.append(resolved_hospital_room_seq)
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
     limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
     count_join_clauses: list[str] = []
-    if normalized_hospital_name or normalized_room_name:
+    if normalized_hospital_name and resolved_hospital_seq is None:
         count_join_clauses.append("LEFT JOIN hospitals h ON uc.hospitalSeq = h.seq")
-    if normalized_room_name:
+    if normalized_room_name and resolved_hospital_room_seq is None:
         count_join_clauses.append("LEFT JOIN hospital_rooms hr ON uc.hospitalRoomSeq = hr.seq")
     count_join_sql = (" " + " ".join(count_join_clauses)) if count_join_clauses else ""
 
@@ -1164,20 +1250,24 @@ def _query_hospitals_by_filters(
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
 
     normalized_hospital_name = str(hospital_name or "").strip() or None
+    resolved_hospital_seq = hospital_seq
     if hospital_seq is not None:
         hospital_seq = int(hospital_seq)
+        resolved_hospital_seq = hospital_seq
+    if resolved_hospital_seq is None and normalized_hospital_name:
+        resolved_hospital_seq = _lookup_hospital_seq_by_name(normalized_hospital_name)
 
     if not any((normalized_hospital_name, hospital_seq is not None, target_date, target_year is not None)):
         raise ValueError("병원 조회는 병원명, hospitalSeq, 날짜, 연도 중 최소 1개 조건이 필요해")
 
     where_clauses: list[str] = []
     params: list[object] = []
-    if normalized_hospital_name:
+    if normalized_hospital_name and resolved_hospital_seq is None:
         where_clauses.append("h.hospitalName = %s")
         params.append(normalized_hospital_name)
-    if hospital_seq is not None:
+    if resolved_hospital_seq is not None:
         where_clauses.append("h.seq = %s")
-        params.append(hospital_seq)
+        params.append(resolved_hospital_seq)
     if target_date:
         utc_start, utc_end = _local_date_to_utc_range(target_date)
         where_clauses.append("h.createdAt >= %s")
@@ -1302,31 +1392,36 @@ def _query_hospital_rooms_by_filters(
 
     normalized_hospital_name = str(hospital_name or "").strip() or None
     normalized_room_name = str(room_name or "").strip() or None
+    resolved_hospital_seq = hospital_seq
     if hospital_seq is not None:
         hospital_seq = int(hospital_seq)
+        resolved_hospital_seq = hospital_seq
     if hospital_room_seq is not None:
         hospital_room_seq = int(hospital_room_seq)
+    if resolved_hospital_seq is None and normalized_hospital_name:
+        resolved_hospital_seq = _lookup_hospital_seq_by_name(normalized_hospital_name)
 
     if not any((normalized_hospital_name, hospital_seq is not None, hospital_room_seq is not None)):
         raise ValueError("병실 조회는 병원명, hospitalSeq, hospitalRoomSeq 중 최소 1개 조건이 필요해")
 
     where_clauses: list[str] = []
     params: list[object] = []
-    if normalized_hospital_name:
+    if normalized_hospital_name and resolved_hospital_seq is None:
         where_clauses.append("h.hospitalName = %s")
         params.append(normalized_hospital_name)
     if normalized_room_name:
         where_clauses.append("hr.roomName = %s")
         params.append(normalized_room_name)
-    if hospital_seq is not None:
+    if resolved_hospital_seq is not None:
         where_clauses.append("hr.hospitalSeq = %s")
-        params.append(hospital_seq)
+        params.append(resolved_hospital_seq)
     if hospital_room_seq is not None:
         where_clauses.append("hr.seq = %s")
         params.append(hospital_room_seq)
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
     limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
+    count_join_sql = " LEFT JOIN hospitals h ON hr.hospitalSeq = h.seq" if normalized_hospital_name and resolved_hospital_seq is None else ""
 
     connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
     try:
@@ -1334,7 +1429,7 @@ def _query_hospital_rooms_by_filters(
             cursor.execute(
                 "SELECT COUNT(*) AS roomCount "
                 "FROM hospital_rooms hr "
-                "LEFT JOIN hospitals h ON hr.hospitalSeq = h.seq "
+                f"{count_join_sql} "
                 f"WHERE {where_sql}",
                 tuple(params),
             )
@@ -1427,16 +1522,27 @@ def _query_devices_by_filters(
     normalized_hospital_name = str(hospital_name or "").strip() or None
     normalized_room_name = str(room_name or "").strip() or None
     normalized_status = str(status or "").strip() or None
+    resolved_hospital_seq = hospital_seq
+    resolved_hospital_room_seq = hospital_room_seq
     if device_seq is not None:
         device_seq = int(device_seq)
     if hospital_seq is not None:
         hospital_seq = int(hospital_seq)
+        resolved_hospital_seq = hospital_seq
     if hospital_room_seq is not None:
         hospital_room_seq = int(hospital_room_seq)
+        resolved_hospital_room_seq = hospital_room_seq
     if active_flag is not None:
         active_flag = int(active_flag)
     if install_flag is not None:
         install_flag = int(install_flag)
+    if resolved_hospital_seq is None and normalized_hospital_name:
+        resolved_hospital_seq = _lookup_hospital_seq_by_name(normalized_hospital_name)
+    if resolved_hospital_room_seq is None and normalized_room_name and resolved_hospital_seq is not None:
+        resolved_hospital_room_seq = _lookup_hospital_room_seq_by_name(
+            normalized_room_name,
+            hospital_seq=resolved_hospital_seq,
+        )
 
     if not any(
         (
@@ -1463,18 +1569,18 @@ def _query_devices_by_filters(
     if device_seq is not None:
         where_clauses.append("d.seq = %s")
         params.append(device_seq)
-    if normalized_hospital_name:
+    if normalized_hospital_name and resolved_hospital_seq is None:
         where_clauses.append("h.hospitalName = %s")
         params.append(normalized_hospital_name)
-    if normalized_room_name:
+    if normalized_room_name and resolved_hospital_room_seq is None:
         where_clauses.append("hr.roomName = %s")
         params.append(normalized_room_name)
-    if hospital_seq is not None:
+    if resolved_hospital_seq is not None:
         where_clauses.append("d.hospitalSeq = %s")
-        params.append(hospital_seq)
-    if hospital_room_seq is not None:
+        params.append(resolved_hospital_seq)
+    if resolved_hospital_room_seq is not None:
         where_clauses.append("d.hospitalRoomSeq = %s")
-        params.append(hospital_room_seq)
+        params.append(resolved_hospital_room_seq)
     if normalized_status:
         where_clauses.append("UPPER(COALESCE(d.status, '')) = UPPER(%s)")
         params.append(normalized_status)
@@ -1487,6 +1593,12 @@ def _query_devices_by_filters(
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
     limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
+    count_join_clauses: list[str] = []
+    if normalized_hospital_name and resolved_hospital_seq is None:
+        count_join_clauses.append("LEFT JOIN hospitals h ON d.hospitalSeq = h.seq")
+    if normalized_room_name and resolved_hospital_room_seq is None:
+        count_join_clauses.append("LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq")
+    count_join_sql = (" " + " ".join(count_join_clauses)) if count_join_clauses else ""
 
     connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
     try:
@@ -1494,8 +1606,7 @@ def _query_devices_by_filters(
             cursor.execute(
                 "SELECT COUNT(*) AS deviceCount "
                 "FROM devices d "
-                "LEFT JOIN hospitals h ON d.hospitalSeq = h.seq "
-                "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
+                f"{count_join_sql} "
                 f"WHERE {where_sql}",
                 tuple(params),
             )
@@ -1699,29 +1810,33 @@ def _lookup_device_contexts_by_hospital_room(
     if not normalized_hospital_name or not normalized_room_name:
         return []
 
+    hospital_seq = _lookup_hospital_seq_by_name(normalized_hospital_name)
+    if hospital_seq is None:
+        return []
+    hospital_room_seq = _lookup_hospital_room_seq_by_name(
+        normalized_room_name,
+        hospital_seq=hospital_seq,
+    )
+    if hospital_room_seq is None:
+        return []
+
     limit = max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))
     connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT "
-                "h.seq AS hospitalSeq, "
-                "h.hospitalName AS hospitalName, "
-                "hr.seq AS hospitalRoomSeq, "
-                "hr.roomName AS roomName, "
                 "d.seq AS deviceSeq, "
                 "d.deviceName AS deviceName "
-                "FROM hospitals h "
-                "INNER JOIN hospital_rooms hr ON hr.hospitalSeq = h.seq "
-                "INNER JOIN devices d ON d.hospitalSeq = h.seq AND d.hospitalRoomSeq = hr.seq "
-                "WHERE h.hospitalName = %s "
-                "AND hr.roomName = %s "
+                "FROM devices d "
+                "WHERE d.hospitalSeq = %s "
+                "AND d.hospitalRoomSeq = %s "
                 "AND COALESCE(d.deviceName, '') <> '' "
                 "ORDER BY d.seq DESC "
                 "LIMIT %s",
                 (
-                    normalized_hospital_name,
-                    normalized_room_name,
+                    hospital_seq,
+                    hospital_room_seq,
                     limit,
                 ),
             )
@@ -1740,10 +1855,10 @@ def _lookup_device_contexts_by_hospital_room(
             {
                 "deviceName": device_name,
                 "deviceSeq": row.get("deviceSeq"),
-                "hospitalSeq": row.get("hospitalSeq"),
-                "hospitalRoomSeq": row.get("hospitalRoomSeq"),
-                "hospitalName": row.get("hospitalName"),
-                "roomName": row.get("roomName"),
+                "hospitalSeq": hospital_seq,
+                "hospitalRoomSeq": hospital_room_seq,
+                "hospitalName": normalized_hospital_name,
+                "roomName": normalized_room_name,
             }
         )
     return items

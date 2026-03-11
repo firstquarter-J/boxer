@@ -25,6 +25,7 @@ _COMPACT_YYYYMMDD_PATTERN = re.compile(r"(?<!\d)(20\d{2}|19\d{2})(\d{2})(\d{2})(
 _COMPACT_YYMMDD_PATTERN = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)")
 _COMPACT_MMDD_PATTERN = re.compile(r"(?<!\d)(\d{2})(\d{2})(?!\d)")
 _YEAR_ONLY_PATTERN = re.compile(r"(?<!\d)(20\d{2}|\d{2})\s*년(?:도)?(?!\d)")
+_BARE_YEAR_ONLY_PATTERN = re.compile(r"(?<![A-Za-z0-9])(20\d{2}|19\d{2})(?![A-Za-z0-9])")
 _MOTION_STOP_STATUS_PATTERN = re.compile(
     r"Motion detected:\s*(true|false)\s*,\s*Error:\s*(true|false)",
     re.IGNORECASE,
@@ -306,10 +307,27 @@ def _extract_log_date_with_presence(question: str) -> tuple[str, bool]:
 
 def _extract_year_filter(question: str) -> int | None:
     text = (question or "").strip()
+    for pattern in (
+        _KOREAN_YMD_PATTERN,
+        _NUMERIC_YMD_PATTERN,
+        _KOREAN_MD_PATTERN,
+        _NUMERIC_MD_PATTERN,
+        _NUMERIC_MD_DASH_PATTERN,
+        _COMPACT_YYYYMMDD_PATTERN,
+        _COMPACT_YYMMDD_PATTERN,
+    ):
+        if pattern.search(text):
+            return None
+
     matched = _YEAR_ONLY_PATTERN.search(text)
-    if not matched:
-        return None
-    return _normalize_year(int(matched.group(1)))
+    if matched:
+        return _normalize_year(int(matched.group(1)))
+
+    bare_year_match = _BARE_YEAR_ONLY_PATTERN.search(text)
+    if bare_year_match:
+        return int(bare_year_match.group(1))
+
+    return None
 
 
 def _is_barcode_log_analysis_request(question: str, barcode: str | None) -> bool:

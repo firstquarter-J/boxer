@@ -1890,6 +1890,8 @@ def create_app() -> App:
             structured_date_error = None
 
         structured_target_year = _extract_year_filter(question)
+        if structured_target_year is not None and structured_target_date is None:
+            structured_date_error = None
         structured_hospital_name, structured_room_name = _extract_hospital_room_scope(question)
         if not structured_hospital_name:
             structured_hospital_name = _extract_leading_hospital_scope(question)
