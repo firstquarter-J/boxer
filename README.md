@@ -12,12 +12,14 @@
 ## 제품 전략 (Open Core + Domain Adapter)
 
 ### 1) Open Core (공개 대상)
+
 - 범용 `RAG LLM Bot` 엔진
 - Intent/Slot Router, Policy Guard, Tool Executor, Evidence Merger, Audit Logger
 - 팀/도메인 무관하게 재사용 가능한 구조
 
 ### 2) Domain Adapter (회사 전용)
-- 예시: `Momybox Router`
+
+- 예시: `Mommybox Router`
 - 회사 도메인 규칙(바코드/영상/로그), 권한 정책, 내부 데이터 소스 연결
 - 코어와 분리해 운영하며 민감 정보/내부 정책은 비공개 유지
 
@@ -34,6 +36,9 @@
 - `boxer/adapters/factory.py`
   - 환경변수 `ADAPTER_ENTRYPOINT`로 활성 어댑터 선택
   - 기본값: `boxer.adapters.sample.slack:create_app`
+- `boxer/adapters/sample`
+  - open core smoke test용 최소 Slack adapter
+  - 회사 설정 없이 ping/기본 응답만 검증
 - `boxer/adapters/slack.py`
   - 기존 경로 호환을 위한 legacy alias
   - 내부적으로 `ADAPTER_ENTRYPOINT`를 따라 어댑터를 재로딩(재귀 방지 포함)
@@ -59,6 +64,7 @@
   - Mommybox 운영 문서 탐색, overview/reference 선택 담당
 
 원칙:
+
 - 타인이 이 저장소를 사용할 때 `common`은 그대로 재사용
 - `company`는 각 조직 규칙에 맞춰 교체/재구현
 
@@ -120,28 +126,35 @@
 핵심 원칙: `LLM은 판단`, `서버는 정책 검증과 실제 실행`을 담당합니다.
 
 1. Input Normalizer
+
 - 멘션 텍스트, 스레드 맥락, 사용자 식별자, 타임스탬프 정규화
 
 2. Intent/Slot Router (rule + LLM)
+
 - 의도 분류 및 필요한 슬롯 추출
 - 예시: `video_count_by_barcode`, `video_dates_by_barcode`
 
 3. Policy Guard (server authority)
+
 - 실행 여부를 최종 결정
 - 권한, PII 정책, 허용 템플릿(allowlist) 검증
 
 4. Tool Executor
+
 - 승인된 도구/템플릿만 실행
 - 가드레일이 적용된 DB/API/S3/Notion 조회
 
 5. Evidence Merger
+
 - 수집된 근거를 정규화하고 중복 제거
 
 6. Answer Synthesizer
+
 - 근거 기반 최종 답변 생성
 - 근거가 부족하면 보강 질문 1개 또는 근거 부족 안내
 
 7. Audit Logger
+
 - 실행 추적 정보와 근거 메타데이터 저장
 
 ## 권장 자연어 처리 구조 (Hybrid Router)
@@ -151,22 +164,28 @@
 권장 흐름:
 
 1. Rule Router
+
 - 고빈도/고정형 의도(`바코드 영상 개수`, `바코드 로그 분석`)를 즉시 매핑
 
 2. LLM Intent Parser
+
 - Rule Router 미스 시 LLM이 `intent + slots(JSON)`만 생성
 - 이 단계에서 SQL/API/S3를 직접 실행하지 않음
 
 3. Policy Guard
+
 - 사용자 권한, PII 정책, 허용 템플릿(allowlist) 검증
 
 4. Tool Executor
+
 - 검증된 템플릿만 실제 실행(DB/API/S3/Notion)
 
 5. Answer Synthesizer
+
 - 근거 기반으로 응답 생성, 근거 부족 시 보강 질문 1회
 
 핵심 제약:
+
 - LLM은 직접 조회 권한이 없음
 - 서버만 실행 권한을 가짐
 - 실행 근거 메타데이터를 반드시 남김
@@ -174,10 +193,12 @@
 ## 정책 가드 라우팅을 쓰는 이유 (일반 GPT 답변 대비)
 
 일반 GPT 대화:
+
 - 도구 실행 보장 없이 그럴듯한 텍스트를 생성할 수 있음
 - 실제 데이터를 조회했는지 증명하기 어려움
 
 정책 가드 라우팅:
+
 - `LLM 판단 -> 정책 검증 -> 실제 조회 -> 근거 기반 응답`
 - 환각 및 허위 조회 주장 감소
 - 권한/개인정보(PII) 정책 강제
@@ -197,7 +218,7 @@
 }
 ```
 
-## 빠른 시작 (Slack 레퍼런스 앱)
+## 빠른 시작 (Sample Adapter)
 
 1. 가상환경 생성 및 의존성 설치
 
@@ -213,7 +234,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-필수 기본 변수:
+샘플 어댑터 최소 변수:
 
 - `SLACK_BOT_TOKEN`
 - `SLACK_APP_TOKEN`
@@ -229,40 +250,62 @@ LLM 변수:
 
 - Ollama: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT_SEC`, `OLLAMA_TEMPERATURE`
 - Claude: `ANTHROPIC_API_KEY_HUMANSCAPE`, `ANTHROPIC_MODEL`, `ANTHROPIC_TIMEOUT_SEC`, `ANTHROPIC_MAX_TOKENS`
-- Claude 접근 제어(선택): `CLAUDE_ALLOWED_USER_IDS` (콤마 구분, 비워두면 전체 허용)
 - Retrieval Synthesis: `LLM_SYNTHESIS_ENABLED`, `LLM_SYNTHESIS_MAX_EVIDENCE_CHARS`, `LLM_SYNTHESIS_MASKING_ENABLED`, `RETRIEVAL_SYNTHESIS_SYSTEM_PROMPT`
 - Retrieval Synthesis 추가 옵션: `LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT` (기본 `false`, 조회형 합성 시 스레드 문맥 주입 여부)
 
-바코드 프로필 API 변수:
+공통 connector 변수:
 
-- `APP_USER_API_URL`
-- `APP_USER_API_TIMEOUT_SEC`
-- `HYUN_USER_ID`, `MARK_USER_ID`, `DD_USER_ID`
-- `APP_USER_LOOKUP_ALLOWED_USER_IDS` (콤마 구분)
-- `COMPANY_SYSTEM_PROMPT` (선택)
-
-DB 조회 변수:
-
-- `DB_QUERY_ENABLED=true`
-- `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_DATABASE`
-- `DB_QUERY_TIMEOUT_SEC`, `DB_QUERY_MAX_ROWS`, `DB_QUERY_MAX_SQL_CHARS`, `DB_QUERY_MAX_RESULT_CHARS`
-- `RECORDINGS_CONTEXT_LIMIT` (바코드 기준 recordings 기본 컨텍스트 로드 개수, 기본 `30`)
-
-S3 조회 변수:
-
-- `S3_QUERY_ENABLED=true`
-- `AWS_REGION`
-- `S3_ULTRASOUND_BUCKET`, `S3_LOG_BUCKET`
-- `S3_QUERY_TIMEOUT_SEC`, `S3_QUERY_MAX_KEYS`, `S3_QUERY_MAX_ITEMS`, `S3_QUERY_MAX_RESULT_CHARS`
-- `S3_LOG_TAIL_BYTES`, `S3_LOG_TAIL_LINES`
-- `LOG_ANALYSIS_MAX_DEVICES`, `LOG_ANALYSIS_MAX_SAMPLES`, `LOG_SCAN_MAX_EVENTS`, `LOG_SESSION_SAFETY_LINES`
+- DB 조회: `DB_QUERY_ENABLED=true`, `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_DATABASE`
+- DB 제한값: `DB_QUERY_TIMEOUT_SEC`, `DB_QUERY_MAX_ROWS`, `DB_QUERY_MAX_SQL_CHARS`, `DB_QUERY_MAX_RESULT_CHARS`
+- S3 조회: `S3_QUERY_ENABLED=true`, `AWS_REGION`, `S3_ULTRASOUND_BUCKET`, `S3_LOG_BUCKET`
+- S3 제한값: `S3_QUERY_TIMEOUT_SEC`, `S3_QUERY_MAX_KEYS`, `S3_QUERY_MAX_ITEMS`, `S3_QUERY_MAX_RESULT_CHARS`, `S3_LOG_TAIL_BYTES`, `S3_LOG_TAIL_LINES`
+- Notion 조회: `NOTION_TOKEN`, `NOTION_TEST_PAGE_ID`, `NOTION_API_TIMEOUT_SEC`
 - Access Key 방식일 때만 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` 사용
 
-3. 실행
+회사 어댑터를 쓸 때는 `.env.company.example` 를 참고해서 같은 `.env` 에 필요한 key를 추가해.
+
+3. sample adapter smoke test
+
+```bash
+scripts/smoke_sample_adapter.sh
+```
+
+4. 실행
 
 ```bash
 python app.py
 ```
+
+5. 회사 어댑터 전환
+
+- `ADAPTER_ENTRYPOINT=boxer.adapters.company.slack:create_app`
+- `.env.company.example` 의 회사 전용 key를 `.env` 에 추가
+- DB/S3/Notion/company policy key는 실제 쓰는 기능만 켜서 설정
+
+## Open Core 경계와 검증
+
+- open core 경계 원칙:
+  - `boxer/core`, `boxer/routers/common`, `boxer/adapters/common` 에 회사 고유 키워드와 정책을 넣지 않음
+  - 회사 전용 규칙, env, prompt, 문서 선택 로직은 `boxer/company`, `boxer/routers/company`, `boxer/adapters/company` 에만 둠
+  - `.env.example` 는 공통 key만 두고, 회사 key는 `.env.company.example` 를 참고해 실제 `.env` 에 추가
+- 정적 경계 검사:
+
+```bash
+scripts/verify_open_core_boundary.sh
+```
+
+- sample adapter smoke test:
+
+```bash
+scripts/smoke_sample_adapter.sh
+```
+
+검증 기준:
+
+- `boxer/core`, `boxer/routers/common`, `boxer/adapters/common` 에 회사 키워드가 없어야 함
+- `.env.example` 는 sample/open core 기준 key만 포함해야 함
+- 회사 전용 key는 `.env.company.example`, `boxer/company/settings.py` 기준으로 관리
+- sample adapter는 회사 설정 없이 smoke test가 돌아야 함
 
 ## EC2 설치/실행 (Private Subnet + Session Manager)
 
@@ -454,18 +497,19 @@ Slack/Web -> Input Normalizer -> Intent/Slot Router -> Policy Guard -> Tool Exec
 
 ### 진행 상태 요약
 
-| Phase | 상태 | 비고 |
-| --- | --- | --- |
-| A | 완료 | Slack 레퍼런스 동작 + 권한 게이트 + 명시적 DB 조회 |
-| B | 진행중 | 자연어 질의 자동 라우팅 설계 정리, 실행 로직은 미완 |
-| C | 예정 | S3/Notion/DB 증거 병합 파이프라인 구현 예정 |
-| D | 예정 | 채널 확장(Web/WS/API) 및 성능/동시성 고도화 예정 |
+| Phase | 상태   | 비고                                                |
+| ----- | ------ | --------------------------------------------------- |
+| A     | 완료   | Slack 레퍼런스 동작 + 권한 게이트 + 명시적 DB 조회  |
+| B     | 진행중 | 자연어 질의 자동 라우팅 설계 정리, 실행 로직은 미완 |
+| C     | 예정   | S3/Notion/DB 증거 병합 파이프라인 구현 예정         |
+| D     | 예정   | 채널 확장(Web/WS/API) 및 성능/동시성 고도화 예정    |
 
 ### 상세 기록
 
 #### Phase A - 안정 베이스라인
 
 완료:
+
 - Slack 멘션 처리 및 스레드 응답
 - `ollama`/`claude` 제공자 라우팅
 - 스레드 맥락 주입
@@ -477,34 +521,42 @@ Slack/Web -> Input Normalizer -> Intent/Slot Router -> Policy Guard -> Tool Exec
 - 어댑터 엔트리포인트 선택 지원 (`ADAPTER_ENTRYPOINT`)
 
 진행중:
+
 - 없음
 
 다음:
+
 - 운영 관점 로그 키/메타데이터 표준화
 
 #### Phase B - 자연어 조회 라우팅
 
 완료:
+
 - 정책 가드 기반 구조/흐름 문서화
 - 의도/슬롯 기반 라우팅 방향 확정
 
 진행중:
+
 - 자연어 입력에서 안전한 템플릿 조회로 연결하는 라우터 구현
 - 슬롯 누락 시 보강 질문 fallback 규칙 구현
 
 다음:
+
 - 의도 스키마 확정 (`video_count_by_barcode`, `video_dates_by_barcode` 우선)
 - 의도별 허용 쿼리/툴 allowlist 연결
 
 #### Phase C - 멀티 소스 조회
 
 완료:
+
 - 없음
 
 진행중:
+
 - 없음
 
 다음:
+
 - S3 로그 조회기 구현 (날짜/키워드/id 필터)
 - Notion 검색/본문 추출 구현
 - DB/API/S3/Notion 통합 근거 병합기 구현
@@ -513,12 +565,15 @@ Slack/Web -> Input Normalizer -> Intent/Slot Router -> Policy Guard -> Tool Exec
 #### Phase D - 인터페이스와 확장
 
 완료:
+
 - 없음
 
 진행중:
+
 - 없음
 
 다음:
+
 - 코어 엔진 모듈화
 - FastAPI/WS 엔드포인트
 - 웹 채널 연동
