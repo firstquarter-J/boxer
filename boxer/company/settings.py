@@ -9,6 +9,12 @@ load_dotenv()
 HYUN_USER_ID = os.getenv("HYUN_USER_ID", "").strip()
 MARK_USER_ID = os.getenv("MARK_USER_ID", "").strip()
 DD_USER_ID = os.getenv("DD_USER_ID", "").strip()
+_raw_claude_allowed_ids = os.getenv("CLAUDE_ALLOWED_USER_IDS", "")
+CLAUDE_ALLOWED_USER_IDS = {
+    item.strip()
+    for item in _raw_claude_allowed_ids.split(",")
+    if item.strip()
+}
 
 _raw_lookup_ids = os.getenv("APP_USER_LOOKUP_ALLOWED_USER_IDS", "")
 if _raw_lookup_ids.strip():

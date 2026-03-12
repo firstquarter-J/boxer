@@ -934,7 +934,14 @@ def _render_device_download_dm_failure_notice(
 
 def create_app() -> App:
     _validate_tokens(include_llm=True, include_data_sources=True)
-    claude_client = Anthropic(api_key=s.ANTHROPIC_API_KEY) if s.LLM_PROVIDER == "claude" else None
+    claude_client = (
+        Anthropic(
+            api_key=s.ANTHROPIC_API_KEY,
+            timeout=s.ANTHROPIC_TIMEOUT_SEC,
+        )
+        if s.LLM_PROVIDER == "claude"
+        else None
+    )
     s3_client: Any | None = None
 
     def _get_s3_client() -> Any:
@@ -976,12 +983,25 @@ def create_app() -> App:
             logger.info("Responded with ping health in thread_ts=%s provider=none", thread_ts)
             return
 
+        def _is_claude_allowed_user(target_user_id: str | None) -> bool:
+            if not cs.CLAUDE_ALLOWED_USER_IDS:
+                return True
+            return bool(target_user_id) and target_user_id in cs.CLAUDE_ALLOWED_USER_IDS
+
         def _timeout_reply_text() -> str:
+            provider = (s.LLM_PROVIDER or "").lower().strip()
+            if provider == "claude":
+                timeout_sec = max(1, s.ANTHROPIC_TIMEOUT_SEC)
+                return f"Claude API가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
             timeout_sec = max(1, s.OLLAMA_TIMEOUT_SEC)
             return f"LLM 서버가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
 
         def _llm_unavailable_reply_text(summary: str | None = None) -> str:
-            base = "LLM 서버가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
+            provider = (s.LLM_PROVIDER or "").lower().strip()
+            if provider == "claude":
+                base = "Claude API가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
+            else:
+                base = "LLM 서버가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
             detail = (summary or "").strip()
             if not detail:
                 return base
@@ -1157,7 +1177,7 @@ def create_app() -> App:
                     reply(fallback_with_references)
                     logger.info("Responded with %s (direct, claude client unavailable)", route_name)
                     return
-                if not cs.HYUN_USER_ID or user_id != cs.HYUN_USER_ID:
+                if not _is_claude_allowed_user(user_id):
                     reply(fallback_with_references)
                     logger.info(
                         "Responded with %s (direct, claude synthesis not allowed for user=%s)",
@@ -1661,7 +1681,7 @@ def create_app() -> App:
                     reply(final_text, mention_user=False)
                     logger.info("Responded with barcode log error summary (direct, claude client unavailable)")
                     return
-                if not cs.HYUN_USER_ID or user_id != cs.HYUN_USER_ID:
+                if not _is_claude_allowed_user(user_id):
                     rendered_sections = _build_rendered_fallback_sections()
                     final_text = fallback_text
                     if rendered_sections:
@@ -2900,11 +2920,7 @@ def create_app() -> App:
             if not question:
                 reply("질문 내용을 같이 보내줘")
                 return
-            if not cs.HYUN_USER_ID:
-                reply("Claude 질문 권한 사용자가 설정되지 않았어. HYUN_USER_ID를 설정해줘")
-                logger.warning("HYUN_USER_ID is not configured")
-                return
-            if user_id != cs.HYUN_USER_ID:
+            if not _is_claude_allowed_user(user_id):
                 reply("Claude 질문은 현재 지정된 사용자만 사용할 수 있어")
                 logger.info("Rejected claude call for user=%s", user_id)
                 return
