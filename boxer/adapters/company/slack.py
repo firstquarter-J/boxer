@@ -11,6 +11,7 @@ from slack_bolt import App
 from boxer.adapters.common.slack import MentionPayload, SlackReplyFn, create_slack_app
 from boxer.adapters.company.fun import handle_fun_message
 from boxer.company.notion_links import select_company_notion_doc_links
+from boxer.company.notion_playbooks import _select_notion_references
 from boxer.company import settings as cs
 from boxer.company.utils import _extract_barcode
 from boxer.core import settings as s
@@ -102,7 +103,7 @@ from boxer.routers.company.s3_domain import (
     _query_s3_ultrasound_by_barcode,
 )
 from boxer.routers.common.db import _query_db, _validate_readonly_sql
-from boxer.routers.common.notion import _is_notion_configured, _select_notion_references
+from boxer.routers.common.notion import _is_notion_configured
 from boxer.routers.common.s3 import _build_s3_client
 
 _NOTION_DOC_QUERY_TOKENS = (

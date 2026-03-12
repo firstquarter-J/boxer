@@ -45,10 +45,14 @@
 - `boxer/routers/common`
   - 제품 공통으로 재사용 가능한 저수준 기능만 포함
   - `db.py`: read-only DB 연결/검증/실행(명령 파싱/문구 제외)
+  - `notion.py`: Notion API 호출, page/block 로드, 캐시
   - `s3.py`: S3 client 생성
 - `boxer/routers/company`
   - 회사 도메인 로직 전용
   - 예: 바코드 영상 개수, app-user 조회, 장비 로그 파싱/분석, S3 요청 파싱
+- `boxer/company/notion_playbooks.py`
+  - 회사 전용 Notion 플레이북 선택/점수화 규칙
+  - Mommybox 운영 문서 탐색, overview/reference 선택 담당
 
 원칙:
 - 타인이 이 저장소를 사용할 때 `common`은 그대로 재사용
