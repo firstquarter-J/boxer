@@ -12,6 +12,10 @@ from boxer.adapters.common.slack import MentionPayload, SlackReplyFn, create_sla
 from boxer.adapters.company.fun import handle_fun_message
 from boxer.company.notion_links import select_company_notion_doc_links
 from boxer.company.notion_playbooks import _select_notion_references
+from boxer.company.retrieval_rules import (
+    _build_company_retrieval_rules,
+    _transform_company_retrieval_payload,
+)
 from boxer.company import settings as cs
 from boxer.company.utils import _extract_barcode
 from boxer.core import settings as s
@@ -1204,6 +1208,8 @@ def create_app() -> App:
                     provider=provider,
                     claude_client=claude_client,
                     system_prompt=cs.SYSTEM_PROMPT or None,
+                    extra_rules=_build_company_retrieval_rules(evidence_payload),
+                    evidence_transform=_transform_company_retrieval_payload,
                     max_tokens=max_tokens,
                 )
                 final_text = synthesized_text or fallback_with_references
@@ -1721,6 +1727,8 @@ def create_app() -> App:
                         provider=provider,
                         claude_client=claude_client,
                         system_prompt=cs.SYSTEM_PROMPT or None,
+                        extra_rules=_build_company_retrieval_rules(session_payload),
+                        evidence_transform=_transform_company_retrieval_payload,
                         max_tokens=s.BARCODE_LOG_ERROR_SUMMARY_MAX_TOKENS,
                     )
                     final_section = synthesized_text or fallback_section
@@ -2944,6 +2952,8 @@ def create_app() -> App:
                         provider="claude",
                         claude_client=claude_client,
                         system_prompt=cs.SYSTEM_PROMPT or None,
+                        extra_rules=_build_company_retrieval_rules(fallback_evidence),
+                        evidence_transform=_transform_company_retrieval_payload,
                     )
                     if answer:
                         reply(answer)
@@ -3008,6 +3018,8 @@ def create_app() -> App:
                         provider="ollama",
                         claude_client=None,
                         system_prompt=cs.SYSTEM_PROMPT or None,
+                        extra_rules=_build_company_retrieval_rules(fallback_evidence),
+                        evidence_transform=_transform_company_retrieval_payload,
                     )
                     if answer:
                         reply(answer)

@@ -42,6 +42,9 @@
 - `boxer/company`
   - 회사 전용 설정/정책/패턴/프롬프트
   - 사용자 권한 ID, 바코드/로그 규칙, 회사용 시스템 프롬프트
+- `boxer/company/retrieval_rules.py`
+  - 회사 전용 retrieval synthesis 규칙
+  - route별 프롬프트 규칙과 evidence 축약 담당
 - `boxer/routers/common`
   - 제품 공통으로 재사용 가능한 저수준 기능만 포함
   - `db.py`: read-only DB 연결/검증/실행(명령 파싱/문구 제외)
