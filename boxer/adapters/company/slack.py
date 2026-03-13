@@ -1049,7 +1049,13 @@ def create_app() -> App:
             required_labels = ("매핑 장비", "병원", "병실")
             required_bullets = ("• 바코드:", "• 날짜:", "• 매핑 장비:")
 
-            if normalized_fallback.startswith("*바코드 로그") and not normalized_synth.startswith("*바코드 로그"):
+            if (
+                normalized_fallback.startswith("*바코드 로그")
+                and not normalized_synth.startswith("*바코드 로그")
+            ) or (
+                normalized_fallback.startswith("*로그 분석 결과")
+                and not normalized_synth.startswith("*로그 분석 결과")
+            ):
                 return True
 
             for bullet in required_bullets:
@@ -2312,7 +2318,7 @@ def create_app() -> App:
                             result_text = _build_phase2_scope_request_message(
                                 barcode or "",
                                 "recordings 장비 매핑이 없어 2차 입력이 필요해",
-                                "*바코드 로그 분석 결과 (2차 수동 범위)*",
+                                "*로그 분석 결과 (2차 수동 범위)*",
                             )
                         else:
                             manual_device_contexts = _lookup_device_contexts_by_hospital_room(
@@ -2324,7 +2330,7 @@ def create_app() -> App:
                                 result_text = _build_phase2_scope_request_message(
                                     barcode or "",
                                     "입력한 병원명/병실명으로 장비를 찾지 못했어. MDA 표시 이름과 정확히 일치하게 입력해줘",
-                                    "*바코드 로그 분석 결과 (2차 수동 범위)*",
+                                    "*로그 분석 결과 (2차 수동 범위)*",
                                 )
                             else:
                                 used_manual_scope = True

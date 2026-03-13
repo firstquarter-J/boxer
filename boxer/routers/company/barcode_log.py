@@ -8,6 +8,7 @@ from boxer.company import settings as cs
 from boxer.core import settings as s
 from boxer.core.utils import _display_value, _format_size, _truncate_text
 from boxer.routers.company.box_db import (
+    _format_video_length,
     _load_recordings_rows_on_date_by_barcode,
     _lookup_device_contexts_by_barcode,
     _lookup_device_contexts_by_hospital_seqs,
@@ -2291,6 +2292,28 @@ def _build_session_card_context(
     }
 
 
+def _build_recordings_video_length_line(
+    recordings_on_date_rows: list[dict[str, Any]] | None,
+) -> str | None:
+    rows = recordings_on_date_rows or []
+    labels: list[str] = []
+    for row in rows:
+        label = _format_video_length(row.get("videoLength"))
+        if label == "미확인" or label in labels:
+            continue
+        labels.append(label)
+
+    if not labels:
+        return None
+    if len(labels) == 1:
+        return f"• 초음파 영상 길이: `{labels[0]}`"
+
+    rendered = " / ".join(f"`{label}`" for label in labels[:5])
+    if len(labels) > 5:
+        rendered = f"{rendered} 외 `{len(labels) - 5}개`"
+    return f"• 초음파 영상 길이: {rendered}"
+
+
 def _is_session_card_abnormal(session_context: dict[str, Any]) -> bool:
     termination_text = str(session_context.get("terminationText") or "")
     recording_result = str(session_context.get("recordingResult") or "")
@@ -2315,6 +2338,7 @@ def _append_session_card(
     session_error_lines: list[tuple[int, str]],
     diagnostic_scan_events: list[dict[str, Any]],
     recordings_on_date_count: int | None,
+    recordings_on_date_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     session_context = _build_session_card_context(
         source_lines,
@@ -2335,6 +2359,9 @@ def _append_session_card(
     lines.append(f"• 핵심 이상 징후: {session_context['anomalyText']}")
     if recordings_on_date_count is not None:
         lines.append(f"• DB 영상 기록: `{recordings_on_date_count}개`")
+    video_length_line = _build_recordings_video_length_line(recordings_on_date_rows)
+    if video_length_line:
+        lines.append(video_length_line)
     _append_restart_events_section(lines, session_restart_events)
     _append_scan_events_section(lines, session_scan_events, session_motion_events)
     _append_error_lines_section(lines, session_error_lines, show_all=True)
@@ -2350,6 +2377,7 @@ def _append_session_sections(
     error_lines: list[tuple[int, str]],
     diagnostic_scan_events: list[dict[str, Any]] | None = None,
     recordings_on_date_count: int | None = None,
+    recordings_on_date_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     diagnostic_scan_events = diagnostic_scan_events or scan_events
     if not sessions:
@@ -2384,6 +2412,7 @@ def _append_session_sections(
             session_error_lines=session_error_lines,
             diagnostic_scan_events=diagnostic_scan_events,
             recordings_on_date_count=recordings_on_date_count,
+            recordings_on_date_rows=recordings_on_date_rows,
         )
 
 
@@ -2857,7 +2886,7 @@ def _analyze_barcode_log_phase1_window(
     recordings_context: dict[str, Any],
     max_days: int,
 ) -> tuple[str, dict[str, Any]]:
-    title = "*바코드 로그 분석 결과 (1차 자동 범위)*"
+    title = "*로그 분석 결과 (1차 자동 범위)*"
     summary = recordings_context.get("summary") or {}
     recording_count = int(summary.get("recordingCount") or 0)
     if recording_count <= 0:
@@ -3060,6 +3089,7 @@ def _analyze_barcode_log_phase1_window(
                 session_error_lines,
                 diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
+                recordings_on_date_rows=recordings_on_date_rows,
             )
 
     if found_log_files == 0:
@@ -3110,7 +3140,7 @@ def _analyze_barcode_log_scan_events(
 
     if not all_device_contexts:
         result_text = (
-            "*바코드 로그 스캔 분석 결과*\n"
+            "*로그 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
             "• recordings/devices에서 매핑된 장비명을 찾지 못했어"
@@ -3135,7 +3165,7 @@ def _analyze_barcode_log_scan_events(
     analysis_records: list[dict[str, Any]] = []
 
     lines = [
-        "*바코드 로그 스캔 분석 결과*",
+        "*로그 분석 결과*",
         f"• 바코드: `{barcode}`",
         f"• 날짜: `{log_date}`",
         f"• 매핑 장비: `{len(all_device_contexts)}개`",
@@ -3246,6 +3276,7 @@ def _analyze_barcode_log_scan_events(
                 session_error_lines,
                 diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
+                recordings_on_date_rows=recordings_on_date_rows,
             )
 
     _analyze_device_context_batch(target_device_contexts)
@@ -3264,7 +3295,7 @@ def _analyze_barcode_log_scan_events(
 
     if logs_with_session == 0:
         result_text = _build_barcode_log_empty_result(
-            title="*바코드 로그 스캔 분석 결과*",
+            title="*로그 분석 결과*",
             barcode=barcode,
             log_date=log_date,
             mapped_device_count=len(all_device_contexts),
@@ -3451,6 +3482,7 @@ def _analyze_barcode_log_errors(
                 session_error_lines,
                 diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
+                recordings_on_date_rows=recordings_on_date_rows,
             )
 
     _analyze_device_context_batch(target_device_contexts)
