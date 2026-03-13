@@ -75,9 +75,14 @@ _COMPANY_NOTION_DOCS: tuple[dict[str, Any], ...] = (
         "keywords": ("소리", "잡음", "노이즈", "지지직", "웅", "울림"),
     },
     {
-        "title": "초음파 화면 잡읍(전기적 아티팩트)",
+        "title": "초음파 화면 잡음(전기적 아티팩트)",
         "url": "https://www.notion.so/177d235a53fd40858dee7691c1acf023?pvs=21",
         "keywords": ("화면", "잡음", "아티팩트", "전기", "노이즈", "줄"),
+    },
+    {
+        "title": "마미박스 장비 그라운드 루프 아이솔레이터",
+        "url": "https://www.notion.so/320cf826870c805ca1fcd80b6160ad9a",
+        "keywords": ("그라운드 루프", "접지", "노이즈", "잡음", "아이솔레이터"),
     },
     {
         "title": "초음파 영상 업로드 반복 실패",
@@ -345,7 +350,6 @@ def select_company_notion_doc_links(
     seed_titles = _build_seed_titles(notion_playbooks)
     has_overview_intent = any(token in normalized_question for token in _COMPANY_DOC_OVERVIEW_TOKENS)
     require_exact_title_match = bool(seed_titles) and not has_overview_intent
-    primary_seed_title = seed_titles[0] if seed_titles else ""
     scored: list[tuple[int, dict[str, Any]]] = []
 
     for entry in _COMPANY_NOTION_DOCS:
@@ -357,7 +361,7 @@ def select_company_notion_doc_links(
         for keyword in keywords:
             entry_terms.update(_extract_lookup_terms(keyword))
 
-        title_matches_seed = normalized_title == primary_seed_title if primary_seed_title else False
+        title_matches_seed = normalized_title in seed_titles if seed_titles else False
         if require_exact_title_match and not title_matches_seed:
             continue
 

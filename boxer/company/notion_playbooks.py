@@ -92,6 +92,19 @@ _NOTION_QUERY_EXPANSIONS = (
         "tokens": ("eai_again", "jwt", "uploader", "endpoint", "네트워크"),
         "aliases": ("네트워크", "통신", "업로드", "dns", "jwt", "eai_again"),
     },
+    {
+        "tokens": ("노이즈", "잡음", "아티팩트", "지지직", "울림", "웅"),
+        "aliases": (
+            "노이즈",
+            "잡음",
+            "소리 잡음",
+            "화면 잡음",
+            "전기적 아티팩트",
+            "그라운드 루프",
+            "ei 코어",
+            "페라이트",
+        ),
+    },
 )
 _NOTION_PLAYBOOK_TOPIC_RULES = (
     {
