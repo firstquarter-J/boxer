@@ -92,8 +92,8 @@
 - `REQUEST_LOG_SQLITE_ENABLED=true`면 Slack 요청 메타데이터용 로컬 SQLite를 시작 시 초기화하고 요청 단위로 저장 가능
 - 선택적으로 최신 SQLite snapshot을 S3에 백업하고, 앱 시작 시 최신 snapshot 복구 가능
 - S3 백업은 요청 시점이 아니라 `python -m boxer.routers.common.request_log_backup` 같은 주기 job으로 실행 가능
-- S3 backup object key는 `YYYY/MM/DD/<sqlite-snapshot>.db` 형태로 저장되며, prefix를 지정하면 `<prefix>/YYYY/MM/DD/...` 형태가 됨
-- `REQUEST_LOG_SQLITE_S3_PREFIX` 기본값은 비어 있으며, 전용 버킷이면 루트 날짜 폴더에 저장하고 공유 버킷일 때만 prefix를 지정
+- S3 backup object key는 기본적으로 `request-log/YYYY-MM-DD-request_log.db` 형태로 저장되며, 같은 날 다시 실행하면 같은 객체를 덮어씀
+- `REQUEST_LOG_SQLITE_S3_PREFIX` 기본값은 `request-log`이며, 필요하면 다른 prefix로 바꿀 수 있음
 - Slack 스레드 맥락을 읽어 LLM 프롬프트에 주입
 - LLM 제공자 라우팅 지원 (`ollama`, `claude`)
 - 조회형 응답은 서버가 근거를 수집한 뒤, LLM이 근거(JSON) 기반으로 최종 문장화

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import socket
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
@@ -61,22 +60,17 @@ def _build_sqlite_snapshot_key(
     key_prefix: str = "",
 ) -> str:
     resolved_path = _resolve_sqlite_path(db_path)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     try:
         local_now = datetime.now(ZoneInfo(s.REQUEST_LOG_TIMEZONE))
     except Exception:
         local_now = datetime.now(timezone.utc)
-    date_prefix = local_now.strftime("%Y/%m/%d")
-    hostname = "".join(
-        ch if ch.isalnum() or ch in {"-", "_"} else "-"
-        for ch in (socket.gethostname().strip() or "unknown-host")
-    )
+    local_date = local_now.strftime("%Y-%m-%d")
     suffix = resolved_path.suffix or ".sqlite3"
-    filename = f"{resolved_path.stem}-{hostname}-{timestamp}{suffix}"
+    filename = f"{local_date}-{resolved_path.stem}{suffix}"
     normalized_prefix = str(key_prefix or "").strip().strip("/")
     if normalized_prefix:
-        return f"{normalized_prefix}/{date_prefix}/{filename}"
-    return f"{date_prefix}/{filename}"
+        return f"{normalized_prefix}/{filename}"
+    return filename
 
 
 def _sqlite_file_exists(db_path: str | Path) -> bool:

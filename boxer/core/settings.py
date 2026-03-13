@@ -142,7 +142,7 @@ REQUEST_LOG_SQLITE_S3_BACKUP_BUCKET = _getenv_any(
 REQUEST_LOG_SQLITE_S3_PREFIX = _getenv_any(
     "REQUEST_LOG_SQLITE_S3_PREFIX",
     "REQUEST_AUDIT_SQLITE_S3_BACKUP_PREFIX",
-    default="",
+    default="request-log",
 ).strip().strip("/")
 REQUEST_LOG_SQLITE_S3_STORAGE_CLASS = _getenv_any(
     "REQUEST_LOG_SQLITE_S3_STORAGE_CLASS",
