@@ -29,6 +29,7 @@ class SlackRequestLogContext(TypedDict, total=False):
     first_replied_at_utc: datetime | None
     permalink: str | None
     thread_permalink: str | None
+    skip_persist: bool
 
 
 class MentionPayload(TypedDict):
@@ -132,6 +133,14 @@ def _set_request_log_status(
     normalized_error_type = str(error_type or "").strip()
     if normalized_error_type:
         context["error_type"] = normalized_error_type
+
+
+def _set_request_log_skip_persist(
+    payload: MentionPayload | MessagePayload,
+    skip_persist: bool = True,
+) -> None:
+    context = _ensure_request_log_context(payload)
+    context["skip_persist"] = bool(skip_persist)
 
 
 def _merge_request_log_metadata(
@@ -313,6 +322,23 @@ def _persist_request_log(
         )
 
 
+def _should_persist_request_log_event(
+    payload: MentionPayload | MessagePayload,
+    *,
+    event_type: str,
+) -> bool:
+    context = _ensure_request_log_context(payload)
+    if bool(context.get("skip_persist")):
+        return False
+    if event_type != "message":
+        return True
+    reply_count = int(context.get("reply_count") or 0)
+    if reply_count > 0:
+        return True
+    status = str(context.get("status") or "").strip().lower()
+    return status == "error"
+
+
 def create_slack_app(
     mention_handler: MentionHandler,
     message_handler: MessageHandler | None = None,
@@ -445,12 +471,19 @@ def create_slack_app(
             _set_request_log_status(payload, "error", error_type=type(exc).__name__)
             raise
         finally:
-            _persist_request_log(
-                payload,
-                event_type="message",
-                client=client,
-                logger=logger,
-            )
+            if _should_persist_request_log_event(payload, event_type="message"):
+                _persist_request_log(
+                    payload,
+                    event_type="message",
+                    client=client,
+                    logger=logger,
+                )
+            else:
+                logger.debug(
+                    "Skipped request log persistence for unhandled message event channel=%s ts=%s",
+                    payload.get("channel_id"),
+                    payload.get("current_ts"),
+                )
 
     return app
 
@@ -459,6 +492,7 @@ SlackRequestAuditContext = SlackRequestLogContext
 _ensure_request_audit_context = _ensure_request_log_context
 _set_request_audit_route = _set_request_log_route
 _set_request_audit_status = _set_request_log_status
+_set_request_audit_skip_persist = _set_request_log_skip_persist
 _merge_request_audit_metadata = _merge_request_log_metadata
 _mark_request_audit_reply = _mark_request_log_reply
 _persist_request_audit = _persist_request_log

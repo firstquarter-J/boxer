@@ -31,6 +31,16 @@ else:
         if user_id
     }
 
+_raw_request_log_query_ids = os.getenv("REQUEST_LOG_QUERY_ALLOWED_USER_IDS", "")
+if _raw_request_log_query_ids.strip():
+    REQUEST_LOG_QUERY_ALLOWED_USER_IDS = {
+        item.strip()
+        for item in _raw_request_log_query_ids.split(",")
+        if item.strip()
+    }
+else:
+    REQUEST_LOG_QUERY_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
+
 APP_USER_API_URL = os.getenv("APP_USER_API_URL", "").strip()
 APP_USER_API_TIMEOUT_SEC = int(os.getenv("APP_USER_API_TIMEOUT_SEC", "8"))
 

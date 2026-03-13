@@ -8,7 +8,13 @@ from anthropic import Anthropic
 from botocore.exceptions import BotoCoreError, ClientError
 from slack_bolt import App
 
-from boxer.adapters.common.slack import MentionPayload, SlackReplyFn, create_slack_app
+from boxer.adapters.common.slack import (
+    MentionPayload,
+    SlackReplyFn,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+    create_slack_app,
+)
 from boxer.adapters.company.fun import handle_fun_message
 from boxer.company.notion_links import select_company_notion_doc_links
 from boxer.company.notion_playbooks import _select_notion_references
@@ -76,6 +82,10 @@ from boxer.routers.company.device_file_probe import (
     _should_render_compact_device_recovery_result,
 )
 from boxer.routers.company.mda_graphql import _create_mda_activity_log
+from boxer.routers.company.request_log_query import (
+    _extract_request_log_query,
+    _query_request_log_text,
+)
 from boxer.routers.company.recording_failure_analysis import (
     _build_cause_line,
     _build_recording_failure_analysis_evidence,
@@ -1854,6 +1864,58 @@ def create_app() -> App:
             return
 
         db_query = _extract_db_query(question)
+        request_log_query = _extract_request_log_query(question)
+
+        def _is_request_log_query_allowed(target_user_id: str | None) -> bool:
+            if not cs.REQUEST_LOG_QUERY_ALLOWED_USER_IDS:
+                return True
+            return bool(target_user_id) and target_user_id in cs.REQUEST_LOG_QUERY_ALLOWED_USER_IDS
+
+        if request_log_query is not None:
+            _set_request_log_route(
+                payload,
+                "request log query",
+                route_mode=request_log_query.mode,
+                requested_date=request_log_query.target_date,
+                subject_type="request_log",
+            )
+            _merge_request_log_metadata(
+                payload,
+                queryMode=request_log_query.mode,
+                queryScope=request_log_query.scope_label,
+                queryLimit=request_log_query.limit,
+            )
+            if not s.REQUEST_LOG_SQLITE_ENABLED:
+                reply("요청 로그 저장 기능이 꺼져 있어. .env에서 REQUEST_LOG_SQLITE_ENABLED=true로 설정해줘")
+                return
+            if not _is_request_log_query_allowed(user_id):
+                approval_text = "요청 로그 조회는 권한이 필요해"
+                if cs.DD_USER_ID:
+                    approval_text = f"요청 로그 조회는 <@{cs.DD_USER_ID}> 승인이 필요해"
+                reply(approval_text, mention_user=False)
+                logger.info(
+                    "Rejected request log query for unauthorized user=%s mode=%s date=%s",
+                    user_id,
+                    request_log_query.mode,
+                    request_log_query.target_date,
+                )
+                return
+            try:
+                result_text = _query_request_log_text(request_log_query)
+                reply(result_text)
+                logger.info(
+                    "Responded with request log query in thread_ts=%s user=%s mode=%s date=%s limit=%s",
+                    thread_ts,
+                    user_id,
+                    request_log_query.mode,
+                    request_log_query.target_date,
+                    request_log_query.limit,
+                )
+            except Exception:
+                logger.exception("Request log query failed")
+                reply("요청 로그 조회 중 오류가 발생했어. SQLite 파일과 권한 상태를 확인해줘")
+            return
+
         barcode = _extract_barcode(question)
         phase2_hospital_name, phase2_room_name = _extract_hospital_room_scope(question)
         has_phase2_scope = bool(phase2_hospital_name and phase2_room_name)

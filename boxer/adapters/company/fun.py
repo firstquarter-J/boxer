@@ -4,7 +4,11 @@ from typing import Any
 
 from anthropic import Anthropic
 
-from boxer.adapters.common.slack import MessagePayload, SlackMessageReplyFn
+from boxer.adapters.common.slack import (
+    MessagePayload,
+    SlackMessageReplyFn,
+    _set_request_log_skip_persist,
+)
 from boxer.company import settings as cs
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
@@ -325,6 +329,7 @@ def handle_fun_message(
     if "모대" not in raw_text:
         return
 
+    _set_request_log_skip_persist(payload, True)
     reply_text, reply_mode, mention_dd = _generate_fun_reply(
         raw_text,
         logger,

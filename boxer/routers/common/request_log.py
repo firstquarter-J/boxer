@@ -395,6 +395,275 @@ def _save_request_log_record(
 }
 
 
+def _build_request_log_filter_clause(
+    *,
+    target_date: str | None = None,
+) -> tuple[str, list[Any]]:
+    normalized_target_date = str(target_date or "").strip()
+    if not normalized_target_date:
+        return "", []
+    return "WHERE requestDateLocal = ?", [normalized_target_date]
+
+
+def _query_request_log_rows(
+    sql: str,
+    parameters: list[Any] | tuple[Any, ...] | None = None,
+    *,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    actual_path = _ensure_request_log_schema(db_path)
+    connection = _connect_sqlite(
+        actual_path,
+        row_factory=True,
+        wal_enabled=False,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        rows = connection.execute(sql, tuple(parameters or ())).fetchall()
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
+
+
+def _query_request_log_value(
+    sql: str,
+    parameters: list[Any] | tuple[Any, ...] | None = None,
+    *,
+    db_path: str | Path | None = None,
+) -> Any:
+    rows = _query_request_log_rows(sql, parameters, db_path=db_path)
+    if not rows:
+        return None
+    first_row = rows[0]
+    if not first_row:
+        return None
+    first_key = next(iter(first_row))
+    return first_row.get(first_key)
+
+
+def _normalize_request_log_query_limit(
+    limit: int | None,
+    *,
+    default: int,
+    max_limit: int,
+) -> int:
+    try:
+        normalized = int(limit or default)
+    except Exception:
+        normalized = default
+    normalized = max(1, normalized)
+    return min(normalized, max_limit)
+
+
+def _list_request_log_recent(
+    *,
+    target_date: str | None = None,
+    limit: int | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    actual_limit = _normalize_request_log_query_limit(limit, default=10, max_limit=30)
+    where_clause, parameters = _build_request_log_filter_clause(target_date=target_date)
+    total_count = int(
+        _query_request_log_value(
+            f"SELECT COUNT(*) AS value FROM {_REQUEST_LOG_TABLE_NAME} {where_clause}",
+            parameters,
+            db_path=db_path,
+        )
+        or 0
+    )
+    rows = _query_request_log_rows(
+        f"""
+        SELECT
+            seq,
+            createdAtUtc,
+            createdAtLocal,
+            requestDateLocal,
+            userId,
+            userName,
+            routeName,
+            routeMode,
+            status,
+            requestText,
+            normalizedQuestion,
+            permalink,
+            threadPermalink,
+            replyCount
+        FROM {_REQUEST_LOG_TABLE_NAME}
+        {where_clause}
+        ORDER BY seq DESC
+        LIMIT ?
+        """,
+        [*parameters, actual_limit],
+        db_path=db_path,
+    )
+    return {
+        "dbPath": str(_request_log_db_path(db_path)),
+        "targetDate": target_date,
+        "limit": actual_limit,
+        "totalCount": total_count,
+        "rows": rows,
+    }
+
+
+def _summarize_request_log_by_user(
+    *,
+    target_date: str | None = None,
+    limit: int | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    actual_limit = _normalize_request_log_query_limit(limit, default=10, max_limit=20)
+    where_clause, parameters = _build_request_log_filter_clause(target_date=target_date)
+    total_count = int(
+        _query_request_log_value(
+            f"SELECT COUNT(*) AS value FROM {_REQUEST_LOG_TABLE_NAME} {where_clause}",
+            parameters,
+            db_path=db_path,
+        )
+        or 0
+    )
+    unique_user_count = int(
+        _query_request_log_value(
+            f"""
+            SELECT COUNT(DISTINCT userId) AS value
+            FROM {_REQUEST_LOG_TABLE_NAME}
+            {where_clause}
+            """,
+            parameters,
+            db_path=db_path,
+        )
+        or 0
+    )
+    rows = _query_request_log_rows(
+        f"""
+        SELECT
+            userId,
+            COALESCE(NULLIF(TRIM(userName), ''), userId) AS userLabel,
+            COUNT(*) AS requestCount,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errorCount,
+            MAX(createdAtLocal) AS lastRequestedAtLocal
+        FROM {_REQUEST_LOG_TABLE_NAME}
+        {where_clause}
+        GROUP BY userId, COALESCE(NULLIF(TRIM(userName), ''), userId)
+        ORDER BY requestCount DESC, lastRequestedAtLocal DESC, userId ASC
+        LIMIT ?
+        """,
+        [*parameters, actual_limit],
+        db_path=db_path,
+    )
+    return {
+        "dbPath": str(_request_log_db_path(db_path)),
+        "targetDate": target_date,
+        "limit": actual_limit,
+        "totalCount": total_count,
+        "uniqueUserCount": unique_user_count,
+        "rows": rows,
+    }
+
+
+def _summarize_request_log_by_route(
+    *,
+    target_date: str | None = None,
+    limit: int | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    actual_limit = _normalize_request_log_query_limit(limit, default=10, max_limit=20)
+    where_clause, parameters = _build_request_log_filter_clause(target_date=target_date)
+    total_count = int(
+        _query_request_log_value(
+            f"SELECT COUNT(*) AS value FROM {_REQUEST_LOG_TABLE_NAME} {where_clause}",
+            parameters,
+            db_path=db_path,
+        )
+        or 0
+    )
+    unique_route_count = int(
+        _query_request_log_value(
+            f"""
+            SELECT COUNT(*) AS value
+            FROM (
+                SELECT routeName, COALESCE(NULLIF(TRIM(routeMode), ''), '') AS routeMode
+                FROM {_REQUEST_LOG_TABLE_NAME}
+                {where_clause}
+                GROUP BY routeName, COALESCE(NULLIF(TRIM(routeMode), ''), '')
+            )
+            """,
+            parameters,
+            db_path=db_path,
+        )
+        or 0
+    )
+    rows = _query_request_log_rows(
+        f"""
+        SELECT
+            routeName,
+            COALESCE(NULLIF(TRIM(routeMode), ''), '') AS routeMode,
+            COUNT(*) AS requestCount,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errorCount,
+            MAX(createdAtLocal) AS lastRequestedAtLocal
+        FROM {_REQUEST_LOG_TABLE_NAME}
+        {where_clause}
+        GROUP BY routeName, COALESCE(NULLIF(TRIM(routeMode), ''), '')
+        ORDER BY requestCount DESC, lastRequestedAtLocal DESC, routeName ASC
+        LIMIT ?
+        """,
+        [*parameters, actual_limit],
+        db_path=db_path,
+    )
+    return {
+        "dbPath": str(_request_log_db_path(db_path)),
+        "targetDate": target_date,
+        "limit": actual_limit,
+        "totalCount": total_count,
+        "uniqueRouteCount": unique_route_count,
+        "rows": rows,
+    }
+
+
+def _summarize_request_log_overview(
+    *,
+    target_date: str | None = None,
+    db_path: str | Path | None = None,
+    top_limit: int | None = None,
+) -> dict[str, Any]:
+    actual_top_limit = _normalize_request_log_query_limit(top_limit, default=5, max_limit=10)
+    where_clause, parameters = _build_request_log_filter_clause(target_date=target_date)
+    summary_rows = _query_request_log_rows(
+        f"""
+        SELECT
+            COUNT(*) AS totalCount,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errorCount,
+            COUNT(DISTINCT userId) AS uniqueUserCount,
+            MIN(createdAtLocal) AS firstRequestedAtLocal,
+            MAX(createdAtLocal) AS lastRequestedAtLocal
+        FROM {_REQUEST_LOG_TABLE_NAME}
+        {where_clause}
+        """,
+        parameters,
+        db_path=db_path,
+    )
+    summary = summary_rows[0] if summary_rows else {}
+    return {
+        "dbPath": str(_request_log_db_path(db_path)),
+        "targetDate": target_date,
+        "topLimit": actual_top_limit,
+        "totalCount": int(summary.get("totalCount") or 0),
+        "errorCount": int(summary.get("errorCount") or 0),
+        "uniqueUserCount": int(summary.get("uniqueUserCount") or 0),
+        "firstRequestedAtLocal": summary.get("firstRequestedAtLocal"),
+        "lastRequestedAtLocal": summary.get("lastRequestedAtLocal"),
+        "topUsers": _summarize_request_log_by_user(
+            target_date=target_date,
+            limit=actual_top_limit,
+            db_path=db_path,
+        ).get("rows", []),
+        "topRoutes": _summarize_request_log_by_route(
+            target_date=target_date,
+            limit=actual_top_limit,
+            db_path=db_path,
+        ).get("rows", []),
+    }
+
+
 def _backup_request_log_to_s3(
     *,
     db_path: str | Path | None = None,
