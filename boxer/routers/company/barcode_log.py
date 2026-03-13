@@ -2502,6 +2502,21 @@ def _to_local_date(value: object) -> date | None:
     return value.astimezone(local_tz).date()
 
 
+def _to_local_datetime(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+
+    tz_name = os.getenv("TZ", "Asia/Seoul")
+    try:
+        local_tz = ZoneInfo(tz_name)
+    except Exception:
+        local_tz = ZoneInfo("Asia/Seoul")
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(local_tz)
+
+
 def _build_phase2_scope_request_message(
     barcode: str,
     reason: str,
@@ -2522,6 +2537,33 @@ def _build_phase2_scope_request_message(
     )
 
 
+def _build_recent_recording_hint_lines(
+    recordings_context: dict[str, Any] | None,
+    log_date: str,
+) -> list[str]:
+    if recordings_context is None:
+        return []
+
+    summary = recordings_context.get("summary") or {}
+    local_dt = _to_local_datetime(summary.get("lastRecordedAt"))
+    if local_dt is None:
+        return []
+
+    try:
+        requested_date = datetime.strptime(log_date, "%Y-%m-%d").date()
+    except ValueError:
+        return []
+
+    last_recorded_date = local_dt.date()
+    if requested_date <= last_recorded_date:
+        return []
+
+    return [
+        f"• 참고: recordings 기준 최근 영상 시각은 `{local_dt:%Y-%m-%d %H:%M:%S}` KST야",
+        f"• 힌트: `{last_recorded_date:%Y-%m-%d} 로그`로 다시 보면 실제 세션이 나올 수 있어",
+    ]
+
+
 def _build_barcode_log_empty_result(
     *,
     title: str,
@@ -2530,6 +2572,7 @@ def _build_barcode_log_empty_result(
     mapped_device_count: int,
     logs_found_any: int,
     used_expanded_scope: bool,
+    recordings_context: dict[str, Any] | None = None,
 ) -> str:
     lines = [
         title,
@@ -2544,6 +2587,7 @@ def _build_barcode_log_empty_result(
         lines.append("• 결과: 요청 바코드 세션을 찾지 못했어")
     if used_expanded_scope:
         lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+    lines.extend(_build_recent_recording_hint_lines(recordings_context, log_date))
     return "\n".join(lines)
 
 
@@ -3226,6 +3270,7 @@ def _analyze_barcode_log_scan_events(
             mapped_device_count=len(all_device_contexts),
             logs_found_any=logs_found_any,
             used_expanded_scope=used_expanded_scope,
+            recordings_context=recordings_context,
         )
         return result_text, _build_log_analysis_payload(
             mode="scan",
@@ -3430,6 +3475,7 @@ def _analyze_barcode_log_errors(
             mapped_device_count=len(all_device_contexts),
             logs_found_any=logs_found_any,
             used_expanded_scope=used_expanded_scope,
+            recordings_context=recordings_context,
         )
         return result_text, _build_log_analysis_payload(
             mode="error",
