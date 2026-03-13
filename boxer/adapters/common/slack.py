@@ -11,11 +11,14 @@ from boxer.routers.common.request_log import (
     _save_request_log_record,
 )
 
+_SLACK_USER_NAME_CACHE: dict[tuple[str, str], str | None] = {}
+
 
 class SlackRequestLogContext(TypedDict, total=False):
     route_name: str
     route_mode: str | None
     status: str
+    user_name: str | None
     request_key: str | None
     subject_type: str | None
     subject_key: str | None
@@ -185,6 +188,54 @@ def _load_slack_permalink(
         return None
 
 
+def _extract_slack_user_name(user: dict[str, Any] | None) -> str | None:
+    if not isinstance(user, dict):
+        return None
+    profile = user.get("profile")
+    profile_dict = profile if isinstance(profile, dict) else {}
+    candidates = (
+        profile_dict.get("display_name_normalized"),
+        profile_dict.get("display_name"),
+        profile_dict.get("real_name_normalized"),
+        profile_dict.get("real_name"),
+        user.get("real_name"),
+        user.get("name"),
+    )
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _load_slack_user_name(
+    client: Any,
+    workspace_id: str,
+    user_id: str,
+    logger: logging.Logger,
+) -> str | None:
+    normalized_workspace_id = str(workspace_id or "").strip()
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id or normalized_user_id == "unknown":
+        return None
+    cache_key = (normalized_workspace_id, normalized_user_id)
+    if cache_key in _SLACK_USER_NAME_CACHE:
+        return _SLACK_USER_NAME_CACHE[cache_key]
+    try:
+        response = client.users_info(user=normalized_user_id)
+        user_name = _extract_slack_user_name((response or {}).get("user"))
+    except Exception:
+        logger.warning(
+            "Failed to resolve Slack user name workspace=%s user=%s",
+            normalized_workspace_id,
+            normalized_user_id,
+            exc_info=True,
+        )
+        user_name = None
+    _SLACK_USER_NAME_CACHE[cache_key] = user_name
+    return user_name
+
+
 def _persist_request_log(
     payload: MentionPayload | MessagePayload,
     *,
@@ -202,6 +253,8 @@ def _persist_request_log(
     context = _ensure_request_log_context(payload)
     channel_id = str(payload.get("channel_id") or "").strip()
     thread_ts = str(payload.get("thread_ts") or "").strip() or current_ts
+    workspace_id = str(payload.get("workspace_id") or "").strip()
+    user_id = str(payload.get("user_id") or "unknown").strip() or "unknown"
     permalink = str(context.get("permalink") or "").strip() or None
     if permalink is None:
         permalink = _load_slack_permalink(client, channel_id, current_ts, logger)
@@ -215,16 +268,23 @@ def _persist_request_log(
     else:
         normalized_question = str(payload.get("raw_text") or "").strip() or None
 
+    user_name = str(context.get("user_name") or "").strip() or None
+    if user_name is None:
+        user_name = _load_slack_user_name(client, workspace_id, user_id, logger)
+        if user_name is not None:
+            context["user_name"] = user_name
+
     try:
         _save_request_log_record(
             {
                 "sourcePlatform": "slack",
-                "workspaceId": str(payload.get("workspace_id") or "").strip(),
+                "workspaceId": workspace_id,
                 "eventType": event_type,
                 "routeName": str(context.get("route_name") or event_type).strip() or event_type,
                 "routeMode": str(context.get("route_mode") or "").strip() or None,
                 "status": str(context.get("status") or "handled").strip() or "handled",
-                "userId": str(payload.get("user_id") or "unknown").strip() or "unknown",
+                "userId": user_id,
+                "userName": user_name,
                 "channelId": channel_id,
                 "threadId": thread_ts,
                 "messageId": current_ts,

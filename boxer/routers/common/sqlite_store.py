@@ -58,7 +58,12 @@ def _build_sqlite_snapshot_key(
     db_path: str | Path,
     *,
     key_prefix: str = "",
+    object_key: str = "",
 ) -> str:
+    normalized_object_key = str(object_key or "").strip().strip("/")
+    if normalized_object_key:
+        return normalized_object_key
+
     resolved_path = _resolve_sqlite_path(db_path)
     try:
         local_now = datetime.now(ZoneInfo(s.REQUEST_LOG_TIMEZONE))
@@ -185,6 +190,7 @@ def _backup_sqlite_to_s3(
     *,
     bucket: str,
     key_prefix: str = "",
+    object_key: str = "",
     s3_client: Any | None = None,
     storage_class: str | None = None,
     server_side_encryption: str | None = None,
@@ -194,7 +200,11 @@ def _backup_sqlite_to_s3(
         raise ValueError("S3 백업 버킷이 필요해")
 
     snapshot_path = _create_sqlite_snapshot(db_path)
-    object_key = _build_sqlite_snapshot_key(db_path, key_prefix=key_prefix)
+    resolved_object_key = _build_sqlite_snapshot_key(
+        db_path,
+        key_prefix=key_prefix,
+        object_key=object_key,
+    )
     client = s3_client or _build_s3_client()
     extra_args: dict[str, str] = {}
 
@@ -211,17 +221,17 @@ def _backup_sqlite_to_s3(
             client.upload_file(
                 str(snapshot_path),
                 actual_bucket,
-                object_key,
+                resolved_object_key,
                 ExtraArgs=extra_args,
             )
         else:
-            client.upload_file(str(snapshot_path), actual_bucket, object_key)
+            client.upload_file(str(snapshot_path), actual_bucket, resolved_object_key)
     finally:
         snapshot_path.unlink(missing_ok=True)
 
     return {
         "bucket": actual_bucket,
-        "key": object_key,
+        "key": resolved_object_key,
         "dbPath": str(_resolve_sqlite_path(db_path)),
     }
 
@@ -231,6 +241,7 @@ def _restore_sqlite_from_s3(
     *,
     bucket: str,
     key_prefix: str = "",
+    object_key: str = "",
     s3_client: Any | None = None,
     only_if_missing: bool = True,
 ) -> dict[str, Any]:
@@ -243,12 +254,33 @@ def _restore_sqlite_from_s3(
         }
 
     client = s3_client or _build_s3_client()
-    latest_backup = _find_latest_sqlite_backup_in_s3(
-        bucket=bucket,
-        key_prefix=key_prefix,
-        s3_client=client,
-    )
-    if latest_backup is None:
+    resolved_object_key = str(object_key or "").strip().strip("/")
+    backup_target: dict[str, Any] | None
+    if resolved_object_key:
+        try:
+            metadata = client.head_object(Bucket=str(bucket), Key=resolved_object_key)
+        except Exception:
+            return {
+                "restored": False,
+                "reason": "remote_missing",
+                "dbPath": str(target_path),
+                "bucket": str(bucket or "").strip(),
+                "key": resolved_object_key,
+            }
+        backup_target = {
+            "bucket": str(bucket or "").strip(),
+            "key": resolved_object_key,
+            "lastModified": metadata.get("LastModified"),
+            "size": int(metadata.get("ContentLength") or 0),
+            "etag": metadata.get("ETag"),
+        }
+    else:
+        backup_target = _find_latest_sqlite_backup_in_s3(
+            bucket=bucket,
+            key_prefix=key_prefix,
+            s3_client=client,
+        )
+    if backup_target is None:
         return {
             "restored": False,
             "reason": "remote_missing",
@@ -265,7 +297,7 @@ def _restore_sqlite_from_s3(
     temp_path = Path(temp_file.name)
 
     try:
-        client.download_file(str(bucket), str(latest_backup["key"]), str(temp_path))
+        client.download_file(str(bucket), str(backup_target["key"]), str(temp_path))
         with sqlite3.connect(temp_path) as validation_connection:
             row = validation_connection.execute("PRAGMA integrity_check").fetchone()
             if not row or str(row[0]).strip().lower() != "ok":
@@ -281,7 +313,7 @@ def _restore_sqlite_from_s3(
         "restored": True,
         "dbPath": str(target_path),
         "bucket": str(bucket or "").strip(),
-        "key": str(latest_backup["key"]),
-        "size": latest_backup.get("size"),
-        "lastModified": latest_backup.get("lastModified"),
+        "key": str(backup_target["key"]),
+        "size": backup_target.get("size"),
+        "lastModified": backup_target.get("lastModified"),
     }

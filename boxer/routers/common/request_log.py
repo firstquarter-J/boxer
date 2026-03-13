@@ -31,6 +31,7 @@ _REQUEST_LOG_SCHEMA_STATEMENTS = (
         routeMode TEXT,
         status TEXT NOT NULL,
         userId TEXT NOT NULL,
+        userName TEXT,
         channelId TEXT NOT NULL DEFAULT '',
         threadId TEXT NOT NULL,
         messageId TEXT NOT NULL,
@@ -85,6 +86,7 @@ INSERT INTO {_REQUEST_LOG_TABLE_NAME} (
     routeMode,
     status,
     userId,
+    userName,
     channelId,
     threadId,
     messageId,
@@ -113,6 +115,7 @@ INSERT INTO {_REQUEST_LOG_TABLE_NAME} (
     :routeMode,
     :status,
     :userId,
+    :userName,
     :channelId,
     :threadId,
     :messageId,
@@ -138,6 +141,7 @@ ON CONFLICT(sourcePlatform, channelId, messageId) DO UPDATE SET
     END,
     routeMode = COALESCE(excluded.routeMode, {_REQUEST_LOG_TABLE_NAME}.routeMode),
     status = excluded.status,
+    userName = COALESCE(excluded.userName, {_REQUEST_LOG_TABLE_NAME}.userName),
     permalink = COALESCE(excluded.permalink, {_REQUEST_LOG_TABLE_NAME}.permalink),
     threadPermalink = COALESCE(excluded.threadPermalink, {_REQUEST_LOG_TABLE_NAME}.threadPermalink),
     normalizedQuestion = COALESCE(
@@ -171,6 +175,7 @@ class RequestLogRecord(TypedDict, total=False):
     routeMode: str | None
     status: str
     userId: str
+    userName: str | None
     channelId: str
     threadId: str
     messageId: str
@@ -274,6 +279,7 @@ def _normalize_request_log_record(record: RequestLogRecord) -> dict[str, Any]:
     requested_date = str(record.get("requestedDate") or "").strip() or None
     route_name = str(record.get("routeName") or "unknown").strip() or "unknown"
     status = str(record.get("status") or "handled").strip() or "handled"
+    user_name = str(record.get("userName") or "").strip() or None
 
     return {
         "createdAtUtc": _render_iso(created_at_utc),
@@ -286,6 +292,7 @@ def _normalize_request_log_record(record: RequestLogRecord) -> dict[str, Any]:
         "routeMode": str(record.get("routeMode") or "").strip() or None,
         "status": status,
         "userId": user_id,
+        "userName": user_name,
         "channelId": channel_id,
         "threadId": thread_id,
         "messageId": message_id,
@@ -327,6 +334,17 @@ def _migrate_legacy_request_audit_table(connection) -> bool:
     return True
 
 
+def _ensure_request_log_columns(connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({_REQUEST_LOG_TABLE_NAME})").fetchall()
+    }
+    if "userName" not in columns:
+        connection.execute(
+            f"ALTER TABLE {_REQUEST_LOG_TABLE_NAME} ADD COLUMN userName TEXT"
+        )
+
+
 def _ensure_request_log_schema(
     db_path: str | Path | None = None,
 ) -> Path:
@@ -336,6 +354,7 @@ def _ensure_request_log_schema(
         _migrate_legacy_request_audit_table(connection)
         for statement in _REQUEST_LOG_SCHEMA_STATEMENTS:
             connection.execute(statement)
+        _ensure_request_log_columns(connection)
     finally:
         connection.close()
     return actual_path
@@ -353,7 +372,7 @@ def _save_request_log_record(
         cursor = connection.execute(_REQUEST_LOG_UPSERT_SQL, normalized_record)
         row = connection.execute(
             f"""
-            SELECT seq, createdAtUtc, routeName, status, replyCount
+            SELECT seq, createdAtUtc, routeName, status, replyCount, userName
             FROM {_REQUEST_LOG_TABLE_NAME}
             WHERE sourcePlatform = :sourcePlatform
               AND channelId = :channelId
@@ -372,6 +391,7 @@ def _save_request_log_record(
         "routeName": row[2] if row else normalized_record["routeName"],
         "status": row[3] if row else normalized_record["status"],
         "replyCount": row[4] if row else normalized_record["replyCount"],
+        "userName": row[5] if row else normalized_record["userName"],
 }
 
 
@@ -379,6 +399,7 @@ def _backup_request_log_to_s3(
     *,
     db_path: str | Path | None = None,
     bucket: str | None = None,
+    object_key: str | None = None,
     key_prefix: str | None = None,
     s3_client: Any | None = None,
 ) -> dict[str, Any]:
@@ -390,6 +411,7 @@ def _backup_request_log_to_s3(
     return _backup_sqlite_to_s3(
         actual_path,
         bucket=actual_bucket,
+        object_key=object_key if object_key is not None else s.REQUEST_LOG_SQLITE_S3_OBJECT_KEY,
         key_prefix=key_prefix if key_prefix is not None else s.REQUEST_LOG_SQLITE_S3_PREFIX,
         s3_client=s3_client,
         storage_class=s.REQUEST_LOG_SQLITE_S3_STORAGE_CLASS,
@@ -414,6 +436,7 @@ def _restore_request_log_from_s3(
     *,
     db_path: str | Path | None = None,
     bucket: str | None = None,
+    object_key: str | None = None,
     key_prefix: str | None = None,
     s3_client: Any | None = None,
     only_if_missing: bool = True,
@@ -425,6 +448,7 @@ def _restore_request_log_from_s3(
     return _restore_sqlite_from_s3(
         _request_log_db_path(db_path),
         bucket=actual_bucket,
+        object_key=object_key if object_key is not None else s.REQUEST_LOG_SQLITE_S3_OBJECT_KEY,
         key_prefix=key_prefix if key_prefix is not None else s.REQUEST_LOG_SQLITE_S3_PREFIX,
         s3_client=s3_client,
         only_if_missing=only_if_missing,
