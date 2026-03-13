@@ -170,6 +170,16 @@ _NOTION_DOC_QUERY_TOKENS = (
     "그라운드 루프",
     "메모리",
     "패치",
+    "방화벽",
+    "firewall",
+    "mda",
+    "모니터링",
+    "종합모니터링",
+    "원격 접속",
+    "원격 연결",
+    "ssh",
+    "status none",
+    "에이전트",
 )
 _NOTION_DOC_EXFILTRATION_PATTERNS = (
     re.compile(
@@ -459,6 +469,7 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
             break
 
     is_barcode_sync_doc = primary_title == "바코드 동기화: 분만 병원에서 핑크 바코드가 스캔되는 경우"
+    is_firewall_doc = primary_title == "병원 방화벽으로 MDA/원격 접속이 안 될 때"
     normalized_question = (question or "").strip()
     is_reason_question = any(token in normalized_question for token in ("왜", "원인", "이유"))
     is_restart_question = any(token in normalized_question for token in ("재부팅", "재시작", "껐다", "켜야"))
@@ -528,6 +539,12 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         lines.append("• 조치: 마미박스를 핑크 바코드 동기화가 가능한 버전으로 업데이트해야 해. 1회당 약 10일치 바코드를 가져오고, 매일 동기화를 시도해. 현재 기본 DB에는 1월 1일부터의 핑크 바코드 목록이 있어")
         return "\n".join(lines)
 
+    if is_firewall_doc:
+        lines.append("• 결론: 영상 업로드는 정상이어도 원격 접속은 별도 경로라 불가할 수 있어. 현재는 장비 원격 접근이 제한된 상태야")
+        lines.append("• 확인: 병원 네트워크 또는 방화벽 설정 여부, 방화벽 정책, 장비 원격 접근 여부(SSH 연결) 확인이 필요해")
+        lines.append("• 조치: 병원과 네트워크 또는 방화벽 설정을 소통 및 협의해야 해. 접속이 열리면 그 뒤에 원격 진단을 다시 진행할 수 있어")
+        return "\n".join(lines)
+
     lines.append(f"• 결론: {conclusion}")
     lines.append(f"• 확인: {confirm}")
     lines.append(f"• 조치: {action}")
@@ -560,6 +577,32 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
         "• 조치:",
     )
     return any(bullet not in normalized for bullet in required_bullets)
+
+
+def _normalize_notion_doc_answer_style(text: str, route_name: str) -> str:
+    if route_name != "notion playbook qa":
+        return (text or "").strip()
+
+    normalized = (text or "").strip()
+    if not normalized:
+        return normalized
+
+    replacements = (
+        ("소통·협의", "소통 및 협의"),
+        ("원격으로 원인 확인이나 조치가 어렵다고 안내해", "원격으로 원인 확인이나 조치가 어려워"),
+        ("협의가 필요하다고 안내해", "협의가 필요해"),
+        ("확인이 필요하다고 안내해", "확인이 필요해"),
+        ("다시 진행한다고 안내해", "다시 진행할 수 있어"),
+        ("다시 진행한다고 답해", "다시 진행할 수 있어"),
+        ("안내해.", ""),
+        ("안내해", ""),
+    )
+    for source, target in replacements:
+        normalized = normalized.replace(source, target)
+
+    normalized = re.sub(r"\s+\.", ".", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
 
 
 def _split_barcode_log_reply(reply_text: str, max_chars: int = 3000) -> list[str]:
@@ -1236,6 +1279,7 @@ def create_app() -> App:
                     evidence_transform=_transform_company_retrieval_payload,
                     max_tokens=max_tokens,
                 )
+                synthesized_text = _normalize_notion_doc_answer_style(synthesized_text, route_name)
                 final_text = synthesized_text or fallback_with_references
                 if "다른 바코드" in final_text and "다른 바코드" not in fallback_text:
                     final_text = fallback_with_references

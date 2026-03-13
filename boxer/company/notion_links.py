@@ -95,6 +95,22 @@ _COMPANY_NOTION_DOCS: tuple[dict[str, Any], ...] = (
         "keywords": ("업로드", "안됨", "네트워크", "network", "eai_again", "통신"),
     },
     {
+        "title": "병원 방화벽으로 MDA/원격 접속이 안 될 때",
+        "url": "https://www.notion.so/MDA-322cf826870c812aaee6f9c62838b486",
+        "keywords": (
+            "병원 방화벽",
+            "방화벽",
+            "firewall",
+            "mda",
+            "원격 접속",
+            "원격 연결",
+            "ssh",
+            "status none",
+            "모니터링",
+            "영상 업로드 정상",
+        ),
+    },
+    {
         "title": "초음파 영상 녹화불가(화면 신호 없음)",
         "url": "https://www.notion.so/30a245b6fc2c4e28a605bb7ca9b34382?pvs=21",
         "keywords": ("녹화불가", "녹화", "신호 없음", "영상 입력", "캡처보드", "ffmpeg"),
