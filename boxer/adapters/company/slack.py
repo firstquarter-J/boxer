@@ -181,6 +181,30 @@ _NOTION_DOC_QUERY_TOKENS = (
     "status none",
     "에이전트",
 )
+_NOTION_DOC_THREAD_MARKERS = (
+    "문서 기반 답변",
+    "함께 참고할 문서",
+)
+_NOTION_DOC_FOLLOWUP_TOKENS = (
+    "다른 방법",
+    "방법 있어",
+    "방법 없어",
+    "대안",
+    "우회",
+    "그럼",
+    "그러면",
+    "그래서",
+    "이 경우",
+    "이때",
+    "그 뒤",
+    "그 후",
+    "이건",
+    "이거",
+    "그건",
+    "그거",
+    "말고",
+    "추가로",
+)
 _NOTION_DOC_EXFILTRATION_PATTERNS = (
     re.compile(
         r"(시스템\s*(정보|프롬프트|지시문)|system\s*prompt|developer\s*prompt|internal\s*prompt|hidden\s*prompt|instruction\s*prompt)",
@@ -316,9 +340,49 @@ def _looks_like_notion_doc_question(question: str) -> bool:
     return any(token in text for token in _NOTION_DOC_QUERY_TOKENS)
 
 
-def _is_notion_doc_exfiltration_attempt(question: str) -> bool:
+def _thread_has_notion_doc_context(thread_context: str) -> bool:
+    text = (thread_context or "").strip()
+    if not text:
+        return False
+    if any(marker in text for marker in _NOTION_DOC_THREAD_MARKERS):
+        return True
+    return _looks_like_notion_doc_question(text)
+
+
+def _looks_like_notion_doc_followup(question: str, thread_context: str) -> bool:
     text = (question or "").strip()
-    if not _looks_like_notion_doc_question(text):
+    if not text or not _thread_has_notion_doc_context(thread_context):
+        return False
+
+    lowered = text.lower()
+    if any(token in text for token in _NOTION_DOC_FOLLOWUP_TOKENS):
+        return True
+    if any(token in lowered for token in ("alternative", "workaround", "other way", "else")):
+        return True
+    return len(text) <= 24
+
+
+def _build_notion_doc_query_text(question: str, thread_context: str) -> str:
+    normalized_question = (question or "").strip()
+    normalized_thread = (thread_context or "").strip()
+    if not normalized_thread or not _thread_has_notion_doc_context(normalized_thread):
+        return normalized_question
+
+    thread_lines = [line.strip() for line in normalized_thread.splitlines() if line.strip()]
+    relevant_thread = "\n".join(thread_lines[-6:])
+    if not relevant_thread:
+        return normalized_question
+    return f"{relevant_thread}\n{normalized_question}".strip()
+
+
+def _is_notion_doc_exfiltration_attempt(question: str, thread_context: str = "") -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+    if not (
+        _looks_like_notion_doc_question(text)
+        or _thread_has_notion_doc_context(thread_context)
+    ):
         return False
     return any(pattern.search(text) for pattern in _NOTION_DOC_EXFILTRATION_PATTERNS)
 
@@ -1195,8 +1259,10 @@ def create_app() -> App:
             evidence_route = str(evidence_payload.get("route") or "").strip().lower()
             company_notion_docs: list[dict[str, str]] = []
             if evidence_route == "notion_playbook_qa":
+                request_payload = evidence_payload.get("request") if isinstance(evidence_payload.get("request"), dict) else {}
+                notion_link_query = str(request_payload.get("contextualQuestion") or question).strip() or question
                 company_notion_docs = select_company_notion_doc_links(
-                    question,
+                    notion_link_query,
                     notion_playbooks=notion_playbooks,
                     max_results=3,
                 )
@@ -1260,7 +1326,7 @@ def create_app() -> App:
 
             try:
                 thread_context = ""
-                if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT and evidence_route != "notion_playbook_qa":
+                if evidence_route == "notion_playbook_qa" or s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
                     thread_context = _load_thread_context(
                         client,
                         logger,
@@ -3024,9 +3090,21 @@ def create_app() -> App:
                 reply("DB 조회 중 오류가 발생했어. 연결 정보와 네트워크 상태를 확인해줘")
             return
 
-        if _looks_like_notion_doc_question(question):
+        notion_thread_context = ""
+        is_notion_doc_question = _looks_like_notion_doc_question(question)
+        if not is_notion_doc_question and thread_ts:
+            notion_thread_context = _load_thread_context(
+                client,
+                logger,
+                channel_id,
+                thread_ts,
+                current_ts,
+            )
+            is_notion_doc_question = _looks_like_notion_doc_followup(question, notion_thread_context)
+
+        if is_notion_doc_question:
             try:
-                if _is_notion_doc_exfiltration_attempt(question):
+                if _is_notion_doc_exfiltration_attempt(question, notion_thread_context):
                     logger.warning(
                         "Blocked notion doc exfiltration attempt in thread_ts=%s question=%s",
                         thread_ts,
@@ -3045,8 +3123,19 @@ def create_app() -> App:
                         "question": question,
                     },
                 }
+                if not notion_thread_context and thread_ts:
+                    notion_thread_context = _load_thread_context(
+                        client,
+                        logger,
+                        channel_id,
+                        thread_ts,
+                        current_ts,
+                    )
+                notion_query_text = _build_notion_doc_query_text(question, notion_thread_context)
+                if notion_query_text and notion_query_text != question:
+                    evidence_payload["request"]["contextualQuestion"] = notion_query_text
                 notion_references = _select_notion_references(
-                    question,
+                    notion_query_text or question,
                     evidence_payload=evidence_payload,
                     max_results=3,
                 )
