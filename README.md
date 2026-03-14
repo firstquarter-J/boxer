@@ -1,5 +1,7 @@
 # Boxer: Retrieval-Grounded Assistant Bot
 
+Open-core framework for retrieval-grounded bots with domain-specific adapters.
+
 Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)` LLM bot을 목표로 하는 프로젝트다.
 질문을 받으면 승인된 데이터 소스(DB/S3/API/Notion)를 먼저 조회하고, 그 근거를 바탕으로 답변한다.
 
@@ -169,7 +171,7 @@ python app.py
 
 ### Custom Adapter Example
 
-실제 예제는 [`examples/custom_adapter/`](/Users/firstquarter/workspace/rag-bot/examples/custom_adapter) 에 추가돼 있다.
+실제 예제는 [`examples/custom_adapter/`](examples/custom_adapter/) 에 추가돼 있다.
 예를 들면 이런 구조로 시작할 수 있다.
 
 ```text
