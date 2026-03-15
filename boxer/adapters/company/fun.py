@@ -20,6 +20,8 @@ FUN_LLM_TIMEOUT_SEC = 60
 CLAUSE_SPLIT_RE = re.compile(r"[\n\r,.!?~]+")
 MENTION_RE = re.compile(r"<@[^>]+>")
 URL_RE = re.compile(r"https?://\S+")
+FORTUNE_DATE_RE = re.compile(r"(?P<year>20\d{2})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일")
+FORTUNE_BIRTH_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)?\d{2})년생(?!\d)")
 EDGE_FILLER_RE = re.compile(r"^(또|진짜|완전|아니|근데|그럼|와|헐)\s+|\s+(또|진짜|완전|아니|근데|그럼|와|헐)$")
 TRAILING_ENDING_RE = re.compile(r"(이네|이야|인가요|인가|인데|네요|네요|이냐|이군)$")
 TRAILING_PARTICLE_RE = re.compile(r"(은|는|이|가|을|를|도|만|이나|나|랑|과|와|임|야|냐|네|군|지)$")
@@ -108,6 +110,59 @@ FUN_GENERIC_TEMPLATES: tuple[str, ...] = (
     "{topic_with_do} 또 말처럼 되나 모대?",
     "{topic_with_do} 그냥 되는 줄 알았모대?",
 )
+FORTUNE_BOT_NAME_HINTS = ("ddalggak", "ddal ggak", "딸깍")
+FORTUNE_REQUIRED_MARKERS = ("오늘의 운세",)
+FORTUNE_THEME_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "행운",
+        ("행운", "lucky", "luck", "clover", "four_leaf_clover", "반짝", "빛나", "sparkles", "순조", "좋은 소식", "해결", "기회"),
+    ),
+    (
+        "응원",
+        ("화이팅", "파이팅", "힘내", "응원", "오늘 하루", "fighting"),
+    ),
+    (
+        "사랑",
+        ("사랑", "연애", "썸", "love_letter", "heart", "인연", "대인관계", "고백", "데이트"),
+    ),
+    (
+        "일",
+        ("업무", "회의", "프로젝트", "출근", "퇴근", "일복", "직장", "성과", "계획", "집중", "공부"),
+    ),
+    (
+        "돈",
+        ("재물", "금전", "보너스", "수익", "용돈", "지출", "과소비", "소비", "투자", "수입"),
+    ),
+    (
+        "건강",
+        ("건강", "컨디션", "휴식", "수면", "회복", "쉬어", "피로", "몸관리", "면역", "무리"),
+    ),
+    (
+        "주의",
+        ("주의", "조심", "신중", "천천히", "무리", "참아", "말실수", "실수", "충동", "서두르"),
+    ),
+    (
+        "행동",
+        ("도전", "시작", "실행", "움직", "추진", "연락", "정리", "결단", "시도", "먼저"),
+    ),
+)
+FORTUNE_THEME_PRIORITY = {
+    label: index for index, (label, _) in enumerate(FORTUNE_THEME_RULES)
+}
+FORTUNE_EVIDENCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("반짝반짝", ("반짝반짝",)),
+    ("빛나는 날", ("빛나는 날",)),
+    ("행운", ("행운", "lucky", "luck")),
+    ("클로버", ("네잎클로버", "클로버", "four_leaf_clover", "clover")),
+    ("화이팅", ("화이팅", "파이팅", "fighting")),
+    ("사랑", ("사랑", "love_letter", "heart")),
+    ("업무", ("업무", "회의", "프로젝트", "출근", "퇴근", "일복")),
+    ("돈", ("재물", "금전", "보너스", "수익", "용돈")),
+    ("건강", ("건강", "컨디션", "휴식", "수면", "회복", "쉬어")),
+    ("조심", ("주의", "조심", "신중", "천천히", "무리", "참아")),
+    ("도전", ("도전", "시작", "실행", "움직", "추진")),
+    ("연락", ("연락", "대화", "메시지")),
+)
 FUN_SYSTEM_PROMPT = (
     "너는 슬랙에서 DD를 가볍게 놀리는 짧은 한국어 답글 보정기야. "
     "기본 템플릿을 더 자연스럽고 유쾌하게 다듬되, 의미는 유지해. "
@@ -126,6 +181,206 @@ def _normalize_fun_text(text: str) -> str:
     normalized = URL_RE.sub(" ", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip()
+
+
+def _normalize_fortune_text(text: str) -> str:
+    return _normalize_fun_text(text).lower()
+
+
+def _count_marker_hits(text: str, markers: tuple[str, ...]) -> int:
+    return sum(1 for marker in markers if marker.lower() in text)
+
+
+def _extract_fortune_date(text: str) -> str | None:
+    match = FORTUNE_DATE_RE.search(text)
+    if not match:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    return f"{year}년 {month}월 {day}일"
+
+
+def _extract_fortune_birth_years(text: str) -> list[str]:
+    seen: set[str] = set()
+    years: list[str] = []
+    for matched_year in FORTUNE_BIRTH_YEAR_RE.findall(text or ""):
+        year = str(matched_year).strip()
+        if not year:
+            continue
+        label = f"{year}년생"
+        if label in seen:
+            continue
+        seen.add(label)
+        years.append(label)
+    return years
+
+
+def _score_fortune_themes(normalized_text: str) -> dict[str, int]:
+    scores: dict[str, int] = {}
+    for label, markers in FORTUNE_THEME_RULES:
+        hit_count = _count_marker_hits(normalized_text, markers)
+        if hit_count > 0:
+            scores[label] = hit_count
+    return scores
+
+
+def _pick_top_fortune_themes(scores: dict[str, int], *, limit: int = 2) -> list[str]:
+    ranked = sorted(
+        scores.items(),
+        key=lambda item: (
+            -item[1],
+            FORTUNE_THEME_PRIORITY.get(item[0], len(FORTUNE_THEME_PRIORITY)),
+        ),
+    )
+    return [label for label, _ in ranked[:limit]]
+
+
+def _classify_fortune_tone(scores: dict[str, int]) -> str:
+    luck_score = scores.get("행운", 0)
+    cheer_score = scores.get("응원", 0)
+    caution_score = scores.get("주의", 0)
+    action_score = scores.get("행동", 0)
+    health_score = scores.get("건강", 0)
+    love_score = scores.get("사랑", 0)
+
+    if caution_score and (luck_score or cheer_score or action_score):
+        return "낙관+주의 혼합형"
+    if caution_score:
+        return "주의형"
+    if action_score and (luck_score or cheer_score):
+        return "행동 촉구형"
+    if luck_score + cheer_score >= 2:
+        return "초긍정 응원형"
+    if health_score:
+        return "회복형"
+    if love_score:
+        return "감성형"
+    return "잔잔한 일반형"
+
+
+def _extract_fortune_evidence(normalized_text: str, *, limit: int = 4) -> list[str]:
+    evidence: list[str] = []
+    for label, markers in FORTUNE_EVIDENCE_RULES:
+        if any(marker.lower() in normalized_text for marker in markers):
+            evidence.append(label)
+        if len(evidence) >= limit:
+            break
+    return evidence
+
+
+def _load_thread_root_text(
+    client: Any,
+    logger: logging.Logger,
+    channel_id: str,
+    thread_ts: str,
+) -> str:
+    if not channel_id or not thread_ts:
+        return ""
+    try:
+        response = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
+            limit=1,
+            inclusive=True,
+        )
+    except Exception:
+        logger.exception("Failed to fetch fortune thread root")
+        return ""
+
+    messages = response.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return ""
+    first_message = messages[0]
+    if not isinstance(first_message, dict):
+        return ""
+    return str(first_message.get("text") or "").strip()
+
+
+def _looks_like_fortune_detail_text(text: str) -> bool:
+    normalized = _normalize_fortune_text(text)
+    if _extract_fortune_birth_years(text):
+        return True
+
+    detail_markers = (
+        "행운",
+        "재물",
+        "금전",
+        "연애",
+        "대인관계",
+        "직장",
+        "건강",
+        "주의",
+        "조심",
+        "기회",
+        "연락",
+        "지출",
+        "계획",
+        "컨디션",
+    )
+    return _count_marker_hits(normalized, detail_markers) >= 2
+
+
+def _is_daily_fortune_message(
+    payload: MessagePayload,
+    thread_root_text: str,
+) -> bool:
+    if payload["channel_id"] != ALLOWED_FUN_CHANNEL_ID:
+        return False
+    if payload.get("subtype") != "bot_message":
+        return False
+
+    if payload.get("thread_ts") == payload.get("current_ts"):
+        return False
+
+    bot_name = str(payload.get("bot_name") or "").strip().lower()
+    known_bot = any(hint in bot_name for hint in FORTUNE_BOT_NAME_HINTS)
+    if not known_bot and not _looks_like_fortune_detail_text(payload["raw_text"]):
+        return False
+
+    normalized_thread = _normalize_fortune_text(thread_root_text)
+    if not all(marker.lower() in normalized_thread for marker in FORTUNE_REQUIRED_MARKERS):
+        return False
+    return _looks_like_fortune_detail_text(payload["raw_text"])
+
+
+def _build_fortune_target_text(years: list[str]) -> str:
+    if not years:
+        return "이 댓글 기준으론"
+    if len(years) == 1:
+        return f"{years[0]} 기준으론"
+    if len(years) == 2:
+        return f"{years[0]}, {years[1]} 기준으론"
+    return f"{years[0]} 외 {len(years) - 1}개 년생 기준으론"
+
+
+def _build_daily_fortune_reply(text: str, thread_root_text: str = "") -> str:
+    normalized = _normalize_fortune_text(text)
+    date_text = _extract_fortune_date(text) or _extract_fortune_date(thread_root_text) or "오늘"
+    years = _extract_fortune_birth_years(text)
+    theme_scores = _score_fortune_themes(normalized)
+    tone = _classify_fortune_tone(theme_scores)
+    top_themes = _pick_top_fortune_themes(theme_scores)
+    evidence = _extract_fortune_evidence(normalized)
+    target_text = _build_fortune_target_text(years)
+
+    intro = f"운세 분석: {date_text} {target_text} {tone}이야."
+    if top_themes:
+        theme_text = ", ".join(top_themes)
+        if "주의" in top_themes and len(top_themes) > 1:
+            middle = f"핵심은 {theme_text} 쪽이고 낙관이랑 경계를 같이 주네."
+        else:
+            middle = f"핵심은 {theme_text} 쪽이네."
+    else:
+        middle = "구체 키워드는 적지만 방향성은 보이네."
+
+    if evidence:
+        evidence_text = ", ".join(f"`{item}`" for item in evidence)
+        ending = f"근거는 {evidence_text}."
+    else:
+        ending = "근거는 응원성 표현이 반복되는 점이야."
+
+    return f"{intro} {middle} {ending}"
 
 
 def _clean_fun_fragment(text: str) -> str:
@@ -326,6 +581,28 @@ def handle_fun_message(
         return
 
     raw_text = payload["raw_text"]
+    thread_root_text = ""
+    if payload.get("subtype") == "bot_message" and payload.get("thread_ts") != payload.get("current_ts"):
+        thread_root_text = _load_thread_root_text(
+            client,
+            logger,
+            payload["channel_id"],
+            payload.get("thread_ts") or "",
+        )
+
+    if _is_daily_fortune_message(payload, thread_root_text):
+        _set_request_log_skip_persist(payload, True)
+        reply(_build_daily_fortune_reply(raw_text, thread_root_text), thread=True)
+        logger.info(
+            "Responded with daily fortune analysis in channel=%s bot=%s",
+            payload["channel_id"],
+            payload.get("bot_name") or payload.get("bot_id") or "unknown",
+        )
+        return
+
+    if payload.get("subtype") == "bot_message":
+        return
+
     if "모대" not in raw_text:
         return
 

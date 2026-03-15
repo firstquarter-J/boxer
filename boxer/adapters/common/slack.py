@@ -52,6 +52,10 @@ class MessagePayload(TypedDict):
     channel_id: str
     current_ts: str
     thread_ts: str
+    subtype: str
+    bot_id: str
+    bot_name: str
+    app_id: str
     request_log: SlackRequestLogContext
 
 
@@ -414,17 +418,30 @@ def create_slack_app(
 
     @app.event("message")
     def handle_message_events(event: dict[str, Any], say, client) -> None:
-        subtype = event.get("subtype")
-        if subtype:
+        subtype = str(event.get("subtype") or "").strip()
+        if subtype and subtype != "bot_message":
             logger.debug("Ignored message event subtype=%s", subtype)
             return
         if message_handler is None:
             logger.debug("Ignored message event without message_handler")
             return
 
-        raw_text = event.get("text") or ""
-        user_id = event.get("user")
-        if not raw_text or not user_id:
+        raw_text = str(event.get("text") or "").strip()
+        user_id = str(event.get("user") or "").strip() or None
+        bot_id = str(event.get("bot_id") or "").strip()
+        bot_profile = event.get("bot_profile")
+        bot_profile_dict = bot_profile if isinstance(bot_profile, dict) else {}
+        bot_name = str(
+            event.get("username")
+            or bot_profile_dict.get("name")
+            or ""
+        ).strip()
+        app_id = str(
+            event.get("app_id")
+            or bot_profile_dict.get("app_id")
+            or ""
+        ).strip()
+        if not raw_text or (subtype != "bot_message" and not user_id):
             logger.debug("Ignored message event without text/user")
             return
 
@@ -438,12 +455,22 @@ def create_slack_app(
             "channel_id": event.get("channel") or "",
             "current_ts": event.get("ts") or "",
             "thread_ts": thread_ts,
+            "subtype": subtype,
+            "bot_id": bot_id,
+            "bot_name": bot_name,
+            "app_id": app_id,
             "request_log": {
                 "route_name": "message",
                 "status": "handled",
             },
         }
-        logger.info("Received message: user=%s text=%s", user_id, payload["text"])
+        logger.info(
+            "Received message: user=%s bot=%s subtype=%s text=%s",
+            user_id or "unknown",
+            bot_id or "none",
+            subtype or "none",
+            payload["text"],
+        )
 
         def reply(reply_text: str, *, thread: bool = False) -> None:
             clean_text = (reply_text or "").strip()
