@@ -70,7 +70,8 @@ LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 RETRIEVAL_SYNTHESIS_SYSTEM_PROMPT = os.getenv(
     "RETRIEVAL_SYNTHESIS_SYSTEM_PROMPT",
-    "You are a retrieval-grounded assistant. Answer briefly in Korean using only provided evidence. "
+    "You are a retrieval-grounded assistant. Answer briefly using only provided evidence. "
+    "Match the user's language when it is clear from the question; otherwise answer in English. "
     "Prioritize Evidence(JSON) over thread context. Do not add recommendations unless evidence explicitly supports them. "
     "If evidence is insufficient, clearly say what is missing.",
 )
@@ -143,9 +144,9 @@ REQUEST_LOG_TIMEZONE = (
     _getenv_any(
         "REQUEST_LOG_TIMEZONE",
         "REQUEST_AUDIT_TIMEZONE",
-        default="Asia/Seoul",
+        default="UTC",
     ).strip()
-    or "Asia/Seoul"
+    or "UTC"
 )
 REQUEST_LOG_SQLITE_S3_BACKUP_ENABLED = _getenv_any(
     "REQUEST_LOG_SQLITE_S3_BACKUP_ENABLED",

@@ -118,6 +118,7 @@ Input
 
 실제 비밀값은 `.env`에만 두고 커밋하지 않는다.
 필요하면 `BOXER_DOTENV_PATH`로 다른 env 파일을 지정하거나 `BOXER_SKIP_DOTENV=true`로 dotenv 로딩 자체를 끌 수 있다.
+별도 설정이 없으면 retrieval synthesis 기본 응답 언어는 `질문 언어를 따라가고`, request log timezone 기본값은 `UTC`다.
 
 ## 빠른 시작
 

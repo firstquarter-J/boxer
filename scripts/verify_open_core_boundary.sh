@@ -43,6 +43,11 @@ check_absent \
   "MOMMYBOX|HYUN_USER_ID|MARK_USER_ID|DD_USER_ID|APP_USER_|ANTHROPIC_API_KEY_HUMANSCAPE" \
   boxer/core .env.example
 
+check_absent \
+  "korea-specific defaults absent from open core" \
+  "Answer in Korean|Answer briefly in Korean|default=\"Asia/Seoul\"|or \"Asia/Seoul\"" \
+  boxer/core boxer/routers/common
+
 echo "[check] compileall"
 "${PYTHON_BIN}" -m compileall boxer >/dev/null
 
