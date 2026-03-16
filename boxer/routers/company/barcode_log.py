@@ -190,6 +190,26 @@ def _expand_device_contexts_to_recordings_hospital_scope(
     return _dedupe_device_contexts_by_name(additional_contexts)
 
 
+def _merge_device_contexts_with_recordings_hospital_scope(
+    recordings_context: dict[str, Any] | None,
+    existing_device_contexts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    base_contexts = [item for item in existing_device_contexts if isinstance(item, dict)]
+    expanded_contexts = _expand_device_contexts_to_recordings_hospital_scope(
+        recordings_context,
+        base_contexts,
+    )
+    if not expanded_contexts:
+        return base_contexts, False
+    return [*base_contexts, *expanded_contexts], True
+
+
+def _device_analysis_limit(*, include_hospital_scope: bool = False) -> int:
+    if include_hospital_scope:
+        return max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))
+    return max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
+
+
 def _normalize_year(raw_year: int) -> int:
     if raw_year < 100:
         return 2000 + raw_year
@@ -2615,7 +2635,7 @@ def _build_barcode_log_empty_result(
     else:
         lines.append("• 결과: 요청 바코드 세션을 찾지 못했어")
     if used_expanded_scope:
-        lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
     lines.extend(_build_recent_recording_hint_lines(recordings_context, log_date))
     return "\n".join(lines)
 
@@ -2937,11 +2957,11 @@ def _analyze_barcode_log_phase1_window(
             records=[],
         )
 
-    device_contexts = _lookup_device_contexts_by_barcode(
+    mapped_device_contexts = _lookup_device_contexts_by_barcode(
         barcode,
         recordings_context=recordings_context,
     )
-    if not device_contexts:
+    if not mapped_device_contexts:
         result_text = _build_phase2_scope_request_message(
             barcode,
             "장비 매핑 정보를 찾지 못했어",
@@ -2955,9 +2975,14 @@ def _analyze_barcode_log_phase1_window(
             records=[],
         )
 
-    max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
-    target_device_contexts = device_contexts[:max_devices]
-    omitted_device_count = max(0, len(device_contexts) - len(target_device_contexts))
+    mapped_device_count = len(mapped_device_contexts)
+    all_device_contexts, used_expanded_scope = _merge_device_contexts_with_recordings_hospital_scope(
+        recordings_context,
+        mapped_device_contexts,
+    )
+    max_devices = _device_analysis_limit(include_hospital_scope=used_expanded_scope)
+    target_device_contexts = all_device_contexts[:max_devices]
+    omitted_device_count = max(0, len(all_device_contexts) - len(target_device_contexts))
     target_date_labels = _iter_date_labels(start_date, end_date)
     use_db_upload_cross_check = recordings_context is not None and day_span <= 1
 
@@ -2971,8 +2996,10 @@ def _analyze_barcode_log_phase1_window(
         title,
         f"• 바코드: `{barcode}`",
         f"• 분석 범위(KST): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)",
-        f"• 매핑 장비: `{len(device_contexts)}개`",
+        f"• 매핑 장비: `{mapped_device_count}개`",
     ]
+    if used_expanded_scope:
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
     if omitted_device_count > 0:
         lines.append(f"• 참고: 장비가 많아서 상위 `{len(target_device_contexts)}개`만 분석했어")
     header_line_count = len(lines)
@@ -3093,13 +3120,16 @@ def _analyze_barcode_log_phase1_window(
             )
 
     if found_log_files == 0:
-        result_text = (
-            f"{title}\n"
-            f"• 바코드: `{barcode}`\n"
-            f"• 분석 범위(KST): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)\n"
-            f"• 매핑 장비: `{len(device_contexts)}개`\n"
-            "• 확인한 로그 파일: `0개`"
-        )
+        result_lines = [
+            title,
+            f"• 바코드: `{barcode}`",
+            f"• 분석 범위(KST): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)",
+            f"• 매핑 장비: `{mapped_device_count}개`",
+        ]
+        if used_expanded_scope:
+            result_lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
+        result_lines.append("• 확인한 로그 파일: `0개`")
+        result_text = "\n".join(result_lines)
         return result_text, _build_log_analysis_payload(
             mode="phase1_window",
             barcode=barcode,
@@ -3131,14 +3161,14 @@ def _analyze_barcode_log_scan_events(
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    all_device_contexts = device_contexts
-    if all_device_contexts is None:
-        all_device_contexts = _lookup_device_contexts_by_barcode(
+    mapped_device_contexts = device_contexts
+    if mapped_device_contexts is None:
+        mapped_device_contexts = _lookup_device_contexts_by_barcode(
             barcode,
             recordings_context=recordings_context,
         )
 
-    if not all_device_contexts:
+    if not mapped_device_contexts:
         result_text = (
             "*로그 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
@@ -3153,7 +3183,12 @@ def _analyze_barcode_log_scan_events(
             records=[],
         )
 
-    max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
+    mapped_device_count = len(mapped_device_contexts)
+    all_device_contexts, used_expanded_scope = _merge_device_contexts_with_recordings_hospital_scope(
+        recordings_context,
+        mapped_device_contexts,
+    )
+    max_devices = _device_analysis_limit(include_hospital_scope=used_expanded_scope)
     target_device_contexts = all_device_contexts[:max_devices]
     omitted_device_count = max(0, len(all_device_contexts) - len(target_device_contexts))
     total_session_count = 0
@@ -3161,15 +3196,16 @@ def _analyze_barcode_log_scan_events(
     logs_with_session = 0
     devices_with_session = 0
     displayed_device_index = 0
-    used_expanded_scope = False
     analysis_records: list[dict[str, Any]] = []
 
     lines = [
         "*로그 분석 결과*",
         f"• 바코드: `{barcode}`",
         f"• 날짜: `{log_date}`",
-        f"• 매핑 장비: `{len(all_device_contexts)}개`",
+        f"• 매핑 장비: `{mapped_device_count}개`",
     ]
+    if used_expanded_scope:
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
     if omitted_device_count > 0:
         lines.append(f"• 참고: 장비가 많아서 상위 `{len(target_device_contexts)}개`만 분석했어")
     header_line_count = len(lines)
@@ -3282,23 +3318,11 @@ def _analyze_barcode_log_scan_events(
     _analyze_device_context_batch(target_device_contexts)
 
     if logs_with_session == 0:
-        expanded_device_contexts = _expand_device_contexts_to_recordings_hospital_scope(
-            recordings_context,
-            target_device_contexts,
-        )
-        if expanded_device_contexts:
-            used_expanded_scope = True
-            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
-            _analyze_device_context_batch(
-                expanded_device_contexts[: max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))]
-            )
-
-    if logs_with_session == 0:
         result_text = _build_barcode_log_empty_result(
             title="*로그 분석 결과*",
             barcode=barcode,
             log_date=log_date,
-            mapped_device_count=len(all_device_contexts),
+            mapped_device_count=mapped_device_count,
             logs_found_any=logs_found_any,
             used_expanded_scope=used_expanded_scope,
             recordings_context=recordings_context,
@@ -3334,14 +3358,14 @@ def _analyze_barcode_log_errors(
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    all_device_contexts = device_contexts
-    if all_device_contexts is None:
-        all_device_contexts = _lookup_device_contexts_by_barcode(
+    mapped_device_contexts = device_contexts
+    if mapped_device_contexts is None:
+        mapped_device_contexts = _lookup_device_contexts_by_barcode(
             barcode,
             recordings_context=recordings_context,
         )
 
-    if not all_device_contexts:
+    if not mapped_device_contexts:
         result_text = (
             "*바코드 로그 에러 분석 결과*\n"
             f"• 바코드: `{barcode}`\n"
@@ -3356,7 +3380,12 @@ def _analyze_barcode_log_errors(
             records=[],
         )
 
-    max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
+    mapped_device_count = len(mapped_device_contexts)
+    all_device_contexts, used_expanded_scope = _merge_device_contexts_with_recordings_hospital_scope(
+        recordings_context,
+        mapped_device_contexts,
+    )
+    max_devices = _device_analysis_limit(include_hospital_scope=used_expanded_scope)
     target_device_contexts = all_device_contexts[:max_devices]
     omitted_device_count = max(0, len(all_device_contexts) - len(target_device_contexts))
 
@@ -3366,14 +3395,15 @@ def _analyze_barcode_log_errors(
     total_session_count = 0
     devices_with_session = 0
     displayed_device_index = 0
-    used_expanded_scope = False
     analysis_records: list[dict[str, Any]] = []
     lines = [
         "*바코드 로그 에러 분석 결과*",
         f"• 바코드: `{barcode}`",
         f"• 날짜: `{log_date}`",
-        f"• 매핑 장비: `{len(all_device_contexts)}개`",
+        f"• 매핑 장비: `{mapped_device_count}개`",
     ]
+    if used_expanded_scope:
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
     if omitted_device_count > 0:
         lines.append(f"• 참고: 장비가 많아서 상위 `{len(target_device_contexts)}개`만 분석했어")
     header_line_count = len(lines)
@@ -3488,23 +3518,11 @@ def _analyze_barcode_log_errors(
     _analyze_device_context_batch(target_device_contexts)
 
     if logs_with_session == 0:
-        expanded_device_contexts = _expand_device_contexts_to_recordings_hospital_scope(
-            recordings_context,
-            target_device_contexts,
-        )
-        if expanded_device_contexts:
-            used_expanded_scope = True
-            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
-            _analyze_device_context_batch(
-                expanded_device_contexts[: max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))]
-            )
-
-    if logs_with_session == 0:
         result_text = _build_barcode_log_empty_result(
             title="*바코드 로그 에러 분석 결과*",
             barcode=barcode,
             log_date=log_date,
-            mapped_device_count=len(all_device_contexts),
+            mapped_device_count=mapped_device_count,
             logs_found_any=logs_found_any,
             used_expanded_scope=used_expanded_scope,
             recordings_context=recordings_context,

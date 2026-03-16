@@ -1025,7 +1025,7 @@ def _render_device_download_thread_notice(
         f"• 날짜: `{log_date}`",
     ]
     if used_expanded_scope:
-        lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
     for record in records:
         lines.append("")
         lines.append(f"• 장비: `{record['deviceName']}`")
@@ -1055,7 +1055,7 @@ def _render_device_download_dm_failure_notice(
         f"• 날짜: `{log_date}`",
     ]
     if used_expanded_scope:
-        lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
     for record in records:
         lines.append("")
         lines.append(f"• 장비: `{record['deviceName']}`")

@@ -27,12 +27,13 @@ from boxer.core.utils import _display_value, _truncate_text
 from boxer.routers.company.barcode_log import (
     _build_phase2_scope_request_message,
     _error_lines_in_session,
-    _expand_device_contexts_to_recordings_hospital_scope,
+    _device_analysis_limit,
     _extract_recording_sessions,
     _extract_scan_events_with_line_no,
     _find_error_lines,
     _find_first_ffmpeg_error_context,
     _find_recording_recovery_context,
+    _merge_device_contexts_with_recordings_hospital_scope,
 )
 from boxer.routers.company.box_db import (
     _lookup_device_contexts_by_barcode,
@@ -850,6 +851,7 @@ def _render_file_candidate_result(
     *,
     barcode: str,
     log_date: str,
+    mapped_device_count: int,
     all_device_contexts: list[dict[str, Any]],
     records: list[dict[str, Any]],
     used_expanded_scope: bool,
@@ -864,7 +866,7 @@ def _render_file_candidate_result(
             "*파일 확인 대상 세션 조회 결과*\n"
             f"• 바코드: `{barcode}`\n"
             f"• 날짜: `{log_date}`\n"
-            f"• 매핑 장비: `{len(all_device_contexts)}개`\n"
+            f"• 매핑 장비: `{mapped_device_count}개`\n"
             "• 확인한 로그 파일: `0개`"
         )
 
@@ -873,12 +875,12 @@ def _render_file_candidate_result(
             "*파일 확인 대상 세션 조회 결과*",
             f"• 바코드: `{barcode}`",
             f"• 날짜: `{log_date}`",
-            f"• 매핑 장비: `{len(all_device_contexts)}개`",
+            f"• 매핑 장비: `{mapped_device_count}개`",
             f"• 확인한 로그 파일: `{logs_found_any}개`",
             "• 결과: 요청 바코드 세션을 찾지 못했어",
         ]
         if used_expanded_scope:
-            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+            lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
         return "\n".join(lines)
 
     if compact_file_list:
@@ -889,7 +891,7 @@ def _render_file_candidate_result(
             f"• 세션이 확인된 장비: `{len(records)}개`",
         ]
         if used_expanded_scope:
-            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+            lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
 
         for record in records:
             lines.append("")
@@ -958,7 +960,7 @@ def _render_file_candidate_result(
             f"• 날짜: `{log_date}`",
         ]
         if used_expanded_scope:
-            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+            lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
 
         for record in records:
             lines.append("")
@@ -1039,7 +1041,7 @@ def _render_file_candidate_result(
             f"• 날짜: `{log_date}`",
         ]
         if used_expanded_scope:
-            lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+            lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
 
         for record in records:
             lines.append("")
@@ -1122,11 +1124,11 @@ def _render_file_candidate_result(
         "*파일 확인 대상 세션 조회 결과*",
         f"• 바코드: `{barcode}`",
         f"• 날짜: `{log_date}`",
-        f"• 매핑 장비: `{len(all_device_contexts)}개`",
+        f"• 매핑 장비: `{mapped_device_count}개`",
         f"• 세션이 확인된 장비: `{len(records)}개`",
     ]
     if used_expanded_scope:
-        lines.append("• 참고: 매핑 장비에서 세션을 못 찾아 동일 병원 장비까지 확장 검색했어")
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
 
     for record in records:
         lines.append("")
@@ -1223,14 +1225,14 @@ def _locate_barcode_file_candidates(
     recover_remote_files: bool = False,
     compact_recovery: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    all_device_contexts = device_contexts
-    if all_device_contexts is None:
-        all_device_contexts = _lookup_device_contexts_by_barcode(
+    mapped_device_contexts = device_contexts
+    if mapped_device_contexts is None:
+        mapped_device_contexts = _lookup_device_contexts_by_barcode(
             barcode,
             recordings_context=recordings_context,
         )
 
-    if not all_device_contexts:
+    if not mapped_device_contexts:
         result_text = (
             "*파일 확인 대상 세션 조회 결과*\n"
             f"• 바코드: `{barcode}`\n"
@@ -1243,11 +1245,15 @@ def _locate_barcode_file_candidates(
             "records": [],
         }
 
-    max_devices = max(1, min(20, cs.LOG_ANALYSIS_MAX_DEVICES))
+    mapped_device_count = len(mapped_device_contexts)
+    all_device_contexts, used_expanded_scope = _merge_device_contexts_with_recordings_hospital_scope(
+        recordings_context,
+        mapped_device_contexts,
+    )
+    max_devices = _device_analysis_limit(include_hospital_scope=used_expanded_scope)
     target_device_contexts = all_device_contexts[:max_devices]
     logs_found_any = 0
     records: list[dict[str, Any]] = []
-    used_expanded_scope = False
 
     def _analyze_batch(device_context_batch: list[dict[str, Any]]) -> None:
         nonlocal logs_found_any
@@ -1303,15 +1309,6 @@ def _locate_barcode_file_candidates(
             )
 
     _analyze_batch(target_device_contexts)
-
-    if not records:
-        expanded_device_contexts = _expand_device_contexts_to_recordings_hospital_scope(
-            recordings_context,
-            target_device_contexts,
-        )
-        if expanded_device_contexts:
-            used_expanded_scope = True
-            _analyze_batch(expanded_device_contexts[: max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))])
 
     if probe_remote_files and records:
         for record in records:
@@ -1386,6 +1383,7 @@ def _locate_barcode_file_candidates(
     result_text = _render_file_candidate_result(
         barcode=barcode,
         log_date=log_date,
+        mapped_device_count=mapped_device_count,
         all_device_contexts=all_device_contexts,
         records=records,
         used_expanded_scope=used_expanded_scope,
@@ -1413,6 +1411,7 @@ def _locate_barcode_file_candidates(
         "summary": {
             "recordCount": len(records),
             "logsFound": logs_found_any,
+            "mappedDeviceCount": mapped_device_count,
             "deviceCount": len(all_device_contexts),
         },
         "records": records,
