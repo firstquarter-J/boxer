@@ -10,6 +10,9 @@
 실행 예시:
 
 ```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-open-core.txt
 cp .env.example .env
 export ADAPTER_ENTRYPOINT=examples.custom_adapter.adapters.slack:create_app
 python app.py
@@ -27,4 +30,3 @@ python app.py
 - `ping`은 기본 route
 - FAQ 질문은 adapter가 router로 넘긴다
 - 민감 질문은 adapter의 policy guard가 막는다
-

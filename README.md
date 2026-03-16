@@ -117,6 +117,7 @@ Input
 - `.env`: 실제 실행 값만 기록
 
 실제 비밀값은 `.env`에만 두고 커밋하지 않는다.
+필요하면 `BOXER_DOTENV_PATH`로 다른 env 파일을 지정하거나 `BOXER_SKIP_DOTENV=true`로 dotenv 로딩 자체를 끌 수 있다.
 
 ## 빠른 시작
 
@@ -128,7 +129,7 @@ Input
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-open-core.txt
 cp .env.example .env
 ```
 
@@ -141,7 +142,7 @@ cp .env.example .env
 선택:
 
 - `ADAPTER_ENTRYPOINT=boxer.adapters.sample.slack:create_app`
-- LLM 기능을 실험할 때만 `LLM_PROVIDER`와 provider별 env 추가
+- LLM 기능을 실험할 때만 `LLM_PROVIDER`와 provider별 env(`ANTHROPIC_API_KEY`, `OLLAMA_*`) 추가
 
 실행:
 
@@ -149,6 +150,8 @@ cp .env.example .env
 scripts/smoke_sample_adapter.sh
 python app.py
 ```
+
+`smoke_sample_adapter.sh`는 `BOXER_SKIP_DOTENV=true`로 실행돼서, 로컬 `.env`에 회사용 설정이 있어도 샘플 팩토리 확인만 안정적으로 수행한다.
 
 예시:
 
@@ -230,6 +233,12 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 이 위에 어떤 질문을 어떤 connector로 처리할지는 각 adapter가 정한다.
 
+## Requirements Files
+
+- `requirements-open-core.txt`: sample adapter, custom adapter, reusable core만 쓸 때
+- `requirements-company.txt`: open core + company/reference adapter 확장까지 필요할 때
+- `requirements.txt`: 공개 기본 설치용 alias (`requirements-open-core.txt` 포함)
+
 ## 검증 스크립트
 
 ```bash
@@ -255,6 +264,10 @@ scripts/verify_open_core_boundary.sh
 - 민감 정보가 필요한 질문은 adapter에서 명시적으로 차단하거나 마스킹한다
 - 가능하면 sample adapter 또는 `examples/` 예제로 먼저 구조를 검증한다
 - open core에 올릴 코드는 다른 도메인에서도 재사용 가능한지 먼저 확인한다
+
+## License
+
+Apache License 2.0을 따른다. 자세한 내용은 [`LICENSE`](LICENSE) 참고.
 
 ## 보안 / 운영 원칙
 
