@@ -15,7 +15,7 @@ from boxer.core import settings as s
 from boxer.core.utils import _display_value, _format_datetime, _truncate_text
 from boxer.routers.common.db import _create_db_connection
 from boxer.routers.company.mda_graphql import (
-    _get_mda_device_versions,
+    _get_mda_devices_details,
     _is_mda_graphql_configured,
     _wait_for_mda_device_agent_ssh,
 )
@@ -159,7 +159,7 @@ def _lookup_device_ssh_status(device_name: str) -> str:
     return "연결 가능"
 
 
-def _lookup_device_versions(device_names: list[object]) -> dict[str, str]:
+def _lookup_mda_device_details(device_names: list[object]) -> dict[str, dict[str, Any]]:
     normalized_names: list[str] = []
     seen_names: set[str] = set()
     for raw_name in device_names:
@@ -173,7 +173,7 @@ def _lookup_device_versions(device_names: list[object]) -> dict[str, str]:
         return {}
 
     try:
-        return _get_mda_device_versions(normalized_names)
+        return _get_mda_devices_details(normalized_names)
     except Exception:
         return {}
 
@@ -190,12 +190,18 @@ def _build_device_detail_lines(
         f"{line_prefix}버전: `{_display_value(row.get('version'), default='미확인')}`",
         f"{line_prefix}병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
         f"{line_prefix}병실: `{_display_value(row.get('roomName'), default='미확인')}`",
-        f"{line_prefix}status: `{_display_value(row.get('status'), default='미확인')}`",
-        f"{line_prefix}활성 유무: `{_format_active_flag_label(row.get('activeFlag'))}`",
-        f"{line_prefix}설치 유무: `{_format_install_flag_label(row.get('installFlag'))}`",
     ]
     if ssh_status is not None:
-        lines.insert(5, f"{line_prefix}SSH 연결 상태: `{_display_value(ssh_status, default='미확인')}`")
+        lines.append(f"{line_prefix}SSH 연결 상태: `{_display_value(ssh_status, default='미확인')}`")
+    lines.extend(
+        [
+            f"{line_prefix}캡처보드 종류: `{_display_value(row.get('captureBoardType'), default='미확인')}`",
+            f"{line_prefix}캡처보드 연결 상태: `{_display_value(row.get('captureBoardStatus'), default='미확인')}`",
+            f"{line_prefix}status: `{_display_value(row.get('status'), default='미확인')}`",
+            f"{line_prefix}활성 유무: `{_format_active_flag_label(row.get('activeFlag'))}`",
+            f"{line_prefix}설치 유무: `{_format_install_flag_label(row.get('installFlag'))}`",
+        ]
+    )
     description = _display_value(row.get("description"), default="")
     if description:
         lines.append(f"{line_prefix}description: `{description}`")
@@ -1799,12 +1805,22 @@ def _query_devices_by_filters(
         connection.close()
 
     if rows:
-        version_by_name = _lookup_device_versions([row.get("deviceName") for row in rows])
-        if version_by_name:
+        detail_by_name = _lookup_mda_device_details([row.get("deviceName") for row in rows])
+        if detail_by_name:
             for row in rows:
                 device_name = _display_value(row.get("deviceName"), default="")
-                if device_name in version_by_name:
-                    row["version"] = version_by_name[device_name]
+                detail = detail_by_name.get(device_name)
+                if not isinstance(detail, dict):
+                    continue
+                version = _display_value(detail.get("version"), default="")
+                if version:
+                    row["version"] = version
+                capture_board_type = _display_value(detail.get("captureBoardType"), default="")
+                if capture_board_type:
+                    row["captureBoardType"] = capture_board_type
+                capture_board_status = _display_value(detail.get("captureBoardStatus"), default="")
+                if capture_board_status:
+                    row["captureBoardStatus"] = capture_board_status
 
     lines = ["*장비 조회 결과*"]
     summary_lines: list[str] = []

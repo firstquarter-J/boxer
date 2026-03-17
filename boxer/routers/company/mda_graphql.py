@@ -46,6 +46,10 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
     nodes {
       deviceName
       version
+      deviceState {
+        captureBoardType
+        captureBoardStatus
+      }
       hospital {
         hospitalName
       }
@@ -214,6 +218,11 @@ def _normalize_agent_ssh(agent_ssh: Any) -> dict[str, Any] | None:
     }
 
 
+def _normalize_mda_state_text(value: Any) -> str:
+    text = _display_value(value, default="")
+    return "" if text.upper() == "NONE" else text
+
+
 def _extract_device_row(data: dict[str, Any], device_name: str) -> dict[str, Any] | None:
     paginated = data.get("paginatedDevices")
     if not isinstance(paginated, dict):
@@ -240,17 +249,18 @@ def _extract_device_row(data: dict[str, Any], device_name: str) -> dict[str, Any
 
 
 def _normalize_mda_device_detail(row: dict[str, Any], *, device_name: str) -> dict[str, Any]:
+    device_state = row.get("deviceState") if isinstance(row.get("deviceState"), dict) else {}
     hospital = row.get("hospital") if isinstance(row.get("hospital"), dict) else {}
     hospital_room = row.get("hospitalRoom") if isinstance(row.get("hospitalRoom"), dict) else {}
     agent_state = row.get("agentState") if isinstance(row.get("agentState"), dict) else {}
     agent_ssh = _normalize_agent_ssh(agent_state.get("agentSsh"))
-    version = _display_value(row.get("version"), default="")
-    if version.upper() == "NONE":
-        version = ""
+    version = _normalize_mda_state_text(row.get("version"))
 
     return {
         "deviceName": _display_value(row.get("deviceName"), default=device_name),
         "version": version,
+        "captureBoardType": _normalize_mda_state_text(device_state.get("captureBoardType")),
+        "captureBoardStatus": _normalize_mda_state_text(device_state.get("captureBoardStatus")),
         "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
         "roomName": _display_value(hospital_room.get("roomName"), default="미확인"),
         "isConnected": bool(agent_state.get("isConnected")),
@@ -279,8 +289,8 @@ def _get_mda_device_agent_ssh(device_name: str) -> dict[str, Any] | None:
     return _get_mda_device_detail(device_name)
 
 
-def _get_mda_device_versions(device_names: list[str]) -> dict[str, str]:
-    versions: dict[str, str] = {}
+def _get_mda_devices_details(device_names: list[str]) -> dict[str, dict[str, Any]]:
+    details: dict[str, dict[str, Any]] = {}
     seen_names: set[str] = set()
     for raw_name in device_names:
         normalized_name = str(raw_name or "").strip()
@@ -289,6 +299,14 @@ def _get_mda_device_versions(device_names: list[str]) -> dict[str, str]:
         seen_names.add(normalized_name)
 
         detail = _get_mda_device_detail(normalized_name)
+        if isinstance(detail, dict):
+            details[normalized_name] = detail
+    return details
+
+
+def _get_mda_device_versions(device_names: list[str]) -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for normalized_name, detail in _get_mda_devices_details(device_names).items():
         version = str((detail or {}).get("version") or "").strip()
         if version:
             versions[normalized_name] = version
