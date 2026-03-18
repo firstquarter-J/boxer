@@ -10,8 +10,10 @@ from boxer.adapters.common.slack import (
     _set_request_log_skip_persist,
 )
 from boxer.company import settings as cs
+from boxer.company.team_chat_context import build_team_chat_context
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
+from boxer.core.thread_context import _load_thread_context
 
 ALLOWED_FUN_CHANNEL_ID = "C0621TL2HSB"
 FUN_OLLAMA_MODEL = "qwen2.5:1.5b"
@@ -164,15 +166,16 @@ FORTUNE_EVIDENCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("연락", ("연락", "대화", "메시지")),
 )
 FUN_SYSTEM_PROMPT = (
-    "너는 슬랙에서 DD를 가볍게 놀리는 짧은 한국어 답글 보정기야. "
-    "기본 템플릿을 더 자연스럽고 유쾌하게 다듬되, 의미는 유지해. "
+    "너는 슬랙에서 DD를 향한 가벼운 한방 드립을 짧게 다듬는 한국어 답글 보정기야. "
+    "기본 템플릿을 더 자연스럽고 유쾌하게 다듬되, 최근 맥락과 인물 성향을 참고해. "
     "출력 규칙: "
     "1) 반드시 한국어 한 문장만 출력. "
     "2) 마지막은 반드시 '모대?'로 끝낼 것. "
     "3) 길이 8~22자 정도. "
     "4) 영어, 설명, 해설, 자기소개, 따옴표, 이모지, 멘션 금지. "
-    "5) 욕설, 비하, 성적 표현 금지. "
-    "6) 기본 템플릿보다 이상하면 기본 템플릿 그대로 출력."
+    "5) 욕설, 비하, 성적 표현, 외모 조롱, 따돌림, 집요한 모욕 금지. "
+    "6) 가볍게 치고 빠지는 수준으로만 놀릴 것. "
+    "7) 기본 템플릿보다 이상하면 기본 템플릿 그대로 출력."
 )
 
 
@@ -483,15 +486,22 @@ def _finalize_fun_reply(source_text: str, generated_text: str, fallback_text: st
     return f"{cleaned} 모대?"
 
 
-def _build_fun_llm_prompt(text: str) -> str:
+def _build_fun_llm_prompt(text: str, thread_context: str = "") -> str:
     topic = _extract_fun_topic(text) or "없음"
     template = _build_fun_template(text)
+    team_context = build_team_chat_context(text, thread_context, required_names=("DD",))
+    context_block = ""
+    if thread_context:
+        context_block = f"최근 대화 맥락:\n{thread_context}\n\n"
     return (
+        f"{context_block}"
+        f"{team_context}\n\n"
         f"원문: {text.strip()}\n"
         f"추출 토픽: {topic}\n"
         f"기본 템플릿: {template}\n"
         "출력 규칙:\n"
         "- DD를 살짝 놀리는 톤\n"
+        "- 최근 맥락이 있으면 그걸 재료로 짧게 받아칠 것\n"
         "- 기본 템플릿 의미 유지\n"
         "- 끝은 반드시 모대?\n"
         "- 영어/설명/자기소개 금지\n"
@@ -504,10 +514,11 @@ def _generate_fun_reply(
     logger: logging.Logger,
     *,
     claude_client: Anthropic | None,
+    thread_context: str = "",
 ) -> tuple[str, str, bool]:
     provider = (s.LLM_PROVIDER or "").lower().strip()
     fallback_text = _build_fun_template(text)
-    prompt = _build_fun_llm_prompt(text)
+    prompt = _build_fun_llm_prompt(text, thread_context)
 
     try:
         if provider == "ollama":
@@ -606,11 +617,20 @@ def handle_fun_message(
     if "모대" not in raw_text:
         return
 
+    thread_context = _load_thread_context(
+        client,
+        logger,
+        payload["channel_id"],
+        payload.get("thread_ts") or payload.get("current_ts"),
+        payload.get("current_ts"),
+    )
+
     _set_request_log_skip_persist(payload, True)
     reply_text, reply_mode, mention_dd = _generate_fun_reply(
         raw_text,
         logger,
         claude_client=claude_client,
+        thread_context=thread_context,
     )
     if mention_dd and cs.DD_USER_ID and _is_dd_active(client, logger):
         reply(f"<@{cs.DD_USER_ID}> {reply_text}", thread=True)

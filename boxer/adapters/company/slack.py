@@ -16,6 +16,7 @@ from boxer.adapters.common.slack import (
     create_slack_app,
 )
 from boxer.adapters.company.fun import handle_fun_message
+from boxer.company.team_chat_context import build_team_chat_context
 from boxer.company.notion_links import select_company_notion_doc_links
 from boxer.company.notion_playbooks import _select_notion_references
 from boxer.company.retrieval_rules import (
@@ -396,6 +397,16 @@ def _build_notion_doc_security_refusal() -> str:
 def _get_freeform_system_prompt() -> str | None:
     prompt = (cs.FREEFORM_SYSTEM_PROMPT or "").strip()
     return prompt or None
+
+
+def _build_freeform_chat_system_prompt(question: str, thread_context: str) -> str | None:
+    base_prompt = _get_freeform_system_prompt() or ""
+    team_context = build_team_chat_context(question, thread_context)
+    if base_prompt and team_context:
+        return f"{base_prompt}\n\n{team_context}"
+    if base_prompt:
+        return base_prompt
+    return team_context or None
 
 
 def _sanitize_notion_references_for_llm(references: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -3230,7 +3241,11 @@ def create_app() -> App:
                     current_ts,
                 )
                 model_input = _build_model_input(question, thread_context)
-                answer = _ask_claude(claude_client, model_input, system_prompt=_get_freeform_system_prompt())
+                answer = _ask_claude(
+                    claude_client,
+                    model_input,
+                    system_prompt=_build_freeform_chat_system_prompt(question, thread_context),
+                )
                 if not answer:
                     answer = "답변을 생성하지 못했어. 다시 질문해줘"
                 reply(answer)
@@ -3298,7 +3313,7 @@ def create_app() -> App:
                 model_input = _build_model_input(question, thread_context)
                 answer = _ask_ollama_chat(
                     model_input,
-                    system_prompt=_get_freeform_system_prompt(),
+                    system_prompt=_build_freeform_chat_system_prompt(question, thread_context),
                     think=False,
                 )
                 if not answer:
