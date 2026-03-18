@@ -16,6 +16,10 @@ from boxer.adapters.common.slack import (
     create_slack_app,
 )
 from boxer.adapters.company.fun import handle_fun_message
+from boxer.company.prompt_security import (
+    build_prompt_security_refusal,
+    is_prompt_exfiltration_attempt,
+)
 from boxer.company.team_chat_context import build_team_chat_context
 from boxer.company.notion_links import select_company_notion_doc_links
 from boxer.company.notion_playbooks import _select_notion_references
@@ -399,9 +403,18 @@ def _get_freeform_system_prompt() -> str | None:
     return prompt or None
 
 
-def _build_freeform_chat_system_prompt(question: str, thread_context: str) -> str | None:
+def _build_freeform_chat_system_prompt(
+    question: str,
+    thread_context: str,
+    *,
+    speaker_user_id: str = "",
+) -> str | None:
     base_prompt = _get_freeform_system_prompt() or ""
-    team_context = build_team_chat_context(question, thread_context)
+    team_context = build_team_chat_context(
+        question,
+        thread_context,
+        speaker_user_id=speaker_user_id,
+    )
     if base_prompt and team_context:
         return f"{base_prompt}\n\n{team_context}"
     if base_prompt:
@@ -3198,6 +3211,21 @@ def create_app() -> App:
                 logger.info("Rejected claude call for user=%s", user_id)
                 return
             try:
+                thread_context = _load_thread_context(
+                    client,
+                    logger,
+                    channel_id,
+                    thread_ts,
+                    current_ts,
+                )
+                if is_prompt_exfiltration_attempt(question, thread_context):
+                    logger.warning(
+                        "Blocked freeform prompt exfiltration attempt in thread_ts=%s question=%s",
+                        thread_ts,
+                        question,
+                    )
+                    reply(build_prompt_security_refusal())
+                    return
                 fallback_evidence = _build_barcode_fallback_evidence()
                 if fallback_evidence is not None:
                     synthesis_thread_context = ""
@@ -3232,19 +3260,15 @@ def create_app() -> App:
                         thread_ts,
                         barcode,
                     )
-
-                thread_context = _load_thread_context(
-                    client,
-                    logger,
-                    channel_id,
-                    thread_ts,
-                    current_ts,
-                )
                 model_input = _build_model_input(question, thread_context)
                 answer = _ask_claude(
                     claude_client,
                     model_input,
-                    system_prompt=_build_freeform_chat_system_prompt(question, thread_context),
+                    system_prompt=_build_freeform_chat_system_prompt(
+                        question,
+                        thread_context,
+                        speaker_user_id=user_id,
+                    ),
                 )
                 if not answer:
                     answer = "답변을 생성하지 못했어. 다시 질문해줘"
@@ -3263,6 +3287,21 @@ def create_app() -> App:
                 reply("질문 내용을 같이 보내줘. 지원 기능이 궁금하면 `사용법`이라고 보내줘")
                 return
             try:
+                thread_context = _load_thread_context(
+                    client,
+                    logger,
+                    channel_id,
+                    thread_ts,
+                    current_ts,
+                )
+                if is_prompt_exfiltration_attempt(question, thread_context):
+                    logger.warning(
+                        "Blocked freeform prompt exfiltration attempt in thread_ts=%s question=%s",
+                        thread_ts,
+                        question,
+                    )
+                    reply(build_prompt_security_refusal())
+                    return
                 health = _check_ollama_health()
                 if not health["ok"]:
                     logger.warning("Ollama unavailable before answer generation: %s", health["summary"])
@@ -3302,18 +3341,14 @@ def create_app() -> App:
                         thread_ts,
                         barcode,
                     )
-
-                thread_context = _load_thread_context(
-                    client,
-                    logger,
-                    channel_id,
-                    thread_ts,
-                    current_ts,
-                )
                 model_input = _build_model_input(question, thread_context)
                 answer = _ask_ollama_chat(
                     model_input,
-                    system_prompt=_build_freeform_chat_system_prompt(question, thread_context),
+                    system_prompt=_build_freeform_chat_system_prompt(
+                        question,
+                        thread_context,
+                        speaker_user_id=user_id,
+                    ),
                     think=False,
                 )
                 if not answer:

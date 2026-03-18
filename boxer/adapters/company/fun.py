@@ -10,6 +10,10 @@ from boxer.adapters.common.slack import (
     _set_request_log_skip_persist,
 )
 from boxer.company import settings as cs
+from boxer.company.prompt_security import (
+    build_prompt_security_refusal,
+    is_prompt_exfiltration_attempt,
+)
 from boxer.company.team_chat_context import build_team_chat_context
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
@@ -486,10 +490,20 @@ def _finalize_fun_reply(source_text: str, generated_text: str, fallback_text: st
     return f"{cleaned} 모대?"
 
 
-def _build_fun_llm_prompt(text: str, thread_context: str = "") -> str:
+def _build_fun_llm_prompt(
+    text: str,
+    thread_context: str = "",
+    *,
+    speaker_user_id: str = "",
+) -> str:
     topic = _extract_fun_topic(text) or "없음"
     template = _build_fun_template(text)
-    team_context = build_team_chat_context(text, thread_context, required_names=("DD",))
+    team_context = build_team_chat_context(
+        text,
+        thread_context,
+        speaker_user_id=speaker_user_id,
+        required_names=("DD",),
+    )
     context_block = ""
     if thread_context:
         context_block = f"최근 대화 맥락:\n{thread_context}\n\n"
@@ -515,10 +529,15 @@ def _generate_fun_reply(
     *,
     claude_client: Anthropic | None,
     thread_context: str = "",
+    speaker_user_id: str = "",
 ) -> tuple[str, str, bool]:
     provider = (s.LLM_PROVIDER or "").lower().strip()
     fallback_text = _build_fun_template(text)
-    prompt = _build_fun_llm_prompt(text, thread_context)
+    prompt = _build_fun_llm_prompt(
+        text,
+        thread_context,
+        speaker_user_id=speaker_user_id,
+    )
 
     try:
         if provider == "ollama":
@@ -625,12 +644,23 @@ def handle_fun_message(
         payload.get("current_ts"),
     )
 
+    if is_prompt_exfiltration_attempt(raw_text, thread_context):
+        _set_request_log_skip_persist(payload, True)
+        reply(build_prompt_security_refusal(), thread=True)
+        logger.warning(
+            "Blocked fun prompt exfiltration attempt in channel=%s user=%s",
+            payload["channel_id"],
+            payload.get("user_id") or "unknown",
+        )
+        return
+
     _set_request_log_skip_persist(payload, True)
     reply_text, reply_mode, mention_dd = _generate_fun_reply(
         raw_text,
         logger,
         claude_client=claude_client,
         thread_context=thread_context,
+        speaker_user_id=str(payload.get("user_id") or "").strip(),
     )
     if mention_dd and cs.DD_USER_ID and _is_dd_active(client, logger):
         reply(f"<@{cs.DD_USER_ID}> {reply_text}", thread=True)
