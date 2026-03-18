@@ -48,7 +48,6 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
       version
       deviceState {
         captureBoardType
-        captureBoardStatus
       }
       hospital {
         hospitalName
@@ -260,7 +259,6 @@ def _normalize_mda_device_detail(row: dict[str, Any], *, device_name: str) -> di
         "deviceName": _display_value(row.get("deviceName"), default=device_name),
         "version": version,
         "captureBoardType": _normalize_mda_state_text(device_state.get("captureBoardType")),
-        "captureBoardStatus": _normalize_mda_state_text(device_state.get("captureBoardStatus")),
         "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
         "roomName": _display_value(hospital_room.get("roomName"), default="미확인"),
         "isConnected": bool(agent_state.get("isConnected")),
