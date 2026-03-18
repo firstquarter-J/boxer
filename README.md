@@ -130,7 +130,7 @@ Input
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-open-core.txt
+pip install -e .
 cp .env.example .env
 ```
 
@@ -236,8 +236,10 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 ## Requirements Files
 
-- `requirements-open-core.txt`: sample adapter, custom adapter, reusable core만 쓸 때
-- `requirements-company.txt`: open core + company/reference adapter 확장까지 필요할 때
+- 기본 설치: `pip install -e .`
+- company/reference adapter 확장까지 필요할 때: `pip install -e ".[company]"`
+- `requirements-open-core.txt`: requirements 기반 설치가 필요할 때의 open core 목록
+- `requirements-company.txt`: company/reference adapter 확장까지 포함한 requirements 목록
 - `requirements.txt`: 공개 기본 설치용 alias (`requirements-open-core.txt` 포함)
 
 ## 검증 스크립트

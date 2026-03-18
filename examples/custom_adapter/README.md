@@ -12,7 +12,7 @@
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-open-core.txt
+pip install -e .
 cp .env.example .env
 export ADAPTER_ENTRYPOINT=examples.custom_adapter.adapters.slack:create_app
 python app.py

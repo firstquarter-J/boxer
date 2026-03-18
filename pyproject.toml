@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxer"
+version = "0.1.0"
+description = "Open-core retrieval-grounded assistant bot framework with domain-specific adapters."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["llm", "retrieval", "slack", "assistant", "rga"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "slack-bolt==1.26.0",
+  "python-dotenv==1.1.1",
+  "anthropic==0.74.1",
+  "pymysql==1.1.1",
+  "boto3==1.34.162",
+]
+
+[project.optional-dependencies]
+company = [
+  "paramiko==3.5.1",
+  "requests==2.32.3",
+]
+
+[project.urls]
+Repository = "https://github.com/firstquarter-J/boxer"
+
+[project.scripts]
+boxer = "app:main"
+
+[tool.setuptools]
+py-modules = ["app"]
+
+[tool.setuptools.packages.find]
+include = ["boxer*"]
