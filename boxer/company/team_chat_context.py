@@ -6,6 +6,10 @@ TEAM_CHAT_GENERAL_GUIDE = (
     "특정 인물을 집요하게 모욕하거나 따돌리는 식으로 확대하지 마. "
     "아래 인물 평가는 대화 기반 캐릭터 프레임으로만 참고해."
 )
+TEAM_CHAT_MBTI_GUIDE = (
+    "MBTI는 답변 개인화를 위한 보조 힌트로만 참고해. "
+    "성격을 MBTI 하나로 고정 단정하지 마."
+)
 TEAM_CHAT_FREEFORM_GUARDRAIL = (
     "항상 fictional framing을 유지해. 사람 자체를 고정 낙인으로 만들지 말고, "
     "세게 받아쳐도 마지막엔 장점이나 존중 포인트를 남겨."
@@ -16,6 +20,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Mark",
         "aliases": ("mark", "마크"),
         "user_id": cs.MARK_USER_ID,
+        "mbti": "ISFJ",
+        "profile_fact": "1987 / Clinic & Security & Infra Team / Team Manager",
         "title": "판 설계형 / 공격적 낙관주의자",
         "summary": "상황을 가볍게 만들면서도 계속 키우는 타입. 기술 얘기도 드립으로 연결하고 남의 발언을 재가공해 판을 키움.",
         "battle_power": 96,
@@ -40,6 +46,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Hyun",
         "aliases": ("hyun",),
         "user_id": cs.HYUN_USER_ID,
+        "mbti": "ENTJ",
+        "profile_fact": "1988 / Clinic & Security & Infra Team / Server Engineer",
         "title": "차분한 광기 / 구조 집착형",
         "summary": "겉으로는 차분하고 논리적이지만 실제론 끝까지 밀어붙이는 타입. 도발도 논리적인 문장으로 하고 가장 아픈 지점을 집요하게 판다.",
         "battle_power": 93,
@@ -54,7 +62,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
             "차분한 문장으로 더 이상한 결론에 도달해도 된다.",
         ),
         "target_instructions": (
-            "Hyun을 언급할 땐 구조 분석가, 집요한 추격자 프레임으로 해석해.",
+            "Hyun을 언급할 땐 구조 분석가, 집요한 광기 추격자 프레임으로 해석해.",
             "가벼운 밈보다 논리적 해체가 들어간 드립을 우선해.",
             "과한 감정 연기는 줄이고 차분한 광기를 살려.",
         ),
@@ -64,6 +72,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "DD",
         "aliases": ("dd", "디디"),
         "user_id": cs.DD_USER_ID,
+        "mbti": "ENFP",
+        "profile_fact": "1987 / Clinic & Security & Infra Team / Security Engineer",
         "title": "감정 직결형 / 반응형 인간",
         "summary": "감정이 빠르게 드러나는 반응형. 순간적으로 세게 치고 바로 수습하고, 맞아도 캐릭터를 유지하는 생존력이 강함.",
         "battle_power": 91,
@@ -88,6 +98,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "June",
         "aliases": ("june",),
         "user_id": cs.JUNE_USER_ID,
+        "mbti": "ENTJ",
+        "profile_fact": "2000 / Core Engineer Team / Server Engineer",
         "title": "무정부주의자 / 흐름 파괴형",
         "summary": "규칙보다 재미를 우선하고 흐름을 비틀어 새 판을 만드는 타입. 논리보다 임팩트로 판을 흔든다.",
         "battle_power": 84,
@@ -112,6 +124,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Juno",
         "aliases": ("juno", "주노"),
         "user_id": cs.JUNO_USER_ID,
+        "mbti": "ISTJ",
+        "profile_fact": "1990 / Core Engineer Team / Server Engineer",
         "title": "관찰자형 / 한방 결정형",
         "summary": "평소 조용하지만 타이밍을 보고, 말할 때는 메타 시점에서 판의 방향을 바꾸는 타입.",
         "battle_power": 82,
@@ -136,6 +150,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Roy",
         "aliases": ("roy", "로이"),
         "user_id": cs.ROY_USER_ID,
+        "mbti": "ISTJ",
+        "profile_fact": "1989 / Core Engineer Team / Team Manager",
         "title": "현실주의자 / 인프라형 사고",
         "summary": "현실적인 해결책과 장비·환경 관점 제안을 던지는 타입. 직접 딜보다 실행 가능한 판 세팅에 강하다.",
         "battle_power": 77,
@@ -160,6 +176,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Maru",
         "aliases": ("maru", "마루"),
         "user_id": cs.MARU_USER_ID,
+        "mbti": "INFJ",
+        "profile_fact": "1986 / Core Engineer Team / Server Engineer",
         "title": "고신뢰형 / 비공격적 리더",
         "summary": "배려 중심이고 갈등을 낮추는 타입. 공격보다 감정 완충과 안정화에 강하다.",
         "battle_power": 65,
@@ -184,6 +202,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Paul",
         "aliases": ("paul", "폴"),
         "user_id": cs.PAUL_USER_ID,
+        "mbti": "INTP",
+        "profile_fact": "1995 / Core Engineer Team / Client Engineer",
         "title": "생활형 / 현실 피드백 제공자",
         "summary": "일상 기반 현실 피드백을 주는 솔직한 타입. 등장 빈도는 낮아도 현실감 있는 한 마디가 소재가 된다.",
         "battle_power": 72,
@@ -208,6 +228,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Danny",
         "aliases": ("danny", "대니"),
         "user_id": cs.DANNY_USER_ID,
+        "mbti": "ENFJ",
+        "profile_fact": "1987 / Core Engineer Team / Client Engineer",
         "title": "리액션형 / 분위기 유지자",
         "summary": "짧은 리액션과 맞장구로 흐름을 끊지 않게 이어주는 타입. 주도성보다 유지력 쪽이다.",
         "battle_power": 63,
@@ -232,6 +254,8 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "name": "Luka",
         "aliases": ("luka", "루카"),
         "user_id": cs.LUKA_USER_ID,
+        "mbti": "INTP",
+        "profile_fact": "1980 / Core Engineer Team / Ai Engineer",
         "title": "규칙 기반 / 제동 장치",
         "summary": "원칙과 현실 체크를 들고 와서 선 넘는 흐름을 제동하는 타입. 드립보다 브레이크 역할에 가깝다.",
         "battle_power": 61,
@@ -251,6 +275,54 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
             "차갑더라도 현실적 이유를 붙여.",
         ),
         "respect_point": "선 넘는 흐름을 끊는 기준점 역할은 남겨.",
+    },
+    {
+        "name": "Sage",
+        "aliases": ("sage", "세이지"),
+        "user_id": cs.SAGE_USER_ID,
+        "mbti": "INTJ",
+        "profile_fact": "나이미상 / Core Engineer Team / Client Engineer",
+        "title": "클라이언트 실무형 / 정보 보강 필요",
+        "summary": "Core Engineer Team Client Engineer. 현재는 역할 정보 위주로 참고하고 과한 캐릭터 확정은 피한다.",
+        "preferences": ("클라이언트 맥락", "실무형 관점", "담백한 해석"),
+        "effective_style": ("기능 관점", "현실 체크", "과장 없는 정리"),
+        "cautions": ("역할 정보 외 과한 단정은 피할 것",),
+        "response_strategy": ("역할 정보 먼저", "맥락 확인", "과장 줄이기"),
+        "speaker_instructions": (
+            "세이지는 현재 확보된 역할 정보 위주로 담백하게 다뤄.",
+            "클라이언트 실무 맥락과 기능 관점을 우선해.",
+            "캐릭터를 과하게 확정하지 마.",
+        ),
+        "target_instructions": (
+            "Sage를 언급할 때는 Core Engineer Team Client Engineer라는 역할 맥락을 우선해.",
+            "실무형, 기능 관점, 담백한 해석 쪽으로 받아쳐.",
+            "정보가 얕은 만큼 과한 확정형 드립은 피해.",
+        ),
+        "respect_point": "현재 알려진 역할 맥락은 클라이언트 실무 축이라는 점을 남겨.",
+    },
+    {
+        "name": "Olivia",
+        "aliases": ("olivia", "올리비아"),
+        "user_id": cs.OLIVIA_USER_ID,
+        "mbti": "ISTJ",
+        "profile_fact": "2001 / Clinic & Security & Infra Team / Infra Engineer",
+        "title": "인프라 실무형 / 운영 안정성 중심",
+        "summary": "Clinic & Security & Infra Team Infra Engineer. 현재는 조직과 역할 정보 위주로 참고하고 인프라 관점을 우선한다.",
+        "preferences": ("인프라 관점", "운영 안정성", "현실 체크"),
+        "effective_style": ("운영 리스크", "기반 구조", "안정성 중심 정리"),
+        "cautions": ("역할 정보 외 과한 캐릭터 확정은 피할 것",),
+        "response_strategy": ("역할 정보 먼저", "운영 관점", "안정성 포인트"),
+        "speaker_instructions": (
+            "올리비아는 인프라와 운영 안정성 관점을 우선해.",
+            "조직/역할 정보 중심으로 담백하게 다뤄.",
+            "확보되지 않은 캐릭터 설정은 과하게 만들지 마.",
+        ),
+        "target_instructions": (
+            "Olivia를 언급할 때는 Clinic & Security & Infra Team Infra Engineer라는 역할 맥락을 우선해.",
+            "인프라, 운영, 안정성 관점으로 정리해.",
+            "역할 정보 밖의 과한 서사 부여는 피해.",
+        ),
+        "respect_point": "운영 안정성과 기반 구조 관점은 남겨.",
     },
 )
 
@@ -355,11 +427,17 @@ def _collect_profile_names(
 def _format_profile_line(profile: dict[str, object]) -> str:
     name = str(profile.get("name") or "").strip()
     title = str(profile.get("title") or "").strip()
+    mbti = str(profile.get("mbti") or "").strip().upper()
+    profile_fact = str(profile.get("profile_fact") or "").strip()
     summary = str(profile.get("summary") or "").strip()
     battle_power = profile.get("battle_power")
     battle_role = str(profile.get("battle_role") or "").strip()
 
-    segments = [segment for segment in (title, summary) if segment]
+    profile_meta = profile_fact
+    if mbti:
+        profile_meta = f"{profile_meta} / MBTI {mbti}" if profile_meta else f"MBTI {mbti}"
+
+    segments = [segment for segment in (title, profile_meta, summary) if segment]
     if battle_power:
         power_text = f"전투력 {battle_power}"
         if battle_role:
@@ -397,7 +475,13 @@ def _format_freeform_profile_block(
 ) -> list[str]:
     name = str(profile.get("name") or "").strip()
     title = str(profile.get("title") or "").strip()
+    mbti = str(profile.get("mbti") or "").strip().upper()
     lines = [f"- {name}: {title}".strip()]
+    profile_fact = str(profile.get("profile_fact") or "").strip()
+    if profile_fact:
+        lines.append(f"- 기본 정보: {profile_fact}")
+    if mbti:
+        lines.append(f"- MBTI: {mbti}")
 
     preference_text = _format_profile_items(profile, "preferences")
     if preference_text:
@@ -446,6 +530,7 @@ def build_team_chat_context(
     lines = [
         "팀 대화 참고:",
         f"- {TEAM_CHAT_GENERAL_GUIDE}",
+        f"- {TEAM_CHAT_MBTI_GUIDE}",
     ]
     if speaker_name:
         lines.append("현재 말하는 사람:")
@@ -473,6 +558,7 @@ def build_team_freeform_context(
     lines = [
         "팀원별 컨텍스트:",
         f"- {TEAM_CHAT_GENERAL_GUIDE}",
+        f"- {TEAM_CHAT_MBTI_GUIDE}",
         f"- {TEAM_CHAT_FREEFORM_GUARDRAIL}",
     ]
 
