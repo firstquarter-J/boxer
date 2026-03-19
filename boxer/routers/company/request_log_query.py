@@ -311,6 +311,7 @@ def _format_request_log_recent(result: dict[str, Any], spec: RequestLogQuerySpec
             f"{index}. `{_time_label(row.get('createdAtLocal'))}`"
             f" | `{_user_label(row)}`"
             f" | `{_route_label(row)}`"
+            f" | `{_handler_type_label(row.get('handlerType'))}`"
             f" | `{_status_label(row.get('status'))}`"
         )
         if permalink:
@@ -394,6 +395,10 @@ def _status_label(value: Any) -> str:
     if text == "error":
         return "error"
     return text
+
+
+def _handler_type_label(value: Any) -> str:
+    return str(value or "").strip() or "unknown"
 
 
 def _compact_request_text(row: dict[str, Any]) -> str:

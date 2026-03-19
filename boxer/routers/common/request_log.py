@@ -29,6 +29,7 @@ _REQUEST_LOG_SCHEMA_STATEMENTS = (
         eventType TEXT NOT NULL,
         routeName TEXT NOT NULL,
         routeMode TEXT,
+        handlerType TEXT NOT NULL DEFAULT 'unknown',
         status TEXT NOT NULL,
         userId TEXT NOT NULL,
         userName TEXT,
@@ -84,6 +85,7 @@ INSERT INTO {_REQUEST_LOG_TABLE_NAME} (
     eventType,
     routeName,
     routeMode,
+    handlerType,
     status,
     userId,
     userName,
@@ -113,6 +115,7 @@ INSERT INTO {_REQUEST_LOG_TABLE_NAME} (
     :eventType,
     :routeName,
     :routeMode,
+    :handlerType,
     :status,
     :userId,
     :userName,
@@ -140,6 +143,10 @@ ON CONFLICT(sourcePlatform, channelId, messageId) DO UPDATE SET
         ELSE excluded.routeName
     END,
     routeMode = COALESCE(excluded.routeMode, {_REQUEST_LOG_TABLE_NAME}.routeMode),
+    handlerType = CASE
+        WHEN excluded.handlerType = 'unknown' THEN {_REQUEST_LOG_TABLE_NAME}.handlerType
+        ELSE excluded.handlerType
+    END,
     status = excluded.status,
     userName = COALESCE(excluded.userName, {_REQUEST_LOG_TABLE_NAME}.userName),
     permalink = COALESCE(excluded.permalink, {_REQUEST_LOG_TABLE_NAME}.permalink),
@@ -173,6 +180,7 @@ class RequestLogRecord(TypedDict, total=False):
     eventType: str
     routeName: str
     routeMode: str | None
+    handlerType: str
     status: str
     userId: str
     userName: str | None
@@ -290,6 +298,7 @@ def _normalize_request_log_record(record: RequestLogRecord) -> dict[str, Any]:
         "eventType": str(record.get("eventType") or "message").strip() or "message",
         "routeName": route_name,
         "routeMode": str(record.get("routeMode") or "").strip() or None,
+        "handlerType": str(record.get("handlerType") or "unknown").strip() or "unknown",
         "status": status,
         "userId": user_id,
         "userName": user_name,
@@ -343,6 +352,13 @@ def _ensure_request_log_columns(connection) -> None:
         connection.execute(
             f"ALTER TABLE {_REQUEST_LOG_TABLE_NAME} ADD COLUMN userName TEXT"
         )
+    if "handlerType" not in columns:
+        connection.execute(
+            f"""
+            ALTER TABLE {_REQUEST_LOG_TABLE_NAME}
+            ADD COLUMN handlerType TEXT NOT NULL DEFAULT 'unknown'
+            """
+        )
 
 
 def _ensure_request_log_schema(
@@ -372,7 +388,7 @@ def _save_request_log_record(
         cursor = connection.execute(_REQUEST_LOG_UPSERT_SQL, normalized_record)
         row = connection.execute(
             f"""
-            SELECT seq, createdAtUtc, routeName, status, replyCount, userName
+            SELECT seq, createdAtUtc, routeName, handlerType, status, replyCount, userName
             FROM {_REQUEST_LOG_TABLE_NAME}
             WHERE sourcePlatform = :sourcePlatform
               AND channelId = :channelId
@@ -389,9 +405,10 @@ def _save_request_log_record(
         "seq": row[0] if row else None,
         "createdAtUtc": row[1] if row else None,
         "routeName": row[2] if row else normalized_record["routeName"],
-        "status": row[3] if row else normalized_record["status"],
-        "replyCount": row[4] if row else normalized_record["replyCount"],
-        "userName": row[5] if row else normalized_record["userName"],
+        "handlerType": row[3] if row else normalized_record["handlerType"],
+        "status": row[4] if row else normalized_record["status"],
+        "replyCount": row[5] if row else normalized_record["replyCount"],
+        "userName": row[6] if row else normalized_record["userName"],
 }
 
 
@@ -512,6 +529,7 @@ def _list_request_log_recent(
             userName,
             routeName,
             routeMode,
+            handlerType,
             status,
             requestText,
             normalizedQuestion,

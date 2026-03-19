@@ -17,6 +17,7 @@ _SLACK_USER_NAME_CACHE: dict[tuple[str, str], str | None] = {}
 class SlackRequestLogContext(TypedDict, total=False):
     route_name: str
     route_mode: str | None
+    handler_type: str
     status: str
     user_name: str | None
     request_key: str | None
@@ -94,6 +95,7 @@ def _set_request_log_route(
     route_name: str,
     *,
     route_mode: str | None = None,
+    handler_type: str | None = None,
     status: str | None = None,
     request_key: str | None = None,
     subject_type: str | None = None,
@@ -107,6 +109,9 @@ def _set_request_log_route(
     normalized_route_mode = str(route_mode or "").strip()
     if normalized_route_mode:
         context["route_mode"] = normalized_route_mode
+    normalized_handler_type = str(handler_type or "").strip()
+    if normalized_handler_type:
+        context["handler_type"] = normalized_handler_type
     normalized_status = str(status or "").strip()
     if normalized_status:
         context["status"] = normalized_status
@@ -295,6 +300,10 @@ def _persist_request_log(
                 "eventType": event_type,
                 "routeName": str(context.get("route_name") or event_type).strip() or event_type,
                 "routeMode": str(context.get("route_mode") or "").strip() or None,
+                "handlerType": (
+                    str(context.get("handler_type") or "").strip()
+                    or ("router" if event_type == "app_mention" else "message_event")
+                ),
                 "status": str(context.get("status") or "handled").strip() or "handled",
                 "userId": user_id,
                 "userName": user_name,
@@ -376,6 +385,7 @@ def create_slack_app(
             "thread_ts": thread_ts or "",
             "request_log": {
                 "route_name": "app_mention",
+                "handler_type": "router",
                 "status": "handled",
             },
         }
@@ -461,6 +471,7 @@ def create_slack_app(
             "app_id": app_id,
             "request_log": {
                 "route_name": "message",
+                "handler_type": "message_event",
                 "status": "handled",
             },
         }

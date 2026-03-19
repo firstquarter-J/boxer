@@ -1445,6 +1445,7 @@ def create_app() -> App:
             *,
             max_tokens: int | None = None,
         ) -> None:
+            _set_request_log_route(payload, route_name, handler_type="router")
             notion_playbooks = _attach_notion_playbooks_to_evidence(evidence_payload)
             evidence_route = str(evidence_payload.get("route") or "").strip().lower()
             company_notion_docs: list[dict[str, str]] = []
@@ -3279,6 +3280,7 @@ def create_app() -> App:
             is_notion_doc_question = _looks_like_notion_doc_followup(question, notion_thread_context)
 
         if is_notion_doc_question:
+            _set_request_log_route(payload, "notion playbook qa", handler_type="router")
             try:
                 if _is_notion_doc_exfiltration_attempt(question, notion_thread_context):
                     logger.warning(
@@ -3344,6 +3346,12 @@ def create_app() -> App:
                 return
 
         if s.LLM_PROVIDER == "claude" and claude_client:
+            _set_request_log_route(
+                payload,
+                "llm_freeform",
+                route_mode="claude",
+                handler_type="llm_freeform",
+            )
             if not question:
                 reply("질문 내용을 같이 보내줘. 지원 기능이 궁금하면 `사용법`이라고 보내줘")
                 return
@@ -3425,6 +3433,12 @@ def create_app() -> App:
             return
 
         if s.LLM_PROVIDER == "ollama":
+            _set_request_log_route(
+                payload,
+                "llm_freeform",
+                route_mode="ollama",
+                handler_type="llm_freeform",
+            )
             if not question:
                 reply("질문 내용을 같이 보내줘. 지원 기능이 궁금하면 `사용법`이라고 보내줘")
                 return
