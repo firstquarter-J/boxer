@@ -48,4 +48,4 @@ boxer-slack = "boxer_adapter_slack.runtime:main"
 py-modules = ["app"]
 
 [tool.setuptools.packages.find]
-include = ["boxer*", "boxer_adapter_slack*"]
+include = ["boxer*", "boxer_adapter_slack*", "boxer_company_adapter_slack*"]

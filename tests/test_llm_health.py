@@ -3,7 +3,7 @@ import unittest
 import pymysql
 from botocore.exceptions import ClientError
 
-from boxer_adapter_slack.company import _build_dependency_failure_reply, _format_ping_llm_status
+from boxer_company_adapter_slack.company import _build_dependency_failure_reply, _format_ping_llm_status
 from boxer.core.llm import _check_claude_health
 
 

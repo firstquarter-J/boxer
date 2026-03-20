@@ -7,8 +7,6 @@ from boxer_adapter_slack import settings as ss
 
 LEGACY_ENTRYPOINT_ALIASES = {
     "boxer.adapters.common.slack": "boxer_adapter_slack.common",
-    "boxer.adapters.company.fun": "boxer_adapter_slack.fun",
-    "boxer.adapters.company.slack": "boxer_adapter_slack.company",
     "boxer.adapters.factory": "boxer_adapter_slack.factory",
     "boxer.adapters.sample.slack": "boxer_adapter_slack.sample",
     # Old alias wrapper defaulted to the sample adapter when self-pointing.

@@ -15,7 +15,7 @@ from boxer_adapter_slack.common import (
     _set_request_log_route,
     create_slack_app,
 )
-from boxer_adapter_slack.fun import handle_fun_message
+from boxer_company_adapter_slack.fun import handle_fun_message
 from boxer.company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,

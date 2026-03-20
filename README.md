@@ -42,7 +42,8 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 현재 저장소는 모노레포 구조로 아래 모듈을 함께 둔다.
 
 - `boxer/`: 채널 중립 RAG core
-- `boxer_adapter_slack/`: Slack 채널 adapter
+- `boxer_adapter_slack/`: 공개용 Slack 채널 adapter
+- `boxer_company_adapter_slack/`: 회사 전용 Slack adapter 조립부
 - `boxer_adapter_web/`: 웹 API / BFF adapter 자리
 - `widget/`: 브라우저 채팅 UI 자리
 
@@ -76,8 +77,10 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 
 - `boxer/company`
 - `boxer/routers/company`
+- `boxer_company_adapter_slack`
 
 도메인 규칙, 권한 정책, prompt, 구체적인 라우터와 connector 조합을 둔다.
+회사 전용 Slack app 조립은 공개 `boxer_adapter_slack` 안이 아니라 별도 company adapter에 둔다.
 
 이 저장소의 기본 경계 원칙은 단순하다.
 
@@ -129,6 +132,7 @@ Slack / Web Widget / Other Channel
 boxer/
   boxer/
   boxer_adapter_slack/
+  boxer_company_adapter_slack/
   boxer_adapter_web/
   widget/
   examples/
@@ -138,7 +142,8 @@ boxer/
 모듈 역할:
 
 - `boxer/`: 채널 중립 RAG core
-- `boxer_adapter_slack/`: Slack 런타임과 Slack reference adapter
+- `boxer_adapter_slack/`: 공개용 Slack 런타임과 Slack reference adapter
+- `boxer_company_adapter_slack/`: 회사 전용 Slack adapter 조립부
 - `boxer_adapter_web/`: 위젯이나 웹 클라이언트가 붙는 API / BFF
 - `widget/`: 브라우저 채팅 UI
 
