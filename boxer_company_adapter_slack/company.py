@@ -20,7 +20,7 @@ from boxer.company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
 )
-from boxer.company.team_chat_context import build_team_freeform_context
+from boxer.company.team_chat_context import TEAM_MEMBER_PROFILES, build_team_freeform_context
 from boxer.company.notion_links import select_company_notion_doc_links
 from boxer.company.notion_playbooks import _select_notion_references
 from boxer.company.retrieval_rules import (
@@ -211,6 +211,83 @@ _NOTION_DOC_FOLLOWUP_TOKENS = (
     "그거",
     "말고",
     "추가로",
+)
+_NOTION_DOC_OPERATION_FOLLOWUP_TOKENS = (
+    "왜",
+    "원인",
+    "이유",
+    "어떻게",
+    "어떻게 해",
+    "어떻게 해야",
+    "확인",
+    "재부팅",
+    "재시작",
+    "동기화",
+    "설정",
+    "조치",
+    "해결",
+    "방법",
+    "맞아",
+    "맞아?",
+    "맞나요",
+    "어디",
+)
+_FREEFORM_SMALL_TALK_TOKENS = (
+    "안녕",
+    "반가",
+    "하이",
+    "hello",
+    "hi",
+    "hey",
+    "굿모닝",
+    "굿나잇",
+    "잘자",
+    "잘 자",
+)
+_FREEFORM_IDENTITY_TOKENS = (
+    "넌누구",
+    "너누구",
+    "너는누구",
+    "누구야",
+    "정체",
+    "자기소개",
+    "넌나야",
+    "너는나야",
+    "너도나야",
+)
+_TEAM_MEMBER_ALIAS_TOKENS = tuple(
+    sorted(
+        {
+            str(alias or "").strip().lower()
+            for profile in TEAM_MEMBER_PROFILES
+            for alias in (
+                *(profile.get("aliases") or ()),
+                profile.get("name"),
+            )
+            if str(alias or "").strip()
+        }
+    )
+)
+_FREEFORM_PROFILE_HINTS = (
+    "어떤 사람",
+    "어떤사람",
+    "누구야",
+    "누구 같",
+    "성격",
+    "스타일",
+    "캐릭터",
+    "타입",
+    "mbti",
+    "엠비티아이",
+    "전투력",
+    "상성",
+    "서열",
+    "누가 더 세",
+    "누가 더 쎄",
+    "누가 이겨",
+    "누가이겨",
+    "어때",
+    "어때?",
 )
 _NOTION_DOC_EXFILTRATION_PATTERNS = (
     re.compile(
@@ -413,17 +490,54 @@ def _thread_has_notion_doc_context(thread_context: str) -> bool:
     return _looks_like_notion_doc_question(text)
 
 
+def _looks_like_small_talk_question(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    collapsed = re.sub(r"[\s?!.,~]+", "", lowered)
+    if any(token in text for token in _FREEFORM_SMALL_TALK_TOKENS):
+        return True
+    return any(token in collapsed for token in _FREEFORM_IDENTITY_TOKENS)
+
+
+def _looks_like_team_freeform_question(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    collapsed = re.sub(r"[\s?!.,~]+", "", lowered)
+    has_member_alias = any(alias in lowered for alias in _TEAM_MEMBER_ALIAS_TOKENS)
+    has_profile_hint = any(token in lowered for token in _FREEFORM_PROFILE_HINTS) or any(
+        token in collapsed for token in _FREEFORM_PROFILE_HINTS
+    )
+
+    if has_member_alias and has_profile_hint:
+        return True
+    if any(token in lowered for token in _FREEFORM_COMPARISON_HINTS):
+        return True
+    return False
+
+
 def _looks_like_notion_doc_followup(question: str, thread_context: str) -> bool:
     text = (question or "").strip()
     if not text or not _thread_has_notion_doc_context(thread_context):
+        return False
+    if _looks_like_small_talk_question(text):
+        return False
+    if _looks_like_team_freeform_question(text):
         return False
 
     lowered = text.lower()
     if any(token in text for token in _NOTION_DOC_FOLLOWUP_TOKENS):
         return True
+    if any(token in text for token in _NOTION_DOC_OPERATION_FOLLOWUP_TOKENS):
+        return True
     if any(token in lowered for token in ("alternative", "workaround", "other way", "else")):
         return True
-    return len(text) <= 24
+    return False
 
 
 def _build_notion_doc_query_text(question: str, thread_context: str) -> str:
