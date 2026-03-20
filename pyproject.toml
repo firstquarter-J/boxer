@@ -41,7 +41,11 @@ company = [
 Repository = "https://github.com/firstquarter-J/boxer"
 
 [project.scripts]
+boxer = "app:main"
 boxer-slack = "boxer_adapter_slack.runtime:main"
+
+[tool.setuptools]
+py-modules = ["app"]
 
 [tool.setuptools.packages.find]
 include = ["boxer*", "boxer_adapter_slack*"]
