@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxer-adapter-slack"
+version = "0.1.0"
+description = "Public Slack adapter package for Boxer."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boxer>=0.1.0",
+  "slack-bolt==1.26.0",
+]
+
+[project.urls]
+Repository = "https://github.com/firstquarter-J/boxer"
+
+[project.scripts]
+boxer-slack = "boxer_adapter_slack.runtime:main"
+
+[tool.setuptools]
+packages = ["boxer_adapter_slack"]
+
+[tool.setuptools.package-dir]
+boxer_adapter_slack = "."

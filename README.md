@@ -5,156 +5,48 @@ Open-core framework for retrieval-grounded bots with domain-specific adapters.
 Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)` LLM bot을 목표로 하는 프로젝트다.
 질문을 받으면 승인된 데이터 소스(DB/S3/API/Notion)를 먼저 조회하고, 그 근거를 바탕으로 답변한다.
 
-중요한 점:
-
-- open core는 DB/S3/API/Notion helper와 synthesis pipeline을 제공한다
-- 어떤 질문을 어떤 source로 라우팅할지는 기본 내장 정책이 아니라 각 adapter가 결정한다
-
-## Who This Is For
-
-- Slack 기반 retrieval bot을 빠르게 만들고 싶은 사람
-- LLM이 직접 판단만 하게 두지 않고, 서버가 근거 조회를 통제하길 원하는 사람
-- 도메인별 정책 가드와 connector 조합을 직접 설계할 사람
-- open core 위에 자기 조직용 adapter를 붙이려는 팀
-
-## Not For
-
-- 설정 없이 바로 쓰는 완성형 SaaS chatbot을 원하는 경우
-- 모든 자연어 라우팅이 기본 내장된 제품을 기대하는 경우
-- 특정 도메인 규칙과 운영 정책이 이미 완성된 패키지를 찾는 경우
-- Slack 말고 다른 채널까지 즉시 turnkey로 붙어 있길 기대하는 경우
-
 핵심 원칙:
 
+- open core는 DB/S3/API/Notion helper와 synthesis pipeline을 제공한다
 - 추측보다 조회 결과
 - LLM fallback보다 라우터 우선
 - 서버가 실제 조회를 수행하고, LLM은 수집된 근거를 바탕으로만 문장화
 - 근거가 없으면 아는 척하지 않고 `없음`, `확인 필요`로 답변
+- 어떤 질문을 어떤 source로 라우팅할지는 각 adapter가 결정한다
 
 ## 이 저장소가 담고 있는 것
 
-- 재사용 가능한 open core
-- Slack 기반 reference adapter
-- Web adapter / widget 확장 자리
-- DB/S3/Notion/request log 같은 retrieval 경로
-- Ollama / Claude 기반 retrieval synthesis
-
-현재 저장소는 모노레포 구조로 아래 모듈을 함께 둔다.
-
 - `boxer/`: 채널 중립 RAG core
-- `boxer_adapter_slack/`: 공개용 Slack 채널 adapter
-- `boxer_company/`: 회사 도메인 패키지
-- `boxer_company_adapter_slack/`: 회사 전용 Slack adapter 조립부
-- `boxer_adapter_web/`: 웹 API / BFF adapter 자리
+- `boxer_adapter_slack/`: 공개 Slack reference adapter
+- `boxer_adapter_web/`: 웹 API / BFF 자리
 - `widget/`: 브라우저 채팅 UI 자리
 
-지향점은 누구나 open core를 가져다 쓰고, 도메인별 adapter만 바꿔서 자기 조직용 bot을 만들 수 있게 하는 거다.
-이 저장소 안에는 더 풍부한 reference adapter가 함께 있을 수 있지만, README는 open core 기준으로만 설명한다.
+핵심 공개 설치 단위는 현재 2개다.
 
-## Open Core 와 Adapter
-
-### Open Core
-
-- `boxer/core`
-- `boxer/routers/common`
-
-공통 설정, LLM 호출, request log, 저수준 DB/S3/Notion helper 같은 채널 중립 기반을 둔다.
-
-### Channel Adapter
-
+- `boxer`
 - `boxer_adapter_slack`
-- `boxer_adapter_web`
-- 필요하면 다른 채널 adapter
 
-채널별 이벤트 정규화, 인증, 응답 변환, 채널 런타임을 둔다.
-
-### Widget
-
-- `widget`
-
-브라우저에 심는 채팅 UI를 둔다. 이 모듈은 `boxer`를 직접 호출하지 않고, `boxer_adapter_web`과 통신한다.
-
-### Domain-Specific Logic
-
-- `boxer_company`
-- `boxer_company_adapter_slack`
-
-도메인 규칙, 권한 정책, prompt, 구체적인 라우터와 connector 조합을 둔다.
-회사 전용 Slack app 조립은 공개 `boxer_adapter_slack` 안이 아니라 별도 company adapter에 둔다.
-
-이 저장소의 기본 경계 원칙은 단순하다.
-
-- open core에는 조직 고유 규칙을 넣지 않는다
-- domain-specific 정책과 도메인 로직은 adapter/domain 모듈에만 둔다
-
-## Core vs Adapter Feature Matrix
-
-| 영역 | Open Core | Domain-Specific Adapter |
-| --- | --- | --- |
-| 채널 이벤트 정규화 | 제공하지 않음 | 구현 |
-| reply wrapper | 제공하지 않음 | 구현 |
-| request log 저장 | 제공 | 어떤 요청을 어떻게 기록할지 결정 |
-| DB/S3/Notion 저수준 helper | 제공 | 어떤 helper를 어떤 질문에 연결할지 결정 |
-| 질문 라우팅 | 제공하지 않음 | 구현 |
-| 정책 가드 | 제공하지 않음 | 구현 |
-| 권한 규칙 | 제공하지 않음 | 구현 |
-| prompt / 답변 스타일 | 기본값만 제공 | 필요시 재정의 |
-| source 조합 전략 | 제공하지 않음 | 구현 |
-| 도메인 명령어 / 자연어 패턴 | 제공하지 않음 | 구현 |
-
-## 요청 처리 흐름
-
-1. 채널 adapter가 이벤트와 질문을 정규화한다
-2. 라우터와 정책 가드가 직접 처리 가능한 질문을 먼저 잡는다
-3. 승인된 DB/S3/API/Notion 조회만 서버가 실행한다
-4. 수집된 근거를 합치고 필요하면 LLM이 근거 기반으로 최종 문장을 만든다
-5. 응답과 요청 메타데이터를 남긴다
-
-즉, `LLM이 임의로 조회를 상상하는 구조`가 아니라 `서버가 먼저 근거를 확보하고 LLM은 그 근거를 바탕으로만 답하는 구조`다.
-
-이때 open core가 기본적으로 하는 일은 `도구를 제공하는 것`이지 `질문을 특정 source로 자동 라우팅하는 것`이 아니다.
-DB/S3/API/Notion을 어떤 질문에 노출할지, 어떤 정책 가드로 감쌀지는 adapter가 정한다.
-
-## 짧은 구조도
-
-```text
-Slack / Web Widget / Other Channel
-  -> Channel Adapter
-  -> Policy Guard
-  -> Retrieval Helpers
-  -> Evidence + Synthesis
-  -> Reply
-```
+`boxer_adapter_web`, `widget`은 공개 확장 자리만 잡혀 있고 아직 설치 단위는 아니다.
 
 ## Monorepo Layout
 
 ```text
 boxer/
+  pyproject.toml
   boxer/
   boxer_adapter_slack/
-  boxer_company/
-  boxer_company_adapter_slack/
+    pyproject.toml
   boxer_adapter_web/
   widget/
   examples/
   tests/
 ```
 
-모듈 역할:
+경계 원칙:
 
-- `boxer/`: 채널 중립 RAG core
-- `boxer_adapter_slack/`: 공개용 Slack 런타임과 Slack reference adapter
-- `boxer_company/`: 회사 도메인 패키지
-- `boxer_company_adapter_slack/`: 회사 전용 Slack adapter 조립부
-- `boxer_adapter_web/`: 위젯이나 웹 클라이언트가 붙는 API / BFF
-- `widget/`: 브라우저 채팅 UI
-
-## Why RGA Instead Of Plain Chat Bot
-
-- 서버가 먼저 근거를 조회하므로, LLM이 조회 사실을 상상하는 문제를 줄일 수 있다
-- adapter가 정책 가드를 두기 쉬워서 민감 질문, 권한, 허용 source를 강제하기 쉽다
-- 어떤 source를 언제 썼는지 request log와 evidence 단위로 추적하기 쉽다
-- 단순 채팅보다 운영 질의응답, 내부 도구형 bot, audit 가능한 assistant에 더 잘 맞는다
+- open core에는 조직 고유 규칙을 넣지 않는다
+- 질문 라우팅, 정책 가드, 권한 규칙은 adapter/domain 패키지에 둔다
+- 공개 패키지는 다른 adapter가 `import`해서 확장할 수 있어야 한다
 
 ## 환경 파일
 
@@ -175,7 +67,8 @@ boxer/
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[slack]"
+pip install -e .
+pip install -e ./boxer_adapter_slack
 cp .env.example .env
 ```
 
@@ -201,7 +94,7 @@ scripts/smoke_sample_adapter.sh
 boxer-slack
 ```
 
-`smoke_sample_adapter.sh`는 `BOXER_SKIP_DOTENV=true`로 실행돼서, 로컬 `.env`에 회사용 설정이 있어도 샘플 팩토리 확인만 안정적으로 수행한다.
+`smoke_sample_adapter.sh`는 `BOXER_SKIP_DOTENV=true`로 실행돼서, 로컬 `.env`에 다른 설정이 있어도 샘플 팩토리 확인만 안정적으로 수행한다.
 
 예시:
 
@@ -291,15 +184,31 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 지금 단계에서는 폴더와 문서 경계만 잡아두고, 실제 구현은 이후 단계에서 진행한다.
 
-## Requirements Files
+## Packaging And Install
 
-- 기본 설치: `pip install -e .`
-- Slack reference adapter까지 필요할 때: `pip install -e ".[slack]"`
-- company/reference adapter 확장까지 필요할 때: `pip install -e ".[company]"`
-- `requirements-open-core.txt`: requirements 기반 설치가 필요할 때의 open core 목록
-- `requirements-slack.txt`: Slack reference adapter까지 포함한 requirements 목록
-- `requirements-company.txt`: company/reference adapter 확장까지 포함한 requirements 목록
-- `requirements.txt`: 공개 기본 설치용 alias (`requirements-open-core.txt` 포함)
+공개 패키지 의존성 기준은 각 설치 단위의 `pyproject.toml`이다.
+
+- 루트 `pyproject.toml`: `boxer`
+- `boxer_adapter_slack/pyproject.toml`: `boxer-adapter-slack`
+
+설치 예시:
+
+- open core만 필요할 때:
+  ```bash
+  pip install -e .
+  ```
+- 공개 Slack reference adapter까지 필요할 때:
+  ```bash
+  pip install -e .
+  pip install -e ./boxer_adapter_slack
+  ```
+
+도메인 전용 adapter나 private package는 이 공개 패키지들 위에 별도로 얹는 구조를 권장한다.
+
+빌드 경계:
+
+- 루트 `pyproject.toml`은 `boxer`만 포함한다
+- 공개 Slack adapter는 `boxer_adapter_slack/pyproject.toml`에서 따로 빌드한다
 
 ## 검증 스크립트
 

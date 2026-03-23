@@ -1,3 +1,0 @@
--r requirements-slack.txt
-paramiko==3.5.1
-requests==2.32.3

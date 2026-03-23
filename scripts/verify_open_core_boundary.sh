@@ -25,7 +25,7 @@ check_absent \
 
 check_absent \
   "company imports absent from reusable core/sample/example code" \
-  "boxer\\.company|adapters\\.company|routers\\.company" \
+  "boxer_company|boxer_company_adapter_slack|boxer\\.company|adapters\\.company|routers\\.company" \
   boxer/core boxer/routers/common boxer_adapter_slack/common.py boxer_adapter_slack/sample.py examples
 
 check_absent \
@@ -35,7 +35,7 @@ check_absent \
 
 check_absent \
   "company-only scripts absent from public scripts" \
-  "boxer\\.company|adapters\\.company|routers\\.company|마미박스|베이비매직" \
+  "boxer_company|boxer_company_adapter_slack|boxer\\.company|adapters\\.company|routers\\.company|마미박스|베이비매직" \
   scripts/smoke_sample_adapter.sh
 
 check_absent \

@@ -27,34 +27,11 @@ dependencies = [
   "boto3==1.34.162",
 ]
 
-[project.optional-dependencies]
-slack = [
-  "slack-bolt==1.26.0",
-]
-company = [
-  "slack-bolt==1.26.0",
-  "paramiko==3.5.1",
-  "requests==2.32.3",
-]
-
 [project.urls]
 Repository = "https://github.com/firstquarter-J/boxer"
-
-[project.scripts]
-boxer = "app:main"
-boxer-slack = "boxer_adapter_slack.runtime:main"
-
-[tool.setuptools]
-py-modules = ["app"]
 
 [tool.setuptools.packages.find]
 include = [
   "boxer",
   "boxer.*",
-  "boxer_adapter_slack",
-  "boxer_adapter_slack.*",
-  "boxer_company",
-  "boxer_company.*",
-  "boxer_company_adapter_slack",
-  "boxer_company_adapter_slack.*",
 ]

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxer-company"
+version = "0.1.0"
+description = "Company-specific domain package for Boxer."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boxer>=0.1.0",
+  "paramiko==3.5.1",
+  "requests==2.32.3",
+]
+
+[project.urls]
+Repository = "https://github.com/firstquarter-J/boxer"
+
+[tool.setuptools]
+packages = ["boxer_company", "boxer_company.routers"]
+
+[tool.setuptools.package-dir]
+boxer_company = "."
+"boxer_company.routers" = "routers"

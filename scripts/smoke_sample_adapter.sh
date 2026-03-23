@@ -19,7 +19,7 @@ export REQUEST_LOG_SQLITE_S3_RESTORE_ON_STARTUP="${REQUEST_LOG_SQLITE_S3_RESTORE
 export REQUEST_LOG_SQLITE_S3_BACKUP_ENABLED="${REQUEST_LOG_SQLITE_S3_BACKUP_ENABLED:-false}"
 
 if ! "${PYTHON_BIN}" -c "import slack_bolt" >/dev/null 2>&1; then
-  echo "[fail] slack_bolt import 불가. .venv 생성 후 pip install -e \".[slack]\" 또는 requirements-slack 설치가 필요해" >&2
+  echo "[fail] slack_bolt import 불가. .venv 생성 후 pip install -e . && pip install -e ./boxer_adapter_slack 또는 requirements-slack 설치가 필요해" >&2
   exit 1
 fi
 

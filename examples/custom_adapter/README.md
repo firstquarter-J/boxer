@@ -12,7 +12,8 @@
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[slack]"
+pip install -e .
+pip install -e ./boxer_adapter_slack
 cp .env.example .env
 export ADAPTER_ENTRYPOINT=examples.custom_adapter.adapters.slack:create_app
 boxer-slack
