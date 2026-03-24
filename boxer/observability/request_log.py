@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Any, TypedDict
 from zoneinfo import ZoneInfo
 
 from boxer.core import settings as s
-from boxer.routers.common.sqlite_store import (
+from boxer.observability.sqlite_store import (
     _backup_sqlite_to_s3,
     _connect_sqlite,
     _restore_sqlite_from_s3,
@@ -837,3 +838,18 @@ _restore_request_audit_from_s3 = _restore_request_log_from_s3
 _restore_request_audit_from_configured_s3 = _restore_request_log_from_configured_s3
 _run_request_audit_backup_job = _run_request_log_backup_job
 _initialize_request_audit_storage = _initialize_request_log_storage
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Backup request log SQLite snapshot to configured S3",
+    )
+    parser.parse_args()
+
+    result = _run_request_log_backup_job()
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

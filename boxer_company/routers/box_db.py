@@ -13,7 +13,7 @@ except ImportError:  # pragma: no cover - runtime guard
 from boxer_company import settings as cs
 from boxer.core import settings as s
 from boxer.core.utils import _display_value, _format_datetime, _truncate_text
-from boxer.routers.common.db import _create_db_connection
+from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company.routers.mda_graphql import (
     _get_mda_devices_details,
     _is_mda_graphql_configured,

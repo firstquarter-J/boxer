@@ -3,7 +3,10 @@ import unittest
 from pathlib import Path
 
 from boxer_adapter_slack.common import _set_request_log_route
-from boxer.routers.common.request_log import _list_request_log_recent, _save_request_log_record
+from boxer.observability.request_log import (
+    _list_request_log_recent,
+    _save_request_log_record,
+)
 
 
 class RequestLogRouteSetterTests(unittest.TestCase):

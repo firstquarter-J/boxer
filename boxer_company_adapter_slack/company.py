@@ -15,6 +15,7 @@ from boxer_adapter_slack.common import (
     _set_request_log_route,
     create_slack_app,
 )
+from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer_company_adapter_slack.fun import handle_fun_message
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
@@ -29,11 +30,14 @@ from boxer_company.retrieval_rules import (
 )
 from boxer_company import settings as cs
 from boxer_company.utils import _extract_barcode
+from boxer.context.builder import _build_model_input
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_claude_health, _check_ollama_health
-from boxer.core.retrieval_synthesis import _synthesize_retrieval_answer
-from boxer.core.thread_context import _build_model_input, _load_thread_context
 from boxer.core.utils import _validate_tokens
+from boxer.retrieval.connectors.db import _query_db, _validate_readonly_sql
+from boxer.retrieval.connectors.notion import _is_notion_configured
+from boxer.retrieval.connectors.s3 import _build_s3_client
+from boxer.retrieval.synthesis import _synthesize_retrieval_answer
 from boxer_company.routers.app_user import _lookup_app_user_by_barcode, _should_lookup_barcode
 from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_phase1_window,
@@ -126,9 +130,6 @@ from boxer_company.routers.usage_help import (
     _build_usage_help_response,
     _is_usage_help_request,
 )
-from boxer.routers.common.db import _query_db, _validate_readonly_sql
-from boxer.routers.common.notion import _is_notion_configured
-from boxer.routers.common.s3 import _build_s3_client
 
 _NOTION_DOC_QUERY_TOKENS = (
     "마미박스",
@@ -1680,7 +1681,7 @@ def create_app() -> App:
             try:
                 thread_context = ""
                 if evidence_route == "notion_playbook_qa" or s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
-                    thread_context = _load_thread_context(
+                    thread_context = _load_slack_thread_context(
                         client,
                         logger,
                         channel_id,
@@ -2190,7 +2191,7 @@ def create_app() -> App:
             try:
                 thread_context = ""
                 if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
-                    thread_context = _load_thread_context(
+                    thread_context = _load_slack_thread_context(
                         client,
                         logger,
                         channel_id,
@@ -2392,7 +2393,7 @@ def create_app() -> App:
                 phase2_has_requested_date = True
 
         if has_phase2_scope and phase2_has_requested_date:
-            thread_context_for_scope = _load_thread_context(
+            thread_context_for_scope = _load_slack_thread_context(
                 client,
                 logger,
                 channel_id,
@@ -2755,7 +2756,7 @@ def create_app() -> App:
                     question=question,
                     summary_payload=log_analysis_payload,
                 )
-                failure_thread_context = thread_context_for_scope or _load_thread_context(
+                failure_thread_context = thread_context_for_scope or _load_slack_thread_context(
                     client,
                     logger,
                     channel_id,
@@ -3432,7 +3433,7 @@ def create_app() -> App:
         notion_thread_context = ""
         is_notion_doc_question = _looks_like_notion_doc_question(question)
         if not is_notion_doc_question and thread_ts:
-            notion_thread_context = _load_thread_context(
+            notion_thread_context = _load_slack_thread_context(
                 client,
                 logger,
                 channel_id,
@@ -3464,7 +3465,7 @@ def create_app() -> App:
                     },
                 }
                 if not notion_thread_context and thread_ts:
-                    notion_thread_context = _load_thread_context(
+                    notion_thread_context = _load_slack_thread_context(
                         client,
                         logger,
                         channel_id,
@@ -3522,7 +3523,7 @@ def create_app() -> App:
                 logger.info("Rejected claude call for user=%s", user_id)
                 return
             try:
-                thread_context = _load_thread_context(
+                thread_context = _load_slack_thread_context(
                     client,
                     logger,
                     channel_id,
@@ -3541,7 +3542,7 @@ def create_app() -> App:
                 if fallback_evidence is not None:
                     synthesis_thread_context = ""
                     if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
-                        synthesis_thread_context = _load_thread_context(
+                        synthesis_thread_context = _load_slack_thread_context(
                             client,
                             logger,
                             channel_id,
@@ -3605,7 +3606,7 @@ def create_app() -> App:
                 reply("질문 내용을 같이 보내줘. 지원 기능이 궁금하면 `사용법`이라고 보내줘")
                 return
             try:
-                thread_context = _load_thread_context(
+                thread_context = _load_slack_thread_context(
                     client,
                     logger,
                     channel_id,
@@ -3629,7 +3630,7 @@ def create_app() -> App:
                 if fallback_evidence is not None:
                     synthesis_thread_context = ""
                     if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
-                        synthesis_thread_context = _load_thread_context(
+                        synthesis_thread_context = _load_slack_thread_context(
                             client,
                             logger,
                             channel_id,

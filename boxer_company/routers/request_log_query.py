@@ -7,7 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from boxer.core import settings as s
-from boxer.routers.common.request_log import (
+from boxer.observability.request_log import (
     _list_request_log_recent,
     _summarize_request_log_by_route,
     _summarize_request_log_by_user,

@@ -7,7 +7,7 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 
 핵심 원칙:
 
-- open core는 DB/S3/API/Notion helper와 synthesis pipeline을 제공한다
+- open core는 retrieval connector와 synthesis pipeline을 제공한다
 - 추측보다 조회 결과
 - LLM fallback보다 라우터 우선
 - 서버가 실제 조회를 수행하고, LLM은 수집된 근거를 바탕으로만 문장화
@@ -34,6 +34,11 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 boxer/
   pyproject.toml
   boxer/
+    core/
+    context/
+    observability/
+    retrieval/
+      connectors/
   boxer_adapter_slack/
     pyproject.toml
   boxer_adapter_web/
@@ -47,6 +52,15 @@ boxer/
 - open core에는 조직 고유 규칙을 넣지 않는다
 - 질문 라우팅, 정책 가드, 권한 규칙은 adapter/domain 패키지에 둔다
 - 공개 패키지는 다른 adapter가 `import`해서 확장할 수 있어야 한다
+
+open core 내부 구조:
+
+- `boxer/core`: 설정, LLM, 공통 utils
+- `boxer/context`: entries / builder / windowing
+- `boxer/observability`: request log / audit / sqlite snapshot helper
+- `boxer/retrieval/connectors`: DB/S3/Notion connector
+- `boxer/retrieval/synthesis.py`: retrieval evidence masking / serialization / synthesis
+- `boxer_adapter_slack/context.py`: Slack thread/history loader
 
 ## 환경 파일
 
@@ -107,7 +121,8 @@ boxer-slack
 1. `boxer_adapter_slack.sample`를 시작점으로 삼는다
 2. 질문 파싱, 정책 가드, retrieval 라우터를 도메인 모듈에 둔다
 3. `ADAPTER_ENTRYPOINT=<your_module>:create_app` 으로 연결한다
-4. 공통으로 재사용 가능한 코드는 `boxer/core`, `boxer/routers/common`에만 올린다
+4. 공통으로 재사용 가능한 코드는 `boxer/core`, `boxer/context`, `boxer/observability`, `boxer/retrieval`에만 올린다
+5. 채널별 대화 문맥 수집은 각 adapter 패키지에서 처리한다
 
 최소 adapter contract는 단순하다.
 
@@ -167,6 +182,7 @@ ADAPTER_ENTRYPOINT=examples.custom_adapter.adapters.slack:create_app boxer-slack
 open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 - request log 저장
+- context builder / windowing
 - read-only DB 실행 helper
 - S3 client helper
 - Notion page/block 로더
@@ -228,8 +244,10 @@ scripts/verify_open_core_boundary.sh
 
 새 adapter를 추가할 때는 아래 체크리스트를 권장한다.
 
-- `boxer/core`, `boxer/routers/common`에 도메인 고유 규칙을 넣지 않는다
+- `boxer/core`, `boxer/context`, `boxer/observability`, `boxer/retrieval`에 도메인 고유 규칙을 넣지 않는다
+- `boxer/observability`에도 도메인 고유 규칙을 넣지 않는다
 - 질문 라우팅과 정책 가드는 adapter 쪽에 둔다
+- 채널별 history/thread fetch는 adapter 쪽에 둔다
 - connector 호출은 adapter가 명시적으로 선택한다
 - DB 조회는 read-only만 유지한다
 - 민감 정보가 필요한 질문은 adapter에서 명시적으로 차단하거나 마스킹한다

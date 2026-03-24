@@ -79,6 +79,22 @@ class PyprojectBoundaryTests(unittest.TestCase):
         ):
             self.assertFalse((PROJECT_ROOT / relative_path).exists(), relative_path)
 
+    def test_open_core_layout_uses_rag_named_directories(self) -> None:
+        self.assertTrue((PROJECT_ROOT / "boxer" / "core" / "settings.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer" / "context" / "entries.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer" / "context" / "builder.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer" / "context" / "windowing.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer" / "observability" / "request_log.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer" / "retrieval" / "synthesis.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer" / "retrieval" / "connectors" / "db.py").exists())
+        self.assertTrue((PROJECT_ROOT / "boxer_adapter_slack" / "context.py").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "routers" / "common").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "context" / "thread_context.py").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "context" / "models.py").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "retrieval" / "connectors" / "request_log.py").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "observability" / "request_log_backup.py").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "observability" / "request_audit_backup.py").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

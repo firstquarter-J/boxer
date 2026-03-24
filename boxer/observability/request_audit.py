@@ -1,4 +1,4 @@
-from boxer.routers.common.request_log import (
+from boxer.observability.request_log import (
     RequestAuditRecord,
     RequestLogRecord,
     _backup_request_audit_to_configured_s3,

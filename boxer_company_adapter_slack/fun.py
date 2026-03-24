@@ -9,6 +9,7 @@ from boxer_adapter_slack.common import (
     SlackMessageReplyFn,
     _set_request_log_skip_persist,
 )
+from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer_company import settings as cs
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
@@ -17,7 +18,6 @@ from boxer_company.prompt_security import (
 from boxer_company.team_chat_context import build_team_chat_context
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
-from boxer.core.thread_context import _load_thread_context
 
 ALLOWED_FUN_CHANNEL_ID = "C0621TL2HSB"
 FUN_OLLAMA_MODEL = "qwen2.5:1.5b"
@@ -636,7 +636,7 @@ def handle_fun_message(
     if "모대" not in raw_text:
         return
 
-    thread_context = _load_thread_context(
+    thread_context = _load_slack_thread_context(
         client,
         logger,
         payload["channel_id"],

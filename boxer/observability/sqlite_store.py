@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from boxer.core import settings as s
-from boxer.routers.common.s3 import _build_s3_client
+from boxer.retrieval.connectors.s3 import _build_s3_client
 
 
 def _resolve_sqlite_path(raw_path: str | Path) -> Path:

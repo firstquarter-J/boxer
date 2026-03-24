@@ -7,7 +7,7 @@ from slack_bolt import App
 from boxer.core import settings as s
 from boxer.core.utils import _extract_question, _format_reply_text, _validate_tokens
 from boxer_adapter_slack import settings as ss
-from boxer.routers.common.request_log import (
+from boxer.observability.request_log import (
     _initialize_request_log_storage,
     _save_request_log_record,
 )

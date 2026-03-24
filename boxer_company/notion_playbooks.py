@@ -3,7 +3,7 @@ import time
 from typing import Any
 
 from boxer.core import settings as s
-from boxer.routers.common.notion import (
+from boxer.retrieval.connectors.notion import (
     _extract_block_text,
     _fetch_all_notion_blocks,
     _is_notion_configured,

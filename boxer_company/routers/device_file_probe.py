@@ -38,7 +38,7 @@ from boxer_company.routers.barcode_log import (
 from boxer_company.routers.box_db import (
     _lookup_device_contexts_by_barcode,
 )
-from boxer.routers.common.s3 import _build_s3_client
+from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.routers.mda_graphql import (
     _open_mda_device_ssh,
     _get_mda_device_agent_ssh,
