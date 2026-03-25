@@ -732,6 +732,20 @@ def _needs_notion_doc_security_refusal(text: str, route_name: str) -> bool:
     return False
 
 
+_BABYMAGIC_DOC_TITLES = {"베이비매직 장애 안내", "베이비매직 CS 자동화"}
+_BABYMAGIC_SEND_HINT_TOKENS = (
+    "유저 번호",
+    "미매칭",
+    "재전송",
+    "앱으로 전송",
+    "앱 전송",
+)
+_BABYMAGIC_RETRY_ACTION = (
+    "유저가 앱에서 생성한 아이에 바코드를 등록했는지 먼저 확인하고, "
+    "그다음 MDA 베이비매직 관리에서 재전송을 시도해"
+)
+
+
 def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] | None) -> str:
     def _clean_preview_line(text: str) -> str:
         line = re.sub(r"^#+\s*", "", str(text or "").strip())
@@ -833,6 +847,13 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
     is_barcode_sync_doc = primary_title == "바코드 동기화: 분만 병원에서 핑크 바코드가 스캔되는 경우"
     is_firewall_doc = primary_title == "병원 방화벽으로 MDA/원격 접속이 안 될 때"
     normalized_question = (question or "").strip()
+    is_babymagic_send_issue = primary_title in _BABYMAGIC_DOC_TITLES and (
+        any(token in normalized_question for token in ("전송", "재전송", "이유", "원인", "왜", "안 된", "안된"))
+        or any(
+            any(token in fragment for token in _BABYMAGIC_SEND_HINT_TOKENS)
+            for fragment in preview_fragments
+        )
+    )
     is_reason_question = any(token in normalized_question for token in ("왜", "원인", "이유"))
     is_restart_question = any(token in normalized_question for token in ("재부팅", "재시작", "껐다", "켜야"))
     is_meaning_question = "cfg1_barcode_sync_date" in normalized_question or any(
@@ -890,6 +911,8 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         )
     if not action:
         action = "문서 기준 확인 필요"
+    if is_babymagic_send_issue:
+        action = _BABYMAGIC_RETRY_ACTION
 
     if is_barcode_sync_doc and not is_meaning_question:
         if is_restart_question:
@@ -931,6 +954,8 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
     if "핑크 바코드 동기화가 가능한 버전" in fallback_normalized and "핑크 바코드 동기화가 가능한 버전" not in normalized:
         return True
     if "cfg1_barcode_sync_date" in lowered and "cfg1_barcode_sync_date" not in fallback_lowered:
+        return True
+    if _BABYMAGIC_RETRY_ACTION in fallback_normalized and _BABYMAGIC_RETRY_ACTION not in normalized:
         return True
 
     required_bullets = (
