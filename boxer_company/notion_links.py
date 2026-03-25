@@ -97,6 +97,7 @@ _COMPANY_NOTION_DOCS: tuple[dict[str, Any], ...] = (
     {
         "title": "병원 방화벽으로 MDA/원격 접속이 안 될 때",
         "url": "https://www.notion.so/MDA-322cf826870c812aaee6f9c62838b486",
+        "includeInCompanyLinks": False,
         "keywords": (
             "병원 방화벽",
             "방화벽",
@@ -371,6 +372,8 @@ def select_company_notion_doc_links(
     for entry in _COMPANY_NOTION_DOCS:
         title = str(entry.get("title") or "").strip()
         normalized_title = _normalize_lookup_text(title)
+        if entry.get("includeInCompanyLinks") is False:
+            continue
         keywords = [str(keyword).strip() for keyword in entry.get("keywords") or () if str(keyword).strip()]
         normalized_keywords = [_normalize_lookup_text(keyword) for keyword in keywords]
         entry_terms = set(_extract_lookup_terms(title))
