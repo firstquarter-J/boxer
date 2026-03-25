@@ -518,9 +518,14 @@ def _thread_has_notion_doc_context(thread_context: str) -> bool:
     text = (thread_context or "").strip()
     if not text:
         return False
-    if any(marker in text for marker in _NOTION_DOC_THREAD_MARKERS):
-        return True
-    return _looks_like_notion_doc_question(text)
+    return any(marker in text for marker in _NOTION_DOC_THREAD_MARKERS)
+
+
+def _sanitize_notion_doc_thread_context(thread_context: str) -> str:
+    text = (thread_context or "").strip()
+    if not _thread_has_notion_doc_context(text):
+        return ""
+    return text
 
 
 def _looks_like_small_talk_question(question: str) -> bool:
@@ -591,8 +596,8 @@ def _looks_like_notion_doc_followup(question: str, thread_context: str) -> bool:
 
 def _build_notion_doc_query_text(question: str, thread_context: str) -> str:
     normalized_question = (question or "").strip()
-    normalized_thread = (thread_context or "").strip()
-    if not normalized_thread or not _thread_has_notion_doc_context(normalized_thread):
+    normalized_thread = _sanitize_notion_doc_thread_context(thread_context)
+    if not normalized_thread:
         return normalized_question
 
     thread_lines = [line.strip() for line in normalized_thread.splitlines() if line.strip()]
@@ -1713,6 +1718,8 @@ def create_app() -> App:
                         thread_ts,
                         current_ts,
                     )
+                if evidence_route == "notion_playbook_qa":
+                    thread_context = _sanitize_notion_doc_thread_context(thread_context)
                 synthesized_text = _synthesize_retrieval_answer(
                     question=question,
                     thread_context=thread_context,

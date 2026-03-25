@@ -1,8 +1,10 @@
 import unittest
 
 from boxer_company_adapter_slack.company import (
+    _build_notion_doc_query_text,
     _looks_like_notion_doc_followup,
     _looks_like_notion_doc_question,
+    _sanitize_notion_doc_thread_context,
 )
 
 
@@ -33,6 +35,13 @@ class NotionFollowupRoutingTests(unittest.TestCase):
     def test_operational_followup_still_routes_to_notion(self) -> None:
         self.assertTrue(_looks_like_notion_doc_followup("그럼 왜 그래?", _NOTION_THREAD_CONTEXT))
         self.assertTrue(_looks_like_notion_doc_followup("재부팅해야 돼?", _NOTION_THREAD_CONTEXT))
+
+    def test_unrelated_thread_with_notion_keywords_is_not_treated_as_notion_context(self) -> None:
+        unrelated_thread = "베이비매직 문의 있었음\n근데 지금은 영상 업로드 얘기 중"
+
+        self.assertFalse(_looks_like_notion_doc_followup("그럼 왜 그래?", unrelated_thread))
+        self.assertEqual(_build_notion_doc_query_text("베이비매직 전송 안 된 이유", unrelated_thread), "베이비매직 전송 안 된 이유")
+        self.assertEqual(_sanitize_notion_doc_thread_context(unrelated_thread), "")
 
     def test_thread_answer_instruction_is_not_treated_as_notion_followup(self) -> None:
         self.assertFalse(
