@@ -4,6 +4,7 @@ from boxer_company_adapter_slack.company import (
     _build_notion_doc_query_text,
     _looks_like_notion_doc_followup,
     _looks_like_notion_doc_question,
+    _resolve_notion_doc_thread_context,
     _sanitize_notion_doc_thread_context,
 )
 
@@ -42,6 +43,14 @@ class NotionFollowupRoutingTests(unittest.TestCase):
         self.assertFalse(_looks_like_notion_doc_followup("그럼 왜 그래?", unrelated_thread))
         self.assertEqual(_build_notion_doc_query_text("베이비매직 전송 안 된 이유", unrelated_thread), "베이비매직 전송 안 된 이유")
         self.assertEqual(_sanitize_notion_doc_thread_context(unrelated_thread), "")
+        self.assertEqual(_resolve_notion_doc_thread_context("베이비매직 전송 안 된 이유", unrelated_thread), "")
+
+    def test_explicit_notion_question_in_notion_thread_stays_standalone(self) -> None:
+        question = "베이비매직 전송 안 된 이유"
+
+        self.assertFalse(_looks_like_notion_doc_followup(question, _NOTION_THREAD_CONTEXT))
+        self.assertEqual(_build_notion_doc_query_text(question, _NOTION_THREAD_CONTEXT), question)
+        self.assertEqual(_resolve_notion_doc_thread_context(question, _NOTION_THREAD_CONTEXT), "")
 
     def test_thread_answer_instruction_is_not_treated_as_notion_followup(self) -> None:
         self.assertFalse(

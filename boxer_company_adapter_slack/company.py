@@ -583,6 +583,8 @@ def _looks_like_notion_doc_followup(question: str, thread_context: str) -> bool:
         return False
     if _looks_like_thread_answer_instruction(text):
         return False
+    if _looks_like_notion_doc_question(text):
+        return False
 
     lowered = text.lower()
     if any(token in text for token in _NOTION_DOC_FOLLOWUP_TOKENS):
@@ -596,7 +598,7 @@ def _looks_like_notion_doc_followup(question: str, thread_context: str) -> bool:
 
 def _build_notion_doc_query_text(question: str, thread_context: str) -> str:
     normalized_question = (question or "").strip()
-    normalized_thread = _sanitize_notion_doc_thread_context(thread_context)
+    normalized_thread = _resolve_notion_doc_thread_context(question, thread_context)
     if not normalized_thread:
         return normalized_question
 
@@ -605,6 +607,15 @@ def _build_notion_doc_query_text(question: str, thread_context: str) -> str:
     if not relevant_thread:
         return normalized_question
     return f"{relevant_thread}\n{normalized_question}".strip()
+
+
+def _resolve_notion_doc_thread_context(question: str, thread_context: str) -> str:
+    normalized_thread = _sanitize_notion_doc_thread_context(thread_context)
+    if not normalized_thread:
+        return ""
+    if not _looks_like_notion_doc_followup(question, normalized_thread):
+        return ""
+    return normalized_thread
 
 
 def _is_notion_doc_exfiltration_attempt(question: str, thread_context: str = "") -> bool:
@@ -1719,7 +1730,7 @@ def create_app() -> App:
                         current_ts,
                     )
                 if evidence_route == "notion_playbook_qa":
-                    thread_context = _sanitize_notion_doc_thread_context(thread_context)
+                    thread_context = _resolve_notion_doc_thread_context(question, thread_context)
                 synthesized_text = _synthesize_retrieval_answer(
                     question=question,
                     thread_context=thread_context,
