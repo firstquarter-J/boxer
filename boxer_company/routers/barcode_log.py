@@ -65,7 +65,8 @@ _DEVICE_NAME_SCOPE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _LEADING_DEVICE_NAME_SCOPE_PATTERN = re.compile(
-    r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(?:장비|devices?|device|정보|상태|온라인|ssh)\b",
+    r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+"
+    r"(?:장비(?:상태|정보|상세|세부)?|devices?|device|정보|상태|온라인|ssh)\b",
     re.IGNORECASE,
 )
 _DEVICE_STATUS_PATTERN = re.compile(
@@ -129,7 +130,10 @@ _DEVICE_QUERY_HINT_TOKENS = (
     "장비 있는지",
     "장비 유무",
     "장비 상태",
+    "장비상태",
     "장비 정보",
+    "장비정보",
+    "장비상세",
     "장비명",
     "devices",
     "devicename",
