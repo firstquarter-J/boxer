@@ -266,17 +266,33 @@ def _lookup_hospital_seq_by_name(hospital_name: str) -> int | None:
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT seq FROM hospitals WHERE hospitalName = %s ORDER BY seq DESC LIMIT 2",
+                "SELECT seq, activeFlag FROM hospitals "
+                "WHERE hospitalName = %s "
+                "ORDER BY activeFlag DESC, seq DESC LIMIT 5",
                 (normalized_name,),
             )
             rows = cursor.fetchall() or []
     finally:
         connection.close()
 
-    if len(rows) != 1:
+    if len(rows) == 1:
+        try:
+            return int((rows[0] or {}).get("seq"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    active_rows = []
+    for row in rows:
+        try:
+            if int((row or {}).get("activeFlag")) == 1:
+                active_rows.append(row)
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+    if len(active_rows) != 1:
         return None
     try:
-        return int((rows[0] or {}).get("seq"))
+        return int((active_rows[0] or {}).get("seq"))
     except (AttributeError, TypeError, ValueError):
         return None
 
