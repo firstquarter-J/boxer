@@ -161,10 +161,15 @@ _NOTION_DOC_QUERY_TOKENS = (
     "바코드 스캐너",
     "바코드 동기화",
     "핑크 바코드",
+    "하얀색 바코드",
     "무료 바코드",
     "유료 바코드",
     "분만 병원",
     "비분만 병원",
+    "첫 촬영",
+    "첫 녹화",
+    "신규 바코드 구매",
+    "추가 구매",
     "온라인 상태",
     "cfg1_barcode_sync_date",
     "프로비저닝",
@@ -760,6 +765,7 @@ _BABYMAGIC_RETRY_ACTION = (
     "유저가 앱에서 생성한 아이에 바코드를 등록했는지 먼저 확인하고, "
     "그다음 MDA 베이비매직 관리에서 재전송을 시도해"
 )
+_BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE = "바코드 표시: 구매 병원과 첫 촬영 병원이 다른 경우"
 
 
 def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] | None) -> str:
@@ -861,6 +867,7 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
             break
 
     is_barcode_sync_doc = primary_title == "바코드 동기화: 분만 병원에서 핑크 바코드가 스캔되는 경우"
+    is_barcode_first_recording_edge_case_doc = primary_title == _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE
     is_firewall_doc = primary_title == "병원 방화벽으로 MDA/원격 접속이 안 될 때"
     normalized_question = (question or "").strip()
     is_babymagic_send_issue = primary_title in _BABYMAGIC_DOC_TITLES and (
@@ -940,6 +947,12 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         lines.append("• 조치: 마미박스를 핑크 바코드 동기화가 가능한 버전으로 업데이트해야 해. 1회당 약 10일치 바코드를 가져오고, 매일 동기화를 시도해. 현재 기본 DB에는 1월 1일부터의 핑크 바코드 목록이 있어")
         return "\n".join(lines)
 
+    if is_barcode_first_recording_edge_case_doc:
+        lines.append("• 결론: 첫 녹화가 비분만 병원에서 먼저 나가면 앱에는 핑크 바코드로 보일 수 있어")
+        lines.append("• 확인: 분만 병원에서 실제 첫 촬영이 없었는지랑 첫 recording hospital이 비분만 병원인지 먼저 확인해")
+        lines.append("• 조치: 이건 표시상 엣지케이스라 실제 녹화 차단이나 신규 바코드 추가 구매가 필요한 건 아니라고 안내해")
+        return "\n".join(lines)
+
     if is_firewall_doc:
         lines.append("• 결론: 영상 업로드는 정상이어도 원격 접속은 별도 경로라 불가할 수 있어. 현재는 장비 원격 접근이 제한된 상태야")
         lines.append("• 확인: 병원 네트워크 또는 방화벽 설정 여부, 방화벽 정책, 장비 원격 접근 여부(SSH 연결) 확인이 필요해")
@@ -972,6 +985,10 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
     if "cfg1_barcode_sync_date" in lowered and "cfg1_barcode_sync_date" not in fallback_lowered:
         return True
     if _BABYMAGIC_RETRY_ACTION in fallback_normalized and _BABYMAGIC_RETRY_ACTION not in normalized:
+        return True
+    if "표시상 엣지케이스" in fallback_normalized and "엣지케이스" not in normalized:
+        return True
+    if "추가 구매" in fallback_normalized and "추가 구매" not in normalized:
         return True
 
     required_bullets = (
@@ -3496,10 +3513,6 @@ def create_app() -> App:
                     )
                     reply(_build_notion_doc_security_refusal())
                     return
-                if not _is_notion_configured():
-                    logger.warning("Notion doc query skipped because notion is not configured in runtime")
-                    reply("관련 문서를 찾지 못했어. 증상이나 키워드를 조금 더 구체적으로 말해줘")
-                    return
                 evidence_payload = {
                     "route": "notion_playbook_qa",
                     "source": "notion",
@@ -3539,6 +3552,8 @@ def create_app() -> App:
                         len(notion_references),
                     )
                     return
+                if not _is_notion_configured():
+                    logger.warning("Notion doc query had no local match and notion is not configured in runtime")
                 reply("관련 운영 문서를 찾지 못했어. 증상이나 키워드를 조금 더 구체적으로 말해줘")
                 logger.info("No notion references matched in thread_ts=%s question=%s", thread_ts, question)
                 return

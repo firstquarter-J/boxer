@@ -53,6 +53,54 @@ _LOW_SIGNAL_NOTION_TERMS = {
     "초음파",
     "확인",
 }
+_LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
+    {
+        "pageId": "local-playbook:barcode-first-recording-hospital-edge-case",
+        "section": "운영 정책",
+        "kind": "policy",
+        "priority": "high",
+        "title": "바코드 표시: 구매 병원과 첫 촬영 병원이 다른 경우",
+        "keywords": (
+            "첫 촬영",
+            "첫 녹화",
+            "첫 recording",
+            "첫 사용",
+            "첫 기록",
+            "핑크 바코드",
+            "하얀색 바코드",
+            "무료 바코드",
+            "유료 바코드",
+            "분만 병원",
+            "비분만 병원",
+            "구매 후",
+            "구매 이후",
+            "신규 바코드 구매",
+            "추가 구매",
+        ),
+        "requiredTokenGroups": (
+            ("첫 촬영", "첫 녹화", "첫 recording", "첫 사용", "첫 기록"),
+            (
+                "핑크 바코드",
+                "하얀색 바코드",
+                "무료 바코드",
+                "유료 바코드",
+                "분만 병원",
+                "비분만 병원",
+                "구매 후",
+                "구매 이후",
+                "신규 바코드 구매",
+                "추가 구매",
+            ),
+        ),
+        "previewLines": (
+            "정책 첫 녹화가 발생한 병원 기준으로 앱의 바코드 표시가 정해질 수 있어",
+            "실제 사례 분만 병원에서 하얀 바코드를 받았어도 그 병원에서 촬영이 없고 비분만 병원에서 첫 촬영이 먼저 나가면 앱에는 핑크 바코드로 보일 수 있어",
+            "영향 표시상 엣지케이스라 실제 녹화가 차단되거나 신규 바코드 구매가 바로 필요한 상황은 아니야",
+            "확인 포인트 첫 recording hospital이 어디인지와 분만 병원에서 실제 첫 촬영이 없었는지 먼저 확인해",
+            "조치 고객에게 앱 표시와 실제 사용 가능 여부가 다를 수 있다고 안내하고 추가 구매는 필요 없다고 설명해",
+        ),
+    },
+)
 _NOTION_QUERY_EXPANSIONS = (
     {
         "tokens": (
@@ -254,6 +302,12 @@ _PLAYBOOK_PRIORITY_WEIGHT = {
     "medium": 2,
     "low": 1,
 }
+
+
+def _resolve_playbook_page_id(value: object) -> str:
+    raw = str(value or "").strip()
+    normalized = _normalize_notion_id(raw)
+    return normalized or raw
 
 
 def _normalize_notion_lookup_text(text: str) -> str:
@@ -638,7 +692,7 @@ def _select_notion_playbooks(
     selected: list[dict[str, Any]] = []
     seen_page_ids: set[str] = set()
     for score, entry, matched_terms in scored_entries:
-        page_id = _normalize_notion_id(str(entry.get("pageId") or ""))
+        page_id = _resolve_playbook_page_id(entry.get("pageId"))
         if page_id in seen_page_ids:
             continue
         seen_page_ids.add(page_id)
@@ -669,6 +723,83 @@ def _select_notion_playbooks(
     return selected
 
 
+def _matches_local_playbook_query(entry: dict[str, Any], query_text: str) -> bool:
+    for group in entry.get("requiredTokenGroups") or ():
+        normalized_group = [
+            _normalize_notion_lookup_text(token)
+            for token in group
+            if _normalize_notion_lookup_text(token)
+        ]
+        if normalized_group and not any(token in query_text for token in normalized_group):
+            return False
+    return True
+
+
+def _select_local_playbooks(
+    question: str,
+    *,
+    evidence_payload: dict[str, Any] | None = None,
+    max_results: int = 3,
+) -> list[dict[str, Any]]:
+    route = ""
+    if isinstance(evidence_payload, dict):
+        route = str(evidence_payload.get("route") or "").strip().lower()
+
+    query_text = _build_notion_lookup_query(question, evidence_payload)
+    if not query_text:
+        return []
+
+    scored_entries: list[tuple[int, dict[str, Any], list[str]]] = []
+    for entry in _LOCAL_PLAYBOOKS:
+        if not _matches_local_playbook_query(entry, query_text):
+            continue
+        score, matched_terms = _score_notion_playbook_entry(entry, query_text, route)
+        if score <= 0:
+            continue
+        scored_entries.append((score, entry, matched_terms))
+
+    scored_entries.sort(
+        key=lambda item: (
+            item[0],
+            _PLAYBOOK_PRIORITY_WEIGHT.get(str((item[1] or {}).get("priority") or "medium").lower(), 0),
+            str((item[1] or {}).get("title") or ""),
+        ),
+        reverse=True,
+    )
+
+    selected: list[dict[str, Any]] = []
+    seen_page_ids: set[str] = set()
+    for score, entry, matched_terms in scored_entries:
+        page_id = _resolve_playbook_page_id(entry.get("pageId"))
+        if page_id in seen_page_ids:
+            continue
+        seen_page_ids.add(page_id)
+        preview_lines = [
+            str(line or "").strip()
+            for line in (entry.get("previewLines") or [])
+            if str(line or "").strip()
+        ][:8]
+        selected.append(
+            {
+                "pageId": page_id,
+                "title": entry.get("title"),
+                "section": entry.get("section"),
+                "kind": entry.get("kind"),
+                "priority": entry.get("priority"),
+                "keywords": list(entry.get("keywords") or []),
+                "matchedKeywords": matched_terms,
+                "score": score,
+                "url": str(entry.get("url") or "").strip(),
+                "previewLines": preview_lines,
+                "plainText": "\n".join(preview_lines)[:2000],
+            }
+        )
+        if len(selected) >= max(1, max_results):
+            break
+
+    return selected
+
+
 def _select_notion_references(
     question: str,
     *,
@@ -676,37 +807,53 @@ def _select_notion_references(
     root_page_id: str | None = None,
     max_results: int = 3,
 ) -> list[dict[str, Any]]:
-    if not _is_notion_configured():
-        return []
-
     target_root_page_id = root_page_id or s.NOTION_TEST_PAGE_ID
-    if not target_root_page_id:
-        return []
+    limit = max(1, max_results)
 
     selected: list[dict[str, Any]] = []
     seen_page_ids: set[str] = set()
 
-    if _is_notion_overview_query(question):
+    if _is_notion_configured() and target_root_page_id and _is_notion_overview_query(question):
         overview_reference = _build_notion_overview_reference(target_root_page_id)
-        overview_page_id = _normalize_notion_id(str(overview_reference.get("pageId") or ""))
+        overview_page_id = _resolve_playbook_page_id(overview_reference.get("pageId"))
         seen_page_ids.add(overview_page_id)
         selected.append(overview_reference)
 
-    playbooks = _select_notion_playbooks(
+    local_playbooks = _select_local_playbooks(
         question,
         evidence_payload=evidence_payload,
-        root_page_id=target_root_page_id,
-        max_results=max(1, max_results),
+        max_results=limit,
     )
-    for item in playbooks:
+    for item in local_playbooks:
         if not isinstance(item, dict):
             continue
-        page_id = _normalize_notion_id(str(item.get("pageId") or ""))
+        page_id = _resolve_playbook_page_id(item.get("pageId"))
         if page_id in seen_page_ids:
             continue
         seen_page_ids.add(page_id)
         selected.append(item)
-        if len(selected) >= max(1, max_results):
+        if len(selected) >= limit:
+            return selected[:limit]
+
+    if _is_notion_configured() and target_root_page_id:
+        playbooks = _select_notion_playbooks(
+            question,
+            evidence_payload=evidence_payload,
+            root_page_id=target_root_page_id,
+            max_results=limit,
+        )
+    else:
+        playbooks = []
+
+    for item in playbooks:
+        if not isinstance(item, dict):
+            continue
+        page_id = _resolve_playbook_page_id(item.get("pageId"))
+        if page_id in seen_page_ids:
+            continue
+        seen_page_ids.add(page_id)
+        selected.append(item)
+        if len(selected) >= limit:
             break
 
-    return selected[: max(1, max_results)]
+    return selected[:limit]
