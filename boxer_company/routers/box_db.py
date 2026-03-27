@@ -115,6 +115,26 @@ def _format_ssh_status_display(value: object) -> str:
     return f"⚪ *{text}*"
 
 
+def _format_device_download_availability_display(value: object) -> str:
+    text = _display_value(value, default="미확인")
+    if text == "가능":
+        return "🔵 *가능*"
+    if text == "불가":
+        return "🔴 *불가*"
+    if text == "미확인":
+        return "⚪ *미확인*"
+    return f"⚪ *{text}*"
+
+
+def _derive_device_download_availability(ssh_status: object) -> str:
+    normalized = _display_value(ssh_status, default="미확인")
+    if normalized == "연결 가능":
+        return "가능"
+    if normalized == "연결 불가":
+        return "불가"
+    return "미확인"
+
+
 def _lookup_device_ssh_status(device_name: str) -> str:
     normalized_name = str(device_name or "").strip()
     if not normalized_name or not _is_mda_graphql_configured() or not cs.DEVICE_SSH_PASSWORD or paramiko is None:
@@ -204,6 +224,10 @@ def _build_device_detail_lines(
     ]
     if ssh_status is not None:
         lines.append(f"{line_prefix}SSH 연결 상태: {_format_ssh_status_display(ssh_status)}")
+        lines.append(
+            f"{line_prefix}초음파 영상 다운로드 가능 상태: "
+            f"{_format_device_download_availability_display(_derive_device_download_availability(ssh_status))}"
+        )
     lines.extend(
         [
             f"{line_prefix}캡처보드 종류: `{_display_value(row.get('captureBoardType'), default='미확인')}`",

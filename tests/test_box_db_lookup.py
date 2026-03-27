@@ -77,5 +77,30 @@ class LookupHospitalSeqByNameTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class DeviceDetailRenderingTests(unittest.TestCase):
+    def test_single_device_detail_includes_download_availability_from_ssh_status(self) -> None:
+        lines = box_db._build_device_detail_lines(
+            {
+                "seq": 1079,
+                "deviceName": "MB2-B00045",
+                "version": "2.11.300",
+                "hospitalName": "한사랑병원(목포)",
+                "roomName": "2진료실",
+                "captureBoardType": "YUH01",
+                "status": "NOSESS",
+                "activeFlag": 1,
+                "installFlag": 1,
+                "description": "진료실2",
+            },
+            line_prefix="• ",
+            ssh_status="연결 가능",
+        )
+
+        rendered = "\n".join(lines)
+
+        self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
+        self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
