@@ -11,6 +11,7 @@ from slack_bolt import App
 from boxer_adapter_slack.common import (
     MentionPayload,
     SlackReplyFn,
+    _load_slack_user_name,
     _merge_request_log_metadata,
     _set_request_log_route,
     create_slack_app,
@@ -1273,12 +1274,15 @@ def _build_device_download_activity_input(
     log_date: str,
     question: str,
     user_id: str,
+    user_name: str | None,
     channel_id: str,
     thread_ts: str,
 ) -> dict[str, Any]:
     device_name = str(record.get("deviceName") or "").strip() or "미확인"
     hospital_name = str(record.get("hospitalName") or "").strip() or "미확인"
     room_name = str(record.get("roomName") or "").strip() or "미확인"
+    requester_name = str(user_name or "").strip()
+    requester_label = requester_name or str(user_id or "").strip()
     file_names = [str(item).strip() for item in (record.get("fileNames") or []) if str(item).strip()]
     download_links = [
         item
@@ -1292,8 +1296,11 @@ def _build_device_download_activity_input(
         "logDate": log_date,
         "question": question,
         "slackUserId": user_id,
+        "slackUserName": requester_name,
         "slackChannelId": channel_id,
         "slackThreadTs": thread_ts,
+        "requestedBySlackUserId": user_id,
+        "requestedBySlackUserName": requester_name,
         "deviceName": device_name,
         "deviceSeq": record.get("deviceSeq"),
         "hospitalSeq": record.get("hospitalSeq"),
@@ -1319,7 +1326,8 @@ def _build_device_download_activity_input(
         "reason": "Boxer Slack 다운로드 링크 전송 성공",
         "description": (
             f"Boxer Slack 다운로드 링크 전송 완료: 병원명 [{hospital_name}], "
-            f"병실명 [{room_name}], 장비명 [{device_name}], 파일 {len(download_links)}개"
+            f"병실명 [{room_name}], 장비명 [{device_name}]"
+            f"{f', 요청자 [{requester_label}]' if requester_label else ''}, 파일 {len(download_links)}개"
         ),
         "detailLog": json.dumps(detail_log, ensure_ascii=False, separators=(",", ":")),
     }
@@ -1332,6 +1340,7 @@ def _log_device_download_activity(
     log_date: str,
     question: str,
     user_id: str,
+    user_name: str | None,
     channel_id: str,
     thread_ts: str,
     logger: logging.Logger,
@@ -1350,6 +1359,7 @@ def _log_device_download_activity(
                     log_date=log_date,
                     question=question,
                     user_id=user_id,
+                    user_name=user_name,
                     channel_id=channel_id,
                     thread_ts=thread_ts,
                 )
@@ -1476,6 +1486,7 @@ def create_app() -> App:
         text = payload["text"]
         question = payload["question"]
         user_id = payload["user_id"]
+        workspace_id = payload["workspace_id"]
         channel_id = payload["channel_id"]
         current_ts = payload["current_ts"]
         thread_ts = payload["thread_ts"]
@@ -2665,12 +2676,19 @@ def create_app() -> App:
                             download_records,
                         )
                         if _send_dm_message(user_id, dm_text):
+                            requester_name = _load_slack_user_name(
+                                client,
+                                workspace_id,
+                                user_id,
+                                logger,
+                            )
                             logged_count = _log_device_download_activity(
                                 records=download_records,
                                 barcode=barcode or "",
                                 log_date=log_date,
                                 question=question,
                                 user_id=user_id,
+                                user_name=requester_name,
                                 channel_id=channel_id,
                                 thread_ts=thread_ts,
                                 logger=logger,
