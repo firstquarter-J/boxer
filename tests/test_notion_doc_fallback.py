@@ -16,6 +16,14 @@ _BABYMAGIC_REFERENCES = [
         ],
     }
 ]
+_PINK_BARCODE_OVERVIEW_REFERENCES = [
+    {
+        "title": "핑크 바코드: 운영 개요",
+        "previewLines": [
+            "개요: 핑크 바코드 질문은 동기화, 앱 표시, 검증 정책 3가지로 나눠 봐야 해",
+        ],
+    }
+]
 _BARCODE_FIRST_RECORDING_EDGE_CASE_REFERENCES = [
     {
         "title": "바코드 표시: 구매 병원과 첫 촬영 병원이 다른 경우",
@@ -24,9 +32,33 @@ _BARCODE_FIRST_RECORDING_EDGE_CASE_REFERENCES = [
         ],
     }
 ]
+_PINK_BARCODE_VALIDATION_POLICY_REFERENCES = [
+    {
+        "title": "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지",
+        "previewLines": [
+            "정책: 핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어",
+            "전제: 바코드 유효성 검증을 해제하면 검증 없이 녹화가 진행돼",
+        ],
+    }
+]
 
 
 class NotionDocFallbackTests(unittest.TestCase):
+    def test_pink_barcode_overview_breaks_question_into_three_tracks(self) -> None:
+        text = _build_notion_doc_fallback(
+            "핑크 바코드 전체 정리해줘",
+            _PINK_BARCODE_OVERVIEW_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 핑크 바코드 이슈는 동기화, 앱 표시, 검증 정책 3가지로 나눠 봐야 해",
+            text,
+        )
+        self.assertIn(
+            "• 조치: 스캔 이슈면 동기화 문서, 앱 표시 이슈면 첫 촬영 병원 문서, 허용/차단 정책이면 검증 정책 문서 기준으로 이어서 보면 돼",
+            text,
+        )
+
     def test_babymagic_send_issue_action_checks_barcode_before_resend(self) -> None:
         text = _build_notion_doc_fallback("베이비매직 전송 안 된 이유", _BABYMAGIC_REFERENCES)
 
@@ -74,6 +106,36 @@ class NotionDocFallbackTests(unittest.TestCase):
 
         self.assertTrue(
             _needs_notion_doc_fallback(synthesized_text, "notion playbook qa", fallback_text)
+        )
+
+    def test_pink_barcode_validation_policy_explains_no_partial_exception(self) -> None:
+        text = _build_notion_doc_fallback(
+            "핑크 바코드만 분만 병원에서 녹화 허용할 수 있어?",
+            _PINK_BARCODE_VALIDATION_POLICY_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어",
+            text,
+        )
+        self.assertIn(
+            "• 조치: 핑크 바코드도 녹화되게 하려면 바코드 유효성 검증 자체를 해제해야 하고, 그러면 검증 없이 녹화가 진행돼",
+            text,
+        )
+
+    def test_pink_barcode_validation_disable_question_mentions_unvalidated_recording(self) -> None:
+        text = _build_notion_doc_fallback(
+            "바코드 유효성 검증 해제하면 검증 없이 녹화가 진행돼?",
+            _PINK_BARCODE_VALIDATION_POLICY_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 맞아. 바코드 유효성 검증을 해제하면 검증 없이 녹화가 진행돼",
+            text,
+        )
+        self.assertIn(
+            "• 확인: 이건 핑크 바코드만 예외 허용하는 게 아니라 전체 검증을 푸는 설정이야",
+            text,
         )
 
 

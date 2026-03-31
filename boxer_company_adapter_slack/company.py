@@ -766,7 +766,9 @@ _BABYMAGIC_RETRY_ACTION = (
     "유저가 앱에서 생성한 아이에 바코드를 등록했는지 먼저 확인하고, "
     "그다음 MDA 베이비매직 관리에서 재전송을 시도해"
 )
+_PINK_BARCODE_OVERVIEW_TITLE = "핑크 바코드: 운영 개요"
 _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE = "바코드 표시: 구매 병원과 첫 촬영 병원이 다른 경우"
+_PINK_BARCODE_VALIDATION_POLICY_TITLE = "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지"
 
 
 def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] | None) -> str:
@@ -867,8 +869,10 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         if len(preview_fragments) >= 8:
             break
 
+    is_pink_barcode_overview_doc = primary_title == _PINK_BARCODE_OVERVIEW_TITLE
     is_barcode_sync_doc = primary_title == "바코드 동기화: 분만 병원에서 핑크 바코드가 스캔되는 경우"
     is_barcode_first_recording_edge_case_doc = primary_title == _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE
+    is_pink_barcode_validation_policy_doc = primary_title == _PINK_BARCODE_VALIDATION_POLICY_TITLE
     is_firewall_doc = primary_title == "병원 방화벽으로 MDA/원격 접속이 안 될 때"
     normalized_question = (question or "").strip()
     is_babymagic_send_issue = primary_title in _BABYMAGIC_DOC_TITLES and (
@@ -938,6 +942,12 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
     if is_babymagic_send_issue:
         action = _BABYMAGIC_RETRY_ACTION
 
+    if is_pink_barcode_overview_doc:
+        lines.append("• 결론: 핑크 바코드 이슈는 동기화, 앱 표시, 검증 정책 3가지로 나눠 봐야 해")
+        lines.append("• 확인: 지금 질문이 분만 병원에서 스캔된 건지, 앱에 핑크로 보이는 건지, 검증 해제 정책인지 먼저 구분해")
+        lines.append("• 조치: 스캔 이슈면 동기화 문서, 앱 표시 이슈면 첫 촬영 병원 문서, 허용/차단 정책이면 검증 정책 문서 기준으로 이어서 보면 돼")
+        return "\n".join(lines)
+
     if is_barcode_sync_doc and not is_meaning_question:
         if is_restart_question:
             barcode_sync_conclusion = "재부팅이 필수는 아니고, 마미박스는 매일 핑크 바코드 동기화를 시도해"
@@ -952,6 +962,29 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         lines.append("• 결론: 첫 녹화가 비분만 병원에서 먼저 나가면 앱에는 핑크 바코드로 보일 수 있어")
         lines.append("• 확인: 분만 병원에서 실제 첫 촬영이 없었는지랑 첫 recording hospital이 비분만 병원인지 먼저 확인해")
         lines.append("• 조치: 이건 표시상 엣지케이스라 실제 녹화 차단이나 신규 바코드 추가 구매가 필요한 건 아니라고 안내해")
+        return "\n".join(lines)
+
+    if is_pink_barcode_validation_policy_doc:
+        is_validation_disable_question = any(
+            token in normalized_question
+            for token in (
+                "검증을 풀",
+                "검증 풀",
+                "검증 해제",
+                "유효성 검증 해제",
+                "검증없이",
+                "검증 없이",
+            )
+        )
+        if is_validation_disable_question:
+            lines.append("• 결론: 맞아. 바코드 유효성 검증을 해제하면 검증 없이 녹화가 진행돼")
+            lines.append("• 확인: 이건 핑크 바코드만 예외 허용하는 게 아니라 전체 검증을 푸는 설정이야")
+            lines.append("• 조치: 특정 핑크 바코드만 따로 허용하는 건 현재 안 돼. 허용이 필요하면 검증 유지/전체 해제 중 운영 판단이 필요해")
+            return "\n".join(lines)
+
+        lines.append("• 결론: 핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어")
+        lines.append("• 확인: 분만 병원에서 차단이 걸리려면 바코드 유효성 검증이 켜져 있는지 먼저 확인해")
+        lines.append("• 조치: 핑크 바코드도 녹화되게 하려면 바코드 유효성 검증 자체를 해제해야 하고, 그러면 검증 없이 녹화가 진행돼")
         return "\n".join(lines)
 
     if is_firewall_doc:
