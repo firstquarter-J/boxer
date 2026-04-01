@@ -264,6 +264,27 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "20) `함께 참고할 문서` 섹션은 시스템이 뒤에 붙이니 네가 직접 만들지 마.\n"
             "21) 6줄 안팎으로 끝내."
         )
+    if route == "device_audio_probe":
+        return (
+            "\n"
+            "7) 이 작업은 장비 소리 출력 원격 점검 결과 요약이다.\n"
+            "8) 아래 형식 그대로만 답해:\n"
+            "   *장비 소리 출력 점검 결과*\n"
+            "   • 결론:\n"
+            "   • 근거:\n"
+            "   • 확인된 상태:\n"
+            "   • 권장 조치:\n"
+            "9) 반드시 한국어만 사용해. 영어 설명, 자기 사고 과정, 중간 추론, 검토 문장은 절대 쓰지 마.\n"
+            "10) 제공된 evidence만 사용해. 추측 금지.\n"
+            "11) playbackDevices.deviceCount가 1개 이상이고 playbackTest.ok=true이며 summary.mixerMuted=false면 `OS 기준 소리 출력 경로는 정상으로 보여`라고 적어.\n"
+            "12) 위 조건으로 정상 판정이면 `권장 조치`에 연결된 스피커 전원, 케이블, 입력 소스를 먼저 점검하라고 적어.\n"
+            "13) playbackDevices.deviceCount가 0이면 오디오 장치 미인식으로 적어.\n"
+            "14) summary.mixerMuted=true면 볼륨 또는 mute 설정 이상을 먼저 의심해.\n"
+            "15) playbackTest.available=true인데 playbackTest.ok=false면 출력 테스트 실패로 적어.\n"
+            "16) pactl이 없다는 이유만으로 실패 판단하지 마.\n"
+            "17) 원격 명령만으로 물리 스피커 고장, 케이블 접촉 불량, 현장 배선 문제는 확정하지 말고 현장 확인 필요라고 적어.\n"
+            "18) 6줄 안팎으로 짧게 끝내."
+        )
 
     if route != "barcode_log_analysis":
         return ""
