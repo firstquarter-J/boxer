@@ -446,24 +446,28 @@ def _render_device_audio_probe_result(
     playback_test: dict[str, Any] | None,
 ) -> str:
     info = device_info or {}
-    lines = [
-        "*장비 소리 출력 점검 결과*",
-        f"• 장비: `{device_name}`",
-    ]
     hospital_name = _display_value(info.get("hospitalName"), default="")
     room_name = _display_value(info.get("roomName"), default="")
-    if hospital_name:
-        lines.append(f"• 병원: `{hospital_name}`")
-    if room_name:
-        lines.append(f"• 병실: `{room_name}`")
     version = _display_value(info.get("version"), default="")
+    lines = [
+        "*장비 소리 출력 점검*",
+    ]
+    device_line = f"• 장비: `{device_name}`"
     if version:
-        lines.append(f"• 버전: `{version}`")
+        device_line = f"{device_line} | 버전: `{version}`"
+    lines.append(device_line)
+    if hospital_name or room_name:
+        location_parts = []
+        if hospital_name:
+            location_parts.append(f"`{hospital_name}`")
+        if room_name:
+            location_parts.append(f"`{room_name}`")
+        lines.append(f"• 위치: {' / '.join(location_parts)}")
 
-    lines.append(f"• SSH 연결 상태: `{'연결 가능' if ssh_ready else '연결 불가'}`")
     if not ssh_ready:
-        lines.append(f"• 결론: {_display_device_audio_probe_reason(ssh_reason)}")
-        lines.append("• 권장 조치: 장비 온라인 상태, 네트워크, 원격 접속 상태 먼저 확인해")
+        lines.append("• 판정: *점검 불가*")
+        lines.append(f"• 안내: {_display_device_audio_probe_reason(ssh_reason)}")
+        lines.append("• 조치: 장비 온라인 상태, 네트워크, 원격 접속 상태 먼저 확인해")
         return "\n".join(lines)
 
     summary_payload = summary or {}
@@ -473,52 +477,52 @@ def _render_device_audio_probe_result(
     sink_payload = default_sink or {}
     test_payload = playback_test or {}
 
-    available_tools = summary_payload.get("availableTools") if isinstance(summary_payload, dict) else []
-    if available_tools:
-        lines.append(f"• 오디오 도구: `{', '.join(str(item) for item in available_tools)}`")
-
     device_items = playback_payload.get("devices") if isinstance(playback_payload, dict) else []
-    if device_items:
-        labels = [
-            _display_value(item.get("deviceName"), default="")
-            for item in device_items[:2]
-            if isinstance(item, dict)
-        ]
-        label_suffix = f" ({', '.join(label for label in labels if label)})" if labels else ""
-        lines.append(f"• 재생 장치: `{len(device_items)}개`{label_suffix}")
-    else:
-        lines.append("• 재생 장치: `0개`")
+    status = _display_value(summary_payload.get("status"), default="")
+    status_label = "확인 필요"
+    if status == "pass":
+        status_label = "정상"
+    elif status == "fail":
+        status_label = "이상"
+    elif status == "warning":
+        status_label = "확인 필요"
+    lines.append(f"• 판정: *{status_label}*")
 
-    mixer_parts: list[str] = []
+    evidence_parts: list[str] = []
+    if device_items:
+        evidence_parts.append(f"재생 장치 {len(device_items)}개")
+    else:
+        evidence_parts.append("재생 장치 0개")
+
     if master_payload.get("available"):
         percent = master_payload.get("percent")
         switch = _display_value(master_payload.get("switch"), default="")
         if percent is not None and switch:
-            mixer_parts.append(f"Master {percent}% {switch}")
+            evidence_parts.append(f"Master {percent}% {switch}")
         elif percent is not None:
-            mixer_parts.append(f"Master {percent}%")
+            evidence_parts.append(f"Master {percent}%")
     if pcm_payload.get("available"):
         pcm_percent = pcm_payload.get("percent")
         if pcm_percent is not None:
-            mixer_parts.append(f"PCM {pcm_percent}%")
-    if mixer_parts:
-        lines.append(f"• 볼륨 상태: `{', '.join(mixer_parts)}`")
-
-    default_sink_name = _display_value(sink_payload.get("defaultSink"), default="")
-    if default_sink_name:
-        lines.append(f"• 기본 sink: `{default_sink_name}`")
+            evidence_parts.append(f"PCM {pcm_percent}%")
 
     if test_payload.get("available"):
         test_state = "성공" if test_payload.get("ok") else "실패"
         test_command = _display_value(test_payload.get("usedCommand"), default="unknown")
-        lines.append(f"• 재생 테스트: `{test_state}` (`{test_command}`)")
-    else:
-        lines.append("• 재생 테스트: `미실행`")
+        evidence_parts.append(f"{test_command} {test_state}")
+    elif sink_payload.get("reason") == "pactl_missing":
+        evidence_parts.append("pactl 미설치")
 
-    lines.append(f"• 결론: {_display_value(summary_payload.get('summary'), default='확인 필요')}")
+    lines.append(f"• 근거: {' / '.join(evidence_parts)}")
+
+    conclusion = _display_value(summary_payload.get("summary"), default="확인 필요")
     recommended_action = _display_value(summary_payload.get("recommendedAction"), default="")
+    if sink_payload.get("reason") == "pactl_missing" and "pactl 미설치" not in conclusion:
+        conclusion = f"{conclusion}. pactl 미설치는 실패 원인으로 보지 않아"
     if recommended_action:
-        lines.append(f"• 권장 조치: {recommended_action}")
+        lines.append(f"• 안내: {conclusion}. {recommended_action}")
+    else:
+        lines.append(f"• 안내: {conclusion}")
     limitations = summary_payload.get("limitations") if isinstance(summary_payload, dict) else []
     if isinstance(limitations, list) and limitations:
         lines.append(f"• 참고: {_display_value(limitations[0], default='')}")

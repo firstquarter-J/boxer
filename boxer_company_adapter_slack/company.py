@@ -1698,6 +1698,32 @@ def create_app() -> App:
 
             return False
 
+        def _needs_device_audio_probe_fallback(
+            synthesized: str,
+            fallback_text: str,
+            route_name: str,
+        ) -> bool:
+            if route_name != "device audio probe":
+                return False
+
+            normalized_synth = (synthesized or "").strip()
+            normalized_fallback = (fallback_text or "").strip()
+            required_bullets = (
+                "• 장비:",
+                "• 판정:",
+                "• 근거:",
+                "• 안내:",
+            )
+
+            if normalized_fallback.startswith("*장비 소리 출력 점검*") and not normalized_synth.startswith("*장비 소리 출력 점검*"):
+                return True
+
+            for bullet in required_bullets:
+                if bullet in normalized_fallback and bullet not in normalized_synth:
+                    return True
+
+            return False
+
         def _attach_notion_playbooks_to_evidence(
             evidence_payload: dict[str, Any] | None,
         ) -> list[dict[str, Any]]:
@@ -1818,6 +1844,8 @@ def create_app() -> App:
                 if _needs_barcode_log_fallback(final_text, fallback_text, route_name):
                     final_text = fallback_with_references
                 if _needs_recording_failure_analysis_fallback(final_text, fallback_text, route_name):
+                    final_text = fallback_with_references
+                if _needs_device_audio_probe_fallback(final_text, fallback_text, route_name):
                     final_text = fallback_with_references
                 if _needs_notion_doc_fallback(final_text, route_name, fallback_text):
                     final_text = fallback_with_references

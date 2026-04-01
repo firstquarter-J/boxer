@@ -6,6 +6,7 @@ from boxer_company.routers.device_audio_probe import (
     _parse_mixer_control,
     _parse_playback_devices,
     _parse_playback_test,
+    _render_device_audio_probe_result,
     _summarize_device_audio_probe,
 )
 
@@ -92,23 +93,50 @@ class DeviceAudioProbeParsingTests(unittest.TestCase):
         self.assertEqual(pcm["percent"], 100)
 
     def test_summarizes_probe_as_pass_when_playback_path_is_healthy(self) -> None:
+        playback_devices = _parse_playback_devices(_PLAYBACK_DEVICES_OUTPUT)
+        master = _parse_mixer_control(_MASTER_MIXER_OUTPUT, control_name="Master")
+        pcm = _parse_mixer_control(_PCM_MIXER_OUTPUT, control_name="PCM")
+        playback_test = _parse_playback_test(_SPEAKER_TEST_OUTPUT, 0)
         summary = _summarize_device_audio_probe(
             tool_paths={
                 "aplay": "/usr/bin/aplay",
                 "amixer": "/usr/bin/amixer",
                 "speaker-test": "/usr/bin/speaker-test",
             },
-            playback_devices=_parse_playback_devices(_PLAYBACK_DEVICES_OUTPUT),
-            master_mixer=_parse_mixer_control(_MASTER_MIXER_OUTPUT, control_name="Master"),
-            pcm_mixer=_parse_mixer_control(_PCM_MIXER_OUTPUT, control_name="PCM"),
+            playback_devices=playback_devices,
+            master_mixer=master,
+            pcm_mixer=pcm,
             default_sink={"available": False, "reason": "pactl_missing", "defaultSink": ""},
-            playback_test=_parse_playback_test(_SPEAKER_TEST_OUTPUT, 0),
+            playback_test=playback_test,
         )
 
         self.assertEqual(summary["status"], "pass")
         self.assertFalse(summary["mixerMuted"])
         self.assertIn("정상", summary["summary"])
         self.assertIn("연결된 스피커", summary["recommendedAction"])
+
+        rendered = _render_device_audio_probe_result(
+            device_name="MB2-C00419",
+            device_info={
+                "hospitalName": "아이사랑산부인과의원(부산)",
+                "roomName": "2진료실",
+                "version": "2.11.300",
+            },
+            ssh_ready=True,
+            ssh_reason="ready",
+            checks=[],
+            summary=summary,
+            playback_devices=playback_devices,
+            master_mixer=master,
+            pcm_mixer=pcm,
+            default_sink={"available": False, "reason": "pactl_missing", "defaultSink": ""},
+            playback_test=playback_test,
+        )
+
+        self.assertIn("*장비 소리 출력 점검*", rendered)
+        self.assertIn("• 판정: *정상*", rendered)
+        self.assertIn("• 근거:", rendered)
+        self.assertIn("• 안내:", rendered)
 
 
 if __name__ == "__main__":
