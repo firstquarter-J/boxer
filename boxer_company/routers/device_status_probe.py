@@ -460,6 +460,17 @@ def _format_pm2_target_evidence(canonical_name: str, process: dict[str, Any]) ->
     return f"{canonical_name}={actual_name}({' / '.join(details)})"
 
 
+def _format_pm2_target_overview(canonical_name: str, process: dict[str, Any]) -> str:
+    status = _display_value(process.get("status"), default="미확인")
+    version = _display_value(process.get("version"), default="")
+    parts = [canonical_name]
+    if version:
+        parts.append(f"v{version}")
+    if status:
+        parts.append(status)
+    return " ".join(parts)
+
+
 def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
     if not pm2_processes.get("available"):
         return {
@@ -506,6 +517,11 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
         for canonical_name in _PM2_CANONICAL_APP_ORDER
         if canonical_name in selected_targets
     ]
+    overview_detail = " / ".join(
+        _format_pm2_target_overview(canonical_name, selected_targets[canonical_name])
+        for canonical_name in _PM2_CANONICAL_APP_ORDER
+        if canonical_name in selected_targets
+    )
 
     missing_required = [name for name in _PM2_REQUIRED_APPS if name not in selected_targets]
     if missing_required:
@@ -514,6 +530,7 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
             "label": "이상",
             "summary": "PM2에서 핵심 앱 mommybox-v2 가 보이지 않아",
             "evidence": " / ".join(evidence_parts) or "mommybox-v2 미감지",
+            "overviewDetail": overview_detail or "mommybox-v2 미감지",
             "action": "pm2 등록 상태와 본 앱 실행 구성을 확인해",
         }
 
@@ -523,6 +540,7 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
             "label": "확인 필요",
             "summary": "mommybox-v2 는 보이지만 mommybox-agent 앱은 안 보여",
             "evidence": " / ".join(evidence_parts),
+            "overviewDetail": overview_detail,
             "action": "장비가 agent 구성을 써야 하는 장비인지와 PM2 등록 상태를 확인해",
         }
 
@@ -536,6 +554,7 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
             "label": "정상",
             "summary": "PM2 기준 mommybox-v2 와 mommybox-agent 앱이 정상 실행 중이야",
             "evidence": " / ".join(evidence_parts),
+            "overviewDetail": overview_detail,
             "action": "앱 프로세스와 실행 버전은 정상으로 보여",
         }
     if any(status in _PM2_TRANSITION_STATUSES for status in statuses.values()):
@@ -544,6 +563,7 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
             "label": "확인 필요",
             "summary": "PM2 앱이 전환 중이거나 재시작 중이야",
             "evidence": " / ".join(evidence_parts),
+            "overviewDetail": overview_detail,
             "action": "잠시 후 다시 확인하고 반복되면 PM2 로그를 봐",
         }
     return {
@@ -551,6 +571,7 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
         "label": "이상",
         "summary": "PM2 앱 상태가 online이 아니야",
         "evidence": " / ".join(evidence_parts),
+        "overviewDetail": overview_detail,
         "action": "PM2 상태와 앱 로그를 같이 확인해",
     }
 
@@ -585,6 +606,7 @@ def _summarize_captureboard_probe(
                 "label": "확인 필요",
                 "summary": "캡처보드는 잡히지만 MDA 타입과 로컬 인식 타입이 달라 보여",
                 "evidence": " / ".join(evidence_parts) or "캡처보드 타입 불일치",
+                "overviewDetail": " / ".join(evidence_parts) or "캡처보드 타입 불일치",
                 "action": "실제 연결된 캡처보드 모델과 장비 설정을 확인해",
             }
         return {
@@ -592,6 +614,7 @@ def _summarize_captureboard_probe(
             "label": "정상",
             "summary": "캡처보드 USB와 비디오 장치가 같이 보여",
             "evidence": " / ".join(evidence_parts) or "캡처보드 감지",
+            "overviewDetail": " / ".join(evidence_parts) or "캡처보드 감지",
             "action": "하드웨어 연결 자체는 정상으로 보여",
         }
     if aliases and video_count <= 0 and not v4l2_has_video:
@@ -600,6 +623,7 @@ def _summarize_captureboard_probe(
             "label": "확인 필요",
             "summary": "캡처보드 USB는 보이지만 비디오 장치가 안 보여",
             "evidence": " / ".join(evidence_parts) or "USB만 감지",
+            "overviewDetail": " / ".join(evidence_parts) or "USB만 감지",
             "action": "/dev/video 장치 생성 여부와 재인식 상태를 확인해",
         }
     if video_count > 0 or v4l2_has_video:
@@ -608,6 +632,7 @@ def _summarize_captureboard_probe(
             "label": "확인 필요",
             "summary": "비디오 장치는 보이지만 캡처보드 USB 식별은 확실하지 않아",
             "evidence": " / ".join(evidence_parts) or "비디오 장치만 감지",
+            "overviewDetail": " / ".join(evidence_parts) or "비디오 장치만 감지",
             "action": "캡처보드 USB 연결과 모델 인식 상태를 같이 확인해",
         }
     return {
@@ -615,6 +640,7 @@ def _summarize_captureboard_probe(
         "label": "이상",
         "summary": "캡처보드 USB나 비디오 장치를 찾지 못했어",
         "evidence": " / ".join(evidence_parts) or "캡처보드 미감지",
+        "overviewDetail": " / ".join(evidence_parts) or "캡처보드 미감지",
         "action": "캡처보드 전원, USB 연결, 장치 재인식을 먼저 확인해",
     }
 
@@ -639,6 +665,7 @@ def _summarize_led_probe(
             "label": "정상",
             "summary": "LED 장치 USB 연결은 정상으로 보여",
             "evidence": " / ".join(evidence_parts) or "LED USB 감지",
+            "overviewDetail": " / ".join(evidence_parts) or "LED USB 감지",
             "action": "LED 물리 연결 자체는 정상으로 보여",
         }
     if serial_paths:
@@ -647,6 +674,7 @@ def _summarize_led_probe(
             "label": "확인 필요",
             "summary": "시리얼 장치는 보이지만 LED 장치 ID는 확실하지 않아",
             "evidence": " / ".join(evidence_parts) or "시리얼 장치 감지",
+            "overviewDetail": " / ".join(evidence_parts) or "시리얼 장치 감지",
             "action": "LED USB 장치와 시리얼 변환기 연결 상태를 확인해",
         }
     return {
@@ -654,6 +682,7 @@ def _summarize_led_probe(
         "label": "이상",
         "summary": "LED USB 장치를 찾지 못했어",
         "evidence": " / ".join(evidence_parts) or "LED 미감지",
+        "overviewDetail": " / ".join(evidence_parts) or "LED 미감지",
         "action": "LED 케이블과 USB 연결 상태를 먼저 확인해",
     }
 
@@ -687,20 +716,45 @@ def _summarize_audio_path_probe(checks: dict[str, dict[str, Any]]) -> dict[str, 
             "usedCommand": "none",
         },
     )
-    label = "정상" if summary.get("status") == "pass" else "이상" if summary.get("status") == "fail" else "확인 필요"
-    evidence_parts: list[str] = []
+    effective_status = _display_value(summary.get("status"), default="check_needed")
     device_count = int(playback_devices.get("deviceCount") or 0)
-    evidence_parts.append(f"재생 장치 `{device_count}개`")
+    mixer_muted = bool(summary.get("mixerMuted"))
+    if effective_status in {"check_needed", "warning"} and device_count > 0 and not mixer_muted:
+        effective_status = "pass"
+
+    label = "정상" if effective_status == "pass" else "이상" if effective_status == "fail" else "확인 필요"
+    evidence_parts: list[str] = []
+    device_labels = [
+        _display_value(item.get("deviceName"), default="")
+        for item in playback_devices.get("devices") or []
+        if isinstance(item, dict) and _display_value(item.get("deviceName"), default="")
+    ]
+    unique_device_labels: list[str] = []
+    for label_text in device_labels:
+        if label_text not in unique_device_labels:
+            unique_device_labels.append(label_text)
+    if unique_device_labels:
+        evidence_parts.append("오디오 장치 " + ", ".join(f"`{label}`" for label in unique_device_labels))
+    else:
+        evidence_parts.append(f"재생 장치 `{device_count}개`")
     mixer_summary = _display_value(summary.get("mixerSummary"), default="")
     if mixer_summary:
-        evidence_parts.append(mixer_summary)
+        evidence_parts.append(f"음량 `{mixer_summary}`")
     if default_sink.get("available"):
         evidence_parts.append(f"기본 sink `{_display_value(default_sink.get('defaultSink'), default='미확인')}`")
+    if effective_status == "pass":
+        summary_text = "미니PC 오디오 장치와 음량 설정은 정상으로 보여"
+    else:
+        summary_text = _display_value(summary.get("summary"), default="확인 필요")
     return {
-        "status": _display_value(summary.get("status"), default="check_needed"),
+        "status": effective_status,
         "label": label,
-        "summary": _display_value(summary.get("summary"), default="확인 필요"),
+        "summary": summary_text,
         "evidence": " / ".join(evidence_parts),
+        "overviewDetail": " / ".join(evidence_parts),
+        "deviceLabelsText": ", ".join(f"`{label}`" for label in unique_device_labels),
+        "volumeText": f"`{mixer_summary}`" if mixer_summary else "",
+        "sinkText": f"`{_display_value(default_sink.get('defaultSink'), default='미확인')}`" if default_sink.get("available") else "",
         "action": "실제 소리 재생 확인은 `장비 소리 출력 점검`으로 따로 점검해",
     }
 
@@ -778,8 +832,15 @@ def _render_device_status_overview_result(
         lines.append(f"• 안내: {_display_device_status_probe_reason(ssh_reason)}")
         return "\n".join(lines)
 
+    def _append_component_line(label: str, summary: dict[str, Any], *, include_detail: bool = True) -> None:
+        detail = _display_value(summary.get("overviewDetail"), default="") if include_detail else ""
+        line = f"• {label}: *{_display_value(summary.get('label'), default='확인 필요')}*"
+        if detail:
+            line = f"{line} | {detail}"
+        lines.append(line)
+
     component_summaries = {
-        "소리 출력 경로": audio_summary or {},
+        "소리 출력": audio_summary or {},
         "pm2 앱": pm2_summary or {},
         "캡처보드": captureboard_summary or {},
         "LED": led_summary or {},
@@ -791,7 +852,7 @@ def _render_device_status_overview_result(
             worst_rank = max(worst_rank, 2)
         elif state != "pass":
             worst_rank = max(worst_rank, 1)
-        lines.append(f"• {label}: *{_display_value(summary.get('label'), default='확인 필요')}*")
+        _append_component_line(label, summary)
 
     if worst_rank >= 2:
         overall = "이상"
@@ -800,15 +861,8 @@ def _render_device_status_overview_result(
     else:
         overall = "정상"
 
-    overview_parts: list[str] = []
-    for label, summary in component_summaries.items():
-        short_summary = _display_value(summary.get("summary"), default="")
-        if short_summary:
-            overview_parts.append(f"{label} {short_summary}")
     lines.append(f"• 종합: *{overall}*")
-    if overview_parts:
-        lines.append(f"• 근거: {' / '.join(overview_parts)}")
-    lines.append("• 참고: 여기서 소리 출력은 무음 점검 기준이야. 실제 재생 확인은 `장비 소리 출력 점검`으로 따로 해")
+    lines.append(f"• 안내: 실제 소리 출력 테스트는 `{device_name} 장비 소리 출력 점검`으로 다시 명령해")
     return "\n".join(lines)
 
 

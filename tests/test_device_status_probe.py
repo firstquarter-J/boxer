@@ -12,6 +12,7 @@ from boxer_company.routers.device_status_probe import (
     _render_device_status_overview_result,
     _summarize_captureboard_probe,
     _summarize_led_probe,
+    _summarize_audio_path_probe,
     _summarize_pm2_probe,
 )
 
@@ -125,6 +126,41 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertEqual(summary["status"], "pass")
         self.assertIn("LED USB", summary["evidence"])
 
+    def test_summarizes_audio_path_as_passive_ok_when_devices_and_volume_exist(self) -> None:
+        summary = _summarize_audio_path_probe(
+            {
+                "tools": {"output": "aplay=/usr/bin/aplay\namixer=/usr/bin/amixer\npactl=\nspeaker-test="},
+                "playback_devices": {
+                    "output": (
+                        "**** List of PLAYBACK Hardware Devices ****\n"
+                        "card 0: Intel [HDA Intel], device 0: Generic Analog [Generic Analog]\n"
+                        "card 0: Intel [HDA Intel], device 3: Generic Digital [Generic Digital]\n"
+                    )
+                },
+                "master_mixer": {
+                    "output": (
+                        "Simple mixer control 'Master',0\n"
+                        "  Front Left: Playback 76 [87%] [-8.25dB] [on]\n"
+                        "  Front Right: Playback 76 [87%] [-8.25dB] [on]\n"
+                    )
+                },
+                "pcm_mixer": {
+                    "output": (
+                        "Simple mixer control 'PCM',0\n"
+                        "  Front Left: Playback 255 [100%] [0.00dB]\n"
+                        "  Front Right: Playback 255 [100%] [0.00dB]\n"
+                    )
+                },
+                "pactl_info": {"output": "pactl_missing"},
+            }
+        )
+
+        self.assertEqual(summary["status"], "pass")
+        self.assertEqual(summary["label"], "정상")
+        self.assertIn("Generic Analog", summary["evidence"])
+        self.assertIn("87%", summary["evidence"])
+        self.assertIn("오디오 장치", summary["evidence"])
+
     def test_overview_render_mentions_each_component(self) -> None:
         rendered = _render_device_status_overview_result(
             device_name="MB2-C00419",
@@ -135,17 +171,41 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
             },
             ssh_ready=True,
             ssh_reason="ready",
-            audio_summary={"label": "확인 필요", "status": "warning", "summary": "오디오 장치와 볼륨은 보이지만 실제 재생 테스트는 확정하지 못했어"},
-            pm2_summary={"label": "정상", "status": "pass", "summary": "PM2 기준 mommybox-v2 와 mommybox-agent 앱이 정상 실행 중이야"},
-            captureboard_summary={"label": "정상", "status": "pass", "summary": "캡처보드 USB와 비디오 장치가 같이 보여"},
-            led_summary={"label": "정상", "status": "pass", "summary": "LED 장치 USB 연결은 정상으로 보여"},
+            audio_summary={
+                "label": "정상",
+                "status": "pass",
+                "summary": "미니PC 오디오 장치와 음량 설정은 정상으로 보여",
+                "overviewDetail": "오디오 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`",
+                "deviceLabelsText": "`Generic Analog`, `Generic Digital`",
+                "volumeText": "`Master 87% on, PCM 100%`",
+            },
+            pm2_summary={
+                "label": "정상",
+                "status": "pass",
+                "summary": "PM2 기준 mommybox-v2 와 mommybox-agent 앱이 정상 실행 중이야",
+                "overviewDetail": "mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online",
+            },
+            captureboard_summary={
+                "label": "정상",
+                "status": "pass",
+                "summary": "캡처보드 USB와 비디오 장치가 같이 보여",
+                "overviewDetail": "MDA 타입 `YUH01` / USB `YUH01` / /dev/video `1개`",
+            },
+            led_summary={
+                "label": "정상",
+                "status": "pass",
+                "summary": "LED 장치 USB 연결은 정상으로 보여",
+                "overviewDetail": "LED USB 감지 / 시리얼 경로 `1개`",
+            },
         )
 
         self.assertIn("*장비 상태 점검*", rendered)
-        self.assertIn("• 소리 출력 경로: *확인 필요*", rendered)
-        self.assertIn("• pm2 앱: *정상*", rendered)
+        self.assertIn("• 소리 출력: *정상* | 오디오 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
+        self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
         self.assertIn("• 캡처보드: *정상*", rendered)
         self.assertIn("• LED: *정상*", rendered)
+        self.assertIn("• 종합: *정상*", rendered)
+        self.assertIn("• 안내: 실제 소리 출력 테스트는 `MB2-C00419 장비 소리 출력 점검`으로 다시 명령해", rendered)
 
 
 if __name__ == "__main__":
