@@ -832,13 +832,6 @@ def _render_device_status_overview_result(
         lines.append(f"• 안내: {_display_device_status_probe_reason(ssh_reason)}")
         return "\n".join(lines)
 
-    def _append_component_line(label: str, summary: dict[str, Any], *, include_detail: bool = True) -> None:
-        detail = _display_value(summary.get("overviewDetail"), default="") if include_detail else ""
-        line = f"• {label}: *{_display_value(summary.get('label'), default='확인 필요')}*"
-        if detail:
-            line = f"{line} | {detail}"
-        lines.append(line)
-
     component_summaries = {
         "소리 출력": audio_summary or {},
         "pm2 앱": pm2_summary or {},
@@ -852,7 +845,6 @@ def _render_device_status_overview_result(
             worst_rank = max(worst_rank, 2)
         elif state != "pass":
             worst_rank = max(worst_rank, 1)
-        _append_component_line(label, summary)
 
     if worst_rank >= 2:
         overall = "이상"
@@ -861,7 +853,56 @@ def _render_device_status_overview_result(
     else:
         overall = "정상"
 
-    lines.append(f"• 종합: *{overall}*")
+    audio_payload = audio_summary or {}
+    audio_label = _display_value(audio_payload.get("label"), default="확인 필요")
+    audio_device_labels = _display_value(audio_payload.get("deviceLabelsText"), default="")
+    audio_volume_text = _display_value(audio_payload.get("volumeText"), default="")
+    audio_parts: list[str] = []
+    if audio_device_labels:
+        audio_parts.append(f"장치 {audio_device_labels}")
+    if audio_volume_text:
+        audio_parts.append(f"음량 {audio_volume_text}")
+
+    pm2_payload = pm2_summary or {}
+    pm2_label = _display_value(pm2_payload.get("label"), default="확인 필요")
+    pm2_detail = _display_value(pm2_payload.get("overviewDetail"), default="")
+
+    capture_payload = captureboard_summary or {}
+    capture_label = _display_value(capture_payload.get("label"), default="확인 필요")
+    capture_detail = _display_value(capture_payload.get("overviewDetail"), default="")
+
+    led_payload = led_summary or {}
+    led_label = _display_value(led_payload.get("label"), default="확인 필요")
+    led_detail = _display_value(led_payload.get("overviewDetail"), default="")
+
+    lines.append("")
+    lines.append("*오디오*")
+    audio_line = f"• 소리 출력: *{audio_label}*"
+    if audio_parts:
+        audio_line = f"{audio_line} | {' / '.join(audio_parts)}"
+    lines.append(audio_line)
+
+    lines.append("")
+    lines.append("*런타임*")
+    pm2_line = f"• pm2 앱: *{pm2_label}*"
+    if pm2_detail:
+        pm2_line = f"{pm2_line} | {pm2_detail}"
+    lines.append(pm2_line)
+
+    lines.append("")
+    lines.append("*하드웨어*")
+    capture_line = f"• 캡처보드: *{capture_label}*"
+    if capture_detail:
+        capture_line = f"{capture_line} | {capture_detail}"
+    lines.append(capture_line)
+    led_line = f"• LED: *{led_label}*"
+    if led_detail:
+        led_line = f"{led_line} | {led_detail}"
+    lines.append(led_line)
+
+    lines.append("")
+    lines.append("*종합*")
+    lines.append(f"• 상태: *{overall}*")
     lines.append(f"• 안내: 실제 소리 출력 테스트는 `{device_name} 장비 소리 출력 점검`으로 다시 명령해")
     return "\n".join(lines)
 

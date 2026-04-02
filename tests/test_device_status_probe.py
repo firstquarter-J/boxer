@@ -200,11 +200,15 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         )
 
         self.assertIn("*장비 상태 점검*", rendered)
-        self.assertIn("• 소리 출력: *정상* | 오디오 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
+        self.assertIn("*오디오*", rendered)
+        self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
+        self.assertIn("*런타임*", rendered)
         self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
-        self.assertIn("• 캡처보드: *정상*", rendered)
-        self.assertIn("• LED: *정상*", rendered)
-        self.assertIn("• 종합: *정상*", rendered)
+        self.assertIn("*하드웨어*", rendered)
+        self.assertIn("• 캡처보드: *정상* | MDA 타입 `YUH01` / USB `YUH01` / /dev/video `1개`", rendered)
+        self.assertIn("• LED: *정상* | LED USB 감지 / 시리얼 경로 `1개`", rendered)
+        self.assertIn("*종합*", rendered)
+        self.assertIn("• 상태: *정상*", rendered)
         self.assertIn("• 안내: 실제 소리 출력 테스트는 `MB2-C00419 장비 소리 출력 점검`으로 다시 명령해", rendered)
 
 
