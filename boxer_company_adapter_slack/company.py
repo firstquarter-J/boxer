@@ -96,6 +96,16 @@ from boxer_company.routers.device_audio_probe import (
     _is_device_audio_probe_request,
     _probe_device_audio_output,
 )
+from boxer_company.routers.device_status_probe import (
+    _build_device_status_probe_config_message,
+    _extract_device_name_for_status_probe,
+    _is_device_captureboard_probe_request,
+    _is_device_led_probe_request,
+    _is_device_pm2_probe_request,
+    _is_device_status_probe_request,
+    _probe_device_runtime_component,
+    _probe_device_status_overview,
+)
 from boxer_company.routers.mda_graphql import _create_mda_activity_log
 from boxer_company.routers.request_log_query import (
     _extract_request_log_query,
@@ -3115,6 +3125,7 @@ def create_app() -> App:
         structured_hospital_seq, structured_hospital_room_seq = _extract_capture_seq_filters(question)
         structured_device_name = _extract_device_name_scope(question)
         audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
+        status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
         structured_device_seq = _extract_device_seq_filter(question)
         structured_device_status = _extract_device_status_filter(question)
         structured_active_flag, structured_install_flag = _extract_device_flag_filters(question)
@@ -3189,6 +3200,163 @@ def create_app() -> App:
                 reply("병실 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
+        if _is_device_audio_probe_request(question, device_name=audio_probe_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_audio_probe_config_message())
+                return
+
+            try:
+                result_text, evidence_payload = _probe_device_audio_output(
+                    audio_probe_device_name or "",
+                )
+                _reply_with_retrieval_synthesis(
+                    result_text,
+                    evidence_payload,
+                    route_name="device audio probe",
+                    max_tokens=280,
+                )
+                logger.info(
+                    "Responded with device audio probe in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    audio_probe_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 소리 출력 점검 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device audio probe failed")
+                reply(_build_dependency_failure_reply("장비 소리 출력 점검", exc))
+            except Exception:
+                logger.exception("Device audio probe failed")
+                reply("장비 소리 출력 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_pm2_probe_request(question, device_name=status_probe_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_status_probe_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device pm2 probe", handler_type="router")
+                result_text, _ = _probe_device_runtime_component(
+                    status_probe_device_name or "",
+                    component="pm2",
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with device pm2 probe in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    status_probe_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 PM2 상태 점검 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device pm2 probe failed")
+                reply(_build_dependency_failure_reply("장비 PM2 상태 점검", exc))
+            except Exception:
+                logger.exception("Device pm2 probe failed")
+                reply("장비 PM2 상태 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_captureboard_probe_request(question, device_name=status_probe_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_status_probe_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device captureboard probe", handler_type="router")
+                result_text, _ = _probe_device_runtime_component(
+                    status_probe_device_name or "",
+                    component="captureboard",
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with device captureboard probe in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    status_probe_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 캡처보드 점검 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device captureboard probe failed")
+                reply(_build_dependency_failure_reply("장비 캡처보드 점검", exc))
+            except Exception:
+                logger.exception("Device captureboard probe failed")
+                reply("장비 캡처보드 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_led_probe_request(question, device_name=status_probe_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_status_probe_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device led probe", handler_type="router")
+                result_text, _ = _probe_device_runtime_component(
+                    status_probe_device_name or "",
+                    component="led",
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with device led probe in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    status_probe_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 LED 점검 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device led probe failed")
+                reply(_build_dependency_failure_reply("장비 LED 점검", exc))
+            except Exception:
+                logger.exception("Device led probe failed")
+                reply("장비 LED 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_status_probe_request(question, device_name=status_probe_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_status_probe_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device status probe", handler_type="router")
+                result_text, _ = _probe_device_status_overview(
+                    status_probe_device_name or "",
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with device status probe in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    status_probe_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 상태 점검 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device status probe failed")
+                reply(_build_dependency_failure_reply("장비 상태 점검", exc))
+            except Exception:
+                logger.exception("Device status probe failed")
+                reply("장비 상태 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
         if _is_devices_filter_query_request(
             question,
             device_name=structured_device_name,
@@ -3236,40 +3404,6 @@ def create_app() -> App:
             except Exception:
                 logger.exception("Devices filters query failed")
                 reply("장비 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
-            return
-
-        if _is_device_audio_probe_request(question, device_name=audio_probe_device_name):
-            if (
-                not cs.MDA_GRAPHQL_URL
-                or not cs.MDA_ADMIN_USER_PASSWORD
-                or not cs.DEVICE_SSH_PASSWORD
-            ):
-                reply(_build_device_audio_probe_config_message())
-                return
-
-            try:
-                result_text, evidence_payload = _probe_device_audio_output(
-                    audio_probe_device_name or "",
-                )
-                _reply_with_retrieval_synthesis(
-                    result_text,
-                    evidence_payload,
-                    route_name="device audio probe",
-                    max_tokens=280,
-                )
-                logger.info(
-                    "Responded with device audio probe in thread_ts=%s deviceName=%s",
-                    thread_ts,
-                    audio_probe_device_name,
-                )
-            except ValueError as exc:
-                reply(f"장비 소리 출력 점검 요청 형식 오류: {exc}")
-            except RuntimeError as exc:
-                logger.exception("Device audio probe failed")
-                reply(_build_dependency_failure_reply("장비 소리 출력 점검", exc))
-            except Exception:
-                logger.exception("Device audio probe failed")
-                reply("장비 소리 출력 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
         if _is_ultrasound_capture_filter_query_request(
