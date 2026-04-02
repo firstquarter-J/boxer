@@ -57,6 +57,7 @@ from boxer_company.routers.barcode_log import (
     _extract_year_filter,
     _is_barcode_all_recorded_dates_request,
     _is_barcode_baby_ai_list_request,
+    _is_normal_video_status,
     _is_baby_ai_list_request_without_barcode,
     _is_barcode_video_info_request,
     _is_barcode_log_analysis_request,
@@ -772,6 +773,7 @@ _BABYMAGIC_RETRY_ACTION = (
     "유저가 앱에서 생성한 아이에 바코드를 등록했는지 먼저 확인하고, "
     "그다음 MDA 베이비매직 관리에서 재전송을 시도해"
 )
+_MOMMYBOX_RECORDING_PROCESS_TITLE = "마미박스 프로세스 순서"
 _PINK_BARCODE_OVERVIEW_TITLE = "핑크 바코드: 운영 개요"
 _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE = "바코드 표시: 구매 병원과 첫 촬영 병원이 다른 경우"
 _PINK_BARCODE_VALIDATION_POLICY_TITLE = "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지"
@@ -876,6 +878,7 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
             break
 
     is_pink_barcode_overview_doc = primary_title == _PINK_BARCODE_OVERVIEW_TITLE
+    is_mommybox_recording_process_doc = primary_title == _MOMMYBOX_RECORDING_PROCESS_TITLE
     is_barcode_sync_doc = primary_title == "바코드 동기화: 분만 병원에서 핑크 바코드가 스캔되는 경우"
     is_barcode_first_recording_edge_case_doc = primary_title == _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE
     is_pink_barcode_validation_policy_doc = primary_title == _PINK_BARCODE_VALIDATION_POLICY_TITLE
@@ -952,6 +955,12 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         lines.append("• 결론: 핑크 바코드 이슈는 동기화, 앱 표시, 검증 정책 3가지로 나눠 봐야 해")
         lines.append("• 확인: 지금 질문이 분만 병원에서 스캔된 건지, 앱에 핑크로 보이는 건지, 검증 해제 정책인지 먼저 구분해")
         lines.append("• 조치: 스캔 이슈면 동기화 문서, 앱 표시 이슈면 첫 촬영 병원 문서, 허용/차단 정책이면 검증 정책 문서 기준으로 이어서 보면 돼")
+        return "\n".join(lines)
+
+    if is_mommybox_recording_process_doc:
+        lines.append("• 결론: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼")
+        lines.append("• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 본 녹화 종료와 같은 의미가 아니야")
+        lines.append("• 조치: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도한다고 안내해")
         return "\n".join(lines)
 
     if is_barcode_sync_doc and not is_meaning_question:
@@ -1911,12 +1920,12 @@ def create_app() -> App:
             detail = session_entry.get("detail") if isinstance(session_entry, dict) else {}
             if not isinstance(detail, dict):
                 return False
-            recording_result = str(detail.get("recordingResult") or "").strip()
+            video_status = str(detail.get("videoStatus") or detail.get("recordingResult") or "").strip()
             return (
                 bool(detail.get("restartDetected"))
                 or not bool(detail.get("normalClosed"))
                 or int(detail.get("errorLineCount") or 0) > 0
-                or (recording_result not in {"", "정상 녹화로 판단"})
+                or (video_status and not _is_normal_video_status(video_status))
             )
 
         def _build_barcode_log_error_session_record(session_entry: dict[str, Any]) -> dict[str, Any]:
@@ -1969,7 +1978,11 @@ def create_app() -> App:
             stop_token = str(detail.get("stopToken") or "미확인").strip() or "미확인"
             normal_closed = bool(detail.get("normalClosed"))
             restart_detected = bool(detail.get("restartDetected"))
-            recording_result = str(detail.get("recordingResult") or "추가 확인 필요").strip() or "추가 확인 필요"
+            termination_status = str(
+                detail.get("terminationStatus")
+                or ("정상 종료" if bool(detail.get("normalClosed")) else "비정상 종료")
+            ).strip() or "미확인"
+            recording_result = str(detail.get("videoStatus") or detail.get("recordingResult") or "추가 확인 필요").strip() or "추가 확인 필요"
             session_record = _build_barcode_log_error_session_record(session_entry)
             tags = set(session_record.get("classificationTags") or [])
             error_line_count = int(session_record.get("errorLineCount") or 0)
@@ -2037,7 +2050,7 @@ def create_app() -> App:
                 impact_line = f"• 영향: error 라인 `{error_line_count}줄`이 확인됐고 `{recording_result}` 상태야"
             elif top_signature != "미확인" and top_count == 1:
                 cause_line = f"• 핵심 원인: `{top_component}` 오류가 1회 확인돼 영향 여부 점검이 필요해"
-                impact_line = f"• 영향: 종료 상태는 `{stop_token}` 기준 정상인데 `{recording_result}` 상태야"
+                impact_line = f"• 영향: 종료 상태는 `{termination_status}`인데 영상 상태는 `{recording_result}`야"
             else:
                 cause_line = "• 핵심 원인: 운영 근거상 추가 확인이 필요해"
                 impact_line = f"• 영향: 현재 판정은 `{recording_result}`이야"
@@ -2104,6 +2117,8 @@ def create_app() -> App:
                     "stopToken": detail.get("stopToken"),
                     "normalClosed": detail.get("normalClosed"),
                     "restartDetected": detail.get("restartDetected"),
+                    "terminationStatus": detail.get("terminationStatus"),
+                    "videoStatus": detail.get("videoStatus"),
                     "recordingResult": detail.get("recordingResult"),
                     "recordingsOnDateCount": session_entry.get("recordingsOnDateCount"),
                     "errorLineCount": detail.get("errorLineCount"),

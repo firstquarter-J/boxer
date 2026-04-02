@@ -608,7 +608,10 @@ def _build_recording_failure_session_scope_request_message(
                 continue
             start_time = _display_value(session_detail.get("startTime"), default="시간미상")
             stop_time = _display_value(session_detail.get("stopTime"), default="미확인")
-            result_text = _display_value(session_detail.get("recordingResult"), default="미확인")
+            result_text = _display_value(
+                session_detail.get("videoStatus") or session_detail.get("recordingResult"),
+                default="미확인",
+            )
             lines.append(
                 f"- 세션 {candidate_index}: `{start_time}` ~ `{stop_time}` / `{device_name}` / `{hospital_name}` `{room_name}` / `{result_text}`"
             )

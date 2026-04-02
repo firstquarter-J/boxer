@@ -16,6 +16,18 @@ _BABYMAGIC_REFERENCES = [
         ],
     }
 ]
+_MOMMYBOX_RECORDING_PROCESS_REFERENCES = [
+    {
+        "title": "마미박스 프로세스 순서",
+        "previewLines": [
+            "순서: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼",
+            "상태: 모션 감지 단계의 MDA 상태는 RECORDING이 아니라 SESSION이야",
+            "전환: 모션 감지 성공 또는 타임아웃이면 녹화 시작 음성 후 본 녹화가 시작되고 상태가 RECORDING으로 바뀌어",
+            "주의: 모션 감지 단계에서 종료 스캔하면 본 녹화 종료가 아니라 취소 성격으로 처리될 수 있어",
+            "종료: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도해",
+        ],
+    }
+]
 _PINK_BARCODE_OVERVIEW_REFERENCES = [
     {
         "title": "핑크 바코드: 운영 개요",
@@ -44,6 +56,25 @@ _PINK_BARCODE_VALIDATION_POLICY_REFERENCES = [
 
 
 class NotionDocFallbackTests(unittest.TestCase):
+    def test_mommybox_recording_process_explains_session_recording_and_upload(self) -> None:
+        text = _build_notion_doc_fallback(
+            "마미박스 녹화 프로세스 설명",
+            _MOMMYBOX_RECORDING_PROCESS_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼",
+            text,
+        )
+        self.assertIn(
+            "• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 본 녹화 종료와 같은 의미가 아니야",
+            text,
+        )
+        self.assertIn(
+            "• 조치: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도한다고 안내해",
+            text,
+        )
+
     def test_pink_barcode_overview_breaks_question_into_three_tracks(self) -> None:
         text = _build_notion_doc_fallback(
             "핑크 바코드 전체 정리해줘",

@@ -55,6 +55,50 @@ _LOW_SIGNAL_NOTION_TERMS = {
 }
 _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
     {
+        "pageId": "local-playbook:mommybox-recording-process",
+        "section": "마미박스 가이드",
+        "kind": "guide",
+        "priority": "high",
+        "title": "마미박스 프로세스 순서",
+        "keywords": (
+            "마미박스",
+            "녹화 프로세스",
+            "프로세스",
+            "순서",
+            "흐름",
+            "단계",
+            "과정",
+            "세션",
+            "녹화",
+            "모션 감지",
+            "SESSION",
+            "RECORDING",
+            "업로드",
+        ),
+        "requiredTokenGroups": (
+            (
+                "마미박스",
+                "mommybox",
+            ),
+            (
+                "프로세스",
+                "순서",
+                "흐름",
+                "단계",
+                "과정",
+                "세션 진행",
+            ),
+        ),
+        "previewLines": (
+            "순서: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼",
+            "상태: 모션 감지 단계의 MDA 상태는 RECORDING이 아니라 SESSION이야",
+            "전환: 모션 감지 성공 또는 타임아웃이면 녹화 시작 음성 후 본 녹화가 시작되고 상태가 RECORDING으로 바뀌어",
+            "주의: 모션 감지 단계에서 종료 스캔하면 본 녹화 종료가 아니라 취소 성격으로 처리될 수 있어",
+            "종료: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도해",
+            "주의: 모션 감지 성공만 녹화 시작 조건인 건 아니고 타임아웃도 본 녹화 시작 경로야",
+        ),
+    },
+    {
         "pageId": "local-playbook:pink-barcode-overview",
         "section": "운영 정책",
         "kind": "overview",

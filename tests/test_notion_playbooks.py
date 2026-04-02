@@ -6,6 +6,22 @@ from boxer_company.notion_playbooks import _select_notion_references
 
 class NotionPlaybooksTests(unittest.TestCase):
     @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
+    def test_local_mommybox_process_playbook_is_selected_without_notion(self, _: object) -> None:
+        references = _select_notion_references(
+            "마미박스 녹화 프로세스 설명해줘",
+            evidence_payload={
+                "route": "notion_playbook_qa",
+                "request": {
+                    "question": "마미박스 녹화 프로세스 설명해줘",
+                },
+            },
+        )
+
+        self.assertTrue(references)
+        self.assertEqual(references[0]["title"], "마미박스 프로세스 순서")
+        self.assertIn("준비 음성", references[0]["previewLines"][0])
+
+    @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
     def test_local_pink_barcode_overview_playbook_is_selected_for_overview_query(self, _: object) -> None:
         references = _select_notion_references(
             "핑크 바코드 전체 정리해줘",
