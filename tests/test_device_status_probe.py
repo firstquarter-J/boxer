@@ -203,6 +203,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*오디오*", rendered)
         self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
         self.assertIn("*런타임*", rendered)
+        self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
+        self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
         self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
         self.assertIn("*하드웨어*", rendered)
         self.assertIn("• 캡처보드: *정상* | MDA 타입 `YUH01` / USB `YUH01` / /dev/video `1개`", rendered)
@@ -210,6 +212,22 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*종합*", rendered)
         self.assertIn("• 상태: *정상*", rendered)
         self.assertIn("• 안내: 실제 소리 출력 테스트는 `MB2-C00419 장비 소리 출력 점검`으로 다시 명령해", rendered)
+
+    def test_overview_render_marks_ssh_and_download_unavailable_when_ssh_not_ready(self) -> None:
+        rendered = _render_device_status_overview_result(
+            device_name="MB2-C00419",
+            device_info={},
+            ssh_ready=False,
+            ssh_reason="agent_ssh_not_ready",
+            audio_summary=None,
+            pm2_summary=None,
+            captureboard_summary=None,
+            led_summary=None,
+        )
+
+        self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
+        self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
+        self.assertIn("• 안내: 장비 SSH 연결 준비 실패. 온라인 상태, 네트워크, 원격 접속 상태 먼저 확인해", rendered)
 
 
 if __name__ == "__main__":

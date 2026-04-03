@@ -783,6 +783,14 @@ def _build_device_header_lines(
     return lines
 
 
+def _format_probe_ssh_status_display(ready: bool) -> str:
+    return "🔵 *연결 가능*" if ready else "🔴 *연결 불가*"
+
+
+def _format_probe_download_availability_display(ready: bool) -> str:
+    return "🔵 *가능*" if ready else "🔴 *불가*"
+
+
 def _render_single_probe_result(
     *,
     title: str,
@@ -824,7 +832,8 @@ def _render_device_status_overview_result(
         device_info=device_info,
     )
     if not ssh_ready:
-        lines.append("• SSH 연결: *점검 불가*")
+        lines.append(f"• SSH 연결 상태: {_format_probe_ssh_status_display(False)}")
+        lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(False)}")
         lines.append("• 소리 출력 경로: *점검 불가*")
         lines.append("• pm2 앱: *점검 불가*")
         lines.append("• 캡처보드: *점검 불가*")
@@ -884,6 +893,8 @@ def _render_device_status_overview_result(
 
     lines.append("")
     lines.append("*런타임*")
+    lines.append(f"• SSH 연결 상태: {_format_probe_ssh_status_display(ssh_ready)}")
+    lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(ssh_ready)}")
     pm2_line = f"• pm2 앱: *{pm2_label}*"
     if pm2_detail:
         pm2_line = f"{pm2_line} | {pm2_detail}"
