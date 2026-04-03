@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any
 
-from boxer.core.utils import _display_value
+from boxer.core.utils import _display_value, _format_size, _truncate_text
 from boxer_company import settings as cs
 from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_audio_probe import (
@@ -35,6 +35,22 @@ _DEVICE_STATUS_HINTS = (
     "헬스체크",
 )
 _DEVICE_PM2_HINTS = ("pm2",)
+_DEVICE_MEMORY_PATCH_HINTS = (
+    "메모리 패치",
+    "메모리패치",
+    "memory patch",
+)
+_DEVICE_MEMORY_PATCH_BLOCKING_HINTS = (
+    "방법",
+    "어떻게",
+    "확인 방법",
+    "문제 확인",
+    "가이드",
+    "설명",
+    "뭐야",
+    "무엇",
+    "왜",
+)
 _DEVICE_CAPTUREBOARD_HINTS = (
     "캡처보드",
     "캡쳐보드",
@@ -45,6 +61,7 @@ _DEVICE_LED_HINTS = ("led", "엘이디")
 _DEVICE_STATUS_ALL_HINTS = (
     *_DEVICE_STATUS_HINTS,
     *_DEVICE_PM2_HINTS,
+    *_DEVICE_MEMORY_PATCH_HINTS,
     *_DEVICE_CAPTUREBOARD_HINTS,
     *_DEVICE_LED_HINTS,
 )
@@ -69,6 +86,20 @@ _PM2_CANONICAL_APP_ORDER = ("mommybox-v2", "mommybox-agent")
 _PM2_REQUIRED_APPS = ("mommybox-v2",)
 _PM2_TRANSITION_STATUSES = {"launching", "waiting restart", "stopping"}
 _LOGIN_SHELL_USER_PATH_EXPORT = 'export PATH="$HOME/.npm-global/bin:$HOME/bin:/usr/local/bin:$PATH"; '
+_MEMORY_PATCH_EXPECTED_BYTES = 4 * 1024 * 1024 * 1024
+_MEMORY_PATCH_VALUE_PATTERN = re.compile(r"\b(\d{6,})\b")
+_MEMORY_PATCH_EXECUTION_COMMAND = (
+    "bash -lc '"
+    f"{_LOGIN_SHELL_USER_PATH_EXPORT}"
+    "cd mommybox-v2 && (pm2 delete mommybox-v2 || true) && pm2 start --env production && pm2 save'"
+)
+_MEMORY_PATCH_VERIFY_COMMAND = (
+    "bash -lc '"
+    f"{_LOGIN_SHELL_USER_PATH_EXPORT}"
+    "if command -v pm2 >/dev/null 2>&1; then "
+    "pm2 prettylist | grep max_memory_restart || true; "
+    "else echo pm2_missing; fi'"
+)
 
 _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
     "tools": {
@@ -229,6 +260,16 @@ def _is_device_pm2_probe_request(question: str, device_name: str | None = None) 
     return bool(resolved_device_name and _contains_hint(normalized, _DEVICE_PM2_HINTS))
 
 
+def _is_device_memory_patch_request(question: str, device_name: str | None = None) -> bool:
+    normalized = _normalize_device_status_question(question)
+    resolved_device_name = str(
+        device_name or _extract_device_name_scope(normalized) or _extract_device_name_for_status_probe(normalized) or ""
+    ).strip()
+    if not resolved_device_name or not _contains_hint(normalized, _DEVICE_MEMORY_PATCH_HINTS):
+        return False
+    return not _contains_hint(normalized, _DEVICE_MEMORY_PATCH_BLOCKING_HINTS)
+
+
 def _is_device_captureboard_probe_request(question: str, device_name: str | None = None) -> bool:
     normalized = _normalize_device_status_question(question)
     resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
@@ -262,6 +303,13 @@ def _build_device_status_probe_config_message() -> str:
     )
 
 
+def _build_device_memory_patch_config_message() -> str:
+    return (
+        "장비 메모리 패치 설정이 부족해. "
+        "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD가 필요해"
+    )
+
+
 def _display_device_status_probe_reason(reason: str | None) -> str:
     normalized = str(reason or "").strip().lower()
     if normalized in {"agent_ssh_not_ready", "novalidconnectionserror", "timeout", "oerror"}:
@@ -281,12 +329,26 @@ def _display_device_status_probe_reason(reason: str | None) -> str:
     return normalized
 
 
-def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
-    spec = _PROBE_COMMAND_SPECS[key]
-    command = str(spec.get("command") or "").strip()
-    timeout_sec = max(1, int(spec.get("timeout_sec") or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10))
+def _display_device_memory_patch_reason(reason: str | None) -> str:
+    normalized = str(reason or "").strip().lower()
+    if normalized == "pm2_missing":
+        return "장비에서 pm2 명령을 찾지 못했어"
+    if normalized.startswith("ssh_exit_"):
+        return f"메모리 패치 명령 실패 ({normalized})"
+    return _display_device_status_probe_reason(reason)
+
+
+def _run_remote_ssh_command(
+    client: Any,
+    *,
+    command: str,
+    summary: str,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    normalized_command = str(command or "").strip()
+    actual_timeout = max(1, int(timeout_sec or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10))
     try:
-        _, stdout, stderr = client.exec_command(command, timeout=timeout_sec)
+        _, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
         exit_status = stdout.channel.recv_exit_status()
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
         stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
@@ -296,8 +358,8 @@ def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
             if stdout_text and stderr_text not in stdout_text:
                 combined = f"{stdout_text}\n{stderr_text}"
         return {
-            "key": key,
-            "summary": _display_value(spec.get("summary"), default=""),
+            "summary": _display_value(summary, default=""),
+            "command": normalized_command,
             "ok": exit_status == 0,
             "exitStatus": exit_status,
             "output": combined,
@@ -305,13 +367,27 @@ def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
         }
     except Exception as exc:  # pragma: no cover - network/remote dependent
         return {
-            "key": key,
-            "summary": _display_value(spec.get("summary"), default=""),
+            "summary": _display_value(summary, default=""),
+            "command": normalized_command,
             "ok": False,
             "exitStatus": None,
             "output": "",
             "reason": type(exc).__name__.lower(),
         }
+
+
+def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
+    spec = _PROBE_COMMAND_SPECS[key]
+    result = _run_remote_ssh_command(
+        client,
+        command=str(spec.get("command") or "").strip(),
+        summary=_display_value(spec.get("summary"), default=""),
+        timeout_sec=max(1, int(spec.get("timeout_sec") or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+    )
+    return {
+        "key": key,
+        **result,
+    }
 
 
 def _parse_usb_devices(text: str) -> dict[str, Any]:
@@ -425,6 +501,32 @@ def _parse_pm2_processes(text: str) -> dict[str, Any]:
         "available": True,
         "reason": "ok",
         "processes": processes,
+    }
+
+
+def _parse_pm2_memory_restart_values(text: str) -> dict[str, Any]:
+    normalized = str(text or "").strip()
+    if normalized == "pm2_missing":
+        return {
+            "available": False,
+            "reason": "pm2_missing",
+            "values": [],
+            "display": "",
+            "hasExpectedLimit": False,
+        }
+
+    raw_values = [int(match) for match in _MEMORY_PATCH_VALUE_PATTERN.findall(normalized)]
+    values: list[int] = []
+    for value in raw_values:
+        if value not in values:
+            values.append(value)
+
+    return {
+        "available": True,
+        "reason": "ok" if values else "value_missing",
+        "values": values,
+        "display": ", ".join(f"{value} ({_format_size(value)})" for value in values),
+        "hasExpectedLimit": bool(values) and all(value >= _MEMORY_PATCH_EXPECTED_BYTES for value in values),
     }
 
 
@@ -815,6 +917,167 @@ def _render_single_probe_result(
     return "\n".join(lines)
 
 
+def _compact_probe_output(text: str, *, max_chars: int = 280) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return _truncate_text(" / ".join(lines), max_chars)
+
+
+def _summarize_device_memory_patch(
+    *,
+    precheck: dict[str, Any],
+    execution: dict[str, Any],
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    if not precheck.get("ok"):
+        return {
+            "status": "fail",
+            "label": "실패",
+            "summary": _display_device_memory_patch_reason(precheck.get("reason")),
+            "action": "장비 SSH 상태와 PM2 접근 상태를 확인하고 다시 시도해",
+        }
+    if precheck.get("reason") == "pm2_missing":
+        return {
+            "status": "fail",
+            "label": "실패",
+            "summary": _display_device_memory_patch_reason(precheck.get("reason")),
+            "action": "장비에서 PM2 설치 상태와 PATH를 먼저 확인해",
+        }
+    if precheck.get("hasExpectedLimit"):
+        return {
+            "status": "pass",
+            "label": "정상",
+            "summary": "이미 4GB 메모리 설정이라 메모리 패치를 생략했어",
+            "action": "추가 조치 필요 없어",
+        }
+
+    if not execution.get("ok"):
+        return {
+            "status": "fail",
+            "label": "실패",
+            "summary": _display_device_memory_patch_reason(execution.get("reason")),
+            "action": "장비 경로, PM2 상태, 권한을 확인하고 다시 시도해",
+        }
+    if verification.get("hasExpectedLimit"):
+        return {
+            "status": "pass",
+            "label": "완료",
+            "summary": "CS에서 말하는 메모리 패치를 적용했고 4GB 설정으로 확인됐어",
+            "action": "재부팅 이후에도 유지되도록 pm2 save까지 끝냈어",
+        }
+    if verification.get("available") and verification.get("values"):
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "명령은 끝났지만 4GB 메모리 설정으로 보이지 않아",
+            "action": "PM2 ecosystem 설정과 prettylist 결과를 다시 확인해",
+        }
+    return {
+        "status": "warning",
+        "label": "확인 필요",
+        "summary": "명령은 끝났지만 max_memory_restart 값을 확인하지 못했어",
+        "action": "장비에서 `pm2 prettylist | grep max_memory_restart` 결과를 다시 확인해",
+    }
+
+
+def _render_device_memory_patch_result(
+    *,
+    device_name: str,
+    device_info: dict[str, Any],
+    ssh_ready: bool,
+    ssh_reason: str,
+    precheck: dict[str, Any] | None,
+    execution: dict[str, Any] | None,
+    verification: dict[str, Any] | None,
+) -> str:
+    lines = _build_device_header_lines(
+        title="*장비 메모리 패치*",
+        device_name=device_name,
+        device_info=device_info,
+    )
+    if not ssh_ready:
+        lines.append("• 판정: *실행 불가*")
+        lines.append(f"• 안내: {_display_device_memory_patch_reason(ssh_reason)}")
+        return "\n".join(lines)
+
+    precheck_payload = precheck or {}
+    execution_payload = execution or {}
+    verification_payload = verification or {}
+    summary = _summarize_device_memory_patch(
+        precheck=precheck_payload,
+        execution=execution_payload,
+        verification=verification_payload,
+    )
+
+    lines.append(f"• 판정: *{_display_value(summary.get('label'), default='확인 필요')}*")
+
+    precheck_display = _display_value(precheck_payload.get("display"), default="")
+    if precheck_display:
+        lines.append(f"• 사전 확인: `max_memory_restart={precheck_display}`")
+    elif precheck_payload.get("reason") == "pm2_missing":
+        lines.append("• 사전 확인: `pm2` 명령을 찾지 못했어")
+    elif not precheck_payload.get("ok"):
+        lines.append(
+            f"• 사전 확인: {_display_device_memory_patch_reason(precheck_payload.get('reason'))}"
+        )
+    else:
+        lines.append("• 사전 확인: `max_memory_restart` 값을 읽지 못했어")
+
+    if execution_payload:
+        lines.append("• 실행: `mommybox-v2` PM2 재등록 후 `pm2 save`")
+    else:
+        lines.append("• 실행: 이미 정상이라 생략")
+
+    if execution_payload:
+        verification_display = _display_value(verification_payload.get("display"), default="")
+        if verification_display:
+            lines.append(f"• 실행 후 확인: `max_memory_restart={verification_display}`")
+        elif verification_payload.get("reason") == "pm2_missing":
+            lines.append("• 실행 후 확인: `pm2` 명령을 찾지 못해 `max_memory_restart`를 읽지 못했어")
+        else:
+            lines.append("• 실행 후 확인: `max_memory_restart` 값을 읽지 못했어")
+
+    lines.append(f"• 안내: {_display_value(summary.get('summary'), default='확인 필요')}")
+    action = _display_value(summary.get("action"), default="")
+    if action:
+        lines.append(f"• 조치: {action}")
+
+    if not precheck_payload.get("ok"):
+        precheck_output = _compact_probe_output(_display_value(precheck_payload.get("output"), default=""))
+        if precheck_output:
+            lines.append(f"• 로그: `{precheck_output}`")
+    elif execution_payload and not execution_payload.get("ok"):
+        failure_output = _compact_probe_output(_display_value(execution_payload.get("output"), default=""))
+        if failure_output:
+            lines.append(f"• 로그: `{failure_output}`")
+    elif execution_payload and verification_payload.get("available") and not verification_payload.get("hasExpectedLimit"):
+        verification_output = _compact_probe_output(_display_value(verification_payload.get("output"), default=""))
+        if verification_output:
+            lines.append(f"• 참고: `{verification_output}`")
+
+    return _truncate_text("\n".join(lines), 38000)
+
+
+def _build_memory_patch_check_payload(command_result: dict[str, Any]) -> dict[str, Any]:
+    output = _display_value(command_result.get("output"), default="")
+    if not command_result.get("ok"):
+        return {
+            "available": False,
+            "reason": _display_value(command_result.get("reason"), default="check_failed"),
+            "values": [],
+            "display": "",
+            "hasExpectedLimit": False,
+            "output": output,
+            "ok": False,
+            "exitStatus": command_result.get("exitStatus"),
+        }
+
+    parsed = _parse_pm2_memory_restart_values(output)
+    parsed["output"] = output
+    parsed["ok"] = True
+    parsed["exitStatus"] = command_result.get("exitStatus")
+    return parsed
+
+
 def _render_device_status_overview_result(
     *,
     device_name: str,
@@ -1093,5 +1356,101 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
         pm2_summary=pm2_summary,
         captureboard_summary=captureboard_summary,
         led_summary=led_summary,
+    )
+    return result_text, evidence_payload
+
+
+def _patch_device_pm2_memory(device_name: str) -> tuple[str, dict[str, Any]]:
+    normalized_device_name = str(device_name or "").strip()
+    if not normalized_device_name:
+        raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 메모리 패치`")
+
+    evidence_payload, device_info = _build_runtime_probe_payload(
+        device_name=normalized_device_name,
+        component="pm2_memory_patch",
+    )
+    ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
+    ssh_ready = bool(ssh.get("ready"))
+    ssh_reason = _display_value(ssh.get("reason"), default="")
+
+    if not ssh_ready:
+        result_text = _render_device_memory_patch_result(
+            device_name=normalized_device_name,
+            device_info=device_info,
+            ssh_ready=False,
+            ssh_reason=ssh_reason,
+            precheck=None,
+            execution=None,
+            verification=None,
+        )
+        return result_text, evidence_payload
+
+    host = _display_value(ssh.get("host"), default="")
+    try:
+        port = int(ssh.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+
+    connection = _connect_device_ssh_client(host, port)
+    if not connection.get("ok"):
+        ssh_reason = _display_value(connection.get("reason"), default="ssh_connect_failed")
+        evidence_payload["ssh"] = {
+            **ssh,
+            "ready": False,
+            "reason": ssh_reason,
+        }
+        result_text = _render_device_memory_patch_result(
+            device_name=normalized_device_name,
+            device_info=device_info,
+            ssh_ready=False,
+            ssh_reason=ssh_reason,
+            precheck=None,
+            execution=None,
+            verification=None,
+        )
+        return result_text, evidence_payload
+
+    client = connection["client"]
+    try:
+        precheck_command = _run_remote_ssh_command(
+            client,
+            command=_MEMORY_PATCH_VERIFY_COMMAND,
+            summary="사전 max_memory_restart 확인",
+            timeout_sec=max(10, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        )
+        precheck = _build_memory_patch_check_payload(precheck_command)
+
+        execution: dict[str, Any] | None = None
+        verification: dict[str, Any] | None = None
+        if precheck.get("ok") and precheck.get("reason") != "pm2_missing" and not precheck.get("hasExpectedLimit"):
+            execution = _run_remote_ssh_command(
+                client,
+                command=_MEMORY_PATCH_EXECUTION_COMMAND,
+                summary="메모리 패치 실행",
+                timeout_sec=max(30, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+            )
+            if execution.get("ok"):
+                verification_command = _run_remote_ssh_command(
+                    client,
+                    command=_MEMORY_PATCH_VERIFY_COMMAND,
+                    summary="실행 후 max_memory_restart 확인",
+                    timeout_sec=max(10, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+                )
+                verification = _build_memory_patch_check_payload(verification_command)
+    finally:
+        client.close()
+
+    evidence_payload["precheck"] = precheck
+    evidence_payload["execution"] = execution
+    evidence_payload["verification"] = verification
+
+    result_text = _render_device_memory_patch_result(
+        device_name=normalized_device_name,
+        device_info=device_info,
+        ssh_ready=True,
+        ssh_reason="ready",
+        precheck=precheck,
+        execution=execution,
+        verification=verification,
     )
     return result_text, evidence_payload

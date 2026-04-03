@@ -105,12 +105,15 @@ from boxer_company.routers.device_audio_probe import (
     _probe_device_audio_output,
 )
 from boxer_company.routers.device_status_probe import (
+    _build_device_memory_patch_config_message,
     _build_device_status_probe_config_message,
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
     _is_device_led_probe_request,
+    _is_device_memory_patch_request,
     _is_device_pm2_probe_request,
     _is_device_status_probe_request,
+    _patch_device_pm2_memory,
     _probe_device_runtime_component,
     _probe_device_status_overview,
 )
@@ -3326,6 +3329,36 @@ def create_app() -> App:
             except Exception:
                 logger.exception("Device audio probe failed")
                 reply("장비 소리 출력 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_memory_patch_request(question, device_name=status_probe_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_memory_patch_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device memory patch", handler_type="router")
+                result_text, _ = _patch_device_pm2_memory(
+                    status_probe_device_name or "",
+                )
+                reply(result_text)
+                logger.info(
+                    "Responded with device memory patch in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    status_probe_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 메모리 패치 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device memory patch failed")
+                reply(_build_dependency_failure_reply("장비 메모리 패치", exc))
+            except Exception:
+                logger.exception("Device memory patch failed")
+                reply("장비 메모리 패치 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
         if _is_device_pm2_probe_request(question, device_name=status_probe_device_name):
