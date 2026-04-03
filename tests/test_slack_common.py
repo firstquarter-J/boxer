@@ -26,7 +26,7 @@ class SlackCommonTests(unittest.TestCase):
 
         def mention_handler(payload, reply, client, logger: logging.Logger) -> None:
             reply(
-                "전일 Recordings 요약",
+                "주간 Recordings 요약",
                 mention_user=False,
                 blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "report block"}}],
             )
@@ -45,7 +45,7 @@ class SlackCommonTests(unittest.TestCase):
             event_handler = app.handlers["app_mention"]
             event_handler(
                 {
-                    "text": "<@U_BOT> 전일 초음파 영상 현황",
+                    "text": "<@U_BOT> 지난주 초음파 영상 현황",
                     "user": "U_TEST",
                     "channel": "C_TEST",
                     "ts": "123.456",
@@ -56,7 +56,7 @@ class SlackCommonTests(unittest.TestCase):
             )
 
         self.assertEqual(len(say_calls), 1)
-        self.assertEqual(say_calls[0]["text"], "전일 Recordings 요약")
+        self.assertEqual(say_calls[0]["text"], "주간 Recordings 요약")
         self.assertEqual(
             say_calls[0]["blocks"],
             [{"type": "section", "text": {"type": "mrkdwn", "text": "report block"}}],

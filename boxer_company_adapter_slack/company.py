@@ -19,12 +19,12 @@ from boxer_adapter_slack.common import (
 )
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer_company_adapter_slack.fun import handle_fun_message
-from boxer_company_adapter_slack.daily_recordings_reporter import attach_daily_recordings_reporter
-from boxer_company.daily_recordings_report import (
-    _build_daily_recordings_report_blocks,
-    _build_daily_recordings_report_summary,
-    _coerce_daily_recordings_report_now,
-    _format_daily_recordings_report,
+from boxer_company_adapter_slack.weekly_recordings_reporter import attach_weekly_recordings_reporter
+from boxer_company.weekly_recordings_report import (
+    _build_weekly_recordings_report_blocks,
+    _build_weekly_recordings_report_summary,
+    _coerce_weekly_recordings_report_now,
+    _format_weekly_recordings_report,
 )
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
@@ -463,13 +463,13 @@ def _extract_optional_requested_date(question: str) -> tuple[str | None, bool]:
     return (parsed_date if has_requested_date else None, has_requested_date)
 
 
-def _is_daily_recordings_report_request(
+def _is_weekly_recordings_report_request(
     question: str,
     *,
     barcode: str | None,
     target_date: str | None,
 ) -> bool:
-    if barcode or not target_date:
+    if barcode:
         return False
 
     text = (question or "").strip()
@@ -487,6 +487,13 @@ def _is_daily_recordings_report_request(
         token in lowered for token in ("summary", "report", "overview", "status")
     )
     if not has_summary_hint:
+        return False
+
+    has_week_hint = any(
+        token in text
+        for token in ("주간", "주별", "일주일", "한 주", "지난주", "지난 주", "저번주", "저번 주", "전주", "이번주", "이번 주")
+    ) or any(token in lowered for token in ("weekly", "week"))
+    if not has_week_hint:
         return False
 
     has_excluded_hint = any(
@@ -522,22 +529,23 @@ def _is_daily_recordings_report_request(
     return not has_excluded_hint
 
 
-def _build_daily_recordings_report_reply_payload(
+def _build_weekly_recordings_report_reply_payload(
     *,
     target_date: str | None = None,
     now: datetime | None = None,
-) -> tuple[str, list[dict[str, Any]], str]:
+) -> tuple[str, list[dict[str, Any]], str, str]:
     report_target_date = date.fromisoformat(target_date) if target_date else None
-    local_now = _coerce_daily_recordings_report_now(now)
-    report_summary = _build_daily_recordings_report_summary(
+    local_now = _coerce_weekly_recordings_report_now(now)
+    report_summary = _build_weekly_recordings_report_summary(
         target_date=report_target_date,
         now=local_now,
     )
     return (
-        _format_daily_recordings_report(report_summary, now=local_now),
-        _build_daily_recordings_report_blocks(report_summary, now=local_now),
-        str(report_summary.get("targetDate") or "").strip()
+        _format_weekly_recordings_report(report_summary, now=local_now),
+        _build_weekly_recordings_report_blocks(report_summary, now=local_now),
+        str(report_summary.get("weekStartDate") or "").strip()
         or (report_target_date.isoformat() if report_target_date is not None else ""),
+        str(report_summary.get("weekEndDate") or "").strip(),
     )
 
 
@@ -3492,7 +3500,7 @@ def create_app() -> App:
                 reply("장비 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
-        if _is_daily_recordings_report_request(
+        if _is_weekly_recordings_report_request(
             question,
             barcode=barcode,
             target_date=structured_target_date,
@@ -3502,21 +3510,26 @@ def create_app() -> App:
                     raise structured_date_error
                 _set_request_log_route(
                     payload,
-                    "daily recordings report",
+                    "weekly recordings report",
                     route_mode="summary",
                     handler_type="router",
                     requested_date=structured_target_date,
                 )
-                result_text, result_blocks, resolved_target_date = _build_daily_recordings_report_reply_payload(
+                (
+                    result_text,
+                    result_blocks,
+                    resolved_week_start_date,
+                    resolved_week_end_date,
+                ) = _build_weekly_recordings_report_reply_payload(
                     target_date=structured_target_date
                 )
-                if resolved_target_date:
+                if resolved_week_start_date:
                     _set_request_log_route(
                         payload,
-                        "daily recordings report",
+                        "weekly recordings report",
                         route_mode="summary",
                         handler_type="router",
-                        requested_date=resolved_target_date,
+                        requested_date=resolved_week_start_date,
                     )
                 reply(
                     result_text,
@@ -3524,18 +3537,19 @@ def create_app() -> App:
                     blocks=result_blocks,
                 )
                 logger.info(
-                    "Responded with daily recordings report in thread_ts=%s date=%s",
+                    "Responded with weekly recordings report in thread_ts=%s week_start=%s week_end=%s",
                     thread_ts,
-                    resolved_target_date or structured_target_date,
+                    resolved_week_start_date,
+                    resolved_week_end_date,
                 )
             except ValueError as exc:
-                reply(f"일일 영상 현황 요청 형식 오류: {exc}")
+                reply(f"주간 영상 현황 요청 형식 오류: {exc}")
             except (pymysql.MySQLError, RuntimeError):
-                logger.exception("Daily recordings report query failed")
-                reply("일일 영상 현황 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘")
+                logger.exception("Weekly recordings report query failed")
+                reply("주간 영상 현황 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘")
             except Exception:
-                logger.exception("Daily recordings report query failed")
-                reply("일일 영상 현황 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+                logger.exception("Weekly recordings report query failed")
+                reply("주간 영상 현황 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
         if _is_ultrasound_capture_filter_query_request(
@@ -4166,5 +4180,5 @@ def create_app() -> App:
         )
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
-    attach_daily_recordings_reporter(app, logger=logging.getLogger(__name__))
+    attach_weekly_recordings_reporter(app, logger=logging.getLogger(__name__))
     return app
