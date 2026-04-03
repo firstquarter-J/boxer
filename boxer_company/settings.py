@@ -118,6 +118,20 @@ MOMMYBOX_REF_LEGACY_PATH = os.getenv(
     str(Path(MOMMYBOX_REFERENCE_ROOT) / "legacy"),
 ).strip()
 
+DAILY_RECORDINGS_REPORT_ENABLED = (
+    os.getenv("DAILY_RECORDINGS_REPORT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
+DAILY_RECORDINGS_REPORT_CHANNEL_ID = os.getenv("DAILY_RECORDINGS_REPORT_CHANNEL_ID", "").strip()
+DAILY_RECORDINGS_REPORT_HOUR_KST = int(os.getenv("DAILY_RECORDINGS_REPORT_HOUR_KST", "9"))
+DAILY_RECORDINGS_REPORT_MINUTE_KST = int(os.getenv("DAILY_RECORDINGS_REPORT_MINUTE_KST", "0"))
+DAILY_RECORDINGS_REPORT_POLL_INTERVAL_SEC = int(
+    os.getenv("DAILY_RECORDINGS_REPORT_POLL_INTERVAL_SEC", "30")
+)
+DAILY_RECORDINGS_REPORT_STATE_PATH = os.getenv(
+    "DAILY_RECORDINGS_REPORT_STATE_PATH",
+    str(core_settings.PROJECT_ROOT / "data" / "daily_recordings_report_state.json"),
+).strip()
+
 BARCODE_PATTERN = re.compile(r"(?<!\d)(\d{11})(?!\d)")
 S3_LOG_DATE_TOKEN_PATTERN = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
 S3_LOG_PATH_PATTERN = re.compile(

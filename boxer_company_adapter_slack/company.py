@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from datetime import date, datetime
 from typing import Any
 
 import pymysql
@@ -18,6 +19,13 @@ from boxer_adapter_slack.common import (
 )
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer_company_adapter_slack.fun import handle_fun_message
+from boxer_company_adapter_slack.daily_recordings_reporter import attach_daily_recordings_reporter
+from boxer_company.daily_recordings_report import (
+    _build_daily_recordings_report_blocks,
+    _build_daily_recordings_report_summary,
+    _coerce_daily_recordings_report_now,
+    _format_daily_recordings_report,
+)
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
@@ -453,6 +461,84 @@ def _rewrite_phase2_scope_request_message(
 def _extract_optional_requested_date(question: str) -> tuple[str | None, bool]:
     parsed_date, has_requested_date = _extract_log_date_with_presence(question)
     return (parsed_date if has_requested_date else None, has_requested_date)
+
+
+def _is_daily_recordings_report_request(
+    question: str,
+    *,
+    barcode: str | None,
+    target_date: str | None,
+) -> bool:
+    if barcode or not target_date:
+        return False
+
+    text = (question or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+
+    has_media_hint = any(token in text for token in ("초음파", "영상", "비디오", "동영상", "녹화")) or any(
+        token in lowered for token in ("recording", "recordings")
+    )
+    if not has_media_hint:
+        return False
+
+    has_summary_hint = any(token in text for token in ("현황", "요약", "리포트", "보고", "집계", "통계", "정리", "병원별")) or any(
+        token in lowered for token in ("summary", "report", "overview", "status")
+    )
+    if not has_summary_hint:
+        return False
+
+    has_excluded_hint = any(
+        token in text
+        for token in (
+            "바코드",
+            "목록",
+            "리스트",
+            "상세",
+            "길이",
+            "재생시간",
+            "다운로드",
+            "복구",
+            "로그",
+            "캡처",
+            "스냅샷",
+        )
+    ) or any(
+        token in lowered
+        for token in (
+            "list",
+            "detail",
+            "download",
+            "recover",
+            "log",
+            "capture",
+            "captures",
+            "snapshot",
+            "duration",
+            "fileid",
+        )
+    )
+    return not has_excluded_hint
+
+
+def _build_daily_recordings_report_reply_payload(
+    *,
+    target_date: str | None = None,
+    now: datetime | None = None,
+) -> tuple[str, list[dict[str, Any]], str]:
+    report_target_date = date.fromisoformat(target_date) if target_date else None
+    local_now = _coerce_daily_recordings_report_now(now)
+    report_summary = _build_daily_recordings_report_summary(
+        target_date=report_target_date,
+        now=local_now,
+    )
+    return (
+        _format_daily_recordings_report(report_summary, now=local_now),
+        _build_daily_recordings_report_blocks(report_summary, now=local_now),
+        str(report_summary.get("targetDate") or "").strip()
+        or (report_target_date.isoformat() if report_target_date is not None else ""),
+    )
 
 
 def _is_generic_count_or_existence_request(question: str) -> bool:
@@ -3406,6 +3492,52 @@ def create_app() -> App:
                 reply("장비 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
+        if _is_daily_recordings_report_request(
+            question,
+            barcode=barcode,
+            target_date=structured_target_date,
+        ):
+            try:
+                if structured_date_error is not None:
+                    raise structured_date_error
+                _set_request_log_route(
+                    payload,
+                    "daily recordings report",
+                    route_mode="summary",
+                    handler_type="router",
+                    requested_date=structured_target_date,
+                )
+                result_text, result_blocks, resolved_target_date = _build_daily_recordings_report_reply_payload(
+                    target_date=structured_target_date
+                )
+                if resolved_target_date:
+                    _set_request_log_route(
+                        payload,
+                        "daily recordings report",
+                        route_mode="summary",
+                        handler_type="router",
+                        requested_date=resolved_target_date,
+                    )
+                reply(
+                    result_text,
+                    mention_user=False,
+                    blocks=result_blocks,
+                )
+                logger.info(
+                    "Responded with daily recordings report in thread_ts=%s date=%s",
+                    thread_ts,
+                    resolved_target_date or structured_target_date,
+                )
+            except ValueError as exc:
+                reply(f"일일 영상 현황 요청 형식 오류: {exc}")
+            except (pymysql.MySQLError, RuntimeError):
+                logger.exception("Daily recordings report query failed")
+                reply("일일 영상 현황 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘")
+            except Exception:
+                logger.exception("Daily recordings report query failed")
+                reply("일일 영상 현황 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
         if _is_ultrasound_capture_filter_query_request(
             question,
             barcode=barcode,
@@ -4033,4 +4165,6 @@ def create_app() -> App:
             claude_client=claude_client,
         )
 
-    return create_slack_app(_handle_company_mention, _handle_company_message)
+    app = create_slack_app(_handle_company_mention, _handle_company_message)
+    attach_daily_recordings_reporter(app, logger=logging.getLogger(__name__))
+    return app

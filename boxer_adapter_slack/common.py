@@ -62,7 +62,13 @@ class MessagePayload(TypedDict):
 
 
 class SlackReplyFn(Protocol):
-    def __call__(self, text: str, *, mention_user: bool = True) -> None: ...
+    def __call__(
+        self,
+        text: str,
+        *,
+        mention_user: bool = True,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> None: ...
 
 
 MentionHandler = Callable[[MentionPayload, SlackReplyFn, Any, logging.Logger], None]
@@ -393,26 +399,26 @@ def create_slack_app(
         }
         logger.info("Received app_mention: user=%s text=%s", user_id, text)
 
-        def reply(reply_text: str, *, mention_user: bool = True) -> None:
-            if mention_user:
-                say(
-                    text=_format_reply_text(user_id, reply_text),
-                    thread_ts=thread_ts,
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
-                _mark_request_log_reply(payload)
-                return
-
+        def reply(
+            reply_text: str,
+            *,
+            mention_user: bool = True,
+            blocks: list[dict[str, Any]] | None = None,
+        ) -> None:
             clean_text = (reply_text or "").strip()
             if not clean_text:
                 clean_text = "응답 내용이 비어 있어"
-            say(
-                text=clean_text,
-                thread_ts=thread_ts,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
+            if mention_user:
+                clean_text = _format_reply_text(user_id, clean_text)
+            say_kwargs: dict[str, Any] = {
+                "text": clean_text,
+                "thread_ts": thread_ts,
+                "unfurl_links": False,
+                "unfurl_media": False,
+            }
+            if blocks:
+                say_kwargs["blocks"] = blocks
+            say(**say_kwargs)
             _mark_request_log_reply(payload)
 
         try:
