@@ -26,7 +26,14 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 - `boxer`
 - `boxer_adapter_slack`
 
-`boxer_adapter_web`, `widget`은 공개 확장 자리만 잡혀 있고 아직 설치 단위는 아니다.
+`boxer_adapter_web`, `widget`은 공개 확장 자리만 잡혀 있는 experimental placeholder고 아직 설치 단위는 아니다.
+
+## Support Status
+
+- `boxer`: 지금 설치해서 쓸 수 있는 open core
+- `boxer_adapter_slack`: 지금 설치해서 쓸 수 있는 공개 Slack reference adapter
+- `boxer_adapter_web`: 구조와 문서만 있는 experimental placeholder
+- `widget`: 구조와 문서만 있는 experimental placeholder
 
 ## Monorepo Layout
 
@@ -70,6 +77,7 @@ open core 내부 구조:
 실제 비밀값은 `.env`에만 두고 커밋하지 않는다.
 필요하면 `BOXER_DOTENV_PATH`로 다른 env 파일을 지정하거나 `BOXER_SKIP_DOTENV=true`로 dotenv 로딩 자체를 끌 수 있다.
 별도 설정이 없으면 retrieval synthesis 기본 응답 언어는 `질문 언어를 따라가고`, request log timezone 기본값은 `UTC`다.
+패키지 의존성 기준으로는 LLM은 기본 설치에 포함되고, DB/S3 connector만 optional extra로 분리돼 있다.
 
 ## 빠른 시작
 
@@ -127,7 +135,7 @@ boxer-slack
 최소 adapter contract는 단순하다.
 
 - `create_app() -> slack_bolt.App`
-- 공통 Slack wrapper는 `boxer_adapter_slack.common.create_slack_app()`로 붙인다
+- 공통 Slack wrapper는 `boxer_adapter_slack.create_slack_app()`로 붙인다
 - 엔트리포인트 선택은 `ADAPTER_ENTRYPOINT`가 담당한다
 
 ### Custom Adapter Example
@@ -148,7 +156,7 @@ examples/custom_adapter/
 ```python
 from slack_bolt import App
 
-from boxer_adapter_slack.common import create_slack_app
+from boxer_adapter_slack import create_slack_app
 
 
 def create_app() -> App:
@@ -198,7 +206,7 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 - `boxer_adapter_web/`: 추후 Node/TypeScript 기반 웹 adapter 구현 자리
 - `widget/`: 추후 Node/TypeScript 기반 브라우저 위젯 구현 자리
 
-지금 단계에서는 폴더와 문서 경계만 잡아두고, 실제 구현은 이후 단계에서 진행한다.
+지금 단계에서는 폴더와 문서 경계만 잡아둔 experimental placeholder고, 실제 구현은 이후 단계에서 진행한다.
 
 ## Packaging And Install
 
@@ -213,11 +221,30 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
   ```bash
   pip install -e .
   ```
+- DB connector까지 필요할 때:
+  ```bash
+  pip install -e ".[db]"
+  ```
+- S3 connector까지 필요할 때:
+  ```bash
+  pip install -e ".[s3]"
+  ```
+- DB/S3 connector를 함께 쓸 때:
+  ```bash
+  pip install -e ".[all]"
+  ```
 - 공개 Slack reference adapter까지 필요할 때:
   ```bash
   pip install -e .
   pip install -e ./boxer_adapter_slack
   ```
+
+패키징 기준:
+
+- 기본 설치에는 LLM(`anthropic`)과 Notion connector가 포함된다
+- DB connector는 `boxer[db]`에서 설치한다
+- S3 connector는 `boxer[s3]`에서 설치한다
+- Notion connector는 표준 라이브러리 기반이라 extra가 필요 없다
 
 도메인 전용 adapter나 private package는 이 공개 패키지들 위에 별도로 얹는 구조를 권장한다.
 
@@ -239,6 +266,18 @@ scripts/verify_open_core_boundary.sh
 ```
 
 - open core / domain-specific adapter 경계가 깨지지 않았는지 확인
+
+```bash
+./.venv/bin/python -m unittest discover -s tests/open_source
+```
+
+- 공개 패키지 기본 회귀 테스트
+
+```bash
+./.venv/bin/python -m unittest discover -s tests
+```
+
+- 저장소 전체 테스트
 
 ## Contributing
 

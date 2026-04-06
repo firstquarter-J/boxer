@@ -2,6 +2,11 @@
 
 이 폴더는 `boxer` 코어와 웹 클라이언트 사이를 잇는 웹 adapter 자리다.
 
+상태:
+
+- experimental placeholder
+- 아직 설치 단위 아님
+
 예정 역할:
 
 - 웹 API / BFF

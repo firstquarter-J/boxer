@@ -534,6 +534,27 @@ def create_slack_app(
     return app
 
 
+set_request_log_route = _set_request_log_route
+set_request_log_status = _set_request_log_status
+set_request_log_skip_persist = _set_request_log_skip_persist
+merge_request_log_metadata = _merge_request_log_metadata
+
+__all__ = [
+    "MentionHandler",
+    "MentionPayload",
+    "MessageHandler",
+    "MessagePayload",
+    "SlackMessageReplyFn",
+    "SlackReplyFn",
+    "SlackRequestLogContext",
+    "create_slack_app",
+    "merge_request_log_metadata",
+    "set_request_log_route",
+    "set_request_log_skip_persist",
+    "set_request_log_status",
+]
+
+
 SlackRequestAuditContext = SlackRequestLogContext
 _ensure_request_audit_context = _ensure_request_log_context
 _set_request_audit_route = _set_request_log_route

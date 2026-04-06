@@ -3,11 +3,11 @@ from typing import Any
 
 from slack_bolt import App
 
-from boxer_adapter_slack.common import (
+from boxer_adapter_slack import (
     MentionPayload,
     SlackReplyFn,
-    _set_request_log_route,
     create_slack_app,
+    set_request_log_route,
 )
 from examples.custom_adapter.routers.faq import (
     find_faq_answer,
@@ -26,17 +26,17 @@ def create_app() -> App:
         normalized_question = question.lower()
 
         if normalized_question == "ping":
-            _set_request_log_route(payload, "example_ping")
+            set_request_log_route(payload, "example_ping")
             reply("pong")
             return
 
         if not question:
-            _set_request_log_route(payload, "example_empty_question", status="rejected")
+            set_request_log_route(payload, "example_empty_question", status="rejected")
             reply("질문 내용을 같이 보내줘")
             return
 
         if is_sensitive_question(question):
-            _set_request_log_route(
+            set_request_log_route(
                 payload,
                 "example_policy_block",
                 route_mode="sensitive",
@@ -47,11 +47,11 @@ def create_app() -> App:
 
         faq_answer = find_faq_answer(question)
         if faq_answer:
-            _set_request_log_route(payload, "example_faq", route_mode="faq_match")
+            set_request_log_route(payload, "example_faq", route_mode="faq_match")
             reply(faq_answer)
             return
 
-        _set_request_log_route(payload, "example_default")
+        set_request_log_route(payload, "example_default")
         reply(
             "custom adapter 예제가 동작 중이야. `ping`, `what is boxer`, "
             "`how does routing work` 중 하나를 물어봐"

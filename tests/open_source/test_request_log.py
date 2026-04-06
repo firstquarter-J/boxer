@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from boxer_adapter_slack.common import _set_request_log_route
+from boxer_adapter_slack import set_request_log_route
 from boxer.observability.request_log import (
     _list_request_log_recent,
     _save_request_log_record,
@@ -13,7 +13,7 @@ class RequestLogRouteSetterTests(unittest.TestCase):
     def test_sets_handler_type_in_request_log_context(self) -> None:
         payload = {"request_log": {}}
 
-        _set_request_log_route(
+        set_request_log_route(
             payload,
             "llm_freeform",
             route_mode="claude",
