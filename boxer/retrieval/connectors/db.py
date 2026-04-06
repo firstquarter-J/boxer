@@ -1,11 +1,18 @@
 from typing import Any
 
-import pymysql
-
 from boxer.core import settings as s
 
 
+def _load_pymysql() -> Any:
+    try:
+        import pymysql
+    except ModuleNotFoundError as exc:
+        raise RuntimeError('DB connector를 쓰려면 `pip install "boxer[db]"`가 필요해') from exc
+    return pymysql
+
+
 def _create_db_connection(timeout_sec: int | None = None) -> Any:
+    pymysql = _load_pymysql()
     actual_timeout = max(1, timeout_sec if timeout_sec is not None else s.DB_QUERY_TIMEOUT_SEC)
     connection = pymysql.connect(
         host=s.DB_HOST,

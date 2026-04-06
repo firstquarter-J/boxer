@@ -23,6 +23,16 @@ classifiers = [
 dependencies = [
   "python-dotenv==1.1.1",
   "anthropic==0.74.1",
+]
+
+[project.optional-dependencies]
+db = [
+  "pymysql==1.1.1",
+]
+s3 = [
+  "boto3==1.34.162",
+]
+all = [
   "pymysql==1.1.1",
   "boto3==1.34.162",
 ]

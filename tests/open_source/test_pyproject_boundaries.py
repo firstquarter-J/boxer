@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_toml(path: Path) -> dict:
@@ -19,9 +19,28 @@ class PyprojectBoundaryTests(unittest.TestCase):
             [],
         )
         project = data.get("project") or {}
+        dependencies = project.get("dependencies", [])
+        optional_dependencies = project.get("optional-dependencies", {})
 
         self.assertEqual(include, ["boxer", "boxer.*"])
-        self.assertNotIn("optional-dependencies", project)
+        self.assertEqual(
+            dependencies,
+            [
+                "python-dotenv==1.1.1",
+                "anthropic==0.74.1",
+            ],
+        )
+        self.assertEqual(
+            optional_dependencies,
+            {
+                "db": ["pymysql==1.1.1"],
+                "s3": ["boto3==1.34.162"],
+                "all": [
+                    "pymysql==1.1.1",
+                    "boto3==1.34.162",
+                ],
+            },
+        )
         self.assertNotIn("scripts", project)
 
     def test_public_slack_pyproject_is_separate_install_unit(self) -> None:
@@ -42,7 +61,7 @@ class PyprojectBoundaryTests(unittest.TestCase):
         packages = ((data.get("tool") or {}).get("setuptools") or {}).get("packages", [])
 
         self.assertEqual(project.get("name"), "boxer-company")
-        self.assertIn("boxer>=0.1.0", dependencies)
+        self.assertIn("boxer[db,s3]>=0.1.0", dependencies)
         self.assertEqual(packages, ["boxer_company", "boxer_company.routers"])
         self.assertNotIn("boxer", packages)
         self.assertNotIn("boxer_adapter_slack", packages)

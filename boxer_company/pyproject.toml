@@ -9,7 +9,7 @@ description = "Company-specific domain package for Boxer."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "boxer>=0.1.0",
+  "boxer[db,s3]>=0.1.0",
   "paramiko==3.5.1",
   "requests==2.32.3",
 ]
