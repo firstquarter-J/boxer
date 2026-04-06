@@ -52,11 +52,11 @@ class WeeklyRecordingsReportMentionTests(unittest.TestCase):
 
         with (
             patch(
-                "boxer_company_adapter_slack.company._coerce_weekly_recordings_report_now",
+                "boxer_company_adapter_slack.weekly_reports._coerce_weekly_recordings_report_now",
                 return_value=local_now,
             ),
             patch(
-                "boxer_company_adapter_slack.company._build_weekly_recordings_report_summary",
+                "boxer_company_adapter_slack.weekly_reports._build_weekly_recordings_report_summary",
                 return_value={
                     "weekStartDate": "2026-03-23",
                     "weekEndDate": "2026-03-29",
@@ -64,11 +64,11 @@ class WeeklyRecordingsReportMentionTests(unittest.TestCase):
                 },
             ) as summary_mock,
             patch(
-                "boxer_company_adapter_slack.company._format_weekly_recordings_report",
+                "boxer_company_adapter_slack.weekly_reports._format_weekly_recordings_report",
                 return_value="report text",
             ) as format_mock,
             patch(
-                "boxer_company_adapter_slack.company._build_weekly_recordings_report_blocks",
+                "boxer_company_adapter_slack.weekly_reports._build_weekly_recordings_report_blocks",
                 return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "report block"}}],
             ) as blocks_mock,
         ):

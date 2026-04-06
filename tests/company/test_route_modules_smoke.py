@@ -1,0 +1,153 @@
+import logging
+import unittest
+from unittest.mock import patch
+
+from boxer_company_adapter_slack.admin_routes import (
+    AdminRoutesContext,
+    AdminRoutesDeps,
+    _handle_admin_routes,
+)
+from boxer_company_adapter_slack.barcode_query_routes import (
+    BarcodeQueryRoutesContext,
+    BarcodeQueryRoutesDeps,
+    _handle_barcode_query_routes,
+)
+from boxer_company_adapter_slack.device_routes import (
+    DeviceRoutesContext,
+    DeviceRoutesDeps,
+    _handle_device_routes,
+)
+from boxer_company_adapter_slack.knowledge_routes import (
+    KnowledgeRoutesContext,
+    KnowledgeRoutesDeps,
+    _handle_knowledge_routes,
+)
+from boxer_company_adapter_slack.structured_routes import (
+    StructuredRoutesContext,
+    _handle_structured_routes,
+)
+
+
+def _payload() -> dict[str, object]:
+    return {
+        "text": "핑",
+        "question": "핑",
+        "user_id": "U123",
+        "workspace_id": "W123",
+        "channel_id": "C123",
+        "current_ts": "1.1",
+        "thread_ts": "1.0",
+    }
+
+
+class RouteModulesSmokeTests(unittest.TestCase):
+    def test_admin_routes_returns_false_for_unrelated_question(self) -> None:
+        handled = _handle_admin_routes(
+            AdminRoutesContext(
+                question="핑",
+                payload=_payload(),  # type: ignore[arg-type]
+                user_id="U123",
+                thread_ts="1.0",
+                reply=lambda *args, **kwargs: None,
+                logger=logging.getLogger(__name__),
+            ),
+            AdminRoutesDeps(
+                get_s3_client=lambda: None,
+                reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+            ),
+        )
+
+        self.assertFalse(handled)
+
+    def test_structured_routes_returns_false_for_unrelated_question(self) -> None:
+        handled = _handle_structured_routes(
+            StructuredRoutesContext(
+                question="핑",
+                barcode=None,
+                payload=_payload(),  # type: ignore[arg-type]
+                thread_ts="1.0",
+                reply=lambda *args, **kwargs: None,
+                logger=logging.getLogger(__name__),
+            )
+        )
+
+        self.assertFalse(handled)
+
+    def test_barcode_query_routes_returns_false_for_unrelated_question(self) -> None:
+        handled = _handle_barcode_query_routes(
+            BarcodeQueryRoutesContext(
+                question="핑",
+                barcode=None,
+                user_id="U123",
+                thread_ts="1.0",
+                reply=lambda *args, **kwargs: None,
+                logger=logging.getLogger(__name__),
+            ),
+            BarcodeQueryRoutesDeps(
+                get_recordings_context=lambda: {},
+                attach_recordings_context_to_evidence=lambda evidence, context: None,
+                reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+            ),
+        )
+
+        self.assertFalse(handled)
+
+    def test_device_routes_returns_false_for_unrelated_question(self) -> None:
+        handled = _handle_device_routes(
+            DeviceRoutesContext(
+                question="핑",
+                barcode=None,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                payload=_payload(),  # type: ignore[arg-type]
+                user_id="U123",
+                workspace_id="W123",
+                channel_id="C123",
+                thread_ts="1.0",
+                reply=lambda *args, **kwargs: None,
+                client=None,
+                logger=logging.getLogger(__name__),
+            ),
+            DeviceRoutesDeps(
+                get_s3_client=lambda: None,
+                get_recordings_context=lambda: {},
+                has_recordings_device_mapping=lambda context: False,
+                send_dm_message=lambda user_id, text: False,
+                build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+            ),
+        )
+
+        self.assertFalse(handled)
+
+    def test_knowledge_routes_returns_false_when_no_route_matches(self) -> None:
+        with patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", ""):
+            handled = _handle_knowledge_routes(
+                KnowledgeRoutesContext(
+                    question="핑",
+                    barcode=None,
+                    user_id="U123",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    thread_ts="",
+                    channel_id="C123",
+                    current_ts="1.1",
+                    reply=lambda *args, **kwargs: None,
+                    logger=logging.getLogger(__name__),
+                    client=None,
+                    claude_client=None,
+                ),
+                KnowledgeRoutesDeps(
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    timeout_reply_text=lambda: "timeout",
+                    llm_unavailable_reply_text=lambda summary=None: "down",
+                    is_timeout_error=lambda exc: False,
+                    is_claude_allowed_user=lambda user_id: True,
+                    build_barcode_fallback_evidence=lambda: None,
+                ),
+            )
+
+        self.assertFalse(handled)
+
+
+if __name__ == "__main__":
+    unittest.main()
