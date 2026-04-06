@@ -11,8 +11,9 @@ class _FakeSlackClient:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
 
-    def chat_postMessage(self, **kwargs) -> None:
+    def chat_postMessage(self, **kwargs) -> dict[str, str]:
         self.messages.append(kwargs)
+        return {"ts": f"1000.{len(self.messages):03d}"}
 
 
 class WeeklyRecordingsReporterDueTests(unittest.TestCase):
@@ -81,11 +82,11 @@ class WeeklyRecordingsReporterRunTests(unittest.TestCase):
             patch(
                 "boxer_company_adapter_slack.weekly_recordings_reporter._format_weekly_recordings_report",
                 return_value="report body",
-            ),
+            ) as format_report_mock,
             patch(
                 "boxer_company_adapter_slack.weekly_recordings_reporter._build_weekly_recordings_report_blocks",
                 return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "report block"}}],
-            ),
+            ) as build_blocks_mock,
             patch(
                 "boxer_company_adapter_slack.weekly_recordings_reporter._save_weekly_recordings_report_state"
             ) as save_state_mock,
@@ -97,13 +98,37 @@ class WeeklyRecordingsReporterRunTests(unittest.TestCase):
             )
 
         self.assertTrue(sent)
-        self.assertEqual(len(client.messages), 1)
+        format_report_mock.assert_called_once_with(
+            {
+                "weekStartDate": "2026-03-30",
+                "weekEndDate": "2026-04-05",
+                "hospitalCount": 1,
+                "totalCount": 40,
+            },
+            now=local_now,
+            include_title=False,
+        )
+        build_blocks_mock.assert_called_once_with(
+            {
+                "weekStartDate": "2026-03-30",
+                "weekEndDate": "2026-04-05",
+                "hospitalCount": 1,
+                "totalCount": 40,
+            },
+            now=local_now,
+            include_header=False,
+        )
+        self.assertEqual(len(client.messages), 2)
         self.assertEqual(client.messages[0]["channel"], "C_REPORT")
-        self.assertEqual(client.messages[0]["text"], "report body")
+        self.assertEqual(client.messages[0]["text"], "주간 초음파 촬영 요약")
+        self.assertNotIn("blocks", client.messages[0])
+        self.assertEqual(client.messages[1]["channel"], "C_REPORT")
+        self.assertEqual(client.messages[1]["text"], "report body")
         self.assertEqual(
-            client.messages[0]["blocks"],
+            client.messages[1]["blocks"],
             [{"type": "section", "text": {"type": "mrkdwn", "text": "report block"}}],
         )
+        self.assertEqual(client.messages[1]["thread_ts"], "1000.001")
         save_state_mock.assert_called_once_with(
             {
                 "lastReportedWeekStartDate": "2026-03-30",

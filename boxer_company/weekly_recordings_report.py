@@ -6,6 +6,7 @@ from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _create_db_connection
 
 _WEEKLY_RECORDINGS_REPORT_TIMEZONE = ZoneInfo("Asia/Seoul")
+_WEEKLY_RECORDINGS_REPORT_TITLE = "주간 초음파 촬영 요약"
 _WEEKLY_RECORDINGS_REPORT_TOP_HOSPITALS = 10
 _WEEKLY_RECORDINGS_REPORT_MAX_CHANGE_ROWS = 10
 _WEEKLY_RECORDINGS_REPORT_CHANGE_MIN_DELTA = 20
@@ -349,6 +350,7 @@ def _format_weekly_recordings_report(
     report_summary: dict[str, Any],
     *,
     now: datetime | None = None,
+    include_title: bool = True,
 ) -> str:
     local_now = _coerce_weekly_recordings_report_now(now)
     current_week_label = _format_weekly_recordings_report_range_label(
@@ -374,8 +376,12 @@ def _format_weekly_recordings_report(
     surge_lines = _build_weekly_recordings_report_change_lines(surge_rows)
     drop_lines = _build_weekly_recordings_report_change_lines(drop_rows)
 
-    lines = [
-        "*주간 Recordings 요약*",
+    lines: list[str] = []
+    if include_title:
+        lines.append(f"*{_WEEKLY_RECORDINGS_REPORT_TITLE}*")
+
+    lines.extend(
+        [
         f"• 기준 주간: `{current_week_label}` | 비교 주간: `{previous_week_label}`",
         f"• 발송: `{local_now:%Y-%m-%d %H:%M:%S} KST`",
         f"• 전체 row: `{_format_weekly_recordings_report_count(total_count)}` | 병원: `{hospital_count:,}곳`",
@@ -386,7 +392,8 @@ def _format_weekly_recordings_report(
             f"`{_format_weekly_recordings_report_change_rate_label(total_change_rate)}`)"
         ),
         f"• 변화 병원: 급증 `{surge_count:,}곳` | 급감 `{drop_count:,}곳`",
-    ]
+        ]
+    )
 
     if total_count <= 0:
         lines.append("• 결과: 해당 주간 recordings row가 없어")
@@ -427,6 +434,7 @@ def _build_weekly_recordings_report_blocks(
     report_summary: dict[str, Any],
     *,
     now: datetime | None = None,
+    include_header: bool = True,
 ) -> list[dict[str, Any]]:
     local_now = _coerce_weekly_recordings_report_now(now)
     current_week_label = _format_weekly_recordings_report_range_label(
@@ -449,15 +457,21 @@ def _build_weekly_recordings_report_blocks(
     drop_rows = report_summary.get("dropRows") if isinstance(report_summary.get("dropRows"), list) else []
     drop_count = int(report_summary.get("dropCount") or len(drop_rows))
 
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": "주간 Recordings 요약",
-            },
-        },
-        {
+    blocks: list[dict[str, Any]] = []
+    if include_header:
+        blocks.append(
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": _WEEKLY_RECORDINGS_REPORT_TITLE,
+                },
+            }
+        )
+
+    blocks.extend(
+        [
+            {
             "type": "context",
             "elements": [
                 {
@@ -469,7 +483,7 @@ def _build_weekly_recordings_report_blocks(
                 }
             ],
         },
-        {
+            {
             "type": "section",
             "fields": [
                 {
@@ -495,7 +509,7 @@ def _build_weekly_recordings_report_blocks(
                 },
             ],
         },
-        {
+            {
             "type": "context",
             "elements": [
                 {
@@ -504,7 +518,8 @@ def _build_weekly_recordings_report_blocks(
                 }
             ],
         },
-    ]
+        ]
+    )
 
     if total_count <= 0:
         blocks.append({"type": "divider"})

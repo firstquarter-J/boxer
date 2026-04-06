@@ -9,6 +9,7 @@ from typing import Any
 from boxer.core import settings as s
 from boxer_company import settings as cs
 from boxer_company.weekly_recordings_report import (
+    _WEEKLY_RECORDINGS_REPORT_TITLE,
     _build_weekly_recordings_report_blocks,
     _build_weekly_recordings_report_summary,
     _coerce_weekly_recordings_report_now,
@@ -102,12 +103,35 @@ def _run_weekly_recordings_report_if_due(
         target_date=target_week_start_date,
         now=local_now,
     )
-    message_text = _format_weekly_recordings_report(report_summary, now=local_now)
-    message_blocks = _build_weekly_recordings_report_blocks(report_summary, now=local_now)
+    message_text = _format_weekly_recordings_report(
+        report_summary,
+        now=local_now,
+        include_title=False,
+    )
+    message_blocks = _build_weekly_recordings_report_blocks(
+        report_summary,
+        now=local_now,
+        include_header=False,
+    )
+    title_response = client.chat_postMessage(
+        channel=channel_id,
+        text=_WEEKLY_RECORDINGS_REPORT_TITLE,
+        unfurl_links=False,
+        unfurl_media=False,
+    )
+    thread_ts = str(getattr(title_response, "get", lambda *_args, **_kwargs: "")("ts") or "").strip()
+    if not thread_ts:
+        response_data = getattr(title_response, "data", None)
+        thread_ts = str(
+            getattr(response_data, "get", lambda *_args, **_kwargs: "")("ts") or ""
+        ).strip()
+    if not thread_ts:
+        raise RuntimeError("주간 recordings 리포트 제목 메시지 ts를 받지 못했어")
     client.chat_postMessage(
         channel=channel_id,
         text=message_text,
         blocks=message_blocks,
+        thread_ts=thread_ts,
         unfurl_links=False,
         unfurl_media=False,
     )

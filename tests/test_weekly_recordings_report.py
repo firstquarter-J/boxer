@@ -157,7 +157,7 @@ class WeeklyRecordingsReportFormatTests(unittest.TestCase):
             now=datetime(2026, 4, 6, 0, 0, 1, tzinfo=timezone.utc),
         )
 
-        self.assertIn("*주간 Recordings 요약*", message)
+        self.assertIn("*주간 초음파 촬영 요약*", message)
         self.assertIn("• 기준 주간: `2026-03-23 ~ 2026-03-29` | 비교 주간: `2026-03-16 ~ 2026-03-22`", message)
         self.assertIn("• 발송: `2026-04-06 09:00:01 KST`", message)
         self.assertIn("• 전체 row: `150개` | 병원: `2곳`", message)
@@ -169,6 +169,31 @@ class WeeklyRecordingsReportFormatTests(unittest.TestCase):
             message,
         )
         self.assertIn("*급감*\n• 없어", message)
+
+    def test_formats_weekly_report_message_without_title(self) -> None:
+        message = report._format_weekly_recordings_report(
+            {
+                "weekStartDate": "2026-03-23",
+                "weekEndDate": "2026-03-29",
+                "previousWeekStartDate": "2026-03-16",
+                "previousWeekEndDate": "2026-03-22",
+                "hospitalCount": 1,
+                "totalCount": 150,
+                "previousTotalCount": 70,
+                "totalDelta": 80,
+                "totalChangeRate": (80 / 70) * 100,
+                "topRows": [],
+                "surgeRows": [],
+                "surgeCount": 0,
+                "dropRows": [],
+                "dropCount": 0,
+            },
+            now=datetime(2026, 4, 6, 0, 0, 1, tzinfo=timezone.utc),
+            include_title=False,
+        )
+
+        self.assertFalse(message.startswith("*주간 초음파 촬영 요약*"))
+        self.assertTrue(message.startswith("• 기준 주간: `2026-03-23 ~ 2026-03-29`"))
 
     def test_formats_empty_weekly_report_message(self) -> None:
         message = report._format_weekly_recordings_report(
@@ -228,7 +253,7 @@ class WeeklyRecordingsReportFormatTests(unittest.TestCase):
         )
 
         self.assertEqual(blocks[0]["type"], "header")
-        self.assertIn("주간 Recordings 요약", blocks[0]["text"]["text"])
+        self.assertIn("주간 초음파 촬영 요약", blocks[0]["text"]["text"])
         self.assertIn("기준 주간 `2026-03-23 ~ 2026-03-29`", blocks[1]["elements"][0]["text"])
         self.assertIn("`1,500개`", blocks[2]["fields"][0]["text"])
         self.assertIn("*상위 병원 Top 10*", blocks[5]["text"]["text"])
@@ -236,6 +261,31 @@ class WeeklyRecordingsReportFormatTests(unittest.TestCase):
         self.assertIn("*급증*", blocks[7]["text"]["text"])
         self.assertIn("`400 -> 1,200`", blocks[7]["text"]["text"])
         self.assertIn("*급감*\n없어", blocks[9]["text"]["text"])
+
+    def test_builds_weekly_report_blocks_without_header(self) -> None:
+        blocks = report._build_weekly_recordings_report_blocks(
+            {
+                "weekStartDate": "2026-03-23",
+                "weekEndDate": "2026-03-29",
+                "previousWeekStartDate": "2026-03-16",
+                "previousWeekEndDate": "2026-03-22",
+                "hospitalCount": 1,
+                "totalCount": 10,
+                "previousTotalCount": 8,
+                "totalDelta": 2,
+                "totalChangeRate": 25.0,
+                "topRows": [],
+                "surgeRows": [],
+                "surgeCount": 0,
+                "dropRows": [],
+                "dropCount": 0,
+            },
+            now=datetime(2026, 4, 6, 0, 0, 1, tzinfo=timezone.utc),
+            include_header=False,
+        )
+
+        self.assertEqual(blocks[0]["type"], "context")
+        self.assertIn("기준 주간 `2026-03-23 ~ 2026-03-29`", blocks[0]["elements"][0]["text"])
 
 
 if __name__ == "__main__":
