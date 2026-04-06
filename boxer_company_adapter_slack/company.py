@@ -104,6 +104,17 @@ from boxer_company.routers.device_audio_probe import (
     _is_device_audio_probe_request,
     _probe_device_audio_output,
 )
+from boxer_company.routers.device_update import (
+    _build_device_update_activity_input,
+    _build_device_update_config_message,
+    _extract_device_name_for_update,
+    _is_device_agent_update_request,
+    _is_device_box_update_request,
+    _is_device_update_status_request,
+    _query_device_update_status,
+    _request_device_agent_update,
+    _request_device_box_update,
+)
 from boxer_company.routers.device_status_probe import (
     _build_device_memory_patch_config_message,
     _build_device_status_probe_config_message,
@@ -1528,6 +1539,45 @@ def _log_device_download_activity(
                 exc_info=True,
             )
     return success_count
+
+
+def _log_device_update_activity(
+    *,
+    question: str,
+    user_id: str,
+    channel_id: str,
+    thread_ts: str,
+    result_payload: dict[str, Any],
+    client: Any,
+    logger: logging.Logger,
+) -> bool:
+    try:
+        user_name = _load_slack_user_name(
+            client=client,
+            user_id=user_id,
+            logger=logger,
+        )
+        _create_mda_activity_log(
+            _build_device_update_activity_input(
+                question=question,
+                user_id=user_id,
+                user_name=user_name,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                result_payload=result_payload,
+            )
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to create activity log for device update route=%s device=%s",
+            result_payload.get("route"),
+            ((result_payload.get("device") or {}) if isinstance(result_payload.get("device"), dict) else {}).get(
+                "deviceName"
+            ),
+            exc_info=True,
+        )
+        return False
 
 
 def _render_device_download_dm_text(
@@ -3221,6 +3271,7 @@ def create_app() -> App:
             structured_hospital_name = _extract_leading_hospital_scope(question)
         structured_hospital_seq, structured_hospital_room_seq = _extract_capture_seq_filters(question)
         structured_device_name = _extract_device_name_scope(question)
+        update_device_name = _extract_device_name_for_update(question) or structured_device_name
         audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
         status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
         structured_device_seq = _extract_device_seq_filter(question)
@@ -3295,6 +3346,138 @@ def create_app() -> App:
             except Exception:
                 logger.exception("Hospital rooms filters query failed")
                 reply("병실 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_update_status_request(question, device_name=update_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_update_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device update status", handler_type="router")
+                result_text, _ = _query_device_update_status(update_device_name or "")
+                reply(result_text)
+                logger.info(
+                    "Responded with device update status in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    update_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 업데이트 상태 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device update status failed")
+                reply(_build_dependency_failure_reply("장비 업데이트 상태 확인", exc))
+            except Exception:
+                logger.exception("Device update status failed")
+                reply("장비 업데이트 상태 확인 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_box_update_request(question, device_name=update_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_update_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device box update", handler_type="router")
+                def _reply_device_update_notice(notice_text: str) -> None:
+                    try:
+                        reply(notice_text, mention_user=False)
+                    except Exception:
+                        logger.exception(
+                            "Failed to send device box update progress notice in thread_ts=%s deviceName=%s",
+                            thread_ts,
+                            update_device_name,
+                        )
+
+                result_text, result_payload = _request_device_box_update(
+                    question,
+                    device_name=update_device_name,
+                    on_dispatched=_reply_device_update_notice,
+                )
+                reply(result_text, mention_user=False)
+                if bool(((result_payload.get("dispatch") or {}) if isinstance(result_payload, dict) else {}).get("status")):
+                    _log_device_update_activity(
+                        question=question,
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        result_payload=result_payload,
+                        client=client,
+                        logger=logger,
+                    )
+                logger.info(
+                    "Responded with device box update in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    update_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 박스 업데이트 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device box update failed")
+                reply(_build_dependency_failure_reply("장비 박스 업데이트", exc))
+            except Exception:
+                logger.exception("Device box update failed")
+                reply("장비 박스 업데이트 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return
+
+        if _is_device_agent_update_request(question, device_name=update_device_name):
+            if (
+                not cs.MDA_GRAPHQL_URL
+                or not cs.MDA_ADMIN_USER_PASSWORD
+                or not cs.DEVICE_SSH_PASSWORD
+            ):
+                reply(_build_device_update_config_message())
+                return
+
+            try:
+                _set_request_log_route(payload, "device agent update", handler_type="router")
+                def _reply_device_update_notice(notice_text: str) -> None:
+                    try:
+                        reply(notice_text, mention_user=False)
+                    except Exception:
+                        logger.exception(
+                            "Failed to send device agent update progress notice in thread_ts=%s deviceName=%s",
+                            thread_ts,
+                            update_device_name,
+                        )
+
+                result_text, result_payload = _request_device_agent_update(
+                    question,
+                    device_name=update_device_name,
+                    on_dispatched=_reply_device_update_notice,
+                )
+                reply(result_text, mention_user=False)
+                if bool(((result_payload.get("dispatch") or {}) if isinstance(result_payload, dict) else {}).get("status")):
+                    _log_device_update_activity(
+                        question=question,
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        result_payload=result_payload,
+                        client=client,
+                        logger=logger,
+                    )
+                logger.info(
+                    "Responded with device agent update in thread_ts=%s deviceName=%s",
+                    thread_ts,
+                    update_device_name,
+                )
+            except ValueError as exc:
+                reply(f"장비 에이전트 업데이트 요청 형식 오류: {exc}")
+            except RuntimeError as exc:
+                logger.exception("Device agent update failed")
+                reply(_build_dependency_failure_reply("장비 에이전트 업데이트", exc))
+            except Exception:
+                logger.exception("Device agent update failed")
+                reply("장비 에이전트 업데이트 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return
 
         if _is_device_audio_probe_request(question, device_name=audio_probe_device_name):

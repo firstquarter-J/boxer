@@ -30,6 +30,43 @@ mutation SshOrder($deviceName: String!, $action: String!, $host: String!) {
 }
 """
 
+_UPDATE_BOX_MUTATION = """
+mutation UpdateBox($deviceName: String!, $version: String!, $silent: Boolean!) {
+  updateBox(deviceName: $deviceName, version: $version, silent: $silent) {
+    affected
+    status
+    message
+  }
+}
+"""
+
+_UPDATE_AGENT_MUTATION = """
+mutation UpdateAgent($deviceName: String!, $force: Boolean!) {
+  updateAgent(deviceName: $deviceName, force: $force) {
+    affected
+    status
+    message
+  }
+}
+"""
+
+_DEVICE_VERSIONS_QUERY = """
+query DeviceVersions {
+  deviceVersions {
+    seq
+    versionName
+    buildNum
+    buildHash
+    versionDescription
+    versionDate
+    visibleFlag
+    autoUpdate
+    createdAt
+    updatedAt
+  }
+}
+"""
+
 _CREATE_ACTIVITY_LOG_MUTATION = """
 mutation CreateActivityLog($input: ActivityLogCreateInput!) {
   createActivityLog(input: $input) {
@@ -336,6 +373,98 @@ def _open_mda_device_ssh(
         "status": _display_value(result.get("status"), default=""),
         "message": _display_value(result.get("message"), default=""),
         "host": actual_host,
+    }
+
+
+def _update_mda_device_box(
+    device_name: str,
+    *,
+    version: str,
+    silent: bool = False,
+) -> dict[str, Any]:
+    data = _execute_mda_graphql(
+        _UPDATE_BOX_MUTATION,
+        {
+            "deviceName": device_name,
+            "version": version,
+            "silent": bool(silent),
+        },
+    )
+    result = data.get("updateBox")
+    if not isinstance(result, dict):
+        raise RuntimeError("updateBox 응답 형식이 올바르지 않아")
+    return {
+        "affected": result.get("affected"),
+        "status": bool(result.get("status")),
+        "message": _display_value(result.get("message"), default=""),
+    }
+
+
+def _update_mda_device_agent(
+    device_name: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    data = _execute_mda_graphql(
+        _UPDATE_AGENT_MUTATION,
+        {
+            "deviceName": device_name,
+            "force": bool(force),
+        },
+    )
+    result = data.get("updateAgent")
+    if not isinstance(result, dict):
+        raise RuntimeError("updateAgent 응답 형식이 올바르지 않아")
+    return {
+        "affected": result.get("affected"),
+        "status": bool(result.get("status")),
+        "message": _display_value(result.get("message"), default=""),
+    }
+
+
+def _parse_semver_parts(version: Any) -> tuple[int, int, int] | None:
+    raw = str(version or "").strip()
+    parts = raw.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def _get_mda_latest_device_version() -> dict[str, Any]:
+    data = _execute_mda_graphql(_DEVICE_VERSIONS_QUERY, {})
+    rows = data.get("deviceVersions")
+    if not isinstance(rows, list):
+        raise RuntimeError("deviceVersions 응답 형식이 올바르지 않아")
+
+    best_row: dict[str, Any] | None = None
+    best_parts: tuple[int, int, int] | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not bool(row.get("autoUpdate")):
+            continue
+        version_name = _display_value(row.get("versionName"), default="")
+        parts = _parse_semver_parts(version_name)
+        if parts is None:
+            continue
+        if parts[0] != 3:
+            continue
+        if best_parts is None or parts > best_parts:
+            best_parts = parts
+            best_row = row
+
+    if best_row is None:
+        raise RuntimeError("MDA 최신 박스 버전을 찾지 못했어")
+
+    return {
+        "seq": best_row.get("seq"),
+        "versionName": _display_value(best_row.get("versionName"), default=""),
+        "buildNum": best_row.get("buildNum"),
+        "buildHash": _display_value(best_row.get("buildHash"), default=""),
+        "versionDescription": _display_value(best_row.get("versionDescription"), default=""),
+        "versionDate": _display_value(best_row.get("versionDate"), default=""),
+        "visibleFlag": bool(best_row.get("visibleFlag")),
+        "autoUpdate": bool(best_row.get("autoUpdate")),
     }
 
 
