@@ -1211,8 +1211,6 @@ def _describe_recording_start_evidence(recovery_context: dict[str, Any] | None) 
         return "실녹화 시작 로그 확인"
     if isinstance(recovery_context.get("spawnedRecordingFfmpeg"), dict):
         return "녹화 ffmpeg 시작 로그 확인"
-    if isinstance(recovery_context.get("addedRecording"), dict):
-        return "녹화 파일 생성 로그 확인"
     return ""
 
 

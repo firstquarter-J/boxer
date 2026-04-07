@@ -98,6 +98,7 @@ class BarcodeLogHelperTests(unittest.TestCase):
         lines = _build_barcode_log_error_session_section(session_entry)
         text = "\n".join(lines)
 
+        self.assertTrue(text.startswith("*세션 2*"))
         self.assertIn("모션 감지 단계에서 종료 스캔돼 녹화 취소로 끝났고", text)
         self.assertIn("본 녹화 시작 전이라 정상 녹화 실패", text)
 

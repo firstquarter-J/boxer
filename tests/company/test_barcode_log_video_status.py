@@ -104,6 +104,52 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         self.assertIn("실녹화 시작 로그 확인", result)
         self.assertFalse(_is_normal_video_status(result))
 
+    def test_add_recording_only_before_motion_stop_is_canceled_failure(self) -> None:
+        source_lines = [
+            "[14:02:35] Scanned : 23318551080",
+            "[14:02:37] motion detection process initiated successfully",
+            "[14:02:38] addRecording(abc123)",
+            "[14:06:51] Scanned : C_STOPSESS",
+            "[14:06:52] Stopping motion detection. Motion detected: false, Error: false",
+        ]
+        scan_events = _extract_scan_events_with_line_no(source_lines)
+        motion_events = _extract_motion_events_with_line_no(source_lines)
+        session = {
+            "start_line_no": 1,
+            "start_time_label": "14:02:35",
+            "stop_line_no": 4,
+            "stop_time_label": "14:06:51",
+            "stop_token": "C_STOPSESS",
+            "end_line_no": 5,
+        }
+
+        result, _, _ = _build_session_recording_result_text(
+            source_lines,
+            session,
+            [],
+            [],
+            scan_events,
+            recordings_on_date_count=0,
+            session_motion_events=motion_events,
+        )
+
+        self.assertIn("정상 녹화 실패로 판단", result)
+        self.assertIn("모션 감지 단계에서 종료 스캔", result)
+        self.assertNotIn("녹화 파일 생성 로그 확인", result)
+
+        context = _build_session_card_context(
+            source_lines,
+            session,
+            motion_events,
+            [],
+            [],
+            scan_events,
+            recordings_on_date_count=0,
+        )
+
+        self.assertEqual(context["terminationStatus"], "녹화 취소 (모션 감지 단계에서 `C_STOPSESS` 확인)")
+        self.assertTrue(context["preRecordingStopDetected"])
+
     def test_stop_scan_during_motion_stage_is_failure_even_with_db_row(self) -> None:
         source_lines = [
             "[09:37:58] Scanned : 87752940438",

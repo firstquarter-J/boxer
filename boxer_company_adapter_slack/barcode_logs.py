@@ -295,6 +295,7 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
     if not isinstance(detail, dict):
         return []
 
+    session_index = detail.get("index")
     barcode = str(session_entry.get("barcode") or "미확인").strip() or "미확인"
     hospital_name = str(session_entry.get("hospitalName") or "미확인").strip() or "미확인"
     room_name = str(session_entry.get("roomName") or "미확인").strip() or "미확인"
@@ -428,6 +429,12 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
         impact_line,
     ]
     lines.append(f"• 조치: {' / '.join(action_lines[:3])}")
+    try:
+        normalized_index = int(session_index)
+    except (TypeError, ValueError):
+        normalized_index = 0
+    if normalized_index > 0:
+        return [f"*세션 {normalized_index}*", *lines]
     return lines
 
 
@@ -511,6 +518,28 @@ def _build_barcode_log_error_summary_session_payload(
     }
 
 
+def _ensure_barcode_log_error_session_heading(
+    section_text: str,
+    session_entry: dict[str, Any],
+) -> str:
+    normalized = str(section_text or "").strip()
+    detail = session_entry.get("detail") if isinstance(session_entry, dict) else {}
+    session_index = detail.get("index") if isinstance(detail, dict) else None
+    try:
+        normalized_index = int(session_index)
+    except (TypeError, ValueError):
+        normalized_index = 0
+    if normalized_index <= 0:
+        return normalized
+
+    heading = f"*세션 {normalized_index}*"
+    if normalized.startswith(heading):
+        return normalized
+    if not normalized:
+        return heading
+    return f"{heading}\n{normalized}"
+
+
 def _build_barcode_log_error_summary_fallback(summary_payload: dict[str, Any]) -> str:
     summary = summary_payload.get("summary") if isinstance(summary_payload, dict) else None
     if not isinstance(summary, dict):
@@ -528,8 +557,11 @@ def _build_barcode_log_error_summary_fallback(summary_payload: dict[str, Any]) -
         section_lines = _build_barcode_log_error_session_section(session_entry)
         if not section_lines:
             continue
+        section_text = _ensure_barcode_log_error_session_heading("\n".join(section_lines), session_entry)
+        if not section_text:
+            continue
         lines.append("")
-        lines.extend(section_lines)
+        lines.extend(section_text.splitlines())
     return "\n".join(lines).strip()
 
 
@@ -633,6 +665,7 @@ def _render_barcode_log_error_summary_sections(
         fallback_section = "\n".join(_build_barcode_log_error_session_section(session_entry)).strip()
         if not fallback_section:
             continue
+        fallback_section = _ensure_barcode_log_error_session_heading(fallback_section, session_entry)
         session_playbooks = attach_notion_playbooks_to_evidence(session_payload)
         sections.append(_append_notion_playbook_section(fallback_section, session_playbooks))
     return sections
@@ -755,6 +788,7 @@ def _reply_with_barcode_log_error_summary(
             if _needs_barcode_log_error_summary_session_fallback(final_section, session_payload):
                 final_section = fallback_section
             final_section = _append_notion_playbook_section(final_section, session_playbooks)
+            final_section = _ensure_barcode_log_error_session_heading(final_section, session_entry)
             rendered_sections.append(final_section)
 
         reply(_compose_barcode_log_error_summary_text(fallback_text, rendered_sections).strip())
