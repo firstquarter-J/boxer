@@ -1216,6 +1216,46 @@ def _describe_recording_start_evidence(recovery_context: dict[str, Any] | None) 
     return ""
 
 
+def _find_pre_recording_stop_context(
+    session: dict[str, Any],
+    motion_events: list[dict[str, Any]],
+    recovery_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    stop_line_no = int(session.get("stop_line_no") or 0)
+    if stop_line_no <= 0 or not motion_events:
+        return None
+    if _describe_recording_start_evidence(recovery_context):
+        return None
+
+    trigger_before_stop = any(
+        event.get("event_type") == "motion_trigger"
+        and int(event.get("line_no") or 0) <= stop_line_no
+        for event in motion_events
+    )
+    if trigger_before_stop:
+        return None
+
+    motion_stop_event = next(
+        (
+            event
+            for event in motion_events
+            if event.get("event_type") == "motion_stop"
+            and int(event.get("line_no") or 0) >= stop_line_no
+            and event.get("motion_detected") is False
+        ),
+        None,
+    )
+    if motion_stop_event is None:
+        return None
+
+    return {
+        "label": "모션 감지 단계에서 종료 스캔",
+        "stopTime": _display_value(session.get("stop_time_label"), default="미확인"),
+        "motionStopTime": _display_value(motion_stop_event.get("time_label"), default="미확인"),
+        "motionStopLineNo": int(motion_stop_event.get("line_no") or 0),
+    }
+
+
 def _is_normal_video_status(status_text: str) -> bool:
     normalized = str(status_text or "").strip()
     if not normalized:
@@ -1857,11 +1897,27 @@ def _build_session_recording_result_text(
         if has_stop
         else None
     )
+    pre_recording_stop_context = _find_pre_recording_stop_context(
+        session,
+        session_motion_events or [],
+        recovery_context,
+    )
 
     if has_restart:
         return "정상 녹화 실패로 판단", recovery_context, post_stop_context
     if not has_stop:
         return "정상 녹화 실패로 판단", recovery_context, post_stop_context
+    if isinstance(pre_recording_stop_context, dict):
+        detail_parts = [str(pre_recording_stop_context.get("label") or "모션 감지 단계에서 종료 스캔").strip()]
+        if motion_label and motion_label not in detail_parts:
+            detail_parts.append(motion_label)
+        if first_ffmpeg_error is not None:
+            error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
+            elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
+            detail_parts.append(f"첫 ffmpeg 오류 `{error_time}`")
+            if elapsed:
+                detail_parts.append(f"세션 시작 후 `{elapsed}`")
+        return f"정상 녹화 실패로 판단 ({', '.join(detail_parts)})", recovery_context, post_stop_context
     if first_ffmpeg_error is not None:
         error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
         elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
@@ -2313,6 +2369,11 @@ def _build_log_analysis_record(
         session_first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_subset, [session])
         termination_text = _build_session_termination_text(session, session_restart_events)
         motion_outcome = _describe_session_motion_outcome(session_motion_events)
+        pre_recording_stop_context = _find_pre_recording_stop_context(
+            session,
+            session_motion_events,
+            recovery_context,
+        )
         session_detail = {
             "index": index,
             "startTime": _display_value(session.get("start_time_label"), default="시간미상"),
@@ -2330,6 +2391,8 @@ def _build_log_analysis_record(
             "errorLineCount": len(session_error_items),
             "errorGroups": _build_error_groups(session_error_items),
             "firstFfmpegError": session_first_ffmpeg_error or {},
+            "preRecordingStopDetected": isinstance(pre_recording_stop_context, dict),
+            "preRecordingStopLabel": _display_value((pre_recording_stop_context or {}).get("label"), default=""),
         }
         session_diagnostics.append(
             {
@@ -2444,12 +2507,21 @@ def _build_session_card_context(
     termination_text = _build_session_termination_text(session, session_restart_events)
     motion_outcome = _describe_session_motion_outcome(session_motion_events)
     motion_label = _display_value(motion_outcome.get("label"), default="")
+    pre_recording_stop_context = _find_pre_recording_stop_context(
+        session,
+        session_motion_events,
+        recovery_context,
+    )
 
     anomaly_parts: list[str] = []
     if has_restart:
         anomaly_parts.append("재시작 감지")
     if not has_stop:
         anomaly_parts.append("종료 스캔 없음")
+    if isinstance(pre_recording_stop_context, dict):
+        anomaly_parts.append(
+            _display_value(pre_recording_stop_context.get("label"), default="모션 감지 단계에서 종료 스캔")
+        )
     if motion_label and not bool(motion_outcome.get("success")):
         anomaly_parts.append(motion_label)
 
@@ -2485,6 +2557,8 @@ def _build_session_card_context(
         "postStopText": post_stop_text,
         "recoveryContext": recovery_context,
         "postStopContext": post_stop_context,
+        "preRecordingStopDetected": isinstance(pre_recording_stop_context, dict),
+        "preRecordingStopLabel": _display_value((pre_recording_stop_context or {}).get("label"), default=""),
     }
 
 

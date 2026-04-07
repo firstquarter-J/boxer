@@ -277,6 +277,7 @@ def _build_barcode_log_error_session_record(session_entry: dict[str, Any]) -> di
         "firstFfmpegError": (
             detail.get("firstFfmpegError") if isinstance(detail.get("firstFfmpegError"), dict) else {}
         ),
+        "preRecordingStopDetected": bool(detail.get("preRecordingStopDetected")),
         "sessionDiagnostics": [session_diagnostic] if session_diagnostic else [],
     }
     record["classificationTags"] = _classify_record(record)
@@ -318,6 +319,11 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
     ffmpeg_time = str(first_ffmpeg_error.get("timeLabel") or "").strip()
     session_diagnostic = detail.get("sessionDiagnostic") if isinstance(detail.get("sessionDiagnostic"), dict) else {}
     diagnostic_severity = str(session_diagnostic.get("severity") or "").strip()
+    pre_recording_stop_detected = bool(detail.get("preRecordingStopDetected"))
+    pre_recording_stop_label = (
+        str(detail.get("preRecordingStopLabel") or "모션 감지 단계에서 종료 스캔").strip()
+        or "모션 감지 단계에서 종료 스캔"
+    )
 
     first_ffmpeg_text = " ".join(
         str(first_ffmpeg_error.get(key) or "").strip().lower()
@@ -340,6 +346,20 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
     elif not normal_closed:
         cause_line = "• 핵심 원인: 종료 스캔이 없어 세션이 비정상 종료됐어"
         impact_line = "• 영향: 종료 처리가 끝나지 않아 정상 녹화 실패로 봐야 해"
+    elif pre_recording_stop_detected:
+        if "device_busy" in tags:
+            cause_line = (
+                f"• 핵심 원인: {pre_recording_stop_label}돼 녹화 취소로 끝났고, "
+                "직전 `/dev/video0` 점유 오류가 있어 녹화 전환이 막힌 정황이야"
+            )
+        elif is_ffmpeg_error:
+            cause_line = (
+                f"• 핵심 원인: {pre_recording_stop_label}돼 녹화 취소로 끝났고, "
+                "세션 초반 ffmpeg 오류로 본 녹화 전환이 안 된 정황이야"
+            )
+        else:
+            cause_line = f"• 핵심 원인: {pre_recording_stop_label}돼 녹화 취소로 끝났고 실녹화가 시작되지 않았어"
+        impact_line = "• 영향: 종료 스캔은 있었지만 본 녹화 시작 전이라 정상 녹화 실패로 봐야 해"
     elif recordings_on_date_count <= 0 and (is_ffmpeg_error or is_recording_stalled or diagnostic_severity == "high"):
         if is_recording_stalled and is_ffmpeg_error:
             cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)와 ffmpeg 종료가 함께 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해. 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심해"
@@ -377,6 +397,8 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
     action_lines: list[str] = []
     if restart_detected:
         action_lines.append("전원 차단/전원 버튼 오입력 여부 확인")
+    if pre_recording_stop_detected:
+        action_lines.append("종료 스캔 시점과 녹화 취소 안내 여부 확인")
     if is_recording_stalled or is_ffmpeg_timestamp_error or is_standby_ffmpeg_error or is_ffmpeg_error:
         action_lines.append("캡처보드 연결 상태와 입력 신호 점검")
     if is_recording_stalled:
@@ -443,6 +465,8 @@ def _build_barcode_log_error_summary_session_payload(
             "recordingsOnDateCount": session_entry.get("recordingsOnDateCount"),
             "errorLineCount": detail.get("errorLineCount"),
             "firstFfmpegError": detail.get("firstFfmpegError"),
+            "preRecordingStopDetected": detail.get("preRecordingStopDetected"),
+            "preRecordingStopLabel": detail.get("preRecordingStopLabel"),
             "classificationTags": session_record.get("classificationTags") or [],
             "routerCauseHint": _build_cause_line(session_record),
             "representativeErrorGroup": {
@@ -548,8 +572,12 @@ def _needs_barcode_log_error_summary_session_fallback(
         if str(tag).strip()
     }
     recordings_on_date_count = int(session.get("recordingsOnDateCount") or 0)
+    pre_recording_stop_detected = bool(session.get("preRecordingStopDetected"))
     normalized = (synthesized or "").strip()
     lowered = normalized.lower()
+
+    if pre_recording_stop_detected and not any(token in normalized for token in ("녹화 취소", "실녹화", "본 녹화 시작 전", "모션 감지 단계")):
+        return True
 
     if recordings_on_date_count <= 0 and tags.intersection({"ffmpeg_error", "ffmpeg_sigterm", "recording_stalled"}):
         if "녹화 & 업로드 실패" not in normalized:

@@ -22,6 +22,22 @@ class NotionPlaybooksTests(unittest.TestCase):
         self.assertIn("준비 음성", references[0]["previewLines"][0])
 
     @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
+    def test_local_mommybox_cancel_voice_question_selects_process_playbook(self, _: object) -> None:
+        references = _select_notion_references(
+            "마미박스 녹화 취소 음성 왜 나와?",
+            evidence_payload={
+                "route": "notion_playbook_qa",
+                "request": {
+                    "question": "마미박스 녹화 취소 음성 왜 나와?",
+                },
+            },
+        )
+
+        self.assertTrue(references)
+        self.assertEqual(references[0]["title"], "마미박스 프로세스 순서")
+        self.assertTrue(any("녹화 취소 안내 음성" in line for line in references[0]["previewLines"]))
+
+    @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
     def test_local_pink_barcode_overview_playbook_is_selected_for_overview_query(self, _: object) -> None:
         references = _select_notion_references(
             "핑크 바코드 전체 정리해줘",

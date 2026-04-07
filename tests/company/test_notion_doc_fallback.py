@@ -24,6 +24,7 @@ _MOMMYBOX_RECORDING_PROCESS_REFERENCES = [
             "상태: 모션 감지 단계의 MDA 상태는 RECORDING이 아니라 SESSION이야",
             "전환: 모션 감지 성공 또는 타임아웃이면 녹화 시작 음성 후 본 녹화가 시작되고 상태가 RECORDING으로 바뀌어",
             "주의: 모션 감지 단계에서 종료 스캔하면 본 녹화 종료가 아니라 취소 성격으로 처리될 수 있어",
+            "음성: 모션 감지 단계에서 종료 스캔하면 녹화 취소 안내 음성이 나올 수 있고, 아직 본 녹화는 시작되지 않은 상태야",
             "종료: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도해",
         ],
     }
@@ -67,11 +68,26 @@ class NotionDocFallbackTests(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 본 녹화 종료와 같은 의미가 아니야",
+            "• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 녹화 취소 안내 음성이 나올 수 있고 아직 본 녹화는 시작되지 않은 상태야",
             text,
         )
         self.assertIn(
-            "• 조치: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도한다고 안내해",
+            "• 조치: 모션 감지 통과 전 종료 스캔이면 녹화 취소 안내로 봐야 하고, 녹화 중 종료 스캔일 때만 종료 음성과 함께 파일 마무리 후 업로드를 시도한다고 안내해",
+            text,
+        )
+
+    def test_mommybox_recording_cancel_voice_question_is_answered_directly(self) -> None:
+        text = _build_notion_doc_fallback(
+            "마미박스 녹화 취소 음성은 언제 나와?",
+            _MOMMYBOX_RECORDING_PROCESS_REFERENCES,
+        )
+
+        self.assertIn(
+            "녹화 취소 안내 음성이 나올 수 있고 아직 본 녹화는 시작되지 않은 상태야",
+            text,
+        )
+        self.assertIn(
+            "모션 감지 통과 전 종료 스캔이면 녹화 취소 안내로 봐야 하고",
             text,
         )
 

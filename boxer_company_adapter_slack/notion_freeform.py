@@ -800,8 +800,8 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
 
     if is_mommybox_recording_process_doc:
         lines.append("• 결론: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼")
-        lines.append("• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 본 녹화 종료와 같은 의미가 아니야")
-        lines.append("• 조치: 녹화 중 종료 스캔하면 종료 음성이 나오고 파일을 마무리한 뒤 업로드를 시도한다고 안내해")
+        lines.append("• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 녹화 취소 안내 음성이 나올 수 있고 아직 본 녹화는 시작되지 않은 상태야")
+        lines.append("• 조치: 모션 감지 통과 전 종료 스캔이면 녹화 취소 안내로 봐야 하고, 녹화 중 종료 스캔일 때만 종료 음성과 함께 파일 마무리 후 업로드를 시도한다고 안내해")
         return "\n".join(lines)
 
     if is_barcode_sync_doc and not is_meaning_question:
@@ -879,6 +879,8 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
     if "표시상 엣지케이스" in fallback_normalized and "엣지케이스" not in normalized:
         return True
     if "추가 구매" in fallback_normalized and "추가 구매" not in normalized:
+        return True
+    if "녹화 취소 안내 음성" in fallback_normalized and "녹화 취소" not in normalized:
         return True
 
     required_bullets = (
