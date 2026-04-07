@@ -8,6 +8,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _load_slack_user_name, _set_request_log_route
 from boxer.core import settings as s
 from boxer_company import settings as cs
+from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.barcode_log import _extract_device_name_scope, _extract_log_date_with_presence
 from boxer_company.routers.box_db import _lookup_device_contexts_by_hospital_room
 from boxer_company.routers.device_audio_probe import (
@@ -32,10 +33,13 @@ from boxer_company.routers.device_file_probe import (
     _should_render_compact_device_recovery_result,
 )
 from boxer_company.routers.device_status_probe import (
+    _build_led_pattern_help_evidence,
+    _build_led_pattern_help_reply,
     _build_device_memory_patch_config_message,
     _build_device_status_probe_config_message,
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
+    _is_device_led_pattern_help_request,
     _is_device_led_probe_request,
     _is_device_memory_patch_request,
     _is_device_pm2_probe_request,
@@ -108,6 +112,30 @@ def _handle_device_routes(
     update_device_name = _extract_device_name_for_update(question) or structured_device_name
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
+
+    if _is_device_led_pattern_help_request(question):
+        fallback_text = _build_led_pattern_help_reply(question)
+        evidence_payload = _build_led_pattern_help_evidence(question)
+        notion_references = _select_notion_references(
+            question,
+            evidence_payload=evidence_payload,
+            max_results=2,
+        )
+        if notion_references:
+            evidence_payload["notionPlaybooks"] = notion_references
+            evidence_payload["notionReferences"] = notion_references
+        deps.reply_with_retrieval_synthesis(
+            fallback_text,
+            evidence_payload,
+            route_name="device led pattern guide",
+            max_tokens=280,
+        )
+        context.logger.info(
+            "Responded with device led pattern guide in thread_ts=%s refs=%s",
+            context.thread_ts,
+            len(notion_references),
+        )
+        return True
 
     if _is_barcode_device_file_probe_request(question, barcode):
         if not s.S3_QUERY_ENABLED:

@@ -366,6 +366,32 @@ def create_app() -> App:
 
             return False
 
+        def _needs_device_led_pattern_fallback(
+            synthesized: str,
+            fallback_text: str,
+            route_name: str,
+        ) -> bool:
+            if route_name != "device led pattern guide":
+                return False
+
+            normalized_synth = (synthesized or "").strip()
+            normalized_fallback = (fallback_text or "").strip()
+            required_bullets = (
+                "• 결론:",
+                "• 근거:",
+                "• 참고 상태:",
+                "• 안내:",
+            )
+
+            if normalized_fallback.startswith("*LED 증상 안내*") and not normalized_synth.startswith("*LED 증상 안내*"):
+                return True
+
+            for bullet in required_bullets:
+                if bullet in normalized_fallback and bullet not in normalized_synth:
+                    return True
+
+            return False
+
         def _attach_notion_playbooks_to_evidence(
             evidence_payload: dict[str, Any] | None,
         ) -> list[dict[str, Any]]:
@@ -399,6 +425,22 @@ def create_app() -> App:
                 fallback_with_references = _append_company_notion_doc_section(
                     fallback_text,
                     company_notion_docs,
+                )
+            elif evidence_route == "device_led_pattern_guide":
+                request_payload = evidence_payload.get("request") if isinstance(evidence_payload.get("request"), dict) else {}
+                notion_link_query = str(request_payload.get("contextualQuestion") or question).strip() or question
+                company_notion_docs = select_company_notion_doc_links(
+                    notion_link_query,
+                    notion_playbooks=notion_playbooks,
+                    max_results=3,
+                )
+                fallback_with_references = _append_company_notion_doc_section(
+                    fallback_text,
+                    company_notion_docs,
+                )
+                fallback_with_references = _append_notion_playbook_section(
+                    fallback_with_references,
+                    notion_playbooks,
                 )
             else:
                 fallback_with_references = _append_notion_playbook_section(
@@ -489,12 +531,17 @@ def create_app() -> App:
                     final_text = fallback_with_references
                 if _needs_device_audio_probe_fallback(final_text, fallback_text, route_name):
                     final_text = fallback_with_references
+                if _needs_device_led_pattern_fallback(final_text, fallback_text, route_name):
+                    final_text = fallback_with_references
                 if _needs_notion_doc_fallback(final_text, route_name, fallback_text):
                     final_text = fallback_with_references
                 if _needs_notion_doc_security_refusal(final_text, route_name):
                     final_text = _build_notion_doc_security_refusal()
                 elif evidence_route == "notion_playbook_qa":
                     final_text = _append_company_notion_doc_section(final_text, company_notion_docs)
+                elif evidence_route == "device_led_pattern_guide":
+                    final_text = _append_company_notion_doc_section(final_text, company_notion_docs)
+                    final_text = _append_notion_playbook_section(final_text, notion_playbooks)
                 else:
                     final_text = _append_notion_playbook_section(final_text, notion_playbooks)
                 reply(final_text)

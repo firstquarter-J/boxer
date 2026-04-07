@@ -2,9 +2,12 @@ import unittest
 from unittest.mock import patch
 
 from boxer_company.routers.device_status_probe import (
+    _build_led_pattern_help_evidence,
+    _build_led_pattern_help_reply,
     _patch_device_pm2_memory,
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
+    _is_device_led_pattern_help_request,
     _is_device_led_probe_request,
     _is_device_memory_patch_request,
     _is_device_pm2_probe_request,
@@ -66,6 +69,11 @@ class DeviceStatusProbeRoutingTests(unittest.TestCase):
         self.assertTrue(_is_device_pm2_probe_request("MB2-C00419 pm2 상태"))
         self.assertTrue(_is_device_captureboard_probe_request("MB2-C00419 캡처보드 상태"))
         self.assertTrue(_is_device_led_probe_request("MB2-C00419 LED 상태"))
+
+    def test_routes_led_pattern_help_questions_without_runtime_probe(self) -> None:
+        self.assertTrue(_is_device_led_pattern_help_request("LED 증상은 어떨 때 나타나?"))
+        self.assertTrue(_is_device_led_pattern_help_request("MB2-C00419 LED 패턴 의미가 뭐야?"))
+        self.assertFalse(_is_device_led_pattern_help_request("MB2-C00419 LED 상태"))
 
     def test_routes_memory_patch_only_for_explicit_action_question(self) -> None:
         self.assertTrue(_is_device_memory_patch_request("MB2-C00419 메모리 패치"))
@@ -142,6 +150,21 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "pass")
         self.assertIn("LED USB", summary["evidence"])
+
+    def test_builds_led_pattern_help_reply_with_warning_and_network_note(self) -> None:
+        reply = _build_led_pattern_help_reply("LED 초록불 길게 깜빡이다가 빨간불 잠시 들어옴 반복은 뭐야?")
+
+        self.assertIn("• 결론:", reply)
+        self.assertIn("warning", reply)
+        self.assertIn("네트워크 오프라인", reply)
+
+    def test_builds_led_pattern_help_evidence_with_spec_and_interpretation(self) -> None:
+        evidence = _build_led_pattern_help_evidence("LED 초록불 길게 깜빡이다가 빨간불 잠시 들어옴 반복은 뭐야?")
+
+        self.assertEqual(evidence["route"], "device_led_pattern_guide")
+        self.assertEqual(evidence["patternInterpretation"]["status"], "warning")
+        self.assertFalse(evidence["notes"]["networkOfflineLedMapped"])
+        self.assertGreaterEqual(len(evidence["ledSpec"]), 6)
 
     def test_summarizes_audio_path_as_passive_ok_when_devices_and_volume_exist(self) -> None:
         summary = _summarize_audio_path_probe(

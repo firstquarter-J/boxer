@@ -288,6 +288,24 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "18) 원격 명령만으로 물리 스피커 고장, 케이블 접촉 불량, 현장 배선 문제는 확정하지 말고 `참고`에 현장 확인 필요라고 적어.\n"
             "19) 6줄 안팎으로 짧게 끝내."
         )
+    if route == "device_led_pattern_guide":
+        return (
+            "\n"
+            "7) 이 작업은 장비 LED 패턴 설명이다.\n"
+            "8) 아래 형식 그대로만 답해:\n"
+            "   *LED 증상 안내*\n"
+            "   • 결론:\n"
+            "   • 근거:\n"
+            "   • 참고 상태:\n"
+            "   • 안내:\n"
+            "9) 반드시 한국어만 사용해. 영어 설명, 자기 사고 과정, 중간 추론, 검토 문장은 절대 쓰지 마.\n"
+            "10) ledSpec과 patternInterpretation이 1차 근거고 notionPlaybooks/notionReferences/previewLines는 보강 설명용이야. 문서 문구가 있어도 spec과 충돌하면 spec을 우선해.\n"
+            "11) patternInterpretation.status가 비어 있으면 특정 상태를 단정하지 말고 매핑 기준 위주로 설명해.\n"
+            "12) 네트워크 오프라인, 업로드 지연은 evidence에서 LED 매핑 근거가 없으면 LED warning/error 원인으로 단정하지 마.\n"
+            "13) `참고 상태`는 질문과 관련 큰 상태 2~3개만 `state=command` 형식으로 짧게 적어.\n"
+            "14) 현장 표현만으로 하드웨어 고장까지 단정하지 말고, 재부팅 후 미기동 같은 별도 증상은 전원/하드웨어 점검을 분리해서 안내해.\n"
+            "15) 6줄 안팎으로 끝내."
+        )
 
     if route != "barcode_log_analysis":
         return ""

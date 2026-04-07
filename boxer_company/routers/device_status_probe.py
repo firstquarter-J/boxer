@@ -58,6 +58,77 @@ _DEVICE_CAPTUREBOARD_HINTS = (
     "capture board",
 )
 _DEVICE_LED_HINTS = ("led", "엘이디")
+_DEVICE_LED_PATTERN_EXPLAIN_HINTS = (
+    "증상",
+    "패턴",
+    "의미",
+    "뜻",
+    "무슨 상태",
+    "어떤 상태",
+    "어떨 때",
+    "언제",
+    "왜",
+    "원인",
+    "나타나",
+    "나와",
+    "설명",
+)
+_DEVICE_LED_COLOR_HINTS = (
+    "초록불",
+    "녹색불",
+    "빨간불",
+    "적색불",
+    "파란불",
+    "청색불",
+    "초록",
+    "녹색",
+    "빨강",
+    "빨간",
+    "적색",
+    "파랑",
+    "파란",
+    "청색",
+    "깜빡",
+    "깜빡이",
+    "blink",
+)
+_LED_STATE_SPECS: tuple[dict[str, str], ...] = (
+    {
+        "state": "ready",
+        "command": "LC:ON:G:",
+        "meaning": "정상 대기/준비 상태",
+    },
+    {
+        "state": "motion",
+        "command": "LC:ON:B:",
+        "meaning": "모션 감지 대기 상태",
+    },
+    {
+        "state": "recording",
+        "command": "LC:BR:R:",
+        "meaning": "녹화 중",
+    },
+    {
+        "state": "paused",
+        "command": "LC:BL:B:",
+        "meaning": "일시정지",
+    },
+    {
+        "state": "warning",
+        "command": "LC:FBL:R:G:",
+        "meaning": "현장 알림 피드백이 켜진 장비 기준 이미지 품질 이상, 녹화 정체, 비디오 길이 불일치",
+    },
+    {
+        "state": "error",
+        "command": "LC:FBL:R:B:",
+        "meaning": "단색 화면, 입력 없음, 화면 어두움, 캡처 입력 이상 같은 에러 상태",
+    },
+    {
+        "state": "busy",
+        "command": "LC:3C:",
+        "meaning": "종료/재시작 같은 busy 상태",
+    },
+)
 _DEVICE_STATUS_ALL_HINTS = (
     *_DEVICE_STATUS_HINTS,
     *_DEVICE_PM2_HINTS,
@@ -280,6 +351,133 @@ def _is_device_led_probe_request(question: str, device_name: str | None = None) 
     normalized = _normalize_device_status_question(question)
     resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
     return bool(resolved_device_name and _contains_hint(normalized, _DEVICE_LED_HINTS))
+
+
+def _is_device_led_pattern_help_request(question: str) -> bool:
+    normalized = _normalize_device_status_question(question)
+    if not normalized:
+        return False
+    has_led_context = _contains_hint(normalized, _DEVICE_LED_HINTS) or _contains_hint(normalized, _DEVICE_LED_COLOR_HINTS)
+    if not has_led_context:
+        return False
+    return _contains_hint(normalized, _DEVICE_LED_PATTERN_EXPLAIN_HINTS)
+
+
+def _infer_led_pattern_help(question: str) -> dict[str, Any]:
+    normalized = _normalize_device_status_question(question)
+    has_red = any(token in normalized for token in ("빨간불", "적색불", "빨강", "빨간", "적색", "red"))
+    has_green = any(token in normalized for token in ("초록불", "녹색불", "초록", "녹색", "green"))
+    has_blue = any(token in normalized for token in ("파란불", "청색불", "파랑", "파란", "청색", "blue"))
+    has_blink = any(token in normalized for token in ("깜빡", "깜빡이", "blink"))
+
+    signals: list[str] = []
+    if has_green:
+        signals.append("green")
+    if has_red:
+        signals.append("red")
+    if has_blue:
+        signals.append("blue")
+    if has_blink:
+        signals.append("blink")
+
+    if has_red and has_green and has_blink:
+        return {
+            "status": "warning",
+            "confidence": "high",
+            "conclusion": "설명한 패턴은 `warning` 상태로 보는 게 맞아",
+            "reason": "초록/빨강 깜빡 표현이 있고 warning 매핑은 `LC:FBL:R:G:` 기준이야",
+            "guide": "영상 품질 이상, 녹화 정체, 비디오 길이 불일치 쪽을 먼저 확인해",
+            "signals": signals,
+            "relatedStates": ("warning", "error", "ready"),
+        }
+    if has_red and has_blue and has_blink:
+        return {
+            "status": "mixed",
+            "confidence": "medium",
+            "conclusion": "빨강/파랑 점멸 설명만으로는 `error`와 `paused` 해석이 섞일 수 있어",
+            "reason": "빨강 계열은 error, 파랑 점멸은 paused 쪽과 겹쳐서 현장 표현만으론 단정이 어려워",
+            "guide": "입력 없음, 단색 화면, 화면 이상 같은 에러 징후가 같이 있었는지 먼저 확인해",
+            "signals": signals,
+            "relatedStates": ("error", "paused", "warning"),
+        }
+    if has_blue and has_blink:
+        return {
+            "status": "paused",
+            "confidence": "medium",
+            "conclusion": "파란 점멸이면 `paused` 상태로 먼저 보는 게 맞아",
+            "reason": "paused 매핑은 `LC:BL:B:` 기준이야",
+            "guide": "일시정지 직전 조작이나 재개 동작이 있었는지 확인해",
+            "signals": signals,
+            "relatedStates": ("paused", "motion"),
+        }
+    return {
+        "status": "",
+        "confidence": "low",
+        "conclusion": "질문만으로 특정 LED 상태를 단정하긴 어려워",
+        "reason": "색상, 점멸 방식, 반복 여부가 더 있어야 정확히 매핑할 수 있어",
+        "guide": "초록/빨강/파랑, 점등/점멸, 반복 여부를 같이 받아서 매핑해",
+        "signals": signals,
+        "relatedStates": ("ready", "motion", "recording", "warning", "error", "busy"),
+    }
+
+
+def _build_led_pattern_help_evidence(question: str) -> dict[str, Any]:
+    interpretation = _infer_led_pattern_help(question)
+    return {
+        "route": "device_led_pattern_guide",
+        "source": "device_led_spec",
+        "request": {
+            "question": question,
+        },
+        "patternInterpretation": interpretation,
+        "ledSpec": [dict(item) for item in _LED_STATE_SPECS],
+        "notes": {
+            "networkOfflineLedMapped": False,
+            "networkOfflineHandling": "네트워크 오프라인은 현재 LED 변경이 아니라 internet 음성 안내로 처리돼",
+        },
+    }
+
+
+def _build_led_pattern_help_reply(question: str) -> str:
+    evidence = _build_led_pattern_help_evidence(question)
+    interpretation = evidence.get("patternInterpretation") if isinstance(evidence, dict) else {}
+    if not isinstance(interpretation, dict):
+        interpretation = {}
+
+    reference_states = []
+    related_state_names = {
+        str(value).strip()
+        for value in (interpretation.get("relatedStates") or ())
+        if str(value).strip()
+    }
+    for item in _LED_STATE_SPECS:
+        state_name = str(item.get("state") or "").strip()
+        if not state_name:
+            continue
+        if related_state_names and state_name not in related_state_names:
+            continue
+        reference_states.append(f"`{state_name}={item.get('command')}` {item.get('meaning')}")
+        if len(reference_states) >= 3:
+            break
+    if not reference_states:
+        reference_states = [
+            f"`warning=LC:FBL:R:G:` {_LED_STATE_SPECS[4]['meaning']}",
+            f"`error=LC:FBL:R:B:` {_LED_STATE_SPECS[5]['meaning']}",
+            f"`busy=LC:3C:` {_LED_STATE_SPECS[6]['meaning']}",
+        ]
+
+    lines = [
+        "*LED 증상 안내*",
+        f"• 결론: {str(interpretation.get('conclusion') or '').strip()}",
+        (
+            "• 근거: "
+            f"{str(interpretation.get('reason') or '').strip()} / "
+            "네트워크 오프라인은 LED 매핑이 아니라 `internet` 음성 안내야"
+        ),
+        f"• 참고 상태: {' / '.join(reference_states)}",
+        f"• 안내: {str(interpretation.get('guide') or '').strip()}",
+    ]
+    return "\n".join(lines)
 
 
 def _is_device_status_probe_request(question: str, device_name: str | None = None) -> bool:

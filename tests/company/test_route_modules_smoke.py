@@ -120,6 +120,44 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertFalse(handled)
 
+    def test_device_routes_handles_led_pattern_help_before_freeform(self) -> None:
+        replies: list[str] = []
+        synth_calls: list[tuple[str, dict[str, object], str]] = []
+
+        handled = _handle_device_routes(
+            DeviceRoutesContext(
+                question="LED 증상은 어떨 때 나타나?",
+                barcode=None,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                payload=_payload(),  # type: ignore[arg-type]
+                user_id="U123",
+                workspace_id="W123",
+                channel_id="C123",
+                thread_ts="1.0",
+                reply=lambda text, **kwargs: replies.append(text),
+                client=None,
+                logger=logging.getLogger(__name__),
+            ),
+            DeviceRoutesDeps(
+                get_s3_client=lambda: None,
+                get_recordings_context=lambda: {},
+                has_recordings_device_mapping=lambda context: False,
+                send_dm_message=lambda user_id, text: False,
+                build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                reply_with_retrieval_synthesis=lambda fallback_text, evidence_payload, route_name, **kwargs: synth_calls.append(
+                    (fallback_text, evidence_payload, route_name)
+                ),
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, [])
+        self.assertEqual(len(synth_calls), 1)
+        self.assertIn("LED 증상 안내", synth_calls[0][0])
+        self.assertEqual(synth_calls[0][2], "device led pattern guide")
+        self.assertIn("notionPlaybooks", synth_calls[0][1])
+
     def test_knowledge_routes_returns_false_when_no_route_matches(self) -> None:
         with patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", ""):
             handled = _handle_knowledge_routes(

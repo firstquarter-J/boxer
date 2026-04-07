@@ -85,6 +85,22 @@ class NotionPlaybooksTests(unittest.TestCase):
         self.assertEqual(references[0]["title"], "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지")
         self.assertIn("핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어", references[0]["previewLines"][0])
 
+    @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
+    def test_local_led_playbook_is_selected_without_notion(self, _: object) -> None:
+        references = _select_notion_references(
+            "LED 초록불 길게 깜빡이다가 빨간불 잠시 들어옴 반복은 어떤 상태야?",
+            evidence_payload={
+                "route": "device_led_pattern_guide",
+                "request": {
+                    "question": "LED 초록불 길게 깜빡이다가 빨간불 잠시 들어옴 반복은 어떤 상태야?",
+                },
+            },
+        )
+
+        self.assertTrue(references)
+        self.assertEqual(references[0]["title"], "마미박스 장비 LED 상태표시등")
+        self.assertIn("warning", references[0]["previewLines"][1])
+
 
 if __name__ == "__main__":
     unittest.main()

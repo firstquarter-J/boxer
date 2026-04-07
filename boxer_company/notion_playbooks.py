@@ -55,6 +55,59 @@ _LOW_SIGNAL_NOTION_TERMS = {
 }
 _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
     {
+        "pageId": "local-playbook:mommybox-led-state-guide",
+        "section": "마미박스 가이드",
+        "kind": "guide",
+        "priority": "high",
+        "title": "마미박스 장비 LED 상태표시등",
+        "keywords": (
+            "led",
+            "엘이디",
+            "초록불",
+            "빨간불",
+            "파란불",
+            "warning",
+            "error",
+            "ready",
+            "busy",
+            "깜빡",
+            "패턴",
+            "증상",
+            "의미",
+            "어떨 때",
+        ),
+        "requiredTokenGroups": (
+            (
+                "led",
+                "엘이디",
+                "초록불",
+                "빨간불",
+                "파란불",
+            ),
+            (
+                "상태",
+                "증상",
+                "패턴",
+                "의미",
+                "뜻",
+                "어떨 때",
+                "깜빡",
+                "warning",
+                "error",
+                "ready",
+                "busy",
+            ),
+        ),
+        "previewLines": (
+            "매핑: ready=LC:ON:G: / motion=LC:ON:B: / recording=LC:BR:R: / paused=LC:BL:B: / busy=LC:3C:",
+            "warning: LC:FBL:R:G: 는 현장 알림 피드백이 켜진 장비 기준 이미지 품질 이상, recording stalled, video duration mismatch 때 사용해",
+            "error: LC:FBL:R:B: 는 image_uniform_color, 입력 없음, 화면 어두움, 캡처 입력 이상 같은 에러 상태에서 사용해",
+            "해석 기준: 초록불 길게 깜빡이다가 빨간불이 잠시 반복된다고 들리면 warning 계열로 먼저 보고 영상 품질 이상, 녹화 정체, 비디오 길이 불일치를 확인해",
+            "주의: 네트워크 오프라인은 LED 패턴 변경이 아니라 internet 음성 안내로 처리해",
+            "운영: 재부팅 후 아예 안 켜지면 LED 의미와 별개로 전원, 어댑터, 하드웨어 문제를 분리해서 봐야 해",
+        ),
+    },
+    {
         "pageId": "local-playbook:mommybox-recording-process",
         "section": "마미박스 가이드",
         "kind": "guide",
@@ -333,6 +386,25 @@ _NOTION_QUERY_EXPANSIONS = (
     },
 )
 _NOTION_PLAYBOOK_TOPIC_RULES = (
+    {
+        "tokens": (
+            "led",
+            "엘이디",
+            "초록불",
+            "빨간불",
+            "파란불",
+            "warning",
+            "error",
+            "ready",
+            "busy",
+            "깜빡",
+            "패턴",
+            "증상",
+        ),
+        "titles": (
+            "마미박스 장비 LED 상태표시등",
+        ),
+    },
     {
         "tokens": (
             "설명",
