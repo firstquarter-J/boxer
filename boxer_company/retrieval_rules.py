@@ -215,9 +215,9 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "19) 다만 sessionDiagnostics에 종료 처리 지연, 종료 후 추가 스캔, 종료 후 장치 오류가 있으면 이 신호를 초기 standby error보다 더 강한 이상 징후로 우선 해석해.\n"
             "20) `Couldn't renew JWT`, `Send Status: Failed`, `sendScreenShotBase64`, `sendCurrentFrameSnapBase64`, `sendDailyLog`, `Uploader ... couldn't be sent`, `getaddrinfo EAI_AGAIN` 같은 Endpoint/Uploader 통신 오류는 그것만으로 녹화 실패 원인이라고 판단하지 마.\n"
             "21) 위 통신 오류만 있고 종료 스캔/녹화 흐름이 정상이라면, 녹화 실패가 아니라 상태 전송/스크린샷/업로드 통신 오류로 설명해.\n"
-            "22) evidence에 날짜 기준 DB 영상 기록(recordingsOnDateCount)이 있으면 반드시 같이 해석해. DB 영상 기록이 있으면 업로드 최종 성공 근거로 보고, 없으면 업로드 실패 가능성을 언급해.\n"
-            "23) 날짜 기준 DB 영상 기록이 없고 stalled/ffmpeg 오류가 함께 있으면 `녹화 & 업로드 실패로 판단`이라고 적어.\n"
-            "24) stalled 신호가 반복되고 날짜 기준 DB 영상 기록이 없으면 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심한다고 적어.\n"
+            "22) evidence에 세션 기준 DB 영상 기록(sessionRecordingsCount)이 있으면 그 값을 최우선으로 해석해. recordingsOnDateCount는 같은 날짜 다른 세션 영상일 수 있으니 단독으로 세션 성공 근거로 쓰지 마.\n"
+            "23) 세션 기준 DB 영상 기록이 없고 stalled/ffmpeg 오류가 함께 있으면 `녹화 & 업로드 실패로 판단`이라고 적어.\n"
+            "24) stalled 신호가 반복되고 세션 기준 DB 영상 기록이 없으면 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심한다고 적어.\n"
         )
     if route == "barcode_log_error_summary_session":
         return (
@@ -232,11 +232,11 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "10) 제공된 evidence만 사용해. 추정이면 반드시 `추정:`으로 시작해.\n"
             "11) `근거 로그`, `코드 근거`, `확실도`, 추가 섹션을 쓰지 마.\n"
             "12) restartDetected가 있으면 `정상 녹화 실패로 판단`이라고 확정형으로 써.\n"
-            "13) session.errorGroups의 첫 번째 항목만 대표 원인으로 쓰지 마. session.classificationTags, session.representativeErrorGroup, session.routerCauseHint, session.firstFfmpegError, session.recordingsOnDateCount, session.sessionDiagnostic를 같이 봐.\n"
+            "13) session.errorGroups의 첫 번째 항목만 대표 원인으로 쓰지 마. session.classificationTags, session.representativeErrorGroup, session.routerCauseHint, session.firstFfmpegError, session.sessionRecordingsCount, session.recordingsOnDateCount, session.sessionDiagnostic를 같이 봐. 세션 성공 여부는 sessionRecordingsCount를 우선 해석해.\n"
             "14) `startRecording() FFmpeg error encountered`, `generateThumbnail ffmpeg failed`, `ffmpeg was killed with signal SIGTERM`, `recording may be stalled` 같은 Recorder/FFmpeg 종료 신호는 app 계열 오류보다 우선 원인으로 해석해.\n"
-            "15) 날짜 기준 DB 영상 기록이 없고 Recorder/FFmpeg SIGTERM, stalled, firstFfmpegError가 있으면 `녹화 & 업로드 실패로 판단`이라고 써.\n"
+            "15) 세션 기준 DB 영상 기록이 없고 Recorder/FFmpeg SIGTERM, stalled, firstFfmpegError가 있으면 `녹화 & 업로드 실패로 판단`이라고 써.\n"
             "16) ffmpeg timestamp/DTS/PTS/invalid dropping 계열이면 캡처보드 연결 불량 또는 캡처보드 고장을 우선 의심한다고 적어.\n"
-            "17) stalled 신호가 반복되고 날짜 기준 DB 영상 기록이 없으면 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심한다고 적어.\n"
+            "17) stalled 신호가 반복되고 세션 기준 DB 영상 기록이 없으면 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심한다고 적어.\n"
             "18) Endpoint/Uploader/JWT/getaddrinfo EAI_AGAIN 계열만 있으면 녹화 실패 원인으로 단정하지 말고 통신/업로드 이상으로 설명해.\n"
             "19) 조치는 한 줄에 `/`로 이어서 최대 3개만 적어.\n"
             "20) 4줄로 끝내. 장황한 설명 금지."

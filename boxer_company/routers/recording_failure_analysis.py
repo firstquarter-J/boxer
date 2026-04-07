@@ -351,10 +351,17 @@ def _classify_record(record: dict[str, Any]) -> list[str]:
     tags: set[str] = set()
     sessions = record.get("sessions") if isinstance(record.get("sessions"), dict) else {}
     recordings_on_date_count = int(record.get("recordingsOnDateCount") or 0)
+    canceled_count = int(sessions.get("canceledCount") or 0)
+    stop_missing_count = int(sessions.get("stopMissingCount") or 0)
 
     if bool(record.get("restartDetected")):
         tags.add("restart_detected")
-    if int(sessions.get("abnormalCount") or 0) > 0:
+    if canceled_count > 0 or bool(record.get("preRecordingStopDetected")):
+        tags.add("pre_recording_stop")
+    if stop_missing_count > 0 or (
+        int(sessions.get("abnormalCount") or 0) > 0
+        and canceled_count <= 0
+    ):
         tags.add("stop_missing")
     if recordings_on_date_count <= 0:
         tags.add("db_row_missing")
@@ -715,6 +722,9 @@ def _describe_end_state(record: dict[str, Any]) -> str:
     sessions = record.get("sessions") if isinstance(record.get("sessions"), dict) else {}
     if bool(record.get("restartDetected")):
         return "마미박스 비정상 종료"
+    canceled_count = int(sessions.get("canceledCount") or 0)
+    if canceled_count > 0:
+        return f"녹화 취소 세션 `{canceled_count}건`"
     abnormal_count = int(sessions.get("abnormalCount") or 0)
     if abnormal_count > 0:
         return f"비정상 종료 세션 `{abnormal_count}건`"
@@ -725,6 +735,8 @@ def _describe_recording_outcome(record: dict[str, Any]) -> str:
     tags = set(record.get("classificationTags") or [])
     recordings_on_date_count = int(record.get("recordingsOnDateCount") or 0)
     if "restart_detected" in tags:
+        return "정상 녹화 실패로 판단"
+    if "pre_recording_stop" in tags:
         return "정상 녹화 실패로 판단"
     if recordings_on_date_count <= 0 and (
         "ffmpeg_error" in tags or "recording_stalled" in tags or "finish_anomaly" in tags
@@ -757,6 +769,8 @@ def _build_cause_line(record: dict[str, Any]) -> str:
 
     if "restart_detected" in tags:
         return "세션 중 장비 재시작이 확인돼 정상 녹화 실패로 판단해"
+    if "pre_recording_stop" in tags:
+        return "모션 감지 종료 전에 종료 스캔돼 본 녹화 시작 전 녹화 취소로 끝났어"
     if recordings_on_date_count <= 0 and ("ffmpeg_error" in tags or has_stall or "finish_anomaly" in tags):
         if has_stall and "ffmpeg_error" in tags:
             return "녹화 중 파일 증가율 저하(stall)와 ffmpeg 종료가 함께 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해. 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심해"

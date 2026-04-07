@@ -252,6 +252,12 @@ def _build_barcode_log_error_session_record(session_entry: dict[str, Any]) -> di
     if not isinstance(detail, dict):
         return {}
 
+    session_recordings_count = int(
+        detail.get("sessionRecordingsCount")
+        or session_entry.get("sessionRecordingsCount")
+        or session_entry.get("recordingsOnDateCount")
+        or 0
+    )
     normal_closed = bool(detail.get("normalClosed"))
     session_diagnostic = (
         detail.get("sessionDiagnostic") if isinstance(detail.get("sessionDiagnostic"), dict) else {}
@@ -261,7 +267,7 @@ def _build_barcode_log_error_session_record(session_entry: dict[str, Any]) -> di
         "hospitalName": session_entry.get("hospitalName"),
         "roomName": session_entry.get("roomName"),
         "date": session_entry.get("date"),
-        "recordingsOnDateCount": int(session_entry.get("recordingsOnDateCount") or 0),
+        "recordingsOnDateCount": session_recordings_count,
         "sessions": {
             "sessionCount": 1,
             "normalCount": 1 if normal_closed else 0,
@@ -293,7 +299,12 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
     hospital_name = str(session_entry.get("hospitalName") or "미확인").strip() or "미확인"
     room_name = str(session_entry.get("roomName") or "미확인").strip() or "미확인"
     date_label = str(session_entry.get("date") or "미확인").strip() or "미확인"
-    recordings_on_date_count = int(session_entry.get("recordingsOnDateCount") or 0)
+    session_recordings_count = int(
+        detail.get("sessionRecordingsCount")
+        or session_entry.get("sessionRecordingsCount")
+        or session_entry.get("recordingsOnDateCount")
+        or 0
+    )
     start_time = str(detail.get("startTime") or "시간미상").strip() or "시간미상"
     stop_time = str(detail.get("stopTime") or "미확인").strip() or "미확인"
     normal_closed = bool(detail.get("normalClosed"))
@@ -343,9 +354,6 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
     if restart_detected:
         cause_line = "• 핵심 원인: 세션 중 장비 재시작이 확인돼 정상 녹화 실패로 판단해"
         impact_line = "• 영향: 세션 중 장비 재시작으로 정상 녹화 실패가 발생한 것으로 봐야 해"
-    elif not normal_closed:
-        cause_line = "• 핵심 원인: 종료 스캔이 없어 세션이 비정상 종료됐어"
-        impact_line = "• 영향: 종료 처리가 끝나지 않아 정상 녹화 실패로 봐야 해"
     elif pre_recording_stop_detected:
         if "device_busy" in tags:
             cause_line = (
@@ -360,20 +368,23 @@ def _build_barcode_log_error_session_section(session_entry: dict[str, Any]) -> l
         else:
             cause_line = f"• 핵심 원인: {pre_recording_stop_label}돼 녹화 취소로 끝났고 실녹화가 시작되지 않았어"
         impact_line = "• 영향: 종료 스캔은 있었지만 본 녹화 시작 전이라 정상 녹화 실패로 봐야 해"
-    elif recordings_on_date_count <= 0 and (is_ffmpeg_error or is_recording_stalled or diagnostic_severity == "high"):
+    elif not normal_closed:
+        cause_line = "• 핵심 원인: 종료 스캔이 없어 세션이 비정상 종료됐어"
+        impact_line = "• 영향: 종료 처리가 끝나지 않아 정상 녹화 실패로 봐야 해"
+    elif session_recordings_count <= 0 and (is_ffmpeg_error or is_recording_stalled or diagnostic_severity == "high"):
         if is_recording_stalled and is_ffmpeg_error:
-            cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)와 ffmpeg 종료가 함께 확인됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해. 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심해"
+            cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)와 ffmpeg 종료가 함께 확인됐고 세션 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해. 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심해"
         elif is_recording_stalled:
-            cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)가 반복됐고 날짜 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해. 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심해"
+            cause_line = "• 핵심 원인: 녹화 중 파일 증가율 저하(stall)가 반복됐고 세션 기준 DB 영상 기록이 없어 녹화 & 업로드 실패로 판단해. 캡처보드 이상 또는 캡처보드 연결 불량을 우선 의심해"
         else:
             cause_line = f"• 핵심 원인: {router_cause_hint}"
-        impact_line = f"• 영향: 날짜 기준 DB 영상 기록이 `{recordings_on_date_count}개`라 녹화 파일 저장/업로드가 실패한 상태야"
+        impact_line = f"• 영향: 세션 기준 DB 영상 기록이 `{session_recordings_count}개`라 녹화 파일 저장/업로드가 실패한 상태야"
     elif all_network_side_effect_errors and normal_closed and diagnostic_severity != "high":
-        if recordings_on_date_count > 0:
+        if session_recordings_count > 0:
             cause_line = "• 핵심 원인: JWT 갱신/상태 전송/업로드 통신 오류가 있었지만 녹화 실패 원인이라기보다 네트워크/DNS 통신 이상으로 봐야 해"
-            impact_line = f"• 영향: 날짜 기준 DB 영상 기록 `{recordings_on_date_count}개`가 있어 녹화는 성공했고 통신 오류는 별도야"
+            impact_line = f"• 영향: 세션 기준 DB 영상 기록 `{session_recordings_count}개`가 있어 녹화는 성공했고 통신 오류는 별도야"
         else:
-            cause_line = "• 핵심 원인: 업로드/상태 전송 통신 오류가 반복됐고 날짜 기준 DB 영상 기록이 없어 업로드 실패 가능성이 있어"
+            cause_line = "• 핵심 원인: 업로드/상태 전송 통신 오류가 반복됐고 세션 기준 DB 영상 기록이 없어 업로드 실패 가능성이 있어"
             impact_line = "• 영향: 녹화 흐름은 종료됐지만 업로드/상태 전송 단계 실패 가능성이 있어"
     elif diagnostic_severity == "high":
         cause_line = "• 핵심 원인: 종료 처리 지연과 종료 후 장치 오류가 이어져 실제 영상 손상 가능성이 높아"

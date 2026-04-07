@@ -833,6 +833,7 @@ def _load_recordings_rows_on_date_by_barcode(
                 "SELECT "
                 "r.seq, "
                 "r.deviceSeq, "
+                "r.fileId, "
                 "r.videoLength, "
                 "r.streamingStatus, "
                 "r.recordedAt, "

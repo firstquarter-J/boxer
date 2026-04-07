@@ -1216,6 +1216,103 @@ def _describe_recording_start_evidence(recovery_context: dict[str, Any] | None) 
     return ""
 
 
+def _to_local_datetime(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+
+    try:
+        local_tz = ZoneInfo(os.getenv("TZ", "Asia/Seoul"))
+    except Exception:
+        local_tz = ZoneInfo("Asia/Seoul")
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(local_tz)
+
+
+def _datetime_to_local_seconds(value: object) -> int | None:
+    local_dt = _to_local_datetime(value)
+    if local_dt is None:
+        return None
+    return local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+
+
+def _session_time_bounds_seconds(session: dict[str, Any]) -> tuple[int | None, int | None]:
+    start_seconds = _time_label_to_seconds(_display_value(session.get("start_time_label"), default=""))
+    stop_seconds = _time_label_to_seconds(_display_value(session.get("stop_time_label"), default=""))
+    return start_seconds, stop_seconds
+
+
+def _score_recording_row_for_session(
+    row: dict[str, Any],
+    session: dict[str, Any],
+    recovery_context: dict[str, Any] | None,
+) -> tuple[int, int] | None:
+    session_file_id = str((recovery_context or {}).get("fileId") or "").strip().lower()
+    row_file_id = str(row.get("fileId") or "").strip().lower()
+    if session_file_id and row_file_id and session_file_id == row_file_id:
+        return (0, 0)
+
+    start_seconds, stop_seconds = _session_time_bounds_seconds(session)
+    if start_seconds is None:
+        return None
+    end_seconds = stop_seconds if stop_seconds is not None else start_seconds
+
+    created_seconds = _datetime_to_local_seconds(row.get("createdAt"))
+    recorded_seconds = _datetime_to_local_seconds(row.get("recordedAt"))
+    candidate_scores: list[tuple[int, int]] = []
+
+    if created_seconds is not None and start_seconds - 60 <= created_seconds <= end_seconds + 180:
+        candidate_scores.append((1, abs(created_seconds - start_seconds)))
+    if recorded_seconds is not None and start_seconds - 60 <= recorded_seconds <= end_seconds + 180:
+        candidate_scores.append((1, abs(recorded_seconds - end_seconds)))
+
+    if not candidate_scores:
+        if created_seconds is not None and start_seconds - 180 <= created_seconds <= end_seconds + 300:
+            candidate_scores.append(
+                (2, min(abs(created_seconds - start_seconds), abs(created_seconds - end_seconds)))
+            )
+        if recorded_seconds is not None and start_seconds - 180 <= recorded_seconds <= end_seconds + 300:
+            candidate_scores.append((2, abs(recorded_seconds - end_seconds)))
+
+    return min(candidate_scores) if candidate_scores else None
+
+
+def _match_recordings_rows_to_sessions(
+    source_lines: list[str],
+    sessions: list[dict[str, Any]],
+    recordings_on_date_rows: list[dict[str, Any]] | None,
+) -> dict[int, list[dict[str, Any]]]:
+    matched_rows: dict[int, list[dict[str, Any]]] = {
+        index: []
+        for index in range(1, len(sessions) + 1)
+    }
+    rows = recordings_on_date_rows or []
+    if not sessions or not rows:
+        return matched_rows
+
+    recovery_contexts = {
+        index: _find_recording_recovery_context(source_lines, session)
+        for index, session in enumerate(sessions, start=1)
+    }
+
+    for row in rows:
+        candidates: list[tuple[tuple[int, int], int]] = []
+        for index, session in enumerate(sessions, start=1):
+            score = _score_recording_row_for_session(row, session, recovery_contexts.get(index))
+            if score is None:
+                continue
+            candidates.append((score, index))
+
+        if not candidates:
+            continue
+
+        _, matched_index = min(candidates, key=lambda item: (item[0][0], item[0][1], item[1]))
+        matched_rows.setdefault(matched_index, []).append(row)
+
+    return matched_rows
+
+
 def _find_pre_recording_stop_context(
     session: dict[str, Any],
     motion_events: list[dict[str, Any]],
@@ -1254,6 +1351,28 @@ def _find_pre_recording_stop_context(
         "motionStopTime": _display_value(motion_stop_event.get("time_label"), default="미확인"),
         "motionStopLineNo": int(motion_stop_event.get("line_no") or 0),
     }
+
+
+def _classify_session_termination_kind(
+    session: dict[str, Any],
+    restart_events: list[dict[str, Any]],
+    session_motion_events: list[dict[str, Any]] | None = None,
+    recovery_context: dict[str, Any] | None = None,
+) -> str:
+    has_restart = any(
+        int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
+        for event in restart_events
+    )
+    if has_restart:
+        return "restart"
+    if session.get("stop_line_no") is None:
+        return "stop_missing"
+    if isinstance(
+        _find_pre_recording_stop_context(session, session_motion_events or [], recovery_context),
+        dict,
+    ):
+        return "pre_recording_stop"
+    return "normal"
 
 
 def _is_normal_video_status(status_text: str) -> bool:
@@ -1433,19 +1552,23 @@ def _append_session_state_summary(
         return
 
     normal_count = 0
+    canceled_count = 0
     stop_missing_count = 0
     reboot_count = 0
 
     for session in sessions:
-        has_restart = any(
-            int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
-            for event in restart_events
+        session_motion_events = _events_in_session(diagnostic_motion_events, session)
+        termination_kind = _classify_session_termination_kind(
+            session,
+            restart_events,
+            session_motion_events,
+            _find_recording_recovery_context(source_lines, session),
         )
-        has_stop = session.get("stop_line_no") is not None
-
-        if has_restart:
+        if termination_kind == "restart":
             reboot_count += 1
-        elif has_stop:
+        elif termination_kind == "pre_recording_stop":
+            canceled_count += 1
+        elif termination_kind == "normal":
             normal_count += 1
         else:
             stop_missing_count += 1
@@ -1502,6 +1625,8 @@ def _append_session_state_summary(
     outcome_parts: list[str] = []
     if normal_count > 0:
         termination_parts.append(f"정상 종료 *{normal_count}건*")
+    if canceled_count > 0:
+        termination_parts.append(f"녹화 취소 *{canceled_count}건* (모션 감지 단계 종료)")
     if stop_missing_count > 0:
         termination_parts.append(f"비정상 종료 *{stop_missing_count}건* (종료 스캔 없음)")
     if reboot_count > 0:
@@ -1509,6 +1634,8 @@ def _append_session_state_summary(
 
     if reboot_count > 0:
         outcome_parts.append(f"정상 녹화 실패 *{reboot_count}건* (세션 중 재시작 감지)")
+    if canceled_count > 0:
+        outcome_parts.append(f"정상 녹화 실패 *{canceled_count}건* (모션 감지 단계 종료 스캔)")
     if stop_missing_count > 0:
         outcome_parts.append(f"정상 녹화 실패 *{stop_missing_count}건* (종료 스캔 없음)")
 
@@ -1853,19 +1980,17 @@ def _build_session_termination_text(
     session_motion_events: list[dict[str, Any]] | None = None,
     recovery_context: dict[str, Any] | None = None,
 ) -> str:
-    has_restart = any(
-        int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
-        for event in restart_events
+    termination_kind = _classify_session_termination_kind(
+        session,
+        restart_events,
+        session_motion_events,
+        recovery_context,
     )
-    has_stop = session.get("stop_line_no") is not None
-    if has_restart:
+    if termination_kind == "restart":
         return "마미박스 비정상 종료 (세션 중 재시작 감지)"
-    if not has_stop:
+    if termination_kind == "stop_missing":
         return "비정상 종료 (종료 스캔 없음)"
-    if isinstance(
-        _find_pre_recording_stop_context(session, session_motion_events or [], recovery_context),
-        dict,
-    ):
+    if termination_kind == "pre_recording_stop":
         return f"녹화 취소 (모션 감지 단계에서 {_format_session_stop_marker(session)} 확인)"
     return f"정상 종료 ({_format_session_stop_marker(session)} 확인)"
 
@@ -1878,14 +2003,26 @@ def _build_session_recording_result_text(
     scan_events: list[dict[str, Any]] | None = None,
     recordings_on_date_count: int | None = None,
     session_motion_events: list[dict[str, Any]] | None = None,
+    session_recordings_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
     has_restart = any(
         int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
         for event in restart_events
     )
     has_stop = session.get("stop_line_no") is not None
-    has_db_row = recordings_on_date_count is not None and recordings_on_date_count > 0
-    db_row_missing = recordings_on_date_count is not None and recordings_on_date_count <= 0
+    session_recordings_rows = session_recordings_rows or []
+    session_recordings_count = len(session_recordings_rows)
+    has_session_db_row = session_recordings_count > 0
+    has_positive_session_db_row = any(
+        _recording_row_has_positive_video_length(row)
+        for row in session_recordings_rows
+    )
+    session_db_row_missing = session_recordings_count <= 0
+    session_recordings_label = f"세션 기준 DB 영상 기록 `{session_recordings_count}개`"
+    session_length_labels = _collect_recordings_video_length_labels(session_recordings_rows)
+    session_length_text = " / ".join(f"`{label}`" for label in session_length_labels[:5])
+    if len(session_length_labels) > 5:
+        session_length_text = f"{session_length_text} 외 `{len(session_length_labels) - 5}개`"
     first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, [session])
     has_standby_ffmpeg_error = any(
         "ffmpeg" in content.lower() and "standby error" in content.lower()
@@ -1934,7 +2071,7 @@ def _build_session_recording_result_text(
     if first_ffmpeg_error is not None:
         error_time = _display_value(first_ffmpeg_error.get("timeLabel"), default="시간미상")
         elapsed = _display_value(first_ffmpeg_error.get("elapsedFromSessionStart"), default="")
-        if db_row_missing:
+        if session_db_row_missing:
             detail_parts = [f"첫 ffmpeg 오류 `{error_time}`"]
             if elapsed:
                 detail_parts.append(f"세션 시작 후 `{elapsed}`")
@@ -1942,7 +2079,7 @@ def _build_session_recording_result_text(
                 anomaly_text = str(post_stop_context.get("displayText") or "").strip()
                 if anomaly_text:
                     detail_parts.append(anomaly_text)
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
             return (
                 f"녹화 & 업로드 실패로 판단 ({', '.join(detail_parts)})",
                 recovery_context,
@@ -1979,29 +2116,29 @@ def _build_session_recording_result_text(
         anomaly_text = str(post_stop_context.get("displayText") or "").strip()
         if anomaly_text:
             detail_parts.append(anomaly_text)
-        if db_row_missing:
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+        if session_db_row_missing:
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
         if not detail_parts:
             detail_parts.append("종료 후 처리 이상")
         return f"영상 손상 가능성 높음 ({', '.join(detail_parts)})", recovery_context, post_stop_context
     non_recording_network_context = _describe_non_recording_network_error_context(session_error_lines)
     if non_recording_network_context:
-        if _has_uploader_network_error(session_error_lines) and db_row_missing:
+        if _has_uploader_network_error(session_error_lines) and session_db_row_missing:
             detail_parts: list[str] = []
             if recording_start_evidence:
                 detail_parts.append(recording_start_evidence)
             elif has_motion_success:
                 detail_parts.append("모션 감지 성공")
             detail_parts.append(non_recording_network_context)
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
             return (
                 f"영상 업로드 실패 가능성 높음 ({', '.join(detail_parts)})",
                 recovery_context,
                 post_stop_context,
             )
-        if has_db_row:
+        if has_positive_session_db_row:
             return (
-                f"정상 녹화로 판단 (날짜 기준 DB 영상 기록 `{recordings_on_date_count}개` 확인, {non_recording_network_context} 별도)",
+                f"정상 녹화로 판단 ({session_recordings_label} 확인, {non_recording_network_context} 별도)",
                 recovery_context,
                 post_stop_context,
             )
@@ -2010,8 +2147,8 @@ def _build_session_recording_result_text(
             if has_motion_success:
                 detail_parts.append("모션 감지 성공")
             detail_parts.append(non_recording_network_context)
-            if db_row_missing:
-                detail_parts.append("날짜 기준 DB 영상 기록 없음")
+            if session_db_row_missing:
+                detail_parts.append("세션 기준 DB 영상 기록 없음")
             return (
                 f"영상 생성 확인, 업로드 확인 안 됨 ({', '.join(detail_parts)})",
                 recovery_context,
@@ -2019,15 +2156,15 @@ def _build_session_recording_result_text(
             )
         if has_motion_success:
             detail_parts = ["모션 감지 성공", non_recording_network_context]
-            if db_row_missing:
-                detail_parts.append("날짜 기준 DB 영상 기록 없음")
+            if session_db_row_missing:
+                detail_parts.append("세션 기준 DB 영상 기록 없음")
             return (
                 f"모션 감지 성공까지 확인, 영상 생성/업로드 확인 안 됨 ({', '.join(detail_parts)})",
                 recovery_context,
                 post_stop_context,
             )
-        if db_row_missing:
-            detail_parts = [non_recording_network_context, "날짜 기준 DB 영상 기록 없음"]
+        if session_db_row_missing:
+            detail_parts = [non_recording_network_context, "세션 기준 DB 영상 기록 없음"]
             if motion_label:
                 detail_parts.insert(0, motion_label)
             return (
@@ -2040,9 +2177,27 @@ def _build_session_recording_result_text(
             recovery_context,
             post_stop_context,
         )
-    if has_db_row:
+    if has_positive_session_db_row:
         return (
-            f"정상 녹화로 판단 (날짜 기준 DB 영상 기록 `{recordings_on_date_count}개` 확인)",
+            f"정상 녹화로 판단 ({session_recordings_label} 확인)",
+            recovery_context,
+            post_stop_context,
+        )
+    if has_session_db_row:
+        detail_parts: list[str] = []
+        if recording_start_evidence:
+            detail_parts.append(recording_start_evidence)
+        elif has_motion_success:
+            detail_parts.append("모션 감지 성공")
+        elif motion_label:
+            detail_parts.append(motion_label)
+        detail_parts.append(session_recordings_label)
+        if session_length_text:
+            detail_parts.append(f"영상 길이 {session_length_text}")
+        elif recordings_on_date_count is not None and recordings_on_date_count > session_recordings_count:
+            detail_parts.append(f"같은 날짜 전체 DB 영상 기록 `{recordings_on_date_count}개`")
+        return (
+            f"추가 확인 필요 ({', '.join(detail_parts)})",
             recovery_context,
             post_stop_context,
         )
@@ -2050,8 +2205,8 @@ def _build_session_recording_result_text(
         detail_parts = [recording_start_evidence]
         if has_motion_success:
             detail_parts.append("모션 감지 성공")
-        if db_row_missing:
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+        if session_db_row_missing:
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
         return (
             f"영상 생성 확인, 업로드 확인 안 됨 ({', '.join(detail_parts)})",
             recovery_context,
@@ -2059,8 +2214,8 @@ def _build_session_recording_result_text(
         )
     if has_motion_success:
         detail_parts = ["모션 감지 성공"]
-        if db_row_missing:
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+        if session_db_row_missing:
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
         return (
             f"모션 감지 성공까지 확인, 영상 생성/업로드 확인 안 됨 ({', '.join(detail_parts)})",
             recovery_context,
@@ -2071,16 +2226,16 @@ def _build_session_recording_result_text(
         if motion_label:
             detail_parts.append(motion_label)
         detail_parts.append(f"error 라인 `{len(session_error_lines)}줄`")
-        if db_row_missing:
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+        if session_db_row_missing:
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
         return f"영상 생성 근거 없음 ({', '.join(detail_parts)})", recovery_context, post_stop_context
     if motion_label:
         detail_parts = [motion_label]
-        if db_row_missing:
-            detail_parts.append("날짜 기준 DB 영상 기록 없음")
+        if session_db_row_missing:
+            detail_parts.append("세션 기준 DB 영상 기록 없음")
         return f"영상 생성 근거 없음 ({', '.join(detail_parts)})", recovery_context, post_stop_context
-    if db_row_missing:
-        return "영상 생성 근거 없음 (날짜 기준 DB 영상 기록 없음)", recovery_context, post_stop_context
+    if session_db_row_missing:
+        return "영상 생성 근거 없음 (세션 기준 DB 영상 기록 없음)", recovery_context, post_stop_context
     return "추가 확인 필요", recovery_context, post_stop_context
 
 
@@ -2354,14 +2509,23 @@ def _build_log_analysis_record(
     session_restarts: list[dict[str, Any]],
     session_error_lines: list[tuple[int, str]],
     recordings_on_date_count: int = 0,
+    recordings_on_date_rows: list[dict[str, Any]] | None = None,
     recordings_on_date_statuses: list[str] | None = None,
 ) -> dict[str, Any]:
-    closure = _session_closure_counts(sessions)
     scan_items = _serialize_scan_events_for_evidence(session_scans)
     motion_items = _serialize_motion_events_for_evidence(session_motions)
     restart_items = _serialize_restart_events_for_evidence(session_restarts)
     error_items = _serialize_error_lines_for_evidence(session_error_lines)
     first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_lines, sessions)
+    session_recordings_map = _match_recordings_rows_to_sessions(
+        source_lines,
+        sessions,
+        recordings_on_date_rows,
+    )
+    normal_closed_count = 0
+    canceled_count = 0
+    stop_missing_count = 0
+    restart_count = 0
     session_diagnostics: list[dict[str, Any]] = []
     session_details: list[dict[str, Any]] = []
     for index, session in enumerate(sessions, start=1):
@@ -2369,6 +2533,7 @@ def _build_log_analysis_record(
         session_motion_events = _events_in_session(session_motions, session)
         session_restart_events = _events_in_session(session_restarts, session)
         session_error_subset = _error_lines_in_session(session_error_lines, session)
+        session_recordings_rows = session_recordings_map.get(index, [])
         recording_result, recovery_context, post_stop_context = _build_session_recording_result_text(
             source_lines,
             session,
@@ -2377,6 +2542,7 @@ def _build_log_analysis_record(
             all_scan_events,
             recordings_on_date_count,
             session_motion_events,
+            session_recordings_rows,
         )
         session_error_items = _serialize_error_lines_for_evidence(session_error_subset)
         session_first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_subset, [session])
@@ -2386,19 +2552,34 @@ def _build_log_analysis_record(
             session_motion_events,
             recovery_context,
         )
+        termination_kind = _classify_session_termination_kind(
+            session,
+            session_restart_events,
+            session_motion_events,
+            recovery_context,
+        )
         termination_text = _build_session_termination_text(
             session,
             session_restart_events,
             session_motion_events,
             recovery_context,
         )
+        if termination_kind == "restart":
+            restart_count += 1
+        elif termination_kind == "pre_recording_stop":
+            canceled_count += 1
+        elif termination_kind == "normal":
+            normal_closed_count += 1
+        else:
+            stop_missing_count += 1
         session_detail = {
             "index": index,
             "startTime": _display_value(session.get("start_time_label"), default="시간미상"),
             "stopTime": _display_value(session.get("stop_time_label"), default="미확인"),
             "stopToken": _display_value(session.get("stop_token"), default="미확인"),
-            "normalClosed": session.get("stop_line_no") is not None,
+            "normalClosed": termination_kind == "normal",
             "restartDetected": bool(session_restart_events),
+            "terminationKind": termination_kind,
             "terminationStatus": termination_text,
             "videoStatus": recording_result,
             "recordingResult": recording_result,
@@ -2406,6 +2587,7 @@ def _build_log_analysis_record(
             "scanEventCount": len(_serialize_scan_events_for_evidence(session_scan_events)),
             "motionEventCount": len(_serialize_motion_events_for_evidence(session_motion_events)),
             "motionStatus": _display_value(motion_outcome.get("label"), default=""),
+            "sessionRecordingsCount": len(session_recordings_rows),
             "errorLineCount": len(session_error_items),
             "errorGroups": _build_error_groups(session_error_items),
             "firstFfmpegError": session_first_ffmpeg_error or {},
@@ -2428,6 +2610,18 @@ def _build_log_analysis_record(
         )
         session_detail["sessionDiagnostic"] = session_diagnostics[-1]
         session_details.append(session_detail)
+    closure = {
+        "sessionCount": len(sessions),
+        "normalCount": normal_closed_count,
+        "abnormalCount": canceled_count + stop_missing_count + restart_count,
+        "canceledCount": canceled_count,
+        "restartCount": restart_count,
+        "stopMissingCount": stop_missing_count,
+        "allClosedNormally": (
+            len(sessions) > 0
+            and normal_closed_count == len(sessions)
+        ),
+    }
     return {
         "deviceName": device_name,
         "hospitalName": hospital_name,
@@ -2509,6 +2703,7 @@ def _build_session_card_context(
     session_error_lines: list[tuple[int, str]],
     diagnostic_scan_events: list[dict[str, Any]],
     recordings_on_date_count: int | None,
+    session_recordings_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     recording_result, recovery_context, post_stop_context = _build_session_recording_result_text(
         source_lines,
@@ -2518,6 +2713,7 @@ def _build_session_card_context(
         diagnostic_scan_events,
         recordings_on_date_count,
         session_motion_events,
+        session_recordings_rows,
     )
 
     has_restart = bool(session_restart_events)
@@ -2582,20 +2778,37 @@ def _build_session_card_context(
         "postStopContext": post_stop_context,
         "preRecordingStopDetected": isinstance(pre_recording_stop_context, dict),
         "preRecordingStopLabel": _display_value((pre_recording_stop_context or {}).get("label"), default=""),
-    }
+}
 
 
-def _build_recordings_video_length_line(
-    recordings_on_date_rows: list[dict[str, Any]] | None,
-) -> str | None:
-    rows = recordings_on_date_rows or []
+def _recording_row_has_positive_video_length(row: dict[str, Any]) -> bool:
+    raw_value = row.get("videoLength")
+    if raw_value is None:
+        return False
+
+    try:
+        return float(raw_value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _collect_recordings_video_length_labels(
+    recordings_rows: list[dict[str, Any]] | None,
+) -> list[str]:
+    rows = recordings_rows or []
     labels: list[str] = []
     for row in rows:
         label = _format_video_length(row.get("videoLength"))
         if label == "미확인" or label in labels:
             continue
         labels.append(label)
+    return labels
 
+
+def _build_recordings_video_length_line(
+    recordings_on_date_rows: list[dict[str, Any]] | None,
+) -> str | None:
+    labels = _collect_recordings_video_length_labels(recordings_on_date_rows)
     if not labels:
         return None
     if len(labels) == 1:
@@ -2631,7 +2844,7 @@ def _append_session_card(
     session_error_lines: list[tuple[int, str]],
     diagnostic_scan_events: list[dict[str, Any]],
     recordings_on_date_count: int | None,
-    recordings_on_date_rows: list[dict[str, Any]] | None = None,
+    session_recordings_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     session_context = _build_session_card_context(
         source_lines,
@@ -2641,9 +2854,11 @@ def _append_session_card(
         session_error_lines,
         diagnostic_scan_events,
         recordings_on_date_count,
+        session_recordings_rows,
     )
     start_time = _display_value(session.get("start_time_label"), default="시간미상")
     stop_time = _display_value(session.get("stop_time_label"), default="미확인")
+    session_recordings_rows = session_recordings_rows or []
 
     lines.append("")
     lines.append(f"*세션 {index}*")
@@ -2652,8 +2867,8 @@ def _append_session_card(
     lines.append(f"• 영상 상태: {session_context['videoStatus']}")
     lines.append(f"• 핵심 이상 징후: {session_context['anomalyText']}")
     if recordings_on_date_count is not None:
-        lines.append(f"• DB 영상 기록: `{recordings_on_date_count}개`")
-    video_length_line = _build_recordings_video_length_line(recordings_on_date_rows)
+        lines.append(f"• DB 영상 기록(세션 기준): `{len(session_recordings_rows)}개`")
+    video_length_line = _build_recordings_video_length_line(session_recordings_rows)
     if video_length_line:
         lines.append(video_length_line)
     _append_restart_events_section(lines, session_restart_events)
@@ -2691,6 +2906,11 @@ def _append_session_sections(
         _append_error_lines_section(lines, error_lines, show_all=True)
         return
 
+    session_recordings_map = _match_recordings_rows_to_sessions(
+        source_lines,
+        sessions,
+        recordings_on_date_rows,
+    )
     for index, session in enumerate(sessions, start=1):
         session_scan_events = _events_in_session(scan_events, session)
         session_motion_events = _events_in_session(motion_events, session)
@@ -2707,7 +2927,7 @@ def _append_session_sections(
             session_error_lines=session_error_lines,
             diagnostic_scan_events=diagnostic_scan_events,
             recordings_on_date_count=recordings_on_date_count,
-            recordings_on_date_rows=recordings_on_date_rows,
+            session_recordings_rows=session_recordings_map.get(index, []),
         )
 
 
@@ -3370,6 +3590,7 @@ def _analyze_barcode_log_phase1_window(
                     session_restarts=session_restart_events,
                     session_error_lines=session_error_lines,
                     recordings_on_date_count=len(recordings_on_date_rows),
+                    recordings_on_date_rows=recordings_on_date_rows,
                     recordings_on_date_statuses=recordings_on_date_statuses,
                 )
             )
@@ -3567,6 +3788,7 @@ def _analyze_barcode_log_scan_events(
                     session_restarts=session_restart_events,
                     session_error_lines=session_error_lines,
                     recordings_on_date_count=len(recordings_on_date_rows),
+                    recordings_on_date_rows=recordings_on_date_rows,
                     recordings_on_date_statuses=recordings_on_date_statuses,
                 )
             )
@@ -3766,6 +3988,7 @@ def _analyze_barcode_log_errors(
                     session_restarts=session_restart_events,
                     session_error_lines=session_error_lines,
                     recordings_on_date_count=len(recordings_on_date_rows),
+                    recordings_on_date_rows=recordings_on_date_rows,
                     recordings_on_date_statuses=recordings_on_date_statuses,
                 )
             )

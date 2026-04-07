@@ -65,11 +65,13 @@ class BarcodeLogHelperTests(unittest.TestCase):
                 "index": 2,
                 "startTime": "14:06:53",
                 "stopTime": "14:21:30",
-                "normalClosed": True,
+                "normalClosed": False,
                 "restartDetected": False,
+                "terminationKind": "pre_recording_stop",
                 "terminationStatus": "녹화 취소 (모션 감지 단계에서 `C_STOPSESS` 확인)",
                 "videoStatus": "정상 녹화 실패로 판단 (모션 감지 단계에서 종료 스캔, 모션 미감지, 첫 ffmpeg 오류 `14:06:53`, 세션 시작 후 `0초`)",
                 "recordingResult": "정상 녹화 실패로 판단 (모션 감지 단계에서 종료 스캔, 모션 미감지, 첫 ffmpeg 오류 `14:06:53`, 세션 시작 후 `0초`)",
+                "sessionRecordingsCount": 0,
                 "errorLineCount": 1,
                 "errorGroups": [
                     {
