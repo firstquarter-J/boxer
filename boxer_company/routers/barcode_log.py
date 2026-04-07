@@ -1460,7 +1460,6 @@ def _append_session_state_summary(
             lines.append("• *종료 상태:* 비정상 종료 (종료 스캔 없음)")
             lines.append("• *영상 상태:* 정상 녹화 실패로 판단")
             return
-        lines.append(f"• *종료 상태:* 정상 종료 ({_format_session_stop_marker(session)} 확인)")
         session_motion_events = _events_in_session(diagnostic_motion_events, session)
         recording_result, recovery_context, post_stop_context = _build_session_recording_result_text(
             source_lines,
@@ -1471,6 +1470,13 @@ def _append_session_state_summary(
             recordings_on_date_count=recordings_on_date_count,
             session_motion_events=session_motion_events,
         )
+        termination_text = _build_session_termination_text(
+            session,
+            restart_events,
+            session_motion_events,
+            recovery_context,
+        )
+        lines.append(f"• *종료 상태:* {termination_text}")
         lines.append(f"• *영상 상태:* {recording_result}")
         if isinstance(post_stop_context, dict):
             post_stop_text = str(post_stop_context.get("displayText") or "").strip()
@@ -1844,6 +1850,8 @@ def _find_session_post_stop_context(
 def _build_session_termination_text(
     session: dict[str, Any],
     restart_events: list[dict[str, Any]],
+    session_motion_events: list[dict[str, Any]] | None = None,
+    recovery_context: dict[str, Any] | None = None,
 ) -> str:
     has_restart = any(
         int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
@@ -1854,6 +1862,11 @@ def _build_session_termination_text(
         return "마미박스 비정상 종료 (세션 중 재시작 감지)"
     if not has_stop:
         return "비정상 종료 (종료 스캔 없음)"
+    if isinstance(
+        _find_pre_recording_stop_context(session, session_motion_events or [], recovery_context),
+        dict,
+    ):
+        return f"녹화 취소 (모션 감지 단계에서 {_format_session_stop_marker(session)} 확인)"
     return f"정상 종료 ({_format_session_stop_marker(session)} 확인)"
 
 
@@ -2367,10 +2380,15 @@ def _build_log_analysis_record(
         )
         session_error_items = _serialize_error_lines_for_evidence(session_error_subset)
         session_first_ffmpeg_error = _find_first_ffmpeg_error_context(session_error_subset, [session])
-        termination_text = _build_session_termination_text(session, session_restart_events)
         motion_outcome = _describe_session_motion_outcome(session_motion_events)
         pre_recording_stop_context = _find_pre_recording_stop_context(
             session,
+            session_motion_events,
+            recovery_context,
+        )
+        termination_text = _build_session_termination_text(
+            session,
+            session_restart_events,
             session_motion_events,
             recovery_context,
         )
@@ -2504,11 +2522,16 @@ def _build_session_card_context(
 
     has_restart = bool(session_restart_events)
     has_stop = session.get("stop_line_no") is not None
-    termination_text = _build_session_termination_text(session, session_restart_events)
     motion_outcome = _describe_session_motion_outcome(session_motion_events)
     motion_label = _display_value(motion_outcome.get("label"), default="")
     pre_recording_stop_context = _find_pre_recording_stop_context(
         session,
+        session_motion_events,
+        recovery_context,
+    )
+    termination_text = _build_session_termination_text(
+        session,
+        session_restart_events,
         session_motion_events,
         recovery_context,
     )

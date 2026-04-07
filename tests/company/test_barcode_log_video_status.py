@@ -147,6 +147,7 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
 
         self.assertTrue(context["preRecordingStopDetected"])
         self.assertEqual(context["preRecordingStopLabel"], "모션 감지 단계에서 종료 스캔")
+        self.assertEqual(context["terminationStatus"], "녹화 취소 (모션 감지 단계에서 `C_STOPSESS` 확인)")
         self.assertIn("모션 감지 단계에서 종료 스캔", context["anomalyText"])
 
     def test_db_row_keeps_normal_video_status_and_card_shows_video_label(self) -> None:
