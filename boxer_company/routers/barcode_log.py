@@ -51,6 +51,30 @@ _LEADING_HOSPITAL_KEYWORD_SCOPE_PATTERN = re.compile(
     r"^\s*(.+?)\s+병원\s+(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)(?:\s|$)",
     re.IGNORECASE,
 )
+_LEADING_HOSPITAL_SCOPE_QUESTION_TOKENS = (
+    "모션감지",
+    "모션 감지",
+    "종료스캔",
+    "종료 스캔",
+    "녹화 취소",
+    "취소 음성",
+    "안내 음성",
+    "왜",
+    "원인",
+    "이유",
+    "어떻게",
+    "나와",
+)
+_LEADING_HOSPITAL_SCOPE_QUESTION_ENDINGS = (
+    "하면",
+    "돼",
+    "되나",
+    "되나요",
+    "맞아",
+    "맞나요",
+    "있어",
+    "있나",
+)
 _HOSPITAL_SEQ_PATTERN = re.compile(r"(?:hospitalseq|병원seq)\s*[:=]?\s*(\d+)", re.IGNORECASE)
 _HOSPITAL_ROOM_SEQ_PATTERN = re.compile(
     r"(?:hospitalroomseq|hospital_room_seq|병실seq)\s*[:=]?\s*(\d+)",
@@ -3254,7 +3278,14 @@ def _extract_leading_hospital_scope(question: str) -> str | None:
     candidate = " ".join(candidate.split()).strip()
     if not candidate:
         return None
+    lowered_candidate = candidate.lower()
     if any(token in candidate for token in ("fileid", "capturedat", "hospitalseq", "hospitalroomseq")):
+        return None
+    if any(token in candidate for token in _LEADING_HOSPITAL_SCOPE_QUESTION_TOKENS):
+        return None
+    if any(lowered_candidate.endswith(ending) for ending in _LEADING_HOSPITAL_SCOPE_QUESTION_ENDINGS):
+        return None
+    if "?" in candidate:
         return None
     return candidate or None
 

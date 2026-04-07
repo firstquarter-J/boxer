@@ -3,7 +3,9 @@ import unittest
 from boxer_company.routers.barcode_log import (
     _extract_device_name_scope,
     _extract_device_status_filter,
+    _extract_leading_hospital_scope,
     _is_devices_filter_query_request,
+    _is_recordings_filter_query_request,
 )
 
 
@@ -49,6 +51,25 @@ class DeviceQueryRoutingTests(unittest.TestCase):
                 status=None,
                 active_flag=None,
                 install_flag=None,
+            )
+        )
+
+    def test_motion_cancel_voice_question_is_not_treated_as_recordings_query(self) -> None:
+        question = "모션감지 종료 전 종료스캔하면 녹화 취소 음성 나와?"
+
+        hospital_name = _extract_leading_hospital_scope(question)
+
+        self.assertIsNone(hospital_name)
+        self.assertFalse(
+            _is_recordings_filter_query_request(
+                question,
+                barcode=None,
+                target_date=None,
+                target_year=None,
+                hospital_name=hospital_name,
+                room_name=None,
+                hospital_seq=None,
+                hospital_room_seq=None,
             )
         )
 

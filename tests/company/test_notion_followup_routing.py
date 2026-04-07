@@ -23,6 +23,11 @@ class NotionFollowupRoutingTests(unittest.TestCase):
             _looks_like_notion_doc_question("마미박스 2.11.300 버전 참고해서 Zion 의 직전 질문에 대답해봐")
         )
 
+    def test_recording_cancel_voice_question_is_treated_as_notion_question(self) -> None:
+        self.assertTrue(
+            _looks_like_notion_doc_question("모션감지 종료 전 종료스캔하면 녹화 취소 음성 나와?")
+        )
+
     def test_small_talk_is_not_treated_as_notion_followup(self) -> None:
         self.assertFalse(_looks_like_notion_doc_followup("안녕?", _NOTION_THREAD_CONTEXT))
         self.assertFalse(_looks_like_notion_doc_followup("넌 누구?", _NOTION_THREAD_CONTEXT))
