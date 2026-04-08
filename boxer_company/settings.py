@@ -47,6 +47,11 @@ if _raw_request_log_query_ids.strip():
 else:
     REQUEST_LOG_QUERY_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
 
+_raw_daily_device_round_target_hospital_seq = os.getenv(
+    "DAILY_DEVICE_ROUND_TARGET_HOSPITAL_SEQ",
+    "",
+).strip()
+
 APP_USER_API_URL = os.getenv("APP_USER_API_URL", "").strip()
 APP_USER_API_TIMEOUT_SEC = int(os.getenv("APP_USER_API_TIMEOUT_SEC", "8"))
 
@@ -131,6 +136,28 @@ WEEKLY_RECORDINGS_REPORT_STATE_PATH = os.getenv(
     "WEEKLY_RECORDINGS_REPORT_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "weekly_recordings_report_state.json"),
 ).strip()
+DAILY_DEVICE_ROUND_ENABLED = (
+    os.getenv("DAILY_DEVICE_ROUND_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
+DAILY_DEVICE_ROUND_CHANNEL_ID = os.getenv("DAILY_DEVICE_ROUND_CHANNEL_ID", "").strip()
+DAILY_DEVICE_ROUND_HOUR_KST = int(os.getenv("DAILY_DEVICE_ROUND_HOUR_KST", "9"))
+DAILY_DEVICE_ROUND_MINUTE_KST = int(os.getenv("DAILY_DEVICE_ROUND_MINUTE_KST", "30"))
+DAILY_DEVICE_ROUND_POLL_INTERVAL_SEC = int(os.getenv("DAILY_DEVICE_ROUND_POLL_INTERVAL_SEC", "30"))
+DAILY_DEVICE_ROUND_STATE_PATH = os.getenv(
+    "DAILY_DEVICE_ROUND_STATE_PATH",
+    str(core_settings.PROJECT_ROOT / "data" / "daily_device_round_state.json"),
+).strip()
+DAILY_DEVICE_ROUND_TARGET_HOSPITAL_SEQ = (
+    int(_raw_daily_device_round_target_hospital_seq)
+    if re.fullmatch(r"-?\d+", _raw_daily_device_round_target_hospital_seq)
+    else None
+)
+DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT = (
+    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
+DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX = (
+    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
 
 BARCODE_PATTERN = re.compile(r"(?<!\d)(\d{11})(?!\d)")
 S3_LOG_DATE_TOKEN_PATTERN = re.compile(r"^20\d{2}-\d{2}-\d{2}$")

@@ -2,11 +2,13 @@ import unittest
 from unittest.mock import patch
 
 from boxer_company.routers.device_update import (
+    _AGENT_GIT_STATUS_COMMAND,
     _build_device_update_activity_input,
     _extract_device_name_for_update,
     _is_device_agent_update_request,
     _is_device_box_update_request,
     _is_device_update_status_request,
+    _parse_agent_repo_state,
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
@@ -34,6 +36,26 @@ class DeviceUpdateRoutingTests(unittest.TestCase):
 
 
 class DeviceUpdateExecutionTests(unittest.TestCase):
+    def test_parses_agent_repo_state_with_package_version(self) -> None:
+        parsed = _parse_agent_repo_state(
+            "\n".join(
+                [
+                    "HEAD=253cea0c888fb788f3cb803af0d0b23cb08777c2",
+                    "ORIGIN_MAIN=253cea0c888fb788f3cb803af0d0b23cb08777c2",
+                    "BRANCH=main",
+                    "PKG_VERSION=2.0.0",
+                ]
+            )
+        )
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["packageVersion"], "2.0.0")
+        self.assertTrue(parsed["latest"])
+
+    def test_agent_git_status_command_avoids_node_command_substitution(self) -> None:
+        self.assertNotIn("$(node ", _AGENT_GIT_STATUS_COMMAND)
+        self.assertIn('sed "s/^/PKG_VERSION=/"', _AGENT_GIT_STATUS_COMMAND)
+
     @patch("boxer_company.routers.device_update._wait_for_box_update_completion")
     @patch("boxer_company.routers.device_update._update_mda_device_box")
     @patch("boxer_company.routers.device_update._read_agent_runtime_state")
@@ -56,7 +78,7 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             "roomName": "2진료실",
             "isConnected": True,
         }
-        mock_get_latest_device_version.return_value = {"versionName": "3.2.10"}
+        mock_get_latest_device_version.return_value = {"versionName": "2.11.300"}
         mock_read_box_runtime_state.return_value = {
             "ssh": {"ready": True, "reason": "ready"},
             "process": {
@@ -94,20 +116,20 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
                 "process": {
                     "name": "mommybox-v2",
                     "status": "online",
-                    "version": "3.2.10",
+                    "version": "2.11.300",
                 }
             },
         }
 
         result_text, payload = _request_device_box_update("MB2-C00419 장비 업데이트")
 
-        mock_update_box.assert_called_once_with("MB2-C00419", version="3.2.10", silent=False)
-        mock_wait_for_box_update_completion.assert_called_once_with("MB2-C00419", "3.2.10")
+        mock_update_box.assert_called_once_with("MB2-C00419", version="2.11.300", silent=False)
+        mock_wait_for_box_update_completion.assert_called_once_with("MB2-C00419", "2.11.300")
         self.assertIn("*장비 박스 업데이트*", result_text)
         self.assertIn("최신 박스 버전", result_text)
         self.assertIn("완료", result_text)
         self.assertEqual(payload["route"], "device_box_update")
-        self.assertEqual(payload["latestVersion"], "3.2.10")
+        self.assertEqual(payload["latestVersion"], "2.11.300")
         self.assertTrue(payload["dispatch"]["status"])
 
     @patch("boxer_company.routers.device_update._wait_for_box_update_completion")
@@ -132,7 +154,7 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             "roomName": "2진료실",
             "isConnected": True,
         }
-        mock_get_latest_device_version.return_value = {"versionName": "3.2.10"}
+        mock_get_latest_device_version.return_value = {"versionName": "2.11.300"}
         mock_read_box_runtime_state.return_value = {
             "ssh": {"ready": True, "reason": "ready"},
             "process": {
@@ -170,7 +192,7 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
                 "process": {
                     "name": "mommybox-v2",
                     "status": "online",
-                    "version": "3.2.10",
+                    "version": "2.11.300",
                 }
             },
         }
@@ -185,7 +207,7 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         self.assertIn("장비 박스 업데이트 진행 중", notices[0])
         self.assertIn("현재 박스 버전", notices[0])
         self.assertIn("2.11.290", notices[0])
-        self.assertIn("3.2.10", notices[0])
+        self.assertIn("2.11.300", notices[0])
 
     @patch("boxer_company.routers.device_update._update_mda_device_box")
     @patch("boxer_company.routers.device_update._read_agent_runtime_state")
@@ -255,7 +277,7 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
     ) -> None:
         mock_get_device_detail.return_value = {
             "deviceName": "MB2-C00419",
-            "version": "3.2.10",
+            "version": "2.11.300",
             "hospitalName": "아이사랑산부인과의원(부산)",
             "roomName": "2진료실",
             "isConnected": True,
@@ -371,13 +393,13 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             "roomName": "2진료실",
             "isConnected": True,
         }
-        mock_get_latest_device_version.return_value = {"versionName": "3.2.12"}
+        mock_get_latest_device_version.return_value = {"versionName": "2.11.302"}
         mock_read_box_runtime_state.return_value = {
             "ssh": {"ready": True, "reason": "ready"},
             "process": {
                 "name": "mommybox-v2",
                 "status": "online",
-                "version": "3.2.10",
+                "version": "2.11.300",
             },
         }
         mock_read_agent_runtime_state.return_value = {
@@ -405,7 +427,10 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         self.assertIn("에이전트 repo 상태", result_text)
         self.assertIn("박스 업데이트 선행조건", result_text)
         self.assertEqual(payload["route"], "device_update_status")
-        self.assertEqual(payload["latestVersion"], "3.2.12")
+        self.assertEqual(payload["latestVersion"], "2.11.302")
+        self.assertFalse(payload["agentGate"]["ok"])
+        self.assertEqual(payload["agentGate"]["version"], "1.2.0")
+        self.assertIn("에이전트 1.2.0", payload["agentGate"]["reason"])
 
 
 class DeviceUpdateActivityLogTests(unittest.TestCase):
@@ -420,11 +445,11 @@ class DeviceUpdateActivityLogTests(unittest.TestCase):
                 "route": "device_box_update",
                 "request": {
                     "deviceName": "MB2-C00419",
-                    "requestedVersion": "3.2.10",
+                    "requestedVersion": "2.11.300",
                 },
                 "device": {
                     "deviceName": "MB2-C00419",
-                    "version": "3.2.9",
+                    "version": "2.11.299",
                 },
                 "dispatch": {
                     "status": True,
@@ -439,7 +464,7 @@ class DeviceUpdateActivityLogTests(unittest.TestCase):
 
         self.assertEqual(payload["activityType"], "device.edit")
         self.assertIn("MB2-C00419", payload["description"])
-        self.assertIn("3.2.10", payload["description"])
+        self.assertIn("2.11.300", payload["description"])
         self.assertIn("Boxer Slack 박스 업데이트 요청", payload["reason"])
 
 

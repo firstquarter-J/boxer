@@ -438,20 +438,23 @@ def _get_mda_latest_device_version() -> dict[str, Any]:
 
     best_row: dict[str, Any] | None = None
     best_parts: tuple[int, int, int] | None = None
+    best_visible = False
     for row in rows:
         if not isinstance(row, dict):
-            continue
-        if not bool(row.get("autoUpdate")):
             continue
         version_name = _display_value(row.get("versionName"), default="")
         parts = _parse_semver_parts(version_name)
         if parts is None:
             continue
-        if parts[0] != 3:
-            continue
-        if best_parts is None or parts > best_parts:
+        is_visible = bool(row.get("visibleFlag"))
+        if (
+            best_parts is None
+            or (is_visible and not best_visible)
+            or (is_visible == best_visible and parts > best_parts)
+        ):
             best_parts = parts
             best_row = row
+            best_visible = is_visible
 
     if best_row is None:
         raise RuntimeError("MDA 최신 박스 버전을 찾지 못했어")

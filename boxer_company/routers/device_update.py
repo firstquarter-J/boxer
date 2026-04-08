@@ -73,7 +73,10 @@ _AGENT_GIT_STATUS_COMMAND = (
     "printf \"HEAD=%s\\n\" \"$(git rev-parse HEAD 2>/dev/null)\"; "
     "printf \"ORIGIN_MAIN=%s\\n\" \"$(git rev-parse origin/main 2>/dev/null)\"; "
     "printf \"BRANCH=%s\\n\" \"$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; "
-    "if [ -f package.json ]; then printf \"PKG_VERSION=%s\\n\" \"$(node -p \\\"require(\\\"./package.json\\\").version\\\" 2>/dev/null)\"; fi; "
+    "if [ -f package.json ]; then "
+    "node -e \"console.log((JSON.parse(require(\\\"fs\\\").readFileSync(\\\"package.json\\\",\\\"utf8\\\")).version)||\\\"\\\")\" 2>/dev/null "
+    "| sed \"s/^/PKG_VERSION=/\"; "
+    "fi; "
     "else echo repo_missing; fi'"
 )
 _BOX_UPDATE_WAIT_TIMEOUT_SEC = 300
@@ -838,6 +841,7 @@ def _query_device_update_status(device_name: str) -> tuple[str, dict[str, Any]]:
     latest_version = _display_value(latest_device_version.get("versionName"), default="")
     box_runtime = _read_box_runtime_state(normalized_device_name)
     agent_runtime = _read_agent_runtime_state(normalized_device_name)
+    agent_gate = _describe_agent_box_update_gate(agent_runtime)
     payload = {
         "route": "device_update_status",
         "source": "mda_graphql+ssh",
@@ -848,6 +852,7 @@ def _query_device_update_status(device_name: str) -> tuple[str, dict[str, Any]]:
         "latestVersion": latest_version,
         "boxRuntime": box_runtime,
         "agentRuntime": agent_runtime,
+        "agentGate": agent_gate,
     }
     return (
         _render_device_update_status_result(

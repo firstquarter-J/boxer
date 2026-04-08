@@ -1,0 +1,470 @@
+import unittest
+from datetime import datetime
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+from boxer_company import daily_device_round as rounder
+
+
+def _build_status_payload(*, ssh_ready: bool = True, overall: str = "정상") -> dict:
+    status_map = {
+        "정상": ("pass", "정상"),
+        "확인 필요": ("warning", "확인 필요"),
+        "이상": ("fail", "이상"),
+    }
+    component_status, component_label = status_map.get(overall, ("warning", "확인 필요"))
+    return {
+        "ssh": {"ready": ssh_ready, "reason": "ready" if ssh_ready else "agent_ssh_not_ready"},
+        "overview": {
+            "audio": {"status": component_status, "label": component_label},
+            "pm2": {"status": component_status, "label": component_label},
+            "captureboard": {"status": component_status, "label": component_label},
+            "led": {"status": component_status, "label": component_label},
+        },
+    }
+
+
+def _build_update_payload(
+    *,
+    box_version: str,
+    latest_box_version: str,
+    agent_version: str,
+    agent_latest: bool,
+    connected: bool = True,
+    gate_ok: bool = True,
+) -> dict:
+    return {
+        "device": {
+            "deviceName": "MB2-C00419",
+            "version": box_version,
+            "hospitalName": "테스트병원",
+            "roomName": "1진료실",
+            "isConnected": connected,
+        },
+        "latestVersion": latest_box_version,
+        "boxRuntime": {
+            "ssh": {"ready": True, "reason": "ready"},
+            "process": {
+                "name": "mommybox-v2",
+                "status": "online",
+                "version": box_version,
+            },
+        },
+        "agentRuntime": {
+            "ssh": {"ready": True, "reason": "ready"},
+            "process": {
+                "name": "mommybox-agent",
+                "status": "online",
+                "version": agent_version,
+            },
+            "repo": {
+                "available": True,
+                "reason": "ok",
+                "head": "abcdef0",
+                "originMain": "abcdef0" if agent_latest else "1234567",
+                "branch": "main",
+                "packageVersion": agent_version,
+                "latest": agent_latest,
+            },
+        },
+        "agentGate": {
+            "ok": gate_ok,
+            "version": agent_version,
+            "reason": "선행조건 충족" if gate_ok else "에이전트 2.0 이상이 필요해",
+        },
+    }
+
+
+class DailyDeviceRoundSelectionTests(unittest.TestCase):
+    def test_selects_next_hospital_after_last_seq_and_wraps(self) -> None:
+        candidates = [
+            {"hospitalSeq": 10, "hospitalName": "A", "deviceCount": 2},
+            {"hospitalSeq": 20, "hospitalName": "B", "deviceCount": 3},
+            {"hospitalSeq": 30, "hospitalName": "C", "deviceCount": 1},
+        ]
+
+        selected = rounder._select_daily_device_round_hospital(
+            candidates,
+            state={"lastHospitalSeq": 20},
+        )
+        wrapped = rounder._select_daily_device_round_hospital(
+            candidates,
+            state={"lastHospitalSeq": 30},
+        )
+
+        self.assertEqual(selected["hospitalSeq"], 30)
+        self.assertEqual(wrapped["hospitalSeq"], 10)
+        self.assertEqual(
+            rounder._resolve_next_daily_device_round_hospital_seq(candidates, 30),
+            10,
+        )
+
+    def test_selects_fixed_target_hospital_when_configured(self) -> None:
+        candidates = [
+            {"hospitalSeq": 10, "hospitalName": "A", "deviceCount": 2},
+            {"hospitalSeq": 604, "hospitalName": "루이스산부인과의원(동작)", "deviceCount": 2},
+            {"hospitalSeq": 999, "hospitalName": "C", "deviceCount": 1},
+        ]
+
+        with patch.object(rounder.cs, "DAILY_DEVICE_ROUND_TARGET_HOSPITAL_SEQ", 604):
+            selected = rounder._select_daily_device_round_hospital(
+                candidates,
+                state={"lastHospitalSeq": 999, "nextHospitalSeq": 10},
+            )
+            next_seq = rounder._resolve_next_daily_device_round_hospital_seq(candidates, 604)
+
+        self.assertEqual(selected["hospitalSeq"], 604)
+        self.assertEqual(next_seq, 604)
+
+
+class DailyDeviceRoundExecutionTests(unittest.TestCase):
+    def test_build_update_plan_falls_back_to_agent_runtime_gate(self) -> None:
+        plan = rounder._build_daily_device_round_update_plan(
+            {
+                "device": {
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.299",
+                    "isConnected": True,
+                },
+                "latestVersion": "2.11.300",
+                "boxRuntime": {
+                    "process": {
+                        "name": "mommybox-v2",
+                        "status": "online",
+                        "version": "2.11.299",
+                    }
+                },
+                "agentRuntime": {
+                    "process": {
+                        "name": "mommybox-agent",
+                        "status": "online",
+                        "version": "2.0.0",
+                    },
+                    "repo": {
+                        "available": True,
+                        "latest": True,
+                        "packageVersion": "2.0.0",
+                    },
+                },
+            }
+        )
+
+        self.assertTrue(plan["agent"]["isLatest"])
+        self.assertTrue(plan["box"]["gateOk"])
+        self.assertTrue(plan["box"]["shouldUpdate"])
+        self.assertEqual(plan["box"]["reason"], "박스 2.11.299 -> 2.11.300")
+
+    @patch("boxer_company.daily_device_round._request_device_box_update")
+    @patch("boxer_company.daily_device_round._request_device_agent_update")
+    @patch("boxer_company.daily_device_round._query_device_update_status")
+    @patch("boxer_company.daily_device_round._probe_device_status_overview")
+    def test_runs_agent_then_box_update_when_enabled(
+        self,
+        mock_probe_device_status_overview,
+        mock_query_device_update_status,
+        mock_request_device_agent_update,
+        mock_request_device_box_update,
+    ) -> None:
+        mock_probe_device_status_overview.return_value = (
+            "status text",
+            _build_status_payload(overall="정상"),
+        )
+        mock_query_device_update_status.side_effect = [
+            (
+                "initial update status",
+                _build_update_payload(
+                    box_version="3.2.0",
+                    latest_box_version="3.2.10",
+                    agent_version="1.9.0",
+                    agent_latest=False,
+                    gate_ok=False,
+                ),
+            ),
+            (
+                "after agent update",
+                _build_update_payload(
+                    box_version="3.2.0",
+                    latest_box_version="3.2.10",
+                    agent_version="2.0.0",
+                    agent_latest=True,
+                    gate_ok=True,
+                ),
+            ),
+            (
+                "after box update",
+                _build_update_payload(
+                    box_version="3.2.10",
+                    latest_box_version="3.2.10",
+                    agent_version="2.0.0",
+                    agent_latest=True,
+                    gate_ok=True,
+                ),
+            ),
+        ]
+        mock_request_device_agent_update.return_value = (
+            "agent update result",
+            {
+                "route": "device_agent_update",
+                "dispatch": {"status": True},
+                "wait": {"ok": True, "status": "completed"},
+            },
+        )
+        mock_request_device_box_update.return_value = (
+            "box update result",
+            {
+                "route": "device_box_update",
+                "dispatch": {"status": True},
+                "wait": {"ok": True, "status": "completed"},
+            },
+        )
+
+        result = rounder._run_daily_device_round_for_device(
+            "MB2-C00419",
+            auto_update_agent=True,
+            auto_update_box=True,
+        )
+
+        mock_request_device_agent_update.assert_called_once_with(
+            "MB2-C00419 에이전트 업데이트",
+            device_name="MB2-C00419",
+        )
+        mock_request_device_box_update.assert_called_once_with(
+            "MB2-C00419 장비 업데이트",
+            device_name="MB2-C00419",
+        )
+        self.assertEqual(result["overallLabel"], "정상")
+        self.assertTrue(result["initialPlan"]["agent"]["shouldUpdate"])
+        self.assertTrue(result["agentAction"]["ok"])
+        self.assertTrue(result["boxAction"]["ok"])
+        self.assertTrue(result["finalPlan"]["box"]["alreadyLatest"])
+        self.assertEqual(result["agentActionText"], "에이전트 업데이트 완료")
+        self.assertEqual(result["boxActionText"], "박스 업데이트 완료")
+
+
+class DailyDeviceRoundSummaryTests(unittest.TestCase):
+    @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_devices")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_hospital_candidates")
+    def test_builds_summary_and_next_hospital(
+        self,
+        mock_load_hospitals,
+        mock_load_devices,
+        mock_run_for_device,
+    ) -> None:
+        mock_load_hospitals.return_value = [
+            {"hospitalSeq": 10, "hospitalName": "A병원", "deviceCount": 1},
+            {"hospitalSeq": 20, "hospitalName": "B병원", "deviceCount": 2},
+        ]
+        mock_load_devices.return_value = [
+            {
+                "deviceName": "MB2-C00001",
+                "hospitalName": "B병원",
+                "roomName": "1진료실",
+            },
+            {
+                "deviceName": "MB2-C00002",
+                "hospitalName": "B병원",
+                "roomName": "2진료실",
+            },
+        ]
+        mock_run_for_device.side_effect = [
+            {
+                "deviceName": "MB2-C00001",
+                "hospitalName": "B병원",
+                "roomName": "1진료실",
+                "overallLabel": "정상",
+                "componentLabels": {"audio": "정상", "pm2": "정상", "captureboard": "정상", "led": "정상"},
+                "initialPlan": {
+                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
+                    "box": {"shouldUpdate": False, "alreadyLatest": True, "reason": "박스 최신"},
+                },
+                "finalPlan": {
+                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
+                    "box": {"shouldUpdate": False, "alreadyLatest": True, "reason": "박스 최신"},
+                },
+                "agentAction": None,
+                "boxAction": None,
+                "agentActionText": "에이전트 최신",
+                "boxActionText": "박스 최신",
+            },
+            {
+                "deviceName": "MB2-C00002",
+                "hospitalName": "B병원",
+                "roomName": "2진료실",
+                "overallLabel": "확인 필요",
+                "componentLabels": {"audio": "확인 필요", "pm2": "정상", "captureboard": "정상", "led": "정상"},
+                "initialPlan": {
+                    "agent": {"shouldUpdate": True, "isLatest": False, "reason": "에이전트 1.9.0 업데이트 필요"},
+                    "box": {"shouldUpdate": False, "alreadyLatest": False, "reason": "선행조건 미충족"},
+                },
+                "finalPlan": {
+                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
+                    "box": {"shouldUpdate": True, "alreadyLatest": False, "reason": "박스 3.2.0 -> 3.2.10"},
+                },
+                "agentAction": {"ok": True, "status": "completed"},
+                "boxAction": None,
+                "agentActionText": "에이전트 업데이트 완료",
+                "boxActionText": "박스 업데이트 후보",
+            },
+        ]
+
+        summary = rounder._build_daily_device_round_summary(
+            now=datetime(2026, 4, 8, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+            state={"lastHospitalSeq": 10},
+            auto_update_agent=True,
+            auto_update_box=False,
+        )
+
+        self.assertEqual(summary["hospitalSeq"], 20)
+        self.assertEqual(summary["hospitalName"], "B병원")
+        self.assertEqual(summary["deviceCount"], 2)
+        self.assertEqual(summary["statusCounts"]["정상"], 1)
+        self.assertEqual(summary["statusCounts"]["확인 필요"], 1)
+        self.assertEqual(summary["updateCounts"]["agentCandidates"], 1)
+        self.assertEqual(summary["updateCounts"]["agentUpdated"], 1)
+        self.assertEqual(summary["updateCounts"]["boxCandidates"], 1)
+        self.assertEqual(summary["nextHospitalSeq"], 10)
+
+    def test_formats_report_with_hospital_label_and_multiline_device_lines(self) -> None:
+        report_text = rounder._format_daily_device_round_report(
+            {
+                "hospitalSeq": 604,
+                "hospitalName": "루이스산부인과의원(동작)",
+                "deviceCount": 1,
+                "scheduledDeviceCount": 1,
+                "autoUpdateAgent": False,
+                "autoUpdateBox": False,
+                "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+                "updateCounts": {
+                    "agentCandidates": 0,
+                    "agentUpdated": 0,
+                    "agentUpdateFailed": 0,
+                    "boxCandidates": 1,
+                    "boxUpdated": 0,
+                    "boxUpdateFailed": 0,
+                },
+                "deviceResults": [
+                    {
+                        "deviceName": "MB2-C01431",
+                        "roomName": "1진료실",
+                        "overallLabel": "정상",
+                        "componentLabels": {
+                            "audio": "정상",
+                            "pm2": "정상",
+                            "captureboard": "정상",
+                            "led": "정상",
+                        },
+                        "finalPlan": {
+                            "agent": {
+                                "reason": "에이전트 최신",
+                                "currentVersion": "2.0.0",
+                                "isLatest": True,
+                            },
+                            "box": {
+                                "reason": "박스 2.11.299 -> 2.11.300",
+                                "currentVersion": "2.11.299",
+                                "latestVersion": "2.11.300",
+                                "alreadyLatest": False,
+                                "shouldUpdate": True,
+                            },
+                        },
+                        "agentAction": None,
+                        "boxAction": None,
+                    }
+                ],
+            },
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+        self.assertIn("일일 장비 순회 점검 | #604 루이스산부인과의원(동작)", report_text)
+        self.assertIn("• 병원: #604 루이스산부인과의원(동작)", report_text)
+        self.assertIn("• *MB2-C01431* `1진료실`", report_text)
+        self.assertIn("  *상태*  *정상*", report_text)
+        self.assertIn("  *점검*  `오디오 정상` | `pm2 정상` | `캡처보드 정상` | `LED 정상`", report_text)
+        self.assertIn("• 업데이트: 에이전트 성공 `0` (대상 `0`, 실패 `0`) / 박스 성공 `0` (대상 `1`, 실패 `0`)", report_text)
+        self.assertIn("  *에이전트*  *최신* | 버전 `2.0.0`", report_text)
+        self.assertIn("  *박스*  *대기* | 박스 2.11.299 -> 2.11.300", report_text)
+
+    def test_builds_blocks_with_separate_device_sections(self) -> None:
+        blocks = rounder._build_daily_device_round_blocks(
+            {
+                "hospitalSeq": 604,
+                "hospitalName": "루이스산부인과의원(동작)",
+                "deviceCount": 2,
+                "scheduledDeviceCount": 2,
+                "autoUpdateAgent": False,
+                "autoUpdateBox": False,
+                "statusCounts": {"정상": 2, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+                "updateCounts": {
+                    "agentCandidates": 0,
+                    "agentUpdated": 0,
+                    "agentUpdateFailed": 0,
+                    "boxCandidates": 2,
+                    "boxUpdated": 0,
+                    "boxUpdateFailed": 0,
+                },
+                "deviceResults": [
+                    {
+                        "deviceName": "MB2-C01431",
+                        "roomName": "1진료실",
+                        "overallLabel": "정상",
+                        "componentLabels": {
+                            "audio": "정상",
+                            "pm2": "정상",
+                            "captureboard": "정상",
+                            "led": "정상",
+                        },
+                        "finalPlan": {
+                            "agent": {"reason": "에이전트 최신", "currentVersion": "2.0.0", "isLatest": True},
+                            "box": {
+                                "reason": "박스 2.11.299 -> 2.11.300",
+                                "currentVersion": "2.11.299",
+                                "latestVersion": "2.11.300",
+                                "alreadyLatest": False,
+                                "shouldUpdate": True,
+                            },
+                        },
+                        "agentAction": None,
+                        "boxAction": None,
+                    },
+                    {
+                        "deviceName": "MB2-C01432",
+                        "roomName": "2진료실",
+                        "overallLabel": "정상",
+                        "componentLabels": {
+                            "audio": "정상",
+                            "pm2": "정상",
+                            "captureboard": "정상",
+                            "led": "정상",
+                        },
+                        "finalPlan": {
+                            "agent": {"reason": "에이전트 최신", "currentVersion": "2.0.0", "isLatest": True},
+                            "box": {
+                                "reason": "박스 2.11.299 -> 2.11.300",
+                                "currentVersion": "2.11.299",
+                                "latestVersion": "2.11.300",
+                                "alreadyLatest": False,
+                                "shouldUpdate": True,
+                            },
+                        },
+                        "agentAction": None,
+                        "boxAction": None,
+                    },
+                ],
+            },
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+        self.assertEqual(blocks[0]["type"], "header")
+        self.assertIn("#604 루이스산부인과의원(동작)", blocks[0]["text"]["text"])
+        self.assertEqual(blocks[3]["type"], "divider")
+        self.assertEqual(blocks[4]["type"], "section")
+        self.assertEqual(blocks[4]["text"]["text"], "*장비별 결과*")
+        self.assertEqual(blocks[5]["type"], "section")
+        self.assertIn("*MB2-C01431*", blocks[5]["text"]["text"])
+        self.assertEqual(blocks[6]["type"], "section")
+        self.assertIn("*MB2-C01432*", blocks[6]["text"]["text"])
+
+
+if __name__ == "__main__":
+    unittest.main()
