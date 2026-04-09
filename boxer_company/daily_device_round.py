@@ -5,7 +5,6 @@ from zoneinfo import ZoneInfo
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
-from boxer_company import settings as cs
 from boxer_company.routers.device_status_probe import _probe_device_status_overview
 from boxer_company.routers.device_update import (
     _describe_agent_box_update_gate,
@@ -16,7 +15,7 @@ from boxer_company.routers.device_update import (
 )
 
 _DAILY_DEVICE_ROUND_TIMEZONE = ZoneInfo("Asia/Seoul")
-_DAILY_DEVICE_ROUND_TITLE = "일일 장비 순회 점검"
+_DAILY_DEVICE_ROUND_TITLE = "일일 장비 순회 점검 & 업데이트"
 _DAILY_DEVICE_ROUND_MAX_DEVICE_LINES = 20
 
 
@@ -38,6 +37,21 @@ def _coerce_int(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_daily_device_round_hospital_seqs(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+
+    items: list[int] = []
+    seen: set[int] = set()
+    for raw in value:
+        hospital_seq = _coerce_int(raw)
+        if hospital_seq is None or hospital_seq in seen:
+            continue
+        items.append(hospital_seq)
+        seen.add(hospital_seq)
+    return items
 
 
 def _load_daily_device_round_hospital_candidates() -> list[dict[str, Any]]:
@@ -94,38 +108,36 @@ def _select_daily_device_round_hospital(
     if not normalized_candidates:
         return None
 
-    target_hospital_seq = _coerce_int(cs.DAILY_DEVICE_ROUND_TARGET_HOSPITAL_SEQ)
-    if target_hospital_seq is not None:
-        for item in normalized_candidates:
-            if int(item.get("hospitalSeq") or 0) == target_hospital_seq:
-                return item
-        raise RuntimeError(f"고정 hospitalSeq `{target_hospital_seq}` 병원을 찾지 못했어")
-
     state_payload = state if isinstance(state, dict) else {}
+    processed_hospital_seqs = set(_coerce_daily_device_round_hospital_seqs(state_payload.get("processedHospitalSeqs")))
+    selectable_candidates = [
+        item
+        for item in normalized_candidates
+        if int(item.get("hospitalSeq") or 0) not in processed_hospital_seqs
+    ]
+    if not selectable_candidates:
+        return None
+
     next_hospital_seq = _coerce_int(state_payload.get("nextHospitalSeq"))
     if next_hospital_seq is not None:
-        for item in normalized_candidates:
+        for item in selectable_candidates:
             if int(item.get("hospitalSeq") or 0) == next_hospital_seq:
                 return item
 
     last_hospital_seq = _coerce_int(state_payload.get("lastHospitalSeq"))
     if last_hospital_seq is None:
-        return normalized_candidates[0]
+        return selectable_candidates[0]
 
-    for item in normalized_candidates:
+    for item in selectable_candidates:
         if int(item.get("hospitalSeq") or 0) > last_hospital_seq:
             return item
-    return normalized_candidates[0]
+    return selectable_candidates[0]
 
 
 def _resolve_next_daily_device_round_hospital_seq(
     candidates: list[dict[str, Any]],
     current_hospital_seq: int | None,
 ) -> int | None:
-    target_hospital_seq = _coerce_int(cs.DAILY_DEVICE_ROUND_TARGET_HOSPITAL_SEQ)
-    if target_hospital_seq is not None:
-        return target_hospital_seq
-
     normalized_candidates = sorted(
         [item for item in candidates if _coerce_int(item.get("hospitalSeq")) is not None],
         key=lambda item: int(item.get("hospitalSeq") or 0),
@@ -366,17 +378,38 @@ def _describe_daily_device_round_route_summary(
     action = device_result.get(f"{route_kind}Action") if isinstance(device_result.get(f"{route_kind}Action"), dict) else None
     current_version = _display_value(plan.get("currentVersion"), default="")
     latest_version = _display_value(plan.get("latestVersion"), default="")
+    action_payload = action.get("payload") if isinstance((action or {}).get("payload"), dict) else {}
+
+    previous_version = ""
+    if route_kind == "agent":
+        precheck_runtime = action_payload.get("precheck") if isinstance(action_payload.get("precheck"), dict) else {}
+        precheck_process = precheck_runtime.get("process") if isinstance(precheck_runtime.get("process"), dict) else {}
+        precheck_repo = precheck_runtime.get("repo") if isinstance(precheck_runtime.get("repo"), dict) else {}
+        previous_version = _display_value(
+            precheck_repo.get("packageVersion"),
+            default=_display_value(precheck_process.get("version"), default=""),
+        )
+    else:
+        precheck_runtime = action_payload.get("precheck") if isinstance(action_payload.get("precheck"), dict) else {}
+        precheck_process = precheck_runtime.get("process") if isinstance(precheck_runtime.get("process"), dict) else {}
+        device_payload = action_payload.get("device") if isinstance(action_payload.get("device"), dict) else {}
+        previous_version = _display_value(
+            precheck_process.get("version"),
+            default=_display_value(device_payload.get("version"), default=""),
+        )
 
     if route_kind == "agent":
         if action:
             status = _display_value(action.get("status"), default="")
             if status in {"completed", "already_latest"} and action.get("ok"):
-                return "성공", f"최종 `{current_version or '미확인'}`"
+                if previous_version and current_version and previous_version != current_version:
+                    return "성공", f"`{previous_version}` -> `{current_version}`"
+                return "성공", f"버전 `{current_version or '미확인'}`"
             if status == "dispatch_failed":
                 return "실패", _display_value(plan.get("reason"), default="업데이트 실패")
             return "확인 필요", _display_value(plan.get("reason"), default="업데이트 확인 필요")
         if plan.get("isLatest"):
-            return "최신", f"버전 `{current_version or '미확인'}`"
+            return "최신", f"이번 업데이트 불필요 | 버전 `{current_version or '미확인'}`"
         if plan.get("shouldUpdate"):
             return "대기", _display_value(plan.get("reason"), default="업데이트 후보")
         return "확인 필요", _display_value(plan.get("reason"), default="상태 확인 필요")
@@ -384,12 +417,15 @@ def _describe_daily_device_round_route_summary(
     if action:
         status = _display_value(action.get("status"), default="")
         if status in {"completed", "already_latest"} and action.get("ok"):
-            return "성공", f"최종 `{current_version or latest_version or '미확인'}`"
+            final_version = current_version or latest_version
+            if previous_version and final_version and previous_version != final_version:
+                return "성공", f"`{previous_version}` -> `{final_version}`"
+            return "성공", f"버전 `{final_version or '미확인'}`"
         if status == "dispatch_failed":
             return "실패", _display_value(plan.get("reason"), default="업데이트 실패")
         return "확인 필요", _display_value(plan.get("reason"), default="업데이트 확인 필요")
     if plan.get("alreadyLatest"):
-        return "최신", f"버전 `{current_version or latest_version or '미확인'}`"
+        return "최신", f"이번 업데이트 불필요 | 버전 `{current_version or latest_version or '미확인'}`"
     if plan.get("shouldUpdate"):
         return "대기", _display_value(plan.get("reason"), default="업데이트 후보")
     return "확인 필요", _display_value(plan.get("reason"), default="상태 확인 필요")
@@ -541,6 +577,21 @@ def _build_daily_device_round_summary(
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
     candidates = _load_daily_device_round_hospital_candidates()
+    state_payload = state if isinstance(state, dict) else {}
+    processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(state_payload.get("processedHospitalSeqs"))
+    candidate_hospital_seqs = {
+        hospital_seq
+        for hospital_seq in (
+            _coerce_int(item.get("hospitalSeq"))
+            for item in candidates
+        )
+        if hospital_seq is not None
+    }
+    processed_candidate_count = sum(
+        1
+        for hospital_seq in processed_hospital_seqs
+        if hospital_seq in candidate_hospital_seqs
+    )
     hospital = _select_daily_device_round_hospital(candidates, state=state)
     if hospital is None:
         return {
@@ -568,7 +619,12 @@ def _build_daily_device_round_summary(
             },
             "deviceResults": [],
             "nextHospitalSeq": None,
-            "summaryLine": "점검 대상 병원이 없어",
+            "candidateHospitalCount": len(candidate_hospital_seqs),
+            "summaryLine": (
+                "이번 야간 업데이트 창에서 처리할 병원을 모두 끝냈어"
+                if candidate_hospital_seqs and processed_candidate_count >= len(candidate_hospital_seqs)
+                else "점검 대상 병원이 없어"
+            ),
         }
 
     devices = _load_daily_device_round_devices(int(hospital["hospitalSeq"]))
@@ -644,6 +700,7 @@ def _build_daily_device_round_summary(
         "updateCounts": update_counts,
         "deviceResults": device_results,
         "nextHospitalSeq": next_hospital_seq,
+        "candidateHospitalCount": len(candidate_hospital_seqs),
         "summaryLine": (
             f"정상 {status_counts['정상']} / 확인 필요 {status_counts['확인 필요']} / "
             f"이상 {status_counts['이상']} / 점검 불가 {status_counts['점검 불가']}"

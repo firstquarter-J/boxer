@@ -99,22 +99,32 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
             10,
         )
 
-    def test_selects_fixed_target_hospital_when_configured(self) -> None:
+    def test_skips_already_processed_hospitals_in_same_window(self) -> None:
         candidates = [
             {"hospitalSeq": 10, "hospitalName": "A", "deviceCount": 2},
-            {"hospitalSeq": 604, "hospitalName": "루이스산부인과의원(동작)", "deviceCount": 2},
-            {"hospitalSeq": 999, "hospitalName": "C", "deviceCount": 1},
+            {"hospitalSeq": 20, "hospitalName": "B", "deviceCount": 3},
+            {"hospitalSeq": 30, "hospitalName": "C", "deviceCount": 1},
         ]
 
-        with patch.object(rounder.cs, "DAILY_DEVICE_ROUND_TARGET_HOSPITAL_SEQ", 604):
-            selected = rounder._select_daily_device_round_hospital(
-                candidates,
-                state={"lastHospitalSeq": 999, "nextHospitalSeq": 10},
-            )
-            next_seq = rounder._resolve_next_daily_device_round_hospital_seq(candidates, 604)
+        selected = rounder._select_daily_device_round_hospital(
+            candidates,
+            state={
+                "lastHospitalSeq": 10,
+                "nextHospitalSeq": 20,
+                "processedHospitalSeqs": [10, 20],
+            },
+        )
+        completed = rounder._select_daily_device_round_hospital(
+            candidates,
+            state={
+                "lastHospitalSeq": 30,
+                "nextHospitalSeq": 10,
+                "processedHospitalSeqs": [10, 20, 30],
+            },
+        )
 
-        self.assertEqual(selected["hospitalSeq"], 604)
-        self.assertEqual(next_seq, 604)
+        self.assertEqual(selected["hospitalSeq"], 30)
+        self.assertIsNone(completed)
 
 
 class DailyDeviceRoundExecutionTests(unittest.TestCase):
@@ -205,6 +215,16 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
             "agent update result",
             {
                 "route": "device_agent_update",
+                "payload": {
+                    "precheck": {
+                        "process": {
+                            "version": "1.9.0",
+                        },
+                        "repo": {
+                            "packageVersion": "1.9.0",
+                        },
+                    }
+                },
                 "dispatch": {"status": True},
                 "wait": {"ok": True, "status": "completed"},
             },
@@ -213,6 +233,16 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
             "box update result",
             {
                 "route": "device_box_update",
+                "payload": {
+                    "device": {
+                        "version": "3.2.0",
+                    },
+                    "precheck": {
+                        "process": {
+                            "version": "3.2.0",
+                        }
+                    },
+                },
                 "dispatch": {"status": True},
                 "wait": {"ok": True, "status": "completed"},
             },
@@ -376,14 +406,76 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         )
 
-        self.assertIn("일일 장비 순회 점검 | #604 루이스산부인과의원(동작)", report_text)
+        self.assertIn("일일 장비 순회 점검 & 업데이트 | #604 루이스산부인과의원(동작)", report_text)
         self.assertIn("• 병원: #604 루이스산부인과의원(동작)", report_text)
         self.assertIn("• *MB2-C01431* `1진료실`", report_text)
         self.assertIn("  *상태*  *정상*", report_text)
         self.assertIn("  *점검*  `오디오 정상` | `pm2 정상` | `캡처보드 정상` | `LED 정상`", report_text)
         self.assertIn("• 업데이트: 에이전트 성공 `0` (대상 `0`, 실패 `0`) / 박스 성공 `0` (대상 `1`, 실패 `0`)", report_text)
-        self.assertIn("  *에이전트*  *최신* | 버전 `2.0.0`", report_text)
+        self.assertIn("  *에이전트*  *최신* | 이번 업데이트 불필요 | 버전 `2.0.0`", report_text)
         self.assertIn("  *박스*  *대기* | 박스 2.11.299 -> 2.11.300", report_text)
+
+    def test_formats_box_success_with_previous_and_final_version(self) -> None:
+        report_text = rounder._format_daily_device_round_report(
+            {
+                "hospitalSeq": 604,
+                "hospitalName": "루이스산부인과의원(동작)",
+                "deviceCount": 1,
+                "scheduledDeviceCount": 1,
+                "autoUpdateAgent": True,
+                "autoUpdateBox": True,
+                "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+                "updateCounts": {
+                    "agentCandidates": 0,
+                    "agentUpdated": 0,
+                    "agentUpdateFailed": 0,
+                    "boxCandidates": 1,
+                    "boxUpdated": 1,
+                    "boxUpdateFailed": 0,
+                },
+                "deviceResults": [
+                    {
+                        "deviceName": "MB2-C01431",
+                        "roomName": "1진료실",
+                        "overallLabel": "정상",
+                        "componentLabels": {
+                            "audio": "정상",
+                            "pm2": "정상",
+                            "captureboard": "정상",
+                            "led": "정상",
+                        },
+                        "finalPlan": {
+                            "agent": {
+                                "reason": "에이전트 최신",
+                                "currentVersion": "2.0.0",
+                                "isLatest": True,
+                            },
+                            "box": {
+                                "reason": "박스 최신",
+                                "currentVersion": "2.11.300",
+                                "latestVersion": "2.11.300",
+                                "alreadyLatest": True,
+                                "shouldUpdate": False,
+                            },
+                        },
+                        "agentAction": None,
+                        "boxAction": {
+                            "ok": True,
+                            "status": "completed",
+                            "payload": {
+                                "device": {"version": "2.11.299"},
+                                "precheck": {
+                                    "process": {"version": "2.11.299"},
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+        self.assertIn("  *박스*  *성공* | `2.11.299` -> `2.11.300`", report_text)
 
     def test_builds_blocks_with_separate_device_sections(self) -> None:
         blocks = rounder._build_daily_device_round_blocks(

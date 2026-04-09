@@ -2,7 +2,7 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,9 @@ from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
     _build_daily_device_round_summary,
     _build_daily_device_round_title_text,
+    _coerce_daily_device_round_hospital_seqs,
     _coerce_daily_device_round_now,
+    _coerce_int,
     _daily_device_round_timezone,
 )
 
@@ -61,16 +63,68 @@ def _is_daily_device_round_runtime_configured() -> bool:
     )
 
 
+def _daily_device_round_window_schedule() -> tuple[tuple[int, int], tuple[int, int]]:
+    start_hour = max(0, min(23, int(cs.DAILY_DEVICE_ROUND_HOUR_KST)))
+    start_minute = max(0, min(59, int(cs.DAILY_DEVICE_ROUND_MINUTE_KST)))
+    end_hour = max(0, min(23, int(cs.DAILY_DEVICE_ROUND_END_HOUR_KST)))
+    end_minute = max(0, min(59, int(cs.DAILY_DEVICE_ROUND_END_MINUTE_KST)))
+    return (start_hour, start_minute), (end_hour, end_minute)
+
+
+def _daily_device_round_window_key(now: datetime | None) -> str | None:
+    local_now = _coerce_daily_device_round_now(now)
+    (start_hour, start_minute), (end_hour, end_minute) = _daily_device_round_window_schedule()
+    start_minutes = (start_hour * 60) + start_minute
+    end_minutes = (end_hour * 60) + end_minute
+    current_minutes = (local_now.hour * 60) + local_now.minute
+
+    if start_minutes == end_minutes:
+        return local_now.date().isoformat()
+
+    if start_minutes < end_minutes:
+        if start_minutes <= current_minutes < end_minutes:
+            return local_now.date().isoformat()
+        return None
+
+    if current_minutes >= start_minutes:
+        return local_now.date().isoformat()
+    if current_minutes < end_minutes:
+        return (local_now.date() - timedelta(days=1)).isoformat()
+    return None
+
+
+def _normalize_daily_device_round_state(
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    state_payload = state if isinstance(state, dict) else {}
+    normalized_state = dict(state_payload)
+    current_window_key = _daily_device_round_window_key(now)
+    normalized_state["processedHospitalSeqs"] = _coerce_daily_device_round_hospital_seqs(
+        state_payload.get("processedHospitalSeqs")
+    )
+    if not current_window_key:
+        normalized_state["windowKey"] = None
+        normalized_state.pop("windowCompletedAt", None)
+        return normalized_state
+
+    previous_window_key = str(state_payload.get("windowKey") or "").strip()
+    normalized_state["windowKey"] = current_window_key
+    if previous_window_key != current_window_key:
+        normalized_state["processedHospitalSeqs"] = []
+        normalized_state.pop("windowCompletedAt", None)
+    return normalized_state
+
+
 def _is_daily_device_round_due(
     now: datetime | None,
     state: dict[str, Any],
 ) -> bool:
-    local_now = _coerce_daily_device_round_now(now)
-    scheduled_hour = max(0, min(23, int(cs.DAILY_DEVICE_ROUND_HOUR_KST)))
-    scheduled_minute = max(0, min(59, int(cs.DAILY_DEVICE_ROUND_MINUTE_KST)))
-    if (local_now.hour, local_now.minute) < (scheduled_hour, scheduled_minute):
+    if _daily_device_round_window_key(now) is None:
         return False
-    return str(state.get("lastRunDate") or "").strip() != local_now.date().isoformat()
+    normalized_state = _normalize_daily_device_round_state(state, now=now)
+    return not str(normalized_state.get("windowCompletedAt") or "").strip()
 
 
 def _run_daily_device_round_if_due(
@@ -94,7 +148,8 @@ def _run_daily_device_round_if_due(
         return False
 
     local_now = _coerce_daily_device_round_now(now)
-    state = _load_daily_device_round_state(logger=logger)
+    raw_state = _load_daily_device_round_state(logger=logger)
+    state = _normalize_daily_device_round_state(raw_state, now=local_now)
     if not _is_daily_device_round_due(local_now, state):
         return False
 
@@ -104,6 +159,42 @@ def _run_daily_device_round_if_due(
         auto_update_agent=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT),
         auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
     )
+    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
+    processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(state.get("processedHospitalSeqs"))
+    if hospital_seq is not None and hospital_seq not in processed_hospital_seqs:
+        processed_hospital_seqs.append(hospital_seq)
+    candidate_hospital_count = max(0, int(report_summary.get("candidateHospitalCount") or 0))
+    next_state = {
+        **state,
+        "windowKey": _daily_device_round_window_key(local_now),
+        "processedHospitalSeqs": processed_hospital_seqs,
+        "windowCompletedAt": (
+            local_now.isoformat()
+            if hospital_seq is None or (
+                candidate_hospital_count > 0
+                and len(processed_hospital_seqs) >= candidate_hospital_count
+            )
+            else ""
+        ),
+        "lastRunDate": _coerce_daily_device_round_now(local_now).date().isoformat(),
+        "lastHospitalSeq": report_summary.get("hospitalSeq"),
+        "lastHospitalName": report_summary.get("hospitalName"),
+        "nextHospitalSeq": report_summary.get("nextHospitalSeq"),
+        "lastSentAt": local_now.isoformat(),
+        "channelId": channel_id,
+        "statusCounts": report_summary.get("statusCounts"),
+        "updateCounts": report_summary.get("updateCounts"),
+    }
+    if hospital_seq is None:
+        _save_daily_device_round_state(next_state)
+        logger.info(
+            "Daily device round window paused channel=%s windowKey=%s reason=%s",
+            channel_id,
+            next_state.get("windowKey"),
+            report_summary.get("summaryLine"),
+        )
+        return False
+
     message_text = _build_daily_device_round_report_text(report_summary, now=local_now)
     message_blocks = _build_daily_device_round_blocks(
         report_summary,
@@ -134,24 +225,16 @@ def _run_daily_device_round_if_due(
         unfurl_links=False,
         unfurl_media=False,
     )
-    _save_daily_device_round_state(
-        {
-            "lastRunDate": _coerce_daily_device_round_now(local_now).date().isoformat(),
-            "lastHospitalSeq": report_summary.get("hospitalSeq"),
-            "lastHospitalName": report_summary.get("hospitalName"),
-            "nextHospitalSeq": report_summary.get("nextHospitalSeq"),
-            "lastSentAt": local_now.isoformat(),
-            "channelId": channel_id,
-            "statusCounts": report_summary.get("statusCounts"),
-            "updateCounts": report_summary.get("updateCounts"),
-        }
-    )
+    _save_daily_device_round_state(next_state)
     logger.info(
-        "Posted daily device round channel=%s hospitalSeq=%s hospitalName=%s deviceCount=%s",
+        "Posted daily device round channel=%s hospitalSeq=%s hospitalName=%s deviceCount=%s windowKey=%s processed=%s/%s",
         channel_id,
         report_summary.get("hospitalSeq"),
         report_summary.get("hospitalName"),
         report_summary.get("deviceCount"),
+        next_state.get("windowKey"),
+        len(processed_hospital_seqs),
+        candidate_hospital_count,
     )
     return True
 
@@ -217,10 +300,13 @@ def attach_daily_device_round_reporter(app: Any, *, logger: logging.Logger | Non
         _DAILY_DEVICE_ROUND_THREAD.start()
 
     local_tz = _daily_device_round_timezone()
+    (start_hour, start_minute), (end_hour, end_minute) = _daily_device_round_window_schedule()
     actual_logger.info(
-        "Started daily device round scheduler channel=%s every day at %02d:%02d %s",
+        "Started daily device round scheduler channel=%s every day from %02d:%02d to %02d:%02d %s",
         channel_id,
-        max(0, min(23, int(cs.DAILY_DEVICE_ROUND_HOUR_KST))),
-        max(0, min(59, int(cs.DAILY_DEVICE_ROUND_MINUTE_KST))),
+        start_hour,
+        start_minute,
+        end_hour,
+        end_minute,
         local_tz.key,
     )
