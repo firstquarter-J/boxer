@@ -76,6 +76,14 @@ def _build_update_payload(
 
 
 class DailyDeviceRoundSelectionTests(unittest.TestCase):
+    def test_excludes_prefixed_hospitals_from_candidates(self) -> None:
+        self.assertTrue(rounder._is_daily_device_round_excluded_hospital_name("4_입고"))
+        self.assertTrue(rounder._is_daily_device_round_excluded_hospital_name("0_테스트"))
+        self.assertTrue(rounder._is_daily_device_round_excluded_hospital_name("7_창고"))
+        self.assertFalse(rounder._is_daily_device_round_excluded_hospital_name("8_운영"))
+        self.assertFalse(rounder._is_daily_device_round_excluded_hospital_name("장비 창고"))
+        self.assertFalse(rounder._is_daily_device_round_excluded_hospital_name("루이스산부인과의원(동작)"))
+
     def test_selects_next_hospital_after_last_seq_and_wraps(self) -> None:
         candidates = [
             {"hospitalSeq": 10, "hospitalName": "A", "deviceCount": 2},

@@ -54,6 +54,13 @@ def _coerce_daily_device_round_hospital_seqs(value: Any) -> list[int]:
     return items
 
 
+def _is_daily_device_round_excluded_hospital_name(hospital_name: Any) -> bool:
+    normalized_name = _display_value(hospital_name, default="").strip()
+    if not normalized_name:
+        return False
+    return len(normalized_name) >= 2 and normalized_name[0] in "01234567" and normalized_name[1] == "_"
+
+
 def _load_daily_device_round_hospital_candidates() -> list[dict[str, Any]]:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
@@ -84,10 +91,13 @@ def _load_daily_device_round_hospital_candidates() -> list[dict[str, Any]]:
         hospital_seq = _coerce_int(row.get("hospitalSeq"))
         if hospital_seq is None:
             continue
+        hospital_name = _display_value(row.get("hospitalName"), default="미확인")
+        if _is_daily_device_round_excluded_hospital_name(hospital_name):
+            continue
         items.append(
             {
                 "hospitalSeq": hospital_seq,
-                "hospitalName": _display_value(row.get("hospitalName"), default="미확인"),
+                "hospitalName": hospital_name,
                 "deviceCount": int(row.get("deviceCount") or 0),
             }
         )
