@@ -4,6 +4,7 @@ from typing import Any
 
 from boxer.core.utils import _display_value, _format_size, _truncate_text
 from boxer_company import settings as cs
+from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_audio_probe import (
     _parse_default_sink,
@@ -99,6 +100,11 @@ _DEVICE_REMOTE_ACCESS_FAILURE_HINTS = (
     "안열",
     "못 붙",
     "못붙",
+)
+_REMOTE_ACCESS_NOTION_REFERENCE_TITLES = (
+    "병원 방화벽으로 MDA/원격 접속이 안 될 때",
+    "초음파 영상 업로드 안됨(네트워크 이슈)",
+    "네트워크 환경 가이드라인",
 )
 _DEVICE_LED_PATTERN_EXPLAIN_HINTS = (
     "증상",
@@ -1198,10 +1204,75 @@ def _build_mda_ping_line(ping_result: dict[str, Any] | None) -> str:
     raw_status = payload.get("status")
     ping_status = raw_status if isinstance(raw_status, bool) else None
     ping_message = _display_mda_ping_message(_display_value(payload.get("message"), default=""))
-    line = f"• MDA ping 전송: {_format_remote_access_status_display(ping_status, positive='성공', negative='실패')}"
+    line = f"• ping 전송 여부: {_format_remote_access_status_display(ping_status, positive='성공', negative='실패')}"
     if ping_message:
         line = f"{line} | {ping_message}"
     return line
+
+
+def _select_remote_access_notion_references(*, max_results: int = 2) -> list[dict[str, Any]]:
+    title_set = set(_REMOTE_ACCESS_NOTION_REFERENCE_TITLES)
+    selected: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+    for item in _select_notion_references("ssh 원격 접속 방화벽 네트워크", max_results=5):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title or title not in title_set or title in seen_titles:
+            continue
+        selected.append(item)
+        seen_titles.add(title)
+        if len(selected) >= max(1, max_results):
+            break
+    return selected
+
+
+def _render_remote_access_notion_section(docs: list[dict[str, Any]] | None) -> str:
+    items = [item for item in (docs or []) if isinstance(item, dict)]
+    if not items:
+        return ""
+
+    lines = ["*함께 참고할 문서*"]
+    for item in items[:3]:
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not title or not url:
+            continue
+        lines.append(f"- <{url}|{title}>")
+    return "\n".join(lines)
+
+
+def _append_remote_access_notion_section(
+    text: str,
+    docs: list[dict[str, Any]] | None,
+) -> str:
+    section = _render_remote_access_notion_section(docs)
+    normalized_text = (text or "").strip()
+    if not section:
+        return normalized_text
+    if "함께 참고할 문서" in normalized_text:
+        return normalized_text
+    if not normalized_text:
+        return section
+    return f"{normalized_text}\n\n{section}"
+
+
+def _extract_remote_access_state(device_info: dict[str, Any]) -> dict[str, Any]:
+    device_connected = bool(device_info.get("deviceIsConnected")) if "deviceIsConnected" in device_info else None
+    agent_connected = bool(device_info.get("isConnected")) if "isConnected" in device_info else None
+    agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
+    host = _display_value(agent_ssh.get("host"), default="")
+    try:
+        port = int(agent_ssh.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return {
+        "deviceConnected": device_connected,
+        "agentConnected": agent_connected,
+        "host": host,
+        "port": port,
+        "hasSshInfo": bool(host) and port > 0,
+    }
 
 
 def _render_single_probe_result(
@@ -1235,22 +1306,18 @@ def _build_remote_access_diagnosis(
     device_info: dict[str, Any],
 ) -> dict[str, str]:
     ping_message_lower = ping_message.lower()
-    device_connected = bool(device_info.get("deviceIsConnected")) if "deviceIsConnected" in device_info else None
-    agent_connected = bool(device_info.get("isConnected")) if "isConnected" in device_info else None
-    agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
-    host = _display_value(agent_ssh.get("host"), default="")
-    try:
-        port = int(agent_ssh.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    ssh_ready = bool(host) and port > 0
+    remote_state = _extract_remote_access_state(device_info)
+    device_connected = remote_state["deviceConnected"]
+    agent_connected = remote_state["agentConnected"]
+    ssh_ready = bool(remote_state["hasSshInfo"])
+    has_ssh_info = bool(remote_state["host"]) or bool(remote_state["port"])
 
     if "not found" in ping_message_lower or "장비 상태를 찾지 못" in ping_message:
         return {
             "summary": "MDA에서 장비 상태를 못 찾아서 실시간 원격 접속 판단이 아직 안 돼",
             "action": "장비명과 MDA 등록 상태를 먼저 확인해",
         }
-    if ping_status and device_connected is None and agent_connected is None and not agent_ssh:
+    if ping_status and device_connected is None and agent_connected is None and not has_ssh_info:
         return {
             "summary": "장비 ping 전송은 성공했지만 상세 상태를 아직 못 읽었어",
             "action": "잠시 후 다시 점검하거나 MDA 장비 상세 상태를 확인해",
@@ -1262,17 +1329,56 @@ def _build_remote_access_diagnosis(
         }
     if agent_connected is False:
         return {
-            "summary": "장비 command channel은 살아 있는데 agent가 offline이라 SSH 준비가 안 된 상태야",
-            "action": "SSH 방화벽만 단정하지 말고 agent 프로세스와 연결 상태를 먼저 확인해",
+            "summary": "장비 통신은 보이는데 원격 접속 준비가 안 된 상태야",
+            "action": "장비 쪽 원격 접속 서비스 상태를 먼저 확인해",
         }
     if not ssh_ready:
         return {
-            "summary": "장비는 온라인인데 SSH 정보가 안 보여. 병원 네트워크 전체 문제보다는 SSH 개방이나 원격 접속 설정 문제로 좁힐 수 있어",
-            "action": "병원 쪽 SSH 허용 정책과 agent 원격 접속 설정을 확인해",
+            "summary": "장비는 온라인인데 SSH 접속이 안 열려 있어 보여. 병원 네트워크 쪽 문제로 보는 게 맞고, 특히 SSH 방화벽이나 포트 제한 가능성이 커",
+            "action": "병원 쪽 방화벽, 포트 22 제한, 원격 접속 허용 정책을 확인해",
         }
     return {
-        "summary": "장비 통신과 SSH 정보는 둘 다 보여. 실제 SSH 접속 실패면 인증값, 포트, 일시 상태를 확인하면 돼",
+        "summary": "장비 통신과 SSH 접속 경로는 둘 다 보여. 실제 SSH 접속 실패면 인증값, 포트, 일시 상태를 확인하면 돼",
         "action": "SSH 계정/비밀번호, 포트, 접속 시각 기준 상태를 같이 확인해",
+    }
+
+
+def _build_status_overview_ssh_unavailable_guidance(
+    *,
+    ssh_reason: str,
+    ping_result: dict[str, Any] | None,
+    device_info: dict[str, Any],
+) -> dict[str, str]:
+    normalized_reason = str(ssh_reason or "").strip().lower()
+    payload = ping_result if isinstance(ping_result, dict) else {}
+    raw_status = payload.get("status")
+    ping_status = raw_status if isinstance(raw_status, bool) else None
+    ping_message = _display_mda_ping_message(_display_value(payload.get("message"), default=""))
+
+    if normalized_reason == "ssh_auth_failed":
+        return {
+            "summary": "장비-MDA 통신은 보이는데 SSH 인증에서 실패했어",
+            "action": "DEVICE_SSH_USER/DEVICE_SSH_PASSWORD 값과 장비 쪽 SSH 계정 상태를 확인해",
+        }
+    if normalized_reason == "missing_password":
+        return {
+            "summary": "boxer 쪽 DEVICE_SSH_PASSWORD 설정이 없어서 SSH 점검을 이어갈 수 없어",
+            "action": "앱 서버 env의 DEVICE_SSH_PASSWORD를 확인해",
+        }
+    if normalized_reason == "paramiko_missing":
+        return {
+            "summary": "boxer 런타임에 paramiko가 없어 SSH 점검을 이어갈 수 없어",
+            "action": "앱 서버 의존성 설치 상태를 확인해",
+        }
+    if ping_status is not None:
+        return _build_remote_access_diagnosis(
+            ping_status=ping_status,
+            ping_message=ping_message,
+            device_info=device_info,
+        )
+    return {
+        "summary": _display_device_status_probe_reason(ssh_reason),
+        "action": "장비 온라인 상태와 SSH 설정을 같이 확인해",
     }
 
 
@@ -1307,18 +1413,8 @@ def _render_device_remote_access_probe_result(
 
     lines.append(_build_mda_ping_line(ping_result))
     lines.append(
-        f"• 장비 연결 상태: {_format_remote_access_status_display(device_connected, positive='온라인', negative='오프라인')}"
-    )
-    lines.append(
-        f"• agent 연결 상태: {_format_remote_access_status_display(agent_connected, positive='온라인', negative='오프라인')}"
-    )
-    lines.append(
         f"• SSH 준비 상태: {_format_remote_access_status_display(ssh_ready, positive='준비됨', negative='미준비')}"
     )
-    if host and port > 0:
-        lines.append(f"• SSH 정보: `{host}:{port}`")
-    else:
-        lines.append("• SSH 정보: *미확인*")
     lines.append(f"• 판단: {diagnosis['summary']}")
     lines.append(f"• 조치: {diagnosis['action']}")
     return "\n".join(lines)
@@ -1503,6 +1599,12 @@ def _render_device_status_overview_result(
         device_info=device_info,
     )
     if not ssh_ready:
+        remote_state = _extract_remote_access_state(device_info)
+        guidance = _build_status_overview_ssh_unavailable_guidance(
+            ssh_reason=ssh_reason,
+            ping_result=ping_result,
+            device_info=device_info,
+        )
         lines.append(_build_mda_ping_line(ping_result))
         lines.append(f"• SSH 연결 상태: {_format_probe_ssh_status_display(False)}")
         lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(False)}")
@@ -1510,7 +1612,8 @@ def _render_device_status_overview_result(
         lines.append("• pm2 앱: *점검 불가*")
         lines.append("• 캡처보드: *점검 불가*")
         lines.append("• LED: *점검 불가*")
-        lines.append(f"• 안내: {_display_device_status_probe_reason(ssh_reason)}")
+        lines.append(f"• 판단: {guidance['summary']}")
+        lines.append(f"• 조치: {guidance['action']}")
         return "\n".join(lines)
 
     component_summaries = {
@@ -1728,6 +1831,7 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     ssh_ready = bool(ssh.get("ready"))
     ssh_reason = _display_value(ssh.get("reason"), default="")
+    notion_references = _select_remote_access_notion_references() if not ssh_ready else []
 
     audio_summary = None
     pm2_summary = None
@@ -1761,6 +1865,9 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
         "captureboard": captureboard_summary,
         "led": led_summary,
     }
+    if notion_references:
+        evidence_payload["notionPlaybooks"] = notion_references
+        evidence_payload["notionReferences"] = notion_references
     result_text = _render_device_status_overview_result(
         device_name=normalized_device_name,
         device_info=device_info,
@@ -1772,6 +1879,8 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
         captureboard_summary=captureboard_summary,
         led_summary=led_summary,
     )
+    if notion_references:
+        result_text = _append_remote_access_notion_section(result_text, notion_references)
     return result_text, evidence_payload
 
 
@@ -1784,6 +1893,12 @@ def _probe_device_remote_access(device_name: str) -> tuple[str, dict[str, Any]]:
         "deviceName": normalized_device_name,
     }
     ping_result = _send_mda_device_ping(normalized_device_name)
+    remote_state = _extract_remote_access_state(device_info)
+    notion_references = (
+        _select_remote_access_notion_references()
+        if (not bool(remote_state["hasSshInfo"]) or not bool(ping_result.get("status")))
+        else []
+    )
     evidence_payload: dict[str, Any] = {
         "route": "device_remote_access_probe",
         "source": "mda_graphql",
@@ -1794,6 +1909,9 @@ def _probe_device_remote_access(device_name: str) -> tuple[str, dict[str, Any]]:
         "device": device_info,
         "ping": ping_result,
     }
+    if notion_references:
+        evidence_payload["notionPlaybooks"] = notion_references
+        evidence_payload["notionReferences"] = notion_references
     result_text = _render_device_remote_access_probe_result(
         device_name=normalized_device_name,
         device_info=device_info,
@@ -1804,6 +1922,8 @@ def _probe_device_remote_access(device_name: str) -> tuple[str, dict[str, Any]]:
         ping_message=_display_mda_ping_message(_display_value(ping_result.get("message"), default="")),
         device_info=device_info,
     )
+    if notion_references:
+        result_text = _append_remote_access_notion_section(result_text, notion_references)
     return result_text, evidence_payload
 
 

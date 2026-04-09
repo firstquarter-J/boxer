@@ -267,7 +267,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*오디오*", rendered)
         self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
         self.assertIn("*런타임*", rendered)
-        self.assertIn("• MDA ping 전송: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
+        self.assertIn("• ping 전송 여부: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
         self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
         self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
@@ -281,7 +281,10 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
     def test_overview_render_marks_ssh_and_download_unavailable_when_ssh_not_ready(self) -> None:
         rendered = _render_device_status_overview_result(
             device_name="MB2-C00419",
-            device_info={},
+            device_info={
+                "deviceIsConnected": False,
+                "isConnected": False,
+            },
             ping_result={
                 "status": False,
                 "message": "Device is offline",
@@ -294,10 +297,36 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
             led_summary=None,
         )
 
-        self.assertIn("• MDA ping 전송: 🔴 *실패* | 장비 offline", rendered)
+        self.assertIn("• ping 전송 여부: 🔴 *실패* | 장비 offline", rendered)
         self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
-        self.assertIn("• 안내: 장비 SSH 연결 준비 실패. 온라인 상태, 네트워크, 원격 접속 상태 먼저 확인해", rendered)
+        self.assertIn("• 판단: 박서가 직접 ping도 못 보냈어. 장비 자체가 MDA 기준 offline이라 병원 네트워크나 장비 연결 문제를 먼저 봐야 해", rendered)
+        self.assertIn("• 조치: 장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인한 뒤 다시 점검해", rendered)
+
+    def test_overview_render_explains_ping_success_but_ssh_unavailable_in_detail(self) -> None:
+        rendered = _render_device_status_overview_result(
+            device_name="MB2-C00419",
+            device_info={
+                "deviceIsConnected": True,
+                "isConnected": True,
+                "agentSsh": None,
+            },
+            ping_result={
+                "status": True,
+                "message": "Command dispatched to device",
+            },
+            ssh_ready=False,
+            ssh_reason="agent_ssh_not_ready",
+            audio_summary=None,
+            pm2_summary=None,
+            captureboard_summary=None,
+            led_summary=None,
+        )
+
+        self.assertIn("• ping 전송 여부: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
+        self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
+        self.assertIn("• 판단: 장비는 온라인인데 SSH 접속이 안 열려 있어 보여. 병원 네트워크 쪽 문제로 보는 게 맞고, 특히 SSH 방화벽이나 포트 제한 가능성이 커", rendered)
+        self.assertIn("• 조치: 병원 쪽 방화벽, 포트 22 제한, 원격 접속 허용 정책을 확인해", rendered)
 
 
 class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
@@ -330,16 +359,52 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
                     {
                         "deviceName": "MB2-C00419",
                         "version": "2.11.300",
+                        "deviceIsConnected": False,
+                        "isConnected": False,
                     },
                     {},
                 ),
             ),
+            patch(
+                "boxer_company.routers.device_status_probe._select_remote_access_notion_references",
+                return_value=[
+                    {
+                        "title": "병원 방화벽으로 MDA/원격 접속이 안 될 때",
+                        "url": "https://www.notion.so/MDA-322cf826870c812aaee6f9c62838b486",
+                    }
+                ],
+            ),
         ):
             result_text, evidence = _probe_device_status_overview("MB2-C00419")
 
-        self.assertIn("• MDA ping 전송: 🔴 *실패* | 장비 offline", result_text)
+        self.assertIn("• ping 전송 여부: 🔴 *실패* | 장비 offline", result_text)
+        self.assertIn("• 판단: 박서가 직접 ping도 못 보냈어. 장비 자체가 MDA 기준 offline이라 병원 네트워크나 장비 연결 문제를 먼저 봐야 해", result_text)
+        self.assertIn("*함께 참고할 문서*", result_text)
+        self.assertIn("병원 방화벽으로 MDA/원격 접속이 안 될 때", result_text)
         self.assertFalse(evidence["ping"]["status"])
+        self.assertEqual(evidence["notionReferences"][0]["title"], "병원 방화벽으로 MDA/원격 접속이 안 될 때")
         self.assertEqual(evidence["overview"]["audio"], None)
+
+    def test_remote_access_probe_handles_ping_success_without_detail_state(self) -> None:
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._get_mda_device_detail",
+                return_value=None,
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._send_mda_device_ping",
+                return_value={
+                    "status": True,
+                    "message": "Command dispatched to device",
+                    "affected": 1,
+                    "command": "ping",
+                },
+            ),
+        ):
+            result_text, _ = _probe_device_remote_access("MB2-C00419")
+
+        self.assertIn("장비 ping 전송은 성공했지만 상세 상태를 아직 못 읽었어", result_text)
+        self.assertIn("잠시 후 다시 점검하거나 MDA 장비 상세 상태를 확인해", result_text)
 
     def test_remote_access_probe_points_to_network_when_ping_fails(self) -> None:
         with (
@@ -364,13 +429,28 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
                     "command": "ping",
                 },
             ),
+            patch(
+                "boxer_company.routers.device_status_probe._select_remote_access_notion_references",
+                return_value=[
+                    {
+                        "title": "병원 방화벽으로 MDA/원격 접속이 안 될 때",
+                        "url": "https://www.notion.so/MDA-322cf826870c812aaee6f9c62838b486",
+                    },
+                    {
+                        "title": "초음파 영상 업로드 안됨(네트워크 이슈)",
+                        "url": "https://www.notion.so/390aa941853c4c279e545de06e49dce7?pvs=21",
+                    },
+                ],
+            ),
         ):
             result_text, evidence = _probe_device_remote_access("MB2-C00419")
 
         self.assertIn("*장비 원격 접속 점검*", result_text)
-        self.assertIn("• MDA ping 전송: 🔴 *실패* | 장비 offline", result_text)
+        self.assertIn("• ping 전송 여부: 🔴 *실패* | 장비 offline", result_text)
         self.assertIn("병원 네트워크나 장비 연결 문제를 먼저 봐야 해", result_text)
         self.assertIn("장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인", result_text)
+        self.assertIn("*함께 참고할 문서*", result_text)
+        self.assertIn("병원 방화벽으로 MDA/원격 접속이 안 될 때", result_text)
         self.assertFalse(evidence["ping"]["status"])
 
     def test_remote_access_probe_points_to_ssh_policy_when_ping_succeeds_but_ssh_missing(self) -> None:
@@ -402,10 +482,10 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
         ):
             result_text, evidence = _probe_device_remote_access("MB2-C00419")
 
-        self.assertIn("• MDA ping 전송: 🔵 *성공* | 장비로 ping 전송 완료", result_text)
+        self.assertIn("• ping 전송 여부: 🔵 *성공* | 장비로 ping 전송 완료", result_text)
         self.assertIn("• SSH 준비 상태: 🔴 *미준비*", result_text)
-        self.assertIn("SSH 개방이나 원격 접속 설정 문제로 좁힐 수 있어", result_text)
-        self.assertIn("SSH 허용 정책과 agent 원격 접속 설정", result_text)
+        self.assertIn("병원 네트워크 쪽 문제로 보는 게 맞고, 특히 SSH 방화벽이나 포트 제한 가능성이 커", result_text)
+        self.assertIn("방화벽, 포트 22 제한, 원격 접속 허용 정책", result_text)
         self.assertTrue(evidence["ping"]["status"])
 
     def test_remote_access_probe_points_to_agent_when_device_ping_succeeds_but_agent_offline(self) -> None:
@@ -434,9 +514,8 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
         ):
             result_text, _ = _probe_device_remote_access("MB2-C00419")
 
-        self.assertIn("• agent 연결 상태: 🔴 *오프라인*", result_text)
-        self.assertIn("agent가 offline이라 SSH 준비가 안 된 상태야", result_text)
-        self.assertIn("agent 프로세스와 연결 상태를 먼저 확인해", result_text)
+        self.assertIn("장비 통신은 보이는데 원격 접속 준비가 안 된 상태야", result_text)
+        self.assertIn("장비 쪽 원격 접속 서비스 상태를 먼저 확인해", result_text)
 
     def test_patches_device_memory_only_when_precheck_is_not_4gb(self) -> None:
         client = _FakeSshClient(
