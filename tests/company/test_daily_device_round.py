@@ -415,7 +415,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         )
 
         self.assertIn("일일 장비 순회 점검 & 업데이트 | #604 루이스산부인과의원(동작)", report_text)
-        self.assertIn("• 병원: #604 루이스산부인과의원(동작)", report_text)
+        self.assertIn("*#604 루이스산부인과의원(동작)*", report_text)
         self.assertIn("• *MB2-C01431* `1진료실`", report_text)
         self.assertIn("  *상태*  *정상*", report_text)
         self.assertIn("  *점검*  `오디오 정상` | `pm2 정상` | `캡처보드 정상` | `LED 정상`", report_text)
@@ -557,13 +557,16 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
 
         self.assertEqual(blocks[0]["type"], "header")
         self.assertIn("#604 루이스산부인과의원(동작)", blocks[0]["text"]["text"])
-        self.assertEqual(blocks[3]["type"], "divider")
-        self.assertEqual(blocks[4]["type"], "section")
-        self.assertEqual(blocks[4]["text"]["text"], "*장비별 결과*")
+        self.assertEqual(blocks[1]["type"], "header")
+        self.assertEqual(blocks[1]["text"]["text"], "#604 루이스산부인과의원(동작)")
+        self.assertEqual(blocks[2]["type"], "context")
+        self.assertEqual(blocks[4]["type"], "divider")
         self.assertEqual(blocks[5]["type"], "section")
-        self.assertIn("*MB2-C01431*", blocks[5]["text"]["text"])
+        self.assertEqual(blocks[5]["text"]["text"], "*장비별 결과*")
         self.assertEqual(blocks[6]["type"], "section")
-        self.assertIn("*MB2-C01432*", blocks[6]["text"]["text"])
+        self.assertIn("*MB2-C01431*", blocks[6]["text"]["text"])
+        self.assertEqual(blocks[7]["type"], "section")
+        self.assertIn("*MB2-C01432*", blocks[7]["text"]["text"])
 
 
 if __name__ == "__main__":

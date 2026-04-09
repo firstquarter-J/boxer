@@ -378,6 +378,13 @@ def _build_daily_device_round_title_text(report_summary: dict[str, Any]) -> str:
     )
 
 
+def _build_daily_device_round_hospital_heading_text(
+    hospital_name: str | None,
+    hospital_seq: int | None,
+) -> str:
+    return f"*{_format_daily_device_round_hospital_label(hospital_name, hospital_seq)}*"
+
+
 def _describe_daily_device_round_route_summary(
     device_result: dict[str, Any],
     *,
@@ -740,7 +747,10 @@ def _format_daily_device_round_report(
     )
     lines.extend(
         [
-            f"• 병원: {hospital_detail}",
+            _build_daily_device_round_hospital_heading_text(
+                report_summary.get("hospitalName"),
+                hospital_seq,
+            ),
             f"• 실행: `{local_now:%Y-%m-%d %H:%M:%S} KST`",
             (
                 f"• 자동 업데이트: 에이전트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` / "
@@ -816,21 +826,47 @@ def _build_daily_device_round_blocks(
         )
 
     hospital_label = _format_daily_device_round_hospital_label(hospital_name, hospital_seq)
-    blocks.append(
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"병원 *{hospital_label}* | 발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | "
-                        f"에이전트 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` | "
-                        f"박스 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateBox') else '꺼짐'}`"
-                    ),
-                }
-            ],
-        }
-    )
+    if hospital_seq is not None:
+        blocks.append(
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": hospital_label,
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | "
+                            f"에이전트 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` | "
+                            f"박스 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateBox') else '꺼짐'}`"
+                        ),
+                    }
+                ],
+            }
+        )
+    else:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"병원 *{hospital_label}* | 발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | "
+                            f"에이전트 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` | "
+                            f"박스 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateBox') else '꺼짐'}`"
+                        ),
+                    }
+                ],
+            }
+        )
 
     if hospital_seq is None:
         blocks.append(
