@@ -39,6 +39,8 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
         self.assertEqual(normalized["lastHospitalSeq"], 604)
         self.assertIsNone(normalized["nextHospitalSeq"])
         self.assertEqual(normalized["processedHospitalSeqs"], [])
+        self.assertEqual(normalized["windowThreadTs"], "")
+        self.assertEqual(normalized["windowThreadChannelId"], "")
 
     def test_is_due_only_inside_overnight_window_until_completed(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")
@@ -159,6 +161,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "processedHospitalSeqs": [10],
                 "lastHospitalSeq": 10,
                 "nextHospitalSeq": 20,
+                "windowThreadTs": "",
+                "windowThreadChannelId": "",
             },
             auto_update_agent=True,
             auto_update_box=False,
@@ -171,7 +175,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         )
         self.assertEqual(len(client.messages), 2)
         self.assertEqual(client.messages[0]["channel"], "C_DAILY")
-        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | #20 B병원")
+        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
         self.assertEqual(client.messages[1]["channel"], "C_DAILY")
         self.assertEqual(client.messages[1]["text"], "daily round body")
         self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
@@ -184,6 +188,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "lastSentAt": local_now.isoformat(),
                 "channelId": "C_DAILY",
                 "windowKey": "2026-04-08",
+                "windowThreadTs": "2000.001",
+                "windowThreadChannelId": "C_DAILY",
                 "processedHospitalSeqs": [10, 20],
                 "windowCompletedAt": "",
                 "statusCounts": {"정상": 1, "확인 필요": 1, "이상": 0, "점검 불가": 0},
@@ -192,6 +198,106 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                     "agentUpdated": 1,
                     "agentUpdateFailed": 0,
                     "boxCandidates": 1,
+                    "boxUpdated": 0,
+                    "boxUpdateFailed": 0,
+                },
+            }
+        )
+
+    def test_reuses_existing_window_thread_for_next_hospital(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.daily_device_round_reporter")
+        local_now = datetime(2026, 4, 8, 22, 30, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        summary = {
+            "runDate": "2026-04-08",
+            "hospitalSeq": 30,
+            "hospitalName": "C병원",
+            "deviceCount": 1,
+            "nextHospitalSeq": 40,
+            "candidateHospitalCount": 3,
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "updateCounts": {
+                "agentCandidates": 0,
+                "agentUpdated": 0,
+                "agentUpdateFailed": 0,
+                "boxCandidates": 0,
+                "boxUpdated": 0,
+                "boxUpdateFailed": 0,
+            },
+            "deviceResults": [],
+            "autoUpdateAgent": False,
+            "autoUpdateBox": False,
+        }
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 30),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
+                return_value={
+                    "windowKey": "2026-04-08",
+                    "processedHospitalSeqs": [10, 20],
+                    "lastHospitalSeq": 20,
+                    "nextHospitalSeq": 30,
+                    "windowThreadTs": "2000.777",
+                    "windowThreadChannelId": "C_DAILY",
+                },
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
+                return_value=summary,
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
+                return_value="daily round body",
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
+                return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "daily round block"}}],
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
+            ) as save_state_mock,
+        ):
+            sent = reporter._run_daily_device_round_if_due(
+                client,
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(client.messages[0]["channel"], "C_DAILY")
+        self.assertEqual(client.messages[0]["thread_ts"], "2000.777")
+        save_state_mock.assert_called_once_with(
+            {
+                "windowKey": "2026-04-08",
+                "processedHospitalSeqs": [10, 20, 30],
+                "lastHospitalSeq": 30,
+                "lastHospitalName": "C병원",
+                "nextHospitalSeq": 40,
+                "windowThreadTs": "2000.777",
+                "windowThreadChannelId": "C_DAILY",
+                "windowCompletedAt": local_now.isoformat(),
+                "lastRunDate": "2026-04-08",
+                "lastSentAt": local_now.isoformat(),
+                "channelId": "C_DAILY",
+                "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+                "updateCounts": {
+                    "agentCandidates": 0,
+                    "agentUpdated": 0,
+                    "agentUpdateFailed": 0,
+                    "boxCandidates": 0,
                     "boxUpdated": 0,
                     "boxUpdateFailed": 0,
                 },
@@ -273,6 +379,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "nextHospitalSeq": None,
                 "lastSentAt": local_now.isoformat(),
                 "channelId": "C_DAILY",
+                "windowThreadTs": "",
+                "windowThreadChannelId": "",
                 "statusCounts": {"정상": 0, "확인 필요": 0, "이상": 0, "점검 불가": 0},
                 "updateCounts": {
                     "agentCandidates": 0,

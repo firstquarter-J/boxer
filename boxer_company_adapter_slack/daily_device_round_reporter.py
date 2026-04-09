@@ -11,7 +11,6 @@ from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
     _build_daily_device_round_summary,
-    _build_daily_device_round_title_text,
     _coerce_daily_device_round_hospital_seqs,
     _coerce_daily_device_round_now,
     _coerce_int,
@@ -103,12 +102,16 @@ def _normalize_daily_device_round_state(
     current_window_key = _daily_device_round_window_key(now)
     normalized_state["lastHospitalSeq"] = _coerce_int(state_payload.get("lastHospitalSeq"))
     normalized_state["nextHospitalSeq"] = _coerce_int(state_payload.get("nextHospitalSeq"))
+    normalized_state["windowThreadTs"] = str(state_payload.get("windowThreadTs") or "").strip()
+    normalized_state["windowThreadChannelId"] = str(state_payload.get("windowThreadChannelId") or "").strip()
     normalized_state["processedHospitalSeqs"] = _coerce_daily_device_round_hospital_seqs(
         state_payload.get("processedHospitalSeqs")
     )
     if not current_window_key:
         normalized_state["windowKey"] = None
         normalized_state.pop("windowCompletedAt", None)
+        normalized_state["windowThreadTs"] = ""
+        normalized_state["windowThreadChannelId"] = ""
         return normalized_state
 
     previous_window_key = str(state_payload.get("windowKey") or "").strip()
@@ -116,11 +119,28 @@ def _normalize_daily_device_round_state(
     if previous_window_key != current_window_key:
         normalized_state["processedHospitalSeqs"] = []
         normalized_state.pop("windowCompletedAt", None)
+        normalized_state["windowThreadTs"] = ""
+        normalized_state["windowThreadChannelId"] = ""
         # Legacy fixed-target mode persisted the same hospital as both last/next.
         # Clear that self-loop on a new window so the first run can rotate forward.
         if normalized_state.get("nextHospitalSeq") == normalized_state.get("lastHospitalSeq"):
             normalized_state["nextHospitalSeq"] = None
     return normalized_state
+
+
+def _build_daily_device_round_window_title_text(now: datetime | None = None) -> str:
+    local_now = _coerce_daily_device_round_now(now)
+    return f"일일 장비 순회 점검 & 업데이트 | {local_now:%Y-%m-%d}"
+
+
+def _extract_daily_device_round_thread_ts(response: Any) -> str:
+    thread_ts = str(getattr(response, "get", lambda *_args, **_kwargs: "")("ts") or "").strip()
+    if thread_ts:
+        return thread_ts
+    response_data = getattr(response, "data", None)
+    return str(
+        getattr(response_data, "get", lambda *_args, **_kwargs: "")("ts") or ""
+    ).strip()
 
 
 def _is_daily_device_round_due(
@@ -174,6 +194,8 @@ def _run_daily_device_round_if_due(
         **state,
         "windowKey": _daily_device_round_window_key(local_now),
         "processedHospitalSeqs": processed_hospital_seqs,
+        "windowThreadTs": str(state.get("windowThreadTs") or "").strip(),
+        "windowThreadChannelId": str(state.get("windowThreadChannelId") or "").strip(),
         "windowCompletedAt": (
             local_now.isoformat()
             if hospital_seq is None or (
@@ -207,21 +229,20 @@ def _run_daily_device_round_if_due(
         now=local_now,
         include_header=False,
     )
-    title_text = _build_daily_device_round_title_text(report_summary)
-    title_response = client.chat_postMessage(
-        channel=channel_id,
-        text=title_text,
-        unfurl_links=False,
-        unfurl_media=False,
-    )
-    thread_ts = str(getattr(title_response, "get", lambda *_args, **_kwargs: "")("ts") or "").strip()
-    if not thread_ts:
-        response_data = getattr(title_response, "data", None)
-        thread_ts = str(
-            getattr(response_data, "get", lambda *_args, **_kwargs: "")("ts") or ""
-        ).strip()
+    thread_ts = str(state.get("windowThreadTs") or "").strip()
+    thread_channel_id = str(state.get("windowThreadChannelId") or "").strip()
+    if not thread_ts or thread_channel_id != channel_id:
+        title_response = client.chat_postMessage(
+            channel=channel_id,
+            text=_build_daily_device_round_window_title_text(local_now),
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        thread_ts = _extract_daily_device_round_thread_ts(title_response)
     if not thread_ts:
         raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+    next_state["windowThreadTs"] = thread_ts
+    next_state["windowThreadChannelId"] = channel_id
 
     client.chat_postMessage(
         channel=channel_id,
