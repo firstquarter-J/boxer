@@ -36,15 +36,19 @@ from boxer_company.routers.device_status_probe import (
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
     _build_device_memory_patch_config_message,
+    _build_device_remote_access_probe_config_message,
     _build_device_status_probe_config_message,
+    _extract_device_name_for_remote_access_probe,
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
     _is_device_led_pattern_help_request,
     _is_device_led_probe_request,
     _is_device_memory_patch_request,
     _is_device_pm2_probe_request,
+    _is_device_remote_access_probe_request,
     _is_device_status_probe_request,
     _patch_device_pm2_memory,
+    _probe_device_remote_access,
     _probe_device_runtime_component,
     _probe_device_status_overview,
 )
@@ -111,6 +115,7 @@ def _handle_device_routes(
     structured_device_name = _extract_device_name_scope(question)
     update_device_name = _extract_device_name_for_update(question) or structured_device_name
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
+    remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
 
     if _is_device_led_pattern_help_request(question):
@@ -430,6 +435,29 @@ def _handle_device_routes(
         except Exception:
             context.logger.exception("Device audio probe failed")
             context.reply("장비 소리 출력 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+        return True
+
+    if _is_device_remote_access_probe_request(question, device_name=remote_access_device_name):
+        if not cs.MDA_GRAPHQL_URL or not cs.MDA_ADMIN_USER_PASSWORD:
+            context.reply(_build_device_remote_access_probe_config_message())
+            return True
+        try:
+            _set_request_log_route(context.payload, "device remote access probe", handler_type="router")
+            result_text, _ = _probe_device_remote_access(remote_access_device_name or "")
+            context.reply(result_text)
+            context.logger.info(
+                "Responded with device remote access probe in thread_ts=%s deviceName=%s",
+                context.thread_ts,
+                remote_access_device_name,
+            )
+        except ValueError as exc:
+            context.reply(f"장비 원격 접속 점검 요청 형식 오류: {exc}")
+        except RuntimeError as exc:
+            context.logger.exception("Device remote access probe failed")
+            context.reply(deps.build_dependency_failure_reply("장비 원격 접속 점검", exc))
+        except Exception:
+            context.logger.exception("Device remote access probe failed")
+            context.reply("장비 원격 접속 점검 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if _is_device_memory_patch_request(question, device_name=status_probe_device_name):

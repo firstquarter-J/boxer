@@ -54,6 +54,15 @@ _PINK_BARCODE_VALIDATION_POLICY_REFERENCES = [
         ],
     }
 ]
+_REMOTE_ACCESS_FIREWALL_REFERENCES = [
+    {
+        "title": "병원 방화벽으로 MDA/원격 접속이 안 될 때",
+        "previewLines": [
+            "영상 업로드는 정상이어도 원격 접속은 별도 경로라 제한될 수 있어",
+            "병원 네트워크와 SSH 접근 정책을 같이 봐야 해",
+        ],
+    }
+]
 
 
 class NotionDocFallbackTests(unittest.TestCase):
@@ -183,6 +192,54 @@ class NotionDocFallbackTests(unittest.TestCase):
         self.assertIn(
             "• 확인: 이건 핑크 바코드만 예외 허용하는 게 아니라 전체 검증을 푸는 설정이야",
             text,
+        )
+
+    def test_remote_access_issue_does_not_jump_to_firewall_without_https_signal(self) -> None:
+        text = _build_notion_doc_fallback(
+            "장비 ssh 연결이 안 되면 뭘 해야 해?",
+            _REMOTE_ACCESS_FIREWALL_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: SSH 연결 불가만으로는 병원 네트워크 문제인지 SSH 접근 제한인지 아직 단정 못 해",
+            text,
+        )
+        self.assertIn(
+            "HTTPS도 안 되면 네트워크 문제일 수 있고, HTTPS는 되는데 SSH만 안 되면 그때 SSH 방화벽이나 접근 제한으로 좁힐 수 있어",
+            text,
+        )
+        self.assertIn(
+            "• 조치: 먼저 장비 온라인 상태와 HTTPS 응답 여부를 확인해.",
+            text,
+        )
+
+    def test_remote_access_issue_with_https_ping_response_points_to_ssh_block(self) -> None:
+        text = _build_notion_doc_fallback(
+            "HTTPS로 장비에 ping 보냈을 때 응답은 오는데 ssh 연결은 안 돼. 뭘 해야 해?",
+            _REMOTE_ACCESS_FIREWALL_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: HTTPS ping 응답이 오는데 SSH만 안 되면 병원 네트워크 전체 문제보다는 SSH 접근만 막힌 케이스로 보는 게 맞아",
+            text,
+        )
+        self.assertIn(
+            "• 조치: 병원 쪽 SSH 방화벽이나 접근 정책 허용 여부를 확인해.",
+            text,
+        )
+
+    def test_remote_access_old_firewall_only_answer_triggers_fallback(self) -> None:
+        fallback_text = _build_notion_doc_fallback(
+            "장비 ssh 연결이 안 되면 뭘 해야 해?",
+            _REMOTE_ACCESS_FIREWALL_REFERENCES,
+        )
+        synthesized_text = """*문서 기반 답변*
+• 결론: 병원 방화벽이 SSH 연결을 막고 있을 가능성이 높아
+• 확인: 병원 네트워크/방화벽 설정 여부를 확인해
+• 조치: 병원 담당자와 방화벽 설정을 협의해"""
+
+        self.assertTrue(
+            _needs_notion_doc_fallback(synthesized_text, "notion playbook qa", fallback_text)
         )
 
 

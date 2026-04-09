@@ -13,7 +13,11 @@ from boxer_company.routers.device_audio_probe import (
     _summarize_device_audio_probe,
 )
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
-from boxer_company.routers.mda_graphql import _wait_for_mda_device_agent_ssh
+from boxer_company.routers.mda_graphql import (
+    _get_mda_device_detail,
+    _send_mda_device_ping,
+    _wait_for_mda_device_agent_ssh,
+)
 
 _LEADING_DEVICE_PROBE_SCOPE_PATTERN = re.compile(
     r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
@@ -58,6 +62,44 @@ _DEVICE_CAPTUREBOARD_HINTS = (
     "capture board",
 )
 _DEVICE_LED_HINTS = ("led", "엘이디")
+_DEVICE_REMOTE_ACCESS_HINTS = (
+    "ssh",
+    "원격 접속",
+    "원격접속",
+    "원격 연결",
+    "원격연결",
+    "원격 진단",
+    "원격진단",
+    "원격 접근",
+    "원격접근",
+    "방화벽",
+)
+_DEVICE_REMOTE_ACCESS_ACTION_HINTS = (
+    "ping",
+    "핑",
+    "확인",
+    "점검",
+    "체크",
+    "테스트",
+)
+_DEVICE_REMOTE_ACCESS_FAILURE_HINTS = (
+    "안 돼",
+    "안되",
+    "안 돼서",
+    "안돼서",
+    "안 됨",
+    "안됨",
+    "불가",
+    "실패",
+    "막혀",
+    "닫혀",
+    "접속 안",
+    "연결 안",
+    "안 열",
+    "안열",
+    "못 붙",
+    "못붙",
+)
 _DEVICE_LED_PATTERN_EXPLAIN_HINTS = (
     "증상",
     "패턴",
@@ -325,6 +367,23 @@ def _extract_device_name_for_status_probe(question: str) -> str | None:
     return candidate
 
 
+def _extract_device_name_for_remote_access_probe(question: str) -> str | None:
+    normalized = _normalize_device_status_question(question)
+    extracted = _extract_device_name_scope(normalized)
+    if extracted and _contains_hint(normalized, _DEVICE_REMOTE_ACCESS_HINTS):
+        return extracted
+
+    matched = _LEADING_DEVICE_PROBE_SCOPE_PATTERN.search(normalized)
+    if not matched:
+        return None
+
+    candidate = " ".join(str(matched.group(1) or "").split()).strip()
+    remainder = " ".join(str(matched.group(2) or "").split()).strip()
+    if not candidate or not _contains_hint(remainder, _DEVICE_REMOTE_ACCESS_HINTS):
+        return None
+    return candidate
+
+
 def _is_device_pm2_probe_request(question: str, device_name: str | None = None) -> bool:
     normalized = _normalize_device_status_question(question)
     resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
@@ -480,6 +539,17 @@ def _build_led_pattern_help_reply(question: str) -> str:
     return "\n".join(lines)
 
 
+def _is_device_remote_access_probe_request(question: str, device_name: str | None = None) -> bool:
+    normalized = _normalize_device_status_question(question)
+    resolved_device_name = str(device_name or _extract_device_name_for_remote_access_probe(normalized) or "").strip()
+    if not resolved_device_name or not _contains_hint(normalized, _DEVICE_REMOTE_ACCESS_HINTS):
+        return False
+    return _contains_hint(normalized, _DEVICE_REMOTE_ACCESS_ACTION_HINTS) or _contains_hint(
+        normalized,
+        _DEVICE_REMOTE_ACCESS_FAILURE_HINTS,
+    )
+
+
 def _is_device_status_probe_request(question: str, device_name: str | None = None) -> bool:
     normalized = _normalize_device_status_question(question)
     resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
@@ -498,6 +568,13 @@ def _build_device_status_probe_config_message() -> str:
     return (
         "장비 상태 점검 설정이 부족해. "
         "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD가 필요해"
+    )
+
+
+def _build_device_remote_access_probe_config_message() -> str:
+    return (
+        "장비 원격 접속 점검 설정이 부족해. "
+        "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD가 필요해"
     )
 
 
@@ -1091,6 +1168,42 @@ def _format_probe_download_availability_display(ready: bool) -> str:
     return "🔵 *가능*" if ready else "🔴 *불가*"
 
 
+def _format_remote_access_status_display(
+    status: bool | None,
+    *,
+    positive: str,
+    negative: str,
+) -> str:
+    if status is True:
+        return f"🔵 *{positive}*"
+    if status is False:
+        return f"🔴 *{negative}*"
+    return "⚪ *미확인*"
+
+
+def _display_mda_ping_message(message: str | None) -> str:
+    normalized = _display_value(message, default="")
+    lowered = normalized.lower()
+    if lowered == "command dispatched to device":
+        return "장비로 ping 전송 완료"
+    if lowered == "device is offline":
+        return "장비 offline"
+    if lowered == "device state not found":
+        return "MDA에서 장비 상태를 찾지 못했어"
+    return normalized
+
+
+def _build_mda_ping_line(ping_result: dict[str, Any] | None) -> str:
+    payload = ping_result if isinstance(ping_result, dict) else {}
+    raw_status = payload.get("status")
+    ping_status = raw_status if isinstance(raw_status, bool) else None
+    ping_message = _display_mda_ping_message(_display_value(payload.get("message"), default=""))
+    line = f"• MDA ping 전송: {_format_remote_access_status_display(ping_status, positive='성공', negative='실패')}"
+    if ping_message:
+        line = f"{line} | {ping_message}"
+    return line
+
+
 def _render_single_probe_result(
     *,
     title: str,
@@ -1112,6 +1225,102 @@ def _render_single_probe_result(
     action = _display_value(summary.get("action"), default="")
     if action:
         lines.append(f"• 조치: {action}")
+    return "\n".join(lines)
+
+
+def _build_remote_access_diagnosis(
+    *,
+    ping_status: bool,
+    ping_message: str,
+    device_info: dict[str, Any],
+) -> dict[str, str]:
+    ping_message_lower = ping_message.lower()
+    device_connected = bool(device_info.get("deviceIsConnected")) if "deviceIsConnected" in device_info else None
+    agent_connected = bool(device_info.get("isConnected")) if "isConnected" in device_info else None
+    agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
+    host = _display_value(agent_ssh.get("host"), default="")
+    try:
+        port = int(agent_ssh.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    ssh_ready = bool(host) and port > 0
+
+    if "not found" in ping_message_lower or "장비 상태를 찾지 못" in ping_message:
+        return {
+            "summary": "MDA에서 장비 상태를 못 찾아서 실시간 원격 접속 판단이 아직 안 돼",
+            "action": "장비명과 MDA 등록 상태를 먼저 확인해",
+        }
+    if ping_status and device_connected is None and agent_connected is None and not agent_ssh:
+        return {
+            "summary": "장비 ping 전송은 성공했지만 상세 상태를 아직 못 읽었어",
+            "action": "잠시 후 다시 점검하거나 MDA 장비 상세 상태를 확인해",
+        }
+    if not ping_status or device_connected is False:
+        return {
+            "summary": "박서가 직접 ping도 못 보냈어. 장비 자체가 MDA 기준 offline이라 병원 네트워크나 장비 연결 문제를 먼저 봐야 해",
+            "action": "장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인한 뒤 다시 점검해",
+        }
+    if agent_connected is False:
+        return {
+            "summary": "장비 command channel은 살아 있는데 agent가 offline이라 SSH 준비가 안 된 상태야",
+            "action": "SSH 방화벽만 단정하지 말고 agent 프로세스와 연결 상태를 먼저 확인해",
+        }
+    if not ssh_ready:
+        return {
+            "summary": "장비는 온라인인데 SSH 정보가 안 보여. 병원 네트워크 전체 문제보다는 SSH 개방이나 원격 접속 설정 문제로 좁힐 수 있어",
+            "action": "병원 쪽 SSH 허용 정책과 agent 원격 접속 설정을 확인해",
+        }
+    return {
+        "summary": "장비 통신과 SSH 정보는 둘 다 보여. 실제 SSH 접속 실패면 인증값, 포트, 일시 상태를 확인하면 돼",
+        "action": "SSH 계정/비밀번호, 포트, 접속 시각 기준 상태를 같이 확인해",
+    }
+
+
+def _render_device_remote_access_probe_result(
+    *,
+    device_name: str,
+    device_info: dict[str, Any],
+    ping_result: dict[str, Any],
+) -> str:
+    lines = _build_device_header_lines(
+        title="*장비 원격 접속 점검*",
+        device_name=device_name,
+        device_info=device_info,
+    )
+
+    ping_status = bool(ping_result.get("status"))
+    ping_message = _display_mda_ping_message(_display_value(ping_result.get("message"), default=""))
+    device_connected = bool(device_info.get("deviceIsConnected")) if "deviceIsConnected" in device_info else None
+    agent_connected = bool(device_info.get("isConnected")) if "isConnected" in device_info else None
+    agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
+    host = _display_value(agent_ssh.get("host"), default="")
+    try:
+        port = int(agent_ssh.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    ssh_ready = True if host and port > 0 else False if agent_ssh or agent_connected is not None else None
+    diagnosis = _build_remote_access_diagnosis(
+        ping_status=ping_status,
+        ping_message=ping_message,
+        device_info=device_info,
+    )
+
+    lines.append(_build_mda_ping_line(ping_result))
+    lines.append(
+        f"• 장비 연결 상태: {_format_remote_access_status_display(device_connected, positive='온라인', negative='오프라인')}"
+    )
+    lines.append(
+        f"• agent 연결 상태: {_format_remote_access_status_display(agent_connected, positive='온라인', negative='오프라인')}"
+    )
+    lines.append(
+        f"• SSH 준비 상태: {_format_remote_access_status_display(ssh_ready, positive='준비됨', negative='미준비')}"
+    )
+    if host and port > 0:
+        lines.append(f"• SSH 정보: `{host}:{port}`")
+    else:
+        lines.append("• SSH 정보: *미확인*")
+    lines.append(f"• 판단: {diagnosis['summary']}")
+    lines.append(f"• 조치: {diagnosis['action']}")
     return "\n".join(lines)
 
 
@@ -1280,6 +1489,7 @@ def _render_device_status_overview_result(
     *,
     device_name: str,
     device_info: dict[str, Any],
+    ping_result: dict[str, Any] | None,
     ssh_ready: bool,
     ssh_reason: str,
     audio_summary: dict[str, Any] | None,
@@ -1293,6 +1503,7 @@ def _render_device_status_overview_result(
         device_info=device_info,
     )
     if not ssh_ready:
+        lines.append(_build_mda_ping_line(ping_result))
         lines.append(f"• SSH 연결 상태: {_format_probe_ssh_status_display(False)}")
         lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(False)}")
         lines.append("• 소리 출력 경로: *점검 불가*")
@@ -1315,6 +1526,8 @@ def _render_device_status_overview_result(
             worst_rank = max(worst_rank, 2)
         elif state != "pass":
             worst_rank = max(worst_rank, 1)
+    if isinstance(ping_result, dict) and ping_result.get("status") is False:
+        worst_rank = max(worst_rank, 1)
 
     if worst_rank >= 2:
         overall = "이상"
@@ -1354,6 +1567,7 @@ def _render_device_status_overview_result(
 
     lines.append("")
     lines.append("*런타임*")
+    lines.append(_build_mda_ping_line(ping_result))
     lines.append(f"• SSH 연결 상태: {_format_probe_ssh_status_display(ssh_ready)}")
     lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(ssh_ready)}")
     pm2_line = f"• pm2 앱: *{pm2_label}*"
@@ -1508,7 +1722,9 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 장비 상태`")
 
+    ping_result = _send_mda_device_ping(normalized_device_name)
     evidence_payload, device_info, checks = _collect_runtime_checks(normalized_device_name, "all")
+    evidence_payload["ping"] = ping_result
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     ssh_ready = bool(ssh.get("ready"))
     ssh_reason = _display_value(ssh.get("reason"), default="")
@@ -1548,12 +1764,45 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
     result_text = _render_device_status_overview_result(
         device_name=normalized_device_name,
         device_info=device_info,
+        ping_result=ping_result,
         ssh_ready=ssh_ready,
         ssh_reason=ssh_reason,
         audio_summary=audio_summary,
         pm2_summary=pm2_summary,
         captureboard_summary=captureboard_summary,
         led_summary=led_summary,
+    )
+    return result_text, evidence_payload
+
+
+def _probe_device_remote_access(device_name: str) -> tuple[str, dict[str, Any]]:
+    normalized_device_name = str(device_name or "").strip()
+    if not normalized_device_name:
+        raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 ssh 연결 확인`")
+
+    device_info = _get_mda_device_detail(normalized_device_name) or {
+        "deviceName": normalized_device_name,
+    }
+    ping_result = _send_mda_device_ping(normalized_device_name)
+    evidence_payload: dict[str, Any] = {
+        "route": "device_remote_access_probe",
+        "source": "mda_graphql",
+        "request": {
+            "deviceName": normalized_device_name,
+            "command": "ping",
+        },
+        "device": device_info,
+        "ping": ping_result,
+    }
+    result_text = _render_device_remote_access_probe_result(
+        device_name=normalized_device_name,
+        device_info=device_info,
+        ping_result=ping_result,
+    )
+    evidence_payload["diagnosis"] = _build_remote_access_diagnosis(
+        ping_status=bool(ping_result.get("status")),
+        ping_message=_display_mda_ping_message(_display_value(ping_result.get("message"), default="")),
+        device_info=device_info,
     )
     return result_text, evidence_payload
 

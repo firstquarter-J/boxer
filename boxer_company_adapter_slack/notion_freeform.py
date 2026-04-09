@@ -710,6 +710,9 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
             return line
         return ""
 
+    def _question_has_any_token(text: str, tokens: tuple[str, ...]) -> bool:
+        return any(token in text for token in tokens)
+
     items = [item for item in (references or []) if isinstance(item, dict)]
     lines = ["*문서 기반 답변*"]
     if not items:
@@ -744,6 +747,27 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
     is_pink_barcode_validation_policy_doc = primary_title == _PINK_BARCODE_VALIDATION_POLICY_TITLE
     is_firewall_doc = primary_title == "병원 방화벽으로 MDA/원격 접속이 안 될 때"
     normalized_question = (question or "").strip()
+    normalized_question_lower = normalized_question.lower()
+    is_remote_access_network_doc = primary_title in {
+        "병원 방화벽으로 MDA/원격 접속이 안 될 때",
+        "초음파 영상 업로드 안됨(네트워크 이슈)",
+        "네트워크 환경 가이드라인",
+    }
+    has_remote_access_failure_signal = (
+        _question_has_any_token(normalized_question_lower, ("ssh",))
+        or _question_has_any_token(normalized_question, ("원격 접속", "원격 연결", "원격 진단"))
+    ) and _question_has_any_token(
+        normalized_question,
+        ("안 돼", "안되", "안 돼서", "안돼서", "안 됨", "불가", "실패", "막혀", "접속 안", "연결 안"),
+    )
+    has_https_ping_success_signal = (
+        _question_has_any_token(normalized_question_lower, ("https", "http"))
+        and "ping" in normalized_question_lower
+        and _question_has_any_token(
+            normalized_question,
+            ("응답", "열려", "성공", "정상", "살아", "통신은 열려", "통신이 열려"),
+        )
+    )
     is_babymagic_send_issue = primary_title in _BABYMAGIC_DOC_TITLES and (
         any(token in normalized_question for token in ("전송", "재전송", "이유", "원인", "왜", "안 된", "안된"))
         or any(
@@ -862,10 +886,16 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         lines.append("• 조치: 핑크 바코드도 녹화되게 하려면 바코드 유효성 검증 자체를 해제해야 하고, 그러면 검증 없이 녹화가 진행돼")
         return "\n".join(lines)
 
-    if is_firewall_doc:
-        lines.append("• 결론: 영상 업로드는 정상이어도 원격 접속은 별도 경로라 불가할 수 있어. 현재는 장비 원격 접근이 제한된 상태야")
-        lines.append("• 확인: 병원 네트워크 또는 방화벽 설정 여부, 방화벽 정책, 장비 원격 접근 여부(SSH 연결) 확인이 필요해")
-        lines.append("• 조치: 병원과 네트워크 또는 방화벽 설정을 소통 및 협의해야 해. 접속이 열리면 그 뒤에 원격 진단을 다시 진행할 수 있어")
+    if is_firewall_doc or (is_remote_access_network_doc and has_remote_access_failure_signal):
+        if has_https_ping_success_signal and has_remote_access_failure_signal:
+            lines.append("• 결론: HTTPS ping 응답이 오는데 SSH만 안 되면 병원 네트워크 전체 문제보다는 SSH 접근만 막힌 케이스로 보는 게 맞아")
+            lines.append("• 확인: HTTPS 통신은 열려 있어도 SSH는 별도 포트라 따로 막힐 수 있어. 장비가 온라인이고 HTTPS 응답이 오는지, SSH만 실패하는지 같이 봐")
+            lines.append("• 조치: 병원 쪽 SSH 방화벽이나 접근 정책 허용 여부를 확인해. HTTPS만 열려 있으면 업로드 확인은 돼도 원격 진단은 바로 못 해")
+            return "\n".join(lines)
+
+        lines.append("• 결론: SSH 연결 불가만으로는 병원 네트워크 문제인지 SSH 접근 제한인지 아직 단정 못 해")
+        lines.append("• 확인: 장비가 병원 네트워크에 정상 연결돼 있는지와 HTTPS/MDA 응답이 오는지 먼저 봐. HTTPS도 안 되면 네트워크 문제일 수 있고, HTTPS는 되는데 SSH만 안 되면 그때 SSH 방화벽이나 접근 제한으로 좁힐 수 있어")
+        lines.append("• 조치: 먼저 장비 온라인 상태와 HTTPS 응답 여부를 확인해. HTTPS 응답까지 없으면 병원 네트워크나 장비 연결부터 보고, HTTPS는 되는데 SSH만 안 되면 병원 쪽 SSH 허용 정책을 확인해")
         return "\n".join(lines)
 
     lines.append(f"• 결론: {conclusion}")
@@ -900,6 +930,12 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
     if "추가 구매" in fallback_normalized and "추가 구매" not in normalized:
         return True
     if "녹화 취소 안내 음성" in fallback_normalized and "녹화 취소" not in normalized:
+        return True
+    if "ssh 연결 불가만으로는" in fallback_lowered and "단정 못 해" not in normalized and "네트워크 문제인지" not in normalized:
+        return True
+    if "https는 되는데 ssh만 안 되면" in fallback_lowered and "ssh만 안 되면" not in lowered:
+        return True
+    if "https ping 응답이 오는데 ssh만 안 되면" in fallback_lowered and "ssh만 안 되면" not in lowered:
         return True
 
     required_bullets = (

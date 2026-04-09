@@ -4,18 +4,23 @@ from unittest.mock import patch
 from boxer_company.routers.device_status_probe import (
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
+    _build_device_remote_access_probe_config_message,
     _patch_device_pm2_memory,
+    _extract_device_name_for_remote_access_probe,
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
     _is_device_led_pattern_help_request,
     _is_device_led_probe_request,
     _is_device_memory_patch_request,
     _is_device_pm2_probe_request,
+    _is_device_remote_access_probe_request,
     _is_device_status_probe_request,
     _parse_device_path_list,
     _parse_pm2_memory_restart_values,
     _parse_pm2_processes,
     _parse_usb_devices,
+    _probe_device_remote_access,
+    _probe_device_status_overview,
     _render_device_status_overview_result,
     _summarize_captureboard_probe,
     _summarize_led_probe,
@@ -65,6 +70,12 @@ class DeviceStatusProbeRoutingTests(unittest.TestCase):
             "MB2-C00419",
         )
 
+    def test_extracts_device_name_for_remote_access_probe(self) -> None:
+        self.assertEqual(
+            _extract_device_name_for_remote_access_probe("MB2-C00419 ssh 연결 안 돼"),
+            "MB2-C00419",
+        )
+
     def test_routes_specific_pm2_captureboard_led_questions(self) -> None:
         self.assertTrue(_is_device_pm2_probe_request("MB2-C00419 pm2 상태"))
         self.assertTrue(_is_device_captureboard_probe_request("MB2-C00419 캡처보드 상태"))
@@ -83,6 +94,15 @@ class DeviceStatusProbeRoutingTests(unittest.TestCase):
     def test_routes_overview_status_but_not_specific_probe(self) -> None:
         self.assertTrue(_is_device_status_probe_request("MB2-C00419 장비 상태"))
         self.assertFalse(_is_device_status_probe_request("MB2-C00419 pm2 상태"))
+
+    def test_routes_remote_access_probe_only_for_device_specific_question(self) -> None:
+        self.assertTrue(_is_device_remote_access_probe_request("MB2-C00419 ssh 연결 안 돼"))
+        self.assertTrue(_is_device_remote_access_probe_request("MB2-C00419 원격 접속 ping 확인"))
+        self.assertFalse(_is_device_remote_access_probe_request("MB2-C00419 장비 상태"))
+
+    def test_builds_remote_access_probe_config_message(self) -> None:
+        self.assertIn("MDA_GRAPHQL_URL", _build_device_remote_access_probe_config_message())
+        self.assertNotIn("DEVICE_SSH_PASSWORD", _build_device_remote_access_probe_config_message())
 
 
 class DeviceStatusProbeParsingTests(unittest.TestCase):
@@ -209,6 +229,10 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "hospitalName": "아이사랑산부인과의원(부산)",
                 "roomName": "2진료실",
             },
+            ping_result={
+                "status": True,
+                "message": "Command dispatched to device",
+            },
             ssh_ready=True,
             ssh_reason="ready",
             audio_summary={
@@ -243,6 +267,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*오디오*", rendered)
         self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
         self.assertIn("*런타임*", rendered)
+        self.assertIn("• MDA ping 전송: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
         self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
         self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
@@ -257,6 +282,10 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         rendered = _render_device_status_overview_result(
             device_name="MB2-C00419",
             device_info={},
+            ping_result={
+                "status": False,
+                "message": "Device is offline",
+            },
             ssh_ready=False,
             ssh_reason="agent_ssh_not_ready",
             audio_summary=None,
@@ -265,12 +294,150 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
             led_summary=None,
         )
 
+        self.assertIn("• MDA ping 전송: 🔴 *실패* | 장비 offline", rendered)
         self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
         self.assertIn("• 안내: 장비 SSH 연결 준비 실패. 온라인 상태, 네트워크, 원격 접속 상태 먼저 확인해", rendered)
 
 
-class DeviceMemoryPatchExecutionTests(unittest.TestCase):
+class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
+    def test_status_overview_probe_includes_ping_result_when_ssh_not_ready(self) -> None:
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._send_mda_device_ping",
+                return_value={
+                    "status": False,
+                    "message": "Device is offline",
+                    "affected": 0,
+                    "command": "ping",
+                },
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._collect_runtime_checks",
+                return_value=(
+                    {
+                        "route": "device_status_probe",
+                        "source": "mda_graphql+ssh",
+                        "request": {
+                            "deviceName": "MB2-C00419",
+                            "component": "all",
+                        },
+                        "ssh": {
+                            "ready": False,
+                            "reason": "agent_ssh_not_ready",
+                        },
+                    },
+                    {
+                        "deviceName": "MB2-C00419",
+                        "version": "2.11.300",
+                    },
+                    {},
+                ),
+            ),
+        ):
+            result_text, evidence = _probe_device_status_overview("MB2-C00419")
+
+        self.assertIn("• MDA ping 전송: 🔴 *실패* | 장비 offline", result_text)
+        self.assertFalse(evidence["ping"]["status"])
+        self.assertEqual(evidence["overview"]["audio"], None)
+
+    def test_remote_access_probe_points_to_network_when_ping_fails(self) -> None:
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._get_mda_device_detail",
+                return_value={
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.300",
+                    "hospitalName": "아이사랑산부인과의원(부산)",
+                    "roomName": "2진료실",
+                    "deviceIsConnected": False,
+                    "isConnected": False,
+                    "agentSsh": None,
+                },
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._send_mda_device_ping",
+                return_value={
+                    "status": False,
+                    "message": "Device is offline",
+                    "affected": 0,
+                    "command": "ping",
+                },
+            ),
+        ):
+            result_text, evidence = _probe_device_remote_access("MB2-C00419")
+
+        self.assertIn("*장비 원격 접속 점검*", result_text)
+        self.assertIn("• MDA ping 전송: 🔴 *실패* | 장비 offline", result_text)
+        self.assertIn("병원 네트워크나 장비 연결 문제를 먼저 봐야 해", result_text)
+        self.assertIn("장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인", result_text)
+        self.assertFalse(evidence["ping"]["status"])
+
+    def test_remote_access_probe_points_to_ssh_policy_when_ping_succeeds_but_ssh_missing(self) -> None:
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._get_mda_device_detail",
+                return_value={
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.300",
+                    "hospitalName": "아이사랑산부인과의원(부산)",
+                    "roomName": "2진료실",
+                    "deviceIsConnected": True,
+                    "isConnected": True,
+                    "agentSsh": {
+                        "host": "",
+                        "port": None,
+                    },
+                },
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._send_mda_device_ping",
+                return_value={
+                    "status": True,
+                    "message": "Command dispatched to device",
+                    "affected": 1,
+                    "command": "ping",
+                },
+            ),
+        ):
+            result_text, evidence = _probe_device_remote_access("MB2-C00419")
+
+        self.assertIn("• MDA ping 전송: 🔵 *성공* | 장비로 ping 전송 완료", result_text)
+        self.assertIn("• SSH 준비 상태: 🔴 *미준비*", result_text)
+        self.assertIn("SSH 개방이나 원격 접속 설정 문제로 좁힐 수 있어", result_text)
+        self.assertIn("SSH 허용 정책과 agent 원격 접속 설정", result_text)
+        self.assertTrue(evidence["ping"]["status"])
+
+    def test_remote_access_probe_points_to_agent_when_device_ping_succeeds_but_agent_offline(self) -> None:
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._get_mda_device_detail",
+                return_value={
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.300",
+                    "hospitalName": "아이사랑산부인과의원(부산)",
+                    "roomName": "2진료실",
+                    "deviceIsConnected": True,
+                    "isConnected": False,
+                    "agentSsh": None,
+                },
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._send_mda_device_ping",
+                return_value={
+                    "status": True,
+                    "message": "Command dispatched to device",
+                    "affected": 1,
+                    "command": "ping",
+                },
+            ),
+        ):
+            result_text, _ = _probe_device_remote_access("MB2-C00419")
+
+        self.assertIn("• agent 연결 상태: 🔴 *오프라인*", result_text)
+        self.assertIn("agent가 offline이라 SSH 준비가 안 된 상태야", result_text)
+        self.assertIn("agent 프로세스와 연결 상태를 먼저 확인해", result_text)
+
     def test_patches_device_memory_only_when_precheck_is_not_4gb(self) -> None:
         client = _FakeSshClient(
             [

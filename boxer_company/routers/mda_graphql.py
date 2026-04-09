@@ -30,6 +30,16 @@ mutation SshOrder($deviceName: String!, $action: String!, $host: String!) {
 }
 """
 
+_SEND_COMMAND_MUTATION = """
+mutation SendCommand($deviceName: String!, $command: String!) {
+  sendCommand(deviceName: $deviceName, command: $command) {
+    affected
+    status
+    message
+  }
+}
+"""
+
 _UPDATE_BOX_MUTATION = """
 mutation UpdateBox($deviceName: String!, $version: String!, $silent: Boolean!) {
   updateBox(deviceName: $deviceName, version: $version, silent: $silent) {
@@ -85,6 +95,11 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
       version
       deviceState {
         captureBoardType
+        isConnected
+        status
+        connectedAt
+        updatedAt
+        ip
       }
       hospital {
         hospitalName
@@ -94,6 +109,9 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
       }
       agentState {
         isConnected
+        agentVersion
+        connectedAt
+        updatedAt
         agentSsh {
           action
           host
@@ -259,6 +277,15 @@ def _normalize_mda_state_text(value: Any) -> str:
     return "" if text.upper() == "NONE" else text
 
 
+def _normalize_mda_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "t", "yes", "y", "on"}
+
+
 def _extract_device_row(data: dict[str, Any], device_name: str) -> dict[str, Any] | None:
     paginated = data.get("paginatedDevices")
     if not isinstance(paginated, dict):
@@ -298,7 +325,15 @@ def _normalize_mda_device_detail(row: dict[str, Any], *, device_name: str) -> di
         "captureBoardType": _normalize_mda_state_text(device_state.get("captureBoardType")),
         "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
         "roomName": _display_value(hospital_room.get("roomName"), default="미확인"),
-        "isConnected": bool(agent_state.get("isConnected")),
+        "isConnected": _normalize_mda_boolean(agent_state.get("isConnected")),
+        "deviceIsConnected": _normalize_mda_boolean(device_state.get("isConnected")),
+        "deviceStatus": _normalize_mda_state_text(device_state.get("status")),
+        "deviceConnectedAt": _display_value(device_state.get("connectedAt"), default=""),
+        "deviceUpdatedAt": _display_value(device_state.get("updatedAt"), default=""),
+        "deviceIp": _display_value(device_state.get("ip"), default=""),
+        "agentVersion": _display_value(agent_state.get("agentVersion"), default=""),
+        "agentConnectedAt": _display_value(agent_state.get("connectedAt"), default=""),
+        "agentUpdatedAt": _display_value(agent_state.get("updatedAt"), default=""),
         "agentSsh": agent_ssh,
     }
 
@@ -322,6 +357,33 @@ def _get_mda_device_detail(device_name: str) -> dict[str, Any] | None:
 
 def _get_mda_device_agent_ssh(device_name: str) -> dict[str, Any] | None:
     return _get_mda_device_detail(device_name)
+
+
+def _send_mda_device_command(
+    device_name: str,
+    *,
+    command: str,
+) -> dict[str, Any]:
+    data = _execute_mda_graphql(
+        _SEND_COMMAND_MUTATION,
+        {
+            "deviceName": device_name,
+            "command": command,
+        },
+    )
+    result = data.get("sendCommand")
+    if not isinstance(result, dict):
+        raise RuntimeError("sendCommand 응답 형식이 올바르지 않아")
+    return {
+        "affected": result.get("affected"),
+        "status": _normalize_mda_boolean(result.get("status")),
+        "message": _display_value(result.get("message"), default=""),
+        "command": _display_value(command, default=""),
+    }
+
+
+def _send_mda_device_ping(device_name: str) -> dict[str, Any]:
+    return _send_mda_device_command(device_name, command="ping")
 
 
 def _get_mda_devices_details(device_names: list[str]) -> dict[str, dict[str, Any]]:

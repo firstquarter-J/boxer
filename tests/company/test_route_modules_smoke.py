@@ -158,6 +158,45 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertEqual(synth_calls[0][2], "device led pattern guide")
         self.assertIn("notionPlaybooks", synth_calls[0][1])
 
+    def test_device_routes_handles_remote_access_probe_before_freeform(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.cs.MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+            patch("boxer_company_adapter_slack.device_routes.cs.MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch(
+                "boxer_company_adapter_slack.device_routes._probe_device_remote_access",
+                return_value=("*장비 원격 접속 점검*\n• 판단: 테스트", {"route": "device_remote_access_probe"}),
+            ),
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="MB2-C00419 ssh 연결 안 돼",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                DeviceRoutesDeps(
+                    get_s3_client=lambda: None,
+                    get_recordings_context=lambda: {},
+                    has_recordings_device_mapping=lambda context: False,
+                    send_dm_message=lambda user_id, text: False,
+                    build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*장비 원격 접속 점검*\n• 판단: 테스트"])
+
     def test_knowledge_routes_returns_false_when_no_route_matches(self) -> None:
         with patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", ""):
             handled = _handle_knowledge_routes(
