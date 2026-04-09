@@ -17,6 +17,29 @@ class _FakeSlackClient:
 
 
 class DailyDeviceRoundReporterDueTests(unittest.TestCase):
+    def test_clears_legacy_fixed_target_self_loop_on_new_window(self) -> None:
+        local_tz = ZoneInfo("Asia/Seoul")
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+        ):
+            normalized = reporter._normalize_daily_device_round_state(
+                {
+                    "lastHospitalSeq": 604,
+                    "nextHospitalSeq": 604,
+                    "lastRunDate": "2026-04-08",
+                },
+                now=datetime(2026, 4, 9, 22, 0, tzinfo=local_tz),
+            )
+
+        self.assertEqual(normalized["windowKey"], "2026-04-09")
+        self.assertEqual(normalized["lastHospitalSeq"], 604)
+        self.assertIsNone(normalized["nextHospitalSeq"])
+        self.assertEqual(normalized["processedHospitalSeqs"], [])
+
     def test_is_due_only_inside_overnight_window_until_completed(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")
 

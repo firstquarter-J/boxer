@@ -101,6 +101,8 @@ def _normalize_daily_device_round_state(
     state_payload = state if isinstance(state, dict) else {}
     normalized_state = dict(state_payload)
     current_window_key = _daily_device_round_window_key(now)
+    normalized_state["lastHospitalSeq"] = _coerce_int(state_payload.get("lastHospitalSeq"))
+    normalized_state["nextHospitalSeq"] = _coerce_int(state_payload.get("nextHospitalSeq"))
     normalized_state["processedHospitalSeqs"] = _coerce_daily_device_round_hospital_seqs(
         state_payload.get("processedHospitalSeqs")
     )
@@ -114,6 +116,10 @@ def _normalize_daily_device_round_state(
     if previous_window_key != current_window_key:
         normalized_state["processedHospitalSeqs"] = []
         normalized_state.pop("windowCompletedAt", None)
+        # Legacy fixed-target mode persisted the same hospital as both last/next.
+        # Clear that self-loop on a new window so the first run can rotate forward.
+        if normalized_state.get("nextHospitalSeq") == normalized_state.get("lastHospitalSeq"):
+            normalized_state["nextHospitalSeq"] = None
     return normalized_state
 
 
