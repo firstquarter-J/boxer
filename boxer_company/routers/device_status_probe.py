@@ -220,6 +220,81 @@ _MEMORY_PATCH_VERIFY_COMMAND = (
     "else echo pm2_missing; fi'"
 )
 
+
+def _device_trashcan_path() -> str:
+    return _display_value(
+        getattr(cs, "DAILY_DEVICE_ROUND_TRASHCAN_PATH", ""),
+        default="/home/mommytalk/AppData/TrashCan",
+    ).strip() or "/home/mommytalk/AppData/TrashCan"
+
+
+def _device_trashcan_label_path() -> str:
+    path = _device_trashcan_path()
+    return path.replace("/home/mommytalk/", "", 1) if path.startswith("/home/mommytalk/") else path
+
+
+def _device_trashcan_threshold_percent() -> int:
+    try:
+        value = int(getattr(cs, "DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT", 60))
+    except (TypeError, ValueError):
+        value = 60
+    return max(1, value)
+
+
+def _device_trashcan_delete_age_days() -> int:
+    try:
+        value = int(getattr(cs, "DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS", 30))
+    except (TypeError, ValueError):
+        value = 30
+    return max(1, value)
+
+
+def _build_trashcan_filesystem_command() -> str:
+    path = _device_trashcan_path()
+    return (
+        "sh -lc 'if command -v df >/dev/null 2>&1; then "
+        f"df -kP {path} 2>&1; "
+        "else echo df_missing; fi'"
+    )
+
+
+def _build_trashcan_directory_command() -> str:
+    path = _device_trashcan_path()
+    return (
+        "sh -lc 'if [ -d "
+        f"{path}"
+        " ]; then "
+        f"du -sk {path} 2>&1; "
+        "else echo path_missing; fi'"
+    )
+
+
+def _build_trashcan_file_count_command(*, older_than_days: int | None = None) -> str:
+    path = _device_trashcan_path()
+    age_filter = (
+        f"-mtime +{max(0, int(older_than_days or 0))} "
+        if older_than_days is not None
+        else ""
+    )
+    return (
+        "sh -lc 'if [ -d "
+        f"{path}"
+        " ]; then "
+        f"find {path} -type f {age_filter}2>/dev/null | wc -l | tr -d \" \"; "
+        "else echo path_missing; fi'"
+    )
+
+
+def _build_trashcan_delete_command(age_days: int) -> str:
+    path = _device_trashcan_path()
+    return (
+        "sh -lc 'if [ -d "
+        f"{path}"
+        " ]; then "
+        f"find {path} -type f -mtime +{max(0, int(age_days or 0))} -delete 2>&1; "
+        "else echo path_missing; fi'"
+    )
+
 _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
     "tools": {
         "summary": "점검 도구 확인",
@@ -279,6 +354,28 @@ _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
             "else echo pm2_missing; fi'"
         ),
     },
+    "disk_usage_root": {
+        "summary": "TrashCan 기준 디스크 용량 확인",
+        "timeout_sec": 10,
+        "command": _build_trashcan_filesystem_command(),
+    },
+    "trashcan_dir_usage": {
+        "summary": "TrashCan 폴더 용량 확인",
+        "timeout_sec": 10,
+        "command": _build_trashcan_directory_command(),
+    },
+    "trashcan_file_count": {
+        "summary": "TrashCan 파일 개수 확인",
+        "timeout_sec": 10,
+        "command": _build_trashcan_file_count_command(),
+    },
+    "trashcan_expired_file_count": {
+        "summary": "TrashCan 30일 초과 파일 개수 확인",
+        "timeout_sec": 10,
+        "command": _build_trashcan_file_count_command(
+            older_than_days=_device_trashcan_delete_age_days()
+        ),
+    },
     "lsusb": {
         "summary": "USB 장치 확인",
         "timeout_sec": 10,
@@ -322,6 +419,10 @@ _PROBE_COMPONENT_COMMAND_KEYS = {
         "pcm_mixer",
         "pactl_info",
         "pm2_jlist",
+        "disk_usage_root",
+        "trashcan_dir_usage",
+        "trashcan_file_count",
+        "trashcan_expired_file_count",
         "lsusb",
         "serial_devices",
         "video_devices",
@@ -716,6 +817,215 @@ def _parse_device_path_list(text: str, *, missing_token: str) -> dict[str, Any]:
         "reason": "ok" if paths else "not_found",
         "count": len(paths),
         "paths": paths,
+    }
+
+
+def _parse_disk_usage(text: str) -> dict[str, Any]:
+    normalized = str(text or "").strip()
+    if normalized == "df_missing":
+        return {
+            "available": False,
+            "reason": "df_missing",
+            "filesystem": "",
+            "mount": "",
+            "sizeBytes": 0,
+            "usedBytes": 0,
+            "availableBytes": 0,
+            "usedPercent": None,
+        }
+
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if not lines:
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "filesystem": "",
+            "mount": "",
+            "sizeBytes": 0,
+            "usedBytes": 0,
+            "availableBytes": 0,
+            "usedPercent": None,
+        }
+
+    data_line = ""
+    for line in lines:
+        if line.lower().startswith("filesystem"):
+            continue
+        data_line = line
+        break
+    if not data_line:
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "filesystem": "",
+            "mount": "",
+            "sizeBytes": 0,
+            "usedBytes": 0,
+            "availableBytes": 0,
+            "usedPercent": None,
+        }
+
+    parts = re.split(r"\s+", data_line)
+    if len(parts) < 6:
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "filesystem": "",
+            "mount": "",
+            "sizeBytes": 0,
+            "usedBytes": 0,
+            "availableBytes": 0,
+            "usedPercent": None,
+        }
+
+    try:
+        size_bytes = int(parts[1]) * 1024
+        used_bytes = int(parts[2]) * 1024
+        available_bytes = int(parts[3]) * 1024
+    except (TypeError, ValueError):
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "filesystem": "",
+            "mount": "",
+            "sizeBytes": 0,
+            "usedBytes": 0,
+            "availableBytes": 0,
+            "usedPercent": None,
+        }
+
+    try:
+        used_percent = int(str(parts[4]).rstrip("%"))
+    except (TypeError, ValueError):
+        used_percent = None
+
+    return {
+        "available": True,
+        "reason": "ok" if used_percent is not None else "parse_failed",
+        "filesystem": _display_value(parts[0], default=""),
+        "mount": _display_value(" ".join(parts[5:]), default=""),
+        "sizeBytes": size_bytes,
+        "usedBytes": used_bytes,
+        "availableBytes": available_bytes,
+        "usedPercent": used_percent,
+    }
+
+
+def _parse_directory_usage(text: str) -> dict[str, Any]:
+    normalized = str(text or "").strip()
+    if normalized == "path_missing":
+        return {
+            "available": False,
+            "reason": "path_missing",
+            "path": "",
+            "sizeBytes": 0,
+        }
+
+    line = normalized.splitlines()[0].strip() if normalized else ""
+    parts = re.split(r"\s+", line, maxsplit=1) if line else []
+    if len(parts) < 2:
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "path": "",
+            "sizeBytes": 0,
+        }
+
+    try:
+        size_bytes = int(parts[0]) * 1024
+    except (TypeError, ValueError):
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "path": "",
+            "sizeBytes": 0,
+        }
+
+    return {
+        "available": True,
+        "reason": "ok",
+        "path": _display_value(parts[1], default=""),
+        "sizeBytes": size_bytes,
+    }
+
+
+def _parse_count_value(text: str) -> dict[str, Any]:
+    normalized = str(text or "").strip()
+    if normalized == "path_missing":
+        return {
+            "available": False,
+            "reason": "path_missing",
+            "count": 0,
+        }
+
+    try:
+        count = int(normalized)
+    except (TypeError, ValueError):
+        return {
+            "available": True,
+            "reason": "parse_failed",
+            "count": 0,
+        }
+
+    return {
+        "available": True,
+        "reason": "ok",
+        "count": max(0, count),
+    }
+
+
+def _format_storage_percent(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "미확인"
+    if abs(numeric - round(numeric)) < 0.05:
+        return f"{int(round(numeric))}%"
+    return f"{numeric:.1f}%"
+
+
+def _build_trashcan_storage_usage(
+    *,
+    filesystem_usage: dict[str, Any],
+    directory_usage: dict[str, Any],
+    file_count: dict[str, Any],
+    expired_file_count: dict[str, Any],
+    cleanup_threshold_percent: int | None = None,
+    cleanup_age_days: int | None = None,
+) -> dict[str, Any]:
+    threshold_percent = max(1, int(cleanup_threshold_percent or _device_trashcan_threshold_percent()))
+    age_days = max(1, int(cleanup_age_days or _device_trashcan_delete_age_days()))
+    filesystem_size_bytes = int(filesystem_usage.get("sizeBytes") or 0)
+    directory_size_bytes = int(directory_usage.get("sizeBytes") or 0)
+    directory_share_percent = None
+    if bool(filesystem_usage.get("available")) and bool(directory_usage.get("available")) and filesystem_size_bytes > 0:
+        directory_share_percent = round((directory_size_bytes * 100) / filesystem_size_bytes, 1)
+
+    reason = "ok"
+    for payload in (filesystem_usage, directory_usage, file_count, expired_file_count):
+        if not isinstance(payload, dict):
+            continue
+        payload_reason = _display_value(payload.get("reason"), default="")
+        if payload_reason and payload_reason != "ok":
+            reason = payload_reason
+            break
+
+    return {
+        "available": bool(filesystem_usage.get("available")) and bool(directory_usage.get("available")),
+        "reason": reason,
+        "path": _display_value(directory_usage.get("path"), default=_device_trashcan_path()),
+        "displayPath": _device_trashcan_label_path(),
+        "filesystem": _display_value(filesystem_usage.get("filesystem"), default=""),
+        "mount": _display_value(filesystem_usage.get("mount"), default=""),
+        "filesystemSizeBytes": filesystem_size_bytes,
+        "filesystemAvailableBytes": int(filesystem_usage.get("availableBytes") or 0),
+        "filesystemUsedPercent": filesystem_usage.get("usedPercent"),
+        "directorySizeBytes": directory_size_bytes,
+        "directorySharePercent": directory_share_percent,
+        "fileCount": int(file_count.get("count") or 0),
+        "expiredFileCount": int(expired_file_count.get("count") or 0),
+        "cleanupThresholdPercent": threshold_percent,
+        "cleanupAgeDays": age_days,
     }
 
 
@@ -1139,6 +1449,448 @@ def _summarize_audio_path_probe(checks: dict[str, dict[str, Any]]) -> dict[str, 
         "volumeText": f"`{mixer_summary}`" if mixer_summary else "",
         "sinkText": f"`{_display_value(default_sink.get('defaultSink'), default='미확인')}`" if default_sink.get("available") else "",
         "action": "실제 소리 재생 확인은 `장비 소리 출력 점검`으로 따로 점검해",
+    }
+
+
+def _summarize_storage_probe(storage_usage: dict[str, Any]) -> dict[str, Any]:
+    path_label = _display_value(storage_usage.get("displayPath"), default=_device_trashcan_label_path())
+    filesystem = _display_value(storage_usage.get("filesystem"), default="")
+    mount = _display_value(storage_usage.get("mount"), default="")
+    filesystem_size_bytes = int(storage_usage.get("filesystemSizeBytes") or 0)
+    filesystem_available_bytes = int(storage_usage.get("filesystemAvailableBytes") or 0)
+    filesystem_used_percent = storage_usage.get("filesystemUsedPercent")
+    directory_size_bytes = int(storage_usage.get("directorySizeBytes") or 0)
+    file_count = int(storage_usage.get("fileCount") or 0)
+    expired_file_count = int(storage_usage.get("expiredFileCount") or 0)
+    directory_share_percent = storage_usage.get("directorySharePercent")
+    threshold_percent = max(1, int(storage_usage.get("cleanupThresholdPercent") or _device_trashcan_threshold_percent()))
+    age_days = max(1, int(storage_usage.get("cleanupAgeDays") or _device_trashcan_delete_age_days()))
+
+    disk_parts: list[str] = []
+    if mount:
+        disk_parts.append(f"경로 `{mount}`")
+    disk_parts.append(f"사용량 `{_format_storage_percent(filesystem_used_percent)}`")
+    if filesystem_available_bytes > 0:
+        disk_parts.append(f"여유 `{_format_size(filesystem_available_bytes)}`")
+    if filesystem_size_bytes > 0:
+        disk_parts.append(f"전체 `{_format_size(filesystem_size_bytes)}`")
+    if filesystem:
+        disk_parts.append(f"파일시스템 `{filesystem}`")
+    disk_overview_detail = " / ".join(disk_parts) or "디스크 사용량 파싱 실패"
+
+    trashcan_parts = [
+        f"경로 `{path_label}`",
+        f"폴더 `{_format_size(directory_size_bytes)}` ({_format_storage_percent(directory_share_percent)})",
+        f"파일 `{file_count}개`",
+        f"{age_days}일 초과 `{expired_file_count}개`",
+    ]
+    trashcan_overview_detail = " / ".join(trashcan_parts)
+    evidence_text = f"디스크 {disk_overview_detail} / TrashCan {trashcan_overview_detail}"
+
+    disk_status = "warning"
+    disk_label = "확인 필요"
+    if filesystem_used_percent is not None:
+        if int(filesystem_used_percent) >= 90:
+            disk_status = "fail"
+            disk_label = "이상"
+        elif int(filesystem_used_percent) >= 80:
+            disk_status = "warning"
+            disk_label = "확인 필요"
+        else:
+            disk_status = "pass"
+            disk_label = "정상"
+
+    if not storage_usage.get("available"):
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "TrashCan 경로 용량을 읽지 못했어",
+            "evidence": evidence_text,
+            "overviewDetail": trashcan_overview_detail,
+            "diskStatus": disk_status,
+            "diskLabel": disk_label,
+            "diskOverviewDetail": disk_overview_detail,
+            "trashcanStatus": "warning",
+            "trashcanLabel": "확인 필요",
+            "trashcanOverviewDetail": trashcan_overview_detail,
+            "action": f"장비에서 `{_device_trashcan_path()}` 경로와 `df`/`du` 결과를 확인해",
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+            "directorySizeBytes": directory_size_bytes,
+            "directorySharePercent": directory_share_percent,
+            "filesystemSizeBytes": filesystem_size_bytes,
+            "filesystemAvailableBytes": filesystem_available_bytes,
+            "filesystemUsedPercent": filesystem_used_percent,
+            "fileCount": file_count,
+            "expiredFileCount": expired_file_count,
+            "cleanupThresholdPercent": threshold_percent,
+            "cleanupAgeDays": age_days,
+        }
+
+    if storage_usage.get("reason") != "ok" or directory_share_percent is None:
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "TrashCan 용량 정보는 읽었지만 해석이 불완전해",
+            "evidence": evidence_text,
+            "overviewDetail": trashcan_overview_detail,
+            "diskStatus": disk_status,
+            "diskLabel": disk_label,
+            "diskOverviewDetail": disk_overview_detail,
+            "trashcanStatus": "warning",
+            "trashcanLabel": "확인 필요",
+            "trashcanOverviewDetail": trashcan_overview_detail,
+            "action": f"장비에서 `{_device_trashcan_path()}` 기준 `df`, `du` 결과를 다시 확인해",
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+            "directorySizeBytes": directory_size_bytes,
+            "directorySharePercent": directory_share_percent,
+            "filesystemSizeBytes": filesystem_size_bytes,
+            "filesystemAvailableBytes": filesystem_available_bytes,
+            "filesystemUsedPercent": filesystem_used_percent,
+            "fileCount": file_count,
+            "expiredFileCount": expired_file_count,
+            "cleanupThresholdPercent": threshold_percent,
+            "cleanupAgeDays": age_days,
+        }
+
+    warning_threshold = max(1, threshold_percent - 20)
+    if float(directory_share_percent) >= threshold_percent:
+        summary = f"TrashCan 용량이 자동 정리 기준 `{threshold_percent}%`를 넘겼어"
+        if expired_file_count <= 0:
+            summary = f"TrashCan 용량은 기준 `{threshold_percent}%`를 넘겼는데 `{age_days}일` 지난 파일이 없어"
+        return {
+            "status": "fail",
+            "label": "이상",
+            "summary": summary,
+            "evidence": evidence_text,
+            "overviewDetail": trashcan_overview_detail,
+            "diskStatus": disk_status,
+            "diskLabel": disk_label,
+            "diskOverviewDetail": disk_overview_detail,
+            "trashcanStatus": "fail",
+            "trashcanLabel": "이상",
+            "trashcanOverviewDetail": trashcan_overview_detail,
+            "action": f"자동 정리 대상이야. `{age_days}일` 지난 파일부터 정리해",
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+            "directorySizeBytes": directory_size_bytes,
+            "directorySharePercent": directory_share_percent,
+            "filesystemSizeBytes": filesystem_size_bytes,
+            "filesystemAvailableBytes": filesystem_available_bytes,
+            "filesystemUsedPercent": filesystem_used_percent,
+            "fileCount": file_count,
+            "expiredFileCount": expired_file_count,
+            "cleanupThresholdPercent": threshold_percent,
+            "cleanupAgeDays": age_days,
+        }
+    if float(directory_share_percent) >= warning_threshold:
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "TrashCan 용량이 빠르게 커지고 있어",
+            "evidence": evidence_text,
+            "overviewDetail": trashcan_overview_detail,
+            "diskStatus": disk_status,
+            "diskLabel": disk_label,
+            "diskOverviewDetail": disk_overview_detail,
+            "trashcanStatus": "warning",
+            "trashcanLabel": "확인 필요",
+            "trashcanOverviewDetail": trashcan_overview_detail,
+            "action": f"기준 `{threshold_percent}%` 전이라도 `{age_days}일` 지난 파일 수를 같이 봐",
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+            "directorySizeBytes": directory_size_bytes,
+            "directorySharePercent": directory_share_percent,
+            "filesystemSizeBytes": filesystem_size_bytes,
+            "filesystemAvailableBytes": filesystem_available_bytes,
+            "filesystemUsedPercent": filesystem_used_percent,
+            "fileCount": file_count,
+            "expiredFileCount": expired_file_count,
+            "cleanupThresholdPercent": threshold_percent,
+            "cleanupAgeDays": age_days,
+        }
+    return {
+        "status": "pass",
+        "label": "정상",
+        "summary": "TrashCan 용량은 아직 안정 범위야",
+        "evidence": evidence_text,
+        "overviewDetail": trashcan_overview_detail,
+        "diskStatus": disk_status,
+        "diskLabel": disk_label,
+        "diskOverviewDetail": disk_overview_detail,
+        "trashcanStatus": "pass",
+        "trashcanLabel": "정상",
+        "trashcanOverviewDetail": trashcan_overview_detail,
+        "action": "현재는 추가 정리 없어도 돼",
+        "path": _device_trashcan_path(),
+        "displayPath": path_label,
+        "directorySizeBytes": directory_size_bytes,
+        "directorySharePercent": directory_share_percent,
+        "filesystemSizeBytes": filesystem_size_bytes,
+        "filesystemAvailableBytes": filesystem_available_bytes,
+        "filesystemUsedPercent": filesystem_used_percent,
+        "fileCount": file_count,
+        "expiredFileCount": expired_file_count,
+        "cleanupThresholdPercent": threshold_percent,
+        "cleanupAgeDays": age_days,
+    }
+
+
+def _collect_trashcan_runtime_checks(
+    client: Any,
+    *,
+    cleanup_age_days: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    age_days = max(1, int(cleanup_age_days or _device_trashcan_delete_age_days()))
+    return {
+        "disk_usage_root": _run_remote_ssh_command(
+            client,
+            command=_build_trashcan_filesystem_command(),
+            summary="TrashCan 기준 디스크 용량 확인",
+            timeout_sec=max(1, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        ),
+        "trashcan_dir_usage": _run_remote_ssh_command(
+            client,
+            command=_build_trashcan_directory_command(),
+            summary="TrashCan 폴더 용량 확인",
+            timeout_sec=max(1, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        ),
+        "trashcan_file_count": _run_remote_ssh_command(
+            client,
+            command=_build_trashcan_file_count_command(),
+            summary="TrashCan 파일 개수 확인",
+            timeout_sec=max(1, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        ),
+        "trashcan_expired_file_count": _run_remote_ssh_command(
+            client,
+            command=_build_trashcan_file_count_command(older_than_days=age_days),
+            summary="TrashCan 보관기한 초과 파일 개수 확인",
+            timeout_sec=max(1, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        ),
+    }
+
+
+def _build_trashcan_storage_summary_from_checks(
+    checks: dict[str, dict[str, Any]],
+    *,
+    cleanup_threshold_percent: int | None = None,
+    cleanup_age_days: int | None = None,
+) -> dict[str, Any]:
+    storage_usage = _build_trashcan_storage_usage(
+        filesystem_usage=_parse_disk_usage(_display_value((checks.get("disk_usage_root") or {}).get("output"), default="")),
+        directory_usage=_parse_directory_usage(_display_value((checks.get("trashcan_dir_usage") or {}).get("output"), default="")),
+        file_count=_parse_count_value(_display_value((checks.get("trashcan_file_count") or {}).get("output"), default="")),
+        expired_file_count=_parse_count_value(
+            _display_value((checks.get("trashcan_expired_file_count") or {}).get("output"), default="")
+        ),
+        cleanup_threshold_percent=cleanup_threshold_percent,
+        cleanup_age_days=cleanup_age_days,
+    )
+    return _summarize_storage_probe(storage_usage)
+
+
+def _run_device_trashcan_cleanup(
+    status_payload: dict[str, Any],
+    *,
+    execute: bool = False,
+    cleanup_threshold_percent: int | None = None,
+    cleanup_age_days: int | None = None,
+) -> dict[str, Any]:
+    threshold_percent = max(1, int(cleanup_threshold_percent or _device_trashcan_threshold_percent()))
+    age_days = max(1, int(cleanup_age_days or _device_trashcan_delete_age_days()))
+    ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
+    overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
+    storage_summary = overview.get("storage") if isinstance(overview.get("storage"), dict) else {}
+    path_label = _display_value(storage_summary.get("displayPath"), default=_device_trashcan_label_path())
+    current_share_percent = storage_summary.get("directorySharePercent")
+    expired_file_count = int(storage_summary.get("expiredFileCount") or 0)
+
+    if not ssh_payload.get("ready"):
+        return {
+            "status": "unavailable",
+            "label": "실행 불가",
+            "detail": "SSH 연결 불가라 정리 판단을 못 했어",
+            "required": False,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    if current_share_percent is None:
+        return {
+            "status": "unavailable",
+            "label": "실행 불가",
+            "detail": "TrashCan 용량 계산이 불완전해서 정리를 보류했어",
+            "required": False,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    if float(current_share_percent) < threshold_percent:
+        return {
+            "status": "disabled" if not execute else "skipped",
+            "label": "꺼짐" if not execute else "생략",
+            "detail": (
+                f"기준 `{threshold_percent}%` 미만 | 현재 `{_format_storage_percent(current_share_percent)}`"
+            ),
+            "required": False,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    if not execute:
+        return {
+            "status": "candidate",
+            "label": "대상",
+            "detail": (
+                f"기준 `{threshold_percent}%` 초과 | 현재 `{_format_storage_percent(current_share_percent)}` / "
+                f"`{age_days}일` 초과 `{expired_file_count}개`"
+            ),
+            "required": True,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    if expired_file_count <= 0:
+        return {
+            "status": "skipped",
+            "label": "생략",
+            "detail": f"기준은 넘겼지만 `{age_days}일` 초과 파일이 없어",
+            "required": True,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    host = _display_value(ssh_payload.get("host"), default="")
+    try:
+        port = int(ssh_payload.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    connection = _connect_device_ssh_client(host, port)
+    if not connection.get("ok"):
+        return {
+            "status": "failed",
+            "label": "실패",
+            "detail": _display_device_status_probe_reason(connection.get("reason")),
+            "required": True,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    client = connection["client"]
+    delete_result: dict[str, Any] | None = None
+    after_summary: dict[str, Any] | None = None
+    try:
+        delete_result = _run_remote_ssh_command(
+            client,
+            command=_build_trashcan_delete_command(age_days),
+            summary="TrashCan 보관기한 초과 파일 삭제",
+            timeout_sec=max(10, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        )
+        if delete_result.get("ok"):
+            after_checks = _collect_trashcan_runtime_checks(
+                client,
+                cleanup_age_days=age_days,
+            )
+            after_summary = _build_trashcan_storage_summary_from_checks(
+                after_checks,
+                cleanup_threshold_percent=threshold_percent,
+                cleanup_age_days=age_days,
+            )
+    finally:
+        client.close()
+
+    if not delete_result or not delete_result.get("ok"):
+        return {
+            "status": "failed",
+            "label": "실패",
+            "detail": _display_device_status_probe_reason((delete_result or {}).get("reason")),
+            "required": True,
+            "executed": False,
+            "thresholdPercent": threshold_percent,
+            "ageDays": age_days,
+            "currentSharePercent": current_share_percent,
+            "candidateFileCount": expired_file_count,
+            "deletedFileCount": 0,
+            "freedBytes": 0,
+            "path": _device_trashcan_path(),
+            "displayPath": path_label,
+        }
+
+    after_file_count = int((after_summary or {}).get("fileCount") or 0)
+    after_size_bytes = int((after_summary or {}).get("directorySizeBytes") or 0)
+    before_file_count = int(storage_summary.get("fileCount") or 0)
+    before_size_bytes = int(storage_summary.get("directorySizeBytes") or 0)
+    deleted_file_count = max(0, before_file_count - after_file_count) if after_summary else expired_file_count
+    freed_bytes = max(0, before_size_bytes - after_size_bytes) if after_summary else 0
+    after_detail = ""
+    if after_summary:
+        after_detail = (
+            f" / 현재 `{_format_storage_percent(after_summary.get('directorySharePercent'))}`"
+            f" / 남은 `{age_days}일` 초과 `{int(after_summary.get('expiredFileCount') or 0)}개`"
+        )
+
+    return {
+        "status": "completed",
+        "label": "성공",
+        "detail": (
+            f"`{age_days}일` 초과 `{deleted_file_count}개` 삭제"
+            f" / `{_format_size(before_size_bytes)}` -> `{_format_size(after_size_bytes) if after_summary else _format_size(before_size_bytes)}`"
+            f"{after_detail}"
+        ),
+        "required": True,
+        "executed": True,
+        "thresholdPercent": threshold_percent,
+        "ageDays": age_days,
+        "currentSharePercent": current_share_percent,
+        "candidateFileCount": expired_file_count,
+        "deletedFileCount": deleted_file_count,
+        "freedBytes": freed_bytes,
+        "path": _device_trashcan_path(),
+        "displayPath": path_label,
+        "afterSummary": after_summary,
     }
 
 
@@ -1590,6 +2342,7 @@ def _render_device_status_overview_result(
     ssh_reason: str,
     audio_summary: dict[str, Any] | None,
     pm2_summary: dict[str, Any] | None,
+    storage_summary: dict[str, Any] | None,
     captureboard_summary: dict[str, Any] | None,
     led_summary: dict[str, Any] | None,
 ) -> str:
@@ -1610,6 +2363,8 @@ def _render_device_status_overview_result(
         lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(False)}")
         lines.append("• 소리 출력 경로: *점검 불가*")
         lines.append("• pm2 앱: *점검 불가*")
+        lines.append("• 디스크 용량: *점검 불가*")
+        lines.append("• TrashCan 용량: *점검 불가*")
         lines.append("• 캡처보드: *점검 불가*")
         lines.append("• LED: *점검 불가*")
         lines.append(f"• 판단: {guidance['summary']}")
@@ -1619,6 +2374,7 @@ def _render_device_status_overview_result(
     component_summaries = {
         "소리 출력": audio_summary or {},
         "pm2 앱": pm2_summary or {},
+        "TrashCan 용량": storage_summary or {},
         "캡처보드": captureboard_summary or {},
         "LED": led_summary or {},
     }
@@ -1653,6 +2409,16 @@ def _render_device_status_overview_result(
     pm2_label = _display_value(pm2_payload.get("label"), default="확인 필요")
     pm2_detail = _display_value(pm2_payload.get("overviewDetail"), default="")
 
+    storage_payload = storage_summary or {}
+    storage_label = _display_value(storage_payload.get("label"), default="확인 필요")
+    disk_label = _display_value(storage_payload.get("diskLabel"), default=storage_label)
+    disk_detail = _display_value(storage_payload.get("diskOverviewDetail"), default="")
+    trashcan_label = _display_value(storage_payload.get("trashcanLabel"), default=storage_label)
+    trashcan_detail = _display_value(
+        storage_payload.get("trashcanOverviewDetail"),
+        default=_display_value(storage_payload.get("overviewDetail"), default=""),
+    )
+
     capture_payload = captureboard_summary or {}
     capture_label = _display_value(capture_payload.get("label"), default="확인 필요")
     capture_detail = _display_value(capture_payload.get("overviewDetail"), default="")
@@ -1677,6 +2443,14 @@ def _render_device_status_overview_result(
     if pm2_detail:
         pm2_line = f"{pm2_line} | {pm2_detail}"
     lines.append(pm2_line)
+    disk_line = f"• 디스크 용량: *{disk_label}*"
+    if disk_detail:
+        disk_line = f"{disk_line} | {disk_detail}"
+    lines.append(disk_line)
+    trashcan_line = f"• TrashCan 용량: *{trashcan_label}*"
+    if trashcan_detail:
+        trashcan_line = f"{trashcan_line} | {trashcan_detail}"
+    lines.append(trashcan_line)
 
     lines.append("")
     lines.append("*하드웨어*")
@@ -1835,12 +2609,18 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
 
     audio_summary = None
     pm2_summary = None
+    storage_summary = None
     captureboard_summary = None
     led_summary = None
     if ssh_ready:
         audio_summary = _summarize_audio_path_probe(checks)
         pm2_summary = _summarize_pm2_probe(
             _parse_pm2_processes(_display_value((checks.get("pm2_jlist") or {}).get("output"), default=""))
+        )
+        storage_summary = _build_trashcan_storage_summary_from_checks(
+            checks,
+            cleanup_threshold_percent=_device_trashcan_threshold_percent(),
+            cleanup_age_days=_device_trashcan_delete_age_days(),
         )
         captureboard_summary = _summarize_captureboard_probe(
             device_info=device_info,
@@ -1862,6 +2642,7 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
     evidence_payload["overview"] = {
         "audio": audio_summary,
         "pm2": pm2_summary,
+        "storage": storage_summary,
         "captureboard": captureboard_summary,
         "led": led_summary,
     }
@@ -1876,6 +2657,7 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
         ssh_reason=ssh_reason,
         audio_summary=audio_summary,
         pm2_summary=pm2_summary,
+        storage_summary=storage_summary,
         captureboard_summary=captureboard_summary,
         led_summary=led_summary,
     )

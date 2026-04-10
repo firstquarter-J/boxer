@@ -104,9 +104,15 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "boxUpdated": 0,
                 "boxUpdateFailed": 0,
             },
+            "cleanupCounts": {
+                "candidates": 1,
+                "executed": 1,
+                "failed": 0,
+            },
             "deviceResults": [],
             "autoUpdateAgent": True,
             "autoUpdateBox": False,
+            "autoCleanupTrashCan": True,
         }
 
         with (
@@ -122,6 +128,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
                 return_value={
@@ -166,6 +173,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             },
             auto_update_agent=True,
             auto_update_box=False,
+            auto_cleanup_trashcan=True,
         )
         format_mock.assert_called_once_with(summary, now=local_now)
         blocks_mock.assert_called_once_with(
@@ -201,6 +209,11 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                     "boxUpdated": 0,
                     "boxUpdateFailed": 0,
                 },
+                "cleanupCounts": {
+                    "candidates": 1,
+                    "executed": 1,
+                    "failed": 0,
+                },
             }
         )
 
@@ -224,9 +237,15 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "boxUpdated": 0,
                 "boxUpdateFailed": 0,
             },
+            "cleanupCounts": {
+                "candidates": 0,
+                "executed": 0,
+                "failed": 0,
+            },
             "deviceResults": [],
             "autoUpdateAgent": False,
             "autoUpdateBox": False,
+            "autoCleanupTrashCan": False,
         }
 
         with (
@@ -242,6 +261,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
                 return_value={
@@ -301,6 +321,11 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                     "boxUpdated": 0,
                     "boxUpdateFailed": 0,
                 },
+                "cleanupCounts": {
+                    "candidates": 0,
+                    "executed": 0,
+                    "failed": 0,
+                },
             }
         )
 
@@ -324,9 +349,15 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "boxUpdated": 0,
                 "boxUpdateFailed": 0,
             },
+            "cleanupCounts": {
+                "candidates": 0,
+                "executed": 0,
+                "failed": 0,
+            },
             "deviceResults": [],
             "autoUpdateAgent": True,
             "autoUpdateBox": True,
+            "autoCleanupTrashCan": False,
             "summaryLine": "이번 야간 업데이트 창에서 처리할 병원을 모두 끝냈어",
         }
 
@@ -343,6 +374,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", True),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
                 return_value={
@@ -389,6 +421,11 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                     "boxCandidates": 0,
                     "boxUpdated": 0,
                     "boxUpdateFailed": 0,
+                },
+                "cleanupCounts": {
+                    "candidates": 0,
+                    "executed": 0,
+                    "failed": 0,
                 },
             }
         )

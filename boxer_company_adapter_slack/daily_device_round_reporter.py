@@ -184,6 +184,7 @@ def _run_daily_device_round_if_due(
         state=state,
         auto_update_agent=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT),
         auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
+        auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
     )
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(state.get("processedHospitalSeqs"))
@@ -212,6 +213,7 @@ def _run_daily_device_round_if_due(
         "channelId": channel_id,
         "statusCounts": report_summary.get("statusCounts"),
         "updateCounts": report_summary.get("updateCounts"),
+        "cleanupCounts": report_summary.get("cleanupCounts"),
     }
     if hospital_seq is None:
         _save_daily_device_round_state(next_state)

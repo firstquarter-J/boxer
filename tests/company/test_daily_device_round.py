@@ -18,6 +18,15 @@ def _build_status_payload(*, ssh_ready: bool = True, overall: str = "정상") ->
         "overview": {
             "audio": {"status": component_status, "label": component_label},
             "pm2": {"status": component_status, "label": component_label},
+            "storage": {
+                "status": component_status,
+                "label": component_label,
+                "directorySharePercent": 10.0,
+                "expiredFileCount": 0,
+                "fileCount": 12,
+                "directorySizeBytes": 2 * 1024 * 1024 * 1024,
+                "displayPath": "AppData/TrashCan",
+            },
             "captureboard": {"status": component_status, "label": component_label},
             "led": {"status": component_status, "label": component_label},
         },
@@ -136,6 +145,35 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
 
 
 class DailyDeviceRoundExecutionTests(unittest.TestCase):
+    def test_defers_priority_when_network_is_unavailable(self) -> None:
+        priority = rounder._build_daily_device_round_priority(
+            _build_status_payload(ssh_ready=False)
+        )
+
+        self.assertFalse(priority["eligible"])
+        self.assertEqual(priority["label"], "판단 보류")
+        self.assertEqual(priority["reason"], "네트워크 연결 불가로 이상 징후 판단 보류")
+
+    def test_marks_pm2_failure_as_high_priority_when_network_is_available(self) -> None:
+        status_payload = _build_status_payload(overall="정상")
+        status_payload["overview"]["pm2"] = {"status": "fail", "label": "이상"}
+
+        priority = rounder._build_daily_device_round_priority(status_payload)
+
+        self.assertTrue(priority["eligible"])
+        self.assertEqual(priority["label"], "높음")
+        self.assertEqual(priority["reason"], "pm2 이상")
+
+    def test_marks_storage_warning_as_medium_priority_when_network_is_available(self) -> None:
+        status_payload = _build_status_payload(overall="정상")
+        status_payload["overview"]["storage"] = {"status": "warning", "label": "확인 필요"}
+
+        priority = rounder._build_daily_device_round_priority(status_payload)
+
+        self.assertTrue(priority["eligible"])
+        self.assertEqual(priority["label"], "중간")
+        self.assertEqual(priority["reason"], "용량 확인 필요")
+
     def test_build_update_plan_falls_back_to_agent_runtime_gate(self) -> None:
         plan = rounder._build_daily_device_round_update_plan(
             {
@@ -275,6 +313,8 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertTrue(result["agentAction"]["ok"])
         self.assertTrue(result["boxAction"]["ok"])
         self.assertTrue(result["finalPlan"]["box"]["alreadyLatest"])
+        self.assertEqual(result["priorityLabel"], "정상")
+        self.assertEqual(result["priorityReason"], "원격 점검상 이상 징후 없음")
         self.assertEqual(result["agentActionText"], "에이전트 업데이트 완료")
         self.assertEqual(result["boxActionText"], "박스 업데이트 완료")
 
@@ -311,7 +351,30 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                 "hospitalName": "B병원",
                 "roomName": "1진료실",
                 "overallLabel": "정상",
-                "componentLabels": {"audio": "정상", "pm2": "정상", "captureboard": "정상", "led": "정상"},
+                "priorityEligible": True,
+                "priorityScore": 0,
+                "priorityLabel": "정상",
+                "priorityReason": "원격 점검상 이상 징후 없음",
+                "componentLabels": {
+                    "audio": "정상",
+                    "pm2": "정상",
+                    "storage": "정상",
+                    "captureboard": "정상",
+                    "led": "정상",
+                },
+                "storageDetails": {
+                    "diskLabel": "정상",
+                    "diskDetail": "경로 `/` / 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`",
+                    "trashcanLabel": "정상",
+                    "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `2.0 GB` (`0.9%`) / 파일 `20개` / 30일 초과 `0개`",
+                },
+                "trashcanCleanup": {
+                    "status": "disabled",
+                    "label": "꺼짐",
+                    "detail": "기준 `60%` 미만 | 현재 `10%`",
+                    "required": False,
+                    "executed": False,
+                },
                 "initialPlan": {
                     "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
                     "box": {"shouldUpdate": False, "alreadyLatest": True, "reason": "박스 최신"},
@@ -330,7 +393,30 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                 "hospitalName": "B병원",
                 "roomName": "2진료실",
                 "overallLabel": "확인 필요",
-                "componentLabels": {"audio": "확인 필요", "pm2": "정상", "captureboard": "정상", "led": "정상"},
+                "priorityEligible": True,
+                "priorityScore": 1,
+                "priorityLabel": "낮음",
+                "priorityReason": "오디오 확인 필요",
+                "componentLabels": {
+                    "audio": "확인 필요",
+                    "pm2": "정상",
+                    "storage": "정상",
+                    "captureboard": "정상",
+                    "led": "정상",
+                },
+                "storageDetails": {
+                    "diskLabel": "정상",
+                    "diskDetail": "경로 `/` / 사용량 `18%` / 여유 `178.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`",
+                    "trashcanLabel": "정상",
+                    "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `9.0 GB` (`4.1%`) / 파일 `120개` / 30일 초과 `4개`",
+                },
+                "trashcanCleanup": {
+                    "status": "completed",
+                    "label": "성공",
+                    "detail": "`30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`",
+                    "required": True,
+                    "executed": True,
+                },
                 "initialPlan": {
                     "agent": {"shouldUpdate": True, "isLatest": False, "reason": "에이전트 1.9.0 업데이트 필요"},
                     "box": {"shouldUpdate": False, "alreadyLatest": False, "reason": "선행조건 미충족"},
@@ -361,6 +447,8 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertEqual(summary["updateCounts"]["agentCandidates"], 1)
         self.assertEqual(summary["updateCounts"]["agentUpdated"], 1)
         self.assertEqual(summary["updateCounts"]["boxCandidates"], 1)
+        self.assertEqual(summary["cleanupCounts"]["candidates"], 1)
+        self.assertEqual(summary["cleanupCounts"]["executed"], 1)
         self.assertEqual(summary["nextHospitalSeq"], 10)
 
     def test_formats_report_with_hospital_label_and_multiline_device_lines(self) -> None:
@@ -372,6 +460,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                 "scheduledDeviceCount": 1,
                 "autoUpdateAgent": False,
                 "autoUpdateBox": False,
+                "autoCleanupTrashCan": False,
                 "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
                 "updateCounts": {
                     "agentCandidates": 0,
@@ -381,16 +470,36 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                     "boxUpdated": 0,
                     "boxUpdateFailed": 0,
                 },
+                "cleanupCounts": {
+                    "candidates": 0,
+                    "executed": 0,
+                    "failed": 0,
+                },
                 "deviceResults": [
                     {
                         "deviceName": "MB2-C01431",
                         "roomName": "1진료실",
                         "overallLabel": "정상",
+                        "priorityEligible": True,
+                        "priorityScore": 0,
+                        "priorityLabel": "정상",
+                        "priorityReason": "원격 점검상 이상 징후 없음",
                         "componentLabels": {
                             "audio": "정상",
                             "pm2": "정상",
+                            "storage": "정상",
                             "captureboard": "정상",
                             "led": "정상",
+                        },
+                        "storageDetails": {
+                            "diskLabel": "정상",
+                            "diskDetail": "경로 `/` / 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`",
+                            "trashcanLabel": "정상",
+                            "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `2.0 GB` (`0.9%`) / 파일 `20개` / 30일 초과 `0개`",
+                        },
+                        "trashcanCleanup": {
+                            "label": "꺼짐",
+                            "detail": "기준 `60%` 미만 | 현재 `12%`",
                         },
                         "finalPlan": {
                             "agent": {
@@ -416,12 +525,18 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
 
         self.assertIn("일일 장비 순회 점검 & 업데이트 | #604 루이스산부인과의원(동작)", report_text)
         self.assertIn("*#604 루이스산부인과의원(동작)*", report_text)
+        self.assertIn("• 자동 동작: 에이전트 업데이트 `꺼짐` / 박스 업데이트 `꺼짐` / TrashCan 정리 `꺼짐`", report_text)
         self.assertIn("• *MB2-C01431* `1진료실`", report_text)
         self.assertIn("  *상태*  *정상*", report_text)
-        self.assertIn("  *점검*  `오디오 정상` | `pm2 정상` | `캡처보드 정상` | `LED 정상`", report_text)
+        self.assertIn("  *우선순위*  *정상* | 원격 점검상 이상 징후 없음", report_text)
+        self.assertIn("  *점검*  `오디오 정상` | `pm2 정상` | `용량 정상` | `캡처보드 정상` | `LED 정상`", report_text)
+        self.assertIn("  *디스크 용량*  *정상* | 경로 `/` / 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`", report_text)
+        self.assertIn("  *TrashCan 용량*  *정상* | 경로 `AppData/TrashCan` / 폴더 `2.0 GB` (`0.9%`) / 파일 `20개` / 30일 초과 `0개`", report_text)
         self.assertIn("• 업데이트: 에이전트 성공 `0` (대상 `0`, 실패 `0`) / 박스 성공 `0` (대상 `1`, 실패 `0`)", report_text)
-        self.assertIn("  *에이전트*  *최신* | 이번 업데이트 불필요 | 버전 `2.0.0`", report_text)
-        self.assertIn("  *박스*  *대기* | 박스 2.11.299 -> 2.11.300", report_text)
+        self.assertIn("• 정리: 기준 초과 `0` / 실행 `0` / 실패 `0`", report_text)
+        self.assertIn("  *TrashCan 정리*  *꺼짐* | 기준 `60%` 미만 | 현재 `12%`", report_text)
+        self.assertIn("  *에이전트 업데이트*  ⚪ *업데이트 불필요* | 버전 `2.0.0`", report_text)
+        self.assertIn("  *박스 업데이트*  🟠 *업데이트 필요* | 박스 2.11.299 -> 2.11.300", report_text)
 
     def test_formats_box_success_with_previous_and_final_version(self) -> None:
         report_text = rounder._format_daily_device_round_report(
@@ -432,6 +547,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                 "scheduledDeviceCount": 1,
                 "autoUpdateAgent": True,
                 "autoUpdateBox": True,
+                "autoCleanupTrashCan": True,
                 "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
                 "updateCounts": {
                     "agentCandidates": 0,
@@ -441,16 +557,36 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                     "boxUpdated": 1,
                     "boxUpdateFailed": 0,
                 },
+                "cleanupCounts": {
+                    "candidates": 1,
+                    "executed": 1,
+                    "failed": 0,
+                },
                 "deviceResults": [
                     {
                         "deviceName": "MB2-C01431",
                         "roomName": "1진료실",
                         "overallLabel": "정상",
+                        "priorityEligible": True,
+                        "priorityScore": 0,
+                        "priorityLabel": "정상",
+                        "priorityReason": "원격 점검상 이상 징후 없음",
                         "componentLabels": {
                             "audio": "정상",
                             "pm2": "정상",
+                            "storage": "정상",
                             "captureboard": "정상",
                             "led": "정상",
+                        },
+                        "storageDetails": {
+                            "diskLabel": "정상",
+                            "diskDetail": "경로 `/` / 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`",
+                            "trashcanLabel": "정상",
+                            "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `9.0 GB` (`4.1%`) / 파일 `120개` / 30일 초과 `4개`",
+                        },
+                        "trashcanCleanup": {
+                            "label": "성공",
+                            "detail": "`30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`",
                         },
                         "finalPlan": {
                             "agent": {
@@ -483,7 +619,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         )
 
-        self.assertIn("  *박스*  *성공* | `2.11.299` -> `2.11.300`", report_text)
+        self.assertIn("  *박스 업데이트*  🟢 *업데이트 완료* | `2.11.299` -> `2.11.300`", report_text)
 
     def test_builds_blocks_with_separate_device_sections(self) -> None:
         blocks = rounder._build_daily_device_round_blocks(
@@ -494,6 +630,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                 "scheduledDeviceCount": 2,
                 "autoUpdateAgent": False,
                 "autoUpdateBox": False,
+                "autoCleanupTrashCan": True,
                 "statusCounts": {"정상": 2, "확인 필요": 0, "이상": 0, "점검 불가": 0},
                 "updateCounts": {
                     "agentCandidates": 0,
@@ -503,16 +640,36 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                     "boxUpdated": 0,
                     "boxUpdateFailed": 0,
                 },
+                "cleanupCounts": {
+                    "candidates": 1,
+                    "executed": 1,
+                    "failed": 0,
+                },
                 "deviceResults": [
                     {
                         "deviceName": "MB2-C01431",
                         "roomName": "1진료실",
                         "overallLabel": "정상",
+                        "priorityEligible": True,
+                        "priorityScore": 0,
+                        "priorityLabel": "정상",
+                        "priorityReason": "원격 점검상 이상 징후 없음",
                         "componentLabels": {
                             "audio": "정상",
                             "pm2": "정상",
+                            "storage": "정상",
                             "captureboard": "정상",
                             "led": "정상",
+                        },
+                        "storageDetails": {
+                            "diskLabel": "정상",
+                            "diskDetail": "경로 `/` / 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`",
+                            "trashcanLabel": "정상",
+                            "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `2.0 GB` (`0.9%`) / 파일 `20개` / 30일 초과 `0개`",
+                        },
+                        "trashcanCleanup": {
+                            "label": "꺼짐",
+                            "detail": "기준 `60%` 미만 | 현재 `12%`",
                         },
                         "finalPlan": {
                             "agent": {"reason": "에이전트 최신", "currentVersion": "2.0.0", "isLatest": True},
@@ -531,11 +688,26 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                         "deviceName": "MB2-C01432",
                         "roomName": "2진료실",
                         "overallLabel": "정상",
+                        "priorityEligible": True,
+                        "priorityScore": 0,
+                        "priorityLabel": "정상",
+                        "priorityReason": "원격 점검상 이상 징후 없음",
                         "componentLabels": {
                             "audio": "정상",
                             "pm2": "정상",
+                            "storage": "정상",
                             "captureboard": "정상",
                             "led": "정상",
+                        },
+                        "storageDetails": {
+                            "diskLabel": "정상",
+                            "diskDetail": "경로 `/` / 사용량 `18%` / 여유 `178.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`",
+                            "trashcanLabel": "정상",
+                            "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `9.0 GB` (`4.1%`) / 파일 `120개` / 30일 초과 `4개`",
+                        },
+                        "trashcanCleanup": {
+                            "label": "성공",
+                            "detail": "`30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`",
                         },
                         "finalPlan": {
                             "agent": {"reason": "에이전트 최신", "currentVersion": "2.0.0", "isLatest": True},

@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from boxer_company.routers.device_status_probe import (
+    _build_trashcan_storage_usage,
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
     _build_device_remote_access_probe_config_message,
@@ -15,17 +16,22 @@ from boxer_company.routers.device_status_probe import (
     _is_device_pm2_probe_request,
     _is_device_remote_access_probe_request,
     _is_device_status_probe_request,
+    _parse_count_value,
     _parse_device_path_list,
+    _parse_directory_usage,
+    _parse_disk_usage,
     _parse_pm2_memory_restart_values,
     _parse_pm2_processes,
     _parse_usb_devices,
     _probe_device_remote_access,
     _probe_device_status_overview,
     _render_device_status_overview_result,
+    _run_device_trashcan_cleanup,
     _summarize_captureboard_probe,
     _summarize_led_probe,
     _summarize_audio_path_probe,
     _summarize_pm2_probe,
+    _summarize_storage_probe,
 )
 
 
@@ -61,6 +67,12 @@ _PM2_JLIST_OUTPUT = """[
 _LSUSB_OUTPUT = """Bus 001 Device 002: ID 1a86:7523 QinHeng Electronics CH340 serial converter
 Bus 001 Device 003: ID 1164:f57a YUH01 HDMI capture
 """
+
+_DF_ROOT_OUTPUT = """Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/nvme0n1p2    488061244 128735836 334481104      28% /
+"""
+
+_DU_TRASHCAN_OUTPUT = "2981888\t/home/mommytalk/AppData/TrashCan\n"
 
 
 class DeviceStatusProbeRoutingTests(unittest.TestCase):
@@ -150,6 +162,73 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertEqual(parsed["values"], [4294967296])
         self.assertTrue(parsed["hasExpectedLimit"])
         self.assertIn("4.0 GB", parsed["display"])
+
+    def test_parses_root_disk_usage(self) -> None:
+        parsed = _parse_disk_usage(_DF_ROOT_OUTPUT)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["filesystem"], "/dev/nvme0n1p2")
+        self.assertEqual(parsed["mount"], "/")
+        self.assertEqual(parsed["usedPercent"], 28)
+        self.assertGreater(parsed["availableBytes"], 0)
+
+    def test_parses_trashcan_directory_usage(self) -> None:
+        parsed = _parse_directory_usage(_DU_TRASHCAN_OUTPUT)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["path"], "/home/mommytalk/AppData/TrashCan")
+        self.assertGreater(parsed["sizeBytes"], 0)
+
+    def test_summarizes_storage_as_fail_when_trashcan_share_exceeds_threshold(self) -> None:
+        summary = _summarize_storage_probe(
+            _build_trashcan_storage_usage(
+                filesystem_usage=_parse_disk_usage(
+                    "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                    "/dev/nvme0n1p2 102400000 35840000 66560000 35% /\n"
+                ),
+                directory_usage=_parse_directory_usage(
+                    "64000000\t/home/mommytalk/AppData/TrashCan\n"
+                ),
+                file_count=_parse_count_value("210"),
+                expired_file_count=_parse_count_value("45"),
+                cleanup_threshold_percent=60,
+                cleanup_age_days=30,
+            )
+        )
+
+        self.assertEqual(summary["status"], "fail")
+        self.assertEqual(summary["label"], "이상")
+        self.assertIn("AppData/TrashCan", summary["evidence"])
+        self.assertIn("30일 초과 `45개`", summary["evidence"])
+        self.assertIn("자동 정리 기준 `60%`", summary["summary"])
+        self.assertEqual(summary["diskLabel"], "정상")
+        self.assertEqual(summary["trashcanLabel"], "이상")
+        self.assertIn("경로 `/`", summary["diskOverviewDetail"])
+        self.assertIn("경로 `AppData/TrashCan`", summary["trashcanOverviewDetail"])
+
+    def test_marks_trashcan_cleanup_candidate_without_execute(self) -> None:
+        cleanup = _run_device_trashcan_cleanup(
+            {
+                "ssh": {"ready": True, "host": "127.0.0.1", "port": 22},
+                "overview": {
+                    "storage": {
+                        "directorySharePercent": 61.2,
+                        "expiredFileCount": 12,
+                        "fileCount": 100,
+                        "directorySizeBytes": 12 * 1024 * 1024 * 1024,
+                        "displayPath": "AppData/TrashCan",
+                    }
+                },
+            },
+            execute=False,
+            cleanup_threshold_percent=60,
+            cleanup_age_days=30,
+        )
+
+        self.assertEqual(cleanup["status"], "candidate")
+        self.assertEqual(cleanup["label"], "대상")
+        self.assertIn("기준 `60%` 초과", cleanup["detail"])
+        self.assertIn("`30일` 초과 `12개`", cleanup["detail"])
 
     def test_summarizes_captureboard_as_pass_with_usb_and_video_device(self) -> None:
         summary = _summarize_captureboard_probe(
@@ -249,6 +328,16 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "summary": "PM2 기준 mommybox-v2 와 mommybox-agent 앱이 정상 실행 중이야",
                 "overviewDetail": "mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online",
             },
+            storage_summary={
+                "label": "정상",
+                "status": "pass",
+                "summary": "TrashCan 용량은 아직 안정 범위야",
+                "overviewDetail": "경로 `AppData/TrashCan` / 폴더 `2.8 GB` (`0.6%`) / 파일 `167개` / 30일 초과 `0개`",
+                "diskLabel": "정상",
+                "diskOverviewDetail": "경로 `/` / 사용량 `28%` / 여유 `319.0 GB` / 전체 `465.5 GB` / 파일시스템 `/dev/nvme0n1p2`",
+                "trashcanLabel": "정상",
+                "trashcanOverviewDetail": "경로 `AppData/TrashCan` / 폴더 `2.8 GB` (`0.6%`) / 파일 `167개` / 30일 초과 `0개`",
+            },
             captureboard_summary={
                 "label": "정상",
                 "status": "pass",
@@ -271,6 +360,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
         self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
+        self.assertIn("• 디스크 용량: *정상* | 경로 `/` / 사용량 `28%` / 여유 `319.0 GB` / 전체 `465.5 GB` / 파일시스템 `/dev/nvme0n1p2`", rendered)
+        self.assertIn("• TrashCan 용량: *정상* | 경로 `AppData/TrashCan` / 폴더 `2.8 GB` (`0.6%`) / 파일 `167개` / 30일 초과 `0개`", rendered)
         self.assertIn("*하드웨어*", rendered)
         self.assertIn("• 캡처보드: *정상* | MDA 타입 `YUH01` / USB `YUH01` / /dev/video `1개`", rendered)
         self.assertIn("• LED: *정상* | LED USB 감지 / 시리얼 경로 `1개`", rendered)
@@ -293,6 +384,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
             ssh_reason="agent_ssh_not_ready",
             audio_summary=None,
             pm2_summary=None,
+            storage_summary=None,
             captureboard_summary=None,
             led_summary=None,
         )
@@ -300,6 +392,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• ping 전송 여부: 🔴 *실패* | 장비 offline", rendered)
         self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
+        self.assertIn("• 디스크 용량: *점검 불가*", rendered)
+        self.assertIn("• TrashCan 용량: *점검 불가*", rendered)
         self.assertIn("• 판단: 박서가 직접 ping도 못 보냈어. 장비 자체가 MDA 기준 offline이라 병원 네트워크나 장비 연결 문제를 먼저 봐야 해", rendered)
         self.assertIn("• 조치: 장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인한 뒤 다시 점검해", rendered)
 
@@ -319,12 +413,15 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
             ssh_reason="agent_ssh_not_ready",
             audio_summary=None,
             pm2_summary=None,
+            storage_summary=None,
             captureboard_summary=None,
             led_summary=None,
         )
 
         self.assertIn("• ping 전송 여부: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
         self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
+        self.assertIn("• 디스크 용량: *점검 불가*", rendered)
+        self.assertIn("• TrashCan 용량: *점검 불가*", rendered)
         self.assertIn("• 판단: 장비는 온라인인데 SSH 접속이 안 열려 있어 보여. 병원 네트워크 쪽 문제로 보는 게 맞고, 특히 SSH 방화벽이나 포트 제한 가능성이 커", rendered)
         self.assertIn("• 조치: 병원 쪽 방화벽, 포트 22 제한, 원격 접속 허용 정책을 확인해", rendered)
 
