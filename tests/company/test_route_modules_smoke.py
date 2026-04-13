@@ -235,6 +235,106 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(replies, ["*장비 로그 업로드 확인*\n• 결과: 테스트"])
 
+    def test_device_routes_handles_hospital_room_log_upload_check(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch(
+                "boxer_company_adapter_slack.device_routes._lookup_device_contexts_by_hospital_room",
+                return_value=[
+                    {
+                        "deviceName": "MB2-C00419",
+                        "hospitalName": "분당서울여성의원(성남)",
+                        "roomName": "초음파실1",
+                    }
+                ],
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._check_and_request_device_log_upload",
+                return_value=("*장비 로그 업로드 확인*\n• 결과: 테스트", {"route": "device_log_upload_check"}),
+            ),
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="분당서울여성의원(성남) / 초음파실1 로그 업로드 확인",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                DeviceRoutesDeps(
+                    get_s3_client=lambda: None,
+                    get_recordings_context=lambda: {},
+                    has_recordings_device_mapping=lambda context: False,
+                    send_dm_message=lambda user_id, text: False,
+                    build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*장비 로그 업로드 확인*\n• 결과: 테스트"])
+
+    def test_device_routes_recovers_hospital_room_log_upload_scope_from_thread(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch(
+                "boxer_company_adapter_slack.device_routes._load_slack_thread_context",
+                return_value="U1: 분당서울여성의원(성남) / 초음파실1 / 마미박스/전원",
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._lookup_device_contexts_by_hospital_room",
+                return_value=[
+                    {
+                        "deviceName": "MB2-C00419",
+                        "hospitalName": "분당서울여성의원(성남)",
+                        "roomName": "초음파실1",
+                    }
+                ],
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._check_and_request_device_log_upload",
+                return_value=("*장비 로그 업로드 확인*\n• 결과: 테스트", {"route": "device_log_upload_check"}),
+            ),
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="4월 11일 로그 업로드 확인해줘",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                DeviceRoutesDeps(
+                    get_s3_client=lambda: None,
+                    get_recordings_context=lambda: {},
+                    has_recordings_device_mapping=lambda context: False,
+                    send_dm_message=lambda user_id, text: False,
+                    build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*장비 로그 업로드 확인*\n• 결과: 테스트"])
+
     def test_knowledge_routes_returns_false_when_no_route_matches(self) -> None:
         with patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", ""):
             handled = _handle_knowledge_routes(

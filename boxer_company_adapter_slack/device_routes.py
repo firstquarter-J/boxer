@@ -6,6 +6,7 @@ import pymysql
 from botocore.exceptions import BotoCoreError, ClientError
 
 from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _load_slack_user_name, _set_request_log_route
+from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.core import settings as s
 from boxer_company import settings as cs
 from boxer_company.notion_playbooks import _select_notion_references
@@ -33,8 +34,12 @@ from boxer_company.routers.device_file_probe import (
     _should_render_compact_device_recovery_result,
 )
 from boxer_company.routers.device_log_upload import (
+    _build_device_log_upload_scope_ambiguous_reply,
+    _build_device_log_upload_scope_not_found_reply,
     _check_and_request_device_log_upload,
     _extract_device_name_for_log_upload,
+    _extract_hospital_room_scope_for_log_upload,
+    _extract_latest_hospital_room_scope_from_thread_context,
     _is_device_log_upload_check_request,
 )
 from boxer_company.routers.device_status_probe import (
@@ -120,6 +125,10 @@ def _handle_device_routes(
     barcode = context.barcode
     structured_device_name = _extract_device_name_scope(question)
     log_upload_device_name = _extract_device_name_for_log_upload(question) or structured_device_name
+    log_upload_hospital_name, log_upload_room_name = _extract_hospital_room_scope_for_log_upload(question)
+    if not (log_upload_hospital_name and log_upload_room_name):
+        log_upload_hospital_name = context.phase2_hospital_name
+        log_upload_room_name = context.phase2_room_name
     update_device_name = _extract_device_name_for_update(question) or structured_device_name
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
@@ -155,12 +164,57 @@ def _handle_device_routes(
             return True
         try:
             log_date, has_requested_date = _extract_log_date_with_presence(question)
+            resolved_device_name = log_upload_device_name
+            resolved_hospital_name = log_upload_hospital_name
+            resolved_room_name = log_upload_room_name
+
+            if not resolved_device_name and not (resolved_hospital_name and resolved_room_name):
+                thread_context = _load_slack_thread_context(
+                    context.client,
+                    context.logger,
+                    context.channel_id,
+                    context.thread_ts,
+                    context.payload.get("current_ts"),
+                )
+                if thread_context:
+                    resolved_hospital_name, resolved_room_name = _extract_latest_hospital_room_scope_from_thread_context(
+                        thread_context
+                    )
+
+            if not resolved_device_name and resolved_hospital_name and resolved_room_name:
+                device_contexts = _lookup_device_contexts_by_hospital_room(
+                    resolved_hospital_name,
+                    resolved_room_name,
+                )
+                if not device_contexts:
+                    context.reply(
+                        _build_device_log_upload_scope_not_found_reply(
+                            resolved_hospital_name,
+                            resolved_room_name,
+                        )
+                    )
+                    return True
+                if len(device_contexts) > 1:
+                    context.reply(
+                        _build_device_log_upload_scope_ambiguous_reply(
+                            resolved_hospital_name,
+                            resolved_room_name,
+                            device_contexts,
+                        )
+                    )
+                    return True
+                resolved_device_name = str(device_contexts[0].get("deviceName") or "").strip()
+
+            if not resolved_device_name:
+                context.reply("장비 로그 업로드 확인은 장비명이나 병원명/병실명이 필요해")
+                return True
+
             _set_request_log_route(
                 context.payload,
                 "device log upload check",
                 handler_type="router",
                 subject_type="device",
-                subject_key=log_upload_device_name,
+                subject_key=resolved_device_name,
                 requested_date=log_date,
             )
 
@@ -174,7 +228,7 @@ def _handle_device_routes(
             )
             result_text, _ = _check_and_request_device_log_upload(
                 deps.get_s3_client(),
-                log_upload_device_name or "",
+                resolved_device_name,
                 log_date,
                 has_requested_date=has_requested_date,
                 dispatch_device_command=command_dispatcher,
@@ -183,7 +237,7 @@ def _handle_device_routes(
             context.logger.info(
                 "Responded with device log upload check in thread_ts=%s deviceName=%s date=%s",
                 context.thread_ts,
-                log_upload_device_name,
+                resolved_device_name,
                 log_date,
             )
         except ValueError as exc:

@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from boxer_company.routers.barcode_log import _extract_device_name_scope
+from boxer_company.routers.barcode_log import _extract_device_name_scope, _extract_hospital_room_scope
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
 DeviceCommandDispatcher = Callable[[str, str], dict[str, Any]]
@@ -29,6 +29,8 @@ _DEVICE_LOG_UPLOAD_ACTION_HINTS = (
     "올려",
     "요청",
 )
+_HOSPITAL_HINT_TOKENS = ("병원", "의원", "클리닉", "센터")
+_ROOM_HINT_TOKENS = ("진료실", "병실", "초음파실", "분만실", "수술실", "상담실")
 
 
 def _normalize_device_log_upload_question(question: str) -> str:
@@ -38,6 +40,79 @@ def _normalize_device_log_upload_question(question: str) -> str:
 
 def _current_kst_date() -> str:
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+
+
+def _clean_log_upload_scope_value(value: str) -> str:
+    normalized = " ".join(str(value or "").split()).strip().strip("`'\"")
+    normalized = re.sub(r"(?<!\d)\d{11}(?!\d)", "", normalized)
+    normalized = re.sub(
+        r"\b(?:로그|업로드|확인해줘|확인해|확인|해줘|해주세요|부탁|요청|장비|마미박스|전원|운영)\b",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\b(?:today|check|upload|request|log|device)\b", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"(?<!\d)(20\d{2}|19\d{2})[-./]\d{1,2}[-./]\d{1,2}(?!\d)", " ", normalized)
+    normalized = re.sub(r"(?<!\d)\d{1,2}\s*월\s*\d{1,2}\s*일(?!\d)", " ", normalized)
+    normalized = re.sub(r"[/:|]+$", "", normalized)
+    return " ".join(normalized.split()).strip(" /")
+
+
+def _looks_like_hospital_name(value: str) -> bool:
+    normalized = _clean_log_upload_scope_value(value)
+    return bool(normalized) and any(token in normalized for token in _HOSPITAL_HINT_TOKENS)
+
+
+def _looks_like_room_name(value: str) -> bool:
+    normalized = _clean_log_upload_scope_value(value)
+    return bool(normalized) and any(token in normalized for token in _ROOM_HINT_TOKENS)
+
+
+def _extract_hospital_room_scope_for_log_upload(question: str) -> tuple[str | None, str | None]:
+    normalized = _normalize_device_log_upload_question(question)
+    hospital_name, room_name = _extract_hospital_room_scope(normalized)
+    hospital_name = _clean_log_upload_scope_value(hospital_name or "")
+    room_name = _clean_log_upload_scope_value(room_name or "")
+    if _looks_like_hospital_name(hospital_name) and _looks_like_room_name(room_name):
+        return hospital_name, room_name
+
+    slash_parts = [_clean_log_upload_scope_value(part) for part in re.split(r"\s*/\s*", normalized) if part.strip()]
+    for index, part in enumerate(slash_parts):
+        if not _looks_like_hospital_name(part):
+            continue
+        for candidate_room in slash_parts[index + 1 :]:
+            if _looks_like_room_name(candidate_room):
+                return part, candidate_room
+
+    compact_text = _clean_log_upload_scope_value(normalized)
+    if not compact_text:
+        return None, None
+    room_patterns = [
+        r"(?P<hospital>.+?)\s+(?P<room>(?:초음파실|진료실|병실|분만실|수술실|상담실)\S*)$",
+        r"(?P<hospital>.+?)\s+(?P<room>\S*(?:초음파실|진료실|병실|분만실|수술실|상담실)\S*)$",
+    ]
+    for pattern in room_patterns:
+        match = re.search(pattern, compact_text)
+        if not match:
+            continue
+        hospital_candidate = _clean_log_upload_scope_value(match.group("hospital"))
+        room_candidate = _clean_log_upload_scope_value(match.group("room"))
+        if _looks_like_hospital_name(hospital_candidate) and _looks_like_room_name(room_candidate):
+            return hospital_candidate, room_candidate
+
+    return None, None
+
+
+def _extract_latest_hospital_room_scope_from_thread_context(
+    thread_context: str,
+) -> tuple[str | None, str | None]:
+    lines = [line.strip() for line in (thread_context or "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        message = line.split(":", 1)[1].strip() if ":" in line else line
+        hospital_name, room_name = _extract_hospital_room_scope_for_log_upload(message)
+        if hospital_name and room_name:
+            return hospital_name, room_name
+    return None, None
 
 
 def _extract_device_name_for_log_upload(question: str) -> str | None:
@@ -58,10 +133,6 @@ def _extract_device_name_for_log_upload(question: str) -> str | None:
 
 
 def _is_device_log_upload_check_request(question: str, device_name: str | None = None) -> bool:
-    resolved_device_name = str(device_name or "").strip()
-    if not resolved_device_name:
-        return False
-
     text = _normalize_device_log_upload_question(question)
     lowered = text.lower()
     if not text:
@@ -174,3 +245,34 @@ def _check_and_request_device_log_upload(
     if dispatch_message:
         lines.append(f"• 이유: `{dispatch_message}`")
     return "\n".join(lines), payload
+
+
+def _build_device_log_upload_scope_not_found_reply(hospital_name: str, room_name: str) -> str:
+    return "\n".join(
+        [
+            "*장비 로그 업로드 확인*",
+            f"• 병원: `{hospital_name}`",
+            f"• 병실: `{room_name}`",
+            "• 결과: 해당 병원/병실로 장비를 찾지 못했어",
+            "• 안내: MDA에 표시된 병원명/병실명과 같게 다시 보내줘",
+        ]
+    )
+
+
+def _build_device_log_upload_scope_ambiguous_reply(
+    hospital_name: str,
+    room_name: str,
+    device_contexts: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "*장비 로그 업로드 확인*",
+        f"• 병원: `{hospital_name}`",
+        f"• 병실: `{room_name}`",
+        f"• 결과: 장비가 `{len(device_contexts)}개`라 하나로 못 정했어",
+        "• 장비명으로 다시 보내줘",
+    ]
+    for index, item in enumerate(device_contexts[:10], start=1):
+        device_name = str(item.get("deviceName") or "").strip()
+        if device_name:
+            lines.append(f"{index}. `{device_name}`")
+    return "\n".join(lines)

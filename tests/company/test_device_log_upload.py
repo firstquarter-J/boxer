@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 from boxer_company.routers.device_log_upload import (
     _check_and_request_device_log_upload,
+    _extract_hospital_room_scope_for_log_upload,
+    _extract_latest_hospital_room_scope_from_thread_context,
     _is_device_log_upload_check_request,
 )
 
@@ -21,6 +23,7 @@ class DeviceLogUploadRoutingTests(unittest.TestCase):
                 device_name="MB2-C00419",
             )
         )
+        self.assertTrue(_is_device_log_upload_check_request("4월 11일 로그 업로드 확인해줘"))
         self.assertFalse(
             _is_device_log_upload_check_request(
                 "MB2-C00419 pm2 상태",
@@ -32,6 +35,34 @@ class DeviceLogUploadRoutingTests(unittest.TestCase):
                 "s3 로그 MB2-C00419 2026-03-06",
                 device_name="MB2-C00419",
             )
+        )
+
+    def test_extracts_hospital_room_scope_for_slash_text(self) -> None:
+        self.assertEqual(
+            _extract_hospital_room_scope_for_log_upload(
+                "분당서울여성의원(성남) / 초음파실1 / 마미박스/전원"
+            ),
+            ("분당서울여성의원(성남)", "초음파실1"),
+        )
+        self.assertEqual(
+            _extract_hospital_room_scope_for_log_upload(
+                "분당서울여성의원(성남) / 초음파실1 로그 업로드 확인"
+            ),
+            ("분당서울여성의원(성남)", "초음파실1"),
+        )
+
+    def test_extracts_latest_hospital_room_scope_from_thread_context(self) -> None:
+        thread_context = "\n".join(
+            [
+                "U1: 안내 문구",
+                "U2: 분당서울여성의원(성남) / 초음파실1 / 마미박스/전원",
+                "U3: 4월 11일 로그 업로드 확인해줘",
+            ]
+        )
+
+        self.assertEqual(
+            _extract_latest_hospital_room_scope_from_thread_context(thread_context),
+            ("분당서울여성의원(성남)", "초음파실1"),
         )
 
 
