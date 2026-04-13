@@ -32,6 +32,11 @@ from boxer_company.routers.device_file_probe import (
     _should_render_compact_device_file_list,
     _should_render_compact_device_recovery_result,
 )
+from boxer_company.routers.device_log_upload import (
+    _check_and_request_device_log_upload,
+    _extract_device_name_for_log_upload,
+    _is_device_log_upload_check_request,
+)
 from boxer_company.routers.device_status_probe import (
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
@@ -62,6 +67,7 @@ from boxer_company.routers.device_update import (
     _request_device_agent_update,
     _request_device_box_update,
 )
+from boxer_company.routers.mda_graphql import _send_mda_device_command
 from boxer_company_adapter_slack.device_activity import (
     _collect_device_download_records,
     _log_device_download_activity,
@@ -113,6 +119,7 @@ def _handle_device_routes(
     question = context.question
     barcode = context.barcode
     structured_device_name = _extract_device_name_scope(question)
+    log_upload_device_name = _extract_device_name_for_log_upload(question) or structured_device_name
     update_device_name = _extract_device_name_for_update(question) or structured_device_name
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
@@ -140,6 +147,53 @@ def _handle_device_routes(
             context.thread_ts,
             len(notion_references),
         )
+        return True
+
+    if _is_device_log_upload_check_request(question, device_name=log_upload_device_name):
+        if not s.S3_QUERY_ENABLED:
+            context.reply("장비 로그 업로드 확인을 위해 S3_QUERY_ENABLED=true가 필요해")
+            return True
+        try:
+            log_date, has_requested_date = _extract_log_date_with_presence(question)
+            _set_request_log_route(
+                context.payload,
+                "device log upload check",
+                handler_type="router",
+                subject_type="device",
+                subject_key=log_upload_device_name,
+                requested_date=log_date,
+            )
+
+            def _dispatch_device_command(device_name: str, command: str) -> dict[str, Any]:
+                return _send_mda_device_command(device_name, command=command)
+
+            command_dispatcher = (
+                _dispatch_device_command
+                if cs.MDA_GRAPHQL_URL and cs.MDA_ADMIN_USER_PASSWORD
+                else None
+            )
+            result_text, _ = _check_and_request_device_log_upload(
+                deps.get_s3_client(),
+                log_upload_device_name or "",
+                log_date,
+                has_requested_date=has_requested_date,
+                dispatch_device_command=command_dispatcher,
+            )
+            context.reply(result_text)
+            context.logger.info(
+                "Responded with device log upload check in thread_ts=%s deviceName=%s date=%s",
+                context.thread_ts,
+                log_upload_device_name,
+                log_date,
+            )
+        except ValueError as exc:
+            context.reply(f"장비 로그 업로드 확인 요청 형식 오류: {exc}")
+        except (BotoCoreError, ClientError, RuntimeError) as exc:
+            context.logger.exception("Device log upload check failed")
+            context.reply(deps.build_dependency_failure_reply("장비 로그 업로드 확인", exc))
+        except Exception:
+            context.logger.exception("Device log upload check failed")
+            context.reply("장비 로그 업로드 확인 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if _is_barcode_device_file_probe_request(question, barcode):
