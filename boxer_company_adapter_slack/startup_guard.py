@@ -6,6 +6,8 @@ _EC2_HINT_FILES: tuple[tuple[Path, tuple[str, ...]], ...] = (
     (Path("/sys/hypervisor/uuid"), ("ec2",)),
     (Path("/sys/devices/virtual/dmi/id/product_uuid"), ("ec2",)),
     (Path("/sys/devices/virtual/dmi/id/product_name"), ("amazon ec2",)),
+    (Path("/sys/devices/virtual/dmi/id/board_vendor"), ("amazon ec2",)),
+    (Path("/sys/devices/virtual/dmi/id/sys_vendor"), ("amazon ec2",)),
 )
 
 _FORBIDDEN_EC2_AWS_ENV_KEYS: tuple[str, ...] = (

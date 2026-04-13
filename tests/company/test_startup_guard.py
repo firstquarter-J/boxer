@@ -4,6 +4,7 @@ from unittest.mock import patch
 from boxer_company_adapter_slack import company
 from boxer_company_adapter_slack.startup_guard import (
     _find_forbidden_ec2_aws_env_keys,
+    _looks_like_ec2_runtime,
     _validate_ec2_runtime_aws_env,
 )
 
@@ -59,6 +60,13 @@ class StartupGuardTests(unittest.TestCase):
                 company.create_app()
 
         guard.assert_called_once_with()
+
+    def test_detects_ec2_runtime_from_board_vendor_hint(self) -> None:
+        with patch(
+            "boxer_company_adapter_slack.startup_guard._read_runtime_hint",
+            side_effect=["", "", "", "amazon ec2", ""],
+        ):
+            self.assertTrue(_looks_like_ec2_runtime())
 
 
 if __name__ == "__main__":
