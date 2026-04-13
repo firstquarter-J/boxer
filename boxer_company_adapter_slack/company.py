@@ -91,6 +91,7 @@ from boxer_company_adapter_slack.weekly_reports import (
     _is_weekly_recordings_report_request,
 )
 from boxer_company_adapter_slack.weekly_recordings_reporter import attach_weekly_recordings_reporter
+from boxer_company_adapter_slack.startup_guard import _validate_ec2_runtime_aws_env
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
@@ -187,6 +188,7 @@ from boxer_company.routers.usage_help import (
 
 
 def create_app() -> App:
+    _validate_ec2_runtime_aws_env()
     _validate_tokens(include_llm=True, include_data_sources=True)
     claude_client = (
         Anthropic(
