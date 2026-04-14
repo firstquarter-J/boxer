@@ -176,7 +176,6 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
             patch(
@@ -309,7 +308,6 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 30),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
@@ -422,7 +420,6 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(

@@ -68,6 +68,7 @@ DEVICE_SSH_USER = os.getenv("DEVICE_SSH_USER", "mommytalk").strip()
 DEVICE_SSH_PASSWORD = os.getenv("DEVICE_SSH_PASSWORD", "").strip()
 DEVICE_SSH_CONNECT_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_CONNECT_TIMEOUT_SEC", "8"))
 DEVICE_SSH_COMMAND_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_COMMAND_TIMEOUT_SEC", "20"))
+DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC = int(os.getenv("DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC", "600"))
 DEVICE_FILE_TEMP_DIR = os.getenv("DEVICE_FILE_TEMP_DIR", "/tmp/boxer-device-files").strip()
 DEVICE_FILE_TEMP_RETENTION_SEC = int(os.getenv("DEVICE_FILE_TEMP_RETENTION_SEC", "86400"))
 DEVICE_FILE_SEARCH_PATHS = [
@@ -144,9 +145,6 @@ DAILY_DEVICE_ROUND_STATE_PATH = os.getenv(
     "DAILY_DEVICE_ROUND_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "daily_device_round_state.json"),
 ).strip()
-DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT = (
-    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
 DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX = (
     os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

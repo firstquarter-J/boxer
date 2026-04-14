@@ -183,7 +183,7 @@ def _run_daily_device_round_if_due(
     report_summary = _build_daily_device_round_summary(
         now=local_now,
         state=state,
-        auto_update_agent=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT),
+        auto_update_agent=True,
         auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
         auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
     )
