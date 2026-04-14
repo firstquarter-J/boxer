@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from boxer.core import settings as s
+from boxer.core.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
@@ -273,13 +274,52 @@ def _build_daily_device_round_report_text(
     *,
     now: datetime | None = None,
 ) -> str:
-    from boxer_company.daily_device_round import _format_daily_device_round_report
+    from boxer_company.daily_device_round import _format_daily_device_round_hospital_label
 
-    return _format_daily_device_round_report(
-        report_summary,
-        now=now,
-        include_title=False,
+    hospital_label = _format_daily_device_round_hospital_label(
+        report_summary.get("hospitalName"),
+        _coerce_int(report_summary.get("hospitalSeq")),
     )
+    status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
+    update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
+    cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
+    summary_line = _display_value(report_summary.get("summaryLine"), default="점검 결과")
+
+    if _coerce_int(report_summary.get("hospitalSeq")) is None:
+        return summary_line
+
+    executed_parts: list[str] = []
+
+    agent_updated = int(update_counts.get("agentUpdated") or 0)
+    agent_failed = int(update_counts.get("agentUpdateFailed") or 0)
+    box_updated = int(update_counts.get("boxUpdated") or 0)
+    box_failed = int(update_counts.get("boxUpdateFailed") or 0)
+    update_parts: list[str] = []
+    if agent_updated or agent_failed:
+        item = f"에이전트 {agent_updated}"
+        if agent_failed:
+            item = f"{item} 실패 {agent_failed}"
+        update_parts.append(item)
+    if box_updated or box_failed:
+        item = f"박스 {box_updated}"
+        if box_failed:
+            item = f"{item} 실패 {box_failed}"
+        update_parts.append(item)
+    if update_parts:
+        executed_parts.append("업데이트 " + " / ".join(update_parts))
+
+    cleanup_executed = int(cleanup_counts.get("executed") or 0)
+    cleanup_failed = int(cleanup_counts.get("failed") or 0)
+    if cleanup_executed or cleanup_failed:
+        cleanup_text = f"정리 실행 {cleanup_executed}"
+        if cleanup_failed:
+            cleanup_text = f"{cleanup_text} / 실패 {cleanup_failed}"
+        executed_parts.append(cleanup_text)
+
+    if executed_parts:
+        return f"{hospital_label} | {' | '.join(executed_parts)}"
+
+    return hospital_label
 
 
 def _daily_device_round_loop(client: Any, logger: logging.Logger) -> None:

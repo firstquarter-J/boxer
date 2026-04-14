@@ -12,6 +12,7 @@ from boxer_company.routers.device_update import (
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
+    _run_remote_ssh_command,
 )
 
 
@@ -431,6 +432,70 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         self.assertFalse(payload["agentGate"]["ok"])
         self.assertEqual(payload["agentGate"]["version"], "1.2.0")
         self.assertIn("에이전트 1.2.0", payload["agentGate"]["reason"])
+
+
+class _FakeSshChannel:
+    def __init__(self, exit_status: int) -> None:
+        self._exit_status = exit_status
+        self.closed = False
+
+    def recv_exit_status(self) -> int:
+        return self._exit_status
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSshStream:
+    def __init__(self, text: str, exit_status: int) -> None:
+        self._text = text
+        self.channel = _FakeSshChannel(exit_status)
+        self.closed = False
+
+    def read(self) -> bytes:
+        return self._text.encode("utf-8")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSshClient:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self._responses = list(responses)
+        self.streams: list[_FakeSshStream] = []
+
+    def exec_command(self, command: str, timeout: int | None = None):
+        del command, timeout
+        response = self._responses.pop(0)
+        exit_status = int(response.get("exit_status") or 0)
+        stdout = _FakeSshStream(str(response.get("stdout") or ""), exit_status)
+        stderr = _FakeSshStream(str(response.get("stderr") or ""), exit_status)
+        self.streams.extend([stdout, stderr])
+        return None, stdout, stderr
+
+
+class DeviceUpdateSshLifecycleTests(unittest.TestCase):
+    def test_closes_ssh_streams_after_command(self) -> None:
+        client = _FakeSshClient(
+            [
+                {
+                    "exit_status": 0,
+                    "stdout": "ok",
+                    "stderr": "",
+                }
+            ]
+        )
+
+        result = _run_remote_ssh_command(
+            client,
+            command="echo ok",
+            timeout_sec=5,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(client.streams), 2)
+        self.assertTrue(all(stream.closed for stream in client.streams))
+        self.assertTrue(all(stream.channel.closed for stream in client.streams))
 
 
 class DeviceUpdateActivityLogTests(unittest.TestCase):

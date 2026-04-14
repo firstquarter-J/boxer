@@ -3,7 +3,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from boxer.core import settings as s
-from boxer.core.utils import _display_value
+from boxer.core.utils import _display_value, _format_size
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as cs
 from boxer_company.routers.device_status_probe import (
@@ -546,6 +546,119 @@ def _format_daily_device_round_update_badge(status_kind: str, label: str) -> str
     return f"{icon} *{_display_value(label, default='확인 필요')}*"
 
 
+def _format_daily_device_round_status_badge(label: str) -> str:
+    normalized = _display_value(label, default="확인 필요")
+    icon_map = {
+        "정상": "🟢",
+        "확인 필요": "🟠",
+        "이상": "🔴",
+        "점검 불가": "⚫",
+    }
+    return f"{icon_map.get(normalized, '🟡')} *{normalized}*"
+
+
+def _format_daily_device_round_priority_badge(label: str) -> str:
+    normalized = _display_value(label, default="판단 보류")
+    icon_map = {
+        "높음": "🔴",
+        "중간": "🟠",
+        "낮음": "🟡",
+        "정상": "🟢",
+        "판단 보류": "⚫",
+    }
+    return f"{icon_map.get(normalized, '🟡')} *{normalized}*"
+
+
+def _format_daily_device_round_percent(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "미확인"
+
+    if numeric.is_integer():
+        return f"{int(numeric)}%"
+    return f"{numeric:.1f}%"
+
+
+def _build_daily_device_round_summary_lines(
+    report_summary: dict[str, Any],
+) -> list[str]:
+    status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
+    update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
+    cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
+
+    lines = [
+        f"• 🟢 정상 `{int(status_counts.get('정상') or 0)}`",
+        f"• 🟠 확인 필요 `{int(status_counts.get('확인 필요') or 0)}`",
+        f"• 🔴 이상 `{int(status_counts.get('이상') or 0)}`",
+        f"• ⚫ 점검 불가 `{int(status_counts.get('점검 불가') or 0)}`",
+    ]
+
+    update_parts: list[str] = []
+    agent_updated = int(update_counts.get("agentUpdated") or 0)
+    agent_failed = int(update_counts.get("agentUpdateFailed") or 0)
+    box_updated = int(update_counts.get("boxUpdated") or 0)
+    box_failed = int(update_counts.get("boxUpdateFailed") or 0)
+    if agent_updated or agent_failed:
+        part = f"에이전트 업데이트 성공 `{agent_updated}`"
+        if agent_failed:
+            part = f"{part} / 실패 `{agent_failed}`"
+        update_parts.append(part)
+    if box_updated or box_failed:
+        part = f"박스 업데이트 성공 `{box_updated}`"
+        if box_failed:
+            part = f"{part} / 실패 `{box_failed}`"
+        update_parts.append(part)
+    if update_parts:
+        lines.extend(f"• {part}" for part in update_parts)
+
+    cleanup_executed = int(cleanup_counts.get("executed") or 0)
+    cleanup_failed = int(cleanup_counts.get("failed") or 0)
+    if cleanup_executed or cleanup_failed:
+        cleanup_line = f"• 🧹 디스크 정리 실행 `{cleanup_executed}`"
+        if cleanup_failed:
+            cleanup_line = f"{cleanup_line} / 실패 `{cleanup_failed}`"
+        lines.append(cleanup_line)
+
+    return lines
+
+
+def _build_daily_device_round_summary_rich_text_block(
+    report_summary: dict[str, Any],
+) -> dict[str, Any]:
+    summary_items = []
+    for line in _build_daily_device_round_summary_lines(report_summary):
+        text = line[2:] if line.startswith("• ") else line
+        summary_items.append(
+            {
+                "type": "rich_text_section",
+                "elements": [
+                    {
+                        "type": "text",
+                        "text": text,
+                    }
+                ],
+            }
+        )
+
+    return {
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_list",
+                "style": "bullet",
+                "elements": summary_items,
+            },
+        ],
+    }
+
+
+def _is_daily_device_round_ssh_unavailable(device_result: dict[str, Any]) -> bool:
+    status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
+    ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
+    return bool(ssh_payload) and not bool(ssh_payload.get("ready"))
+
+
 def _describe_daily_device_round_trashcan_cleanup(
     device_result: dict[str, Any],
 ) -> tuple[str, str]:
@@ -571,20 +684,80 @@ def _build_daily_device_round_storage_details(status_payload: dict[str, Any]) ->
     }
 
 
-def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
+def _build_daily_device_round_issue_summary(device_result: dict[str, Any]) -> str:
     component_labels = device_result.get("componentLabels") if isinstance(device_result.get("componentLabels"), dict) else {}
+    issues: list[str] = []
+    for key in ("audio", "pm2", "storage", "captureboard", "led"):
+        label = _display_value(component_labels.get(key), default="")
+        if not label or label == "정상":
+            continue
+        issues.append(f"{_DAILY_DEVICE_ROUND_COMPONENT_NAMES.get(key, key)} {label}")
+
+    if issues:
+        return " / ".join(issues)
+
+    overall_label = _display_value(device_result.get("overallLabel"), default="확인 필요")
+    if overall_label != "정상":
+        return _display_value(device_result.get("priorityReason"), default="")
+    return ""
+
+
+def _build_daily_device_round_disk_detail(device_result: dict[str, Any]) -> str:
+    status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
+    overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
+    storage_payload = overview.get("storage") if isinstance(overview.get("storage"), dict) else {}
+    filesystem_used_percent = storage_payload.get("filesystemUsedPercent")
+    filesystem_available_bytes = int(storage_payload.get("filesystemAvailableBytes") or 0)
+    filesystem_size_bytes = int(storage_payload.get("filesystemSizeBytes") or 0)
+
+    parts: list[str] = []
+    if filesystem_used_percent is not None:
+        parts.append(f"사용량 `{_format_daily_device_round_percent(filesystem_used_percent)}`")
+    if filesystem_available_bytes > 0:
+        parts.append(f"여유 `{_format_size(filesystem_available_bytes)}`")
+    if filesystem_size_bytes > 0:
+        parts.append(f"전체 `{_format_size(filesystem_size_bytes)}`")
+
+    if parts:
+        return " / ".join(parts)
+
     storage_details = device_result.get("storageDetails") if isinstance(device_result.get("storageDetails"), dict) else {}
-    priority_label = _display_value(device_result.get("priorityLabel"), default="판단 보류")
-    priority_reason = _display_value(device_result.get("priorityReason"), default="네트워크 연결 불가로 이상 징후 판단 보류")
-    component_text = " | ".join(
-        [
-            f"`오디오 {component_labels.get('audio', '확인 필요')}`",
-            f"`pm2 {component_labels.get('pm2', '확인 필요')}`",
-            f"`용량 {component_labels.get('storage', '확인 필요')}`",
-            f"`캡처보드 {component_labels.get('captureboard', '확인 필요')}`",
-            f"`LED {component_labels.get('led', '확인 필요')}`",
-        ]
-    )
+    return _display_value(storage_details.get("diskDetail"), default="")
+
+
+def _build_daily_device_round_trashcan_detail(device_result: dict[str, Any]) -> str:
+    status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
+    overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
+    storage_payload = overview.get("storage") if isinstance(overview.get("storage"), dict) else {}
+    directory_size_bytes = int(storage_payload.get("directorySizeBytes") or 0)
+    directory_share_percent = storage_payload.get("directorySharePercent")
+    file_count = int(storage_payload.get("fileCount") or 0)
+    expired_file_count = int(storage_payload.get("expiredFileCount") or 0)
+    age_days = max(1, int(storage_payload.get("cleanupAgeDays") or cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS))
+
+    parts: list[str] = []
+    if directory_size_bytes > 0:
+        folder_part = f"폴더 `{_format_size(directory_size_bytes)}`"
+        if directory_share_percent is not None:
+            folder_part = f"{folder_part} (`{_format_daily_device_round_percent(directory_share_percent)}`)"
+        parts.append(folder_part)
+    elif directory_share_percent is not None:
+        parts.append(f"비중 `{_format_daily_device_round_percent(directory_share_percent)}`")
+    if file_count > 0:
+        parts.append(f"파일 `{file_count:,}개`")
+    if expired_file_count > 0:
+        parts.append(f"{age_days}일 초과 `{expired_file_count:,}개`")
+
+    if parts:
+        return " / ".join(parts)
+
+    storage_details = device_result.get("storageDetails") if isinstance(device_result.get("storageDetails"), dict) else {}
+    return _display_value(storage_details.get("trashcanDetail"), default="")
+
+
+def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
+    storage_details = device_result.get("storageDetails") if isinstance(device_result.get("storageDetails"), dict) else {}
+    overall_label = _display_value(device_result.get("overallLabel"), default="확인 필요")
     agent_status_kind, agent_status_label, agent_detail = _describe_daily_device_round_route_summary(
         device_result,
         route_kind="agent",
@@ -594,36 +767,46 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         route_kind="box",
     )
     cleanup_status, cleanup_detail = _describe_daily_device_round_trashcan_cleanup(device_result)
-    disk_label = _display_value(storage_details.get("diskLabel"), default=component_labels.get("storage", "확인 필요"))
-    disk_detail = _display_value(storage_details.get("diskDetail"), default="")
+    disk_label = _display_value(storage_details.get("diskLabel"), default="확인 필요")
+    disk_detail = _build_daily_device_round_disk_detail(device_result)
     trashcan_label = _display_value(
         storage_details.get("trashcanLabel"),
-        default=component_labels.get("storage", "확인 필요"),
+        default="확인 필요",
     )
-    trashcan_detail = _display_value(storage_details.get("trashcanDetail"), default="")
+    trashcan_detail = _build_daily_device_round_trashcan_detail(device_result)
     room_name = _display_value(device_result.get("roomName"), default="")
-    header = f"• *{_display_value(device_result.get('deviceName'), default='미확인')}*"
+    device_name = _display_value(device_result.get("deviceName"), default="미확인")
+    header_parts: list[str] = []
     if room_name and room_name != "미확인":
-        header = f"{header} `{room_name}`"
+        header_parts.append(f"*{room_name}*")
+    header_parts.append(f"*{device_name}*")
+    header_parts.append(_format_daily_device_round_status_badge(overall_label))
+    header = f"• {'  |  '.join(header_parts)}"
+
+    if _is_daily_device_round_ssh_unavailable(device_result):
+        return "\n".join(
+            [
+                header,
+                "  *안내*  ⚫ *장비 종료 또는 네트워크 연결 불가로 점검 불가*",
+            ]
+        )
+
+    issue_summary = _build_daily_device_round_issue_summary(device_result)
     disk_line = f"  *디스크 용량*  *{disk_label}*"
     if disk_detail:
         disk_line = f"{disk_line} | {disk_detail}"
     trashcan_line = f"  *TrashCan 용량*  *{trashcan_label}*"
     if trashcan_detail:
         trashcan_line = f"{trashcan_line} | {trashcan_detail}"
-    return "\n".join(
-        [
-            header,
-            f"  *상태*  *{_display_value(device_result.get('overallLabel'), default='확인 필요')}*",
-            f"  *우선순위*  *{priority_label}* | {priority_reason}",
-            f"  *점검*  {component_text}",
-            disk_line,
-            trashcan_line,
-            f"  *TrashCan 정리*  *{cleanup_status}* | {cleanup_detail}",
-            f"  *에이전트 업데이트*  {_format_daily_device_round_update_badge(agent_status_kind, agent_status_label)} | {agent_detail}",
-            f"  *박스 업데이트*  {_format_daily_device_round_update_badge(box_status_kind, box_status_label)} | {box_detail}",
-        ]
-    )
+    lines = [header]
+    if issue_summary:
+        lines.append(f"  *이슈*  {issue_summary}")
+    lines.extend([disk_line, trashcan_line])
+    if cleanup_status and cleanup_status != "꺼짐":
+        lines.append(f"  *디스크 정리*  *{cleanup_status}* | {cleanup_detail}")
+    lines.append(f"  *에이전트 업데이트*  {_format_daily_device_round_update_badge(agent_status_kind, agent_status_label)} | {agent_detail}")
+    lines.append(f"  *박스 업데이트*  {_format_daily_device_round_update_badge(box_status_kind, box_status_label)} | {box_detail}")
+    return "\n".join(lines)
 
 
 def _run_daily_device_round_for_device(
@@ -942,9 +1125,6 @@ def _format_daily_device_round_report(
     include_title: bool = True,
 ) -> str:
     local_now = _coerce_daily_device_round_now(now)
-    status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
-    update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
-    cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     device_results = report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
 
@@ -964,11 +1144,6 @@ def _format_daily_device_round_report(
             ),
             f"• 실행: `{local_now:%Y-%m-%d %H:%M:%S} KST`",
             (
-                f"• 자동 동작: 에이전트 업데이트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` / "
-                f"박스 업데이트 `{'켜짐' if report_summary.get('autoUpdateBox') else '꺼짐'}` / "
-                f"TrashCan 정리 `{'켜짐' if report_summary.get('autoCleanupTrashCan') else '꺼짐'}`"
-            ),
-            (
                 f"• 장비: `{int(report_summary.get('deviceCount') or 0)}대` "
                 f"(후보 `{int(report_summary.get('scheduledDeviceCount') or 0)}대`)"
             ),
@@ -979,27 +1154,7 @@ def _format_daily_device_round_report(
         lines.append(f"• 결과: {_display_value(report_summary.get('summaryLine'), default='점검 대상 병원이 없어')}")
         return "\n".join(lines)
 
-    lines.extend(
-        [
-            (
-                f"• 상태: 정상 `{int(status_counts.get('정상') or 0)}` / "
-                f"확인 필요 `{int(status_counts.get('확인 필요') or 0)}` / "
-                f"이상 `{int(status_counts.get('이상') or 0)}` / "
-                f"점검 불가 `{int(status_counts.get('점검 불가') or 0)}`"
-            ),
-            (
-                f"• 업데이트: 에이전트 성공 `{int(update_counts.get('agentUpdated') or 0)}` "
-                f"(대상 `{int(update_counts.get('agentCandidates') or 0)}`, 실패 `{int(update_counts.get('agentUpdateFailed') or 0)}`) / "
-                f"박스 성공 `{int(update_counts.get('boxUpdated') or 0)}` "
-                f"(대상 `{int(update_counts.get('boxCandidates') or 0)}`, 실패 `{int(update_counts.get('boxUpdateFailed') or 0)}`)"
-            ),
-            (
-                f"• 정리: 기준 초과 `{int(cleanup_counts.get('candidates') or 0)}` / "
-                f"실행 `{int(cleanup_counts.get('executed') or 0)}` / "
-                f"실패 `{int(cleanup_counts.get('failed') or 0)}`"
-            ),
-        ]
-    )
+    lines.extend(_build_daily_device_round_summary_lines(report_summary))
 
     if not device_results:
         lines.append("• 결과: 점검할 장비가 없어")
@@ -1024,9 +1179,6 @@ def _build_daily_device_round_blocks(
     include_header: bool = True,
 ) -> list[dict[str, Any]]:
     local_now = _coerce_daily_device_round_now(now)
-    status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
-    update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
-    cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     hospital_name = _display_value(report_summary.get("hospitalName"), default="미선정")
     device_results = report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
@@ -1060,12 +1212,7 @@ def _build_daily_device_round_blocks(
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": (
-                            f"발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | "
-                            f"에이전트 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` | "
-                            f"박스 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateBox') else '꺼짐'}` | "
-                            f"TrashCan 자동정리 `{'켜짐' if report_summary.get('autoCleanupTrashCan') else '꺼짐'}`"
-                        ),
+                        "text": f"발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | 장비 `{int(report_summary.get('deviceCount') or 0)}대`",
                     }
                 ],
             }
@@ -1079,9 +1226,7 @@ def _build_daily_device_round_blocks(
                         "type": "mrkdwn",
                         "text": (
                             f"병원 *{hospital_label}* | 발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | "
-                            f"에이전트 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateAgent') else '꺼짐'}` | "
-                            f"박스 자동업데이트 `{'켜짐' if report_summary.get('autoUpdateBox') else '꺼짐'}` | "
-                            f"TrashCan 자동정리 `{'켜짐' if report_summary.get('autoCleanupTrashCan') else '꺼짐'}`"
+                            f"장비 `{int(report_summary.get('deviceCount') or 0)}대`"
                         ),
                     }
                 ],
@@ -1100,35 +1245,7 @@ def _build_daily_device_round_blocks(
         )
         return blocks
 
-    blocks.append(
-        {
-            "type": "section",
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*상태*\n"
-                        f"정상 `{int(status_counts.get('정상') or 0)}` / "
-                        f"확인 필요 `{int(status_counts.get('확인 필요') or 0)}` / "
-                        f"이상 `{int(status_counts.get('이상') or 0)}` / "
-                        f"점검 불가 `{int(status_counts.get('점검 불가') or 0)}`"
-                    ),
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*업데이트*\n"
-                        f"에이전트 성공 `{int(update_counts.get('agentUpdated') or 0)}` "
-                        f"(대상 `{int(update_counts.get('agentCandidates') or 0)}`, 실패 `{int(update_counts.get('agentUpdateFailed') or 0)}`)\n"
-                        f"박스 성공 `{int(update_counts.get('boxUpdated') or 0)}` "
-                        f"(대상 `{int(update_counts.get('boxCandidates') or 0)}`, 실패 `{int(update_counts.get('boxUpdateFailed') or 0)}`)\n"
-                        f"정리 실행 `{int(cleanup_counts.get('executed') or 0)}` "
-                        f"(기준 초과 `{int(cleanup_counts.get('candidates') or 0)}`, 실패 `{int(cleanup_counts.get('failed') or 0)}`)"
-                    ),
-                },
-            ],
-        }
-    )
+    blocks.append(_build_daily_device_round_summary_rich_text_block(report_summary))
 
     if not device_results:
         blocks.append(
@@ -1143,15 +1260,6 @@ def _build_daily_device_round_blocks(
         return blocks
 
     blocks.append({"type": "divider"})
-    blocks.append(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*장비별 결과*",
-            },
-        }
-    )
     for item in device_results[:_DAILY_DEVICE_ROUND_MAX_DEVICE_LINES]:
         blocks.append(
             {

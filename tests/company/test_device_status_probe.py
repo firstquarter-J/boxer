@@ -26,6 +26,7 @@ from boxer_company.routers.device_status_probe import (
     _probe_device_remote_access,
     _probe_device_status_overview,
     _render_device_status_overview_result,
+    _run_remote_ssh_command,
     _run_device_trashcan_cleanup,
     _summarize_captureboard_probe,
     _summarize_led_probe,
@@ -728,18 +729,26 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
 class _FakeSshChannel:
     def __init__(self, exit_status: int) -> None:
         self._exit_status = exit_status
+        self.closed = False
 
     def recv_exit_status(self) -> int:
         return self._exit_status
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeSshStream:
     def __init__(self, text: str, exit_status: int) -> None:
         self._text = text
         self.channel = _FakeSshChannel(exit_status)
+        self.closed = False
 
     def read(self) -> bytes:
         return self._text.encode("utf-8")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeSshClient:
@@ -747,6 +756,7 @@ class _FakeSshClient:
         self._responses = list(responses)
         self.commands: list[str] = []
         self.closed = False
+        self.streams: list[_FakeSshStream] = []
 
     def exec_command(self, command: str, timeout: int | None = None):
         del timeout
@@ -755,10 +765,36 @@ class _FakeSshClient:
         exit_status = int(response.get("exit_status") or 0)
         stdout = _FakeSshStream(str(response.get("stdout") or ""), exit_status)
         stderr = _FakeSshStream(str(response.get("stderr") or ""), exit_status)
+        self.streams.extend([stdout, stderr])
         return None, stdout, stderr
 
     def close(self) -> None:
         self.closed = True
+
+
+class DeviceStatusProbeSshLifecycleTests(unittest.TestCase):
+    def test_closes_ssh_streams_after_command(self) -> None:
+        client = _FakeSshClient(
+            [
+                {
+                    "exit_status": 0,
+                    "stdout": "ok",
+                    "stderr": "",
+                }
+            ]
+        )
+
+        result = _run_remote_ssh_command(
+            client,
+            command="echo ok",
+            summary="테스트 명령",
+            timeout_sec=5,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(client.streams), 2)
+        self.assertTrue(all(stream.closed for stream in client.streams))
+        self.assertTrue(all(stream.channel.closed for stream in client.streams))
 
 
 if __name__ == "__main__":

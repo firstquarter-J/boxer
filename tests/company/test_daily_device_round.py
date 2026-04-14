@@ -497,6 +497,20 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                             "trashcanLabel": "정상",
                             "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `2.0 GB` (`0.9%`) / 파일 `20개` / 30일 초과 `0개`",
                         },
+                        "statusPayload": {
+                            "overview": {
+                                "storage": {
+                                    "filesystemUsedPercent": 12,
+                                    "filesystemAvailableBytes": 190 * 1024**3,
+                                    "filesystemSizeBytes": 218 * 1024**3,
+                                    "directorySizeBytes": 2 * 1024**3,
+                                    "directorySharePercent": 0.9,
+                                    "fileCount": 20,
+                                    "expiredFileCount": 0,
+                                    "cleanupAgeDays": 30,
+                                }
+                            }
+                        },
                         "trashcanCleanup": {
                             "label": "꺼짐",
                             "detail": "기준 `60%` 미만 | 현재 `12%`",
@@ -525,16 +539,19 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
 
         self.assertIn("일일 장비 순회 점검 & 업데이트 | #604 루이스산부인과의원(동작)", report_text)
         self.assertIn("*#604 루이스산부인과의원(동작)*", report_text)
-        self.assertIn("• 자동 동작: 에이전트 업데이트 `꺼짐` / 박스 업데이트 `꺼짐` / TrashCan 정리 `꺼짐`", report_text)
-        self.assertIn("• *MB2-C01431* `1진료실`", report_text)
-        self.assertIn("  *상태*  *정상*", report_text)
-        self.assertIn("  *우선순위*  *정상* | 원격 점검상 이상 징후 없음", report_text)
-        self.assertIn("  *점검*  `오디오 정상` | `pm2 정상` | `용량 정상` | `캡처보드 정상` | `LED 정상`", report_text)
-        self.assertIn("  *디스크 용량*  *정상* | 경로 `/` / 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB` / 파일시스템 `/dev/sda2`", report_text)
-        self.assertIn("  *TrashCan 용량*  *정상* | 경로 `AppData/TrashCan` / 폴더 `2.0 GB` (`0.9%`) / 파일 `20개` / 30일 초과 `0개`", report_text)
-        self.assertIn("• 업데이트: 에이전트 성공 `0` (대상 `0`, 실패 `0`) / 박스 성공 `0` (대상 `1`, 실패 `0`)", report_text)
-        self.assertIn("• 정리: 기준 초과 `0` / 실행 `0` / 실패 `0`", report_text)
-        self.assertIn("  *TrashCan 정리*  *꺼짐* | 기준 `60%` 미만 | 현재 `12%`", report_text)
+        self.assertNotIn("• 자동 동작:", report_text)
+        self.assertIn("• 🟢 정상 `1`", report_text)
+        self.assertIn("• 🟠 확인 필요 `0`", report_text)
+        self.assertIn("• 🔴 이상 `0`", report_text)
+        self.assertIn("• ⚫ 점검 불가 `0`", report_text)
+        self.assertNotIn("업데이트 성공", report_text)
+        self.assertNotIn("디스크 정리 실행", report_text)
+        self.assertIn("• *1진료실*  |  *MB2-C01431*  |  🟢 *정상*", report_text)
+        self.assertNotIn("*이슈*", report_text)
+        self.assertNotIn("*점검*", report_text)
+        self.assertIn("  *디스크 용량*  *정상* | 사용량 `12%` / 여유 `190.0 GB` / 전체 `218.0 GB`", report_text)
+        self.assertIn("  *TrashCan 용량*  *정상* | 폴더 `2.0 GB` (`0.9%`) / 파일 `20개`", report_text)
+        self.assertNotIn("*디스크 정리*", report_text)
         self.assertIn("  *에이전트 업데이트*  ⚪ *업데이트 불필요* | 버전 `2.0.0`", report_text)
         self.assertIn("  *박스 업데이트*  🟠 *업데이트 필요* | 박스 2.11.299 -> 2.11.300", report_text)
 
@@ -584,6 +601,20 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                             "trashcanLabel": "정상",
                             "trashcanDetail": "경로 `AppData/TrashCan` / 폴더 `9.0 GB` (`4.1%`) / 파일 `120개` / 30일 초과 `4개`",
                         },
+                        "statusPayload": {
+                            "overview": {
+                                "storage": {
+                                    "filesystemUsedPercent": 12,
+                                    "filesystemAvailableBytes": 190 * 1024**3,
+                                    "filesystemSizeBytes": 218 * 1024**3,
+                                    "directorySizeBytes": 9 * 1024**3,
+                                    "directorySharePercent": 4.1,
+                                    "fileCount": 120,
+                                    "expiredFileCount": 4,
+                                    "cleanupAgeDays": 30,
+                                }
+                            }
+                        },
                         "trashcanCleanup": {
                             "label": "성공",
                             "detail": "`30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`",
@@ -619,7 +650,91 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         )
 
+        self.assertIn("• 🟢 정상 `1`", report_text)
+        self.assertIn("• 🟠 확인 필요 `0`", report_text)
+        self.assertIn("• 🔴 이상 `0`", report_text)
+        self.assertIn("• ⚫ 점검 불가 `0`", report_text)
+        self.assertIn("• 박스 업데이트 성공 `1`", report_text)
+        self.assertIn("• 🧹 디스크 정리 실행 `1`", report_text)
+        self.assertIn("  *디스크 정리*  *성공* | `30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`", report_text)
+        self.assertIn("  *에이전트 업데이트*  ⚪ *업데이트 불필요* | 버전 `2.0.0`", report_text)
         self.assertIn("  *박스 업데이트*  🟢 *업데이트 완료* | `2.11.299` -> `2.11.300`", report_text)
+
+    def test_formats_ssh_unavailable_device_as_single_guidance_line(self) -> None:
+        report_text = rounder._format_daily_device_round_report(
+            {
+                "hospitalSeq": 24,
+                "hospitalName": "푸른산부인과의원(전주)",
+                "deviceCount": 1,
+                "scheduledDeviceCount": 1,
+                "autoUpdateAgent": False,
+                "autoUpdateBox": False,
+                "autoCleanupTrashCan": True,
+                "statusCounts": {"정상": 0, "확인 필요": 0, "이상": 0, "점검 불가": 1},
+                "updateCounts": {
+                    "agentCandidates": 0,
+                    "agentUpdated": 0,
+                    "agentUpdateFailed": 0,
+                    "boxCandidates": 0,
+                    "boxUpdated": 0,
+                    "boxUpdateFailed": 0,
+                },
+                "cleanupCounts": {
+                    "candidates": 0,
+                    "executed": 0,
+                    "failed": 0,
+                },
+                "deviceResults": [
+                    {
+                        "deviceName": "MB1-B00461",
+                        "roomName": "1진료실",
+                        "overallLabel": "점검 불가",
+                        "priorityLabel": "판단 보류",
+                        "priorityReason": "네트워크 연결 불가로 이상 징후 판단 보류",
+                        "componentLabels": {
+                            "audio": "확인 필요",
+                            "pm2": "확인 필요",
+                            "storage": "확인 필요",
+                            "captureboard": "확인 필요",
+                            "led": "확인 필요",
+                        },
+                        "storageDetails": {
+                            "diskLabel": "확인 필요",
+                            "diskDetail": "",
+                            "trashcanLabel": "확인 필요",
+                            "trashcanDetail": "",
+                        },
+                        "trashcanCleanup": {
+                            "label": "실행 불가",
+                            "detail": "SSH 연결 불가라 정리 판단을 못 했어",
+                        },
+                        "statusPayload": {
+                            "ssh": {"ready": False, "reason": "agent_ssh_not_ready"},
+                        },
+                        "finalPlan": {
+                            "agent": {"reason": "장비 agent 연결 끊김", "shouldUpdate": False},
+                            "box": {"reason": "장비 agent 연결 끊김", "shouldUpdate": False},
+                        },
+                        "agentAction": None,
+                        "boxAction": None,
+                    }
+                ],
+            },
+            now=datetime(2026, 4, 11, 0, 46, 43, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+        self.assertIn("• 🟢 정상 `0`", report_text)
+        self.assertIn("• 🟠 확인 필요 `0`", report_text)
+        self.assertIn("• 🔴 이상 `0`", report_text)
+        self.assertIn("• ⚫ 점검 불가 `1`", report_text)
+        self.assertNotIn("업데이트 성공", report_text)
+        self.assertNotIn("디스크 정리 실행", report_text)
+        self.assertIn("• *1진료실*  |  *MB1-B00461*  |  ⚫ *점검 불가*", report_text)
+        self.assertIn("  *안내*  ⚫ *장비 종료 또는 네트워크 연결 불가로 점검 불가*", report_text)
+        self.assertNotIn("*디스크 용량*", report_text)
+        self.assertNotIn("*디스크 정리*", report_text)
+        self.assertNotIn("*에이전트 업데이트*", report_text)
+        self.assertNotIn("*박스 업데이트*", report_text)
 
     def test_builds_blocks_with_separate_device_sections(self) -> None:
         blocks = rounder._build_daily_device_round_blocks(
@@ -732,13 +847,19 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertEqual(blocks[1]["type"], "header")
         self.assertEqual(blocks[1]["text"]["text"], "#604 루이스산부인과의원(동작)")
         self.assertEqual(blocks[2]["type"], "context")
+        self.assertIn("발송 `2026-04-08 22:00:00 KST` | 장비 `2대`", blocks[2]["elements"][0]["text"])
+        self.assertEqual(blocks[3]["type"], "rich_text")
+        self.assertEqual(blocks[3]["elements"][0]["type"], "rich_text_list")
+        self.assertEqual("🟢 정상 `2`", blocks[3]["elements"][0]["elements"][0]["elements"][0]["text"])
+        self.assertEqual("🟠 확인 필요 `0`", blocks[3]["elements"][0]["elements"][1]["elements"][0]["text"])
+        self.assertEqual("🔴 이상 `0`", blocks[3]["elements"][0]["elements"][2]["elements"][0]["text"])
+        self.assertEqual("⚫ 점검 불가 `0`", blocks[3]["elements"][0]["elements"][3]["elements"][0]["text"])
+        self.assertEqual("🧹 디스크 정리 실행 `1`", blocks[3]["elements"][0]["elements"][4]["elements"][0]["text"])
         self.assertEqual(blocks[4]["type"], "divider")
         self.assertEqual(blocks[5]["type"], "section")
-        self.assertEqual(blocks[5]["text"]["text"], "*장비별 결과*")
+        self.assertIn("*1진료실*  |  *MB2-C01431*  |  🟢 *정상*", blocks[5]["text"]["text"])
         self.assertEqual(blocks[6]["type"], "section")
-        self.assertIn("*MB2-C01431*", blocks[6]["text"]["text"])
-        self.assertEqual(blocks[7]["type"], "section")
-        self.assertIn("*MB2-C01432*", blocks[7]["text"]["text"])
+        self.assertIn("*2진료실*  |  *MB2-C01432*  |  🟢 *정상*", blocks[6]["text"]["text"])
 
 
 if __name__ == "__main__":

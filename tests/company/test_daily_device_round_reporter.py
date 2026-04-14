@@ -16,6 +16,56 @@ class _FakeSlackClient:
         return {"ts": f"2000.{len(self.messages):03d}"}
 
 
+class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
+    def test_builds_minimal_preview_text_with_only_cleanup(self) -> None:
+        text = reporter._build_daily_device_round_report_text(
+            {
+                "hospitalSeq": 24,
+                "hospitalName": "푸른산부인과의원(전주)",
+                "statusCounts": {"정상": 0, "확인 필요": 1, "이상": 0, "점검 불가": 1},
+                "updateCounts": {
+                    "agentUpdated": 0,
+                    "agentUpdateFailed": 0,
+                    "boxUpdated": 0,
+                    "boxUpdateFailed": 0,
+                },
+                "cleanupCounts": {
+                    "executed": 1,
+                    "failed": 0,
+                },
+            }
+        )
+
+        self.assertEqual(
+            text,
+            "#24 푸른산부인과의원(전주) | 정리 실행 1",
+        )
+
+    def test_builds_minimal_preview_text_with_update_and_cleanup_failures(self) -> None:
+        text = reporter._build_daily_device_round_report_text(
+            {
+                "hospitalSeq": 24,
+                "hospitalName": "푸른산부인과의원(전주)",
+                "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 1, "점검 불가": 0},
+                "updateCounts": {
+                    "agentUpdated": 1,
+                    "agentUpdateFailed": 0,
+                    "boxUpdated": 0,
+                    "boxUpdateFailed": 1,
+                },
+                "cleanupCounts": {
+                    "executed": 0,
+                    "failed": 1,
+                },
+            }
+        )
+
+        self.assertEqual(
+            text,
+            "#24 푸른산부인과의원(전주) | 업데이트 에이전트 1 / 박스 0 실패 1 | 정리 실행 0 / 실패 1",
+        )
+
+
 class DailyDeviceRoundReporterDueTests(unittest.TestCase):
     def test_clears_legacy_fixed_target_self_loop_on_new_window(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")

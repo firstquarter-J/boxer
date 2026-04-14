@@ -729,8 +729,11 @@ def _run_remote_ssh_command(
 ) -> dict[str, Any]:
     normalized_command = str(command or "").strip()
     actual_timeout = max(1, int(timeout_sec or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10))
+    stdin = None
+    stdout = None
+    stderr = None
     try:
-        _, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
+        stdin, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
         exit_status = stdout.channel.recv_exit_status()
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
         stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
@@ -756,6 +759,21 @@ def _run_remote_ssh_command(
             "output": "",
             "reason": type(exc).__name__.lower(),
         }
+    finally:
+        for stream in (stdin, stdout, stderr):
+            if stream is None:
+                continue
+            channel = getattr(stream, "channel", None)
+            try:
+                stream.close()
+            except Exception:
+                pass
+            if channel is None:
+                continue
+            try:
+                channel.close()
+            except Exception:
+                pass
 
 
 def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
