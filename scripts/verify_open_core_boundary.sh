@@ -45,7 +45,7 @@ check_absent \
 
 check_absent \
   "korea-specific defaults absent from open core" \
-  "Answer in Korean|Answer briefly in Korean|default=\"Asia/Seoul\"|or \"Asia/Seoul\"" \
+  "Answer in Korean|Answer briefly in Korean|default=\"Asia/Seoul\"|or \"Asia/Seoul\"|ap-northeast-2" \
   boxer/core boxer/context boxer/observability boxer/retrieval
 
 echo "[check] compileall"

@@ -95,7 +95,7 @@ DB_QUERY_MAX_SQL_CHARS = int(os.getenv("DB_QUERY_MAX_SQL_CHARS", "600"))
 DB_QUERY_MAX_RESULT_CHARS = int(os.getenv("DB_QUERY_MAX_RESULT_CHARS", "2500"))
 
 S3_QUERY_ENABLED = os.getenv("S3_QUERY_ENABLED", "").lower() in {"1", "true", "yes", "on"}
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+AWS_REGION = os.getenv("AWS_REGION", "").strip()
 S3_ULTRASOUND_BUCKET = os.getenv("S3_ULTRASOUND_BUCKET", "")
 S3_LOG_BUCKET = os.getenv("S3_LOG_BUCKET", "")
 S3_QUERY_TIMEOUT_SEC = int(os.getenv("S3_QUERY_TIMEOUT_SEC", "8"))

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+
+jobs:
+  boundary-check:
+    name: Open Core Boundary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Verify open core boundary
+        run: PYTHON_BIN=python ./scripts/verify_open_core_boundary.sh
+
+  open-source-tests:
+    name: Open Source Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build public-only checkout
+        run: |
+          public_root="/tmp/boxer-public-checkout"
+          rm -rf "${public_root}"
+          mkdir -p "${public_root}/tests"
+          cp pyproject.toml README.md LICENSE .env.example "${public_root}/"
+          cp -R boxer boxer_adapter_slack examples scripts "${public_root}/"
+          cp -R tests/open_source "${public_root}/tests/open_source"
+
+      - name: Install public packages only
+        working-directory: /tmp/boxer-public-checkout
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install -e ./boxer_adapter_slack
+
+      - name: Assert company packages are unavailable
+        working-directory: /tmp/boxer-public-checkout
+        run: |
+          python - <<'PY'
+          import importlib.util
+
+          for package_name in ("boxer_company", "boxer_company_adapter_slack"):
+              if importlib.util.find_spec(package_name) is not None:
+                  raise SystemExit(f"{package_name} must not be importable in open-source CI")
+          PY
+
+      - name: Run open-source tests
+        working-directory: /tmp/boxer-public-checkout
+        env:
+          BOXER_SKIP_DOTENV: "true"
+        run: python -m unittest discover -s tests/open_source -q
+
+  company-tests:
+    name: Company Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install all packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install -e ./boxer_adapter_slack
+          python -m pip install -e ./boxer_company
+          python -m pip install -e ./boxer_company_adapter_slack
+
+      - name: Run company tests
+        env:
+          BOXER_SKIP_DOTENV: "true"
+          AWS_REGION: ap-northeast-2
+        run: python -m unittest discover -s tests/company -q

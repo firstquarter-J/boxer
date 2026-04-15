@@ -9,14 +9,14 @@ class AdapterFactoryCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(factory.__module__, "boxer_adapter_slack.sample")
 
-    def test_keeps_company_entrypoint_in_company_package(self) -> None:
-        factory = load_entrypoint("boxer_company_adapter_slack.company:create_app")
+    def test_keeps_legacy_public_alias_pointing_to_sample_adapter(self) -> None:
+        factory = load_entrypoint("boxer.adapters.slack:create_app")
 
-        self.assertEqual(factory.__module__, "boxer_company_adapter_slack.company")
+        self.assertEqual(factory.__module__, "boxer_adapter_slack.sample")
 
-    def test_rejects_removed_legacy_company_entrypoint(self) -> None:
+    def test_rejects_invalid_entrypoint_format(self) -> None:
         with self.assertRaises(RuntimeError):
-            load_entrypoint("boxer.adapters.company.slack:create_app")
+            load_entrypoint("not-a-valid-entrypoint")
 
 
 if __name__ == "__main__":
