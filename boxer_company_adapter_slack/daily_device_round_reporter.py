@@ -16,10 +16,16 @@ from boxer_company.daily_device_round import (
     _coerce_daily_device_round_now,
     _coerce_int,
     _daily_device_round_timezone,
+    _format_daily_device_round_report,
 )
 
 _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
 _DAILY_DEVICE_ROUND_THREAD_LOCK = threading.Lock()
+_DAILY_DEVICE_ROUND_RUNTIME_STATE: dict[str, Any] = {}
+_DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK = threading.Lock()
+_DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
+_DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12000
+_DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
 
 
 def _daily_device_round_state_path() -> Path:
@@ -32,15 +38,21 @@ def _load_daily_device_round_state(
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     path = state_path or _daily_device_round_state_path()
+    runtime_state = _load_daily_device_round_runtime_state()
     if not path.exists():
-        return {}
+        return runtime_state
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         if logger is not None:
             logger.warning("일일 장비 순회 상태 파일을 읽지 못했어: %s", path, exc_info=True)
-        return {}
-    return data if isinstance(data, dict) else {}
+        return runtime_state
+    state = data if isinstance(data, dict) else {}
+    if runtime_state:
+        merged_state = dict(state)
+        merged_state.update(runtime_state)
+        return merged_state
+    return state
 
 
 def _save_daily_device_round_state(
@@ -53,6 +65,114 @@ def _save_daily_device_round_state(
         json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _load_daily_device_round_runtime_state() -> dict[str, Any]:
+    with _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
+        return dict(_DAILY_DEVICE_ROUND_RUNTIME_STATE)
+
+
+def _remember_daily_device_round_runtime_state(
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    normalized_state = _normalize_daily_device_round_state(state, now=now)
+    with _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
+        _DAILY_DEVICE_ROUND_RUNTIME_STATE.clear()
+        _DAILY_DEVICE_ROUND_RUNTIME_STATE.update(normalized_state)
+    return normalized_state
+
+
+def _persist_daily_device_round_state_best_effort(
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    normalized_state = _remember_daily_device_round_runtime_state(state, now=now)
+    try:
+        _save_daily_device_round_state(normalized_state)
+    except Exception:
+        if logger is not None:
+            logger.warning("일일 장비 순회 상태를 즉시 저장하지 못했어", exc_info=True)
+    return normalized_state
+
+
+def _estimate_daily_device_round_block_size(block: dict[str, Any]) -> int:
+    return len(json.dumps(block, ensure_ascii=False))
+
+
+def _split_daily_device_round_blocks(
+    blocks: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    chunks: list[list[dict[str, Any]]] = []
+    current_chunk: list[dict[str, Any]] = []
+    current_size = 0
+
+    for block in blocks:
+        block_size = _estimate_daily_device_round_block_size(block)
+        should_rotate = (
+            current_chunk
+            and (
+                len(current_chunk) >= _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE
+                or current_size + block_size > _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE
+            )
+        )
+        if should_rotate:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_size = 0
+        current_chunk.append(block)
+        current_size += block_size
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks or [[]]
+
+
+def _split_daily_device_round_text(
+    text: str,
+) -> list[str]:
+    normalized_text = str(text or "").strip()
+    if not normalized_text:
+        return [""]
+    if len(normalized_text) <= _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE:
+        return [normalized_text]
+
+    chunks: list[str] = []
+    current_chunk = ""
+    # Slack text fallback도 길이 제한을 넘지 않도록 줄 단위로 먼저 자르고,
+    # 한 줄이 너무 길면 그 줄만 다시 잘라서 이어 보내.
+    for line in normalized_text.split("\n"):
+        line_parts = [line] or [""]
+        if len(line) > _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE:
+            line_parts = [
+                line[index : index + _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE]
+                for index in range(0, len(line), _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE)
+            ]
+        for line_part in line_parts:
+            candidate = line_part if not current_chunk else f"{current_chunk}\n{line_part}"
+            if current_chunk and len(candidate) > _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE:
+                chunks.append(current_chunk)
+                current_chunk = line_part
+                continue
+            current_chunk = candidate
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def _build_daily_device_round_chunk_text(
+    base_text: str,
+    *,
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    if chunk_count <= 1:
+        return base_text
+    return f"{base_text} | 계속 {chunk_index + 1}/{chunk_count}"
 
 
 def _is_daily_device_round_runtime_configured() -> bool:
@@ -217,6 +337,7 @@ def _run_daily_device_round_if_due(
         "cleanupCounts": report_summary.get("cleanupCounts"),
     }
     if hospital_seq is None:
+        _remember_daily_device_round_runtime_state(next_state, now=local_now)
         _save_daily_device_round_state(next_state)
         logger.info(
             "Daily device round window paused channel=%s windowKey=%s reason=%s",
@@ -232,6 +353,7 @@ def _run_daily_device_round_if_due(
         now=local_now,
         include_header=False,
     )
+    message_block_chunks = _split_daily_device_round_blocks(message_blocks)
     thread_ts = str(state.get("windowThreadTs") or "").strip()
     thread_channel_id = str(state.get("windowThreadChannelId") or "").strip()
     if not thread_ts or thread_channel_id != channel_id:
@@ -246,15 +368,61 @@ def _run_daily_device_round_if_due(
         raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
     next_state["windowThreadTs"] = thread_ts
     next_state["windowThreadChannelId"] = channel_id
-
-    client.chat_postMessage(
-        channel=channel_id,
-        text=message_text,
-        blocks=message_blocks,
-        thread_ts=thread_ts,
-        unfurl_links=False,
-        unfurl_media=False,
+    # 본문 전송이 실패하더라도 다음 재시도에서 같은 제목 스레드를 재사용해.
+    _persist_daily_device_round_state_best_effort(
+        {
+            **state,
+            "windowKey": next_state.get("windowKey"),
+            "windowThreadTs": thread_ts,
+            "windowThreadChannelId": channel_id,
+            "channelId": channel_id,
+        },
+        now=local_now,
+        logger=logger,
     )
+
+    try:
+        for index, block_chunk in enumerate(message_block_chunks):
+            client.chat_postMessage(
+                channel=channel_id,
+                text=_build_daily_device_round_chunk_text(
+                    message_text,
+                    chunk_index=index,
+                    chunk_count=len(message_block_chunks),
+                ),
+                blocks=block_chunk,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+    except Exception:
+        # rich_text/section 길이 같은 block payload 오류가 나면 plain text 전체 리포트로라도 남겨.
+        logger.warning(
+            "일일 장비 순회 block 전송이 실패해서 text fallback으로 다시 보낼게 channel=%s thread_ts=%s hospitalSeq=%s",
+            channel_id,
+            thread_ts,
+            hospital_seq,
+            exc_info=True,
+        )
+        fallback_text_chunks = _split_daily_device_round_text(
+            _format_daily_device_round_report(
+                report_summary,
+                now=local_now,
+                include_title=False,
+            )
+        )
+        for index, text_chunk in enumerate(fallback_text_chunks):
+            text_body = text_chunk
+            if len(fallback_text_chunks) > 1:
+                text_body = f"(계속 {index + 1}/{len(fallback_text_chunks)})\n{text_chunk}"
+            client.chat_postMessage(
+                channel=channel_id,
+                text=text_body,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+    _remember_daily_device_round_runtime_state(next_state, now=local_now)
     _save_daily_device_round_state(next_state)
     logger.info(
         "Posted daily device round channel=%s hospitalSeq=%s hospitalName=%s deviceCount=%s windowKey=%s processed=%s/%s",

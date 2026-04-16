@@ -17,6 +17,10 @@ class _FakeSlackClient:
 
 
 class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
+            reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE.clear()
+
     def test_builds_minimal_preview_text_with_only_cleanup(self) -> None:
         text = reporter._build_daily_device_round_report_text(
             {
@@ -65,8 +69,18 @@ class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
             "#24 푸른산부인과의원(전주) | 업데이트 에이전트 1 / 박스 0 실패 1 | 정리 실행 0 / 실패 1",
         )
 
+    def test_splits_long_text_fallback_by_line_and_character_limit(self) -> None:
+        with patch.object(reporter, "_DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE", 10):
+            chunks = reporter._split_daily_device_round_text("12345678901\nabc")
+
+        self.assertEqual(chunks, ["1234567890", "1\nabc"])
+
 
 class DailyDeviceRoundReporterDueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
+            reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE.clear()
+
     def test_clears_legacy_fixed_target_self_loop_on_new_window(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")
 
@@ -134,6 +148,10 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
 
 
 class DailyDeviceRoundReporterRunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
+            reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE.clear()
+
     def test_posts_report_and_saves_window_state_when_due(self) -> None:
         client = _FakeSlackClient()
         logger = logging.getLogger("test.daily_device_round_reporter")
@@ -236,7 +254,21 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         self.assertEqual(client.messages[1]["channel"], "C_DAILY")
         self.assertEqual(client.messages[1]["text"], "daily round body")
         self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
-        save_state_mock.assert_called_once_with(
+        self.assertEqual(save_state_mock.call_count, 2)
+        self.assertEqual(
+            save_state_mock.call_args_list[0].args[0],
+            {
+                "windowKey": "2026-04-08",
+                "processedHospitalSeqs": [10],
+                "lastHospitalSeq": 10,
+                "nextHospitalSeq": 20,
+                "windowThreadTs": "2000.001",
+                "windowThreadChannelId": "C_DAILY",
+                "channelId": "C_DAILY",
+            },
+        )
+        self.assertEqual(
+            save_state_mock.call_args_list[1].args[0],
             {
                 "lastRunDate": "2026-04-08",
                 "lastHospitalSeq": 20,
@@ -347,7 +379,21 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         self.assertEqual(len(client.messages), 1)
         self.assertEqual(client.messages[0]["channel"], "C_DAILY")
         self.assertEqual(client.messages[0]["thread_ts"], "2000.777")
-        save_state_mock.assert_called_once_with(
+        self.assertEqual(save_state_mock.call_count, 2)
+        self.assertEqual(
+            save_state_mock.call_args_list[0].args[0],
+            {
+                "windowKey": "2026-04-08",
+                "processedHospitalSeqs": [10, 20],
+                "lastHospitalSeq": 20,
+                "nextHospitalSeq": 30,
+                "windowThreadTs": "2000.777",
+                "windowThreadChannelId": "C_DAILY",
+                "channelId": "C_DAILY",
+            },
+        )
+        self.assertEqual(
+            save_state_mock.call_args_list[1].args[0],
             {
                 "windowKey": "2026-04-08",
                 "processedHospitalSeqs": [10, 20, 30],
@@ -376,6 +422,263 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 },
             }
         )
+
+    def test_falls_back_to_plain_text_when_block_post_fails(self) -> None:
+        class _BlockFailingClient(_FakeSlackClient):
+            def chat_postMessage(self, **kwargs) -> dict[str, str]:
+                self.messages.append(kwargs)
+                if kwargs.get("blocks"):
+                    raise RuntimeError("invalid_blocks")
+                return {"ts": f"2000.{len(self.messages):03d}"}
+
+        client = _BlockFailingClient()
+        logger = logging.getLogger("test.daily_device_round_reporter")
+        local_now = datetime(2026, 4, 8, 22, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        summary = {
+            "runDate": "2026-04-08",
+            "hospitalSeq": 20,
+            "hospitalName": "B병원",
+            "deviceCount": 1,
+            "scheduledDeviceCount": 1,
+            "nextHospitalSeq": 30,
+            "candidateHospitalCount": 3,
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "updateCounts": {
+                "agentCandidates": 0,
+                "agentUpdated": 0,
+                "agentUpdateFailed": 0,
+                "boxCandidates": 0,
+                "boxUpdated": 0,
+                "boxUpdateFailed": 0,
+            },
+            "cleanupCounts": {
+                "candidates": 0,
+                "executed": 0,
+                "failed": 0,
+            },
+            "deviceResults": [],
+            "autoUpdateAgent": True,
+            "autoUpdateBox": False,
+            "autoCleanupTrashCan": False,
+        }
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
+                return_value=summary,
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
+                return_value="daily round body",
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
+                return_value=[{"type": "rich_text", "elements": []}],
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
+            ) as save_state_mock,
+        ):
+            sent = reporter._run_daily_device_round_if_due(
+                client,
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(len(client.messages), 3)
+        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
+        self.assertIn("blocks", client.messages[1])
+        self.assertEqual(client.messages[2]["thread_ts"], "2000.001")
+        self.assertNotIn("blocks", client.messages[2])
+        self.assertIn("B병원", client.messages[2]["text"])
+        save_state_mock.assert_called()
+
+    def test_splits_block_messages_when_chunk_limit_is_hit(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.daily_device_round_reporter")
+        local_now = datetime(2026, 4, 8, 22, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        summary = {
+            "runDate": "2026-04-08",
+            "hospitalSeq": 20,
+            "hospitalName": "B병원",
+            "deviceCount": 2,
+            "scheduledDeviceCount": 2,
+            "nextHospitalSeq": 30,
+            "candidateHospitalCount": 3,
+            "statusCounts": {"정상": 1, "확인 필요": 1, "이상": 0, "점검 불가": 0},
+            "updateCounts": {
+                "agentCandidates": 1,
+                "agentUpdated": 0,
+                "agentUpdateFailed": 0,
+                "boxCandidates": 1,
+                "boxUpdated": 0,
+                "boxUpdateFailed": 0,
+            },
+            "cleanupCounts": {
+                "candidates": 1,
+                "executed": 0,
+                "failed": 0,
+            },
+            "deviceResults": [],
+            "autoUpdateAgent": True,
+            "autoUpdateBox": False,
+            "autoCleanupTrashCan": True,
+        }
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
+                return_value=summary,
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
+                return_value="daily round body",
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
+                return_value=[
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "block-1"}},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "block-2"}},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "block-3"}},
+                ],
+            ),
+            patch.object(reporter, "_DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE", 1),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
+            ),
+        ):
+            sent = reporter._run_daily_device_round_if_due(
+                client,
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(len(client.messages), 4)
+        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[1]["text"], "daily round body | 계속 1/3")
+        self.assertEqual(client.messages[2]["text"], "daily round body | 계속 2/3")
+        self.assertEqual(client.messages[3]["text"], "daily round body | 계속 3/3")
+        self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
+        self.assertEqual(client.messages[2]["thread_ts"], "2000.001")
+        self.assertEqual(client.messages[3]["thread_ts"], "2000.001")
+
+    def test_reuses_runtime_thread_state_when_final_state_save_fails(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.daily_device_round_reporter")
+        local_now = datetime(2026, 4, 8, 22, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        first_summary = {
+            "runDate": "2026-04-08",
+            "hospitalSeq": 20,
+            "hospitalName": "B병원",
+            "deviceCount": 1,
+            "nextHospitalSeq": 30,
+            "candidateHospitalCount": 3,
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "updateCounts": {
+                "agentCandidates": 0,
+                "agentUpdated": 0,
+                "agentUpdateFailed": 0,
+                "boxCandidates": 0,
+                "boxUpdated": 0,
+                "boxUpdateFailed": 0,
+            },
+            "cleanupCounts": {
+                "candidates": 0,
+                "executed": 0,
+                "failed": 0,
+            },
+            "deviceResults": [],
+            "autoUpdateAgent": True,
+            "autoUpdateBox": False,
+            "autoCleanupTrashCan": False,
+        }
+        second_summary = {
+            **first_summary,
+            "hospitalSeq": 30,
+            "hospitalName": "C병원",
+            "nextHospitalSeq": 40,
+        }
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
+                side_effect=[first_summary, second_summary],
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
+                side_effect=["first body", "second body"],
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
+                return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "daily round block"}}],
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state",
+                side_effect=[
+                    RuntimeError("disk write failed"),
+                    RuntimeError("disk write failed"),
+                    None,
+                    None,
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "disk write failed"):
+                reporter._run_daily_device_round_if_due(
+                    client,
+                    logger,
+                    now=local_now,
+                )
+
+            sent = reporter._run_daily_device_round_if_due(
+                client,
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(len(client.messages), 3)
+        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
+        self.assertEqual(client.messages[2]["thread_ts"], "2000.001")
 
     def test_marks_window_completed_without_post_when_no_hospital_left(self) -> None:
         client = _FakeSlackClient()

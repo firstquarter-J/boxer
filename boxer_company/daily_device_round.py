@@ -20,7 +20,6 @@ from boxer_company.routers.device_update import (
 
 _DAILY_DEVICE_ROUND_TIMEZONE = ZoneInfo("Asia/Seoul")
 _DAILY_DEVICE_ROUND_TITLE = "일일 장비 순회 점검 & 업데이트"
-_DAILY_DEVICE_ROUND_MAX_DEVICE_LINES = 20
 _DAILY_DEVICE_ROUND_COMPONENT_NAMES = {
     "audio": "오디오",
     "pm2": "pm2",
@@ -587,38 +586,60 @@ def _build_daily_device_round_summary_lines(
     update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
     cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
 
-    lines = [
-        f"• 🟢 정상 `{int(status_counts.get('정상') or 0)}`",
-        f"• 🟠 확인 필요 `{int(status_counts.get('확인 필요') or 0)}`",
-        f"• 🔴 이상 `{int(status_counts.get('이상') or 0)}`",
-        f"• ⚫ 점검 불가 `{int(status_counts.get('점검 불가') or 0)}`",
-    ]
+    lines: list[str] = []
+    check_needed_count = int(status_counts.get("확인 필요") or 0)
+    failed_count = int(status_counts.get("이상") or 0)
+    unavailable_count = int(status_counts.get("점검 불가") or 0)
+    if check_needed_count:
+        lines.append(f"• 🟠 확인 필요 `{check_needed_count}`")
+    if failed_count:
+        lines.append(f"• 🔴 이상 `{failed_count}`")
+    if unavailable_count:
+        lines.append(f"• ⚫ 점검 불가 `{unavailable_count}`")
+    if not lines:
+        lines.append("• 🟢 문제 장비 없음")
 
-    update_parts: list[str] = []
     agent_updated = int(update_counts.get("agentUpdated") or 0)
     agent_failed = int(update_counts.get("agentUpdateFailed") or 0)
     box_updated = int(update_counts.get("boxUpdated") or 0)
     box_failed = int(update_counts.get("boxUpdateFailed") or 0)
-    if agent_updated or agent_failed:
-        part = f"에이전트 업데이트 성공 `{agent_updated}`"
-        if agent_failed:
-            part = f"{part} / 실패 `{agent_failed}`"
-        update_parts.append(part)
-    if box_updated or box_failed:
-        part = f"박스 업데이트 성공 `{box_updated}`"
-        if box_failed:
-            part = f"{part} / 실패 `{box_failed}`"
-        update_parts.append(part)
-    if update_parts:
-        lines.extend(f"• {part}" for part in update_parts)
+    agent_candidates = int(update_counts.get("agentCandidates") or 0)
+    box_candidates = int(update_counts.get("boxCandidates") or 0)
+    agent_pending = max(0, agent_candidates - agent_updated - agent_failed)
+    box_pending = max(0, box_candidates - box_updated - box_failed)
 
+    if agent_pending or agent_updated or agent_failed:
+        parts = []
+        if agent_pending:
+            parts.append(f"대상 `{agent_pending}`")
+        if agent_updated:
+            parts.append(f"성공 `{agent_updated}`")
+        if agent_failed:
+            parts.append(f"실패 `{agent_failed}`")
+        lines.append("• 에이전트 업데이트 " + " / ".join(parts))
+    if box_pending or box_updated or box_failed:
+        parts = []
+        if box_pending:
+            parts.append(f"대상 `{box_pending}`")
+        if box_updated:
+            parts.append(f"성공 `{box_updated}`")
+        if box_failed:
+            parts.append(f"실패 `{box_failed}`")
+        lines.append("• 박스 업데이트 " + " / ".join(parts))
+
+    cleanup_candidates = int(cleanup_counts.get("candidates") or 0)
     cleanup_executed = int(cleanup_counts.get("executed") or 0)
     cleanup_failed = int(cleanup_counts.get("failed") or 0)
-    if cleanup_executed or cleanup_failed:
-        cleanup_line = f"• 🧹 디스크 정리 실행 `{cleanup_executed}`"
+    cleanup_pending = max(0, cleanup_candidates - cleanup_executed - cleanup_failed)
+    if cleanup_pending or cleanup_executed or cleanup_failed:
+        parts = []
+        if cleanup_pending:
+            parts.append(f"대상 `{cleanup_pending}`")
+        if cleanup_executed:
+            parts.append(f"실행 `{cleanup_executed}`")
         if cleanup_failed:
-            cleanup_line = f"{cleanup_line} / 실패 `{cleanup_failed}`"
-        lines.append(cleanup_line)
+            parts.append(f"실패 `{cleanup_failed}`")
+        lines.append("• 🧹 디스크 정리 " + " / ".join(parts))
 
     return lines
 
@@ -657,6 +678,61 @@ def _is_daily_device_round_ssh_unavailable(device_result: dict[str, Any]) -> boo
     status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
     ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
     return bool(ssh_payload) and not bool(ssh_payload.get("ready"))
+
+
+def _is_daily_device_round_cleanup_actionable(device_result: dict[str, Any]) -> bool:
+    cleanup = device_result.get("trashcanCleanup") if isinstance(device_result.get("trashcanCleanup"), dict) else {}
+    if cleanup.get("required") or cleanup.get("executed"):
+        return True
+    status = _display_value(cleanup.get("status"), default="")
+    if status in {"failed", "unavailable", "candidate", "completed"}:
+        return True
+    label = _display_value(cleanup.get("label"), default="")
+    return label in {"실패", "실행 불가", "대상", "성공"}
+
+
+def _is_daily_device_round_route_actionable(
+    device_result: dict[str, Any],
+    *,
+    route_kind: str,
+) -> bool:
+    status_kind, _, _ = _describe_daily_device_round_route_summary(
+        device_result,
+        route_kind=route_kind,
+    )
+    if status_kind == "latest":
+        return False
+    if status_kind in {"success", "pending", "failed", "check"}:
+        return True
+    return bool(
+        device_result.get(f"{route_kind}Action")
+        if isinstance(device_result.get(f"{route_kind}Action"), dict)
+        else False
+    )
+
+
+def _is_daily_device_round_actionable_device(device_result: dict[str, Any]) -> bool:
+    overall_label = _display_value(device_result.get("overallLabel"), default="확인 필요")
+    if overall_label != "정상":
+        return True
+    if _is_daily_device_round_cleanup_actionable(device_result):
+        return True
+    if _is_daily_device_round_route_actionable(device_result, route_kind="agent"):
+        return True
+    if _is_daily_device_round_route_actionable(device_result, route_kind="box"):
+        return True
+    return False
+
+
+def _collect_daily_device_round_actionable_device_results(
+    device_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    # Slack 본문 길이를 줄이기 위해 문제 있거나 실제 작업이 있었던 장비만 남겨.
+    return [
+        item
+        for item in device_results
+        if isinstance(item, dict) and _is_daily_device_round_actionable_device(item)
+    ]
 
 
 def _describe_daily_device_round_trashcan_cleanup(
@@ -756,7 +832,6 @@ def _build_daily_device_round_trashcan_detail(device_result: dict[str, Any]) -> 
 
 
 def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
-    storage_details = device_result.get("storageDetails") if isinstance(device_result.get("storageDetails"), dict) else {}
     overall_label = _display_value(device_result.get("overallLabel"), default="확인 필요")
     agent_status_kind, agent_status_label, agent_detail = _describe_daily_device_round_route_summary(
         device_result,
@@ -767,13 +842,6 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         route_kind="box",
     )
     cleanup_status, cleanup_detail = _describe_daily_device_round_trashcan_cleanup(device_result)
-    disk_label = _display_value(storage_details.get("diskLabel"), default="확인 필요")
-    disk_detail = _build_daily_device_round_disk_detail(device_result)
-    trashcan_label = _display_value(
-        storage_details.get("trashcanLabel"),
-        default="확인 필요",
-    )
-    trashcan_detail = _build_daily_device_round_trashcan_detail(device_result)
     room_name = _display_value(device_result.get("roomName"), default="")
     device_name = _display_value(device_result.get("deviceName"), default="미확인")
     header_parts: list[str] = []
@@ -792,20 +860,23 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         )
 
     issue_summary = _build_daily_device_round_issue_summary(device_result)
-    disk_line = f"  *디스크 용량*  *{disk_label}*"
-    if disk_detail:
-        disk_line = f"{disk_line} | {disk_detail}"
-    trashcan_line = f"  *TrashCan 용량*  *{trashcan_label}*"
-    if trashcan_detail:
-        trashcan_line = f"{trashcan_line} | {trashcan_detail}"
     lines = [header]
     if issue_summary:
         lines.append(f"  *이슈*  {issue_summary}")
-    lines.extend([disk_line, trashcan_line])
-    if cleanup_status and cleanup_status != "꺼짐":
+    elif overall_label != "정상":
+        lines.append(
+            f"  *이슈*  {_display_value(device_result.get('priorityReason'), default='상세 확인 필요')}"
+        )
+    if _is_daily_device_round_cleanup_actionable(device_result):
         lines.append(f"  *디스크 정리*  *{cleanup_status}* | {cleanup_detail}")
-    lines.append(f"  *에이전트 업데이트*  {_format_daily_device_round_update_badge(agent_status_kind, agent_status_label)} | {agent_detail}")
-    lines.append(f"  *박스 업데이트*  {_format_daily_device_round_update_badge(box_status_kind, box_status_label)} | {box_detail}")
+    if _is_daily_device_round_route_actionable(device_result, route_kind="agent"):
+        lines.append(
+            f"  *에이전트 업데이트*  {_format_daily_device_round_update_badge(agent_status_kind, agent_status_label)} | {agent_detail}"
+        )
+    if _is_daily_device_round_route_actionable(device_result, route_kind="box"):
+        lines.append(
+            f"  *박스 업데이트*  {_format_daily_device_round_update_badge(box_status_kind, box_status_label)} | {box_detail}"
+        )
     return "\n".join(lines)
 
 
@@ -1127,6 +1198,7 @@ def _format_daily_device_round_report(
     local_now = _coerce_daily_device_round_now(now)
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     device_results = report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
+    actionable_device_results = _collect_daily_device_round_actionable_device_results(device_results)
 
     lines: list[str] = []
     if include_title:
@@ -1156,18 +1228,16 @@ def _format_daily_device_round_report(
 
     lines.extend(_build_daily_device_round_summary_lines(report_summary))
 
-    if not device_results:
-        lines.append("• 결과: 점검할 장비가 없어")
+    if not actionable_device_results:
+        lines.append("• 결과: 문제 있거나 작업한 장비가 없어")
         return "\n".join(lines)
 
     lines.append("")
-    lines.append("*장비별 결과*")
-    for index, item in enumerate(device_results[:_DAILY_DEVICE_ROUND_MAX_DEVICE_LINES]):
+    lines.append("*문제/작업 장비*")
+    for index, item in enumerate(actionable_device_results):
         if index > 0:
             lines.append("")
         lines.append(_build_daily_device_round_device_line(item))
-    if len(device_results) > _DAILY_DEVICE_ROUND_MAX_DEVICE_LINES:
-        lines.append(f"• 참고: 장비 `{_DAILY_DEVICE_ROUND_MAX_DEVICE_LINES}대`까지만 표시했어")
 
     return "\n".join(lines)
 
@@ -1182,6 +1252,7 @@ def _build_daily_device_round_blocks(
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     hospital_name = _display_value(report_summary.get("hospitalName"), default="미선정")
     device_results = report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
+    actionable_device_results = _collect_daily_device_round_actionable_device_results(device_results)
 
     blocks: list[dict[str, Any]] = []
     if include_header:
@@ -1247,20 +1318,20 @@ def _build_daily_device_round_blocks(
 
     blocks.append(_build_daily_device_round_summary_rich_text_block(report_summary))
 
-    if not device_results:
+    if not actionable_device_results:
         blocks.append(
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*결과*\n점검할 장비가 없어",
+                    "text": "*결과*\n문제 있거나 작업한 장비가 없어",
                 },
             }
         )
         return blocks
 
     blocks.append({"type": "divider"})
-    for item in device_results[:_DAILY_DEVICE_ROUND_MAX_DEVICE_LINES]:
+    for item in actionable_device_results:
         blocks.append(
             {
                 "type": "section",
@@ -1268,18 +1339,6 @@ def _build_daily_device_round_blocks(
                     "type": "mrkdwn",
                     "text": _build_daily_device_round_device_line(item),
                 },
-            }
-        )
-    if len(device_results) > _DAILY_DEVICE_ROUND_MAX_DEVICE_LINES:
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"장비 `{_DAILY_DEVICE_ROUND_MAX_DEVICE_LINES}대`까지만 표시",
-                    }
-                ],
             }
         )
     return blocks
