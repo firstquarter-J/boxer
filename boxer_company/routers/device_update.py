@@ -12,7 +12,6 @@ from boxer_company.routers.device_status_probe import _parse_pm2_processes
 from boxer_company.routers.mda_graphql import (
     _get_mda_device_detail,
     _get_mda_latest_device_version,
-    _update_mda_device_agent,
     _update_mda_device_box,
     _wait_for_mda_device_agent_ssh,
 )
@@ -79,8 +78,15 @@ _AGENT_GIT_STATUS_COMMAND = (
     "fi; "
     "else echo repo_missing; fi'"
 )
+_AGENT_INSTALL_SCRIPT_URL = "https://mmb-release.s3.ap-northeast-2.amazonaws.com/provision/install-agent.sh"
+_AGENT_INSTALL_SCRIPT_COMMAND = (
+    "bash -lc '"
+    f"cd /tmp && rm -f install-agent.sh && curl -fsSL -o install-agent.sh {_AGENT_INSTALL_SCRIPT_URL} && "
+    "bash install-agent.sh -f 1'"
+)
 _BOX_UPDATE_WAIT_TIMEOUT_SEC = 300
 _AGENT_UPDATE_WAIT_TIMEOUT_SEC = max(300, int(cs.DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC or 600))
+_AGENT_INSTALL_SCRIPT_TIMEOUT_SEC = max(120, _AGENT_UPDATE_WAIT_TIMEOUT_SEC)
 _UPDATE_POLL_INTERVAL_SEC = 5
 _AGENT_MINIMUM_FOR_BOX_UPDATE = (2, 0, 0)
 _BOX_PM2_NAMES = {"mommybox-v2"}
@@ -536,23 +542,36 @@ def _wait_for_box_update_completion(device_name: str, target_version: str) -> di
     }
 
 
-def _wait_for_agent_update_completion(device_name: str) -> dict[str, Any]:
+def _wait_for_agent_update_completion(
+    device_name: str,
+    *,
+    baseline_runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     deadline = time.monotonic() + _AGENT_UPDATE_WAIT_TIMEOUT_SEC
     attempts = 0
     last_state: dict[str, Any] = {}
+    baseline_parts = _parse_semver_parts(_resolve_agent_runtime_version(baseline_runtime or {}))
     while True:
         attempts += 1
         last_state = _read_agent_runtime_state(device_name)
         process = last_state.get("process") if isinstance(last_state.get("process"), dict) else {}
-        repo = last_state.get("repo") if isinstance(last_state.get("repo"), dict) else {}
         status = _display_value((process or {}).get("status"), default="").strip().lower()
-        if bool(repo.get("latest")) and status == "online":
+        current_version = _resolve_agent_runtime_version(last_state)
+        current_parts = _parse_semver_parts(current_version)
+        gate = _describe_agent_box_update_gate(last_state)
+        # install-agent 스크립트는 zip 재설치라 repo 최신 여부보다 PM2 online과 실행 가능 버전을 우선 본다.
+        ready = status == "online" and (
+            bool(gate.get("ok"))
+            if baseline_parts is None or baseline_parts < _AGENT_MINIMUM_FOR_BOX_UPDATE
+            else bool(current_parts)
+        )
+        if ready:
             return {
                 "ok": True,
                 "status": "completed",
                 "attempts": attempts,
                 "observedStatus": status,
-                "observedVersion": _display_value((process or {}).get("version"), default=""),
+                "observedVersion": current_version,
                 "runtime": last_state,
             }
         if time.monotonic() >= deadline:
@@ -568,6 +587,44 @@ def _wait_for_agent_update_completion(device_name: str) -> dict[str, Any]:
         "observedVersion": _display_value((process or {}).get("version"), default=""),
         "runtime": last_state,
     }
+
+
+def _dispatch_device_agent_install_script(device_name: str) -> dict[str, Any]:
+    device_info, ssh_state, client = _open_device_ssh_for_update(device_name)
+    dispatch_payload: dict[str, Any] = {
+        "affected": 0,
+        "status": False,
+        "message": "",
+        "method": "ssh_install_script",
+        "device": _build_device_snapshot(device_name, device_info),
+        "ssh": ssh_state,
+        "command": "install-agent.sh -f 1",
+    }
+    if client is None:
+        dispatch_payload["message"] = (
+            f"SSH로 install-agent 스크립트를 실행할 수 없어 (`{_display_value(ssh_state.get('reason'), default='unknown')}`)"
+        )
+        return dispatch_payload
+
+    try:
+        install_result = _run_remote_ssh_command(
+            client,
+            command=_AGENT_INSTALL_SCRIPT_COMMAND,
+            timeout_sec=_AGENT_INSTALL_SCRIPT_TIMEOUT_SEC,
+        )
+    finally:
+        client.close()
+
+    dispatch_payload["result"] = install_result
+    dispatch_payload["status"] = bool(install_result.get("ok"))
+    dispatch_payload["affected"] = 1 if dispatch_payload["status"] else 0
+    if dispatch_payload["status"]:
+        dispatch_payload["message"] = "install-agent 스크립트 실행 완료"
+    else:
+        dispatch_payload["message"] = (
+            f"install-agent 스크립트 실행 실패 (`{_display_value(install_result.get('reason'), default='unknown')}`)"
+        )
+    return dispatch_payload
 
 
 def _render_device_update_status_result(
@@ -774,7 +831,7 @@ def _request_device_agent_update(
     precheck_runtime = _read_agent_runtime_state(normalized_device_name)
     payload: dict[str, Any] = {
         "route": "device_agent_update",
-        "source": "mda_graphql+ssh",
+        "source": "mda_graphql+ssh_install_script",
         "request": {
             "deviceName": normalized_device_name,
             "requestedVersion": "latest",
@@ -805,12 +862,14 @@ def _request_device_agent_update(
     pre_repo = precheck_runtime.get("repo") if isinstance(precheck_runtime.get("repo"), dict) else {}
     if pre_repo:
         lines.append(f"• 에이전트 repo 사전 확인: `{_format_agent_repo_line(pre_repo)}`")
+    # 에이전트 업데이트는 install-agent 스크립트를 표준 실행 경로로 통일한다.
+    lines.append("• 실행 경로: `install-agent.sh -f 1`")
 
     pre_process = precheck_runtime.get("process") if isinstance(precheck_runtime.get("process"), dict) else {}
     if bool(pre_repo.get("latest")) and _display_value((pre_process or {}).get("status"), default="").strip().lower() == "online":
         payload["wait"] = {"status": "already_latest", "ok": True, "runtime": precheck_runtime}
         lines.append("• 결과: *생략*")
-        lines.append("• 안내: 이미 최신 `origin/main` 기준으로 실행 중이야")
+        lines.append("• 안내: 이미 최신 repo 기준으로 online 상태야")
         return "\n".join(lines), payload
 
     if not snapshot.get("isConnected"):
@@ -818,32 +877,39 @@ def _request_device_agent_update(
         lines.append("• 안내: 장비 agent 연결이 끊겨 있어. 장비 온라인 상태를 먼저 확인해")
         return "\n".join(lines), payload
 
-    dispatch_result = _update_mda_device_agent(normalized_device_name, force=False)
+    dispatch_result = _dispatch_device_agent_install_script(normalized_device_name)
     payload["dispatch"] = dispatch_result
     if not dispatch_result.get("status"):
         lines.append("• 결과: *요청 실패*")
-        lines.append(f"• MDA 응답: {_display_value(dispatch_result.get('message'), default='미확인')}")
+        lines.append(f"• SSH 스크립트 결과: {_display_value(dispatch_result.get('message'), default='미확인')}")
         return "\n".join(lines), payload
 
     if on_dispatched is not None:
         on_dispatched(_build_device_update_started_notice(payload))
 
-    wait_result = _wait_for_agent_update_completion(normalized_device_name)
+    wait_result = _wait_for_agent_update_completion(
+        normalized_device_name,
+        baseline_runtime=precheck_runtime,
+    )
     payload["wait"] = wait_result
     wait_runtime = wait_result.get("runtime") if isinstance(wait_result.get("runtime"), dict) else {}
     wait_repo = wait_runtime.get("repo") if isinstance(wait_runtime.get("repo"), dict) else {}
-    lines.append("• MDA 응답: 업데이트 요청 전송 완료")
+    wait_gate = _describe_agent_box_update_gate(wait_runtime)
+    lines.append("• SSH 스크립트: install-agent 스크립트 실행 완료")
     lines.append(
         f"• SSH 완료 확인: `{_format_pm2_process_line(wait_runtime.get('process'), 'mommybox-agent 미감지')}`"
     )
     lines.append(f"• 에이전트 repo 완료 확인: `{_format_agent_repo_line(wait_repo)}`")
     if wait_result.get("ok"):
         lines.append("• 결과: *완료*")
-        lines.append("• 안내: SSH 기준 agent repo가 `origin/main`과 일치하고 PM2도 online 상태야")
+        if wait_gate.get("ok"):
+            lines.append("• 안내: SSH 기준 agent가 online이고 박스 업데이트 가능한 버전이 확인됐어")
+        else:
+            lines.append("• 안내: SSH 기준 agent가 online이고 실행 버전이 확인됐어")
     else:
         lines.append("• 결과: *확인 필요*")
         lines.append(
-            f"• 안내: {_AGENT_UPDATE_WAIT_TIMEOUT_SEC}초 안에 `origin/main + online` 상태까지는 못 봤어. "
+            f"• 안내: {_AGENT_UPDATE_WAIT_TIMEOUT_SEC}초 안에 `online + 실행 버전 확인` 상태까지는 못 봤어. "
             f"`{normalized_device_name} 업데이트 상태`나 `{normalized_device_name} pm2 상태`로 다시 확인해"
         )
     return "\n".join(lines), payload

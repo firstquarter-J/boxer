@@ -313,14 +313,88 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             _request_device_agent_update("MB2-C00419 에이전트 업데이트 1.2.3")
 
     @patch("boxer_company.routers.device_update._wait_for_agent_update_completion")
-    @patch("boxer_company.routers.device_update._update_mda_device_agent")
+    @patch("boxer_company.routers.device_update._dispatch_device_agent_install_script")
+    @patch("boxer_company.routers.device_update._read_agent_runtime_state")
+    @patch("boxer_company.routers.device_update._get_mda_device_detail")
+    def test_dispatches_agent_update_via_install_script(
+        self,
+        mock_get_device_detail,
+        mock_read_agent_runtime_state,
+        mock_dispatch_device_agent_install_script,
+        mock_wait_for_agent_update_completion,
+    ) -> None:
+        mock_get_device_detail.return_value = {
+            "deviceName": "MB2-C00819",
+            "version": "",
+            "hospitalName": "통일산부인과의원(서초)",
+            "roomName": "2진료실",
+            "isConnected": True,
+        }
+        mock_read_agent_runtime_state.return_value = {
+            "ssh": {"ready": True, "reason": "ready"},
+            "process": {
+                "name": "mommybox-v2-agent",
+                "status": "online",
+                "version": "1.5.0",
+            },
+            "repo": {
+                "available": False,
+                "reason": "repo_missing",
+                "head": "",
+                "originMain": "",
+                "branch": "",
+                "packageVersion": "",
+                "latest": False,
+            },
+        }
+        mock_dispatch_device_agent_install_script.return_value = {
+            "affected": 1,
+            "status": True,
+            "message": "install-agent 스크립트 실행 완료",
+            "method": "ssh_install_script",
+        }
+        mock_wait_for_agent_update_completion.return_value = {
+            "ok": True,
+            "status": "completed",
+            "runtime": {
+                "process": {
+                    "name": "mommybox-v2-agent",
+                    "status": "online",
+                    "version": "2.0.0",
+                },
+                "repo": {
+                    "available": True,
+                    "reason": "ok",
+                    "head": "abcdef0",
+                    "originMain": "abcdef0",
+                    "branch": "main",
+                    "packageVersion": "2.0.0",
+                    "latest": True,
+                },
+            },
+        }
+
+        result_text, payload = _request_device_agent_update("MB2-C00819 에이전트 업데이트")
+
+        mock_dispatch_device_agent_install_script.assert_called_once_with("MB2-C00819")
+        mock_wait_for_agent_update_completion.assert_called_once_with(
+            "MB2-C00819",
+            baseline_runtime=mock_read_agent_runtime_state.return_value,
+        )
+        self.assertIn("install-agent.sh -f 1", result_text)
+        self.assertIn("SSH 스크립트", result_text)
+        self.assertEqual(payload["dispatch"]["method"], "ssh_install_script")
+        self.assertEqual(payload["source"], "mda_graphql+ssh_install_script")
+
+    @patch("boxer_company.routers.device_update._wait_for_agent_update_completion")
+    @patch("boxer_company.routers.device_update._dispatch_device_agent_install_script")
     @patch("boxer_company.routers.device_update._read_agent_runtime_state")
     @patch("boxer_company.routers.device_update._get_mda_device_detail")
     def test_sends_agent_update_progress_notice_after_dispatch(
         self,
         mock_get_device_detail,
         mock_read_agent_runtime_state,
-        mock_update_agent,
+        mock_dispatch_device_agent_install_script,
         mock_wait_for_agent_update_completion,
     ) -> None:
         mock_get_device_detail.return_value = {
@@ -347,10 +421,11 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
                 "latest": False,
             },
         }
-        mock_update_agent.return_value = {
+        mock_dispatch_device_agent_install_script.return_value = {
             "affected": 1,
             "status": True,
-            "message": "Agent update dispatched",
+            "message": "install-agent 스크립트 실행 완료",
+            "method": "ssh_install_script",
         }
         mock_wait_for_agent_update_completion.return_value = {
             "ok": True,

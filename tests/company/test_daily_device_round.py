@@ -174,6 +174,68 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertEqual(priority["label"], "중간")
         self.assertEqual(priority["reason"], "용량 확인 필요")
 
+    def test_builds_issue_line_with_component_summary_before_generic_reason(self) -> None:
+        device_line = rounder._build_daily_device_round_device_line(
+            {
+                "deviceName": "MB2-D00268",
+                "roomName": "4층 3진료실",
+                "overallLabel": "확인 필요",
+                "priorityReason": "용량 확인 필요",
+                "componentLabels": {
+                    "audio": "정상",
+                    "pm2": "정상",
+                    "storage": "확인 필요",
+                    "captureboard": "정상",
+                    "led": "정상",
+                },
+                "statusPayload": {
+                    "ssh": {"ready": True, "reason": "ready"},
+                    "overview": {
+                        "storage": {
+                            "status": "warning",
+                            "label": "확인 필요",
+                            "summary": "TrashCan 용량이 빠르게 커지고 있어",
+                            "directorySharePercent": 43.8,
+                            "directorySizeBytes": 95.6 * 1024**3,
+                            "expiredFileCount": 4520,
+                            "cleanupAgeDays": 30,
+                            "overviewDetail": "경로 `AppData/TrashCan` / 폴더 `95.6 GB` (43.8%) / 파일 `5728개` / 30일 초과 `4520개`",
+                        }
+                    },
+                },
+                "trashcanCleanup": {
+                    "status": "disabled",
+                    "label": "꺼짐",
+                    "detail": "기준 `60%` 미만 | 현재 `43.8%`",
+                    "required": False,
+                    "executed": False,
+                },
+                "finalPlan": {
+                    "agent": {
+                        "reason": "에이전트 정상",
+                        "currentVersion": "2.0.0",
+                        "isLatest": True,
+                        "shouldUpdate": False,
+                    },
+                    "box": {
+                        "reason": "박스 최신",
+                        "currentVersion": "2.11.300",
+                        "latestVersion": "2.11.300",
+                        "alreadyLatest": True,
+                        "shouldUpdate": False,
+                    },
+                },
+                "agentAction": None,
+                "boxAction": None,
+            }
+        )
+
+        self.assertIn(
+            "  *이슈*  TrashCan 용량이 빠르게 커지고 있어 | 현재 `43.8%` / 폴더 `95.6 GB` / `30일` 초과 `4,520개`",
+            device_line,
+        )
+        self.assertNotIn("  *이슈*  용량 확인 필요", device_line)
+
     def test_build_update_plan_falls_back_to_agent_runtime_gate(self) -> None:
         plan = rounder._build_daily_device_round_update_plan(
             {
@@ -206,9 +268,96 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         )
 
         self.assertTrue(plan["agent"]["isLatest"])
+        self.assertFalse(plan["agent"]["shouldUpdate"])
+        self.assertEqual(plan["agent"]["reason"], "에이전트 정상")
         self.assertTrue(plan["box"]["gateOk"])
         self.assertTrue(plan["box"]["shouldUpdate"])
         self.assertEqual(plan["box"]["reason"], "박스 2.11.299 -> 2.11.300")
+
+    def test_build_update_plan_does_not_repeat_agent_install_for_online_v2_runtime(self) -> None:
+        plan = rounder._build_daily_device_round_update_plan(
+            {
+                "device": {
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.299",
+                    "isConnected": True,
+                },
+                "latestVersion": "2.11.300",
+                "boxRuntime": {
+                    "process": {
+                        "name": "mommybox-v2",
+                        "status": "online",
+                        "version": "2.11.299",
+                    }
+                },
+                "agentRuntime": {
+                    "process": {
+                        "name": "mommybox-agent",
+                        "status": "online",
+                        "version": "2.0.0",
+                    },
+                    "repo": {
+                        "available": True,
+                        "latest": False,
+                        "packageVersion": "2.0.0",
+                    },
+                },
+                "agentGate": {
+                    "ok": True,
+                    "version": "2.0.0",
+                    "source": "pm2",
+                    "reason": "에이전트 2.0.0 확인돼서 박스 업데이트 진행 가능해",
+                    "minimumVersion": "2.0.0",
+                },
+            }
+        )
+
+        self.assertTrue(plan["agent"]["isHealthy"])
+        self.assertFalse(plan["agent"]["shouldUpdate"])
+        self.assertEqual(plan["agent"]["reason"], "에이전트 정상")
+
+    def test_build_update_plan_updates_agent_when_repo_missing_but_pm2_version_is_too_old(self) -> None:
+        plan = rounder._build_daily_device_round_update_plan(
+            {
+                "device": {
+                    "deviceName": "MB2-C00819",
+                    "version": "",
+                    "isConnected": True,
+                },
+                "latestVersion": "2.11.300",
+                "boxRuntime": {
+                    "process": {
+                        "name": "mommybox-v2",
+                        "status": "online",
+                        "version": "2.9.276",
+                    }
+                },
+                "agentRuntime": {
+                    "process": {
+                        "name": "mommybox-v2-agent",
+                        "status": "online",
+                        "version": "1.5.0",
+                    },
+                    "repo": {
+                        "available": False,
+                        "reason": "repo_missing",
+                        "packageVersion": "",
+                        "latest": False,
+                    },
+                },
+                "agentGate": {
+                    "ok": False,
+                    "version": "1.5.0",
+                    "source": "pm2",
+                    "reason": "에이전트 1.5.0라서 박스 업데이트를 막았어. 먼저 에이전트 2.0 이상으로 올려줘",
+                    "minimumVersion": "2.0.0",
+                },
+            }
+        )
+
+        self.assertTrue(plan["agent"]["shouldUpdate"])
+        self.assertEqual(plan["agent"]["reason"], "에이전트 1.5.0 업데이트 필요")
+        self.assertFalse(plan["box"]["shouldUpdate"])
 
     @patch("boxer_company.daily_device_round._request_device_box_update")
     @patch("boxer_company.daily_device_round._request_device_agent_update")
@@ -318,6 +467,131 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertEqual(result["agentActionText"], "에이전트 업데이트 완료")
         self.assertEqual(result["boxActionText"], "박스 업데이트 완료")
 
+    @patch("boxer_company.daily_device_round._request_device_agent_update")
+    @patch("boxer_company.daily_device_round._query_device_update_status")
+    @patch("boxer_company.daily_device_round._probe_device_status_overview")
+    def test_runs_agent_update_when_repo_missing_but_pm2_version_is_too_old(
+        self,
+        mock_probe_device_status_overview,
+        mock_query_device_update_status,
+        mock_request_device_agent_update,
+    ) -> None:
+        mock_probe_device_status_overview.return_value = (
+            "status text",
+            _build_status_payload(overall="정상"),
+        )
+        mock_query_device_update_status.side_effect = [
+            (
+                "initial update status",
+                {
+                    "device": {
+                        "deviceName": "MB2-C00819",
+                        "version": "",
+                        "hospitalName": "통일산부인과의원(서초)",
+                        "roomName": "2진료실",
+                        "isConnected": True,
+                    },
+                    "latestVersion": "2.11.300",
+                    "boxRuntime": {
+                        "process": {
+                            "name": "mommybox-v2",
+                            "status": "online",
+                            "version": "2.9.276",
+                        }
+                    },
+                    "agentRuntime": {
+                        "process": {
+                            "name": "mommybox-v2-agent",
+                            "status": "online",
+                            "version": "1.5.0",
+                        },
+                        "repo": {
+                            "available": False,
+                            "reason": "repo_missing",
+                            "packageVersion": "",
+                            "latest": False,
+                        },
+                    },
+                    "agentGate": {
+                        "ok": False,
+                        "version": "1.5.0",
+                        "source": "pm2",
+                        "reason": "에이전트 1.5.0라서 박스 업데이트를 막았어. 먼저 에이전트 2.0 이상으로 올려줘",
+                        "minimumVersion": "2.0.0",
+                    },
+                },
+            ),
+            (
+                "final update status",
+                {
+                    "device": {
+                        "deviceName": "MB2-C00819",
+                        "version": "",
+                        "hospitalName": "통일산부인과의원(서초)",
+                        "roomName": "2진료실",
+                        "isConnected": True,
+                    },
+                    "latestVersion": "2.11.300",
+                    "boxRuntime": {
+                        "process": {
+                            "name": "mommybox-v2",
+                            "status": "online",
+                            "version": "2.9.276",
+                        }
+                    },
+                    "agentRuntime": {
+                        "process": {
+                            "name": "mommybox-v2-agent",
+                            "status": "online",
+                            "version": "2.0.0",
+                        },
+                        "repo": {
+                            "available": False,
+                            "reason": "repo_missing",
+                            "packageVersion": "",
+                            "latest": False,
+                        },
+                    },
+                    "agentGate": {
+                        "ok": True,
+                        "version": "2.0.0",
+                        "source": "pm2",
+                        "reason": "에이전트 2.0.0 확인돼서 박스 업데이트 진행 가능해",
+                        "minimumVersion": "2.0.0",
+                    },
+                },
+            ),
+        ]
+        mock_request_device_agent_update.return_value = (
+            "agent update result",
+            {
+                "route": "device_agent_update",
+                "payload": {
+                    "precheck": {
+                        "process": {
+                            "version": "1.5.0",
+                        }
+                    },
+                },
+                "dispatch": {"status": True},
+                "wait": {"ok": True, "status": "completed"},
+            },
+        )
+
+        result = rounder._run_daily_device_round_for_device(
+            "MB2-C00819",
+            auto_update_agent=True,
+            auto_update_box=False,
+        )
+
+        mock_request_device_agent_update.assert_called_once_with(
+            "MB2-C00819 에이전트 업데이트",
+            device_name="MB2-C00819",
+        )
+        self.assertTrue(result["initialPlan"]["agent"]["shouldUpdate"])
+        self.assertEqual(result["initialPlan"]["agent"]["reason"], "에이전트 1.5.0 업데이트 필요")
+        self.assertTrue(result["agentAction"]["ok"])
+
 
 class DailyDeviceRoundSummaryTests(unittest.TestCase):
     @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
@@ -376,16 +650,16 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                     "executed": False,
                 },
                 "initialPlan": {
-                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
+                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 정상"},
                     "box": {"shouldUpdate": False, "alreadyLatest": True, "reason": "박스 최신"},
                 },
                 "finalPlan": {
-                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
+                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 정상"},
                     "box": {"shouldUpdate": False, "alreadyLatest": True, "reason": "박스 최신"},
                 },
                 "agentAction": None,
                 "boxAction": None,
-                "agentActionText": "에이전트 최신",
+                "agentActionText": "에이전트 정상",
                 "boxActionText": "박스 최신",
             },
             {
@@ -422,7 +696,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                     "box": {"shouldUpdate": False, "alreadyLatest": False, "reason": "선행조건 미충족"},
                 },
                 "finalPlan": {
-                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 최신"},
+                    "agent": {"shouldUpdate": False, "isLatest": True, "reason": "에이전트 정상"},
                     "box": {"shouldUpdate": True, "alreadyLatest": False, "reason": "박스 3.2.0 -> 3.2.10"},
                 },
                 "agentAction": {"ok": True, "status": "completed"},
@@ -517,7 +791,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                         },
                         "finalPlan": {
                             "agent": {
-                                "reason": "에이전트 최신",
+                                "reason": "에이전트 정상",
                                 "currentVersion": "2.0.0",
                                 "isLatest": True,
                             },
@@ -620,7 +894,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                         },
                         "finalPlan": {
                             "agent": {
-                                "reason": "에이전트 최신",
+                                "reason": "에이전트 정상",
                                 "currentVersion": "2.0.0",
                                 "isLatest": True,
                             },
@@ -782,7 +1056,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                             "detail": "기준 `60%` 미만 | 현재 `12%`",
                         },
                         "finalPlan": {
-                            "agent": {"reason": "에이전트 최신", "currentVersion": "2.0.0", "isLatest": True},
+                            "agent": {"reason": "에이전트 정상", "currentVersion": "2.0.0", "isLatest": True},
                             "box": {
                                 "reason": "박스 2.11.299 -> 2.11.300",
                                 "currentVersion": "2.11.299",
@@ -820,7 +1094,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
                             "detail": "`30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`",
                         },
                         "finalPlan": {
-                            "agent": {"reason": "에이전트 최신", "currentVersion": "2.0.0", "isLatest": True},
+                            "agent": {"reason": "에이전트 정상", "currentVersion": "2.0.0", "isLatest": True},
                             "box": {
                                 "reason": "박스 2.11.299 -> 2.11.300",
                                 "currentVersion": "2.11.299",
