@@ -1,7 +1,7 @@
 import logging
 import unittest
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from zoneinfo import ZoneInfo
 
 from boxer_company_adapter_slack import daily_device_round_reporter as reporter
@@ -95,6 +95,9 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
                     "lastHospitalSeq": 604,
                     "nextHospitalSeq": 604,
                     "lastRunDate": "2026-04-08",
+                    "activeHospitalSeq": 601,
+                    "activeHospitalName": "A병원",
+                    "activeDeviceIndex": 3,
                 },
                 now=datetime(2026, 4, 9, 22, 0, tzinfo=local_tz),
             )
@@ -105,6 +108,8 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
         self.assertEqual(normalized["processedHospitalSeqs"], [])
         self.assertEqual(normalized["windowThreadTs"], "")
         self.assertEqual(normalized["windowThreadChannelId"], "")
+        self.assertNotIn("activeHospitalSeq", normalized)
+        self.assertNotIn("activeDeviceIndex", normalized)
 
     def test_is_due_only_inside_overnight_window_until_completed(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")
@@ -241,6 +246,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             auto_update_agent=True,
             auto_update_box=False,
             auto_cleanup_trashcan=True,
+            progress_callback=ANY,
         )
         format_mock.assert_called_once_with(summary, now=local_now)
         blocks_mock.assert_called_once_with(
@@ -379,21 +385,9 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         self.assertEqual(len(client.messages), 1)
         self.assertEqual(client.messages[0]["channel"], "C_DAILY")
         self.assertEqual(client.messages[0]["thread_ts"], "2000.777")
-        self.assertEqual(save_state_mock.call_count, 2)
+        self.assertEqual(save_state_mock.call_count, 1)
         self.assertEqual(
             save_state_mock.call_args_list[0].args[0],
-            {
-                "windowKey": "2026-04-08",
-                "processedHospitalSeqs": [10, 20],
-                "lastHospitalSeq": 20,
-                "nextHospitalSeq": 30,
-                "windowThreadTs": "2000.777",
-                "windowThreadChannelId": "C_DAILY",
-                "channelId": "C_DAILY",
-            },
-        )
-        self.assertEqual(
-            save_state_mock.call_args_list[1].args[0],
             {
                 "windowKey": "2026-04-08",
                 "processedHospitalSeqs": [10, 20, 30],
@@ -679,6 +673,109 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
         self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
         self.assertEqual(client.messages[2]["thread_ts"], "2000.001")
+
+    def test_posts_title_and_saves_active_progress_before_hospital_finishes(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.daily_device_round_reporter")
+        local_now = datetime(2026, 4, 8, 22, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        summary = {
+            "runDate": "2026-04-08",
+            "hospitalSeq": 20,
+            "hospitalName": "B병원",
+            "deviceCount": 1,
+            "nextHospitalSeq": 30,
+            "candidateHospitalCount": 3,
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "updateCounts": {
+                "agentCandidates": 0,
+                "agentUpdated": 0,
+                "agentUpdateFailed": 0,
+                "boxCandidates": 0,
+                "boxUpdated": 0,
+                "boxUpdateFailed": 0,
+            },
+            "cleanupCounts": {
+                "candidates": 0,
+                "executed": 0,
+                "failed": 0,
+            },
+            "deviceResults": [],
+            "autoUpdateAgent": True,
+            "autoUpdateBox": False,
+            "autoCleanupTrashCan": False,
+        }
+
+        def _build_summary_side_effect(**kwargs):
+            progress_callback = kwargs["progress_callback"]
+            progress_callback(
+                "hospital_started",
+                {
+                    "hospitalSeq": 20,
+                    "hospitalName": "B병원",
+                    "deviceCount": 1,
+                    "startedAt": local_now.isoformat(),
+                },
+            )
+            self.assertEqual(len(client.messages), 1)
+            self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+            progress_callback(
+                "device_started",
+                {
+                    "hospitalSeq": 20,
+                    "hospitalName": "B병원",
+                    "deviceCount": 1,
+                    "deviceIndex": 1,
+                    "deviceName": "MB2-C00001",
+                    "updatedAt": local_now.isoformat(),
+                },
+            )
+            return summary
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
+                side_effect=_build_summary_side_effect,
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
+                return_value="daily round body",
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
+                return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "daily round block"}}],
+            ),
+            patch(
+                "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
+            ) as save_state_mock,
+        ):
+            sent = reporter._run_daily_device_round_if_due(
+                client,
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertGreaterEqual(save_state_mock.call_count, 4)
+        self.assertEqual(
+            save_state_mock.call_args_list[1].args[0]["activeHospitalSeq"],
+            20,
+        )
+        self.assertEqual(
+            save_state_mock.call_args_list[2].args[0]["activeDeviceIndex"],
+            1,
+        )
 
     def test_marks_window_completed_without_post_when_no_hospital_left(self) -> None:
         client = _FakeSlackClient()

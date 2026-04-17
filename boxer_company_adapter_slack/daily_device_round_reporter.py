@@ -26,6 +26,15 @@ _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK = threading.Lock()
 _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
 _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12000
 _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
+_DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS = (
+    "activeHospitalSeq",
+    "activeHospitalName",
+    "activeHospitalStartedAt",
+    "activeHospitalDeviceCount",
+    "activeDeviceIndex",
+    "activeDeviceName",
+    "activeDeviceUpdatedAt",
+)
 
 
 def _daily_device_round_state_path() -> Path:
@@ -97,6 +106,44 @@ def _persist_daily_device_round_state_best_effort(
         if logger is not None:
             logger.warning("일일 장비 순회 상태를 즉시 저장하지 못했어", exc_info=True)
     return normalized_state
+
+
+def _clear_daily_device_round_active_progress(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    next_state = dict(state if isinstance(state, dict) else {})
+    for key in _DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS:
+        next_state.pop(key, None)
+    return next_state
+
+
+def _merge_daily_device_round_active_progress(
+    state: dict[str, Any],
+    *,
+    hospital_seq: int | None,
+    hospital_name: str | None = None,
+    hospital_started_at: str | None = None,
+    hospital_device_count: int | None = None,
+    device_index: int | None = None,
+    device_name: str | None = None,
+    device_updated_at: str | None = None,
+) -> dict[str, Any]:
+    next_state = _clear_daily_device_round_active_progress(state)
+    if hospital_seq is None:
+        return next_state
+
+    next_state["activeHospitalSeq"] = int(hospital_seq)
+    next_state["activeHospitalName"] = str(hospital_name or "").strip()
+    next_state["activeHospitalStartedAt"] = str(hospital_started_at or "").strip()
+    if hospital_device_count is not None:
+        next_state["activeHospitalDeviceCount"] = max(0, int(hospital_device_count))
+    if device_index is not None:
+        next_state["activeDeviceIndex"] = max(1, int(device_index))
+    if device_name:
+        next_state["activeDeviceName"] = str(device_name).strip()
+    if device_updated_at:
+        next_state["activeDeviceUpdatedAt"] = str(device_updated_at).strip()
+    return next_state
 
 
 def _estimate_daily_device_round_block_size(block: dict[str, Any]) -> int:
@@ -228,12 +275,29 @@ def _normalize_daily_device_round_state(
     normalized_state["processedHospitalSeqs"] = _coerce_daily_device_round_hospital_seqs(
         state_payload.get("processedHospitalSeqs")
     )
+    active_hospital_seq = _coerce_int(state_payload.get("activeHospitalSeq"))
+    if active_hospital_seq is not None:
+        normalized_state["activeHospitalSeq"] = active_hospital_seq
+        normalized_state["activeHospitalName"] = str(state_payload.get("activeHospitalName") or "").strip()
+        normalized_state["activeHospitalStartedAt"] = str(state_payload.get("activeHospitalStartedAt") or "").strip()
+        active_hospital_device_count = _coerce_int(state_payload.get("activeHospitalDeviceCount"))
+        if active_hospital_device_count is not None and active_hospital_device_count > 0:
+            normalized_state["activeHospitalDeviceCount"] = active_hospital_device_count
+        active_device_index = _coerce_int(state_payload.get("activeDeviceIndex"))
+        if active_device_index is not None and active_device_index > 0:
+            normalized_state["activeDeviceIndex"] = active_device_index
+        active_device_name = str(state_payload.get("activeDeviceName") or "").strip()
+        if active_device_name:
+            normalized_state["activeDeviceName"] = active_device_name
+        active_device_updated_at = str(state_payload.get("activeDeviceUpdatedAt") or "").strip()
+        if active_device_updated_at:
+            normalized_state["activeDeviceUpdatedAt"] = active_device_updated_at
     if not current_window_key:
         normalized_state["windowKey"] = None
         normalized_state.pop("windowCompletedAt", None)
         normalized_state["windowThreadTs"] = ""
         normalized_state["windowThreadChannelId"] = ""
-        return normalized_state
+        return _clear_daily_device_round_active_progress(normalized_state)
 
     previous_window_key = str(state_payload.get("windowKey") or "").strip()
     normalized_state["windowKey"] = current_window_key
@@ -246,6 +310,7 @@ def _normalize_daily_device_round_state(
         # Clear that self-loop on a new window so the first run can rotate forward.
         if normalized_state.get("nextHospitalSeq") == normalized_state.get("lastHospitalSeq"):
             normalized_state["nextHospitalSeq"] = None
+        return _clear_daily_device_round_active_progress(normalized_state)
     return normalized_state
 
 
@@ -300,24 +365,119 @@ def _run_daily_device_round_if_due(
     if not _is_daily_device_round_due(local_now, state):
         return False
 
+    window_key = _daily_device_round_window_key(local_now)
+    thread_ts = str(state.get("windowThreadTs") or "").strip()
+    thread_channel_id = str(state.get("windowThreadChannelId") or "").strip()
+
+    def _ensure_daily_device_round_thread() -> str:
+        nonlocal state, thread_ts, thread_channel_id
+        if thread_ts and thread_channel_id == channel_id:
+            return thread_ts
+
+        title_response = client.chat_postMessage(
+            channel=channel_id,
+            text=_build_daily_device_round_window_title_text(local_now),
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        thread_ts = _extract_daily_device_round_thread_ts(title_response)
+        if not thread_ts:
+            raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+        thread_channel_id = channel_id
+        # 병원 점검이 오래 걸리더라도 제목 스레드는 먼저 확보해서 진행 상황이 보이게 해.
+        state = _persist_daily_device_round_state_best_effort(
+            {
+                **state,
+                "windowKey": window_key,
+                "windowThreadTs": thread_ts,
+                "windowThreadChannelId": channel_id,
+                "channelId": channel_id,
+            },
+            now=local_now,
+            logger=logger,
+        )
+        return thread_ts
+
+    def _persist_active_progress(
+        *,
+        hospital_seq: int | None,
+        hospital_name: str | None = None,
+        hospital_started_at: str | None = None,
+        hospital_device_count: int | None = None,
+        device_index: int | None = None,
+        device_name: str | None = None,
+        device_updated_at: str | None = None,
+    ) -> None:
+        nonlocal state
+        _ensure_daily_device_round_thread()
+        # 재시작 후에도 현재 병원/장비를 이어갈 수 있게 active progress를 중간 저장해.
+        state = _persist_daily_device_round_state_best_effort(
+            _merge_daily_device_round_active_progress(
+                {
+                    **state,
+                    "windowKey": window_key,
+                    "windowThreadTs": thread_ts,
+                    "windowThreadChannelId": channel_id,
+                    "channelId": channel_id,
+                },
+                hospital_seq=hospital_seq,
+                hospital_name=hospital_name,
+                hospital_started_at=hospital_started_at,
+                hospital_device_count=hospital_device_count,
+                device_index=device_index,
+                device_name=device_name,
+                device_updated_at=device_updated_at,
+            ),
+            now=local_now,
+            logger=logger,
+        )
+
+    def _handle_daily_device_round_progress(event: str, payload: dict[str, Any]) -> None:
+        if event == "hospital_started":
+            _persist_active_progress(
+                hospital_seq=_coerce_int(payload.get("hospitalSeq")),
+                hospital_name=_display_value(payload.get("hospitalName"), default=""),
+                hospital_started_at=_display_value(payload.get("startedAt"), default=""),
+                hospital_device_count=_coerce_int(payload.get("deviceCount")),
+            )
+            return
+        if event == "device_started":
+            _persist_active_progress(
+                hospital_seq=_coerce_int(payload.get("hospitalSeq")),
+                hospital_name=_display_value(
+                    payload.get("hospitalName"),
+                    default=_display_value(state.get("activeHospitalName"), default=""),
+                ),
+                hospital_started_at=_display_value(
+                    state.get("activeHospitalStartedAt"),
+                    default=_display_value(payload.get("updatedAt"), default=""),
+                ),
+                hospital_device_count=_coerce_int(payload.get("deviceCount")),
+                device_index=_coerce_int(payload.get("deviceIndex")),
+                device_name=_display_value(payload.get("deviceName"), default=""),
+                device_updated_at=_display_value(payload.get("updatedAt"), default=""),
+            )
+
     report_summary = _build_daily_device_round_summary(
         now=local_now,
         state=state,
         auto_update_agent=True,
         auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
         auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
+        progress_callback=_handle_daily_device_round_progress,
     )
+    base_state = _clear_daily_device_round_active_progress(state)
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
-    processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(state.get("processedHospitalSeqs"))
+    processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(base_state.get("processedHospitalSeqs"))
     if hospital_seq is not None and hospital_seq not in processed_hospital_seqs:
         processed_hospital_seqs.append(hospital_seq)
     candidate_hospital_count = max(0, int(report_summary.get("candidateHospitalCount") or 0))
     next_state = {
-        **state,
-        "windowKey": _daily_device_round_window_key(local_now),
+        **base_state,
+        "windowKey": window_key,
         "processedHospitalSeqs": processed_hospital_seqs,
-        "windowThreadTs": str(state.get("windowThreadTs") or "").strip(),
-        "windowThreadChannelId": str(state.get("windowThreadChannelId") or "").strip(),
+        "windowThreadTs": thread_ts,
+        "windowThreadChannelId": thread_channel_id,
         "windowCompletedAt": (
             local_now.isoformat()
             if hospital_seq is None or (
@@ -354,32 +514,9 @@ def _run_daily_device_round_if_due(
         include_header=False,
     )
     message_block_chunks = _split_daily_device_round_blocks(message_blocks)
-    thread_ts = str(state.get("windowThreadTs") or "").strip()
-    thread_channel_id = str(state.get("windowThreadChannelId") or "").strip()
-    if not thread_ts or thread_channel_id != channel_id:
-        title_response = client.chat_postMessage(
-            channel=channel_id,
-            text=_build_daily_device_round_window_title_text(local_now),
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        thread_ts = _extract_daily_device_round_thread_ts(title_response)
-    if not thread_ts:
-        raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+    thread_ts = _ensure_daily_device_round_thread()
     next_state["windowThreadTs"] = thread_ts
     next_state["windowThreadChannelId"] = channel_id
-    # 본문 전송이 실패하더라도 다음 재시도에서 같은 제목 스레드를 재사용해.
-    _persist_daily_device_round_state_best_effort(
-        {
-            **state,
-            "windowKey": next_state.get("windowKey"),
-            "windowThreadTs": thread_ts,
-            "windowThreadChannelId": channel_id,
-            "channelId": channel_id,
-        },
-        now=local_now,
-        logger=logger,
-    )
 
     try:
         for index, block_chunk in enumerate(message_block_chunks):

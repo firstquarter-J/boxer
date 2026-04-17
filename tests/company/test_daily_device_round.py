@@ -143,6 +143,25 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
         self.assertEqual(selected["hospitalSeq"], 30)
         self.assertIsNone(completed)
 
+    def test_prefers_active_hospital_before_next_hospital(self) -> None:
+        candidates = [
+            {"hospitalSeq": 10, "hospitalName": "A", "deviceCount": 2},
+            {"hospitalSeq": 20, "hospitalName": "B", "deviceCount": 3},
+            {"hospitalSeq": 30, "hospitalName": "C", "deviceCount": 1},
+        ]
+
+        selected = rounder._select_daily_device_round_hospital(
+            candidates,
+            state={
+                "lastHospitalSeq": 10,
+                "nextHospitalSeq": 30,
+                "processedHospitalSeqs": [10],
+                "activeHospitalSeq": 20,
+            },
+        )
+
+        self.assertEqual(selected["hospitalSeq"], 20)
+
 
 class DailyDeviceRoundExecutionTests(unittest.TestCase):
     def test_defers_priority_when_network_is_unavailable(self) -> None:
@@ -724,6 +743,59 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertEqual(summary["cleanupCounts"]["candidates"], 1)
         self.assertEqual(summary["cleanupCounts"]["executed"], 1)
         self.assertEqual(summary["nextHospitalSeq"], 10)
+
+    @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_devices")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_hospital_candidates")
+    def test_emits_progress_callback_before_processing_devices(
+        self,
+        mock_load_candidates,
+        mock_load_devices,
+        mock_run_daily_device_round_for_device,
+    ) -> None:
+        mock_load_candidates.return_value = [
+            {"hospitalSeq": 20, "hospitalName": "B병원", "deviceCount": 2},
+        ]
+        mock_load_devices.return_value = [
+            {"deviceName": "MB2-C00001", "hospitalSeq": 20, "hospitalName": "B병원", "roomName": "1진료실"},
+            {"deviceName": "MB2-C00002", "hospitalSeq": 20, "hospitalName": "B병원", "roomName": "2진료실"},
+        ]
+        mock_run_daily_device_round_for_device.side_effect = [
+            {
+                "overallLabel": "정상",
+                "initialPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+                "finalPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+                "trashcanCleanup": {"required": False, "executed": False, "status": "disabled"},
+                "agentAction": None,
+                "boxAction": None,
+            },
+            {
+                "overallLabel": "점검 불가",
+                "initialPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+                "finalPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+                "trashcanCleanup": {"required": False, "executed": False, "status": "disabled"},
+                "agentAction": None,
+                "boxAction": None,
+            },
+        ]
+        events: list[tuple[str, dict]] = []
+
+        summary = rounder._build_daily_device_round_summary(
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            state={"lastHospitalSeq": 10},
+            auto_update_agent=True,
+            auto_update_box=False,
+            progress_callback=lambda event, payload: events.append((event, payload)),
+        )
+
+        self.assertEqual(events[0][0], "hospital_started")
+        self.assertEqual(events[0][1]["hospitalSeq"], 20)
+        self.assertEqual(events[0][1]["deviceCount"], 2)
+        self.assertEqual(events[1][0], "device_started")
+        self.assertEqual(events[1][1]["deviceIndex"], 1)
+        self.assertEqual(events[2][0], "device_started")
+        self.assertEqual(events[2][1]["deviceIndex"], 2)
+        self.assertEqual(summary["hospitalSeq"], 20)
 
     def test_formats_report_with_hospital_label_and_multiline_device_lines(self) -> None:
         report_text = rounder._format_daily_device_round_report(

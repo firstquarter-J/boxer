@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -27,6 +28,7 @@ _DAILY_DEVICE_ROUND_COMPONENT_NAMES = {
     "captureboard": "캡처보드",
     "led": "LED",
 }
+_DailyDeviceRoundProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 def _daily_device_round_timezone() -> ZoneInfo:
@@ -137,6 +139,13 @@ def _select_daily_device_round_hospital(
     ]
     if not selectable_candidates:
         return None
+
+    active_hospital_seq = _coerce_int(state_payload.get("activeHospitalSeq"))
+    if active_hospital_seq is not None:
+        # 병원 처리 중 재시작되면 진행 중이던 병원부터 다시 이어가도록 active 병원을 우선해.
+        for item in selectable_candidates:
+            if int(item.get("hospitalSeq") or 0) == active_hospital_seq:
+                return item
 
     next_hospital_seq = _coerce_int(state_payload.get("nextHospitalSeq"))
     if next_hospital_seq is not None:
@@ -1089,6 +1098,7 @@ def _build_daily_device_round_summary(
     auto_update_agent: bool = False,
     auto_update_box: bool = False,
     auto_cleanup_trashcan: bool = False,
+    progress_callback: _DailyDeviceRoundProgressCallback | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
     candidates = _load_daily_device_round_hospital_candidates()
@@ -1149,8 +1159,32 @@ def _build_daily_device_round_summary(
         }
 
     devices = _load_daily_device_round_devices(int(hospital["hospitalSeq"]))
+    if progress_callback is not None:
+        # 장비별 원격 점검/업데이트 대기 전에 현재 병원을 먼저 알려서
+        # 리포터가 제목을 선발송하고 진행 상태를 저장할 수 있게 해.
+        progress_callback(
+            "hospital_started",
+            {
+                "hospitalSeq": int(hospital["hospitalSeq"]),
+                "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
+                "deviceCount": len(devices),
+                "startedAt": local_now.isoformat(),
+            },
+        )
     device_results: list[dict[str, Any]] = []
-    for device in devices:
+    for index, device in enumerate(devices, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                "device_started",
+                {
+                    "hospitalSeq": int(hospital["hospitalSeq"]),
+                    "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
+                    "deviceCount": len(devices),
+                    "deviceIndex": index,
+                    "deviceName": _display_value(device.get("deviceName"), default=""),
+                    "updatedAt": _coerce_daily_device_round_now(now).isoformat(),
+                },
+            )
         try:
             device_results.append(
                 _run_daily_device_round_for_device(
