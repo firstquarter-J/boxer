@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.egg-info/
+build/
 .env
 .env.local
 .env.*

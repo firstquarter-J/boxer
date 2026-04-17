@@ -171,11 +171,11 @@ class NotionDocFallbackTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "• 결론: 핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어",
+            "• 결론: 핑크 바코드만 따로 풀어주는 설정은 없어",
             text,
         )
         self.assertIn(
-            "• 조치: 핑크 바코드도 녹화되게 하려면 바코드 유효성 검증 자체를 해제해야 하고, 그러면 검증 없이 녹화가 진행돼",
+            "• 조치: 핑크 바코드도 찍히게 하려면 유효성 검사를 꺼야 하고, 그러면 다른 바코드도 함께 검사 없이 진행돼",
             text,
         )
 
@@ -186,11 +186,41 @@ class NotionDocFallbackTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "• 결론: 맞아. 바코드 유효성 검증을 해제하면 검증 없이 녹화가 진행돼",
+            "• 결론: 맞아. 바코드 유효성 검사를 끄면 바코드를 따로 걸러보지 않고 바로 녹화가 진행돼",
             text,
         )
         self.assertIn(
-            "• 확인: 이건 핑크 바코드만 예외 허용하는 게 아니라 전체 검증을 푸는 설정이야",
+            "• 확인: 이건 특정 바코드만 예외로 두는 게 아니라, 바코드 확인 기능 자체를 끄는 거야",
+            text,
+        )
+
+    def test_pink_barcode_validation_status_question_explains_expected_blocking_behavior(self) -> None:
+        text = _build_notion_doc_fallback(
+            "해당 박스에 유효성 검사가 정상적으로 작동 되고 있어?",
+            _PINK_BARCODE_VALIDATION_POLICY_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 이 기능이 켜져 있으면 사용하면 안 되는 바코드는 촬영 전에 막혀야 해",
+            text,
+        )
+        self.assertIn(
+            "무료 바코드나 환불 처리된 바코드처럼 제한 대상",
+            text,
+        )
+
+    def test_pink_barcode_validation_explain_question_uses_plain_language(self) -> None:
+        text = _build_notion_doc_fallback(
+            "바코드 유효성 검사는 뭐야?",
+            _PINK_BARCODE_VALIDATION_POLICY_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 바코드 유효성 검사는 촬영 전에 이 바코드로 진행해도 되는지 먼저 확인하는 기능이야",
+            text,
+        )
+        self.assertIn(
+            "• 조치: 핑크 바코드만 따로 예외로 풀 수는 없고, 검사 전체를 켜거나 끄는 방식이야",
             text,
         )
 

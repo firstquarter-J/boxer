@@ -8,6 +8,9 @@ _NOTION_DOC_QUERY_TOKENS = (
     "마미박스",
     "mommybox",
     "박스",
+    "유효성 검사",
+    "유효성 검증",
+    "바코드 검증",
     "녹화 취소",
     "취소 음성",
     "녹화 취소 음성",
@@ -85,6 +88,9 @@ _NOTION_DOC_QUERY_TOKENS = (
     "ssh",
     "status none",
     "에이전트",
+    "invalid barcode",
+    "invalid_barcode",
+    "ln_invalid_barcode",
 )
 _NOTION_DOC_THREAD_MARKERS = (
     "문서 기반 답변",
@@ -875,15 +881,61 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
                 "검증 없이",
             )
         )
+        is_validation_status_question = any(
+            token in normalized_question
+            for token in (
+                "유효성 검사",
+                "유효성 검증",
+                "바코드 검증",
+            )
+        ) and any(
+            token in normalized_question
+            for token in (
+                "작동",
+                "동작",
+                "정상",
+                "켜져",
+                "켜 있",
+                "적용",
+            )
+        )
+        is_validation_explain_question = any(
+            token in normalized_question
+            for token in (
+                "유효성 검사",
+                "유효성 검증",
+                "바코드 검증",
+            )
+        ) and any(
+            token in normalized_question
+            for token in (
+                "뭐야",
+                "무슨",
+                "무엇",
+                "설명",
+                "뜻",
+                "어떤",
+            )
+        )
         if is_validation_disable_question:
-            lines.append("• 결론: 맞아. 바코드 유효성 검증을 해제하면 검증 없이 녹화가 진행돼")
-            lines.append("• 확인: 이건 핑크 바코드만 예외 허용하는 게 아니라 전체 검증을 푸는 설정이야")
-            lines.append("• 조치: 특정 핑크 바코드만 따로 허용하는 건 현재 안 돼. 허용이 필요하면 검증 유지/전체 해제 중 운영 판단이 필요해")
+            lines.append("• 결론: 맞아. 바코드 유효성 검사를 끄면 바코드를 따로 걸러보지 않고 바로 녹화가 진행돼")
+            lines.append("• 확인: 이건 특정 바코드만 예외로 두는 게 아니라, 바코드 확인 기능 자체를 끄는 거야")
+            lines.append("• 조치: 일부만 풀 수는 없어서 검사를 유지할지, 전체를 끌지 운영 판단이 필요해")
+            return "\n".join(lines)
+        if is_validation_explain_question:
+            lines.append("• 결론: 바코드 유효성 검사는 촬영 전에 이 바코드로 진행해도 되는지 먼저 확인하는 기능이야")
+            lines.append("• 확인: 켜져 있으면 사용하면 안 되는 바코드는 막고, 꺼져 있으면 이런 확인 없이 바로 진행돼")
+            lines.append("• 조치: 핑크 바코드만 따로 예외로 풀 수는 없고, 검사 전체를 켜거나 끄는 방식이야")
+            return "\n".join(lines)
+        if is_validation_status_question:
+            lines.append("• 결론: 이 기능이 켜져 있으면 사용하면 안 되는 바코드는 촬영 전에 막혀야 해")
+            lines.append("• 확인: 예를 들면 무료 바코드나 환불 처리된 바코드처럼 제한 대상이면 안내 후 진행이 막혀야 해")
+            lines.append("• 조치: 해당 박스 실제 상태는 설정이 켜져 있는지와 제한 대상 바코드가 실제로 막히는지 같이 확인해")
             return "\n".join(lines)
 
-        lines.append("• 결론: 핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어")
-        lines.append("• 확인: 분만 병원에서 차단이 걸리려면 바코드 유효성 검증이 켜져 있는지 먼저 확인해")
-        lines.append("• 조치: 핑크 바코드도 녹화되게 하려면 바코드 유효성 검증 자체를 해제해야 하고, 그러면 검증 없이 녹화가 진행돼")
+        lines.append("• 결론: 핑크 바코드만 따로 풀어주는 설정은 없어")
+        lines.append("• 확인: 지금 구조는 특정 바코드만 예외로 두는 방식이 아니라, 바코드 확인 기능 전체를 켜거나 끄는 방식이야")
+        lines.append("• 조치: 핑크 바코드도 찍히게 하려면 유효성 검사를 꺼야 하고, 그러면 다른 바코드도 함께 검사 없이 진행돼")
         return "\n".join(lines)
 
     if is_firewall_doc or (is_remote_access_network_doc and has_remote_access_failure_signal):

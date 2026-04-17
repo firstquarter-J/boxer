@@ -83,7 +83,23 @@ class NotionPlaybooksTests(unittest.TestCase):
 
         self.assertTrue(references)
         self.assertEqual(references[0]["title"], "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지")
-        self.assertIn("핑크 바코드만 따로 녹화 허용/차단하는 설정은 없어", references[0]["previewLines"][0])
+        self.assertIn("핑크 바코드만 따로 허용하거나 막는 설정은 없어", references[0]["previewLines"][0])
+
+    @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
+    def test_local_validation_status_question_selects_validation_playbook_without_notion(self, _: object) -> None:
+        references = _select_notion_references(
+            "해당 박스에 유효성 검사가 정상적으로 작동 되고 있어?",
+            evidence_payload={
+                "route": "notion_playbook_qa",
+                "request": {
+                    "question": "해당 박스에 유효성 검사가 정상적으로 작동 되고 있어?",
+                },
+            },
+        )
+
+        self.assertTrue(references)
+        self.assertEqual(references[0]["title"], "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지")
+        self.assertIn("촬영 전에 이 바코드로 진행해도 되는지", references[0]["previewLines"][1])
 
     @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
     def test_local_led_playbook_is_selected_without_notion(self, _: object) -> None:

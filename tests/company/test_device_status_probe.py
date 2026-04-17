@@ -106,6 +106,7 @@ class DeviceStatusProbeRoutingTests(unittest.TestCase):
 
     def test_routes_overview_status_but_not_specific_probe(self) -> None:
         self.assertTrue(_is_device_status_probe_request("MB2-C00419 장비 상태"))
+        self.assertTrue(_is_device_status_probe_request("MB2-C00072 장비연결상태 확인"))
         self.assertFalse(_is_device_status_probe_request("MB2-C00419 pm2 상태"))
 
     def test_routes_remote_access_probe_only_for_device_specific_question(self) -> None:
@@ -308,6 +309,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "version": "2.11.300",
                 "hospitalName": "아이사랑산부인과의원(부산)",
                 "roomName": "2진료실",
+                "useDiaryCapture": True,
+                "checkInvalidBarcode": False,
             },
             ping_result={
                 "status": True,
@@ -363,6 +366,9 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• pm2 앱: *정상* | mommybox-v2 v2.11.300 online / mommybox-agent v2.0.0 online", rendered)
         self.assertIn("• 디스크 용량: *정상* | 경로 `/` / 사용량 `28%` / 여유 `319.0 GB` / 전체 `465.5 GB` / 파일시스템 `/dev/nvme0n1p2`", rendered)
         self.assertIn("• TrashCan 용량: *정상* | 경로 `AppData/TrashCan` / 폴더 `2.8 GB` (`0.6%`) / 파일 `167개` / 30일 초과 `0개`", rendered)
+        self.assertIn("*설정*", rendered)
+        self.assertIn("• 산모수첩 캡처 사용(캡처 기능): 🔵 *켜짐*", rendered)
+        self.assertIn("• 바코드 유효성 검사: ⚪ *꺼짐*", rendered)
         self.assertIn("*하드웨어*", rendered)
         self.assertIn("• 캡처보드: *정상* | MDA 타입 `YUH01` / USB `YUH01` / /dev/video `1개`", rendered)
         self.assertIn("• LED: *정상* | LED USB 감지 / 시리얼 경로 `1개`", rendered)
@@ -376,6 +382,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
             device_info={
                 "deviceIsConnected": False,
                 "isConnected": False,
+                "useDiaryCapture": False,
+                "checkInvalidBarcode": True,
             },
             ping_result={
                 "status": False,
@@ -395,6 +403,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
         self.assertIn("• 디스크 용량: *점검 불가*", rendered)
         self.assertIn("• TrashCan 용량: *점검 불가*", rendered)
+        self.assertIn("• 산모수첩 캡처 사용(캡처 기능): ⚪ *꺼짐*", rendered)
+        self.assertIn("• 바코드 유효성 검사: 🔵 *켜짐*", rendered)
         self.assertIn("• 판단: 박서가 직접 ping도 못 보냈어. 장비 자체가 MDA 기준 offline이라 병원 네트워크나 장비 연결 문제를 먼저 봐야 해", rendered)
         self.assertIn("• 조치: 장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인한 뒤 다시 점검해", rendered)
 

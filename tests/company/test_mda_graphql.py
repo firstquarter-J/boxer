@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from boxer_company.routers.mda_graphql import _get_mda_latest_device_version
+from boxer_company.routers.mda_graphql import _get_mda_latest_device_version, _normalize_mda_device_detail
 
 
 class MdaLatestDeviceVersionTests(unittest.TestCase):
@@ -39,6 +39,26 @@ class MdaLatestDeviceVersionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "최신 박스 버전"):
             _get_mda_latest_device_version()
+
+
+class MdaDeviceDetailNormalizationTests(unittest.TestCase):
+    def test_normalizes_optional_device_config_booleans(self) -> None:
+        result = _normalize_mda_device_detail(
+            {
+                "deviceName": "MB2-C00419",
+                "version": "2.11.300",
+                "cfg1_use_diary_capture": 1,
+                "cfg1_check_invalid_barcode": 0,
+                "deviceState": {},
+                "hospital": {},
+                "hospitalRoom": {},
+                "agentState": {},
+            },
+            device_name="MB2-C00419",
+        )
+
+        self.assertTrue(result["useDiaryCapture"])
+        self.assertFalse(result["checkInvalidBarcode"])
 
 
 if __name__ == "__main__":

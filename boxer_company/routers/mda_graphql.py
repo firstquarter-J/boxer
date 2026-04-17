@@ -93,6 +93,8 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
     nodes {
       deviceName
       version
+      cfg1_use_diary_capture
+      cfg1_check_invalid_barcode
       deviceState {
         captureBoardType
         isConnected
@@ -120,6 +122,21 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
           error
         }
       }
+    }
+  }
+}
+"""
+
+_PAGINATED_SPECIAL_BARCODES_QUERY = """
+query PaginatedSpecialBarcodes($listOptions: SpecialBarcodeListOptions) {
+  paginatedSpecialBarcodes(listOptions: $listOptions) {
+    nodes {
+      seq
+      barcode
+      type
+      reason
+      createdAt
+      updatedAt
     }
   }
 }
@@ -286,6 +303,12 @@ def _normalize_mda_boolean(value: Any) -> bool:
     return normalized in {"1", "true", "t", "yes", "y", "on"}
 
 
+def _normalize_optional_mda_boolean(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return _normalize_mda_boolean(value)
+
+
 def _extract_device_row(data: dict[str, Any], device_name: str) -> dict[str, Any] | None:
     paginated = data.get("paginatedDevices")
     if not isinstance(paginated, dict):
@@ -322,6 +345,8 @@ def _normalize_mda_device_detail(row: dict[str, Any], *, device_name: str) -> di
     return {
         "deviceName": _display_value(row.get("deviceName"), default=device_name),
         "version": version,
+        "useDiaryCapture": _normalize_optional_mda_boolean(row.get("cfg1_use_diary_capture")),
+        "checkInvalidBarcode": _normalize_optional_mda_boolean(row.get("cfg1_check_invalid_barcode")),
         "captureBoardType": _normalize_mda_state_text(device_state.get("captureBoardType")),
         "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
         "roomName": _display_value(hospital_room.get("roomName"), default="미확인"),
@@ -408,6 +433,48 @@ def _get_mda_device_versions(device_names: list[str]) -> dict[str, str]:
         if version:
             versions[normalized_name] = version
     return versions
+
+
+def _lookup_mda_special_barcodes_by_barcode(barcode: str) -> list[dict[str, Any]]:
+    normalized_barcode = str(barcode or "").strip()
+    if not normalized_barcode:
+        return []
+
+    data = _execute_mda_graphql(
+        _PAGINATED_SPECIAL_BARCODES_QUERY,
+        {
+            "listOptions": {
+                "barcode": normalized_barcode,
+                "page": 1,
+                "limit": 10,
+            }
+        },
+    )
+    paginated = data.get("paginatedSpecialBarcodes")
+    if not isinstance(paginated, dict):
+        return []
+    rows = paginated.get("nodes")
+    if not isinstance(rows, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_barcode = _display_value(row.get("barcode"), default="")
+        if row_barcode != normalized_barcode:
+            continue
+        items.append(
+            {
+                "seq": row.get("seq"),
+                "barcode": row_barcode,
+                "type": _display_value(row.get("type"), default=""),
+                "reason": _display_value(row.get("reason"), default=""),
+                "createdAt": _display_value(row.get("createdAt"), default=""),
+                "updatedAt": _display_value(row.get("updatedAt"), default=""),
+            }
+        )
+    return items
 
 
 def _open_mda_device_ssh(

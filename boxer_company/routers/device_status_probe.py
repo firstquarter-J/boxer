@@ -30,6 +30,10 @@ _USB_LINE_PATTERN = re.compile(
 )
 _DEVICE_STATUS_HINTS = (
     "장비 상태",
+    "장비 연결 상태",
+    "장비연결상태",
+    "연결 상태",
+    "연결상태",
     "상태 점검",
     "장비 점검",
     "전체 상태",
@@ -1944,6 +1948,22 @@ def _format_probe_download_availability_display(ready: bool) -> str:
     return "🔵 *가능*" if ready else "🔴 *불가*"
 
 
+def _format_probe_config_enabled_display(value: Any) -> str:
+    if value is True:
+        return "🔵 *켜짐*"
+    if value is False:
+        return "⚪ *꺼짐*"
+    return "⚪ *미확인*"
+
+
+def _build_device_config_lines(device_info: dict[str, Any]) -> list[str]:
+    return [
+        "*설정*",
+        f"• 산모수첩 캡처 사용(캡처 기능): {_format_probe_config_enabled_display(device_info.get('useDiaryCapture'))}",
+        f"• 바코드 유효성 검사: {_format_probe_config_enabled_display(device_info.get('checkInvalidBarcode'))}",
+    ]
+
+
 def _format_remote_access_status_display(
     status: bool | None,
     *,
@@ -2385,6 +2405,8 @@ def _render_device_status_overview_result(
         lines.append("• TrashCan 용량: *점검 불가*")
         lines.append("• 캡처보드: *점검 불가*")
         lines.append("• LED: *점검 불가*")
+        lines.append("")
+        lines.extend(_build_device_config_lines(device_info))
         lines.append(f"• 판단: {guidance['summary']}")
         lines.append(f"• 조치: {guidance['action']}")
         return "\n".join(lines)
@@ -2471,6 +2493,9 @@ def _render_device_status_overview_result(
     lines.append(trashcan_line)
 
     lines.append("")
+    lines.extend(_build_device_config_lines(device_info))
+
+    lines.append("")
     lines.append("*하드웨어*")
     capture_line = f"• 캡처보드: *{capture_label}*"
     if capture_detail:
@@ -2513,6 +2538,8 @@ def _build_runtime_probe_payload(
         "device": {
             "deviceName": _display_value(device_info.get("deviceName"), default=device_name),
             "version": _display_value(device_info.get("version"), default=""),
+            "useDiaryCapture": device_info.get("useDiaryCapture"),
+            "checkInvalidBarcode": device_info.get("checkInvalidBarcode"),
             "captureBoardType": _display_value(device_info.get("captureBoardType"), default=""),
             "hospitalName": _display_value(device_info.get("hospitalName"), default=""),
             "roomName": _display_value(device_info.get("roomName"), default=""),

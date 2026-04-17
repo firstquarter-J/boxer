@@ -222,10 +222,14 @@ _COMPANY_NOTION_DOCS: tuple[dict[str, Any], ...] = (
         "keywords": (
             "핑크 바코드",
             "검증",
+            "유효성 검사",
             "유효성 검증",
             "검증 해제",
             "녹화 차단",
             "녹화 진행",
+            "invalid barcode",
+            "invalid_barcode",
+            "ln_invalid_barcode",
         ),
     },
     {

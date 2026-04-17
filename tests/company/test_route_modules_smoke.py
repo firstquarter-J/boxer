@@ -92,6 +92,32 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertFalse(handled)
 
+    def test_barcode_query_routes_handles_validation_status_question(self) -> None:
+        replies: list[str] = []
+
+        with patch(
+            "boxer_company_adapter_slack.barcode_query_routes._query_barcode_validation_status",
+            return_value="*바코드 유효성 검사 확인*\n• 결론: 테스트",
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question="10255657857 이건 유효성 검사에 걸리는 바코드냐",
+                    barcode="10255657857",
+                    user_id="U123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=lambda evidence, context: None,
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*바코드 유효성 검사 확인*\n• 결론: 테스트"])
+
     def test_device_routes_returns_false_for_unrelated_question(self) -> None:
         handled = _handle_device_routes(
             DeviceRoutesContext(
@@ -196,6 +222,46 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(replies, ["*장비 원격 접속 점검*\n• 판단: 테스트"])
+
+    def test_device_routes_handles_connected_status_probe_before_freeform(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.cs.MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+            patch("boxer_company_adapter_slack.device_routes.cs.MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch("boxer_company_adapter_slack.device_routes.cs.DEVICE_SSH_PASSWORD", "secret"),
+            patch(
+                "boxer_company_adapter_slack.device_routes._probe_device_status_overview",
+                return_value=("*장비 상태 점검*\n• 판단: 테스트", {"route": "device_status_probe"}),
+            ),
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="MB2-C00072 장비연결상태 확인",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                DeviceRoutesDeps(
+                    get_s3_client=lambda: None,
+                    get_recordings_context=lambda: {},
+                    has_recordings_device_mapping=lambda context: False,
+                    send_dm_message=lambda user_id, text: False,
+                    build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*장비 상태 점검*\n• 판단: 테스트"])
 
     def test_device_routes_handles_device_log_upload_check_before_freeform(self) -> None:
         replies: list[str] = []
