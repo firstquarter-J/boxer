@@ -102,5 +102,51 @@ class DeviceDetailRenderingTests(unittest.TestCase):
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
 
 
+class LookupDeviceContextsByBarcodeOnDateTests(unittest.TestCase):
+    def test_falls_back_to_hospital_room_scope_when_device_seq_is_missing(self) -> None:
+        room_scope_contexts = [
+            {
+                "deviceName": "MB2-C00419",
+                "deviceSeq": 1079,
+                "hospitalSeq": 297,
+                "hospitalRoomSeq": 412,
+                "hospitalName": "다온미래산부인과의원(아산)",
+                "roomName": "초음파실1",
+            }
+        ]
+
+        with (
+            patch.object(box_db.s, "DB_HOST", "db-host"),
+            patch.object(box_db.s, "DB_USERNAME", "db-user"),
+            patch.object(box_db.s, "DB_PASSWORD", "db-pass"),
+            patch.object(box_db.s, "DB_DATABASE", "db-name"),
+            patch(
+                "boxer_company.routers.box_db._load_recordings_rows_on_date_by_barcode",
+                return_value=[
+                    {
+                        "hospitalSeq": 297,
+                        "hospitalRoomSeq": 412,
+                        "deviceSeq": None,
+                        "hospitalName": "다온미래산부인과의원(아산)",
+                        "roomName": "초음파실1",
+                    }
+                ],
+            ),
+            patch(
+                "boxer_company.routers.box_db._lookup_device_contexts_by_hospital_room_seqs",
+                return_value=room_scope_contexts,
+            ) as room_scope_lookup,
+            patch(
+                "boxer_company.routers.box_db._lookup_device_contexts_by_hospital_seqs",
+                return_value=[],
+            ) as hospital_scope_lookup,
+        ):
+            result = box_db._lookup_device_contexts_by_barcode_on_date("13194526492", "2026-04-18")
+
+        self.assertEqual(result, room_scope_contexts)
+        room_scope_lookup.assert_called_once()
+        hospital_scope_lookup.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,10 @@ from boxer_company.routers.barcode_log import (
     _build_phase2_scope_request_message,
     _extract_log_date_with_presence,
 )
-from boxer_company.routers.box_db import _lookup_device_contexts_by_hospital_room
+from boxer_company.routers.box_db import (
+    _lookup_device_contexts_by_barcode_on_date,
+    _lookup_device_contexts_by_hospital_room,
+)
 from boxer_company.routers.recording_failure_analysis import (
     _build_recording_failure_analysis_evidence,
     _is_recording_failure_analysis_request,
@@ -78,6 +81,7 @@ def _handle_recording_failure_analysis_request(
         recording_count = int(summary.get("recordingCount") or 0)
         has_device_mapping = deps.has_recordings_device_mapping(recordings_context)
         used_manual_scope = False
+        used_recordings_scope = False
         analysis_mode = "phase1_window"
         result_text = ""
         log_analysis_payload: dict[str, Any] | None = None
@@ -85,50 +89,67 @@ def _handle_recording_failure_analysis_request(
         if has_requested_date:
             if recording_count <= 0 or not has_device_mapping:
                 if not context.phase2_hospital_name or not context.phase2_room_name:
-                    context.reply(
-                        _build_phase2_scope_request_message(
+                    auto_device_contexts = (
+                        _lookup_device_contexts_by_barcode_on_date(barcode or "", log_date)
+                        if recording_count > 0
+                        else []
+                    )
+                    if auto_device_contexts:
+                        used_recordings_scope = True
+                        analysis_mode = "error_recordings_scope"
+                        result_text, log_analysis_payload = _analyze_barcode_log_errors(
+                            deps.get_s3_client(),
                             barcode or "",
-                            "recordings 장비 매핑이 없어 2차 입력이 필요해",
-                            "*녹화 실패 원인 분석*",
-                            example_action="녹화 실패 원인 분석",
+                            log_date,
+                            recordings_context=recordings_context,
+                            device_contexts=auto_device_contexts,
                         )
-                    )
-                    context.logger.info(
-                        "Responded with recording failure scope guidance in thread_ts=%s barcode=%s mode=scope_required",
-                        context.thread_ts,
-                        barcode,
-                    )
-                    return True
-
-                manual_device_contexts = _lookup_device_contexts_by_hospital_room(
-                    context.phase2_hospital_name,
-                    context.phase2_room_name,
-                )
-                if not manual_device_contexts:
-                    context.reply(
-                        _build_phase2_scope_request_message(
-                            barcode or "",
-                            "입력한 병원명/병실명으로 장비를 찾지 못했어. MDA 표시 이름과 정확히 일치하게 입력해줘",
-                            "*녹화 실패 원인 분석*",
-                            example_action="녹화 실패 원인 분석",
+                    else:
+                        context.reply(
+                            _build_phase2_scope_request_message(
+                                barcode or "",
+                                "recordings 장비 매핑이 없어 2차 입력이 필요해",
+                                "*녹화 실패 원인 분석*",
+                                example_action="녹화 실패 원인 분석",
+                            )
                         )
-                    )
-                    context.logger.info(
-                        "Responded with recording failure scope guidance in thread_ts=%s barcode=%s mode=scope_not_found",
-                        context.thread_ts,
-                        barcode,
-                    )
-                    return True
+                        context.logger.info(
+                            "Responded with recording failure scope guidance in thread_ts=%s barcode=%s mode=scope_required",
+                            context.thread_ts,
+                            barcode,
+                        )
+                        return True
 
-                used_manual_scope = True
-                analysis_mode = "error_manual_scope"
-                result_text, log_analysis_payload = _analyze_barcode_log_errors(
-                    deps.get_s3_client(),
-                    barcode or "",
-                    log_date,
-                    recordings_context=recordings_context,
-                    device_contexts=manual_device_contexts,
-                )
+                elif not used_recordings_scope:
+                    manual_device_contexts = _lookup_device_contexts_by_hospital_room(
+                        context.phase2_hospital_name,
+                        context.phase2_room_name,
+                    )
+                    if not manual_device_contexts:
+                        context.reply(
+                            _build_phase2_scope_request_message(
+                                barcode or "",
+                                "입력한 병원명/병실명으로 장비를 찾지 못했어. MDA 표시 이름과 정확히 일치하게 입력해줘",
+                                "*녹화 실패 원인 분석*",
+                                example_action="녹화 실패 원인 분석",
+                            )
+                        )
+                        context.logger.info(
+                            "Responded with recording failure scope guidance in thread_ts=%s barcode=%s mode=scope_not_found",
+                            context.thread_ts,
+                            barcode,
+                        )
+                        return True
+
+                    used_manual_scope = True
+                    analysis_mode = "error_manual_scope"
+                    result_text, log_analysis_payload = _analyze_barcode_log_errors(
+                        deps.get_s3_client(),
+                        barcode or "",
+                        log_date,
+                        recordings_context=recordings_context,
+                        device_contexts=manual_device_contexts,
+                    )
             else:
                 analysis_mode = "error"
                 result_text, log_analysis_payload = _analyze_barcode_log_errors(
@@ -192,6 +213,7 @@ def _handle_recording_failure_analysis_request(
             request_payload["phase2HospitalName"] = context.phase2_hospital_name
             request_payload["phase2RoomName"] = context.phase2_room_name
             request_payload["usedManualScope"] = used_manual_scope
+            request_payload["usedRecordingsScopeFallback"] = used_recordings_scope
         deps.attach_recordings_context_to_evidence(failure_evidence, recordings_context)
         fallback_text = _render_recording_failure_analysis_fallback(failure_evidence)
         deps.reply_with_retrieval_synthesis(

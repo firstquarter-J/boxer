@@ -1,5 +1,6 @@
 import unittest
 
+from boxer_company.routers.barcode_log import _extract_hospital_room_scope
 from boxer_company_adapter_slack.barcode_logs import (
     _build_barcode_log_error_session_section,
     _needs_barcode_log_fallback,
@@ -101,6 +102,22 @@ class BarcodeLogHelperTests(unittest.TestCase):
         self.assertTrue(text.startswith("*세션 2*"))
         self.assertIn("모션 감지 단계에서 종료 스캔돼 녹화 취소로 끝났고", text)
         self.assertIn("본 녹화 시작 전이라 정상 녹화 실패", text)
+
+    def test_extract_hospital_room_scope_handles_unlabeled_phase2_followup(self) -> None:
+        hospital_name, room_name = _extract_hospital_room_scope(
+            "@Boxer 13194526492 분당제일여성병원(성남) 5층 4진료실 2026-04-18 파일 다운로드"
+        )
+
+        self.assertEqual(hospital_name, "분당제일여성병원(성남)")
+        self.assertEqual(room_name, "5층 4진료실")
+
+    def test_extract_hospital_room_scope_preserves_room_prefix_for_ultrasound_room(self) -> None:
+        hospital_name, room_name = _extract_hospital_room_scope(
+            "<@U123> 23318551080 분당제일여성병원(성남) 3층 C동 초음파실3 2026-04-07 로그 분석"
+        )
+
+        self.assertEqual(hospital_name, "분당제일여성병원(성남)")
+        self.assertEqual(room_name, "3층 C동 초음파실3")
 
 
 if __name__ == "__main__":

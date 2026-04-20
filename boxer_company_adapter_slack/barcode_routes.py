@@ -18,7 +18,10 @@ from boxer_company.routers.barcode_log import (
     _is_error_focused_request,
     _is_scan_focused_request,
 )
-from boxer_company.routers.box_db import _lookup_device_contexts_by_hospital_room
+from boxer_company.routers.box_db import (
+    _lookup_device_contexts_by_barcode_on_date,
+    _lookup_device_contexts_by_hospital_room,
+)
 from boxer_company_adapter_slack.barcode_logs import _reply_with_barcode_log_error_summary
 
 
@@ -79,6 +82,7 @@ def _handle_barcode_log_analysis_request(
         recording_count = int(summary.get("recordingCount") or 0)
         has_device_mapping = deps.has_recordings_device_mapping(recordings_context)
         used_manual_scope = False
+        used_recordings_scope = False
 
         if has_requested_date:
             base_mode = (
@@ -87,14 +91,41 @@ def _handle_barcode_log_analysis_request(
                 else "scan"
             )
 
+            auto_device_contexts = None
+            if recording_count > 0 and not has_device_mapping:
+                auto_device_contexts = _lookup_device_contexts_by_barcode_on_date(
+                    barcode or "",
+                    log_date,
+                )
+
             if recording_count <= 0 or not has_device_mapping:
                 if not context.phase2_hospital_name or not context.phase2_room_name:
-                    analysis_mode = "scope_required"
-                    result_text = _build_phase2_scope_request_message(
-                        barcode or "",
-                        "recordings 장비 매핑이 없어 2차 입력이 필요해",
-                        "*로그 분석 결과 (2차 수동 범위)*",
-                    )
+                    if auto_device_contexts:
+                        used_recordings_scope = True
+                        analysis_mode = f"{base_mode}_recordings_scope"
+                        if base_mode == "error":
+                            result_text, log_analysis_payload = _analyze_barcode_log_errors(
+                                deps.get_s3_client(),
+                                barcode or "",
+                                log_date,
+                                recordings_context=recordings_context,
+                                device_contexts=auto_device_contexts,
+                            )
+                        else:
+                            result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
+                                deps.get_s3_client(),
+                                barcode or "",
+                                log_date,
+                                recordings_context=recordings_context,
+                                device_contexts=auto_device_contexts,
+                            )
+                    else:
+                        analysis_mode = "scope_required"
+                        result_text = _build_phase2_scope_request_message(
+                            barcode or "",
+                            "recordings 장비 매핑이 없어 2차 입력이 필요해",
+                            "*로그 분석 결과 (2차 수동 범위)*",
+                        )
                 else:
                     manual_device_contexts = _lookup_device_contexts_by_hospital_room(
                         context.phase2_hospital_name,
@@ -174,6 +205,7 @@ def _handle_barcode_log_analysis_request(
                 "phase2HospitalName": context.phase2_hospital_name,
                 "phase2RoomName": context.phase2_room_name,
                 "usedManualScope": used_manual_scope,
+                "usedRecordingsScopeFallback": used_recordings_scope,
             },
             "analysisResult": result_text,
         }

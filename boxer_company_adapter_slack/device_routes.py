@@ -11,7 +11,10 @@ from boxer.core import settings as s
 from boxer_company import settings as cs
 from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.barcode_log import _extract_device_name_scope, _extract_log_date_with_presence
-from boxer_company.routers.box_db import _lookup_device_contexts_by_hospital_room
+from boxer_company.routers.box_db import (
+    _lookup_device_contexts_by_barcode_on_date,
+    _lookup_device_contexts_by_hospital_room,
+)
 from boxer_company.routers.device_audio_probe import (
     _build_device_audio_probe_config_message,
     _extract_device_name_for_audio_probe,
@@ -295,14 +298,14 @@ def _handle_device_routes(
             summary = recordings_context.get("summary") or {}
             recording_count = int(summary.get("recordingCount") or 0)
             has_device_mapping = deps.has_recordings_device_mapping(recordings_context)
-            manual_device_contexts = None
+            resolved_device_contexts = None
 
             if context.phase2_hospital_name and context.phase2_room_name:
-                manual_device_contexts = _lookup_device_contexts_by_hospital_room(
+                resolved_device_contexts = _lookup_device_contexts_by_hospital_room(
                     context.phase2_hospital_name,
                     context.phase2_room_name,
                 )
-                if not manual_device_contexts:
+                if not resolved_device_contexts:
                     context.reply(
                         _build_device_file_scope_request_message(
                             barcode or "",
@@ -311,20 +314,27 @@ def _handle_device_routes(
                     )
                     return True
             elif recording_count <= 0 or not has_device_mapping:
-                context.reply(
-                    _build_device_file_scope_request_message(
-                        barcode or "",
-                        "recordings 장비 매핑이 없어 2차 입력이 필요해",
-                    )
+                # explicit 날짜 요청이면 해당 날짜 recordings로 병원/병실 스코프를 먼저 자동 보정한다.
+                resolved_device_contexts = (
+                    _lookup_device_contexts_by_barcode_on_date(barcode or "", log_date)
+                    if recording_count > 0
+                    else []
                 )
-                return True
+                if not resolved_device_contexts:
+                    context.reply(
+                        _build_device_file_scope_request_message(
+                            barcode or "",
+                            "recordings 장비 매핑이 없어 2차 입력이 필요해",
+                        )
+                    )
+                    return True
 
             result_text, probe_payload = _locate_barcode_file_candidates(
                 deps.get_s3_client(),
                 barcode or "",
                 log_date,
                 recordings_context=recordings_context,
-                device_contexts=manual_device_contexts,
+                device_contexts=resolved_device_contexts,
                 probe_remote_files=probe_remote_files,
                 download_remote_files=download_remote_files,
                 recover_remote_files=recover_remote_files,

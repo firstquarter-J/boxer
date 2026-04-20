@@ -42,7 +42,10 @@ _HOSPITAL_SCOPE_PATTERN = re.compile(
 _ROOM_SCOPE_PATTERN = re.compile(
     r"(?:^|[\s)])(?:병실(?:명)?|진료실명)\s*[:=]?\s*(.+?)(?=\s*(?:날짜|로그|분석)\s*[:=]?|$)"
 )
-_ROOM_TOKEN_PATTERN = re.compile(r"([^\s`'\",]*(?:진료실|병실)[^\s`'\",]*)")
+_ROOM_TOKEN_PATTERN = re.compile(
+    r"([^\s`'\",]*(?:초음파실|진료실|병실|분만실|수술실|원장실)[^\s`'\",]*)"
+)
+_ROOM_PREFIX_PATTERN = re.compile(r"((?:(?:\d+\s*층|[A-Za-z0-9가-힣]+동)\s*)+)$")
 _LEADING_HOSPITAL_SCOPE_PATTERN = re.compile(
     r"^\s*(.+?)\s+(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|병원|병실|진료실)(?:\s|$)",
     re.IGNORECASE,
@@ -3164,7 +3167,9 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     room_match = _ROOM_SCOPE_PATTERN.search(text)
 
     def _clean(value: str) -> str:
-        normalized = " ".join(value.split()).strip().strip("`'\"")
+        normalized = re.sub(r"<@[^>]+>", " ", str(value or ""))
+        normalized = re.sub(r"(?<!\S)@\S+", " ", normalized)
+        normalized = " ".join(normalized.split()).strip().strip("`'\"")
         normalized = re.sub(r"(?<!\d)\d{11}(?!\d)", "", normalized)
         normalized = re.sub(r"\s+\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*$", "", normalized)
         normalized = re.sub(r"\s+\d{1,2}\s*월\s*\d{1,2}\s*일\s*$", "", normalized)
@@ -3175,7 +3180,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         normalized = re.sub(r"^\s*날짜\s*[:=]?\s*", "", normalized)
         normalized = re.sub(r"\s*(?:로그|분석)\s*$", "", normalized)
         normalized = re.sub(
-            r"\s*(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)\s*$",
+            r"\s*(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|파일|file|download|다운로드|다운)\s*$",
             "",
             normalized,
             flags=re.IGNORECASE,
@@ -3206,7 +3211,8 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     if hospital_name and room_name:
         return (hospital_name or None, room_name or None)
 
-    fallback_text = text
+    fallback_text = re.sub(r"<@[^>]+>", " ", text)
+    fallback_text = re.sub(r"(?<!\S)@\S+", " ", fallback_text)
     for pattern in (
         _KOREAN_YMD_PATTERN,
         _NUMERIC_YMD_PATTERN,
@@ -3222,7 +3228,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     fallback_text = re.sub(r"(?<!\d)\d{11}(?!\d)", " ", fallback_text)
     fallback_text = re.sub(r"\b(?:로그|분석)\b", " ", fallback_text)
     fallback_text = re.sub(
-        r"\b(?:영상|비디오|동영상|recording|recordings|캡처|capture|captures|스냅샷|snapshot|조회|목록|개수|갯수|count|있는지|있나|있어|유무|존재|전체)\b",
+        r"\b(?:영상|비디오|동영상|recording|recordings|캡처|capture|captures|스냅샷|snapshot|조회|목록|개수|갯수|count|있는지|있나|있어|유무|존재|전체|파일|file|download|다운로드|다운)\b",
         " ",
         fallback_text,
         flags=re.IGNORECASE,
@@ -3230,12 +3236,24 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     fallback_text = " ".join(fallback_text.split()).strip()
 
     room_token_match = _ROOM_TOKEN_PATTERN.search(fallback_text)
-    if not room_name and room_token_match:
-        room_name = _clean(room_token_match.group(1))
+    if room_token_match:
+        room_prefix = ""
+        hospital_source = fallback_text[: room_token_match.start()].rstrip()
 
-    if not hospital_name and room_token_match:
-        hospital_candidate = _clean(fallback_text[: room_token_match.start()])
-        hospital_name = hospital_candidate
+        # 무라벨 입력은 "5층 4진료실"처럼 위치 prefix가 병실 앞에 붙는 경우가 많아서 같이 묶어준다.
+        room_prefix_match = _ROOM_PREFIX_PATTERN.search(hospital_source)
+        if room_prefix_match:
+            room_prefix = _clean(room_prefix_match.group(1))
+            hospital_source = hospital_source[: room_prefix_match.start()].rstrip()
+
+        derived_room_name = _clean(
+            " ".join(part for part in (room_prefix, room_token_match.group(1)) if part)
+        )
+        if not room_name:
+            room_name = derived_room_name
+
+        if not hospital_name:
+            hospital_name = _clean(hospital_source)
 
     if not hospital_name and not room_name:
         leading_hospital_keyword_match = _LEADING_HOSPITAL_KEYWORD_SCOPE_PATTERN.search(text)

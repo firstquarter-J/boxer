@@ -832,13 +832,19 @@ def _load_recordings_rows_on_date_by_barcode(
             sql = (
                 "SELECT "
                 "r.seq, "
+                "r.hospitalSeq, "
+                "r.hospitalRoomSeq, "
                 "r.deviceSeq, "
                 "r.fileId, "
                 "r.videoLength, "
                 "r.streamingStatus, "
+                "h.hospitalName AS hospitalName, "
+                "hr.roomName AS roomName, "
                 "r.recordedAt, "
                 "r.createdAt "
                 "FROM recordings r "
+                "LEFT JOIN hospitals h ON r.hospitalSeq = h.seq "
+                "LEFT JOIN hospital_rooms hr ON r.hospitalRoomSeq = hr.seq "
                 "WHERE r.fullBarcode = %s "
                 "AND r.recordedAt >= %s "
                 "AND r.recordedAt < %s "
@@ -1923,35 +1929,101 @@ def _lookup_device_contexts_by_barcode(
     barcode: str,
     recordings_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    context = recordings_context or _load_recordings_context_by_barcode(barcode)
+    return _lookup_device_contexts_from_recording_rows(context.get("rows") or [])
+
+
+def _lookup_device_contexts_by_barcode_on_date(
+    barcode: str,
+    target_date: str,
+) -> list[dict[str, Any]]:
+    recording_rows = _load_recordings_rows_on_date_by_barcode(barcode, target_date)
+    return _lookup_device_contexts_from_recording_rows(recording_rows)
+
+
+def _lookup_device_contexts_from_recording_rows(
+    recording_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
 
-    context = recordings_context or _load_recordings_context_by_barcode(barcode)
     pair_meta_map: dict[tuple[Any, Any], dict[str, Any]] = {}
-    for row in context.get("rows") or []:
+    room_scope_meta_map: dict[tuple[int, int], dict[str, Any]] = {}
+    hospital_seqs: list[int] = []
+    seen_hospital_seqs: set[int] = set()
+
+    # deviceSeq가 있으면 해당 장비를 우선 후보로 잡고, 없으면 병원/병실 스코프로 자동 보정한다.
+    for row in recording_rows:
         device_seq = row.get("deviceSeq")
         hospital_seq = row.get("hospitalSeq")
+        hospital_room_seq = row.get("hospitalRoomSeq")
+        hospital_name = row.get("hospitalName")
+        room_name = row.get("roomName")
+
+        try:
+            normalized_hospital_seq = int(hospital_seq) if hospital_seq is not None else None
+        except (TypeError, ValueError):
+            normalized_hospital_seq = None
+
+        try:
+            normalized_hospital_room_seq = int(hospital_room_seq) if hospital_room_seq is not None else None
+        except (TypeError, ValueError):
+            normalized_hospital_room_seq = None
+
+        if normalized_hospital_seq is not None and normalized_hospital_seq not in seen_hospital_seqs:
+            seen_hospital_seqs.add(normalized_hospital_seq)
+            hospital_seqs.append(normalized_hospital_seq)
+
+        if normalized_hospital_seq is not None and normalized_hospital_room_seq is not None:
+            room_pair = (normalized_hospital_seq, normalized_hospital_room_seq)
+            room_meta = room_scope_meta_map.get(room_pair)
+            if room_meta is None:
+                room_scope_meta_map[room_pair] = {
+                    "hospitalSeq": normalized_hospital_seq,
+                    "hospitalRoomSeq": normalized_hospital_room_seq,
+                    "hospitalName": hospital_name,
+                    "roomName": room_name,
+                }
+            else:
+                if not room_meta.get("hospitalName") and hospital_name:
+                    room_meta["hospitalName"] = hospital_name
+                if not room_meta.get("roomName") and room_name:
+                    room_meta["roomName"] = room_name
+
         if device_seq is None:
             continue
-        pair = (device_seq, hospital_seq)
+        pair = (device_seq, normalized_hospital_seq)
         meta = pair_meta_map.get(pair)
         if meta is None:
             pair_meta_map[pair] = {
                 "deviceSeq": device_seq,
-                "hospitalSeq": hospital_seq,
-                "hospitalRoomSeq": row.get("hospitalRoomSeq"),
-                "hospitalName": row.get("hospitalName"),
-                "roomName": row.get("roomName"),
+                "hospitalSeq": normalized_hospital_seq,
+                "hospitalRoomSeq": normalized_hospital_room_seq,
+                "hospitalName": hospital_name,
+                "roomName": room_name,
             }
             continue
 
-        if not meta.get("hospitalName") and row.get("hospitalName"):
-            meta["hospitalName"] = row.get("hospitalName")
-        if not meta.get("roomName") and row.get("roomName"):
-            meta["roomName"] = row.get("roomName")
-        if not meta.get("hospitalRoomSeq") and row.get("hospitalRoomSeq"):
-            meta["hospitalRoomSeq"] = row.get("hospitalRoomSeq")
+        if not meta.get("hospitalName") and hospital_name:
+            meta["hospitalName"] = hospital_name
+        if not meta.get("roomName") and room_name:
+            meta["roomName"] = room_name
+        if not meta.get("hospitalRoomSeq") and normalized_hospital_room_seq is not None:
+            meta["hospitalRoomSeq"] = normalized_hospital_room_seq
 
+    if pair_meta_map:
+        return _lookup_device_contexts_from_pair_meta_map(pair_meta_map)
+
+    # recordings에 deviceSeq가 빠져도 병원/병실 정보가 있으면 자동으로 장비 후보를 찾는다.
+    room_scope_contexts = _lookup_device_contexts_by_hospital_room_seqs(room_scope_meta_map)
+    if room_scope_contexts:
+        return room_scope_contexts
+    return _lookup_device_contexts_by_hospital_seqs(hospital_seqs)
+
+
+def _lookup_device_contexts_from_pair_meta_map(
+    pair_meta_map: dict[tuple[Any, Any], dict[str, Any]],
+) -> list[dict[str, Any]]:
     if not pair_meta_map:
         return []
 
@@ -2012,6 +2084,72 @@ def _lookup_device_contexts_by_barcode(
                         "roomName": meta.get("roomName"),
                     }
                 )
+    finally:
+        connection.close()
+
+    return items
+
+
+def _lookup_device_contexts_by_hospital_room_seqs(
+    room_scope_meta_map: dict[tuple[int, int], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    ordered_pairs: list[tuple[int, int]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for room_pair in room_scope_meta_map:
+        if room_pair in seen_pairs:
+            continue
+        seen_pairs.add(room_pair)
+        ordered_pairs.append(room_pair)
+
+    if not ordered_pairs:
+        return []
+
+    items: list[dict[str, Any]] = []
+    seen_device_names: set[str] = set()
+    limit = max(1, min(50, cs.LOG_ANALYSIS_MAX_DEVICES * 4))
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            for hospital_seq, hospital_room_seq in ordered_pairs:
+                if len(items) >= limit:
+                    break
+                remaining_limit = max(1, limit - len(items))
+                cursor.execute(
+                    "SELECT "
+                    "d.seq AS deviceSeq, "
+                    "d.deviceName AS deviceName "
+                    "FROM devices d "
+                    "WHERE d.hospitalSeq = %s "
+                    "AND d.hospitalRoomSeq = %s "
+                    "AND COALESCE(d.deviceName, '') <> '' "
+                    "ORDER BY d.seq DESC "
+                    "LIMIT %s",
+                    (
+                        hospital_seq,
+                        hospital_room_seq,
+                        remaining_limit,
+                    ),
+                )
+                rows = cursor.fetchall() or []
+                room_meta = room_scope_meta_map.get((hospital_seq, hospital_room_seq)) or {}
+                for row in rows:
+                    device_name = _display_value(row.get("deviceName"), default="")
+                    if not device_name or device_name in seen_device_names:
+                        continue
+                    seen_device_names.add(device_name)
+                    items.append(
+                        {
+                            "deviceName": device_name,
+                            "deviceSeq": row.get("deviceSeq"),
+                            "hospitalSeq": hospital_seq,
+                            "hospitalRoomSeq": hospital_room_seq,
+                            "hospitalName": room_meta.get("hospitalName"),
+                            "roomName": room_meta.get("roomName"),
+                        }
+                    )
     finally:
         connection.close()
 
