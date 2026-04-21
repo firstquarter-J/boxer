@@ -1047,7 +1047,11 @@ def _extract_motion_events_with_line_no(lines: list[str]) -> list[dict[str, Any]
         motion_detected: bool | None = None
         error_flag: bool | None = None
 
-        if "motion detection process initiated successfully" in lowered:
+        if "starting motion detection" in lowered:
+            event_type = "motion_start"
+            label = "모션 감지 시작"
+            motion_counter_active = False
+        elif "motion detection process initiated successfully" in lowered:
             event_type = "motion_start"
             label = "모션 감지 시작(정상)"
             motion_counter_active = False
@@ -1342,6 +1346,7 @@ def _find_pre_recording_stop_context(
     session: dict[str, Any],
     motion_events: list[dict[str, Any]],
     recovery_context: dict[str, Any] | None,
+    session_recordings_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     stop_line_no = int(session.get("stop_line_no") or 0)
     if stop_line_no <= 0 or not motion_events:
@@ -1349,6 +1354,8 @@ def _find_pre_recording_stop_context(
     if _describe_recording_start_evidence(recovery_context):
         return None
 
+    has_session_recording_context = session_recordings_rows is not None
+    session_recordings_rows = session_recordings_rows or []
     trigger_before_stop = any(
         event.get("event_type") == "motion_trigger"
         and int(event.get("line_no") or 0) <= stop_line_no
@@ -1357,6 +1364,15 @@ def _find_pre_recording_stop_context(
     if trigger_before_stop:
         return None
 
+    motion_start_event = next(
+        (
+            event
+            for event in motion_events
+            if event.get("event_type") == "motion_start"
+            and int(event.get("line_no") or 0) <= stop_line_no
+        ),
+        None,
+    )
     motion_stop_event = next(
         (
             event
@@ -1368,7 +1384,16 @@ def _find_pre_recording_stop_context(
         None,
     )
     if motion_stop_event is None:
-        return None
+        # 모션 단계 진입은 확인됐는데 녹화 시작/DB 영상 근거 없이 종료 스캔되면
+        # 실녹화 전 취소로 보는 게 운영 기대값에 더 가깝다.
+        if motion_start_event is None or not has_session_recording_context or session_recordings_rows:
+            return None
+        return {
+            "label": "모션 감지 단계에서 종료 스캔",
+            "stopTime": _display_value(session.get("stop_time_label"), default="미확인"),
+            "motionStopTime": "미확인",
+            "motionStopLineNo": 0,
+        }
 
     return {
         "label": "모션 감지 단계에서 종료 스캔",
@@ -1383,6 +1408,7 @@ def _classify_session_termination_kind(
     restart_events: list[dict[str, Any]],
     session_motion_events: list[dict[str, Any]] | None = None,
     recovery_context: dict[str, Any] | None = None,
+    session_recordings_rows: list[dict[str, Any]] | None = None,
 ) -> str:
     has_restart = any(
         int(session["start_line_no"]) <= int(event.get("line_no") or 0) <= int(session["end_line_no"])
@@ -1393,7 +1419,12 @@ def _classify_session_termination_kind(
     if session.get("stop_line_no") is None:
         return "stop_missing"
     if isinstance(
-        _find_pre_recording_stop_context(session, session_motion_events or [], recovery_context),
+        _find_pre_recording_stop_context(
+            session,
+            session_motion_events or [],
+            recovery_context,
+            session_recordings_rows,
+        ),
         dict,
     ):
         return "pre_recording_stop"
@@ -2004,12 +2035,14 @@ def _build_session_termination_text(
     restart_events: list[dict[str, Any]],
     session_motion_events: list[dict[str, Any]] | None = None,
     recovery_context: dict[str, Any] | None = None,
+    session_recordings_rows: list[dict[str, Any]] | None = None,
 ) -> str:
     termination_kind = _classify_session_termination_kind(
         session,
         restart_events,
         session_motion_events,
         recovery_context,
+        session_recordings_rows,
     )
     if termination_kind == "restart":
         return "마미박스 비정상 종료 (세션 중 재시작 감지)"
@@ -2076,6 +2109,7 @@ def _build_session_recording_result_text(
         session,
         session_motion_events or [],
         recovery_context,
+        session_recordings_rows,
     )
 
     if has_restart:
@@ -2576,18 +2610,21 @@ def _build_log_analysis_record(
             session,
             session_motion_events,
             recovery_context,
+            session_recordings_rows,
         )
         termination_kind = _classify_session_termination_kind(
             session,
             session_restart_events,
             session_motion_events,
             recovery_context,
+            session_recordings_rows,
         )
         termination_text = _build_session_termination_text(
             session,
             session_restart_events,
             session_motion_events,
             recovery_context,
+            session_recordings_rows,
         )
         if termination_kind == "restart":
             restart_count += 1
@@ -2749,12 +2786,14 @@ def _build_session_card_context(
         session,
         session_motion_events,
         recovery_context,
+        session_recordings_rows,
     )
     termination_text = _build_session_termination_text(
         session,
         session_restart_events,
         session_motion_events,
         recovery_context,
+        session_recordings_rows,
     )
 
     anomaly_parts: list[str] = []
