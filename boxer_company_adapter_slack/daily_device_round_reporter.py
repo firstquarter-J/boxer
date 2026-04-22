@@ -464,6 +464,7 @@ def _run_daily_device_round_if_due(
         auto_update_agent=True,
         auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
         auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
+        auto_power_off=bool(cs.DAILY_DEVICE_ROUND_AUTO_POWER_OFF),
         progress_callback=_handle_daily_device_round_progress,
     )
     base_state = _clear_daily_device_round_active_progress(state)
@@ -495,6 +496,7 @@ def _run_daily_device_round_if_due(
         "statusCounts": report_summary.get("statusCounts"),
         "updateCounts": report_summary.get("updateCounts"),
         "cleanupCounts": report_summary.get("cleanupCounts"),
+        "powerCounts": report_summary.get("powerCounts"),
     }
     if hospital_seq is None:
         _remember_daily_device_round_runtime_state(next_state, now=local_now)
@@ -588,6 +590,7 @@ def _build_daily_device_round_report_text(
     status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
     update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
     cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
+    power_counts = report_summary.get("powerCounts") if isinstance(report_summary.get("powerCounts"), dict) else {}
     summary_line = _display_value(report_summary.get("summaryLine"), default="점검 결과")
 
     if _coerce_int(report_summary.get("hospitalSeq")) is None:
@@ -620,6 +623,17 @@ def _build_daily_device_round_report_text(
         if cleanup_failed:
             cleanup_text = f"{cleanup_text} / 실패 {cleanup_failed}"
         executed_parts.append(cleanup_text)
+
+    power_completed = int(power_counts.get("poweredOff") or 0)
+    power_already_offline = int(power_counts.get("alreadyOffline") or 0)
+    power_failed = int(power_counts.get("powerOffFailed") or 0)
+    if power_completed or power_already_offline or power_failed:
+        power_text = f"장비 종료 {power_completed}"
+        if power_already_offline:
+            power_text = f"{power_text} / 생략 {power_already_offline}"
+        if power_failed:
+            power_text = f"{power_text} / 실패 {power_failed}"
+        executed_parts.append(power_text)
 
     if executed_parts:
         return f"{hospital_label} | {' | '.join(executed_parts)}"

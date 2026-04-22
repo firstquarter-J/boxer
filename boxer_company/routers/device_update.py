@@ -1,5 +1,6 @@
 import json
 import re
+import shlex
 import time
 from collections.abc import Callable
 from typing import Any
@@ -12,6 +13,7 @@ from boxer_company.routers.device_status_probe import _parse_pm2_processes
 from boxer_company.routers.mda_graphql import (
     _get_mda_device_detail,
     _get_mda_latest_device_version,
+    _send_mda_device_ping,
     _update_mda_device_box,
     _wait_for_mda_device_agent_ssh,
 )
@@ -55,6 +57,24 @@ _AGENT_UPDATE_HINTS = (
     "mommybox-agent",
     "momybox-agent",
 )
+_POWER_HINTS = (
+    "전원",
+    "power",
+)
+_POWER_OFF_HINTS = (
+    "장비 종료",
+    "장비종료",
+    "전원 종료",
+    "전원종료",
+    "전원 꺼",
+    "전원꺼",
+    "전원 끄기",
+    "전원 꺼줘",
+    "꺼버려",
+    "power off",
+    "poweroff",
+    "shutdown",
+)
 _LOGIN_SHELL_USER_PATH_EXPORT = 'export PATH="$HOME/.npm-global/bin:$HOME/bin:/usr/local/bin:$PATH"; '
 _PM2_JLIST_COMMAND = (
     "bash -lc '"
@@ -87,6 +107,28 @@ _AGENT_INSTALL_SCRIPT_COMMAND = (
 _BOX_UPDATE_WAIT_TIMEOUT_SEC = 300
 _AGENT_UPDATE_WAIT_TIMEOUT_SEC = max(300, int(cs.DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC or 600))
 _AGENT_INSTALL_SCRIPT_TIMEOUT_SEC = max(120, _AGENT_UPDATE_WAIT_TIMEOUT_SEC)
+_DEVICE_POWER_OFF_WAIT_TIMEOUT_SEC = max(15, int(cs.DEVICE_POWER_OFF_WAIT_TIMEOUT_SEC or 60))
+_DEVICE_POWER_OFF_POLL_INTERVAL_SEC = 3
+_DEVICE_POWER_OFF_DISPATCH_DELAY_SEC = max(1, int(cs.DEVICE_POWER_OFF_DISPATCH_DELAY_SEC or 2))
+_DEVICE_POWER_OFF_LOG_PATH = "/tmp/boxer-device-poweroff.log"
+_DEVICE_POWER_OFF_PRECHECK_COMMAND = (
+    "bash -lc '"
+    "if [ \"$(id -u)\" -eq 0 ]; then "
+    "  SUDO_PREFIX=\"\"; "
+    "elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then "
+    "  SUDO_PREFIX=\"sudo -n \"; "
+    "else "
+    "  echo privilege_missing; exit 91; "
+    "fi; "
+    "for candidate in /sbin/shutdown /usr/sbin/shutdown /sbin/poweroff /usr/sbin/poweroff; do "
+    "  if [ -x \"$candidate\" ]; then "
+    "    printf \"SUDO_PREFIX=%s\\n\" \"$SUDO_PREFIX\"; "
+    "    printf \"COMMAND_PATH=%s\\n\" \"$candidate\"; "
+    "    exit 0; "
+    "  fi; "
+    "done; "
+    "echo poweroff_command_missing; exit 92'"
+)
 _UPDATE_POLL_INTERVAL_SEC = 5
 _AGENT_MINIMUM_FOR_BOX_UPDATE = (2, 0, 0)
 _BOX_PM2_NAMES = {"mommybox-v2"}
@@ -130,7 +172,16 @@ def _extract_requested_update_version(question: str) -> str | None:
 
 
 def _resolve_update_device_name(question: str, device_name: str | None = None) -> str:
-    resolved = str(device_name or _extract_device_name_for_update(question) or "").strip()
+    normalized_question = _normalize_device_update_question(question)
+    matched = _LEADING_DEVICE_UPDATE_SCOPE_PATTERN.search(normalized_question)
+    leading_device_name = " ".join(str(matched.group(1) or "").split()).strip() if matched else ""
+    resolved = str(
+        device_name
+        or _extract_device_name_scope(normalized_question)
+        or leading_device_name
+        or _extract_device_name_for_update(normalized_question)
+        or ""
+    ).strip()
     if not resolved:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 박스 업데이트`")
     return resolved
@@ -165,9 +216,45 @@ def _is_device_box_update_request(question: str, device_name: str | None = None)
     )
 
 
+def _is_device_power_off_request(question: str, device_name: str | None = None) -> bool:
+    normalized = _normalize_device_update_question(question)
+    matched = _LEADING_DEVICE_UPDATE_SCOPE_PATTERN.search(normalized)
+    leading_device_name = " ".join(str(matched.group(1) or "").split()).strip() if matched else ""
+    resolved_device_name = str(
+        device_name
+        or _extract_device_name_scope(normalized)
+        or leading_device_name
+        or _extract_device_name_for_update(normalized)
+        or ""
+    ).strip()
+    if not resolved_device_name:
+        return False
+    if (
+        _is_device_update_status_request(normalized, resolved_device_name)
+        or _is_device_agent_update_request(normalized, resolved_device_name)
+        or _is_device_box_update_request(normalized, resolved_device_name)
+    ):
+        return False
+    if _contains_hint(normalized, _POWER_OFF_HINTS):
+        return True
+    return _contains_hint(normalized, _POWER_HINTS) and (
+        "꺼" in normalized
+        or "끄" in normalized
+        or "종료" in normalized
+        or "off" in normalized.lower()
+    )
+
+
 def _build_device_update_config_message() -> str:
     return (
         "장비 업데이트 기능 설정이 부족해. "
+        "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD가 필요해"
+    )
+
+
+def _build_device_power_control_config_message() -> str:
+    return (
+        "장비 종료 기능 설정이 부족해. "
         "MDA_GRAPHQL_URL, MDA_ADMIN_USER_PASSWORD, DEVICE_SSH_PASSWORD가 필요해"
     )
 
@@ -589,6 +676,145 @@ def _wait_for_agent_update_completion(
     }
 
 
+def _parse_device_power_off_precheck(output: str) -> dict[str, Any]:
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    if not lines:
+        return {
+            "ok": False,
+            "reason": "poweroff_precheck_empty",
+            "commandPath": "",
+            "sudoPrefix": "",
+            "command": "",
+            "commandLabel": "",
+        }
+
+    values: dict[str, str] = {}
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+
+    command_path = values.get("COMMAND_PATH", "")
+    sudo_prefix = values.get("SUDO_PREFIX", "")
+    if not command_path:
+        reason = lines[-1]
+        return {
+            "ok": False,
+            "reason": reason or "poweroff_precheck_failed",
+            "commandPath": "",
+            "sudoPrefix": "",
+            "command": "",
+            "commandLabel": "",
+        }
+
+    if cs.DEVICE_POWER_OFF_COMMAND:
+        actual_command = cs.DEVICE_POWER_OFF_COMMAND
+        command_label = "custom"
+    elif command_path.endswith("/shutdown"):
+        actual_command = f"{sudo_prefix}{command_path} -h now"
+        command_label = "shutdown"
+    else:
+        actual_command = f"{sudo_prefix}{command_path}"
+        command_label = "poweroff"
+
+    return {
+        "ok": True,
+        "reason": "ok",
+        "commandPath": command_path,
+        "sudoPrefix": sudo_prefix,
+        "command": actual_command,
+        "commandLabel": command_label,
+    }
+
+
+def _build_device_power_off_dispatch_command(actual_command: str) -> str:
+    delayed_command = f"sleep {_DEVICE_POWER_OFF_DISPATCH_DELAY_SEC}; {actual_command}"
+    # SSH 세션이 끊기기 전에 wrapper가 먼저 종료되도록 실제 전원 종료는 백그라운드로 예약해.
+    return (
+        "bash -lc "
+        + shlex.quote(
+            "nohup sh -c "
+            + shlex.quote(delayed_command)
+            + f" >{_DEVICE_POWER_OFF_LOG_PATH} 2>&1 < /dev/null & echo poweroff_scheduled"
+        )
+    )
+
+
+def _prepare_device_power_off_command(client: Any) -> dict[str, Any]:
+    if cs.DEVICE_POWER_OFF_COMMAND:
+        return {
+            "ok": True,
+            "reason": "custom_command",
+            "commandPath": "",
+            "sudoPrefix": "",
+            "command": cs.DEVICE_POWER_OFF_COMMAND,
+            "commandLabel": "custom",
+            "result": {
+                "ok": True,
+                "exitStatus": 0,
+                "output": "custom_command",
+                "reason": "",
+            },
+        }
+
+    result = _run_remote_ssh_command(
+        client,
+        command=_DEVICE_POWER_OFF_PRECHECK_COMMAND,
+        timeout_sec=max(10, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+    )
+    parsed = _parse_device_power_off_precheck(_display_value(result.get("output"), default=""))
+    parsed["result"] = result
+    if not result.get("ok"):
+        parsed["ok"] = False
+        parsed["reason"] = parsed.get("reason") or _display_value(result.get("reason"), default="poweroff_precheck_failed")
+    return parsed
+
+
+def _wait_for_device_power_off_completion(device_name: str) -> dict[str, Any]:
+    deadline = time.monotonic() + _DEVICE_POWER_OFF_WAIT_TIMEOUT_SEC
+    attempts = 0
+    last_device: dict[str, Any] | None = None
+    last_ping: dict[str, Any] | None = None
+    while True:
+        attempts += 1
+        try:
+            last_device = _get_mda_device_detail(device_name)
+        except Exception:
+            last_device = None
+        try:
+            last_ping = _send_mda_device_ping(device_name)
+        except Exception as exc:
+            last_ping = {
+                "status": False,
+                "message": type(exc).__name__,
+            }
+        device_payload = last_device if isinstance(last_device, dict) else {}
+        agent_connected = bool(device_payload.get("isConnected"))
+        device_connected = bool(device_payload.get("deviceIsConnected"))
+        ping_ok = bool((last_ping or {}).get("status"))
+        # 종료 직후 MDA 상태가 잠깐 남을 수 있어서 agent/device 상태와 ping이 같이 꺼졌는지 본다.
+        if isinstance(last_device, dict) and not agent_connected and not device_connected and not ping_ok:
+            return {
+                "ok": True,
+                "status": "completed",
+                "attempts": attempts,
+                "device": _build_device_snapshot(device_name, last_device),
+                "ping": last_ping,
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_DEVICE_POWER_OFF_POLL_INTERVAL_SEC)
+
+    return {
+        "ok": False,
+        "status": "timed_out",
+        "attempts": attempts,
+        "device": _build_device_snapshot(device_name, last_device),
+        "ping": last_ping,
+    }
+
+
 def _dispatch_device_agent_install_script(device_name: str) -> dict[str, Any]:
     device_info, ssh_state, client = _open_device_ssh_for_update(device_name)
     dispatch_payload: dict[str, Any] = {
@@ -694,6 +920,14 @@ def _build_device_update_started_notice(result_payload: dict[str, Any]) -> str:
             f"• 현재 에이전트 버전: `{current_agent_version or '미확인'}`",
             "• 대상: `latest`",
             "• 안내: 업데이트 중이야. 완료되면 다시 알려줄게",
+        ]
+        return "\n".join(lines)
+
+    if route == "device_power_off":
+        lines = [
+            "*장비 전원 종료 진행 중*",
+            f"• 장비: `{device_name}`",
+            "• 안내: 종료 명령은 보냈고 실제 오프라인 여부를 확인 중이야",
         ]
         return "\n".join(lines)
 
@@ -915,6 +1149,125 @@ def _request_device_agent_update(
     return "\n".join(lines), payload
 
 
+def _request_device_power_off(
+    question: str,
+    device_name: str | None = None,
+    on_dispatched: _DeviceUpdateDispatchNoticeFn | None = None,
+) -> tuple[str, dict[str, Any]]:
+    normalized_device_name = _resolve_update_device_name(question, device_name)
+    device_info, ssh_state, client = _open_device_ssh_for_update(normalized_device_name)
+    snapshot = _build_device_snapshot(normalized_device_name, device_info)
+    payload: dict[str, Any] = {
+        "route": "device_power_off",
+        "source": "ssh",
+        "request": {
+            "deviceName": normalized_device_name,
+            "requestedAction": "power_off",
+        },
+        "device": snapshot,
+        "precheck": None,
+        "dispatch": None,
+        "wait": None,
+    }
+
+    lines = _build_device_header_lines(
+        title="*장비 전원 종료*",
+        device_name=normalized_device_name,
+        device_info=snapshot,
+    )
+    if not device_info:
+        lines.append("• 결과: *요청 불가*")
+        lines.append("• 안내: MDA에서 장비를 찾지 못했어")
+        return "\n".join(lines), payload
+
+    lines.append(f"• MDA 연결: *{_connection_label(bool(snapshot.get('isConnected')))}*")
+    lines.append(
+        f"• SSH 사전 확인: 연결 가능 (`{_display_value(ssh_state.get('host'), default='미확인')}:{int(ssh_state.get('port') or 0)}`)"
+        if ssh_state.get("ready")
+        else f"• SSH 사전 확인: 불가 (`{_display_value(ssh_state.get('reason'), default='unknown')}`)"
+    )
+
+    if not snapshot.get("isConnected"):
+        payload["wait"] = {"status": "already_offline", "ok": True, "runtime": {"ssh": ssh_state}}
+        lines.append("• 결과: *생략*")
+        lines.append("• 안내: 이미 장비 agent 연결이 끊겨 있어. 전원이 꺼졌거나 네트워크가 끊긴 상태야")
+        if client is not None:
+            client.close()
+        return "\n".join(lines), payload
+
+    if client is None:
+        lines.append("• 결과: *요청 불가*")
+        lines.append(f"• 안내: SSH 연결을 못 열었어 (`{_display_value(ssh_state.get('reason'), default='unknown')}`)")
+        return "\n".join(lines), payload
+
+    try:
+        # 종료는 되돌리기 어려운 액션이라 실제 종료 커맨드를 고르기 전에 권한/경로를 먼저 확인해.
+        precheck = _prepare_device_power_off_command(client)
+        payload["precheck"] = precheck
+        if not precheck.get("ok"):
+            lines.append("• 결과: *요청 실패*")
+            reason = _display_value(precheck.get("reason"), default="poweroff_precheck_failed")
+            if reason == "privilege_missing":
+                lines.append("• 안내: 장비에서 비대화형 sudo 권한이 없어 종료 명령을 못 보냈어")
+            elif reason == "poweroff_command_missing":
+                lines.append("• 안내: 장비에서 종료 명령 경로를 찾지 못했어")
+            else:
+                lines.append(f"• 안내: 종료 사전 확인에 실패했어 (`{reason}`)")
+            return "\n".join(lines), payload
+
+        dispatch_command = _build_device_power_off_dispatch_command(
+            _display_value(precheck.get("command"), default="")
+        )
+        dispatch_result = _run_remote_ssh_command(
+            client,
+            command=dispatch_command,
+            timeout_sec=max(10, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        )
+    finally:
+        client.close()
+
+    dispatch_status = bool(dispatch_result.get("ok")) and (
+        "poweroff_scheduled" in _display_value(dispatch_result.get("output"), default="")
+    )
+    payload["dispatch"] = {
+        "affected": 1 if dispatch_status else 0,
+        "status": dispatch_status,
+        "message": (
+            "poweroff_scheduled"
+            if dispatch_status
+            else _display_value(dispatch_result.get("reason"), default="poweroff_dispatch_failed")
+        ),
+        "commandLabel": _display_value(
+            ((payload.get("precheck") or {}) if isinstance(payload.get("precheck"), dict) else {}).get("commandLabel"),
+            default="",
+        ),
+        "result": dispatch_result,
+    }
+    if not dispatch_status:
+        lines.append("• 결과: *요청 실패*")
+        lines.append(
+            f"• 안내: 종료 예약 명령을 못 보냈어 (`{_display_value(payload['dispatch'].get('message'), default='poweroff_dispatch_failed')}`)"
+        )
+        return "\n".join(lines), payload
+
+    if on_dispatched is not None:
+        on_dispatched(_build_device_update_started_notice(payload))
+
+    wait_result = _wait_for_device_power_off_completion(normalized_device_name)
+    payload["wait"] = wait_result
+    lines.append("• SSH 응답: 종료 예약 완료")
+    if wait_result.get("ok"):
+        lines.append("• 결과: *완료*")
+        lines.append("• 안내: MDA ping 기준으로 장비 오프라인이 확인됐어")
+    else:
+        lines.append("• 결과: *확인 필요*")
+        lines.append(
+            f"• 안내: {_DEVICE_POWER_OFF_WAIT_TIMEOUT_SEC}초 안에 오프라인까지는 못 봤어. "
+            f"`{normalized_device_name} 장비 상태`로 다시 확인해"
+        )
+    return "\n".join(lines), payload
+
+
 def _query_device_update_status(device_name: str) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
@@ -971,9 +1324,10 @@ def _build_device_update_activity_input(
     requested_version = _display_value(request_payload.get("requestedVersion"), default="")
     requester_label = str(user_name or user_id or "").strip()
     is_agent_update = route == "device_agent_update"
+    is_power_off = route == "device_power_off"
 
     detail_log = {
-        "source": "boxer_slack_device_update",
+        "source": "boxer_slack_device_power" if is_power_off else "boxer_slack_device_update",
         "route": route,
         "question": question,
         "slackUserId": user_id,
@@ -991,15 +1345,24 @@ def _build_device_update_activity_input(
         "waitOk": bool(wait_payload.get("ok")),
     }
 
-    action_label = "에이전트" if is_agent_update else "박스"
+    action_label = "장비 종료" if is_power_off else "에이전트" if is_agent_update else "박스"
     version_label = requested_version or "latest"
     return {
         "activityType": "agent.stateChange" if is_agent_update else "device.edit",
-        "reason": f"Boxer Slack {action_label} 업데이트 요청 전송",
+        "reason": (
+            "Boxer Slack 장비 종료 요청 전송"
+            if is_power_off
+            else f"Boxer Slack {action_label} 업데이트 요청 전송"
+        ),
         "description": (
-            f"Boxer Slack {action_label} 업데이트 요청: 장비명 [{device_name}], "
-            f"대상 [{version_label}]"
+            f"Boxer Slack 장비 종료 요청: 장비명 [{device_name}]"
             f"{f', 요청자 [{requester_label}]' if requester_label else ''}"
+            if is_power_off
+            else (
+                f"Boxer Slack {action_label} 업데이트 요청: 장비명 [{device_name}], "
+                f"대상 [{version_label}]"
+                f"{f', 요청자 [{requester_label}]' if requester_label else ''}"
+            )
         ),
         "detailLog": json.dumps(detail_log, ensure_ascii=False, separators=(",", ":")),
     }

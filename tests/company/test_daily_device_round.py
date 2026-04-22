@@ -486,6 +486,49 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertEqual(result["agentActionText"], "에이전트 업데이트 완료")
         self.assertEqual(result["boxActionText"], "박스 업데이트 완료")
 
+    @patch("boxer_company.daily_device_round._request_device_power_off")
+    @patch("boxer_company.daily_device_round._query_device_update_status")
+    @patch("boxer_company.daily_device_round._probe_device_status_overview")
+    def test_runs_power_off_after_checks_when_enabled(
+        self,
+        mock_probe_device_status_overview,
+        mock_query_device_update_status,
+        mock_request_device_power_off,
+    ) -> None:
+        mock_probe_device_status_overview.return_value = (
+            "status text",
+            _build_status_payload(overall="정상"),
+        )
+        mock_query_device_update_status.return_value = (
+            "update status",
+            _build_update_payload(
+                box_version="2.11.300",
+                latest_box_version="2.11.300",
+                agent_version="2.0.0",
+                agent_latest=True,
+            ),
+        )
+        mock_request_device_power_off.return_value = (
+            "power off result",
+            {
+                "route": "device_power_off",
+                "dispatch": {"status": True},
+                "wait": {"ok": True, "status": "completed"},
+            },
+        )
+
+        result = rounder._run_daily_device_round_for_device(
+            "MB2-C00419",
+            auto_power_off=True,
+        )
+
+        mock_request_device_power_off.assert_called_once_with(
+            "MB2-C00419 장비 종료",
+            device_name="MB2-C00419",
+        )
+        self.assertTrue(result["powerAction"]["ok"])
+        self.assertEqual(result["powerActionText"], "장비 종료 완료")
+
     @patch("boxer_company.daily_device_round._request_device_agent_update")
     @patch("boxer_company.daily_device_round._query_device_update_status")
     @patch("boxer_company.daily_device_round._probe_device_status_overview")

@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from boxer_company.routers.device_update import (
     _AGENT_GIT_STATUS_COMMAND,
@@ -7,11 +7,13 @@ from boxer_company.routers.device_update import (
     _extract_device_name_for_update,
     _is_device_agent_update_request,
     _is_device_box_update_request,
+    _is_device_power_off_request,
     _is_device_update_status_request,
     _parse_agent_repo_state,
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
+    _request_device_power_off,
     _run_remote_ssh_command,
 )
 
@@ -32,8 +34,11 @@ class DeviceUpdateRoutingTests(unittest.TestCase):
         self.assertTrue(_is_device_box_update_request("MB2-C00419 장비 업데이트"))
         self.assertTrue(_is_device_agent_update_request("MB2-C00419 에이전트 업데이트"))
         self.assertTrue(_is_device_update_status_request("MB2-C00419 업데이트 상태"))
+        self.assertTrue(_is_device_power_off_request("MB2-C00419 장비 종료"))
+        self.assertTrue(_is_device_power_off_request("MB2-C00419 전원 꺼줘"))
         self.assertFalse(_is_device_box_update_request("MB2-C00419 에이전트 업데이트"))
         self.assertFalse(_is_device_agent_update_request("MB2-C00419 업데이트 상태"))
+        self.assertFalse(_is_device_power_off_request("MB2-C00419 장비 업데이트"))
 
 
 class DeviceUpdateExecutionTests(unittest.TestCase):
@@ -132,6 +137,60 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         self.assertEqual(payload["route"], "device_box_update")
         self.assertEqual(payload["latestVersion"], "2.11.300")
         self.assertTrue(payload["dispatch"]["status"])
+
+    @patch("boxer_company.routers.device_update._wait_for_device_power_off_completion")
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._prepare_device_power_off_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_requests_device_power_off_via_ssh(
+        self,
+        mock_open_device_ssh_for_update,
+        mock_prepare_device_power_off_command,
+        mock_run_remote_ssh_command,
+        mock_wait_for_device_power_off_completion,
+    ) -> None:
+        client = MagicMock()
+        mock_open_device_ssh_for_update.return_value = (
+            {
+                "deviceName": "MB2-C00419",
+                "version": "2.11.300",
+                "hospitalName": "아이사랑산부인과의원(부산)",
+                "roomName": "2진료실",
+                "isConnected": True,
+            },
+            {
+                "ready": True,
+                "reason": "ready",
+                "host": "10.0.0.10",
+                "port": 22,
+            },
+            client,
+        )
+        mock_prepare_device_power_off_command.return_value = {
+            "ok": True,
+            "reason": "ok",
+            "command": "sudo -n /sbin/shutdown -h now",
+            "commandLabel": "shutdown",
+        }
+        mock_run_remote_ssh_command.return_value = {
+            "ok": True,
+            "exitStatus": 0,
+            "output": "poweroff_scheduled",
+            "reason": "",
+        }
+        mock_wait_for_device_power_off_completion.return_value = {
+            "ok": True,
+            "status": "completed",
+        }
+
+        result_text, payload = _request_device_power_off("MB2-C00419 장비 종료")
+
+        self.assertIn("*장비 전원 종료*", result_text)
+        self.assertIn("완료", result_text)
+        self.assertEqual(payload["route"], "device_power_off")
+        self.assertTrue(payload["dispatch"]["status"])
+        mock_wait_for_device_power_off_completion.assert_called_once_with("MB2-C00419")
+        client.close.assert_called()
 
     @patch("boxer_company.routers.device_update._wait_for_box_update_completion")
     @patch("boxer_company.routers.device_update._update_mda_device_box")
@@ -606,6 +665,38 @@ class DeviceUpdateActivityLogTests(unittest.TestCase):
         self.assertIn("MB2-C00419", payload["description"])
         self.assertIn("2.11.300", payload["description"])
         self.assertIn("Boxer Slack 박스 업데이트 요청", payload["reason"])
+
+    def test_builds_power_off_activity_payload(self) -> None:
+        payload = _build_device_update_activity_input(
+            question="MB2-C00419 장비 종료",
+            user_id="U123",
+            user_name="Rosa",
+            channel_id="C123",
+            thread_ts="123.456",
+            result_payload={
+                "route": "device_power_off",
+                "request": {
+                    "deviceName": "MB2-C00419",
+                    "requestedAction": "power_off",
+                },
+                "device": {
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.300",
+                },
+                "dispatch": {
+                    "status": True,
+                    "message": "poweroff_scheduled",
+                },
+                "wait": {
+                    "status": "completed",
+                    "ok": True,
+                },
+            },
+        )
+
+        self.assertEqual(payload["activityType"], "device.edit")
+        self.assertIn("MB2-C00419", payload["description"])
+        self.assertIn("장비 종료", payload["reason"])
 
 
 if __name__ == "__main__":

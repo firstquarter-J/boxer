@@ -16,6 +16,7 @@ from boxer_company.routers.device_update import (
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
+    _request_device_power_off,
     _resolve_agent_runtime_version,
 )
 
@@ -465,6 +466,40 @@ def _describe_daily_device_round_action(
     return _display_value(plan.get("reason"), default="박스 확인 필요")
 
 
+def _describe_daily_device_round_power_summary(
+    device_result: dict[str, Any],
+) -> tuple[str, str, str]:
+    action = device_result.get("powerAction") if isinstance(device_result.get("powerAction"), dict) else None
+    if not action:
+        return "", "", ""
+
+    status = _display_value(action.get("status"), default="")
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    if status == "already_offline" and action.get("ok"):
+        return "latest", "종료 불필요", "이미 오프라인"
+    if status == "completed" and action.get("ok"):
+        return "success", "종료 완료", "MDA ping 오프라인 확인"
+    if status == "dispatch_failed":
+        dispatch_payload = payload.get("dispatch") if isinstance(payload.get("dispatch"), dict) else {}
+        return "failed", "종료 실패", _display_value(dispatch_payload.get("message"), default="종료 실패")
+    return "check", "확인 필요", "전원 종료 재확인 필요"
+
+
+def _describe_daily_device_round_power_action(
+    action: dict[str, Any] | None,
+) -> str:
+    if not action:
+        return "장비 종료 미실행"
+    status = _display_value(action.get("status"), default="")
+    if status == "already_offline" and action.get("ok"):
+        return "장비 종료 생략"
+    if status == "completed" and action.get("ok"):
+        return "장비 종료 완료"
+    if status == "dispatch_failed":
+        return "장비 종료 실패"
+    return "장비 종료 확인 필요"
+
+
 def _format_daily_device_round_hospital_label(
     hospital_name: str | None,
     hospital_seq: int | None,
@@ -607,6 +642,7 @@ def _build_daily_device_round_summary_lines(
     status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
     update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
     cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
+    power_counts = report_summary.get("powerCounts") if isinstance(report_summary.get("powerCounts"), dict) else {}
 
     lines: list[str] = []
     check_needed_count = int(status_counts.get("확인 필요") or 0)
@@ -662,6 +698,23 @@ def _build_daily_device_round_summary_lines(
         if cleanup_failed:
             parts.append(f"실패 `{cleanup_failed}`")
         lines.append("• 🧹 디스크 정리 " + " / ".join(parts))
+
+    power_requested = int(power_counts.get("requested") or 0)
+    power_completed = int(power_counts.get("poweredOff") or 0)
+    power_already_offline = int(power_counts.get("alreadyOffline") or 0)
+    power_failed = int(power_counts.get("powerOffFailed") or 0)
+    power_pending = max(0, power_requested - power_completed - power_already_offline - power_failed)
+    if power_pending or power_completed or power_already_offline or power_failed:
+        parts = []
+        if power_completed:
+            parts.append(f"완료 `{power_completed}`")
+        if power_already_offline:
+            parts.append(f"생략 `{power_already_offline}`")
+        if power_pending:
+            parts.append(f"확인 필요 `{power_pending}`")
+        if power_failed:
+            parts.append(f"실패 `{power_failed}`")
+        lines.append("• ⏻ 장비 종료 " + " / ".join(parts))
 
     return lines
 
@@ -742,6 +795,8 @@ def _is_daily_device_round_actionable_device(device_result: dict[str, Any]) -> b
     if _is_daily_device_round_route_actionable(device_result, route_kind="agent"):
         return True
     if _is_daily_device_round_route_actionable(device_result, route_kind="box"):
+        return True
+    if isinstance(device_result.get("powerAction"), dict):
         return True
     return False
 
@@ -906,6 +961,7 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         device_result,
         route_kind="box",
     )
+    power_status_kind, power_status_label, power_detail = _describe_daily_device_round_power_summary(device_result)
     cleanup_status, cleanup_detail = _describe_daily_device_round_trashcan_cleanup(device_result)
     room_name = _display_value(device_result.get("roomName"), default="")
     device_name = _display_value(device_result.get("deviceName"), default="미확인")
@@ -942,6 +998,10 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         lines.append(
             f"  *박스 업데이트*  {_format_daily_device_round_update_badge(box_status_kind, box_status_label)} | {box_detail}"
         )
+    if power_status_kind:
+        lines.append(
+            f"  *장비 종료*  {_format_daily_device_round_update_badge(power_status_kind, power_status_label)} | {power_detail}"
+        )
     return "\n".join(lines)
 
 
@@ -951,6 +1011,7 @@ def _run_daily_device_round_for_device(
     auto_update_agent: bool = False,
     auto_update_box: bool = False,
     auto_cleanup_trashcan: bool = False,
+    auto_power_off: bool = False,
 ) -> dict[str, Any]:
     status_text, status_payload = _probe_device_status_overview(device_name)
     trashcan_cleanup = _run_device_trashcan_cleanup(
@@ -991,6 +1052,18 @@ def _run_daily_device_round_for_device(
         )
         update_status_text, update_status_payload = _query_device_update_status(device_name)
 
+    power_action = None
+    if auto_power_off:
+        # 점검/업데이트 결과를 다 모은 뒤 마지막에만 종료를 걸어야 리포트 근거가 흔들리지 않아.
+        power_text, power_payload = _request_device_power_off(
+            f"{device_name} 장비 종료",
+            device_name=device_name,
+        )
+        power_action = _build_daily_device_round_action_result(
+            result_text=power_text,
+            result_payload=power_payload,
+        )
+
     final_plan = _build_daily_device_round_update_plan(update_status_payload)
     overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
     device_payload = update_status_payload.get("device") if isinstance(update_status_payload.get("device"), dict) else {}
@@ -1025,6 +1098,7 @@ def _run_daily_device_round_for_device(
         "finalPlan": final_plan,
         "agentAction": agent_action,
         "boxAction": box_action,
+        "powerAction": power_action,
         "agentActionText": _describe_daily_device_round_action(
             agent_action,
             route_kind="agent",
@@ -1035,6 +1109,7 @@ def _run_daily_device_round_for_device(
             route_kind="box",
             plan=final_plan["box"],
         ),
+        "powerActionText": _describe_daily_device_round_power_action(power_action),
     }
 
 
@@ -1085,8 +1160,10 @@ def _build_daily_device_round_error_result(
         },
         "agentAction": None,
         "boxAction": None,
+        "powerAction": None,
         "agentActionText": "에이전트 점검 실패",
         "boxActionText": "박스 점검 실패",
+        "powerActionText": "장비 종료 점검 실패",
         "error": f"{type(exc).__name__}: {exc}",
     }
 
@@ -1098,6 +1175,7 @@ def _build_daily_device_round_summary(
     auto_update_agent: bool = False,
     auto_update_box: bool = False,
     auto_cleanup_trashcan: bool = False,
+    auto_power_off: bool = False,
     progress_callback: _DailyDeviceRoundProgressCallback | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
@@ -1129,6 +1207,7 @@ def _build_daily_device_round_summary(
             "autoUpdateAgent": bool(auto_update_agent),
             "autoUpdateBox": bool(auto_update_box),
             "autoCleanupTrashCan": bool(auto_cleanup_trashcan),
+            "autoPowerOff": bool(auto_power_off),
             "statusCounts": {
                 "정상": 0,
                 "확인 필요": 0,
@@ -1147,6 +1226,12 @@ def _build_daily_device_round_summary(
                 "candidates": 0,
                 "executed": 0,
                 "failed": 0,
+            },
+            "powerCounts": {
+                "requested": 0,
+                "poweredOff": 0,
+                "alreadyOffline": 0,
+                "powerOffFailed": 0,
             },
             "deviceResults": [],
             "nextHospitalSeq": None,
@@ -1192,6 +1277,7 @@ def _build_daily_device_round_summary(
                     auto_update_agent=auto_update_agent,
                     auto_update_box=auto_update_box,
                     auto_cleanup_trashcan=auto_cleanup_trashcan,
+                    auto_power_off=auto_power_off,
                 )
             )
         except Exception as exc:
@@ -1216,6 +1302,12 @@ def _build_daily_device_round_summary(
         "candidates": 0,
         "executed": 0,
         "failed": 0,
+    }
+    power_counts = {
+        "requested": 0,
+        "poweredOff": 0,
+        "alreadyOffline": 0,
+        "powerOffFailed": 0,
     }
     for item in device_results:
         label = _display_value(item.get("overallLabel"), default="점검 불가")
@@ -1251,6 +1343,17 @@ def _build_daily_device_round_summary(
         elif _display_value(cleanup.get("status"), default="") == "failed":
             cleanup_counts["failed"] += 1
 
+        power_action = item.get("powerAction") if isinstance(item.get("powerAction"), dict) else {}
+        power_status = _display_value(power_action.get("status"), default="")
+        if power_action:
+            power_counts["requested"] += 1
+            if power_status == "already_offline" and power_action.get("ok"):
+                power_counts["alreadyOffline"] += 1
+            elif power_action.get("ok"):
+                power_counts["poweredOff"] += 1
+            else:
+                power_counts["powerOffFailed"] += 1
+
     next_hospital_seq = _resolve_next_daily_device_round_hospital_seq(
         candidates,
         _coerce_int(hospital.get("hospitalSeq")),
@@ -1266,9 +1369,11 @@ def _build_daily_device_round_summary(
         "autoUpdateAgent": bool(auto_update_agent),
         "autoUpdateBox": bool(auto_update_box),
         "autoCleanupTrashCan": bool(auto_cleanup_trashcan),
+        "autoPowerOff": bool(auto_power_off),
         "statusCounts": status_counts,
         "updateCounts": update_counts,
         "cleanupCounts": cleanup_counts,
+        "powerCounts": power_counts,
         "deviceResults": device_results,
         "nextHospitalSeq": next_hospital_seq,
         "candidateHospitalCount": len(candidate_hospital_seqs),

@@ -66,14 +66,17 @@ from boxer_company.routers.device_status_probe import (
     _probe_device_status_overview,
 )
 from boxer_company.routers.device_update import (
+    _build_device_power_control_config_message,
     _build_device_update_config_message,
     _extract_device_name_for_update,
     _is_device_agent_update_request,
     _is_device_box_update_request,
+    _is_device_power_off_request,
     _is_device_update_status_request,
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
+    _request_device_power_off,
 )
 from boxer_company.routers.mda_graphql import _send_mda_device_command
 from boxer_company_adapter_slack.device_activity import (
@@ -526,6 +529,54 @@ def _handle_device_routes(
         except Exception:
             context.logger.exception("Device agent update failed")
             context.reply("장비 에이전트 업데이트 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+        return True
+
+    if _is_device_power_off_request(question, device_name=update_device_name):
+        if not _is_device_runtime_configured():
+            context.reply(_build_device_power_control_config_message())
+            return True
+        try:
+            _set_request_log_route(context.payload, "device power off", handler_type="router")
+
+            def _reply_device_power_notice(notice_text: str) -> None:
+                try:
+                    context.reply(notice_text, mention_user=False)
+                except Exception:
+                    context.logger.exception(
+                        "Failed to send device power-off progress notice in thread_ts=%s deviceName=%s",
+                        context.thread_ts,
+                        update_device_name,
+                    )
+
+            result_text, result_payload = _request_device_power_off(
+                question,
+                device_name=update_device_name,
+                on_dispatched=_reply_device_power_notice,
+            )
+            context.reply(result_text, mention_user=False)
+            if bool(((result_payload.get("dispatch") or {}) if isinstance(result_payload, dict) else {}).get("status")):
+                _log_device_update_activity(
+                    question=question,
+                    user_id=context.user_id,
+                    channel_id=context.channel_id,
+                    thread_ts=context.thread_ts,
+                    result_payload=result_payload,
+                    client=context.client,
+                    logger=context.logger,
+                )
+            context.logger.info(
+                "Responded with device power off in thread_ts=%s deviceName=%s",
+                context.thread_ts,
+                update_device_name,
+            )
+        except ValueError as exc:
+            context.reply(f"장비 종료 요청 형식 오류: {exc}")
+        except RuntimeError as exc:
+            context.logger.exception("Device power off failed")
+            context.reply(deps.build_dependency_failure_reply("장비 종료", exc))
+        except Exception:
+            context.logger.exception("Device power off failed")
+            context.reply("장비 종료 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if _is_device_audio_probe_request(question, device_name=audio_probe_device_name):
