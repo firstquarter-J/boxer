@@ -13,6 +13,7 @@ from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_phase1_window,
     _analyze_barcode_log_scan_events,
     _build_phase2_scope_request_message,
+    _extract_device_name_scope,
     _extract_log_date_with_presence,
     _is_barcode_log_analysis_request,
     _is_error_focused_request,
@@ -61,6 +62,7 @@ def _handle_barcode_log_analysis_request(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+    direct_device_name = _extract_device_name_scope(question)
 
     if not (_is_barcode_log_analysis_request(question, barcode) or context.is_phase2_scope_followup):
         return False
@@ -92,13 +94,44 @@ def _handle_barcode_log_analysis_request(
             )
 
             auto_device_contexts = None
+            direct_device_contexts = (
+                [
+                    {
+                        "deviceName": direct_device_name,
+                        "hospitalName": context.phase2_hospital_name,
+                        "roomName": context.phase2_room_name,
+                    }
+                ]
+                if direct_device_name
+                else []
+            )
             if recording_count > 0 and not has_device_mapping:
                 auto_device_contexts = _lookup_device_contexts_by_barcode_on_date(
                     barcode or "",
                     log_date,
                 )
 
-            if recording_count <= 0 or not has_device_mapping:
+            if direct_device_contexts:
+                # 장비명을 직접 준 로그 분석은 recordings/병원/병실 매핑보다 해당 장비 로그를 우선 검색한다.
+                used_manual_scope = True
+                analysis_mode = f"{base_mode}_device_scope"
+                if base_mode == "error":
+                    result_text, log_analysis_payload = _analyze_barcode_log_errors(
+                        deps.get_s3_client(),
+                        barcode or "",
+                        log_date,
+                        recordings_context=recordings_context,
+                        device_contexts=direct_device_contexts,
+                    )
+                else:
+                    result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
+                        deps.get_s3_client(),
+                        barcode or "",
+                        log_date,
+                        recordings_context=recordings_context,
+                        device_contexts=direct_device_contexts,
+                    )
+            elif recording_count <= 0 or not has_device_mapping:
                 if not context.phase2_hospital_name or not context.phase2_room_name:
                     if auto_device_contexts:
                         used_recordings_scope = True

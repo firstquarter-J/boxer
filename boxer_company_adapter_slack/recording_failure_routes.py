@@ -13,6 +13,7 @@ from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_errors,
     _analyze_barcode_log_phase1_window,
     _build_phase2_scope_request_message,
+    _extract_device_name_scope,
     _extract_log_date_with_presence,
 )
 from boxer_company.routers.box_db import (
@@ -62,6 +63,7 @@ def _handle_recording_failure_analysis_request(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+    direct_device_name = _extract_device_name_scope(question)
 
     if not (_is_recording_failure_analysis_request(question, barcode) or context.is_failure_phase2_scope_followup):
         return False
@@ -87,7 +89,29 @@ def _handle_recording_failure_analysis_request(
         log_analysis_payload: dict[str, Any] | None = None
 
         if has_requested_date:
-            if recording_count <= 0 or not has_device_mapping:
+            direct_device_contexts = (
+                [
+                    {
+                        "deviceName": direct_device_name,
+                        "hospitalName": context.phase2_hospital_name,
+                        "roomName": context.phase2_room_name,
+                    }
+                ]
+                if direct_device_name
+                else []
+            )
+            if direct_device_contexts:
+                # 장비명이 있으면 첫 진료처럼 recordings 매핑이 비어도 지정 장비의 로그로 실패 원인을 본다.
+                used_manual_scope = True
+                analysis_mode = "error_device_scope"
+                result_text, log_analysis_payload = _analyze_barcode_log_errors(
+                    deps.get_s3_client(),
+                    barcode or "",
+                    log_date,
+                    recordings_context=recordings_context,
+                    device_contexts=direct_device_contexts,
+                )
+            elif recording_count <= 0 or not has_device_mapping:
                 if not context.phase2_hospital_name or not context.phase2_room_name:
                     auto_device_contexts = (
                         _lookup_device_contexts_by_barcode_on_date(barcode or "", log_date)

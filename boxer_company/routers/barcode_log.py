@@ -37,15 +37,17 @@ _RESTART_NODE_VERSION_PATTERN = re.compile(r"node\.js version:\s*(.+)$", re.IGNO
 _RESTART_PLATFORM_PATTERN = re.compile(r"platform:\s*(.+)$", re.IGNORECASE)
 _RESTART_START_TIME_PATTERN = re.compile(r"start time:\s*(.+)$", re.IGNORECASE)
 _HOSPITAL_SCOPE_PATTERN = re.compile(
-    r"(?:^|\s)병원(?:명)?\s*[:=]?\s*(.+?)(?=\s*(?:병실(?:명)?|진료실명|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)\s*[:=]?|$)"
+    r"(?:^|\s)병원(?:명)?\s*[:=]?\s*(.+?)(?=\s*(?:병실(?:명)?|진료실명|장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)\s*[:=]?|$)",
+    re.IGNORECASE,
 )
 _ROOM_SCOPE_PATTERN = re.compile(
-    r"(?:^|[\s)])(?:병실(?:명)?|진료실명)\s*[:=]?\s*(.+?)(?=\s*(?:날짜|로그|분석)\s*[:=]?|$)"
+    r"(?:^|[\s)])(?:병실(?:명)?|진료실명)\s*[:=]?\s*(.+?)(?=\s*(?:장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|파일|file|download|다운로드|다운)\s*[:=]?|$)",
+    re.IGNORECASE,
 )
 _ROOM_TOKEN_PATTERN = re.compile(
     r"([^\s`'\",]*(?:초음파실|진료실|병실|분만실|수술실|원장실)[^\s`'\",]*)"
 )
-_ROOM_PREFIX_PATTERN = re.compile(r"((?:(?:\d+\s*층|[A-Za-z0-9가-힣]+동)\s*)+)$")
+_ROOM_PREFIX_PATTERN = re.compile(r"((?:(?:\d+\s*층|[A-Za-z0-9가-힣]+동|\d+\s*-\s*\d+)\s*)+)$")
 _LEADING_HOSPITAL_SCOPE_PATTERN = re.compile(
     r"^\s*(.+?)\s+(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|병원|병실|진료실)(?:\s|$)",
     re.IGNORECASE,
@@ -89,6 +91,10 @@ _DEVICE_SEQ_PATTERN = re.compile(
 )
 _DEVICE_NAME_SCOPE_PATTERN = re.compile(
     r"(?:^|[\s)])(?:장비명|devicename)\s*[:=]?\s*([A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
+_DEVICE_NAME_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9-]*\d[A-Za-z0-9-]*)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _LEADING_DEVICE_NAME_SCOPE_PATTERN = re.compile(
@@ -255,6 +261,47 @@ def _try_format_date(year: int, month: int, day: int) -> str | None:
     return parsed.strftime("%Y-%m-%d")
 
 
+def _is_word_char_for_date_boundary(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z가-힣]", value or ""))
+
+
+def _is_embedded_numeric_date_match(text: str, matched: re.Match[str], kind: str) -> bool:
+    if kind in {"korean_ymd", "korean_md"}:
+        return False
+
+    before = text[matched.start() - 1] if matched.start() > 0 else ""
+    after = text[matched.end()] if matched.end() < len(text) else ""
+    before_is_word = _is_word_char_for_date_boundary(before)
+    after_is_word = _is_word_char_for_date_boundary(after)
+    room_prefix = text[max(0, matched.start() - 12) : matched.start()]
+    room_suffix = text[matched.end() : matched.end() + 12]
+
+    if re.search(r"(?:\d+\s*층|[A-Za-z0-9가-힣]+동)\s*$", room_prefix) and re.match(
+        r"\s*(?:초음파실|진료실|병실|분만실|수술실|원장실)",
+        room_suffix,
+    ):
+        return True
+    if not before_is_word and not after_is_word:
+        return False
+
+    prefix = text[max(0, matched.start() - 4) : matched.start()]
+    suffix = text[matched.end() : matched.end() + 4]
+
+    # 병실명 안의 "2층1-1진료실" 같은 토큰은 날짜보다 위치 정보로 봐야 한다.
+    if re.search(r"(?:날짜|일자)$", prefix) or suffix.startswith(("일", "로그", "영상", "파일")):
+        return False
+    return True
+
+
+def _sub_non_embedded_date_matches(text: str, pattern: re.Pattern[str], kind: str) -> str:
+    return pattern.sub(
+        lambda matched: " "
+        if not _is_embedded_numeric_date_match(text, matched, kind)
+        else matched.group(0),
+        text,
+    )
+
+
 def _parse_explicit_date_expression(text: str) -> tuple[bool, str | None]:
     candidates: list[tuple[int, str, re.Match[str]]] = []
     for kind, pattern in (
@@ -267,37 +314,42 @@ def _parse_explicit_date_expression(text: str) -> tuple[bool, str | None]:
         ("compact_yymmdd", _COMPACT_YYMMDD_PATTERN),
         ("compact_mmdd", _COMPACT_MMDD_PATTERN),
     ):
-        matched = pattern.search(text)
-        if matched:
+        for matched in pattern.finditer(text):
+            if _is_embedded_numeric_date_match(text, matched, kind):
+                continue
             candidates.append((matched.start(), kind, matched))
 
     if not candidates:
         return False, None
 
-    _, kind, matched = min(candidates, key=lambda item: item[0])
+    invalid_date_seen = False
+    for _, kind, matched in sorted(candidates, key=lambda item: item[0]):
+        if kind in {"korean_ymd", "numeric_ymd"}:
+            year = _normalize_year(int(matched.group(1)))
+            month = int(matched.group(2))
+            day = int(matched.group(3))
+            parsed = _try_format_date(year, month, day)
+        elif kind == "compact_yyyymmdd":
+            year = int(matched.group(1))
+            month = int(matched.group(2))
+            day = int(matched.group(3))
+            parsed = _try_format_date(year, month, day)
+        elif kind == "compact_yymmdd":
+            year = _normalize_year(int(matched.group(1)))
+            month = int(matched.group(2))
+            day = int(matched.group(3))
+            parsed = _try_format_date(year, month, day)
+        else:
+            local_year = _current_local_date().year
+            month = int(matched.group(1))
+            day = int(matched.group(2))
+            parsed = _try_format_date(local_year, month, day)
 
-    if kind in {"korean_ymd", "numeric_ymd"}:
-        year = _normalize_year(int(matched.group(1)))
-        month = int(matched.group(2))
-        day = int(matched.group(3))
-        return True, _try_format_date(year, month, day)
+        if parsed is not None:
+            return True, parsed
+        invalid_date_seen = True
 
-    if kind == "compact_yyyymmdd":
-        year = int(matched.group(1))
-        month = int(matched.group(2))
-        day = int(matched.group(3))
-        return True, _try_format_date(year, month, day)
-
-    if kind == "compact_yymmdd":
-        year = _normalize_year(int(matched.group(1)))
-        month = int(matched.group(2))
-        day = int(matched.group(3))
-        return True, _try_format_date(year, month, day)
-
-    local_year = _current_local_date().year
-    month = int(matched.group(1))
-    day = int(matched.group(2))
-    return True, _try_format_date(local_year, month, day)
+    return invalid_date_seen, None
 
 
 def _looks_like_unparsed_date_token(text: str) -> bool:
@@ -876,6 +928,9 @@ def _extract_device_name_scope(question: str) -> str | None:
     matched = _DEVICE_NAME_SCOPE_PATTERN.search(sanitized_text)
     if not matched:
         matched = _LEADING_DEVICE_NAME_SCOPE_PATTERN.search(sanitized_text)
+    if not matched:
+        # 현장 2차 입력은 "장비명" 라벨 없이 MB2-A00313만 붙는 경우가 많다.
+        matched = _DEVICE_NAME_TOKEN_PATTERN.search(sanitized_text)
     if not matched:
         return None
 
@@ -3217,13 +3272,29 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         normalized = re.sub(r"^\s*병원(?:명)?\s*[:=]?\s*", "", normalized)
         normalized = re.sub(r"^\s*(?:병실(?:명)?|진료실명)\s*[:=]?\s*", "", normalized)
         normalized = re.sub(r"^\s*날짜\s*[:=]?\s*", "", normalized)
-        normalized = re.sub(r"\s*(?:로그|분석)\s*$", "", normalized)
         normalized = re.sub(
-            r"\s*(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|파일|file|download|다운로드|다운)\s*$",
+            r"\s+(?:장비명|devicename)\s*[:=]?\s*[A-Za-z0-9._-]+\s*$",
             "",
             normalized,
             flags=re.IGNORECASE,
         )
+        normalized = re.sub(
+            r"\s+[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9-]*\d[A-Za-z0-9-]*\s*$",
+            "",
+            normalized,
+        )
+        # 병실 라벨 뒤에 액션 단어가 연달아 붙어도 병실값에 섞이지 않게 끝에서 반복 제거한다.
+        while True:
+            cleaned = re.sub(r"\s*(?:로그|분석)\s*$", "", normalized)
+            cleaned = re.sub(
+                r"\s*(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|파일|file|download|다운로드|다운)\s*$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+            if cleaned == normalized:
+                break
+            normalized = cleaned
         if re.search(r"(?:병원|의원|클리닉|센터).+\s+병원$", normalized):
             normalized = re.sub(r"\s+병원$", "", normalized)
         return normalized.strip()
@@ -3253,16 +3324,17 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     fallback_text = re.sub(r"<@[^>]+>", " ", text)
     fallback_text = re.sub(r"(?<!\S)@\S+", " ", fallback_text)
     for pattern in (
-        _KOREAN_YMD_PATTERN,
-        _NUMERIC_YMD_PATTERN,
-        _KOREAN_MD_PATTERN,
-        _NUMERIC_MD_PATTERN,
-        _NUMERIC_MD_DASH_PATTERN,
-        _COMPACT_YYYYMMDD_PATTERN,
-        _COMPACT_YYMMDD_PATTERN,
-        _COMPACT_MMDD_PATTERN,
+        ("korean_ymd", _KOREAN_YMD_PATTERN),
+        ("numeric_ymd", _NUMERIC_YMD_PATTERN),
+        ("korean_md", _KOREAN_MD_PATTERN),
+        ("numeric_md", _NUMERIC_MD_PATTERN),
+        ("numeric_md_dash", _NUMERIC_MD_DASH_PATTERN),
+        ("compact_yyyymmdd", _COMPACT_YYYYMMDD_PATTERN),
+        ("compact_yymmdd", _COMPACT_YYMMDD_PATTERN),
+        ("compact_mmdd", _COMPACT_MMDD_PATTERN),
     ):
-        fallback_text = pattern.sub(" ", fallback_text)
+        kind, date_pattern = pattern
+        fallback_text = _sub_non_embedded_date_matches(fallback_text, date_pattern, kind)
     fallback_text = _YEAR_ONLY_PATTERN.sub(" ", fallback_text)
     fallback_text = re.sub(r"(?<!\d)\d{11}(?!\d)", " ", fallback_text)
     fallback_text = re.sub(r"\b(?:로그|분석)\b", " ", fallback_text)

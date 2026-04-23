@@ -303,7 +303,16 @@ def _handle_device_routes(
             has_device_mapping = deps.has_recordings_device_mapping(recordings_context)
             resolved_device_contexts = None
 
-            if context.phase2_hospital_name and context.phase2_room_name:
+            if structured_device_name:
+                # 장비명이 직접 들어온 2차 입력은 병원/병실 exact match 실패에 막히지 않고 해당 장비 로그를 먼저 본다.
+                resolved_device_contexts = [
+                    {
+                        "deviceName": structured_device_name,
+                        "hospitalName": context.phase2_hospital_name,
+                        "roomName": context.phase2_room_name,
+                    }
+                ]
+            elif context.phase2_hospital_name and context.phase2_room_name:
                 resolved_device_contexts = _lookup_device_contexts_by_hospital_room(
                     context.phase2_hospital_name,
                     context.phase2_room_name,

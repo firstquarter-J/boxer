@@ -1,6 +1,10 @@
 import unittest
 
-from boxer_company.routers.barcode_log import _extract_hospital_room_scope
+from boxer_company.routers.barcode_log import (
+    _extract_device_name_scope,
+    _extract_hospital_room_scope,
+    _extract_log_date_with_presence,
+)
 from boxer_company_adapter_slack.barcode_logs import (
     _build_barcode_log_error_session_section,
     _needs_barcode_log_fallback,
@@ -118,6 +122,52 @@ class BarcodeLogHelperTests(unittest.TestCase):
 
         self.assertEqual(hospital_name, "분당제일여성병원(성남)")
         self.assertEqual(room_name, "3층 C동 초음파실3")
+
+    def test_phase2_parser_keeps_hyphenated_room_and_later_date(self) -> None:
+        question = "@Boxer 16971952215 나무정원여성병원(양주) 2층1-1진료실 MB2-A00313 2026-04-22 영상 다운"
+
+        hospital_name, room_name = _extract_hospital_room_scope(question)
+        log_date, has_requested_date = _extract_log_date_with_presence(question)
+        device_name = _extract_device_name_scope(question)
+
+        self.assertEqual(hospital_name, "나무정원여성병원(양주)")
+        self.assertEqual(room_name, "2층1-1진료실")
+        self.assertEqual(log_date, "2026-04-22")
+        self.assertTrue(has_requested_date)
+        self.assertEqual(device_name, "MB2-A00313")
+
+    def test_phase2_parser_keeps_spaced_hyphenated_room_prefix(self) -> None:
+        question = "@Boxer 16971952215 나무정원여성병원(양주) 2층 1-1 진료실 2026-04-22 로그 분석"
+
+        hospital_name, room_name = _extract_hospital_room_scope(question)
+        log_date, has_requested_date = _extract_log_date_with_presence(question)
+
+        self.assertEqual(hospital_name, "나무정원여성병원(양주)")
+        self.assertEqual(room_name, "2층 1-1 진료실")
+        self.assertEqual(log_date, "2026-04-22")
+        self.assertTrue(has_requested_date)
+
+    def test_phase2_parser_stops_room_before_device_label_and_action(self) -> None:
+        question = (
+            "@Boxer 16971952215 병원명 나무정원여성병원(양주) "
+            "병실명 2층1-1진료실 장비명 MB2-A00313 날짜 2026-04-22 영상 다운"
+        )
+
+        hospital_name, room_name = _extract_hospital_room_scope(question)
+        log_date, has_requested_date = _extract_log_date_with_presence(question)
+        device_name = _extract_device_name_scope(question)
+
+        self.assertEqual(hospital_name, "나무정원여성병원(양주)")
+        self.assertEqual(room_name, "2층1-1진료실")
+        self.assertEqual(log_date, "2026-04-22")
+        self.assertTrue(has_requested_date)
+        self.assertEqual(device_name, "MB2-A00313")
+
+    def test_compact_yymmdd_still_parses_for_log_analysis(self) -> None:
+        log_date, has_requested_date = _extract_log_date_with_presence("@Boxer 16971952215 260422 로그분석")
+
+        self.assertEqual(log_date, "2026-04-22")
+        self.assertTrue(has_requested_date)
 
 
 if __name__ == "__main__":
