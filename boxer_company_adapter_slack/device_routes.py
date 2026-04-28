@@ -123,6 +123,30 @@ def _is_device_runtime_configured() -> bool:
     )
 
 
+def _is_missing_barcode_device_download_request(question: str, barcode: str | None) -> bool:
+    if barcode or not _should_download_device_files(question):
+        return False
+
+    text = (question or "").strip()
+    availability_hints = (
+        "다운로드 가능 상태",
+        "다운로드 가능 여부",
+        "다운로드 가능한지",
+        "다운 가능 상태",
+        "다운 가능 여부",
+        "다운 가능한지",
+    )
+    return not any(hint in text for hint in availability_hints)
+
+
+def _build_device_download_barcode_required_message() -> str:
+    return (
+        "영상 다운로드는 바코드 없이는 특정할 수 없어.\n"
+        "11자리 바코드랑 날짜를 같이 보내줘. "
+        "예: `12345678910 2026-04-28 영상 다운로드`"
+    )
+
+
 def _handle_device_routes(
     context: DeviceRoutesContext,
     deps: DeviceRoutesDeps,
@@ -139,6 +163,11 @@ def _handle_device_routes(
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
+
+    if _is_missing_barcode_device_download_request(question, barcode):
+        # 다운로드는 세션 단위 작업이라 병원/병실/날짜만으로 확정하지 않는다.
+        context.reply(_build_device_download_barcode_required_message())
+        return True
 
     if _is_device_led_pattern_help_request(question):
         fallback_text = _build_led_pattern_help_reply(question)
