@@ -5,17 +5,20 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
+    _build_daily_device_round_issue_summary,
     _build_daily_device_round_summary,
     _coerce_daily_device_round_hospital_seqs,
     _coerce_daily_device_round_now,
     _coerce_int,
     _daily_device_round_timezone,
+    _format_daily_device_round_hospital_label,
     _format_daily_device_round_report,
 )
 
@@ -327,6 +330,168 @@ def _extract_daily_device_round_thread_ts(response: Any) -> str:
     return str(
         getattr(response_data, "get", lambda *_args, **_kwargs: "")("ts") or ""
     ).strip()
+
+
+def _daily_device_round_has_abnormal_result(report_summary: dict[str, Any]) -> bool:
+    status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
+    if (_coerce_int(status_counts.get("이상")) or 0) > 0:
+        return True
+
+    device_results = (
+        report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
+    )
+    return any(
+        isinstance(item, dict) and _display_value(item.get("overallLabel"), default="") == "이상"
+        for item in device_results
+    )
+
+
+def _load_daily_device_round_message_permalink(
+    client: Any,
+    *,
+    channel_id: str,
+    message_ts: str,
+    logger: logging.Logger,
+) -> str | None:
+    normalized_channel_id = str(channel_id or "").strip()
+    normalized_message_ts = str(message_ts or "").strip()
+    if not normalized_channel_id or not normalized_message_ts:
+        return None
+
+    try:
+        response = client.chat_getPermalink(
+            channel=normalized_channel_id,
+            message_ts=normalized_message_ts,
+        )
+    except Exception:
+        logger.warning(
+            "일일 장비 순회 이상 알림용 Slack permalink를 가져오지 못했어 channel=%s ts=%s",
+            normalized_channel_id,
+            normalized_message_ts,
+            exc_info=True,
+        )
+        return None
+
+    permalink = str(getattr(response, "get", lambda *_args, **_kwargs: "")("permalink") or "").strip()
+    if permalink:
+        return permalink
+    response_data = getattr(response, "data", None)
+    return str(getattr(response_data, "get", lambda *_args, **_kwargs: "")("permalink") or "").strip() or None
+
+
+def _collect_daily_device_round_abnormal_alert_items(
+    report_summary: dict[str, Any],
+) -> list[dict[str, str]]:
+    device_results = (
+        report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
+    )
+    default_hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
+    default_hospital_name = _display_value(report_summary.get("hospitalName"), default="병원 미확인")
+    items: list[dict[str, str]] = []
+
+    for device_result in device_results:
+        if not isinstance(device_result, dict):
+            continue
+        if _display_value(device_result.get("overallLabel"), default="") != "이상":
+            continue
+        hospital_seq = _coerce_int(device_result.get("hospitalSeq"))
+        if hospital_seq is None:
+            hospital_seq = default_hospital_seq
+        hospital_name = _display_value(device_result.get("hospitalName"), default=default_hospital_name)
+        issue = _build_daily_device_round_issue_summary(device_result)
+        if not issue:
+            issue = _display_value(device_result.get("priorityReason"), default="상세 확인 필요")
+        device_name = _display_value(device_result.get("deviceName"), default="장비명 미확인")
+        items.append(
+            {
+                "hospital": _format_daily_device_round_hospital_label(hospital_name, hospital_seq),
+                "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
+                "device": device_name,
+                "issue": issue,
+                "mdaUrl": _build_daily_device_round_mda_monitoring_url(
+                    device_name=device_name,
+                    hospital_seq=hospital_seq,
+                ),
+            }
+        )
+
+    return items
+
+
+def _build_daily_device_round_mda_monitoring_url(
+    *,
+    device_name: str,
+    hospital_seq: int | None,
+) -> str:
+    normalized_device_name = _display_value(device_name, default="")
+    if not normalized_device_name or hospital_seq is None:
+        return ""
+
+    query = urlencode(
+        {
+            "focusDevice": normalized_device_name,
+            "hospitalSeq": int(hospital_seq),
+        }
+    )
+    return f"{cs.MDA_GRAPHQL_ORIGIN.rstrip('/')}/monitoring?{query}"
+
+
+def _build_daily_device_round_abnormal_alert_text(
+    report_summary: dict[str, Any],
+    permalink: str | None,
+) -> str:
+    alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
+    lines = [":rotating_light: *이상 발견 - 확인 요망*"]
+    if alert_items:
+        # Slack 루트 알림만 보고도 확인 대상을 한눈에 훑을 수 있게 라벨형으로 보여줘.
+        for item in alert_items:
+            if len(lines) > 1:
+                lines.append("")
+            lines.append(f"*{item['hospital']}*")
+            lines.append(f"> *병실*  {item['room']}")
+            lines.append(f"> *장비*  `{item['device']}`")
+            lines.append(f"> *이슈*  {item['issue']}")
+            if item.get("mdaUrl"):
+                lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA Link>")
+    if permalink:
+        if alert_items:
+            lines.append("")
+        lines.append(f":link: <{permalink}|상세 리포트 보기>")
+    return "\n".join(lines)
+
+
+def _post_daily_device_round_abnormal_alert(
+    client: Any,
+    report_summary: dict[str, Any],
+    *,
+    channel_id: str,
+    message_ts: str,
+    logger: logging.Logger,
+) -> None:
+    if not _daily_device_round_has_abnormal_result(report_summary):
+        return
+
+    permalink = _load_daily_device_round_message_permalink(
+        client,
+        channel_id=channel_id,
+        message_ts=message_ts,
+        logger=logger,
+    )
+    try:
+        # 이상 장비가 스레드 안에 묻히지 않도록 같은 채널 루트에도 확인 알림을 남겨.
+        client.chat_postMessage(
+            channel=channel_id,
+            text=_build_daily_device_round_abnormal_alert_text(report_summary, permalink),
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+    except Exception:
+        logger.warning(
+            "일일 장비 순회 이상 알림을 보내지 못했어 channel=%s message_ts=%s",
+            channel_id,
+            message_ts,
+            exc_info=True,
+        )
 
 
 def _is_daily_device_round_due(

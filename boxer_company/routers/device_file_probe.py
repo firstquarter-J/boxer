@@ -7,6 +7,7 @@ import re
 import shlex
 import socket
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -96,6 +97,55 @@ _DEVICE_FILE_RECOVERY_HINTS = (
 )
 
 _TEMP_FILE_PREFIXES = ("device-file-", "device-upload-")
+_DEVICE_SSH_CLIENT_ACTIVE_COUNTS: dict[str, int] = {}
+_DEVICE_SSH_CLIENT_ACTIVE_COUNTS_LOCK = threading.Lock()
+
+
+def _device_ssh_endpoint_key(host: str, port: int) -> str:
+    return f"{str(host or '').strip()}:{int(port or 0)}"
+
+
+def _increment_active_device_ssh_client_count(host: str, port: int) -> str:
+    key = _device_ssh_endpoint_key(host, port)
+    with _DEVICE_SSH_CLIENT_ACTIVE_COUNTS_LOCK:
+        _DEVICE_SSH_CLIENT_ACTIVE_COUNTS[key] = max(0, int(_DEVICE_SSH_CLIENT_ACTIVE_COUNTS.get(key) or 0)) + 1
+    return key
+
+
+def _decrement_active_device_ssh_client_count(key: str) -> None:
+    normalized_key = str(key or "").strip()
+    if not normalized_key:
+        return
+    with _DEVICE_SSH_CLIENT_ACTIVE_COUNTS_LOCK:
+        next_count = max(0, int(_DEVICE_SSH_CLIENT_ACTIVE_COUNTS.get(normalized_key) or 0) - 1)
+        if next_count > 0:
+            _DEVICE_SSH_CLIENT_ACTIVE_COUNTS[normalized_key] = next_count
+        else:
+            _DEVICE_SSH_CLIENT_ACTIVE_COUNTS.pop(normalized_key, None)
+
+
+def _get_active_device_ssh_client_count(host: str, port: int) -> int:
+    key = _device_ssh_endpoint_key(host, port)
+    with _DEVICE_SSH_CLIENT_ACTIVE_COUNTS_LOCK:
+        return max(0, int(_DEVICE_SSH_CLIENT_ACTIVE_COUNTS.get(key) or 0))
+
+
+class _TrackedDeviceSshClient:
+    def __init__(self, client: Any, active_key: str) -> None:
+        self._client = client
+        self._active_key = active_key
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def close(self) -> Any:
+        try:
+            return self._client.close()
+        finally:
+            if not self._closed:
+                self._closed = True
+                _decrement_active_device_ssh_client_count(self._active_key)
 
 
 def _ensure_device_temp_dir() -> str:
@@ -322,9 +372,10 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
             "reason": type(exc).__name__.lower(),
         }
 
+    active_key = _increment_active_device_ssh_client_count(host, int(port))
     return {
         "ok": True,
-        "client": client,
+        "client": _TrackedDeviceSshClient(client, active_key),
     }
 
 

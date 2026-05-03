@@ -505,6 +505,34 @@ def _open_mda_device_ssh(
     }
 
 
+def _close_mda_device_ssh(
+    device_name: str,
+    *,
+    host: str | None = None,
+) -> dict[str, Any]:
+    actual_host = (host or cs.MDA_SSH_OPEN_HOST).strip()
+    if not actual_host:
+        raise RuntimeError("MDA_SSH_OPEN_HOST가 비어 있어")
+
+    data = _execute_mda_graphql(
+        _SSH_ORDER_MUTATION,
+        {
+            "deviceName": device_name,
+            "action": "close",
+            "host": actual_host,
+        },
+    )
+    result = data.get("sshOrder")
+    if not isinstance(result, dict):
+        raise RuntimeError("sshOrder 응답 형식이 올바르지 않아")
+    return {
+        "affected": _display_value(result.get("affected"), default=""),
+        "status": _display_value(result.get("status"), default=""),
+        "message": _display_value(result.get("message"), default=""),
+        "host": actual_host,
+    }
+
+
 def _update_mda_device_box(
     device_name: str,
     *,

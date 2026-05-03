@@ -85,6 +85,7 @@ from boxer_company_adapter_slack.structured_routes import (
     _handle_structured_routes,
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import attach_daily_device_round_reporter
+from boxer_company_adapter_slack.device_health_monitor_reporter import attach_device_health_monitor_reporter
 from boxer_company_adapter_slack.weekly_reports import (
     _build_weekly_recordings_report_reply_payload,
     _extract_optional_requested_date,
@@ -868,5 +869,6 @@ def create_app() -> App:
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
     attach_weekly_recordings_reporter(app, logger=logging.getLogger(__name__))
+    attach_device_health_monitor_reporter(app, logger=logging.getLogger(__name__))
     attach_daily_device_round_reporter(app, logger=logging.getLogger(__name__))
     return app
