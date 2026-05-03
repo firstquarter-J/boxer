@@ -4,6 +4,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from boxer_company import daily_device_round as rounder
+from boxer_company.routers import device_status_probe as status_probe
 
 
 def _build_status_payload(*, ssh_ready: bool = True, overall: str = "정상") -> dict:
@@ -31,6 +32,12 @@ def _build_status_payload(*, ssh_ready: bool = True, overall: str = "정상") ->
             "led": {"status": component_status, "label": component_label},
         },
     }
+
+
+def _build_maintenance_status_payload(*, ssh_ready: bool = True, overall: str = "정상") -> dict:
+    payload = _build_status_payload(ssh_ready=ssh_ready, overall=overall)
+    payload["route"] = "daily_device_round_maintenance_probe"
+    return payload
 
 
 def _build_update_payload(
@@ -164,6 +171,78 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
 
 
 class DailyDeviceRoundExecutionTests(unittest.TestCase):
+    def test_storage_component_probe_uses_only_cleanup_commands(self) -> None:
+        # 야간 순회 유지보수는 하드웨어 이상 감지 명령 없이 용량 판단 명령만 실행해야 해.
+        self.assertEqual(
+            status_probe._PROBE_COMPONENT_COMMAND_KEYS["storage"],
+            (
+                "disk_usage_root",
+                "trashcan_dir_usage",
+                "trashcan_file_count",
+                "trashcan_expired_file_count",
+            ),
+        )
+
+    @patch("boxer_company.daily_device_round._build_trashcan_storage_summary_from_checks")
+    @patch("boxer_company.daily_device_round._collect_runtime_checks")
+    def test_builds_maintenance_status_with_storage_only_probe(
+        self,
+        mock_collect_runtime_checks,
+        mock_build_trashcan_storage_summary_from_checks,
+    ) -> None:
+        mock_collect_runtime_checks.return_value = (
+            {"ssh": {"ready": True, "reason": "ready"}},
+            {},
+            {"disk_usage_root": {"ok": True, "output": "df output"}},
+        )
+        mock_build_trashcan_storage_summary_from_checks.return_value = {
+            "status": "pass",
+            "label": "정상",
+            "trashcanOverviewDetail": "TrashCan 정상",
+        }
+
+        text, payload = rounder._build_daily_device_round_maintenance_status("MB2-C00419")
+        priority = rounder._build_daily_device_round_priority(payload)
+
+        mock_collect_runtime_checks.assert_called_once_with("MB2-C00419", "storage")
+        self.assertIn("야간 순회 유지보수 점검", text)
+        self.assertEqual(payload["route"], "daily_device_round_maintenance_probe")
+        self.assertEqual(payload["request"]["purpose"], "nightly_update_and_cleanup")
+        self.assertEqual(payload["overview"]["storage"]["label"], "정상")
+        self.assertEqual(
+            payload["overview"]["led"]["summary"],
+            "이상 감지는 24시간 모니터가 별도로 담당해",
+        )
+        self.assertEqual(priority["reason"], "업데이트/용량 정리 대상 없음")
+
+    @patch("boxer_company.daily_device_round._build_trashcan_storage_summary_from_checks")
+    @patch("boxer_company.daily_device_round._collect_runtime_checks")
+    def test_maintenance_status_does_not_label_cleanup_target_as_abnormal(
+        self,
+        mock_collect_runtime_checks,
+        mock_build_trashcan_storage_summary_from_checks,
+    ) -> None:
+        mock_collect_runtime_checks.return_value = (
+            {"ssh": {"ready": True, "reason": "ready"}},
+            {},
+            {"trashcan_dir_usage": {"ok": True, "output": "du output"}},
+        )
+        mock_build_trashcan_storage_summary_from_checks.return_value = {
+            "status": "fail",
+            "label": "이상",
+            "trashcanStatus": "fail",
+            "trashcanLabel": "이상",
+            "summary": "TrashCan 용량이 자동 정리 기준 `60%`를 넘겼어",
+        }
+
+        _, payload = rounder._build_daily_device_round_maintenance_status("MB2-C00419")
+
+        self.assertEqual(payload["overview"]["storage"]["status"], "warning")
+        self.assertEqual(payload["overview"]["storage"]["label"], "확인 필요")
+        self.assertEqual(payload["overview"]["storage"]["trashcanStatus"], "warning")
+        self.assertEqual(payload["overview"]["storage"]["trashcanLabel"], "확인 필요")
+        self.assertEqual(rounder._daily_device_round_status_label(payload), "확인 필요")
+
     def test_defers_priority_when_network_is_unavailable(self) -> None:
         priority = rounder._build_daily_device_round_priority(
             _build_status_payload(ssh_ready=False)
@@ -208,6 +287,7 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
                     "led": "정상",
                 },
                 "statusPayload": {
+                    "route": "daily_device_round_maintenance_probe",
                     "ssh": {"ready": True, "reason": "ready"},
                     "overview": {
                         "storage": {
@@ -250,10 +330,10 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "  *이슈*  TrashCan 용량이 빠르게 커지고 있어 | 현재 `43.8%` / 폴더 `95.6 GB` / `30일` 초과 `4,520개`",
+            "  *확인*  TrashCan 용량이 빠르게 커지고 있어 | 현재 `43.8%` / 폴더 `95.6 GB` / `30일` 초과 `4,520개`",
             device_line,
         )
-        self.assertNotIn("  *이슈*  용량 확인 필요", device_line)
+        self.assertNotIn("  *확인*  용량 확인 필요", device_line)
 
     def test_build_update_plan_falls_back_to_agent_runtime_gate(self) -> None:
         plan = rounder._build_daily_device_round_update_plan(
@@ -381,17 +461,17 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
     @patch("boxer_company.daily_device_round._request_device_box_update")
     @patch("boxer_company.daily_device_round._request_device_agent_update")
     @patch("boxer_company.daily_device_round._query_device_update_status")
-    @patch("boxer_company.daily_device_round._probe_device_status_overview")
+    @patch("boxer_company.daily_device_round._build_daily_device_round_maintenance_status")
     def test_runs_agent_then_box_update_when_enabled(
         self,
-        mock_probe_device_status_overview,
+        mock_build_daily_device_round_maintenance_status,
         mock_query_device_update_status,
         mock_request_device_agent_update,
         mock_request_device_box_update,
     ) -> None:
-        mock_probe_device_status_overview.return_value = (
+        mock_build_daily_device_round_maintenance_status.return_value = (
             "status text",
-            _build_status_payload(overall="정상"),
+            _build_maintenance_status_payload(overall="정상"),
         )
         mock_query_device_update_status.side_effect = [
             (
@@ -482,22 +562,22 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertTrue(result["boxAction"]["ok"])
         self.assertTrue(result["finalPlan"]["box"]["alreadyLatest"])
         self.assertEqual(result["priorityLabel"], "정상")
-        self.assertEqual(result["priorityReason"], "원격 점검상 이상 징후 없음")
+        self.assertEqual(result["priorityReason"], "업데이트/용량 정리 대상 없음")
         self.assertEqual(result["agentActionText"], "에이전트 업데이트 완료")
         self.assertEqual(result["boxActionText"], "박스 업데이트 완료")
 
     @patch("boxer_company.daily_device_round._request_device_power_off")
     @patch("boxer_company.daily_device_round._query_device_update_status")
-    @patch("boxer_company.daily_device_round._probe_device_status_overview")
+    @patch("boxer_company.daily_device_round._build_daily_device_round_maintenance_status")
     def test_runs_power_off_after_checks_when_enabled(
         self,
-        mock_probe_device_status_overview,
+        mock_build_daily_device_round_maintenance_status,
         mock_query_device_update_status,
         mock_request_device_power_off,
     ) -> None:
-        mock_probe_device_status_overview.return_value = (
+        mock_build_daily_device_round_maintenance_status.return_value = (
             "status text",
-            _build_status_payload(overall="정상"),
+            _build_maintenance_status_payload(overall="정상"),
         )
         mock_query_device_update_status.return_value = (
             "update status",
@@ -531,16 +611,16 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
 
     @patch("boxer_company.daily_device_round._request_device_agent_update")
     @patch("boxer_company.daily_device_round._query_device_update_status")
-    @patch("boxer_company.daily_device_round._probe_device_status_overview")
+    @patch("boxer_company.daily_device_round._build_daily_device_round_maintenance_status")
     def test_runs_agent_update_when_repo_missing_but_pm2_version_is_too_old(
         self,
-        mock_probe_device_status_overview,
+        mock_build_daily_device_round_maintenance_status,
         mock_query_device_update_status,
         mock_request_device_agent_update,
     ) -> None:
-        mock_probe_device_status_overview.return_value = (
+        mock_build_daily_device_round_maintenance_status.return_value = (
             "status text",
-            _build_status_payload(overall="정상"),
+            _build_maintenance_status_payload(overall="정상"),
         )
         mock_query_device_update_status.side_effect = [
             (
@@ -929,11 +1009,11 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertIn("일일 장비 순회 점검 & 업데이트 | #604 루이스산부인과의원(동작)", report_text)
         self.assertIn("*#604 루이스산부인과의원(동작)*", report_text)
         self.assertNotIn("• 자동 동작:", report_text)
-        self.assertIn("• 🟢 문제 장비 없음", report_text)
+        self.assertIn("• 🟢 확인/작업 장비 없음", report_text)
         self.assertIn("• 박스 업데이트 대상 `1`", report_text)
         self.assertNotIn("업데이트 성공", report_text)
         self.assertNotIn("디스크 정리 실행", report_text)
-        self.assertIn("*문제/작업 장비*", report_text)
+        self.assertIn("*확인/작업 장비*", report_text)
         self.assertIn("• *1진료실*  |  *MB2-C01431*  |  🟢 *정상*", report_text)
         self.assertNotIn("*이슈*", report_text)
         self.assertNotIn("*점검*", report_text)
@@ -1038,10 +1118,10 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         )
 
-        self.assertIn("• 🟢 문제 장비 없음", report_text)
+        self.assertIn("• 🟢 확인/작업 장비 없음", report_text)
         self.assertIn("• 박스 업데이트 성공 `1`", report_text)
         self.assertIn("• 🧹 디스크 정리 실행 `1`", report_text)
-        self.assertIn("*문제/작업 장비*", report_text)
+        self.assertIn("*확인/작업 장비*", report_text)
         self.assertIn("  *디스크 정리*  *성공* | `30일` 초과 `4개` 삭제 / `9.0 GB` -> `6.0 GB` / 현재 `55%` / 남은 `30일` 초과 `0개`", report_text)
         self.assertNotIn("*에이전트 업데이트*", report_text)
         self.assertIn("  *박스 업데이트*  🟢 *업데이트 완료* | `2.11.299` -> `2.11.300`", report_text)
@@ -1112,7 +1192,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertIn("• ⚫ 점검 불가 `1`", report_text)
         self.assertNotIn("업데이트 성공", report_text)
         self.assertNotIn("디스크 정리 실행", report_text)
-        self.assertIn("*문제/작업 장비*", report_text)
+        self.assertIn("*확인/작업 장비*", report_text)
         self.assertIn("• *1진료실*  |  *MB1-B00461*  |  ⚫ *점검 불가*", report_text)
         self.assertIn("  *안내*  ⚫ *장비 종료 또는 네트워크 연결 불가로 점검 불가*", report_text)
         self.assertNotIn("*디스크 용량*", report_text)
@@ -1234,7 +1314,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertIn("발송 `2026-04-08 22:00:00 KST` | 장비 `2대`", blocks[2]["elements"][0]["text"])
         self.assertEqual(blocks[3]["type"], "rich_text")
         self.assertEqual(blocks[3]["elements"][0]["type"], "rich_text_list")
-        self.assertEqual("🟢 문제 장비 없음", blocks[3]["elements"][0]["elements"][0]["elements"][0]["text"])
+        self.assertEqual("🟢 확인/작업 장비 없음", blocks[3]["elements"][0]["elements"][0]["elements"][0]["text"])
         self.assertEqual("박스 업데이트 대상 `2`", blocks[3]["elements"][0]["elements"][1]["elements"][0]["text"])
         self.assertEqual("🧹 디스크 정리 실행 `1`", blocks[3]["elements"][0]["elements"][2]["elements"][0]["text"])
         self.assertEqual(blocks[4]["type"], "divider")

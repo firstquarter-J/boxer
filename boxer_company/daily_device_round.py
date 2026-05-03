@@ -8,7 +8,8 @@ from boxer.core.utils import _display_value, _format_size
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as cs
 from boxer_company.routers.device_status_probe import (
-    _probe_device_status_overview,
+    _build_trashcan_storage_summary_from_checks,
+    _collect_runtime_checks,
     _run_device_trashcan_cleanup,
 )
 from boxer_company.routers.device_update import (
@@ -265,13 +266,22 @@ def _format_daily_device_round_component_names(keys: list[str]) -> str:
 
 
 def _build_daily_device_round_priority(status_payload: dict[str, Any]) -> dict[str, Any]:
+    maintenance_only = (
+        _display_value(status_payload.get("route"), default="")
+        == "daily_device_round_maintenance_probe"
+    )
     ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
     if not ssh_payload.get("ready"):
         return {
             "eligible": False,
             "score": -1,
             "label": "판단 보류",
-            "reason": "네트워크 연결 불가로 이상 징후 판단 보류",
+            # 유지보수 순회에서는 이상 감지가 아니라 실행 가능 여부만 판단해.
+            "reason": (
+                "네트워크 연결 불가로 업데이트/용량 정리 판단 보류"
+                if maintenance_only
+                else "네트워크 연결 불가로 이상 징후 판단 보류"
+            ),
         }
 
     overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
@@ -327,8 +337,96 @@ def _build_daily_device_round_priority(status_payload: dict[str, Any]) -> dict[s
         "eligible": True,
         "score": 0,
         "label": "정상",
-        "reason": "원격 점검상 이상 징후 없음",
+        "reason": (
+            "업데이트/용량 정리 대상 없음"
+            if maintenance_only
+            else "원격 점검상 이상 징후 없음"
+        ),
     }
+
+
+def _build_daily_device_round_skipped_component_summary() -> dict[str, str]:
+    return {
+        "status": "pass",
+        "label": "정상",
+        "summary": "이상 감지는 24시간 모니터가 별도로 담당해",
+    }
+
+
+def _build_daily_device_round_storage_unavailable_summary(status_payload: dict[str, Any]) -> dict[str, str]:
+    ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
+    reason = _display_value(ssh_payload.get("reason"), default="agent_ssh_not_ready")
+    return {
+        "status": "check_needed",
+        "label": "점검 불가",
+        "summary": f"SSH 연결 불가로 용량 확인 불가: {reason}",
+    }
+
+
+def _normalize_daily_device_round_maintenance_storage_summary(storage_summary: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(storage_summary if isinstance(storage_summary, dict) else {})
+    # 용량 초과는 야간 유지보수 대상이지, 24시간 이상 알림의 "이상"과 섞지 않아.
+    if _display_value(normalized.get("status"), default="") == "fail":
+        normalized["status"] = "warning"
+    if _display_value(normalized.get("label"), default="") == "이상":
+        normalized["label"] = "확인 필요"
+    if _display_value(normalized.get("diskStatus"), default="") == "fail":
+        normalized["diskStatus"] = "warning"
+    if _display_value(normalized.get("diskLabel"), default="") == "이상":
+        normalized["diskLabel"] = "확인 필요"
+    if _display_value(normalized.get("trashcanStatus"), default="") == "fail":
+        normalized["trashcanStatus"] = "warning"
+    if _display_value(normalized.get("trashcanLabel"), default="") == "이상":
+        normalized["trashcanLabel"] = "확인 필요"
+    return normalized
+
+
+def _build_daily_device_round_maintenance_status(device_name: str) -> tuple[str, dict[str, Any]]:
+    normalized_device_name = str(device_name or "").strip()
+    if not normalized_device_name:
+        raise ValueError("장비명이 비어 있어")
+
+    # 야간 순회는 이상 감지와 분리됐으므로 업데이트/용량 정리에 필요한 스토리지 근거만 수집해.
+    status_payload, _device_info, checks = _collect_runtime_checks(normalized_device_name, "storage")
+    status_payload["route"] = "daily_device_round_maintenance_probe"
+    status_payload["source"] = "mda_graphql+ssh_storage_commands"
+    status_payload["request"] = {
+        "deviceName": normalized_device_name,
+        "component": "storage",
+        "purpose": "nightly_update_and_cleanup",
+    }
+    status_payload["checks"] = checks
+
+    ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
+    if ssh_payload.get("ready"):
+        storage_summary = _normalize_daily_device_round_maintenance_storage_summary(
+            _build_trashcan_storage_summary_from_checks(
+                checks,
+                cleanup_threshold_percent=cs.DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT,
+                cleanup_age_days=cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS,
+            )
+        )
+    else:
+        storage_summary = _build_daily_device_round_storage_unavailable_summary(status_payload)
+
+    skipped_summary = _build_daily_device_round_skipped_component_summary()
+    status_payload["overview"] = {
+        "audio": dict(skipped_summary),
+        "pm2": dict(skipped_summary),
+        "storage": storage_summary,
+        "captureboard": dict(skipped_summary),
+        "led": dict(skipped_summary),
+    }
+
+    storage_label = _display_value(storage_summary.get("label"), default="확인 필요")
+    storage_detail = _display_value(
+        storage_summary.get("trashcanOverviewDetail"),
+        default=_display_value(storage_summary.get("overviewDetail"), default=storage_summary.get("summary")),
+    )
+    status_text = f"*야간 순회 유지보수 점검*\n• 장비: `{normalized_device_name}`\n• 용량: *{storage_label}*"
+    if storage_detail:
+        status_text = f"{status_text} | {storage_detail}"
+    return status_text, status_payload
 
 
 def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dict[str, Any]:
@@ -655,7 +753,7 @@ def _build_daily_device_round_summary_lines(
     if unavailable_count:
         lines.append(f"• ⚫ 점검 불가 `{unavailable_count}`")
     if not lines:
-        lines.append("• 🟢 문제 장비 없음")
+        lines.append("• 🟢 확인/작업 장비 없음")
 
     agent_updated = int(update_counts.get("agentUpdated") or 0)
     agent_failed = int(update_counts.get("agentUpdateFailed") or 0)
@@ -804,7 +902,7 @@ def _is_daily_device_round_actionable_device(device_result: dict[str, Any]) -> b
 def _collect_daily_device_round_actionable_device_results(
     device_results: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    # Slack 본문 길이를 줄이기 위해 문제 있거나 실제 작업이 있었던 장비만 남겨.
+    # Slack 본문 길이를 줄이기 위해 확인이 필요하거나 실제 작업이 있었던 장비만 남겨.
     return [
         item
         for item in device_results
@@ -898,6 +996,13 @@ def _build_daily_device_round_issue_summary(device_result: dict[str, Any]) -> st
     return ""
 
 
+def _build_daily_device_round_detail_label(device_result: dict[str, Any]) -> str:
+    status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
+    if _display_value(status_payload.get("route"), default="") == "daily_device_round_maintenance_probe":
+        return "확인"
+    return "이슈"
+
+
 def _build_daily_device_round_disk_detail(device_result: dict[str, Any]) -> str:
     status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
     overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
@@ -981,12 +1086,13 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         )
 
     issue_summary = _build_daily_device_round_issue_summary(device_result)
+    detail_label = _build_daily_device_round_detail_label(device_result)
     lines = [header]
     if issue_summary:
-        lines.append(f"  *이슈*  {issue_summary}")
+        lines.append(f"  *{detail_label}*  {issue_summary}")
     elif overall_label != "정상":
         lines.append(
-            f"  *이슈*  {_display_value(device_result.get('priorityReason'), default='상세 확인 필요')}"
+            f"  *{detail_label}*  {_display_value(device_result.get('priorityReason'), default='상세 확인 필요')}"
         )
     if _is_daily_device_round_cleanup_actionable(device_result):
         lines.append(f"  *디스크 정리*  *{cleanup_status}* | {cleanup_detail}")
@@ -1013,7 +1119,7 @@ def _run_daily_device_round_for_device(
     auto_cleanup_trashcan: bool = False,
     auto_power_off: bool = False,
 ) -> dict[str, Any]:
-    status_text, status_payload = _probe_device_status_overview(device_name)
+    status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
     trashcan_cleanup = _run_device_trashcan_cleanup(
         status_payload,
         execute=auto_cleanup_trashcan,
@@ -1021,7 +1127,7 @@ def _run_daily_device_round_for_device(
         cleanup_age_days=cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS,
     )
     if trashcan_cleanup.get("executed"):
-        status_text, status_payload = _probe_device_status_overview(device_name)
+        status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
 
     update_status_text, update_status_payload = _query_device_update_status(device_name)
     initial_update_status_text = update_status_text
@@ -1085,7 +1191,7 @@ def _run_daily_device_round_for_device(
         "priorityEligible": bool(priority.get("eligible")),
         "priorityScore": int(priority.get("score") or 0),
         "priorityLabel": _display_value(priority.get("label"), default="판단 보류"),
-        "priorityReason": _display_value(priority.get("reason"), default="네트워크 연결 불가로 이상 징후 판단 보류"),
+        "priorityReason": _display_value(priority.get("reason"), default="네트워크 연결 불가로 업데이트/용량 정리 판단 보류"),
         "componentLabels": component_labels,
         "storageDetails": storage_details,
         "statusText": status_text,
@@ -1117,7 +1223,8 @@ def _build_daily_device_round_error_result(
     device_context: dict[str, Any],
     exc: Exception,
 ) -> dict[str, Any]:
-    priority = _build_daily_device_round_priority({})
+    # 장비별 처리 예외도 야간 유지보수 실패로 분류해서 이상 감지 문구와 섞이지 않게 해.
+    priority = _build_daily_device_round_priority({"route": "daily_device_round_maintenance_probe"})
     return {
         "deviceName": _display_value(device_context.get("deviceName"), default="미확인"),
         "hospitalName": _display_value(device_context.get("hospitalName"), default="미확인"),
@@ -1126,7 +1233,7 @@ def _build_daily_device_round_error_result(
         "priorityEligible": bool(priority.get("eligible")),
         "priorityScore": int(priority.get("score") or 0),
         "priorityLabel": _display_value(priority.get("label"), default="판단 보류"),
-        "priorityReason": _display_value(priority.get("reason"), default="네트워크 연결 불가로 이상 징후 판단 보류"),
+        "priorityReason": _display_value(priority.get("reason"), default="네트워크 연결 불가로 업데이트/용량 정리 판단 보류"),
         "componentLabels": {
             "audio": "점검 불가",
             "pm2": "점검 불가",
@@ -1424,11 +1531,11 @@ def _format_daily_device_round_report(
     lines.extend(_build_daily_device_round_summary_lines(report_summary))
 
     if not actionable_device_results:
-        lines.append("• 결과: 문제 있거나 작업한 장비가 없어")
+        lines.append("• 결과: 확인하거나 작업한 장비가 없어")
         return "\n".join(lines)
 
     lines.append("")
-    lines.append("*문제/작업 장비*")
+    lines.append("*확인/작업 장비*")
     for index, item in enumerate(actionable_device_results):
         if index > 0:
             lines.append("")
@@ -1519,7 +1626,7 @@ def _build_daily_device_round_blocks(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*결과*\n문제 있거나 작업한 장비가 없어",
+                    "text": "*결과*\n확인하거나 작업한 장비가 없어",
                 },
             }
         )

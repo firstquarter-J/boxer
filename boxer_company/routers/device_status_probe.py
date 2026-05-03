@@ -436,6 +436,13 @@ _PROBE_COMPONENT_COMMAND_KEYS = {
         "tools",
         "pm2_jlist",
     ),
+    # 야간 순회 유지보수에서는 용량 정리 판단에 필요한 명령만 실행해.
+    "storage": (
+        "disk_usage_root",
+        "trashcan_dir_usage",
+        "trashcan_file_count",
+        "trashcan_expired_file_count",
+    ),
     "captureboard": (
         "tools",
         "lsusb",
