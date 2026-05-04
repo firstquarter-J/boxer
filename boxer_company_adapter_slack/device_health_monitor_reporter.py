@@ -8,6 +8,7 @@ from typing import Any
 
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
+from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_priority,
@@ -16,11 +17,8 @@ from boxer_company.daily_device_round import (
     _coerce_daily_device_round_now,
     _coerce_int,
     _daily_device_round_status_label,
-    _load_daily_device_round_devices,
-    _load_daily_device_round_hospital_candidates,
-    _resolve_next_daily_device_round_hospital_seq,
-    _select_daily_device_round_hospital,
 )
+from boxer_company.redis_device_state import DeviceStateRedisClient, DeviceStateRedisUnavailable
 from boxer_company.routers.device_file_probe import (
     _connect_device_ssh_client,
     _get_active_device_ssh_client_count,
@@ -55,6 +53,43 @@ _DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK = threading.Lock()
 
 def _device_health_monitor_state_path() -> Path:
     return Path(cs.DEVICE_HEALTH_MONITOR_STATE_PATH).expanduser()
+
+
+def _device_health_monitor_event_log_dir() -> Path:
+    return Path(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR).expanduser()
+
+
+def _device_health_monitor_event_log_path(now: datetime) -> Path:
+    local_now = _coerce_daily_device_round_now(now)
+    return _device_health_monitor_event_log_dir() / (
+        f"device_health_monitor_events-{local_now.date().isoformat()}.jsonl"
+    )
+
+
+def _append_device_health_monitor_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    local_now = _coerce_daily_device_round_now(now)
+    event_payload = {
+        "eventType": _display_value(event_type, default="unknown"),
+        "createdAt": local_now.isoformat(),
+        **(payload if isinstance(payload, dict) else {}),
+    }
+    path = _device_health_monitor_event_log_path(local_now)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as event_log:
+            event_log.write(
+                json.dumps(event_payload, ensure_ascii=True, sort_keys=True, default=str)
+                + "\n"
+            )
+    except Exception:
+        if logger is not None:
+            logger.warning("장비 상태 모니터 이벤트 로그를 저장하지 못했어: %s", path, exc_info=True)
 
 
 def _load_device_health_monitor_runtime_state() -> dict[str, Any]:
@@ -162,6 +197,32 @@ def _normalize_device_health_monitor_ssh_tunnel_records(value: Any) -> dict[str,
     return records
 
 
+def _normalize_device_health_monitor_device_candidate_cache(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    seen_device_names: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        device_name = _display_value(raw.get("deviceName"), default="")
+        if not device_name or device_name in seen_device_names:
+            continue
+        seen_device_names.add(device_name)
+        items.append(
+            {
+                "deviceSeq": _coerce_int(raw.get("deviceSeq")),
+                "deviceName": device_name,
+                "hospitalSeq": _coerce_int(raw.get("hospitalSeq")),
+                "hospitalRoomSeq": _coerce_int(raw.get("hospitalRoomSeq")),
+                "hospitalName": _display_value(raw.get("hospitalName"), default="미확인"),
+                "roomName": _display_value(raw.get("roomName"), default="미확인"),
+            }
+        )
+    return items
+
+
 def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, Any]:
     state_payload = state if isinstance(state, dict) else {}
     normalized_state = dict(state_payload)
@@ -176,15 +237,19 @@ def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, A
     normalized_state["sshTunnelRecords"] = _normalize_device_health_monitor_ssh_tunnel_records(
         state_payload.get("sshTunnelRecords")
     )
+    normalized_state["deviceCandidateCache"] = _normalize_device_health_monitor_device_candidate_cache(
+        state_payload.get("deviceCandidateCache")
+    )
+    normalized_state["deviceCandidateCachedAt"] = str(state_payload.get("deviceCandidateCachedAt") or "").strip()
     return normalized_state
 
 
 def _is_device_health_monitor_runtime_configured() -> bool:
-    return bool(
-        cs.MDA_GRAPHQL_URL
-        and cs.MDA_ADMIN_USER_PASSWORD
-        and cs.DEVICE_SSH_PASSWORD
-    )
+    return bool(cs.DEVICE_STATE_REDIS_HOST)
+
+
+def _is_device_health_monitor_ssh_verification_configured() -> bool:
+    return bool(cs.MDA_GRAPHQL_URL and cs.MDA_ADMIN_USER_PASSWORD and cs.DEVICE_SSH_PASSWORD)
 
 
 def _device_health_monitor_channel_id() -> str:
@@ -259,6 +324,104 @@ def _build_device_health_monitor_zero_counts() -> dict[str, int]:
     }
 
 
+def _load_device_health_monitor_device_candidates() -> list[dict[str, Any]]:
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            # Redis 상태 감시는 병원 순서를 기다리지 않고 활성/설치 장비 전체를 한 번에 본다.
+            cursor.execute(
+                "SELECT "
+                "d.seq AS deviceSeq, "
+                "d.deviceName AS deviceName, "
+                "d.hospitalSeq AS hospitalSeq, "
+                "d.hospitalRoomSeq AS hospitalRoomSeq, "
+                "h.hospitalName AS hospitalName, "
+                "hr.roomName AS roomName "
+                "FROM devices d "
+                "INNER JOIN hospitals h ON d.hospitalSeq = h.seq "
+                "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
+                "WHERE d.hospitalSeq IS NOT NULL "
+                "AND COALESCE(d.deviceName, '') <> '' "
+                "AND COALESCE(d.activeFlag, 1) = 1 "
+                "AND COALESCE(d.installFlag, 1) = 1 "
+                "ORDER BY d.hospitalSeq ASC, COALESCE(hr.roomName, '') ASC, d.deviceName ASC, d.seq DESC"
+            )
+            rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    items: list[dict[str, Any]] = []
+    seen_device_names: set[str] = set()
+    for row in rows:
+        device_name = _display_value(row.get("deviceName"), default="")
+        if not device_name or device_name in seen_device_names:
+            continue
+        seen_device_names.add(device_name)
+        items.append(
+            {
+                "deviceSeq": _coerce_int(row.get("deviceSeq")),
+                "deviceName": device_name,
+                "hospitalSeq": _coerce_int(row.get("hospitalSeq")),
+                "hospitalRoomSeq": _coerce_int(row.get("hospitalRoomSeq")),
+                "hospitalName": _display_value(row.get("hospitalName"), default="미확인"),
+                "roomName": _display_value(row.get("roomName"), default="미확인"),
+            }
+        )
+    return items
+
+
+def _device_health_monitor_device_cache_ttl_delta() -> timedelta:
+    return timedelta(seconds=max(60, int(cs.DEVICE_HEALTH_MONITOR_DEVICE_CACHE_TTL_SEC)))
+
+
+def _load_device_health_monitor_device_candidates_cached(
+    state: dict[str, Any],
+    *,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    state_payload = state if isinstance(state, dict) else {}
+    cached_devices = _normalize_device_health_monitor_device_candidate_cache(
+        state_payload.get("deviceCandidateCache")
+    )
+    cached_at_text = _display_value(state_payload.get("deviceCandidateCachedAt"), default="")
+    cached_at = _parse_device_health_monitor_datetime(cached_at_text)
+    cache_is_fresh = bool(
+        cached_devices
+        and cached_at is not None
+        and now - cached_at < _device_health_monitor_device_cache_ttl_delta()
+    )
+    if cache_is_fresh:
+        return cached_devices, {
+            "cachedAt": cached_at.isoformat(),
+            "refreshed": False,
+            "refreshError": "",
+            "source": "state_cache",
+        }
+
+    try:
+        # 활성 장비 목록은 자주 바뀌지 않으므로 TTL 만료 때만 DB에서 새로 가져온다.
+        fresh_devices = _load_device_health_monitor_device_candidates()
+    except Exception as exc:
+        if cached_devices:
+            return cached_devices, {
+                "cachedAt": cached_at.isoformat() if cached_at else cached_at_text,
+                "refreshed": False,
+                "refreshError": f"{type(exc).__name__}: {exc}",
+                "source": "stale_state_cache",
+            }
+        raise
+
+    return fresh_devices, {
+        "cachedAt": now.isoformat(),
+        "refreshed": True,
+        "refreshError": "",
+        "source": "db",
+    }
+
+
 def _build_device_health_monitor_empty_action_counts() -> dict[str, dict[str, int]]:
     return {
         "updateCounts": {
@@ -292,6 +455,596 @@ def _build_device_health_monitor_component_labels(
         component = overview.get(key) if isinstance(overview.get(key), dict) else {}
         labels[key] = _display_value(component.get("label"), default="확인 필요")
     return labels
+
+
+def _build_device_health_monitor_run_event_payload(
+    report_summary: dict[str, Any],
+    *,
+    channel_id: str = "",
+    alertable_fingerprints: set[str] | None = None,
+    channel_missing: bool = False,
+) -> dict[str, Any]:
+    raw_status_counts = (
+        report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
+    )
+    status_counts = {
+        label: max(0, int(raw_status_counts.get(label) or 0))
+        for label in ("정상", "확인 필요", "이상", "점검 불가")
+    }
+    return {
+        "runDate": _display_value(report_summary.get("runDate"), default=""),
+        "startedAt": _display_value(report_summary.get("startedAt"), default=""),
+        "finishedAt": _display_value(report_summary.get("finishedAt"), default=""),
+        "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+        "scheduledDeviceCount": max(0, int(report_summary.get("scheduledDeviceCount") or 0)),
+        "deviceCount": max(0, int(report_summary.get("deviceCount") or 0)),
+        "statusCounts": status_counts,
+        "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+        "sshVerifiedCandidateCount": max(0, int(report_summary.get("sshVerifiedCandidateCount") or 0)),
+        "alertableCount": len(alertable_fingerprints or set()),
+        "channelId": _display_value(channel_id, default=""),
+        "channelMissing": bool(channel_missing),
+        "deviceCacheSource": _display_value(report_summary.get("deviceCacheSource"), default=""),
+        "deviceCacheRefreshed": bool(report_summary.get("deviceCacheRefreshed")),
+        "deviceCacheRefreshError": _display_value(report_summary.get("deviceCacheRefreshError"), default=""),
+        "monitorUnavailableReason": _display_value(report_summary.get("monitorUnavailableReason"), default=""),
+        "monitorUnavailableDetail": _display_value(report_summary.get("monitorUnavailableDetail"), default=""),
+    }
+
+
+def _build_device_health_monitor_device_event_payload(device_result: dict[str, Any]) -> dict[str, Any]:
+    status_payload = (
+        device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
+    )
+    request_payload = (
+        status_payload.get("request") if isinstance(status_payload.get("request"), dict) else {}
+    )
+    redis_payload = status_payload.get("redis") if isinstance(status_payload.get("redis"), dict) else {}
+    device_state = redis_payload.get("deviceState") if isinstance(redis_payload.get("deviceState"), dict) else {}
+    agent_state = redis_payload.get("agentState") if isinstance(redis_payload.get("agentState"), dict) else {}
+    ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
+    ssh_close_payload = ssh_payload.get("close") if isinstance(ssh_payload.get("close"), dict) else {}
+
+    # 이벤트 로그에는 추적에 필요한 요약만 남기고 Redis snapshot 원본은 남기지 않는다.
+    return {
+        "hospitalSeq": _coerce_int(device_result.get("hospitalSeq")),
+        "hospitalName": _display_value(device_result.get("hospitalName"), default="미확인"),
+        "roomName": _display_value(device_result.get("roomName"), default="미확인"),
+        "deviceName": _display_value(device_result.get("deviceName"), default="미확인"),
+        "overallLabel": _display_value(device_result.get("overallLabel"), default=""),
+        "priorityReason": _display_value(device_result.get("priorityReason"), default=""),
+        "statusText": _display_value(device_result.get("statusText"), default=""),
+        "error": _display_value(device_result.get("error"), default=""),
+        "source": _display_value(status_payload.get("source"), default=""),
+        "component": _display_value(request_payload.get("component"), default=""),
+        "componentLabels": (
+            device_result.get("componentLabels")
+            if isinstance(device_result.get("componentLabels"), dict)
+            else {}
+        ),
+        "redis": {
+            "checkedAt": _display_value(redis_payload.get("checkedAt"), default=""),
+            "availabilityReasons": (
+                redis_payload.get("availabilityReasons")
+                if isinstance(redis_payload.get("availabilityReasons"), list)
+                else []
+            ),
+            "deviceUpdatedAt": _display_value(device_state.get("updatedAt"), default=""),
+            "agentUpdatedAt": _display_value(agent_state.get("updatedAt"), default=""),
+            "deviceIsConnected": device_state.get("isConnected"),
+            "agentIsConnected": agent_state.get("isConnected"),
+            "deviceStatus": _display_value(device_state.get("status"), default=""),
+            "captureBoardStatus": _display_value(device_state.get("captureBoardStatus"), default=""),
+        },
+        "ssh": {
+            "ready": bool(ssh_payload.get("ready")),
+            "verified": bool(ssh_payload.get("verified")),
+            "reason": _display_value(ssh_payload.get("reason"), default=""),
+            "openedThisRun": bool(ssh_payload.get("openedThisRun")),
+            "reusedExisting": bool(ssh_payload.get("reusedExisting")),
+            "openWaitTimeoutSec": max(0, int(_coerce_int(ssh_payload.get("openWaitTimeoutSec")) or 0)),
+            "closeStatus": _display_value(ssh_close_payload.get("status"), default=""),
+        },
+    }
+
+
+def _iter_device_health_monitor_device_events(
+    report_summary: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    device_results = (
+        report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    unavailable_payloads: list[dict[str, Any]] = []
+    for device_result in device_results:
+        if not isinstance(device_result, dict):
+            continue
+        payload = _build_device_health_monitor_device_event_payload(device_result)
+        label = _display_value(device_result.get("overallLabel"), default="")
+        source = _display_value(payload.get("source"), default="")
+        if label == "점검 불가":
+            unavailable_payloads.append(payload)
+            continue
+        if source == "redis_device_state" and label in {"확인 필요", "이상"}:
+            events.append(("redis_candidate", payload))
+            continue
+        if source == "mda_graphql+ssh_linux_commands" and label == "이상":
+            events.append(("ssh_verified_abnormal", payload))
+
+    if unavailable_payloads:
+        # 병원이 장비를 꺼두는 케이스가 많아 전체 원본 대신 샘플만 남긴다.
+        sample_limit = 20
+        events.insert(
+            0,
+            (
+                "device_unavailable",
+                {
+                    "count": len(unavailable_payloads),
+                    "sampleLimit": sample_limit,
+                    "omittedCount": max(0, len(unavailable_payloads) - sample_limit),
+                    "sampleDevices": unavailable_payloads[:sample_limit],
+                },
+            ),
+        )
+    return events
+
+
+def _log_device_health_monitor_run_events(
+    report_summary: dict[str, Any],
+    *,
+    now: datetime,
+    logger: logging.Logger,
+    channel_id: str = "",
+    alertable_fingerprints: set[str] | None = None,
+    channel_missing: bool = False,
+) -> None:
+    _append_device_health_monitor_event(
+        "run_summary",
+        _build_device_health_monitor_run_event_payload(
+            report_summary,
+            channel_id=channel_id,
+            alertable_fingerprints=alertable_fingerprints,
+            channel_missing=channel_missing,
+        ),
+        now=now,
+        logger=logger,
+    )
+    for event_type, payload in _iter_device_health_monitor_device_events(report_summary):
+        _append_device_health_monitor_event(
+            event_type,
+            payload,
+            now=now,
+            logger=logger,
+        )
+
+
+def _build_device_health_monitor_redis_client() -> DeviceStateRedisClient:
+    return DeviceStateRedisClient.from_settings()
+
+
+def _parse_device_health_monitor_percent(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip().replace("%", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_device_health_monitor_state_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return _coerce_daily_device_round_now(datetime.fromisoformat(text))
+    except ValueError:
+        return None
+
+
+def _is_device_health_monitor_state_stale(
+    state_payload: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> bool:
+    if not isinstance(state_payload, dict):
+        return True
+    updated_at = _parse_device_health_monitor_state_datetime(state_payload.get("updatedAt"))
+    if updated_at is None:
+        return True
+    stale_sec = max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC))
+    return now - updated_at > timedelta(seconds=stale_sec)
+
+
+def _build_device_health_monitor_pass_component(summary: str = "Redis 상태 정상") -> dict[str, str]:
+    return {
+        "status": "pass",
+        "label": "정상",
+        "summary": summary,
+    }
+
+
+def _build_device_health_monitor_redis_component(
+    *,
+    status: str,
+    label: str,
+    summary: str,
+) -> dict[str, str]:
+    return {
+        "status": status,
+        "label": label,
+        "summary": summary,
+    }
+
+
+def _trim_device_health_monitor_redis_state(state_payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(state_payload, dict):
+        return None
+    trimmed = {
+        key: value
+        for key, value in state_payload.items()
+        if key not in {"screenshot"}
+    }
+    acme = trimmed.get("acme") if isinstance(trimmed.get("acme"), dict) else None
+    if acme and isinstance(acme.get("systemInfo"), dict):
+        system_info = {
+            key: value
+            for key, value in acme["systemInfo"].items()
+            if key != "raw"
+        }
+        trimmed["acme"] = {
+            **acme,
+            "systemInfo": system_info,
+        }
+    return trimmed
+
+
+def _extract_device_health_monitor_usb_items(device_state: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(device_state, dict):
+        return []
+    acme = device_state.get("acme") if isinstance(device_state.get("acme"), dict) else {}
+    usb_list = acme.get("usbList") if isinstance(acme.get("usbList"), list) else []
+    return [item for item in usb_list if isinstance(item, dict)]
+
+
+def _device_health_monitor_usb_text(item: dict[str, Any]) -> str:
+    return " ".join(
+        _display_value(item.get(key), default="")
+        for key in ("name", "alias", "type", "deviceId")
+    ).lower()
+
+
+def _device_health_monitor_has_led_usb(device_state: dict[str, Any] | None) -> bool | None:
+    usb_items = _extract_device_health_monitor_usb_items(device_state)
+    if not usb_items:
+        return None
+    return any(
+        "led" in _device_health_monitor_usb_text(item)
+        or "mmtled" in _device_health_monitor_usb_text(item)
+        for item in usb_items
+    )
+
+
+def _device_health_monitor_has_captureboard_usb(device_state: dict[str, Any] | None) -> bool | None:
+    usb_items = _extract_device_health_monitor_usb_items(device_state)
+    if not usb_items:
+        return None
+    return any(
+        "captureboard" in _device_health_monitor_usb_text(item)
+        or "capture" in _device_health_monitor_usb_text(item)
+        or "ls_hdmi" in _device_health_monitor_usb_text(item)
+        or "easycap" in _device_health_monitor_usb_text(item)
+        for item in usb_items
+    )
+
+
+def _extract_device_health_monitor_disk_percent(device_state: dict[str, Any] | None) -> float | None:
+    if not isinstance(device_state, dict):
+        return None
+    direct_percent = _parse_device_health_monitor_percent(device_state.get("diskUsage"))
+    if direct_percent is not None:
+        return direct_percent
+    acme = device_state.get("acme") if isinstance(device_state.get("acme"), dict) else {}
+    system_info = acme.get("systemInfo") if isinstance(acme.get("systemInfo"), dict) else {}
+    return _parse_device_health_monitor_percent(system_info.get("hddUsage"))
+
+
+def _collect_device_health_monitor_redis_availability_reasons(
+    *,
+    device_context: dict[str, Any],
+    device_state: dict[str, Any] | None,
+    agent_state: dict[str, Any] | None,
+    now: datetime,
+) -> list[str]:
+    device_name = _display_value(device_context.get("deviceName"), default="장비명 미확인")
+    reasons: list[str] = []
+    device_stale = _is_device_health_monitor_state_stale(device_state, now=now)
+    agent_stale = _is_device_health_monitor_state_stale(agent_state, now=now)
+    if device_stale and agent_stale:
+        return [f"{device_name} 상태 정보가 Redis에서 갱신되지 않고 있어"]
+    if device_stale:
+        reasons.append(f"{device_name} 장비 상태 정보가 Redis에서 갱신되지 않고 있어")
+    if agent_stale:
+        reasons.append(f"{device_name} agent 상태 정보가 Redis에서 갱신되지 않고 있어")
+
+    device_connected = device_state.get("isConnected") if isinstance(device_state, dict) else None
+    if device_connected is False:
+        reasons.append("장비 socket 연결이 끊겼어")
+
+    agent_connected = agent_state.get("isConnected") if isinstance(agent_state, dict) else None
+    if agent_connected is False:
+        reasons.append("장비 agent 연결이 끊겼어")
+
+    device_status = _display_value((device_state or {}).get("status"), default="").strip().upper()
+    if any(token in device_status for token in ("EXIT", "DISCONNECT", "OFFLINE")):
+        reasons.append(f"장비 상태가 {device_status}로 보고됐어")
+
+    return reasons
+
+
+def _collect_device_health_monitor_redis_issues(
+    *,
+    device_context: dict[str, Any],
+    device_state: dict[str, Any] | None,
+    agent_state: dict[str, Any] | None,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+
+    capture_status = _display_value((device_state or {}).get("captureBoardStatus"), default="").strip().lower()
+    if (
+        capture_status in {"false", "none", "missing"}
+        or "disconnect" in capture_status
+        or "offline" in capture_status
+    ):
+        issues.append(
+            {
+                "component": "captureboard",
+                "status": "warning",
+                "label": "확인 필요",
+                "summary": "Redis 상태에서 캡처보드 연결 이상 후보가 감지됐어",
+                "requiresSshVerification": True,
+            }
+        )
+
+    has_captureboard = _device_health_monitor_has_captureboard_usb(device_state)
+    capture_board_type = _display_value((device_state or {}).get("captureBoardType"), default="")
+    if has_captureboard is False and capture_board_type:
+        issues.append(
+            {
+                "component": "captureboard",
+                "status": "warning",
+                "label": "확인 필요",
+                "summary": "Redis USB 목록에서 캡처보드를 찾지 못했어",
+                "requiresSshVerification": True,
+            }
+        )
+
+    has_led = _device_health_monitor_has_led_usb(device_state)
+    if has_led is False:
+        issues.append(
+            {
+                "component": "led",
+                "status": "warning",
+                "label": "확인 필요",
+                "summary": "Redis USB 목록에서 LED 장치를 찾지 못했어",
+                "requiresSshVerification": True,
+            }
+        )
+
+    disk_percent = _extract_device_health_monitor_disk_percent(device_state)
+    if disk_percent is not None and disk_percent >= 90:
+        issues.append(
+            {
+                "component": "storage",
+                "status": "warning",
+                "label": "확인 필요",
+                "summary": f"Redis 상태에서 디스크 사용량이 {disk_percent:.0f}%로 보고됐어",
+                "requiresSshVerification": True,
+            }
+        )
+
+    return issues
+
+
+def _build_device_health_monitor_redis_status_payload(
+    *,
+    device_context: dict[str, Any],
+    device_state: dict[str, Any] | None,
+    agent_state: dict[str, Any] | None,
+    issues: list[dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    device_name = _display_value(device_context.get("deviceName"), default="미확인")
+    overview: dict[str, Any] = {
+        "audio": _build_device_health_monitor_pass_component(),
+        "pm2": _build_device_health_monitor_pass_component(),
+        "storage": _build_device_health_monitor_pass_component(),
+        "captureboard": _build_device_health_monitor_pass_component(),
+        "led": _build_device_health_monitor_pass_component(),
+    }
+    issues_by_component: dict[str, list[dict[str, Any]]] = {}
+    for issue in issues:
+        component = _display_value(issue.get("component"), default="")
+        if component not in overview:
+            continue
+        issues_by_component.setdefault(component, []).append(issue)
+
+    for component, component_issues in issues_by_component.items():
+        has_fail = any(_display_value(item.get("status"), default="") == "fail" for item in component_issues)
+        summaries = [
+            _display_value(item.get("summary"), default="")
+            for item in component_issues
+            if _display_value(item.get("summary"), default="")
+        ]
+        overview[component] = _build_device_health_monitor_redis_component(
+            status="fail" if has_fail else "warning",
+            label="이상" if has_fail else "확인 필요",
+            summary=" / ".join(summaries) or ("이상 감지" if has_fail else "확인 필요"),
+        )
+
+    device_payload = {
+        "deviceName": device_name,
+        "version": _display_value((device_state or {}).get("version"), default=""),
+        "useDiaryCapture": (device_state or {}).get("useDiaryCapture"),
+        "checkInvalidBarcode": (device_state or {}).get("checkInvalidBarcode"),
+        "captureBoardType": _display_value((device_state or {}).get("captureBoardType"), default=""),
+        "hospitalName": _display_value(device_context.get("hospitalName"), default=""),
+        "roomName": _display_value(device_context.get("roomName"), default=""),
+        "isConnected": bool((device_state or {}).get("isConnected")),
+    }
+    return {
+        "route": "device_health_monitor",
+        "source": "redis_device_state",
+        "request": {
+            "deviceName": device_name,
+            "component": "all",
+        },
+        "device": device_payload,
+        # Redis snapshot 자체가 판정 근거인 경우에는 SSH 불가를 점검 불가로 해석하지 않게 ready로 둔다.
+        "ssh": {
+            "ready": True,
+            "reason": "redis_snapshot",
+            "verified": False,
+        },
+        "redis": {
+            "checkedAt": now.isoformat(),
+            "staleThresholdSec": max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC)),
+            "deviceState": _trim_device_health_monitor_redis_state(device_state),
+            "agentState": _trim_device_health_monitor_redis_state(agent_state),
+        },
+        "checks": {},
+        "overview": overview,
+    }
+
+
+def _build_device_health_monitor_redis_unavailable_status_payload(
+    *,
+    device_context: dict[str, Any],
+    device_state: dict[str, Any] | None,
+    agent_state: dict[str, Any] | None,
+    reasons: list[str],
+    now: datetime,
+) -> dict[str, Any]:
+    device_name = _display_value(device_context.get("deviceName"), default="미확인")
+    return {
+        "route": "device_health_monitor",
+        "source": "redis_device_state",
+        "request": {
+            "deviceName": device_name,
+            "component": "availability",
+        },
+        "device": {
+            "deviceName": device_name,
+            "version": _display_value((device_state or {}).get("version"), default=""),
+            "captureBoardType": _display_value((device_state or {}).get("captureBoardType"), default=""),
+            "hospitalName": _display_value(device_context.get("hospitalName"), default=""),
+            "roomName": _display_value(device_context.get("roomName"), default=""),
+            "isConnected": bool((device_state or {}).get("isConnected")),
+        },
+        # 병원에서 정상적으로 장비를 꺼둘 수 있으므로 통신 불가만으로 이상 알림을 만들지 않는다.
+        "ssh": {
+            "ready": False,
+            "reason": "device_offline_or_state_stale",
+            "verified": False,
+        },
+        "redis": {
+            "checkedAt": now.isoformat(),
+            "staleThresholdSec": max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC)),
+            "availabilityReasons": reasons,
+            "deviceState": _trim_device_health_monitor_redis_state(device_state),
+            "agentState": _trim_device_health_monitor_redis_state(agent_state),
+        },
+        "checks": {},
+        "overview": {
+            "audio": None,
+            "pm2": None,
+            "storage": None,
+            "captureboard": None,
+            "led": None,
+        },
+    }
+
+
+def _build_device_health_monitor_result_from_redis(
+    device_context: dict[str, Any],
+    redis_snapshot: dict[str, Any],
+    *,
+    now: datetime,
+) -> tuple[dict[str, Any], bool]:
+    device_state = redis_snapshot.get("deviceState") if isinstance(redis_snapshot, dict) else None
+    agent_state = redis_snapshot.get("agentState") if isinstance(redis_snapshot, dict) else None
+    availability_reasons = _collect_device_health_monitor_redis_availability_reasons(
+        device_context=device_context,
+        device_state=device_state if isinstance(device_state, dict) else None,
+        agent_state=agent_state if isinstance(agent_state, dict) else None,
+        now=now,
+    )
+    if availability_reasons:
+        status_payload = _build_device_health_monitor_redis_unavailable_status_payload(
+            device_context=device_context,
+            device_state=device_state if isinstance(device_state, dict) else None,
+            agent_state=agent_state if isinstance(agent_state, dict) else None,
+            reasons=availability_reasons,
+            now=now,
+        )
+        result = _build_device_health_monitor_result(device_context, status_payload)
+        return {
+            **result,
+            "overallLabel": "점검 불가",
+            "componentLabels": {
+                "audio": "점검 불가",
+                "pm2": "점검 불가",
+                "storage": "점검 불가",
+                "captureboard": "점검 불가",
+                "led": "점검 불가",
+            },
+            "statusText": "장비가 오프라인이거나 상태 미갱신이라 이상 판단을 건너뛰었어",
+        }, False
+
+    issues = _collect_device_health_monitor_redis_issues(
+        device_context=device_context,
+        device_state=device_state if isinstance(device_state, dict) else None,
+        agent_state=agent_state if isinstance(agent_state, dict) else None,
+        now=now,
+    )
+    direct_issues = [
+        issue
+        for issue in issues
+        if not bool(issue.get("requiresSshVerification"))
+    ]
+    if direct_issues:
+        # Redis가 이미 오프라인/미갱신을 명확히 말하면 SSH 터널을 열지 않고 그 상태로 알린다.
+        status_payload = _build_device_health_monitor_redis_status_payload(
+            device_context=device_context,
+            device_state=device_state if isinstance(device_state, dict) else None,
+            agent_state=agent_state if isinstance(agent_state, dict) else None,
+            issues=direct_issues,
+            now=now,
+        )
+        return _build_device_health_monitor_result(device_context, status_payload), False
+
+    requires_ssh = any(bool(issue.get("requiresSshVerification")) for issue in issues)
+    status_payload = _build_device_health_monitor_redis_status_payload(
+        device_context=device_context,
+        device_state=device_state if isinstance(device_state, dict) else None,
+        agent_state=agent_state if isinstance(agent_state, dict) else None,
+        issues=issues,
+        now=now,
+    )
+    result = _build_device_health_monitor_result(device_context, status_payload)
+    if requires_ssh and not _is_device_health_monitor_ssh_verification_configured():
+        return {
+            **result,
+            "statusText": "Redis 이상 후보지만 SSH 검증 설정이 없어 알림 대상에서 제외했어",
+        }, False
+    return result, requires_ssh
 
 
 def _extract_device_health_monitor_agent_ssh(
@@ -789,27 +1542,22 @@ def _build_device_health_monitor_summary(
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
-    candidates = _load_daily_device_round_hospital_candidates()
-    candidate_hospital_seqs = {
-        hospital_seq
-        for hospital_seq in (_coerce_int(item.get("hospitalSeq")) for item in candidates)
-        if hospital_seq is not None
-    }
     state_payload = state if isinstance(state, dict) else {}
-    processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(
-        state_payload.get("processedHospitalSeqs")
+    ssh_tunnel_records = _normalize_device_health_monitor_ssh_tunnel_records(
+        state_payload.get("sshTunnelRecords")
     )
-    processed_candidate_count = sum(
-        1 for hospital_seq in processed_hospital_seqs if hospital_seq in candidate_hospital_seqs
-    )
-    hospital = _select_daily_device_round_hospital(candidates, state=state_payload)
-    if hospital is None:
+    try:
+        devices, device_cache_payload = _load_device_health_monitor_device_candidates_cached(
+            state_payload,
+            now=local_now,
+        )
+    except Exception as exc:
         return {
             "runDate": local_now.date().isoformat(),
             "startedAt": local_now.isoformat(),
             "finishedAt": local_now.isoformat(),
             "hospitalSeq": None,
-            "hospitalName": "미선정",
+            "hospitalName": "전체 장비",
             "deviceCount": 0,
             "scheduledDeviceCount": 0,
             "autoUpdateAgent": False,
@@ -820,34 +1568,95 @@ def _build_device_health_monitor_summary(
             **_build_device_health_monitor_empty_action_counts(),
             "deviceResults": [],
             "nextHospitalSeq": None,
-            "candidateHospitalCount": len(candidate_hospital_seqs),
-            "sshTunnelRecords": _normalize_device_health_monitor_ssh_tunnel_records(
-                state_payload.get("sshTunnelRecords")
+            "candidateHospitalCount": 0,
+            "checkedDeviceCount": 0,
+            "abnormalCandidateCount": 0,
+            "sshVerifiedCandidateCount": 0,
+            "sshTunnelRecords": ssh_tunnel_records,
+            "deviceCandidateCache": _normalize_device_health_monitor_device_candidate_cache(
+                state_payload.get("deviceCandidateCache")
             ),
-            "summaryLine": (
-                "이번 상태 모니터 순회에서 처리할 병원을 모두 끝냈어"
-                if candidate_hospital_seqs and processed_candidate_count >= len(candidate_hospital_seqs)
-                else "상태 모니터 대상 병원이 없어"
-            ),
+            "deviceCandidateCachedAt": _display_value(state_payload.get("deviceCandidateCachedAt"), default=""),
+            "deviceCacheRefreshed": False,
+            "deviceCacheRefreshError": f"{type(exc).__name__}: {exc}",
+            "deviceCacheSource": "unavailable",
+            "monitorUnavailableReason": "device_cache_unavailable",
+            "monitorUnavailableDetail": f"{type(exc).__name__}: {exc}",
+            "summaryLine": "활성 장비 목록을 가져오지 못해 장비 상태 감시를 건너뛰었어",
         }
 
-    hospital_seq = int(hospital["hospitalSeq"])
-    devices = _load_daily_device_round_devices(hospital_seq)
+    try:
+        redis_client = _build_device_health_monitor_redis_client()
+        redis_client.ping()
+        redis_snapshot = redis_client.load_device_and_agent_states(
+            [_display_value(device.get("deviceName"), default="") for device in devices]
+        )
+    except DeviceStateRedisUnavailable as exc:
+        # Redis를 읽지 못하면 전체 상태 감시 자체가 불가능하므로 SSH 순회 fallback은 하지 않는다.
+        return {
+            "runDate": local_now.date().isoformat(),
+            "startedAt": local_now.isoformat(),
+            "finishedAt": local_now.isoformat(),
+            "hospitalSeq": None,
+            "hospitalName": "전체 장비",
+            "deviceCount": 0,
+            "scheduledDeviceCount": 0,
+            "autoUpdateAgent": False,
+            "autoUpdateBox": False,
+            "autoCleanupTrashCan": False,
+            "autoPowerOff": False,
+            "statusCounts": _build_device_health_monitor_zero_counts(),
+            **_build_device_health_monitor_empty_action_counts(),
+            "deviceResults": [],
+            "nextHospitalSeq": None,
+            "candidateHospitalCount": 0,
+            "checkedDeviceCount": 0,
+            "abnormalCandidateCount": 0,
+            "sshVerifiedCandidateCount": 0,
+            "sshTunnelRecords": ssh_tunnel_records,
+            "deviceCandidateCache": devices,
+            "deviceCandidateCachedAt": _display_value(device_cache_payload.get("cachedAt"), default=""),
+            "deviceCacheRefreshed": bool(device_cache_payload.get("refreshed")),
+            "deviceCacheRefreshError": _display_value(device_cache_payload.get("refreshError"), default=""),
+            "deviceCacheSource": _display_value(device_cache_payload.get("source"), default=""),
+            "monitorUnavailableReason": "redis_unavailable",
+            "monitorUnavailableDetail": str(exc),
+            "summaryLine": "Redis 상태를 읽지 못해 장비 상태 감시를 건너뛰었어",
+        }
+
     device_results: list[dict[str, Any]] = []
-    ssh_tunnel_records = _normalize_device_health_monitor_ssh_tunnel_records(
-        state_payload.get("sshTunnelRecords")
-    )
+    abnormal_candidate_count = 0
+    ssh_verified_candidate_count = 0
     for device_context in devices:
+        device_name = _display_value(device_context.get("deviceName"), default="")
+        redis_result, requires_ssh = _build_device_health_monitor_result_from_redis(
+            device_context,
+            redis_snapshot.get(device_name, {}),
+            now=local_now,
+        )
+        if _display_value(redis_result.get("overallLabel"), default="") in {"이상", "확인 필요"}:
+            abnormal_candidate_count += 1
+        if not requires_ssh:
+            device_results.append(redis_result)
+            continue
+
         try:
-            device_results.append(
-                _run_device_health_monitor_for_device(
-                    device_context,
-                    now=local_now,
-                    ssh_tunnel_records=ssh_tunnel_records,
-                )
+            # Redis에서 하드웨어 후보를 찾은 장비만 실제 SSH 명령으로 2차 확인한다.
+            verified_result = _run_device_health_monitor_for_device(
+                device_context,
+                now=local_now,
+                ssh_tunnel_records=ssh_tunnel_records,
             )
+            ssh_verified_candidate_count += 1
+            device_results.append(verified_result)
         except Exception as exc:
-            device_results.append(_build_device_health_monitor_error_result(device_context, exc))
+            device_results.append(
+                {
+                    **redis_result,
+                    "statusText": f"Redis 이상 후보 SSH 검증 실패: {type(exc).__name__}",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
     finished_at = _coerce_daily_device_round_now(now)
     status_counts = _build_device_health_monitor_zero_counts()
@@ -855,15 +1664,14 @@ def _build_device_health_monitor_summary(
         label = _display_value(item.get("overallLabel"), default="점검 불가")
         status_counts[label if label in status_counts else "점검 불가"] += 1
 
-    next_hospital_seq = _resolve_next_daily_device_round_hospital_seq(candidates, hospital_seq)
     return {
         "runDate": local_now.date().isoformat(),
         "startedAt": local_now.isoformat(),
         "finishedAt": finished_at.isoformat(),
-        "hospitalSeq": hospital_seq,
-        "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
+        "hospitalSeq": None,
+        "hospitalName": "전체 장비",
         "deviceCount": len(device_results),
-        "scheduledDeviceCount": int(hospital.get("deviceCount") or len(device_results)),
+        "scheduledDeviceCount": len(devices),
         "autoUpdateAgent": False,
         "autoUpdateBox": False,
         "autoCleanupTrashCan": False,
@@ -871,9 +1679,19 @@ def _build_device_health_monitor_summary(
         "statusCounts": status_counts,
         **_build_device_health_monitor_empty_action_counts(),
         "deviceResults": device_results,
-        "nextHospitalSeq": next_hospital_seq,
-        "candidateHospitalCount": len(candidate_hospital_seqs),
+        "nextHospitalSeq": None,
+        "candidateHospitalCount": 0,
+        "checkedDeviceCount": len(devices),
+        "abnormalCandidateCount": abnormal_candidate_count,
+        "sshVerifiedCandidateCount": ssh_verified_candidate_count,
         "sshTunnelRecords": ssh_tunnel_records,
+        "deviceCandidateCache": devices,
+        "deviceCandidateCachedAt": _display_value(device_cache_payload.get("cachedAt"), default=""),
+        "deviceCacheRefreshed": bool(device_cache_payload.get("refreshed")),
+        "deviceCacheRefreshError": _display_value(device_cache_payload.get("refreshError"), default=""),
+        "deviceCacheSource": _display_value(device_cache_payload.get("source"), default=""),
+        "monitorUnavailableReason": "",
+        "monitorUnavailableDetail": "",
         "summaryLine": (
             f"정상 {status_counts['정상']} / 확인 필요 {status_counts['확인 필요']} / "
             f"이상 {status_counts['이상']} / 점검 불가 {status_counts['점검 불가']}"
@@ -922,23 +1740,36 @@ def _build_device_health_monitor_next_state(
     now: datetime,
     alert_fingerprints: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
-    processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(state.get("processedHospitalSeqs"))
-    if hospital_seq is not None and hospital_seq not in processed_hospital_seqs:
-        processed_hospital_seqs.append(hospital_seq)
-
-    candidate_hospital_count = max(0, int(report_summary.get("candidateHospitalCount") or 0))
-    if candidate_hospital_count > 0 and len(processed_hospital_seqs) >= candidate_hospital_count:
-        processed_hospital_seqs = []
-
     return {
         **state,
-        "processedHospitalSeqs": processed_hospital_seqs,
+        # Redis 기반 모니터는 병원 순서 state를 쓰지 않으므로 legacy 순회 포인터는 비워 둔다.
+        "processedHospitalSeqs": [],
         "lastRunAt": now.isoformat(),
-        "lastHospitalSeq": report_summary.get("hospitalSeq"),
-        "lastHospitalName": report_summary.get("hospitalName"),
-        "nextHospitalSeq": report_summary.get("nextHospitalSeq"),
-        "candidateHospitalCount": candidate_hospital_count,
+        "lastHospitalSeq": None,
+        "lastHospitalName": "전체 장비",
+        "nextHospitalSeq": None,
+        "candidateHospitalCount": 0,
+        "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+        "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+        "sshVerifiedCandidateCount": max(0, int(report_summary.get("sshVerifiedCandidateCount") or 0)),
+        "monitorUnavailableReason": _display_value(report_summary.get("monitorUnavailableReason"), default=""),
+        "monitorUnavailableDetail": _display_value(report_summary.get("monitorUnavailableDetail"), default=""),
+        "deviceCandidateCache": _normalize_device_health_monitor_device_candidate_cache(
+            report_summary.get(
+                "deviceCandidateCache",
+                state.get("deviceCandidateCache"),
+            )
+        ),
+        "deviceCandidateCachedAt": _display_value(
+            report_summary.get(
+                "deviceCandidateCachedAt",
+                state.get("deviceCandidateCachedAt"),
+            ),
+            default="",
+        ),
+        "deviceCacheRefreshed": bool(report_summary.get("deviceCacheRefreshed")),
+        "deviceCacheRefreshError": _display_value(report_summary.get("deviceCacheRefreshError"), default=""),
+        "deviceCacheSource": _display_value(report_summary.get("deviceCacheSource"), default=""),
         "statusCounts": report_summary.get("statusCounts"),
         "alertFingerprints": alert_fingerprints,
         "sshTunnelRecords": _normalize_device_health_monitor_ssh_tunnel_records(
@@ -958,14 +1789,6 @@ def _run_device_health_monitor_once(
     if not s.DB_QUERY_ENABLED:
         logger.warning("장비 상태 모니터를 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
-    if not _is_device_health_monitor_runtime_configured():
-        logger.warning("장비 상태 모니터를 켤 수 없어. MDA/SSH 설정이 부족해")
-        return False
-
-    channel_id = _device_health_monitor_channel_id()
-    if not channel_id:
-        logger.warning("장비 상태 모니터 채널 ID가 없어. DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘")
-        return False
 
     local_now = _coerce_daily_device_round_now(now)
     state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
@@ -973,15 +1796,43 @@ def _run_device_health_monitor_once(
         now=local_now,
         state=state,
     )
-    if _coerce_int(report_summary.get("hospitalSeq")) is None:
-        next_state = {
-            **state,
-            "processedHospitalSeqs": [],
-            "lastRunAt": local_now.isoformat(),
-            "candidateHospitalCount": int(report_summary.get("candidateHospitalCount") or 0),
-            "statusCounts": report_summary.get("statusCounts"),
-        }
+    if _display_value(report_summary.get("monitorUnavailableReason"), default=""):
+        next_state = _build_device_health_monitor_next_state(
+            state,
+            report_summary,
+            now=local_now,
+            alert_fingerprints=_normalize_device_health_monitor_alerts(state.get("alertFingerprints")),
+        )
         _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
+        _append_device_health_monitor_event(
+            "monitor_unavailable",
+            _build_device_health_monitor_run_event_payload(report_summary),
+            now=local_now,
+            logger=logger,
+        )
+        logger.warning(
+            "Device health monitor unavailable reason=%s detail=%s",
+            report_summary.get("monitorUnavailableReason"),
+            report_summary.get("monitorUnavailableDetail"),
+        )
+        return False
+
+    channel_id = _device_health_monitor_channel_id()
+    if not channel_id:
+        next_state = _build_device_health_monitor_next_state(
+            state,
+            report_summary,
+            now=local_now,
+            alert_fingerprints=_normalize_device_health_monitor_alerts(state.get("alertFingerprints")),
+        )
+        _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
+        _log_device_health_monitor_run_events(
+            report_summary,
+            now=local_now,
+            logger=logger,
+            channel_missing=True,
+        )
+        logger.warning("장비 상태 모니터 채널 ID가 없어. DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘")
         return False
 
     alertable_fingerprints, updated_alerts = _collect_device_health_monitor_alert_updates(
@@ -996,12 +1847,20 @@ def _run_device_health_monitor_once(
         alert_fingerprints=updated_alerts,
     )
     _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
+    _log_device_health_monitor_run_events(
+        report_summary,
+        now=local_now,
+        logger=logger,
+        channel_id=channel_id,
+        alertable_fingerprints=alertable_fingerprints,
+    )
 
     if not alertable_fingerprints:
         logger.info(
-            "Checked device health channel=%s hospitalSeq=%s abnormal=0 alertable=0",
+            "Checked device health channel=%s checkedDevices=%s abnormalCandidates=%s alertable=0",
             channel_id,
-            report_summary.get("hospitalSeq"),
+            report_summary.get("checkedDeviceCount"),
+            report_summary.get("abnormalCandidateCount"),
         )
         return False
 
@@ -1013,10 +1872,22 @@ def _run_device_health_monitor_once(
         message_ts="",
         logger=logger,
     )
+    _append_device_health_monitor_event(
+        "slack_alert_sent",
+        {
+            "channelId": channel_id,
+            "alertableCount": len(alertable_fingerprints),
+            "alertFingerprints": sorted(alertable_fingerprints),
+            "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+            "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+        },
+        now=local_now,
+        logger=logger,
+    )
     logger.info(
-        "Posted device health alert channel=%s hospitalSeq=%s alertable=%s",
+        "Posted device health alert channel=%s checkedDevices=%s alertable=%s",
         channel_id,
-        report_summary.get("hospitalSeq"),
+        report_summary.get("checkedDeviceCount"),
         len(alertable_fingerprints),
     )
     return True
@@ -1041,14 +1912,6 @@ def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | 
         actual_logger.warning(
             "장비 상태 모니터가 활성화됐는데 DB_QUERY_ENABLED가 꺼져 있어 시작하지 않을게"
         )
-        return
-    if not _is_device_health_monitor_runtime_configured():
-        actual_logger.warning(
-            "장비 상태 모니터가 활성화됐는데 MDA/SSH 설정이 부족해 시작하지 않을게"
-        )
-        return
-    if not _device_health_monitor_channel_id():
-        actual_logger.warning("장비 상태 모니터 채널 ID가 없어 시작하지 않을게")
         return
 
     client = getattr(app, "client", None)

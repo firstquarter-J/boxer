@@ -13,5 +13,6 @@ AGENTS.md
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/*.jsonl
 data/*-wal
 data/*-shm
