@@ -174,6 +174,25 @@ def _normalize_device_health_monitor_alerts(value: Any) -> dict[str, dict[str, A
     return alerts
 
 
+def _normalize_device_health_monitor_pending_alerts(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+
+    alerts: dict[str, dict[str, Any]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, dict):
+            continue
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        alerts[normalized_key] = {
+            "firstSeenAt": str(raw.get("firstSeenAt") or "").strip(),
+            "lastSeenAt": str(raw.get("lastSeenAt") or "").strip(),
+            "count": max(0, int(raw.get("count") or 0)),
+        }
+    return alerts
+
+
 def _normalize_device_health_monitor_ssh_tunnel_records(value: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict):
         return {}
@@ -234,6 +253,9 @@ def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, A
     normalized_state["alertFingerprints"] = _normalize_device_health_monitor_alerts(
         state_payload.get("alertFingerprints")
     )
+    normalized_state["pendingAlertFingerprints"] = _normalize_device_health_monitor_pending_alerts(
+        state_payload.get("pendingAlertFingerprints")
+    )
     normalized_state["sshTunnelRecords"] = _normalize_device_health_monitor_ssh_tunnel_records(
         state_payload.get("sshTunnelRecords")
     )
@@ -271,6 +293,10 @@ def _device_health_monitor_alert_reminder_delta() -> timedelta:
     return timedelta(hours=hours)
 
 
+def _device_health_monitor_captureboard_alert_confirmation_polls() -> int:
+    return max(1, int(cs.DEVICE_HEALTH_MONITOR_CAPTUREBOARD_ALERT_CONFIRMATION_POLLS))
+
+
 def _build_device_health_monitor_alert_fingerprint(item: dict[str, str]) -> str:
     return "|".join(
         [
@@ -280,6 +306,13 @@ def _build_device_health_monitor_alert_fingerprint(item: dict[str, str]) -> str:
             _display_value(item.get("issue"), default=""),
         ]
     )
+
+
+def _device_health_monitor_required_confirmation_polls(item: dict[str, str]) -> int:
+    issue = _display_value(item.get("issue"), default="")
+    if "캡처보드" in issue:
+        return _device_health_monitor_captureboard_alert_confirmation_polls()
+    return 1
 
 
 def _filter_device_health_monitor_alert_summary(
@@ -504,6 +537,11 @@ def _build_device_health_monitor_device_event_payload(device_result: dict[str, A
     agent_state = redis_payload.get("agentState") if isinstance(redis_payload.get("agentState"), dict) else {}
     ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
     ssh_close_payload = ssh_payload.get("close") if isinstance(ssh_payload.get("close"), dict) else {}
+    overview_payload = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
+    checks_payload = status_payload.get("checks") if isinstance(status_payload.get("checks"), dict) else {}
+    captureboard_overview = (
+        overview_payload.get("captureboard") if isinstance(overview_payload.get("captureboard"), dict) else {}
+    )
 
     # 이벤트 로그에는 추적에 필요한 요약만 남기고 Redis snapshot 원본은 남기지 않는다.
     return {
@@ -544,6 +582,24 @@ def _build_device_health_monitor_device_event_payload(device_result: dict[str, A
             "reusedExisting": bool(ssh_payload.get("reusedExisting")),
             "openWaitTimeoutSec": max(0, int(_coerce_int(ssh_payload.get("openWaitTimeoutSec")) or 0)),
             "closeStatus": _display_value(ssh_close_payload.get("status"), default=""),
+        },
+        "probe": {
+            "captureboard": {
+                "status": _display_value(captureboard_overview.get("status"), default=""),
+                "label": _display_value(captureboard_overview.get("label"), default=""),
+                "summary": _display_value(captureboard_overview.get("summary"), default=""),
+                "evidence": _display_value(captureboard_overview.get("evidence"), default=""),
+                "overviewDetail": _display_value(captureboard_overview.get("overviewDetail"), default=""),
+            },
+            "lsusbOutput": _display_value((checks_payload.get("lsusb") or {}).get("output"), default="")[:1000],
+            "videoDevicesOutput": _display_value(
+                (checks_payload.get("video_devices") or {}).get("output"),
+                default="",
+            )[:500],
+            "v4l2DevicesOutput": _display_value(
+                (checks_payload.get("v4l2_devices") or {}).get("output"),
+                default="",
+            )[:1000],
         },
     }
 
@@ -797,11 +853,16 @@ def _collect_device_health_monitor_redis_issues(
 ) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
 
+    has_captureboard = _device_health_monitor_has_captureboard_usb(device_state)
+    capture_board_type = _display_value((device_state or {}).get("captureBoardType"), default="")
     capture_status = _display_value((device_state or {}).get("captureBoardStatus"), default="").strip().lower()
     if (
-        capture_status in {"false", "none", "missing"}
-        or "disconnect" in capture_status
-        or "offline" in capture_status
+        has_captureboard is not True
+        and (
+            capture_status in {"false", "none", "missing"}
+            or "disconnect" in capture_status
+            or "offline" in capture_status
+        )
     ):
         issues.append(
             {
@@ -813,8 +874,6 @@ def _collect_device_health_monitor_redis_issues(
             }
         )
 
-    has_captureboard = _device_health_monitor_has_captureboard_usb(device_state)
-    capture_board_type = _display_value((device_state or {}).get("captureBoardType"), default="")
     if has_captureboard is False and capture_board_type:
         issues.append(
             {
@@ -1704,33 +1763,71 @@ def _collect_device_health_monitor_alert_updates(
     state: dict[str, Any],
     *,
     now: datetime,
-) -> tuple[set[str], dict[str, dict[str, Any]]]:
+) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     alert_fingerprints = _normalize_device_health_monitor_alerts(state.get("alertFingerprints"))
+    pending_fingerprints = _normalize_device_health_monitor_pending_alerts(
+        state.get("pendingAlertFingerprints")
+    )
     current_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
-    current_fingerprints = {
-        _build_device_health_monitor_alert_fingerprint(item)
+    current_items_by_fingerprint = {
+        _build_device_health_monitor_alert_fingerprint(item): item
         for item in current_items
     }
+    current_fingerprints = set(current_items_by_fingerprint)
     reminder_delta = _device_health_monitor_alert_reminder_delta()
     now_text = now.isoformat()
     alertable_fingerprints: set[str] = set()
     updated_alerts: dict[str, dict[str, Any]] = {}
+    updated_pending_alerts: dict[str, dict[str, Any]] = {}
+
+    for fingerprint, previous in alert_fingerprints.items():
+        if fingerprint in current_fingerprints:
+            continue
+        last_alerted_at = _parse_device_health_monitor_datetime(previous.get("lastAlertedAt"))
+        if last_alerted_at is not None and now - last_alerted_at < reminder_delta:
+            # 한두 번의 Redis/SSH 폴링에서 이상 후보가 사라져도, 최근 발송 기록은 reminder 기간 동안 유지한다.
+            updated_alerts[fingerprint] = previous
 
     # 같은 장비의 같은 이상은 최초 발견 또는 reminder 주기 경과 때만 다시 알림을 보낸다.
     for fingerprint in current_fingerprints:
         previous = alert_fingerprints.get(fingerprint, {})
         last_alerted_at = _parse_device_health_monitor_datetime(previous.get("lastAlertedAt"))
-        should_alert = last_alerted_at is None or now - last_alerted_at >= reminder_delta
+        has_previous_alert = last_alerted_at is not None
+        should_alert = has_previous_alert and now - last_alerted_at >= reminder_delta
+        pending = pending_fingerprints.get(fingerprint, {})
+        pending_count = max(0, int(pending.get("count") or 0)) + 1
+        required_confirmation_polls = _device_health_monitor_required_confirmation_polls(
+            current_items_by_fingerprint.get(fingerprint, {})
+        )
+        if not has_previous_alert and pending_count >= required_confirmation_polls:
+            should_alert = True
         if should_alert:
             alertable_fingerprints.add(fingerprint)
-        updated_alerts[fingerprint] = {
-            "firstAlertedAt": str(previous.get("firstAlertedAt") or now_text),
-            "lastAlertedAt": now_text if should_alert else str(previous.get("lastAlertedAt") or ""),
+            updated_alerts[fingerprint] = {
+                "firstAlertedAt": str(previous.get("firstAlertedAt") or now_text),
+                "lastAlertedAt": now_text,
+                "lastSeenAt": now_text,
+                "count": max(0, int(previous.get("count") or 0)) + 1,
+            }
+            continue
+
+        if has_previous_alert:
+            updated_alerts[fingerprint] = {
+                "firstAlertedAt": str(previous.get("firstAlertedAt") or now_text),
+                "lastAlertedAt": str(previous.get("lastAlertedAt") or ""),
+                "lastSeenAt": now_text,
+                "count": max(0, int(previous.get("count") or 0)) + 1,
+            }
+            continue
+
+        # 캡처보드처럼 순간 인식이 흔들리는 항목은 연속 확인 후에만 Slack으로 올린다.
+        updated_pending_alerts[fingerprint] = {
+            "firstSeenAt": str(pending.get("firstSeenAt") or now_text),
             "lastSeenAt": now_text,
-            "count": max(0, int(previous.get("count") or 0)) + 1,
+            "count": pending_count,
         }
 
-    return alertable_fingerprints, updated_alerts
+    return alertable_fingerprints, updated_alerts, updated_pending_alerts
 
 
 def _build_device_health_monitor_next_state(
@@ -1739,6 +1836,7 @@ def _build_device_health_monitor_next_state(
     *,
     now: datetime,
     alert_fingerprints: dict[str, dict[str, Any]],
+    pending_alert_fingerprints: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         **state,
@@ -1772,6 +1870,11 @@ def _build_device_health_monitor_next_state(
         "deviceCacheSource": _display_value(report_summary.get("deviceCacheSource"), default=""),
         "statusCounts": report_summary.get("statusCounts"),
         "alertFingerprints": alert_fingerprints,
+        "pendingAlertFingerprints": _normalize_device_health_monitor_pending_alerts(
+            pending_alert_fingerprints
+            if pending_alert_fingerprints is not None
+            else state.get("pendingAlertFingerprints")
+        ),
         "sshTunnelRecords": _normalize_device_health_monitor_ssh_tunnel_records(
             report_summary.get("sshTunnelRecords")
         ),
@@ -1802,6 +1905,9 @@ def _run_device_health_monitor_once(
             report_summary,
             now=local_now,
             alert_fingerprints=_normalize_device_health_monitor_alerts(state.get("alertFingerprints")),
+            pending_alert_fingerprints=_normalize_device_health_monitor_pending_alerts(
+                state.get("pendingAlertFingerprints")
+            ),
         )
         _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
         _append_device_health_monitor_event(
@@ -1824,6 +1930,9 @@ def _run_device_health_monitor_once(
             report_summary,
             now=local_now,
             alert_fingerprints=_normalize_device_health_monitor_alerts(state.get("alertFingerprints")),
+            pending_alert_fingerprints=_normalize_device_health_monitor_pending_alerts(
+                state.get("pendingAlertFingerprints")
+            ),
         )
         _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
         _log_device_health_monitor_run_events(
@@ -1835,7 +1944,7 @@ def _run_device_health_monitor_once(
         logger.warning("장비 상태 모니터 채널 ID가 없어. DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘")
         return False
 
-    alertable_fingerprints, updated_alerts = _collect_device_health_monitor_alert_updates(
+    alertable_fingerprints, updated_alerts, updated_pending_alerts = _collect_device_health_monitor_alert_updates(
         report_summary,
         state,
         now=local_now,
@@ -1845,6 +1954,7 @@ def _run_device_health_monitor_once(
         report_summary,
         now=local_now,
         alert_fingerprints=updated_alerts,
+        pending_alert_fingerprints=updated_pending_alerts,
     )
     _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
     _log_device_health_monitor_run_events(

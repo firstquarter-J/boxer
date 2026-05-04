@@ -101,6 +101,35 @@ def _abnormal_summary() -> dict:
     }
 
 
+def _captureboard_abnormal_summary() -> dict:
+    summary = _abnormal_summary()
+    return {
+        **summary,
+        "deviceResults": [
+            {
+                **summary["deviceResults"][0],
+                "priorityReason": "캡처보드 이상",
+                "componentLabels": {
+                    "audio": "정상",
+                    "pm2": "정상",
+                    "storage": "정상",
+                    "captureboard": "이상",
+                    "led": "정상",
+                },
+                "statusPayload": {
+                    "overview": {
+                        "captureboard": {
+                            "status": "fail",
+                            "label": "이상",
+                            "summary": "캡처보드 USB나 비디오 장치를 찾지 못했어",
+                        }
+                    }
+                },
+            }
+        ],
+    }
+
+
 class DeviceHealthMonitorReporterTests(unittest.TestCase):
     def setUp(self) -> None:
         with reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK:
@@ -146,6 +175,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 "nextHospitalSeq": None,
                 "processedHospitalSeqs": [],
                 "alertFingerprints": {},
+                "pendingAlertFingerprints": {},
                 "sshTunnelRecords": {},
                 "deviceCandidateCache": [],
                 "deviceCandidateCachedAt": "",
@@ -231,6 +261,160 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary"],
         )
+
+    def test_retains_recent_alert_when_issue_temporarily_disappears(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        fingerprint = (
+            "#69 수지미래산부인과의원(용인)|1진료실|"
+            "MB2-C00043|LED USB 장치를 찾지 못했어"
+        )
+        previous_alert_at = (local_now - timedelta(minutes=2)).isoformat()
+        previous_state = {
+            "alertFingerprints": {
+                fingerprint: {
+                    "firstAlertedAt": previous_alert_at,
+                    "lastAlertedAt": previous_alert_at,
+                    "lastSeenAt": previous_alert_at,
+                    "count": 1,
+                }
+            }
+        }
+        normal_summary = {
+            **_abnormal_summary(),
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "deviceResults": [],
+        }
+
+        with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6):
+            alertable, retained_alerts, retained_pending = reporter._collect_device_health_monitor_alert_updates(
+                normal_summary,
+                previous_state,
+                now=local_now,
+            )
+            reappeared_alertable, reappeared_alerts, reappeared_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _abnormal_summary(),
+                    {
+                        "alertFingerprints": retained_alerts,
+                        "pendingAlertFingerprints": retained_pending,
+                    },
+                    now=local_now + timedelta(minutes=1),
+                )
+            )
+
+        self.assertEqual(alertable, set())
+        self.assertIn(fingerprint, retained_alerts)
+        self.assertEqual(retained_pending, {})
+        self.assertEqual(retained_alerts[fingerprint]["lastAlertedAt"], previous_alert_at)
+        self.assertEqual(reappeared_alertable, set())
+        self.assertEqual(reappeared_pending, {})
+        self.assertEqual(reappeared_alerts[fingerprint]["lastAlertedAt"], previous_alert_at)
+        self.assertEqual(reappeared_alerts[fingerprint]["count"], 2)
+
+    def test_prunes_inactive_alert_after_reminder_window(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        fingerprint = (
+            "#69 수지미래산부인과의원(용인)|1진료실|"
+            "MB2-C00043|LED USB 장치를 찾지 못했어"
+        )
+        previous_alert_at = (local_now - timedelta(hours=7)).isoformat()
+        normal_summary = {
+            **_abnormal_summary(),
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "deviceResults": [],
+        }
+
+        with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6):
+            alertable, retained_alerts, retained_pending = reporter._collect_device_health_monitor_alert_updates(
+                normal_summary,
+                {
+                    "alertFingerprints": {
+                        fingerprint: {
+                            "firstAlertedAt": previous_alert_at,
+                            "lastAlertedAt": previous_alert_at,
+                            "lastSeenAt": previous_alert_at,
+                            "count": 1,
+                        }
+                    }
+                },
+                now=local_now,
+            )
+
+        self.assertEqual(alertable, set())
+        self.assertNotIn(fingerprint, retained_alerts)
+        self.assertEqual(retained_pending, {})
+
+    def test_requires_two_consecutive_captureboard_failures_before_alert(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        fingerprint = (
+            "#69 수지미래산부인과의원(용인)|1진료실|"
+            "MB2-C00043|캡처보드 USB나 비디오 장치를 찾지 못했어"
+        )
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CAPTUREBOARD_ALERT_CONFIRMATION_POLLS", 2),
+        ):
+            first_alertable, first_alerts, first_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _captureboard_abnormal_summary(),
+                    {},
+                    now=local_now,
+                )
+            )
+            second_alertable, second_alerts, second_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _captureboard_abnormal_summary(),
+                    {
+                        "alertFingerprints": first_alerts,
+                        "pendingAlertFingerprints": first_pending,
+                    },
+                    now=local_now + timedelta(minutes=1),
+                )
+            )
+
+        self.assertEqual(first_alertable, set())
+        self.assertEqual(first_alerts, {})
+        self.assertEqual(first_pending[fingerprint]["count"], 1)
+        self.assertEqual(second_alertable, {fingerprint})
+        self.assertIn(fingerprint, second_alerts)
+        self.assertEqual(second_alerts[fingerprint]["lastAlertedAt"], (local_now + timedelta(minutes=1)).isoformat())
+        self.assertEqual(second_pending, {})
+
+    def test_drops_pending_captureboard_failure_when_next_poll_is_normal(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        normal_summary = {
+            **_captureboard_abnormal_summary(),
+            "statusCounts": {"정상": 1, "확인 필요": 0, "이상": 0, "점검 불가": 0},
+            "deviceResults": [],
+        }
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CAPTUREBOARD_ALERT_CONFIRMATION_POLLS", 2),
+        ):
+            first_alertable, first_alerts, first_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _captureboard_abnormal_summary(),
+                    {},
+                    now=local_now,
+                )
+            )
+            second_alertable, second_alerts, second_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    normal_summary,
+                    {
+                        "alertFingerprints": first_alerts,
+                        "pendingAlertFingerprints": first_pending,
+                    },
+                    now=local_now + timedelta(minutes=1),
+                )
+            )
+
+        self.assertEqual(first_alertable, set())
+        self.assertEqual(second_alertable, set())
+        self.assertEqual(second_alerts, {})
+        self.assertEqual(second_pending, {})
 
     def test_appends_device_health_monitor_event_log_jsonl(self) -> None:
         logger = logging.getLogger("test.device_health_monitor")
@@ -699,6 +883,32 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(summary["statusCounts"]["점검 불가"], 1)
         self.assertEqual(summary["deviceResults"][0]["overallLabel"], "점검 불가")
         self.assertEqual(reporter._collect_daily_device_round_abnormal_alert_items(summary), [])
+
+    def test_redis_captureboard_status_none_is_ignored_when_usb_list_confirms_captureboard(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        issues = reporter._collect_device_health_monitor_redis_issues(
+            device_context={"deviceName": "MB2-C00544"},
+            device_state={
+                "captureBoardStatus": "none",
+                "captureBoardType": "YUH01",
+                "updatedAt": local_now.isoformat(),
+                "acme": {
+                    "usbList": [
+                        {"deviceId": "1a86:7523", "name": "마미톡 LED", "type": "LED"},
+                        {
+                            "alias": "YUH01",
+                            "deviceId": "1164:f57a",
+                            "name": "신캡 (유안 캡처보드)",
+                            "type": "CAPTUREBOARD",
+                        }
+                    ]
+                },
+            },
+            agent_state={"updatedAt": local_now.isoformat()},
+            now=local_now,
+        )
+
+        self.assertEqual([issue["component"] for issue in issues], [])
 
     def test_redis_led_candidate_uses_ssh_verification_before_alerting(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
