@@ -25,6 +25,9 @@ from boxer_company.routers.barcode_log import (
     _is_recordings_filter_query_request,
     _is_ultrasound_capture_filter_query_request,
 )
+from boxer_company.routers.recording_streaming_restore import (
+    _is_recording_streaming_restore_request,
+)
 from boxer_company.routers.box_db import (
     _query_devices_by_filters,
     _query_hospitals_by_filters,
@@ -47,6 +50,11 @@ class StructuredRoutesContext:
 def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if _is_recording_streaming_restore_request(question, barcode):
+        # 복원 요청은 "영상 + 연월" 형태라 구조화 영상 조회가 먼저 잡기 쉬워서
+        # 전용 MDA 복원 라우터까지 내려가게 한다.
+        return False
 
     try:
         structured_target_date, _ = _extract_optional_requested_date(question)

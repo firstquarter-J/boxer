@@ -73,6 +73,28 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertFalse(handled)
 
+    def test_structured_routes_skips_recording_streaming_restore_question(self) -> None:
+        replies: list[str] = []
+
+        with patch(
+            "boxer_company_adapter_slack.structured_routes._query_recordings_by_filters",
+            return_value="잘못된 영상 조회 응답",
+        ) as recordings_query_mock:
+            handled = _handle_structured_routes(
+                StructuredRoutesContext(
+                    question="35033165423 2024년 4월 영상 복원",
+                    barcode="35033165423",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                )
+            )
+
+        self.assertFalse(handled)
+        self.assertEqual(replies, [])
+        recordings_query_mock.assert_not_called()
+
     def test_barcode_query_routes_returns_false_for_unrelated_question(self) -> None:
         handled = _handle_barcode_query_routes(
             BarcodeQueryRoutesContext(

@@ -28,6 +28,13 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
             ),
             (2024, 4),
         )
+        # 운영자가 "복구"라고 요청해도 같은 스트리밍 종료 영상 복원으로 라우팅한다.
+        self.assertTrue(
+            recording_streaming_restore._is_recording_streaming_restore_request(
+                "35033165423 2024년 4월 영상 복구",
+                "35033165423",
+            )
+        )
         self.assertEqual(
             recording_streaming_restore._extract_recording_streaming_restore_month(
                 "35033165423 2024-04 영상 복원"

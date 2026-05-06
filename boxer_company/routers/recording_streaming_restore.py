@@ -40,8 +40,9 @@ _YEAR_MONTH_PATTERN = re.compile(
     r"(20\d{2})\s*(?:년|[-./])\s*(0?[1-9]|1[0-2])\s*(?:월)?"
 )
 _COMPACT_YEAR_MONTH_PATTERN = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)")
+# 운영 요청에서는 복원/복구/블라인드 해제를 같은 MDA 복원 의도로 본다.
 _STREAMING_RESTORE_ACTION_PATTERN = re.compile(
-    r"(스트리밍\s*종료.*(?:복원|해제|원복)|복원|원복|"
+    r"(스트리밍\s*종료.*(?:복원|복구|해제|원복)|복원|복구|원복|"
     r"블라인드(?:를|을)?\s*해제|숨김(?:을|를)?\s*해제|unblind|reveal|"
     r"공개\s*(?:처리|전환|해줘|해|시켜)|노출\s*(?:처리|전환|해줘|해|시켜|가능))",
     re.IGNORECASE,
