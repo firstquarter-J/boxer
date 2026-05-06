@@ -390,10 +390,6 @@ def _format_recording_streaming_restore_result(result: RecordingStreamingRestore
         f"• 바코드: `{result.barcode}`",
         f"• 대상 월(KST): `{target_month_label}`",
         f"• DB 대상 recordings: `{result.db_target_count}개`",
-        f"• MDA 후보: 대상 `{result.mda_candidate_count}개`, "
-        f"복원 가능 `{result.restorable_count}개`",
-        f"• MDA 실행: 요청 `{result.requested_count}개`, "
-        f"성공 `{result.restored_count}개`, 실패 `{result.failed_count}개`",
         status_line,
     ]
     if result.hospitals:
@@ -401,8 +397,7 @@ def _format_recording_streaming_restore_result(result: RecordingStreamingRestore
         for hospital in result.hospitals[:5]:
             lines.append(
                 f"  - `{hospital.hospital_name}` `#{hospital.hospital_seq}` | "
-                f"DB `{hospital.db_target_count}개`, "
-                f"MDA 후보 `{hospital.mda_candidate_count}개`, "
+                f"대상 `{hospital.db_target_count}개`, "
                 f"복원 가능 `{hospital.restorable_count}개`"
             )
     if result.message:

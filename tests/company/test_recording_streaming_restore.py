@@ -2,6 +2,10 @@ import unittest
 from unittest.mock import patch
 
 from boxer_company.routers import recording_streaming_restore
+from boxer_company.routers.recording_streaming_restore import (
+    RecordingStreamingRestoreResult,
+    _StreamingRestoreHospitalSummary,
+)
 
 
 class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
@@ -169,6 +173,38 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
 
         self.assertEqual(target_year, 2024)
         self.assertEqual([row["seq"] for row in target_rows], [101])
+
+    def test_formats_restore_result_without_internal_mda_metrics(self) -> None:
+        result = RecordingStreamingRestoreResult(
+            barcode="35033165423",
+            target_year=2024,
+            target_month=4,
+            db_target_count=2,
+            mda_candidate_count=2,
+            restorable_count=2,
+            requested_count=2,
+            restored_count=2,
+            failed_count=0,
+            message="복원 2건, 실패 0건",
+            failed_items=[],
+            hospitals=[
+                _StreamingRestoreHospitalSummary(
+                    hospital_seq=53,
+                    hospital_name="미래산부인과(춘천)",
+                    db_target_count=2,
+                    mda_candidate_count=2,
+                    restorable_count=2,
+                )
+            ],
+        )
+
+        text = recording_streaming_restore._format_recording_streaming_restore_result(result)
+
+        self.assertIn("• 결과: *복원 완료* (`2개`)", text)
+        self.assertIn("• DB 대상 recordings: `2개`", text)
+        self.assertIn("대상 `2개`, 복원 가능 `2개`", text)
+        self.assertNotIn("MDA 후보", text)
+        self.assertNotIn("MDA 실행", text)
 
 
 if __name__ == "__main__":
