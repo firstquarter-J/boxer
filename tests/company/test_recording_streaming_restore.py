@@ -8,6 +8,21 @@ from boxer_company.routers.recording_streaming_restore import (
 )
 
 
+class _FakeS3Client:
+    def __init__(self, head_response: dict[str, object]) -> None:
+        self.head_response = head_response
+        self.head_calls: list[dict[str, object]] = []
+        self.restore_calls: list[dict[str, object]] = []
+
+    def head_object(self, **kwargs: object) -> dict[str, object]:
+        self.head_calls.append(kwargs)
+        return self.head_response
+
+    def restore_object(self, **kwargs: object) -> dict[str, object]:
+        self.restore_calls.append(kwargs)
+        return {}
+
+
 class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
     def test_detects_streaming_restore_request_and_year_month(self) -> None:
         question = "35033165423 2024년 4월 영상 블라인드를 해제해줘"
@@ -120,6 +135,7 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
             patch(
                 "boxer_company.routers.recording_streaming_restore._restore_mda_stopped_recordings",
                 return_value={
+                    "status": True,
                     "requestedCount": 1,
                     "restoredCount": 1,
                     "failedCount": 0,
@@ -150,6 +166,133 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
         self.assertEqual(restore_kwargs["recording_seqs"], [101])
         self.assertIn("requester=U123", restore_kwargs["reason"])
         self.assertIn("requesterName=Rosa", restore_kwargs["reason"])
+
+    def test_requests_s3_archive_restore_for_archived_restored_recordings(self) -> None:
+        target_rows = [
+            {
+                "seq": 101,
+                "hospitalSeq": 53,
+                "hospitalName": "미래산부인과(춘천)",
+                "fileId": "a",
+                "s3Bucket": "ultrasound-prod-kr",
+                "s3FileKey": "0000/01/01/a.mp4",
+                "recordedAt": "2024-04-12T01:45:44.000Z",
+            },
+        ]
+        candidates = [
+            {
+                "seq": 101,
+                "recordedAt": "2024-04-12T01:45:44.000Z",
+                "restorable": True,
+                "fileId": "a",
+                "expectedS3FileKey": "35033165423/a.mp4",
+            },
+        ]
+        fake_s3 = _FakeS3Client({"StorageClass": "DEEP_ARCHIVE"})
+
+        with (
+            patch(
+                "boxer_company.routers.recording_streaming_restore._load_recording_streaming_restore_targets",
+                return_value=(2024, target_rows),
+            ),
+            patch(
+                "boxer_company.routers.recording_streaming_restore."
+                "_get_mda_stopped_recording_restore_candidates",
+                return_value=candidates,
+            ),
+            patch(
+                "boxer_company.routers.recording_streaming_restore._restore_mda_stopped_recordings",
+                return_value={
+                    "status": True,
+                    "requestedCount": 1,
+                    "restoredCount": 1,
+                    "failedCount": 0,
+                    "message": "복원 1건, 실패 0건",
+                    "failedItems": [],
+                },
+            ),
+            patch(
+                "boxer_company.routers.recording_streaming_restore._build_s3_client",
+                return_value=fake_s3,
+            ),
+        ):
+            result = recording_streaming_restore._restore_streaming_stopped_recordings_by_barcode_month(
+                "35033165423",
+                requested_year=2024,
+                requested_month=4,
+                requester="U123",
+            )
+
+        self.assertEqual(result.s3_restore_requested_count, 1)
+        self.assertEqual(result.s3_restore_failed_count, 0)
+        self.assertEqual(fake_s3.head_calls[0]["Bucket"], "ultrasound-prod-kr")
+        self.assertEqual(fake_s3.head_calls[0]["Key"], "35033165423/a.mp4")
+        self.assertEqual(fake_s3.restore_calls[0]["RestoreRequest"]["Days"], 7)
+
+        text = recording_streaming_restore._format_recording_streaming_restore_result(result)
+
+        self.assertIn("• S3 장기보관 복원: 요청 `1개`", text)
+        self.assertIn("S3 복원은 비동기", text)
+
+    def test_treats_mda_status_false_as_restore_failure(self) -> None:
+        target_rows = [
+            {
+                "seq": 101,
+                "hospitalSeq": 53,
+                "hospitalName": "미래산부인과(춘천)",
+                "recordedAt": "2024-04-12T01:45:44.000Z",
+            },
+            {
+                "seq": 102,
+                "hospitalSeq": 53,
+                "hospitalName": "미래산부인과(춘천)",
+                "recordedAt": "2024-04-13T01:45:44.000Z",
+            },
+        ]
+        candidates = [
+            {"seq": 101, "recordedAt": "2024-04-12T01:45:44.000Z", "restorable": True},
+            {"seq": 102, "recordedAt": "2024-04-13T01:45:44.000Z", "restorable": True},
+        ]
+
+        with (
+            patch(
+                "boxer_company.routers.recording_streaming_restore._load_recording_streaming_restore_targets",
+                return_value=(2024, target_rows),
+            ),
+            patch(
+                "boxer_company.routers.recording_streaming_restore."
+                "_get_mda_stopped_recording_restore_candidates",
+                return_value=candidates,
+            ),
+            patch(
+                "boxer_company.routers.recording_streaming_restore._restore_mda_stopped_recordings",
+                return_value={
+                    "status": False,
+                    "requestedCount": 2,
+                    "restoredCount": 2,
+                    "failedCount": 0,
+                    "message": "Cannot update entity because entity id is not set in the entity.",
+                    "failedItems": [],
+                },
+            ),
+        ):
+            result = recording_streaming_restore._restore_streaming_stopped_recordings_by_barcode_month(
+                "35033165423",
+                requested_year=2024,
+                requested_month=4,
+                requester="U123",
+            )
+
+        self.assertEqual(result.requested_count, 2)
+        self.assertEqual(result.restored_count, 0)
+        self.assertEqual(result.failed_count, 2)
+        self.assertEqual(len(result.failed_items), 2)
+
+        text = recording_streaming_restore._format_recording_streaming_restore_result(result)
+
+        self.assertIn("• 결과: *복원 실패* (`2개`)", text)
+        self.assertIn("Cannot update entity", text)
+        self.assertNotIn("복원 완료", text)
 
     def test_rejects_when_target_recordings_have_no_hospital_seq(self) -> None:
         target_rows = [

@@ -1,10 +1,11 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _create_db_connection
+from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.routers.box_db import _local_zone
 from boxer_company.routers.mda_graphql import (
     _get_mda_stopped_recording_restore_candidates,
@@ -35,6 +36,11 @@ class RecordingStreamingRestoreResult:
     message: str
     failed_items: list[dict[str, Any]]
     hospitals: list[_StreamingRestoreHospitalSummary]
+    s3_restore_requested_count: int = 0
+    s3_restore_already_in_progress_count: int = 0
+    s3_restore_already_restored_count: int = 0
+    s3_restore_failed_count: int = 0
+    s3_restore_items: list[dict[str, Any]] = field(default_factory=list)
 
 _YEAR_MONTH_PATTERN = re.compile(
     r"(20\d{2})\s*(?:"
@@ -54,6 +60,10 @@ _RECORDING_MEDIA_PATTERN = re.compile(
     r"(영상|동영상|녹화|recording|recordings|ultrasound)",
     re.IGNORECASE,
 )
+_S3_ARCHIVE_STORAGE_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
+_S3_ARCHIVE_STATUSES = {"ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"}
+_S3_RESTORE_DAYS = 7
+_S3_RESTORE_TIER = "Standard"
 
 
 def _is_recording_streaming_restore_request(question: str, barcode: str | None) -> bool:
@@ -171,6 +181,9 @@ def _query_recording_streaming_restore_rows(
                 "r.seq, "
                 "r.hospitalSeq, "
                 "h.hospitalName AS hospitalName, "
+                "r.fileId, "
+                "r.s3Bucket, "
+                "r.s3FileKey, "
                 "r.recordedAt, "
                 "r.createdAt "
                 "FROM recordings r "
@@ -233,6 +246,154 @@ def _row_hospital_seq(row: dict[str, Any]) -> int | None:
 
 def _row_hospital_name(row: dict[str, Any]) -> str:
     return str(row.get("hospitalName") or "미확인").strip() or "미확인"
+
+
+def _aws_error_code(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return ""
+    error = response.get("Error")
+    if not isinstance(error, dict):
+        return ""
+    return str(error.get("Code") or "").strip()
+
+
+def _s3_restore_ongoing(restore_header: Any) -> bool | None:
+    normalized = str(restore_header or "").strip().lower()
+    if 'ongoing-request="true"' in normalized:
+        return True
+    if 'ongoing-request="false"' in normalized:
+        return False
+    return None
+
+
+def _is_s3_archive_restore_needed(head_response: dict[str, Any]) -> bool:
+    storage_class = str(head_response.get("StorageClass") or "STANDARD").strip().upper()
+    archive_status = str(head_response.get("ArchiveStatus") or "").strip().upper()
+    return storage_class in _S3_ARCHIVE_STORAGE_CLASSES or archive_status in _S3_ARCHIVE_STATUSES
+
+
+def _request_s3_archive_restore(
+    *,
+    s3_client: Any,
+    recording_seq: int,
+    bucket: str,
+    key: str,
+) -> dict[str, Any]:
+    base_item: dict[str, Any] = {
+        "seq": recording_seq,
+        "bucket": bucket,
+        "key": key,
+        "storageClass": "",
+        "archiveStatus": "",
+        "status": "",
+        "message": "",
+    }
+    try:
+        head_response = s3_client.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        return {
+            **base_item,
+            "status": "failed",
+            "message": _aws_error_code(exc) or str(exc),
+        }
+
+    storage_class = str(head_response.get("StorageClass") or "STANDARD").strip().upper()
+    archive_status = str(head_response.get("ArchiveStatus") or "").strip().upper()
+    restore_state = _s3_restore_ongoing(head_response.get("Restore"))
+    base_item = {
+        **base_item,
+        "storageClass": storage_class,
+        "archiveStatus": archive_status,
+    }
+
+    if restore_state is False:
+        return {**base_item, "status": "already_restored", "message": "S3 복원 완료 상태"}
+    if restore_state is True:
+        return {**base_item, "status": "already_in_progress", "message": "S3 복원 진행 중"}
+    if not _is_s3_archive_restore_needed(head_response):
+        return {**base_item, "status": "not_needed", "message": "장기보관 복원 불필요"}
+
+    # S3 보관 복원은 비동기 작업이라 요청 성공 이후에도 재생 가능 상태까지 시간이 걸린다.
+    try:
+        s3_client.restore_object(
+            Bucket=bucket,
+            Key=key,
+            RestoreRequest={
+                "Days": _S3_RESTORE_DAYS,
+                "GlacierJobParameters": {"Tier": _S3_RESTORE_TIER},
+            },
+        )
+    except Exception as exc:
+        if _aws_error_code(exc) == "RestoreAlreadyInProgress":
+            return {**base_item, "status": "already_in_progress", "message": "S3 복원 진행 중"}
+        return {
+            **base_item,
+            "status": "failed",
+            "message": _aws_error_code(exc) or str(exc),
+        }
+
+    return {**base_item, "status": "requested", "message": "S3 장기보관 복원 요청됨"}
+
+
+def _recording_s3_restore_target(
+    *,
+    row: dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[str, str] | None:
+    bucket = str(row.get("s3Bucket") or s.S3_ULTRASOUND_BUCKET or "").strip()
+    key = str(candidate.get("expectedS3FileKey") or row.get("s3FileKey") or "").strip()
+    if not bucket or not key:
+        return None
+    return bucket, key
+
+
+def _request_s3_archive_restores_for_recordings(
+    *,
+    rows_by_seq: dict[int, dict[str, Any]],
+    candidates_by_seq: dict[int, dict[str, Any]],
+    restored_seqs: list[int],
+) -> list[dict[str, Any]]:
+    targets: list[tuple[int, str, str]] = []
+    for seq in restored_seqs:
+        row = rows_by_seq.get(seq)
+        candidate = candidates_by_seq.get(seq)
+        if not row or not candidate:
+            continue
+        target = _recording_s3_restore_target(row=row, candidate=candidate)
+        if target is None:
+            continue
+        bucket, key = target
+        targets.append((seq, bucket, key))
+    if not targets:
+        return []
+
+    try:
+        s3_client = _build_s3_client()
+    except Exception as exc:
+        message = _aws_error_code(exc) or str(exc)
+        return [
+            {
+                "seq": seq,
+                "bucket": bucket,
+                "key": key,
+                "storageClass": "",
+                "archiveStatus": "",
+                "status": "failed",
+                "message": message,
+            }
+            for seq, bucket, key in targets
+        ]
+
+    return [
+        _request_s3_archive_restore(
+            s3_client=s3_client,
+            recording_seq=seq,
+            bucket=bucket,
+            key=key,
+        )
+        for seq, bucket, key in targets
+    ]
 
 
 def _group_recording_rows_by_hospital(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -302,10 +463,16 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
     total_restored_count = 0
     total_failed_count = 0
     failed_items: list[dict[str, Any]] = []
+    s3_restore_items: list[dict[str, Any]] = []
     messages: list[str] = []
 
     for hospital_seq, group in sorted(hospital_groups.items()):
         target_recording_seqs = set(group["recordingSeqs"])
+        rows_by_seq = {
+            seq: row
+            for row in group["rows"]
+            if (seq := _row_seq(row)) in target_recording_seqs
+        }
         candidates = _get_mda_stopped_recording_restore_candidates(normalized_barcode, hospital_seq)
         candidate_by_seq = {
             seq: candidate
@@ -348,10 +515,48 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
                 requester_name=requester_name,
             ),
         )
-        total_requested_count += int(mda_result.get("requestedCount") or 0)
-        total_restored_count += int(mda_result.get("restoredCount") or 0)
-        total_failed_count += int(mda_result.get("failedCount") or 0)
         message = str(mda_result.get("message") or "").strip()
+        mda_status = bool(mda_result.get("status"))
+        requested_count = int(mda_result.get("requestedCount") or len(restorable_seqs))
+        restored_count = int(mda_result.get("restoredCount") or 0)
+        failed_count = int(mda_result.get("failedCount") or 0)
+        failed_item_seqs = {
+            seq
+            for item in mda_result.get("failedItems") or []
+            if (seq := _candidate_seq(item)) is not None
+        }
+
+        total_requested_count += requested_count
+        if mda_status:
+            total_restored_count += restored_count
+            total_failed_count += failed_count
+            # MDA 응답에는 성공 seq 목록이 없으므로 failedItems를 제외하고 restoredCount까지만 S3 복원 대상으로 본다.
+            restored_seqs = [seq for seq in restorable_seqs if seq not in failed_item_seqs][
+                : max(restored_count, 0)
+            ]
+            s3_restore_items.extend(
+                _request_s3_archive_restores_for_recordings(
+                    rows_by_seq=rows_by_seq,
+                    candidates_by_seq=candidate_by_seq,
+                    restored_seqs=restored_seqs,
+                )
+            )
+        else:
+            # MDA가 transaction 중 예외를 반환하면 restoredCount가 남아도 실제 반영은 롤백될 수 있다.
+            # status=false일 때는 성공 카운트를 믿지 않고 요청 건을 실패로 집계한다.
+            fallback_failed_count = requested_count or len(restorable_seqs)
+            total_failed_count += fallback_failed_count
+            if not mda_result.get("failedItems"):
+                for seq in restorable_seqs:
+                    failed_items.append(
+                        {
+                            "seq": seq,
+                            "fileId": "",
+                            "reason": message or "MDA 복원 status=false",
+                            "hospitalSeq": hospital_seq,
+                            "hospitalName": group.get("hospitalName") or "미확인",
+                        }
+                    )
         if message:
             messages.append(f"#{hospital_seq}: {message}")
         for item in mda_result.get("failedItems") or []:
@@ -373,6 +578,19 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
         message=" / ".join(messages),
         failed_items=failed_items,
         hospitals=hospital_summaries,
+        s3_restore_requested_count=sum(
+            1 for item in s3_restore_items if item.get("status") == "requested"
+        ),
+        s3_restore_already_in_progress_count=sum(
+            1 for item in s3_restore_items if item.get("status") == "already_in_progress"
+        ),
+        s3_restore_already_restored_count=sum(
+            1 for item in s3_restore_items if item.get("status") == "already_restored"
+        ),
+        s3_restore_failed_count=sum(
+            1 for item in s3_restore_items if item.get("status") == "failed"
+        ),
+        s3_restore_items=s3_restore_items,
     )
 
 
@@ -385,6 +603,8 @@ def _format_recording_streaming_restore_result(result: RecordingStreamingRestore
         )
     elif result.restored_count > 0:
         status_line = f"• 결과: *복원 완료* (`{result.restored_count}개`)"
+    elif result.failed_count > 0:
+        status_line = f"• 결과: *복원 실패* (`{result.failed_count}개`)"
     elif result.restorable_count <= 0:
         status_line = "• 결과: 복원 가능한 영상이 없어"
     else:
@@ -407,6 +627,32 @@ def _format_recording_streaming_restore_result(result: RecordingStreamingRestore
             )
     if result.message:
         lines.append(f"• MDA 메시지: `{result.message}`")
+    s3_visible_items = [
+        item
+        for item in result.s3_restore_items
+        if item.get("status") and item.get("status") != "not_needed"
+    ]
+    if s3_visible_items:
+        lines.append(
+            "• S3 장기보관 복원: "
+            f"요청 `{result.s3_restore_requested_count}개`, "
+            f"진행 중 `{result.s3_restore_already_in_progress_count}개`, "
+            f"이미 복원됨 `{result.s3_restore_already_restored_count}개`, "
+            f"실패 `{result.s3_restore_failed_count}개`"
+        )
+        if result.s3_restore_requested_count or result.s3_restore_already_in_progress_count:
+            lines.append("• 안내: S3 복원은 비동기라 완료 전까지 재생이 안 될 수 있어")
+        if result.s3_restore_failed_count:
+            lines.append("• S3 복원 실패 항목:")
+            failed_s3_items = [
+                entry for entry in s3_visible_items if entry.get("status") == "failed"
+            ]
+            for item in failed_s3_items[:5]:
+                lines.append(
+                    f"  - recordingSeq `{item.get('seq')}` | "
+                    f"`{item.get('storageClass') or '미확인'}` | "
+                    f"`{item.get('message') or '미확인'}`"
+                )
     if result.failed_items:
         lines.append("• 실패 항목:")
         for item in result.failed_items[:5]:
