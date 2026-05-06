@@ -79,6 +79,10 @@ from boxer_company.routers.device_update import (
     _request_device_power_off,
 )
 from boxer_company.routers.mda_graphql import _send_mda_device_command
+from boxer_company.routers.recording_streaming_restore import (
+    _extract_recording_streaming_restore_month,
+    _is_recording_streaming_restore_request,
+)
 from boxer_company_adapter_slack.device_activity import (
     _collect_device_download_records,
     _log_device_download_activity,
@@ -153,6 +157,17 @@ def _handle_device_routes(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if _is_recording_streaming_restore_request(question, barcode):
+        try:
+            _extract_recording_streaming_restore_month(question)
+        except ValueError:
+            pass
+        else:
+            # 월 단위 MDA 복원 요청은 "영상 복구" 문구 때문에 장비 파일 복구로
+            # 오인되기 쉬워서 전용 복원 라우터가 처리하도록 내려보낸다.
+            return False
+
     structured_device_name = _extract_device_name_scope(question)
     log_upload_device_name = _extract_device_name_for_log_upload(question) or structured_device_name
     log_upload_hospital_name, log_upload_room_name = _extract_hospital_room_scope_for_log_upload(question)

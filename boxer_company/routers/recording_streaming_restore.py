@@ -37,7 +37,10 @@ class RecordingStreamingRestoreResult:
     hospitals: list[_StreamingRestoreHospitalSummary]
 
 _YEAR_MONTH_PATTERN = re.compile(
-    r"(20\d{2})\s*(?:년|[-./])\s*(0?[1-9]|1[0-2])\s*(?:월)?"
+    r"(20\d{2})\s*(?:"
+    r"년\s*(0?[1-9]|1[0-2])(?:\s*월(?!\s*(?:[0-3]?\d\s*일|\d))|(?!\s*(?:월|일|[0-3]?\d\s*일|\d)))"
+    r"|[-./]\s*(0?[1-9]|1[0-2])(?!\s*(?:[-./]\s*\d{1,2}|\d))"
+    r")"
 )
 _COMPACT_YEAR_MONTH_PATTERN = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)")
 # 운영 요청에서는 복원/복구/블라인드 해제를 같은 MDA 복원 의도로 본다.
@@ -67,7 +70,8 @@ def _extract_recording_streaming_restore_month(question: str) -> tuple[int, int]
     normalized = question or ""
     year_month_match = _YEAR_MONTH_PATTERN.search(normalized)
     if year_month_match:
-        return int(year_month_match.group(1)), int(year_month_match.group(2))
+        month_text = year_month_match.group(2) or year_month_match.group(3)
+        return int(year_month_match.group(1)), int(month_text)
 
     compact_match = _COMPACT_YEAR_MONTH_PATTERN.search(normalized)
     if compact_match:

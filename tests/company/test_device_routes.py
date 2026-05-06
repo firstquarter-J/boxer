@@ -22,6 +22,42 @@ def _payload() -> dict[str, object]:
 
 
 class DeviceRouteHandlerTests(unittest.TestCase):
+    def test_monthly_streaming_restore_request_bypasses_device_recovery(self) -> None:
+        replies: list[str] = []
+
+        deps = DeviceRoutesDeps(
+            get_s3_client=lambda: self.fail("device file lookup should not handle monthly restore"),
+            get_recordings_context=lambda: self.fail(
+                "recordings lookup should not handle monthly restore"
+            ),
+            has_recordings_device_mapping=lambda context: False,
+            send_dm_message=lambda user_id, text: False,
+            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+        )
+
+        # 월 단위 MDA 복원은 "영상 복구" 문구가 있어도 장비 파일 복구 라우터가 선점하지 않는다.
+        handled = _handle_device_routes(
+            DeviceRoutesContext(
+                question="35033165423 2024년 4월 영상 복구",
+                barcode="35033165423",
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                payload=_payload(),  # type: ignore[arg-type]
+                user_id="U123",
+                workspace_id="W123",
+                channel_id="C123",
+                thread_ts="1.0",
+                reply=lambda text, **kwargs: replies.append(text),
+                client=None,
+                logger=logging.getLogger(__name__),
+            ),
+            deps,
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(replies, [])
+
     def test_download_without_barcode_asks_for_barcode_before_lookup(self) -> None:
         replies: list[str] = []
 

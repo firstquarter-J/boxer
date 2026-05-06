@@ -212,32 +212,36 @@ class RouteModulesSmokeTests(unittest.TestCase):
         replies: list[str] = []
         synth_calls: list[tuple[str, dict[str, object], str]] = []
 
-        handled = _handle_device_routes(
-            DeviceRoutesContext(
-                question="LED 증상은 어떨 때 나타나?",
-                barcode=None,
-                phase2_hospital_name=None,
-                phase2_room_name=None,
-                payload=_payload(),  # type: ignore[arg-type]
-                user_id="U123",
-                workspace_id="W123",
-                channel_id="C123",
-                thread_ts="1.0",
-                reply=lambda text, **kwargs: replies.append(text),
-                client=None,
-                logger=logging.getLogger(__name__),
-            ),
-            DeviceRoutesDeps(
-                get_s3_client=lambda: None,
-                get_recordings_context=lambda: {},
-                has_recordings_device_mapping=lambda context: False,
-                send_dm_message=lambda user_id, text: False,
-                build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-                reply_with_retrieval_synthesis=lambda fallback_text, evidence_payload, route_name, **kwargs: synth_calls.append(
-                    (fallback_text, evidence_payload, route_name)
+        with patch(
+            "boxer_company_adapter_slack.device_routes._select_notion_references",
+            return_value=[{"title": "LED playbook"}],
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="LED 증상은 어떨 때 나타나?",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
                 ),
-            ),
-        )
+                DeviceRoutesDeps(
+                    get_s3_client=lambda: None,
+                    get_recordings_context=lambda: {},
+                    has_recordings_device_mapping=lambda context: False,
+                    send_dm_message=lambda user_id, text: False,
+                    build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+                    reply_with_retrieval_synthesis=lambda fallback_text, evidence_payload, route_name, **kwargs: synth_calls.append(
+                        (fallback_text, evidence_payload, route_name)
+                    ),
+                ),
+            )
 
         self.assertTrue(handled)
         self.assertEqual(replies, [])

@@ -60,6 +60,16 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
                 "12024041234 영상 복원"
             )
 
+    def test_does_not_parse_full_date_as_restore_month(self) -> None:
+        with self.assertRaises(ValueError):
+            recording_streaming_restore._extract_recording_streaming_restore_month(
+                "35033165423 2024-04-18 영상 복구"
+            )
+        with self.assertRaises(ValueError):
+            recording_streaming_restore._extract_recording_streaming_restore_month(
+                "35033165423 2024년 4월 18일 영상 복구"
+            )
+
     def test_restores_only_target_month_recording_seqs_from_db(self) -> None:
         target_rows = [
             {
