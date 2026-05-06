@@ -118,6 +118,46 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(replies, ["*바코드 유효성 검사 확인*\n• 결론: 테스트"])
 
+    def test_barcode_query_routes_handles_recording_streaming_restore_request(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.barcode_query_routes.cs.RECORDING_STREAMING_RESTORE_ENABLED", True),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes.cs.RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS",
+                {"U123"},
+            ),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes._query_recording_streaming_restore_by_barcode_month",
+                return_value="*스트리밍 종료 영상 복원 결과*\n• 결과: 테스트",
+            ) as restore_mock,
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question="35033165423 2024년 4월 영상 블라인드를 해제해줘",
+                    barcode="35033165423",
+                    user_id="U123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=lambda evidence, context: None,
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    resolve_user_name=lambda user_id: "Rosa",
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*스트리밍 종료 영상 복원 결과*\n• 결과: 테스트"])
+        restore_mock.assert_called_once_with(
+            "35033165423",
+            "35033165423 2024년 4월 영상 블라인드를 해제해줘",
+            requester="U123",
+            requester_name="Rosa",
+        )
+
     def test_device_routes_returns_false_for_unrelated_question(self) -> None:
         handled = _handle_device_routes(
             DeviceRoutesContext(

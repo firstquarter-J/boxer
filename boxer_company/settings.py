@@ -47,6 +47,20 @@ if _raw_request_log_query_ids.strip():
 else:
     REQUEST_LOG_QUERY_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
 
+RECORDING_STREAMING_RESTORE_ENABLED = (
+    os.getenv("RECORDING_STREAMING_RESTORE_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_raw_recording_streaming_restore_ids = os.getenv("RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS", "")
+if _raw_recording_streaming_restore_ids.strip():
+    RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS = {
+        item.strip()
+        for item in _raw_recording_streaming_restore_ids.split(",")
+        if item.strip()
+    }
+else:
+    RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
+
 APP_USER_API_URL = os.getenv("APP_USER_API_URL", "").strip()
 APP_USER_API_TIMEOUT_SEC = int(os.getenv("APP_USER_API_TIMEOUT_SEC", "8"))
 

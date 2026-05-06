@@ -822,6 +822,12 @@ def create_app() -> App:
                 get_recordings_context=_get_recordings_context,
                 attach_recordings_context_to_evidence=_attach_recordings_context_to_evidence,
                 reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
+                resolve_user_name=lambda target_user_id: _load_slack_user_name(
+                    client,
+                    workspace_id,
+                    target_user_id or "",
+                    logger,
+                ),
             ),
         ):
             return

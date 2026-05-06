@@ -142,6 +142,38 @@ query PaginatedSpecialBarcodes($listOptions: SpecialBarcodeListOptions) {
 }
 """
 
+_STOPPED_RECORDING_RESTORE_CANDIDATES_QUERY = """
+query StoppedRecordingRestoreCandidates($barcode: String!, $hospitalSeq: Int!) {
+  stoppedRecordingRestoreCandidates(barcode: $barcode, hospitalSeq: $hospitalSeq) {
+    seq
+    fullBarcode
+    fileId
+    recordedAt
+    currentS3FileKey
+    expectedS3FileKey
+    restorable
+    failureReason
+  }
+}
+"""
+
+_RESTORE_STOPPED_RECORDINGS_MUTATION = """
+mutation RestoreStoppedRecordings($input: RestoreStoppedRecordingsInput!) {
+  restoreStoppedRecordings(input: $input) {
+    status
+    message
+    requestedCount
+    restoredCount
+    failedCount
+    failedItems {
+      seq
+      fileId
+      reason
+    }
+  }
+}
+"""
+
 
 def _is_mda_graphql_configured() -> bool:
     return bool(cs.MDA_GRAPHQL_URL and cs.MDA_ADMIN_USER_PASSWORD)
@@ -475,6 +507,96 @@ def _lookup_mda_special_barcodes_by_barcode(barcode: str) -> list[dict[str, Any]
             }
         )
     return items
+
+
+def _get_mda_stopped_recording_restore_candidates(
+    barcode: str,
+    hospital_seq: int,
+) -> list[dict[str, Any]]:
+    normalized_barcode = str(barcode or "").strip()
+    if not normalized_barcode or int(hospital_seq or 0) <= 0:
+        return []
+
+    data = _execute_mda_graphql(
+        _STOPPED_RECORDING_RESTORE_CANDIDATES_QUERY,
+        {
+            "barcode": normalized_barcode,
+            "hospitalSeq": int(hospital_seq),
+        },
+    )
+    rows = data.get("stoppedRecordingRestoreCandidates")
+    if not isinstance(rows, list):
+        raise RuntimeError("stoppedRecordingRestoreCandidates 응답 형식이 올바르지 않아")
+
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        candidates.append(
+            {
+                "seq": row.get("seq"),
+                "fullBarcode": _display_value(row.get("fullBarcode"), default=""),
+                "fileId": _display_value(row.get("fileId"), default=""),
+                "recordedAt": row.get("recordedAt"),
+                "currentS3FileKey": _display_value(row.get("currentS3FileKey"), default=""),
+                "expectedS3FileKey": _display_value(row.get("expectedS3FileKey"), default=""),
+                "restorable": _normalize_mda_boolean(row.get("restorable")),
+                "failureReason": _display_value(row.get("failureReason"), default=""),
+            }
+        )
+    return candidates
+
+
+def _restore_mda_stopped_recordings(
+    *,
+    barcode: str,
+    hospital_seq: int,
+    recording_seqs: list[int],
+    reason: str,
+) -> dict[str, Any]:
+    normalized_barcode = str(barcode or "").strip()
+    normalized_reason = str(reason or "").strip()
+    normalized_seqs = [int(seq) for seq in recording_seqs if int(seq or 0) > 0]
+    if not normalized_barcode or int(hospital_seq or 0) <= 0 or not normalized_seqs:
+        raise RuntimeError("스트리밍 종료 영상 복원 입력이 부족해")
+    if not normalized_reason:
+        raise RuntimeError("스트리밍 종료 영상 복원 사유가 필요해")
+
+    data = _execute_mda_graphql(
+        _RESTORE_STOPPED_RECORDINGS_MUTATION,
+        {
+            "input": {
+                "barcode": normalized_barcode,
+                "hospitalSeq": int(hospital_seq),
+                "recordingSeqs": normalized_seqs,
+                "reason": normalized_reason,
+            }
+        },
+    )
+    result = data.get("restoreStoppedRecordings")
+    if not isinstance(result, dict):
+        raise RuntimeError("restoreStoppedRecordings 응답 형식이 올바르지 않아")
+
+    failed_items: list[dict[str, Any]] = []
+    for item in result.get("failedItems") or []:
+        if not isinstance(item, dict):
+            continue
+        failed_items.append(
+            {
+                "seq": item.get("seq"),
+                "fileId": _display_value(item.get("fileId"), default=""),
+                "reason": _display_value(item.get("reason"), default=""),
+            }
+        )
+
+    return {
+        "status": _normalize_mda_boolean(result.get("status")),
+        "message": _display_value(result.get("message"), default=""),
+        "requestedCount": int(result.get("requestedCount") or 0),
+        "restoredCount": int(result.get("restoredCount") or 0),
+        "failedCount": int(result.get("failedCount") or 0),
+        "failedItems": failed_items,
+    }
 
 
 def _open_mda_device_ssh(

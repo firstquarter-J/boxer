@@ -11,6 +11,10 @@ from boxer_company.routers.barcode_validation import (
     _is_barcode_validation_status_request,
     _query_barcode_validation_status,
 )
+from boxer_company.routers.recording_streaming_restore import (
+    _is_recording_streaming_restore_request,
+    _query_recording_streaming_restore_by_barcode_month,
+)
 from boxer_company.routers.barcode_log import (
     _extract_log_date,
     _extract_log_date_with_presence,
@@ -52,6 +56,7 @@ class BarcodeQueryRoutesDeps:
     get_recordings_context: Callable[[], dict[str, Any]]
     attach_recordings_context_to_evidence: Callable[[dict[str, Any], dict[str, Any]], None]
     reply_with_retrieval_synthesis: Callable[..., None]
+    resolve_user_name: Callable[[str | None], str | None] | None = None
 
 
 def _handle_barcode_query_routes(
@@ -78,6 +83,69 @@ def _handle_barcode_query_routes(
         except Exception:
             context.logger.exception("Barcode validation status query failed")
             context.reply("바코드 유효성 검사 확인 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+        return True
+
+    if _is_recording_streaming_restore_request(question, barcode):
+        if not cs.RECORDING_STREAMING_RESTORE_ENABLED:
+            context.reply(
+                "스트리밍 종료 영상 복원 기능이 꺼져 있어. "
+                ".env에서 RECORDING_STREAMING_RESTORE_ENABLED=true로 설정해줘"
+            )
+            context.logger.info(
+                "Rejected recording streaming restore request because feature is disabled "
+                "thread_ts=%s barcode=%s",
+                context.thread_ts,
+                barcode,
+            )
+            return True
+        if context.user_id not in cs.RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS:
+            approval_text = "스트리밍 종료 영상 복원은 허용 사용자만 가능해"
+            if cs.DD_USER_ID:
+                approval_text = (
+                    "스트리밍 종료 영상 복원은 허용 사용자만 가능해. "
+                    f"필요하면 <@{cs.DD_USER_ID}>에게 요청해줘"
+                )
+            context.reply(approval_text, mention_user=False)
+            context.logger.info(
+                "Rejected recording streaming restore request for unauthorized user=%s barcode=%s",
+                context.user_id,
+                barcode,
+            )
+            return True
+        try:
+            requester_name: str | None = None
+            if deps.resolve_user_name is not None:
+                try:
+                    requester_name = deps.resolve_user_name(context.user_id)
+                except Exception:
+                    context.logger.warning(
+                        "Failed to resolve requester display name user=%s",
+                        context.user_id,
+                        exc_info=True,
+                    )
+            # 예외 바코드/월/병원 scope 검증은 domain 함수 안에서 한 번 더 수행한다.
+            result_text = _query_recording_streaming_restore_by_barcode_month(
+                barcode or "",
+                question,
+                requester=context.user_id or "boxer",
+                requester_name=requester_name,
+            )
+            context.reply(result_text)
+            context.logger.info(
+                "Responded with recording streaming restore result in "
+                "thread_ts=%s barcode=%s user=%s",
+                context.thread_ts,
+                barcode,
+                context.user_id,
+            )
+        except ValueError as exc:
+            context.reply(f"스트리밍 종료 영상 복원 요청 형식 오류: {exc}")
+        except RuntimeError:
+            context.logger.exception("Recording streaming restore query failed")
+            context.reply("스트리밍 종료 영상 복원 중 오류가 발생했어. MDA 연결 상태를 확인해줘")
+        except Exception:
+            context.logger.exception("Recording streaming restore query failed")
+            context.reply("스트리밍 종료 영상 복원 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if _is_barcode_video_count_request(question, barcode):
