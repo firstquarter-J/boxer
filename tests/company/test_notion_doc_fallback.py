@@ -29,6 +29,17 @@ _MOMMYBOX_RECORDING_PROCESS_REFERENCES = [
         ],
     }
 ]
+_AUTO_RECORDING_RETRY_GAP_REFERENCES = [
+    {
+        "title": "자동 녹화 시작 후 즉시 재녹화 실패",
+        "previewLines": [
+            "상태: 파란 LED는 모션 감지 대기 상태야",
+            "원인: 파란 LED 상태에서 프로브 움직임이나 장비가 전달받는 영상 화면 변화가 있으면 모션 감지로 녹화 시작 음성이 나올 수 있어",
+            "로그 패턴: C_STOPSESS 후 4~6초 안에 같은 바코드를 다시 스캔하면 모션 FFmpeg가 /dev/video0: Device or resource busy로 실패할 수 있어",
+            "조치: 동일 증상 발생 시 바로 재녹화하지 말고 종료 후 약 10초 이상 기다린 뒤 다시 스캔하도록 안내해",
+        ],
+    }
+]
 _PINK_BARCODE_OVERVIEW_REFERENCES = [
     {
         "title": "핑크 바코드: 운영 개요",
@@ -98,6 +109,34 @@ class NotionDocFallbackTests(unittest.TestCase):
         self.assertIn(
             "모션 감지 통과 전 종료 스캔이면 녹화 취소 안내로 봐야 하고",
             text,
+        )
+
+    def test_auto_recording_retry_gap_explains_motion_and_wait_time(self) -> None:
+        # 현장에는 자동 시작 원인과 재스캔 대기 시간을 같이 안내해야 한다.
+        text = _build_notion_doc_fallback(
+            "파란 LED만 보고 자리 비운 사이 자동 녹화 시작 후 바로 재녹화 실패",
+            _AUTO_RECORDING_RETRY_GAP_REFERENCES,
+        )
+
+        self.assertIn(
+            "• 결론: 파란 LED는 모션 감지 대기 상태라, 프로브 움직임이나 장비가 받은 영상 화면 변화만 있어도 녹화 시작 음성이 나올 수 있어",
+            text,
+        )
+        self.assertIn("`/dev/video0: Device or resource busy`", text)
+        self.assertIn("약 10초 이상 기다린 뒤 다시 스캔", text)
+
+    def test_auto_recording_retry_gap_missing_wait_time_triggers_fallback(self) -> None:
+        fallback_text = _build_notion_doc_fallback(
+            "파란 LED만 보고 자리 비운 사이 자동 녹화 시작 후 바로 재녹화 실패",
+            _AUTO_RECORDING_RETRY_GAP_REFERENCES,
+        )
+        synthesized_text = """*문서 기반 답변*
+• 결론: 파란 LED에서 화면 변화가 있으면 녹화가 시작될 수 있어
+• 확인: 종료 직후 재스캔한 것으로 보여
+• 조치: 현장에 다시 시도해보라고 안내해"""
+
+        self.assertTrue(
+            _needs_notion_doc_fallback(synthesized_text, "notion playbook qa", fallback_text)
         )
 
     def test_pink_barcode_overview_breaks_question_into_three_tracks(self) -> None:

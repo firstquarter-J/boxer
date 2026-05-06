@@ -32,6 +32,10 @@ class NotionFollowupRoutingTests(unittest.TestCase):
         self.assertTrue(_looks_like_notion_doc_question("LED 상태표시등 문서 뭐야?"))
         self.assertTrue(_looks_like_notion_doc_question("초록불 빨간불 반복 LED 의미가 뭐야?"))
 
+    def test_auto_recording_retry_gap_question_is_treated_as_notion_question(self) -> None:
+        self.assertTrue(_looks_like_notion_doc_question("파란 LED 본 뒤 자동으로 녹화가 시작됐어"))
+        self.assertTrue(_looks_like_notion_doc_question("녹화 자동 시작 후 바로 재녹화 실패는 왜 그래?"))
+
     def test_small_talk_is_not_treated_as_notion_followup(self) -> None:
         self.assertFalse(_looks_like_notion_doc_followup("안녕?", _NOTION_THREAD_CONTEXT))
         self.assertFalse(_looks_like_notion_doc_followup("넌 누구?", _NOTION_THREAD_CONTEXT))

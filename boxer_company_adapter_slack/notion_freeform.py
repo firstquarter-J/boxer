@@ -20,6 +20,22 @@ _NOTION_DOC_QUERY_TOKENS = (
     "종료 스캔",
     "C_STOPSESS",
     "c_stopsess",
+    "자동 녹화",
+    "자동 녹화 시작",
+    "녹화 자동 시작",
+    "자동으로 녹화",
+    "녹화가 시작",
+    "녹화 시작 음성",
+    "녹화시작 안내음성",
+    "녹화준비완료",
+    "녹화 준비 완료",
+    "재녹화",
+    "파란 LED",
+    "파란 led",
+    "resource busy",
+    "Device or resource busy",
+    "/dev/video0",
+    "ffmpeg",
     "동기화",
     "베이비매직",
     "babymagic",
@@ -324,6 +340,7 @@ _BABYMAGIC_RETRY_ACTION = (
     "그다음 MDA 베이비매직 관리에서 재전송을 시도해"
 )
 _MOMMYBOX_RECORDING_PROCESS_TITLE = "마미박스 프로세스 순서"
+_MOMMYBOX_AUTO_RECORDING_RETRY_GAP_TITLE = "자동 녹화 시작 후 즉시 재녹화 실패"
 _PINK_BARCODE_OVERVIEW_TITLE = "핑크 바코드: 운영 개요"
 _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE = "바코드 표시: 구매 병원과 첫 촬영 병원이 다른 경우"
 _PINK_BARCODE_VALIDATION_POLICY_TITLE = "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지"
@@ -748,6 +765,7 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
 
     is_pink_barcode_overview_doc = primary_title == _PINK_BARCODE_OVERVIEW_TITLE
     is_mommybox_recording_process_doc = primary_title == _MOMMYBOX_RECORDING_PROCESS_TITLE
+    is_mommybox_auto_recording_retry_gap_doc = primary_title == _MOMMYBOX_AUTO_RECORDING_RETRY_GAP_TITLE
     is_barcode_sync_doc = primary_title == "바코드 동기화: 분만 병원에서 핑크 바코드가 스캔되는 경우"
     is_barcode_first_recording_edge_case_doc = primary_title == _BARCODE_FIRST_RECORDING_EDGE_CASE_TITLE
     is_pink_barcode_validation_policy_doc = primary_title == _PINK_BARCODE_VALIDATION_POLICY_TITLE
@@ -851,6 +869,13 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
         lines.append("• 결론: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼")
         lines.append("• 확인: 모션 감지 단계의 상태는 RECORDING이 아니라 SESSION이고, 모션 감지 성공 또는 타임아웃이면 그때 녹화 시작 음성 후 본 녹화가 시작돼. 모션 감지 단계에서 종료 스캔하면 녹화 취소 안내 음성이 나올 수 있고 아직 본 녹화는 시작되지 않은 상태야")
         lines.append("• 조치: 모션 감지 통과 전 종료 스캔이면 녹화 취소 안내로 봐야 하고, 녹화 중 종료 스캔일 때만 종료 음성과 함께 파일 마무리 후 업로드를 시도한다고 안내해")
+        return "\n".join(lines)
+
+    if is_mommybox_auto_recording_retry_gap_doc:
+        # 현장 안내 답변은 원인과 재촬영 텀을 빠뜨리면 오해가 커져서 고정 문구로 보강한다.
+        lines.append("• 결론: 파란 LED는 모션 감지 대기 상태라, 프로브 움직임이나 장비가 받은 영상 화면 변화만 있어도 녹화 시작 음성이 나올 수 있어")
+        lines.append("• 확인: 종료 스캔 후 4~6초 안에 바로 재스캔한 세션에서만 실패하고 `/dev/video0: Device or resource busy`가 보이면 캡처보드 단선보다는 직전 FFmpeg 정리 전 재진입으로 봐야 해")
+        lines.append("• 조치: 같은 증상이 생기면 녹화 종료 후 바로 재녹화하지 말고 약 10초 이상 기다린 뒤 다시 스캔하도록 안내해. 반복되면 C_STOPSESS와 재스캔 간격, 첫 FFmpeg error를 같이 확인해")
         return "\n".join(lines)
 
     if is_barcode_sync_doc and not is_meaning_question:
@@ -982,6 +1007,12 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
     if "추가 구매" in fallback_normalized and "추가 구매" not in normalized:
         return True
     if "녹화 취소 안내 음성" in fallback_normalized and "녹화 취소" not in normalized:
+        return True
+    if "직전 ffmpeg 정리 전 재진입" in fallback_lowered and "ffmpeg" not in lowered:
+        return True
+    if "약 10초 이상" in fallback_normalized and "10초" not in normalized:
+        return True
+    if "device or resource busy" in fallback_lowered and "resource busy" not in lowered:
         return True
     if "ssh 연결 불가만으로는" in fallback_lowered and "단정 못 해" not in normalized and "네트워크 문제인지" not in normalized:
         return True
