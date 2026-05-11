@@ -608,6 +608,48 @@ class _FakeSshClient:
         return None, stdout, stderr
 
 
+class _NeverReadySshChannel:
+    def __init__(self) -> None:
+        self.closed = False
+        self.timeout: int | None = None
+
+    def settimeout(self, timeout: int) -> None:
+        self.timeout = timeout
+
+    def exit_status_ready(self) -> bool:
+        return False
+
+    def recv_exit_status(self) -> int:
+        raise AssertionError("stalled channel should not call recv_exit_status")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _NeverReadySshStream:
+    def __init__(self) -> None:
+        self.channel = _NeverReadySshChannel()
+        self.closed = False
+
+    def read(self) -> bytes:
+        raise AssertionError("stalled channel should not read output")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _NeverReadySshClient:
+    def __init__(self) -> None:
+        self.streams: list[_NeverReadySshStream] = []
+
+    def exec_command(self, command: str, timeout: int | None = None):
+        del command, timeout
+        stdout = _NeverReadySshStream()
+        stderr = _NeverReadySshStream()
+        self.streams.extend([stdout, stderr])
+        return None, stdout, stderr
+
+
 class DeviceUpdateSshLifecycleTests(unittest.TestCase):
     def test_closes_ssh_streams_after_command(self) -> None:
         client = _FakeSshClient(
@@ -627,6 +669,23 @@ class DeviceUpdateSshLifecycleTests(unittest.TestCase):
         )
 
         self.assertTrue(result["ok"])
+        self.assertEqual(len(client.streams), 2)
+        self.assertTrue(all(stream.closed for stream in client.streams))
+        self.assertTrue(all(stream.channel.closed for stream in client.streams))
+
+    def test_times_out_and_closes_stalled_channel(self) -> None:
+        client = _NeverReadySshClient()
+
+        with patch("boxer_company.routers.ssh_command.time.monotonic", side_effect=[0, 2]):
+            result = _run_remote_ssh_command(
+                client,
+                command="sleep forever",
+                timeout_sec=1,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "timeout")
+        self.assertIsNone(result["exitStatus"])
         self.assertEqual(len(client.streams), 2)
         self.assertTrue(all(stream.closed for stream in client.streams))
         self.assertTrue(all(stream.channel.closed for stream in client.streams))

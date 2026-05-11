@@ -319,7 +319,7 @@ def _normalize_daily_device_round_state(
 
 def _build_daily_device_round_window_title_text(now: datetime | None = None) -> str:
     local_now = _coerce_daily_device_round_now(now)
-    return f"일일 장비 순회 점검 & 업데이트 | {local_now:%Y-%m-%d}"
+    return f"마미박스 일일 순회 업데이트 | {local_now:%Y-%m-%d}"
 
 
 def _extract_daily_device_round_thread_ts(response: Any) -> str:
@@ -626,7 +626,7 @@ def _run_daily_device_round_if_due(
     report_summary = _build_daily_device_round_summary(
         now=local_now,
         state=state,
-        auto_update_agent=True,
+        auto_update_agent=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT),
         auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
         auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
         auto_power_off=bool(cs.DAILY_DEVICE_ROUND_AUTO_POWER_OFF),

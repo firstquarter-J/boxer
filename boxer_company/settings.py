@@ -162,6 +162,9 @@ DAILY_DEVICE_ROUND_STATE_PATH = os.getenv(
     "DAILY_DEVICE_ROUND_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "daily_device_round_state.json"),
 ).strip()
+DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT = (
+    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
 DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX = (
     os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

@@ -1006,7 +1006,7 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         )
 
-        self.assertIn("일일 장비 순회 점검 & 업데이트 | #604 루이스산부인과의원(동작)", report_text)
+        self.assertIn("마미박스 일일 순회 업데이트 | #604 루이스산부인과의원(동작)", report_text)
         self.assertIn("*#604 루이스산부인과의원(동작)*", report_text)
         self.assertNotIn("• 자동 동작:", report_text)
         self.assertIn("• 🟢 확인/작업 장비 없음", report_text)

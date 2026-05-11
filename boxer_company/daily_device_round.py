@@ -22,7 +22,7 @@ from boxer_company.routers.device_update import (
 )
 
 _DAILY_DEVICE_ROUND_TIMEZONE = ZoneInfo("Asia/Seoul")
-_DAILY_DEVICE_ROUND_TITLE = "일일 장비 순회 점검 & 업데이트"
+_DAILY_DEVICE_ROUND_TITLE = "마미박스 일일 순회 업데이트"
 _DAILY_DEVICE_ROUND_COMPONENT_NAMES = {
     "audio": "오디오",
     "pm2": "pm2",

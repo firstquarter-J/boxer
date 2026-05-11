@@ -213,6 +213,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
@@ -272,7 +273,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         )
         self.assertEqual(len(client.messages), 2)
         self.assertEqual(client.messages[0]["channel"], "C_DAILY")
-        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[0]["text"], "마미박스 일일 순회 업데이트 | 2026-04-08")
         self.assertEqual(client.messages[1]["channel"], "C_DAILY")
         self.assertEqual(client.messages[1]["text"], "daily round body")
         self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
@@ -670,7 +671,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
 
         self.assertTrue(sent)
         self.assertEqual(len(client.messages), 3)
-        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[0]["text"], "마미박스 일일 순회 업데이트 | 2026-04-08")
         self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
         self.assertIn("blocks", client.messages[1])
         self.assertEqual(client.messages[2]["thread_ts"], "2000.001")
@@ -752,7 +753,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
 
         self.assertTrue(sent)
         self.assertEqual(len(client.messages), 4)
-        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[0]["text"], "마미박스 일일 순회 업데이트 | 2026-04-08")
         self.assertEqual(client.messages[1]["text"], "daily round body | 계속 1/3")
         self.assertEqual(client.messages[2]["text"], "daily round body | 계속 2/3")
         self.assertEqual(client.messages[3]["text"], "daily round body | 계속 3/3")
@@ -847,7 +848,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
 
         self.assertTrue(sent)
         self.assertEqual(len(client.messages), 3)
-        self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+        self.assertEqual(client.messages[0]["text"], "마미박스 일일 순회 업데이트 | 2026-04-08")
         self.assertEqual(client.messages[1]["thread_ts"], "2000.001")
         self.assertEqual(client.messages[2]["thread_ts"], "2000.001")
 
@@ -894,7 +895,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 },
             )
             self.assertEqual(len(client.messages), 1)
-            self.assertEqual(client.messages[0]["text"], "일일 장비 순회 점검 & 업데이트 | 2026-04-08")
+            self.assertEqual(client.messages[0]["text"], "마미박스 일일 순회 업데이트 | 2026-04-08")
             progress_callback(
                 "device_started",
                 {

@@ -19,6 +19,7 @@ from boxer_company.routers.mda_graphql import (
     _send_mda_device_ping,
     _wait_for_mda_device_agent_ssh,
 )
+from boxer_company.routers.ssh_command import _close_ssh_streams, _wait_for_ssh_exit_status
 
 _LEADING_DEVICE_PROBE_SCOPE_PATTERN = re.compile(
     r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
@@ -745,7 +746,7 @@ def _run_remote_ssh_command(
     stderr = None
     try:
         stdin, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
-        exit_status = stdout.channel.recv_exit_status()
+        exit_status = _wait_for_ssh_exit_status(stdout, stderr, timeout_sec=actual_timeout)
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
         stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
         combined = stdout_text
@@ -768,23 +769,10 @@ def _run_remote_ssh_command(
             "ok": False,
             "exitStatus": None,
             "output": "",
-            "reason": type(exc).__name__.lower(),
+            "reason": "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__.lower(),
         }
     finally:
-        for stream in (stdin, stdout, stderr):
-            if stream is None:
-                continue
-            channel = getattr(stream, "channel", None)
-            try:
-                stream.close()
-            except Exception:
-                pass
-            if channel is None:
-                continue
-            try:
-                channel.close()
-            except Exception:
-                pass
+        _close_ssh_streams(stdin, stdout, stderr)
 
 
 def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
