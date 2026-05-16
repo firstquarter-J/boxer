@@ -263,14 +263,14 @@ def create_app() -> App:
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if provider == "claude":
                 timeout_sec = max(1, s.ANTHROPIC_TIMEOUT_SEC)
-                return f"Claude API가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
+                return f"AI API가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
             timeout_sec = max(1, s.OLLAMA_TIMEOUT_SEC)
             return f"LLM 서버가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
 
         def _llm_unavailable_reply_text(summary: str | None = None) -> str:
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if provider == "claude":
-                base = "Claude API가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
+                base = "AI API가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
             else:
                 base = "LLM 서버가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
             detail = (summary or "").strip()

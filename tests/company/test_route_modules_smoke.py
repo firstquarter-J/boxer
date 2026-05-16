@@ -2,6 +2,9 @@ import logging
 import unittest
 from unittest.mock import patch
 
+import anthropic
+import httpx
+
 from boxer_company_adapter_slack.admin_routes import (
     AdminRoutesContext,
     AdminRoutesDeps,
@@ -38,6 +41,35 @@ def _payload() -> dict[str, object]:
         "current_ts": "1.1",
         "thread_ts": "1.0",
     }
+
+
+def _anthropic_auth_error() -> anthropic.AuthenticationError:
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    return anthropic.AuthenticationError("invalid api key", response=response, body=None)
+
+
+def _anthropic_credit_error() -> anthropic.RateLimitError:
+    response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    body = {
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "message": "Your credit balance is too low",
+        },
+    }
+    return anthropic.RateLimitError("rate limit", response=response, body=body)
+
+
+def _silent_logger() -> logging.Logger:
+    logger = logging.getLogger(f"{__name__}.silent")
+    logger.disabled = True
+    return logger
 
 
 class RouteModulesSmokeTests(unittest.TestCase):
@@ -538,6 +570,121 @@ class RouteModulesSmokeTests(unittest.TestCase):
             )
 
         self.assertFalse(handled)
+
+    def test_knowledge_routes_reports_missing_claude_api_key_when_client_unavailable(self) -> None:
+        replies: list[str] = []
+
+        with patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", "claude"):
+            handled = _handle_knowledge_routes(
+                KnowledgeRoutesContext(
+                    question="아직도 조회 불가능하니?",
+                    barcode=None,
+                    user_id="U123",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    thread_ts="",
+                    channel_id="C123",
+                    current_ts="1.1",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=_silent_logger(),
+                    client=None,
+                    claude_client=None,
+                ),
+                KnowledgeRoutesDeps(
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    timeout_reply_text=lambda: "timeout",
+                    llm_unavailable_reply_text=lambda summary=None: "down",
+                    is_timeout_error=lambda exc: False,
+                    is_claude_allowed_user=lambda user_id: True,
+                    build_barcode_fallback_evidence=lambda: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(replies), 1)
+        self.assertIn("API 키가 설정되지 않아", replies[0])
+        self.assertNotIn("Claude", replies[0])
+        self.assertIn("ANTHROPIC_API_KEY", replies[0])
+
+    def test_knowledge_routes_reports_claude_auth_error_as_api_key_issue(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", "claude"),
+            patch("boxer_company_adapter_slack.knowledge_routes._load_slack_thread_context", return_value=""),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes._ask_claude",
+                side_effect=_anthropic_auth_error(),
+            ),
+        ):
+            handled = _handle_knowledge_routes(
+                KnowledgeRoutesContext(
+                    question="아직도 조회 불가능하니?",
+                    barcode=None,
+                    user_id="U123",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    thread_ts="1.0",
+                    channel_id="C123",
+                    current_ts="1.1",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=_silent_logger(),
+                    client=None,
+                    claude_client=object(),
+                ),
+                KnowledgeRoutesDeps(
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    timeout_reply_text=lambda: "timeout",
+                    llm_unavailable_reply_text=lambda summary=None: "down",
+                    is_timeout_error=lambda exc: False,
+                    is_claude_allowed_user=lambda user_id: True,
+                    build_barcode_fallback_evidence=lambda: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(replies), 1)
+        self.assertIn("API 키가 유효하지 않아", replies[0])
+        self.assertNotIn("Claude", replies[0])
+        self.assertNotIn("AI 응답 중 오류", replies[0])
+
+    def test_knowledge_routes_reports_claude_credit_error_as_payment_issue(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", "claude"),
+            patch("boxer_company_adapter_slack.knowledge_routes._load_slack_thread_context", return_value=""),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes._ask_claude",
+                side_effect=_anthropic_credit_error(),
+            ),
+        ):
+            handled = _handle_knowledge_routes(
+                KnowledgeRoutesContext(
+                    question="아직도 조회 불가능하니?",
+                    barcode=None,
+                    user_id="U123",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    thread_ts="1.0",
+                    channel_id="C123",
+                    current_ts="1.1",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=_silent_logger(),
+                    client=None,
+                    claude_client=object(),
+                ),
+                KnowledgeRoutesDeps(
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    timeout_reply_text=lambda: "timeout",
+                    llm_unavailable_reply_text=lambda summary=None: "down",
+                    is_timeout_error=lambda exc: False,
+                    is_claude_allowed_user=lambda user_id: True,
+                    build_barcode_fallback_evidence=lambda: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["토큰이 충전되지 않아 답변할 수 없어. 추가 결제가 필요해."])
+        self.assertNotIn("Claude", replies[0])
+        self.assertNotIn("ANTHROPIC_API_KEY", replies[0])
 
 
 if __name__ == "__main__":

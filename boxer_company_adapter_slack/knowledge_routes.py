@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import anthropic
+
 from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _set_request_log_route
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.context.builder import _build_model_input
@@ -57,11 +59,63 @@ class KnowledgeRoutesDeps:
     build_barcode_fallback_evidence: Callable[[], dict[str, Any] | None]
 
 
+def _build_claude_api_key_missing_reply() -> str:
+    # 키 설정 문제는 일반 장애 문구로 숨기지 않고 운영자가 바로 조치할 수 있게 노출한다.
+    return "API 키가 설정되지 않아 지금은 AI 답변을 생성할 수 없어. 서버의 `ANTHROPIC_API_KEY`를 확인해줘"
+
+
+def _build_claude_api_key_invalid_reply() -> str:
+    return "API 키가 유효하지 않아 지금은 AI 답변을 생성할 수 없어. 서버의 `ANTHROPIC_API_KEY`를 확인해줘"
+
+
+def _build_claude_permission_denied_reply() -> str:
+    return (
+        "API 키 권한이 없어 지금은 AI 답변을 생성할 수 없어. "
+        "서버의 `ANTHROPIC_API_KEY`를 확인해줘"
+    )
+
+
+def _build_claude_credit_unavailable_reply() -> str:
+    return "토큰이 충전되지 않아 답변할 수 없어. 추가 결제가 필요해."
+
+
+def _flatten_error_text(value: Any) -> str:
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key, item in value.items():
+            parts.append(str(key))
+            parts.append(_flatten_error_text(item))
+        return " ".join(part for part in parts if part)
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_flatten_error_text(item) for item in value)
+    return str(value or "")
+
+
+def _is_claude_credit_unavailable_error(exc: Exception) -> bool:
+    # Anthropic의 잔액/결제 오류는 SDK 버전에 따라 RateLimitError 본문 문구로만 구분될 수 있다.
+    body_text = _flatten_error_text(getattr(exc, "body", None))
+    combined = f"{body_text} {getattr(exc, 'message', '')} {str(exc)}".lower()
+    return any(
+        token in combined
+        for token in (
+            "credit balance",
+            "credits",
+            "insufficient_quota",
+            "insufficient quota",
+            "quota_exceeded",
+            "billing",
+            "payment",
+            "prepaid",
+        )
+    )
+
+
 def _handle_knowledge_routes(
     context: KnowledgeRoutesContext,
     deps: KnowledgeRoutesDeps,
 ) -> bool:
     question = context.question
+    provider = (s.LLM_PROVIDER or "").lower().strip()
 
     notion_thread_context = ""
     is_notion_doc_question = _looks_like_notion_doc_question(question)
@@ -139,7 +193,18 @@ def _handle_knowledge_routes(
             context.reply("문서 기반 답변 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return True
 
-    if s.LLM_PROVIDER == "claude" and context.claude_client:
+    if provider == "claude" and not context.claude_client:
+        _set_request_log_route(
+            context.payload,
+            "llm_freeform",
+            route_mode="claude",
+            handler_type="llm_freeform",
+        )
+        context.logger.warning("Claude client unavailable before answer generation")
+        context.reply(_build_claude_api_key_missing_reply())
+        return True
+
+    if provider == "claude" and context.claude_client:
         _set_request_log_route(
             context.payload,
             "llm_freeform",
@@ -150,7 +215,7 @@ def _handle_knowledge_routes(
             context.reply("질문 내용을 같이 보내줘. 지원 기능이 궁금하면 `사용법`이라고 보내줘")
             return True
         if not deps.is_claude_allowed_user(context.user_id):
-            context.reply("Claude 질문은 현재 지정된 사용자만 사용할 수 있어")
+            context.reply("AI 질문은 현재 지정된 사용자만 사용할 수 있어")
             context.logger.info("Rejected claude call for user=%s", context.user_id)
             return True
         try:
@@ -221,12 +286,27 @@ def _handle_knowledge_routes(
         except TimeoutError:
             context.logger.warning("Claude API timeout")
             context.reply(deps.timeout_reply_text())
+        except anthropic.AuthenticationError:
+            context.logger.exception("Claude API authentication failed")
+            context.reply(_build_claude_api_key_invalid_reply())
+        except anthropic.RateLimitError as exc:
+            context.logger.exception("Claude API rate limit failed")
+            if _is_claude_credit_unavailable_error(exc):
+                context.reply(_build_claude_credit_unavailable_reply())
+            else:
+                context.reply("API 호출 제한으로 지금은 AI 답변을 생성할 수 없어. 잠시 후 다시 시도해줘")
+        except anthropic.PermissionDeniedError as exc:
+            context.logger.exception("Claude API permission denied")
+            if _is_claude_credit_unavailable_error(exc):
+                context.reply(_build_claude_credit_unavailable_reply())
+            else:
+                context.reply(_build_claude_permission_denied_reply())
         except Exception:
             context.logger.exception("Claude API call failed")
             context.reply("AI 응답 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
-    if s.LLM_PROVIDER == "ollama":
+    if provider == "ollama":
         _set_request_log_route(
             context.payload,
             "llm_freeform",
