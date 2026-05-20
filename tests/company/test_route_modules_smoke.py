@@ -66,6 +66,21 @@ def _anthropic_credit_error() -> anthropic.RateLimitError:
     return anthropic.RateLimitError("rate limit", response=response, body=body)
 
 
+def _anthropic_credit_bad_request_error() -> anthropic.BadRequestError:
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Your credit balance is too low to access the Anthropic API.",
+        },
+    }
+    return anthropic.BadRequestError("bad request", response=response, body=body)
+
+
 def _silent_logger() -> logging.Logger:
     logger = logging.getLogger(f"{__name__}.silent")
     logger.disabled = True
@@ -685,6 +700,45 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertEqual(replies, ["토큰이 충전되지 않아 답변할 수 없어. 추가 결제가 필요해."])
         self.assertNotIn("Claude", replies[0])
         self.assertNotIn("ANTHROPIC_API_KEY", replies[0])
+
+    def test_knowledge_routes_reports_claude_credit_bad_request_as_payment_issue(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch("boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER", "claude"),
+            patch("boxer_company_adapter_slack.knowledge_routes._load_slack_thread_context", return_value=""),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes._ask_claude",
+                side_effect=_anthropic_credit_bad_request_error(),
+            ),
+        ):
+            handled = _handle_knowledge_routes(
+                KnowledgeRoutesContext(
+                    question="마크 분석해봐",
+                    barcode=None,
+                    user_id="U123",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    thread_ts="1.0",
+                    channel_id="C123",
+                    current_ts="1.1",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=_silent_logger(),
+                    client=None,
+                    claude_client=object(),
+                ),
+                KnowledgeRoutesDeps(
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    timeout_reply_text=lambda: "timeout",
+                    llm_unavailable_reply_text=lambda summary=None: "down",
+                    is_timeout_error=lambda exc: False,
+                    is_claude_allowed_user=lambda user_id: True,
+                    build_barcode_fallback_evidence=lambda: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["토큰이 충전되지 않아 답변할 수 없어. 추가 결제가 필요해."])
+        self.assertNotIn("AI 응답 중 오류", replies[0])
 
 
 if __name__ == "__main__":

@@ -301,6 +301,13 @@ def _handle_knowledge_routes(
                 context.reply(_build_claude_credit_unavailable_reply())
             else:
                 context.reply(_build_claude_permission_denied_reply())
+        except anthropic.APIStatusError as exc:
+            context.logger.exception("Claude API status failed")
+            # Anthropic 잔액 부족은 운영에서 400 BadRequest로도 내려와서 status 계열에서 한 번 더 분류한다.
+            if _is_claude_credit_unavailable_error(exc):
+                context.reply(_build_claude_credit_unavailable_reply())
+            else:
+                context.reply("AI 응답 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         except Exception:
             context.logger.exception("Claude API call failed")
             context.reply("AI 응답 중 오류가 발생했어. 잠시 후 다시 시도해줘")
