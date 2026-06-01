@@ -452,7 +452,8 @@ def _build_daily_device_round_abnormal_alert_text(
             lines.append(f"> *장비*  `{item['device']}`")
             lines.append(f"> *이슈*  {item['issue']}")
             if item.get("mdaUrl"):
-                lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA Link>")
+                # 알림 수신자가 링크 목적을 바로 알 수 있게 MDA 장비 확인 문구로 표시한다.
+                lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA 에서 장비 확인 바로가기>")
     if permalink:
         if alert_items:
             lines.append("")
