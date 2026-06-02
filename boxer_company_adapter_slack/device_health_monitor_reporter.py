@@ -1,10 +1,16 @@
+import hashlib
+import hmac
 import json
 import logging
+import re
+import secrets
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
@@ -41,6 +47,9 @@ from boxer_company.routers.mda_graphql import (
     _open_mda_device_ssh,
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import (
+    _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+    _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+    _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
     _collect_daily_device_round_abnormal_alert_items,
     _post_daily_device_round_abnormal_alert,
 )
@@ -49,6 +58,20 @@ _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
 _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
 _DEVICE_HEALTH_MONITOR_RUNTIME_STATE: dict[str, Any] = {}
 _DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK = threading.Lock()
+_DEVICE_HEALTH_MONITOR_ACTION_IDS = {
+    _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+    _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+    _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+}
+_DEVICE_HEALTH_MONITOR_ACTION_LABELS = {
+    _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "병원 문자 보내기",
+    _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE: "장비 음성 안내(미구현)",
+    _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE: "확인 완료",
+}
+_DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS = {
+    _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
+}
+_DEVICE_HEALTH_MONITOR_HOSPITAL_SEQ_PATTERN = re.compile(r"#\s*(\d+)")
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -242,6 +265,24 @@ def _normalize_device_health_monitor_device_candidate_cache(value: Any) -> list[
     return items
 
 
+def _normalize_device_health_monitor_action_cooldowns(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+
+    cooldowns: dict[str, dict[str, Any]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, dict):
+            continue
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        cooldowns[normalized_key] = {
+            "lastTriggeredAt": str(raw.get("lastTriggeredAt") or "").strip(),
+            "count": max(0, int(raw.get("count") or 0)),
+        }
+    return cooldowns
+
+
 def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, Any]:
     state_payload = state if isinstance(state, dict) else {}
     normalized_state = dict(state_payload)
@@ -263,6 +304,10 @@ def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, A
         state_payload.get("deviceCandidateCache")
     )
     normalized_state["deviceCandidateCachedAt"] = str(state_payload.get("deviceCandidateCachedAt") or "").strip()
+    if "alertActionCooldowns" in state_payload:
+        normalized_state["alertActionCooldowns"] = _normalize_device_health_monitor_action_cooldowns(
+            state_payload.get("alertActionCooldowns")
+        )
     return normalized_state
 
 
@@ -293,10 +338,6 @@ def _device_health_monitor_alert_reminder_delta() -> timedelta:
     return timedelta(hours=hours)
 
 
-def _device_health_monitor_captureboard_alert_confirmation_polls() -> int:
-    return max(1, int(cs.DEVICE_HEALTH_MONITOR_CAPTUREBOARD_ALERT_CONFIRMATION_POLLS))
-
-
 def _build_device_health_monitor_alert_fingerprint(item: dict[str, str]) -> str:
     return "|".join(
         [
@@ -309,10 +350,680 @@ def _build_device_health_monitor_alert_fingerprint(item: dict[str, str]) -> str:
 
 
 def _device_health_monitor_required_confirmation_polls(item: dict[str, str]) -> int:
-    issue = _display_value(item.get("issue"), default="")
-    if "캡처보드" in issue:
-        return _device_health_monitor_captureboard_alert_confirmation_polls()
     return 1
+
+
+def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, str]:
+    raw_item = value
+    if isinstance(value, str):
+        try:
+            raw_item = json.loads(value)
+        except json.JSONDecodeError:
+            raw_item = {}
+    item = raw_item if isinstance(raw_item, dict) else {}
+    return {
+        "hospitalSeq": _display_value(item.get("hospitalSeq"), default=""),
+        "hospitalName": _display_value(item.get("hospitalName"), default=""),
+        "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
+        "room": _display_value(item.get("room"), default="병실 미확인"),
+        "device": _display_value(item.get("device"), default="장비명 미확인"),
+        "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
+        "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
+    }
+
+
+def _format_device_health_monitor_action_target(item: dict[str, str]) -> str:
+    return " / ".join(
+        [
+            _display_value(item.get("hospital"), default="병원 미확인"),
+            _display_value(item.get("room"), default="병실 미확인"),
+            _display_value(item.get("device"), default="장비명 미확인"),
+        ]
+    )
+
+
+def _extract_device_health_monitor_hospital_seq(item: dict[str, str]) -> int | None:
+    explicit_seq = _coerce_int(item.get("hospitalSeq"))
+    if explicit_seq is not None:
+        return explicit_seq
+    matched = _DEVICE_HEALTH_MONITOR_HOSPITAL_SEQ_PATTERN.search(
+        _display_value(item.get("hospital"), default="")
+    )
+    if not matched:
+        return None
+    return _coerce_int(matched.group(1))
+
+
+def _normalize_device_health_monitor_phone_number(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("+"):
+        return "+" + re.sub(r"\D", "", text[1:])
+    return re.sub(r"\D", "", text)
+
+
+def _device_health_monitor_sms_target_phone_number(contact: dict[str, str]) -> tuple[str, bool]:
+    test_phone_number = _normalize_device_health_monitor_phone_number(
+        cs.DEVICE_HEALTH_MONITOR_SMS_TEST_PHONE_NUMBER
+    )
+    if test_phone_number:
+        return test_phone_number, True
+    return _display_value(contact.get("phoneNumber"), default=""), False
+
+
+def _lookup_device_health_monitor_hospital_contact(
+    hospital_seq: int | None,
+) -> dict[str, str]:
+    if hospital_seq is None:
+        return {"status": "missing_hospital_seq", "hospitalSeq": "", "hospitalName": "", "telephone": "", "phoneNumber": ""}
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT seq, hospitalName, telephone FROM hospitals WHERE seq = %s LIMIT 1",
+                (int(hospital_seq),),
+            )
+            row = cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+    if not row:
+        return {
+            "status": "hospital_not_found",
+            "hospitalSeq": str(hospital_seq),
+            "hospitalName": "",
+            "telephone": "",
+            "phoneNumber": "",
+        }
+
+    telephone = _display_value(row.get("telephone"), default="")
+    phone_number = _normalize_device_health_monitor_phone_number(telephone)
+    return {
+        "status": "ok" if phone_number else "missing_telephone",
+        "hospitalSeq": _display_value(row.get("seq"), default=str(hospital_seq)),
+        "hospitalName": _display_value(row.get("hospitalName"), default=""),
+        "telephone": telephone,
+        "phoneNumber": phone_number,
+    }
+
+
+def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, Any]:
+    issue = _display_value(item.get("issue"), default="")
+    room = _display_value(item.get("room"), default="진료실")
+    device = _display_value(item.get("device"), default="마미박스 장비")
+    lowered = issue.lower()
+
+    if "캡처보드" in issue or "비디오 장치" in issue or "영상" in issue:
+        message = (
+            "[마미박스] "
+            f"{room} {device}에서 영상 입력 장치를 찾지 못하고 있습니다. "
+            "캡처보드 USB 케이블과 초음파 영상 장치 연결 상태를 확인해 주세요."
+        )
+        return {
+            "supported": True,
+            "templateId": "captureboard_disconnected",
+            "title": "캡처보드 연결 확인 문자",
+            "message": message,
+        }
+
+    if "led" in lowered or "엘이디" in issue:
+        message = (
+            "[마미박스] "
+            f"{room} {device}에서 장비 상태 표시등 연결 확인이 필요합니다. "
+            "LED USB 케이블이 빠져 있거나 헐겁지 않은지 확인해 주세요."
+        )
+        return {
+            "supported": True,
+            "templateId": "led_disconnected",
+            "title": "LED 연결 확인 문자",
+            "message": message,
+        }
+
+    if any(token in lowered for token in ("audio", "sound", "speaker")) or any(
+        token in issue for token in ("오디오", "소리", "스피커")
+    ):
+        message = (
+            "[마미박스] "
+            f"{room} {device}에서 소리 출력 상태 확인이 필요합니다. "
+            "스피커 전원과 오디오 케이블 연결 상태를 확인해 주세요."
+        )
+        return {
+            "supported": True,
+            "templateId": "audio_output_check",
+            "title": "오디오 연결 확인 문자",
+            "message": message,
+        }
+
+    return {
+        "supported": False,
+        "templateId": "unsupported_issue",
+        "title": "병원 연락 제외 이슈",
+        "message": "",
+        "reason": "hospital_sms_not_supported_for_issue",
+    }
+
+
+def _device_health_monitor_action_cooldown_key(action_id: str, item: dict[str, str]) -> str:
+    return "|".join(
+        [
+            _display_value(action_id, default="unknown"),
+            _display_value(item.get("hospital"), default=""),
+            _display_value(item.get("room"), default=""),
+            _display_value(item.get("device"), default=""),
+            _display_value(item.get("issue"), default=""),
+        ]
+    )
+
+
+def _device_health_monitor_voice_guide_cooldown_delta() -> timedelta:
+    return timedelta(seconds=max(0, int(cs.DEVICE_HEALTH_MONITOR_VOICE_GUIDE_COOLDOWN_SEC)))
+
+
+def _check_device_health_monitor_action_cooldown(
+    state: dict[str, Any],
+    *,
+    action_id: str,
+    item: dict[str, str],
+    now: datetime,
+) -> dict[str, Any]:
+    if action_id != _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
+        return {"active": False, "remainingSeconds": 0}
+
+    cooldown_delta = _device_health_monitor_voice_guide_cooldown_delta()
+    if cooldown_delta.total_seconds() <= 0:
+        return {"active": False, "remainingSeconds": 0}
+
+    cooldowns = _normalize_device_health_monitor_action_cooldowns(state.get("alertActionCooldowns"))
+    cooldown_key = _device_health_monitor_action_cooldown_key(action_id, item)
+    last_triggered_at = _parse_device_health_monitor_datetime(
+        (cooldowns.get(cooldown_key) or {}).get("lastTriggeredAt")
+    )
+    if last_triggered_at is None:
+        return {"active": False, "remainingSeconds": 0}
+
+    elapsed = now - last_triggered_at
+    if elapsed >= cooldown_delta:
+        return {"active": False, "remainingSeconds": 0}
+    remaining_seconds = int(max(1, (cooldown_delta - elapsed).total_seconds()))
+    return {"active": True, "remainingSeconds": remaining_seconds, "lastTriggeredAt": last_triggered_at.isoformat()}
+
+
+def _remember_device_health_monitor_action_cooldown(
+    state: dict[str, Any],
+    *,
+    action_id: str,
+    item: dict[str, str],
+    now: datetime,
+) -> dict[str, Any]:
+    cooldowns = _normalize_device_health_monitor_action_cooldowns(state.get("alertActionCooldowns"))
+    cooldown_key = _device_health_monitor_action_cooldown_key(action_id, item)
+    previous = cooldowns.get(cooldown_key) or {}
+    cooldowns[cooldown_key] = {
+        "lastTriggeredAt": now.isoformat(),
+        "count": max(0, int(previous.get("count") or 0)) + 1,
+    }
+    return {**state, "alertActionCooldowns": cooldowns}
+
+
+def _device_health_monitor_action_webhook_url(action_id: str) -> str:
+    setting_name = _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS.get(action_id)
+    if not setting_name:
+        return ""
+    return str(getattr(cs, setting_name, "") or "").strip()
+
+
+def _build_solapi_authorization_header() -> str:
+    date_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    salt = secrets.token_hex(16)
+    signature = hmac.new(
+        cs.SOLAPI_API_SECRET.encode("utf-8"),
+        f"{date_time}{salt}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"HMAC-SHA256 apiKey={cs.SOLAPI_API_KEY}, date={date_time}, salt={salt}, signature={signature}"
+
+
+def _device_health_monitor_sms_type(message: str) -> str:
+    return "SMS" if len(str(message or "").encode("euc-kr", errors="replace")) <= 90 else "LMS"
+
+
+def _post_device_health_monitor_solapi_sms(
+    payload: dict[str, Any],
+    *,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    if not cs.SOLAPI_API_KEY or not cs.SOLAPI_API_SECRET or not cs.SOLAPI_FROM_NUMBER:
+        return {
+            "status": "not_configured",
+            "ok": False,
+            "missingSetting": "SOLAPI_API_KEY/SOLAPI_API_SECRET/SOLAPI_FROM_NUMBER",
+        }
+
+    sms_payload = payload.get("sms") if isinstance(payload.get("sms"), dict) else {}
+    to_number = _normalize_device_health_monitor_phone_number(sms_payload.get("to"))
+    from_number = _normalize_device_health_monitor_phone_number(cs.SOLAPI_FROM_NUMBER)
+    message = _display_value(sms_payload.get("message"), default="")
+    if not to_number or not from_number or not message:
+        return {"status": "invalid_sms_payload", "ok": False}
+
+    request_payload = {
+        "messages": [
+            {
+                "to": to_number,
+                "from": from_number,
+                "text": message,
+                "type": _device_health_monitor_sms_type(message),
+                "country": "82",
+            }
+        ]
+    }
+    url = f"{cs.SOLAPI_BASE_URL.rstrip('/')}/messages/v4/send-many/detail"
+    try:
+        response = requests.post(
+            url,
+            json=request_payload,
+            headers={
+                "Authorization": _build_solapi_authorization_header(),
+                "Content-Type": "application/json",
+            },
+            timeout=max(1, int(cs.DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC)),
+        )
+    except Exception as exc:
+        logger.warning("Solapi SMS 발송 요청 실패", exc_info=True)
+        return {"status": "error", "ok": False, "provider": "solapi", "error": type(exc).__name__}
+
+    response_text = _display_value(response.text, default="")
+    try:
+        response_payload = response.json() if response_text else {}
+    except ValueError:
+        response_payload = {}
+
+    if 200 <= int(response.status_code) < 300:
+        return {
+            "status": "sent",
+            "ok": True,
+            "provider": "solapi",
+            "statusCode": int(response.status_code),
+            "groupId": _display_value(response_payload.get("groupId"), default=""),
+        }
+    return {
+        "status": "error",
+        "ok": False,
+        "provider": "solapi",
+        "statusCode": int(response.status_code),
+        "error": response_text[:300],
+    }
+
+
+def _post_device_health_monitor_sms_payload(
+    payload: dict[str, Any],
+    *,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    provider = str(cs.DEVICE_HEALTH_MONITOR_SMS_PROVIDER or "").strip().lower()
+    if provider == "solapi":
+        return _post_device_health_monitor_solapi_sms(payload, logger=logger)
+    if provider in {"webhook", "http"}:
+        webhook_url = _device_health_monitor_action_webhook_url(
+            _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL
+        )
+        if not webhook_url:
+            return {
+                "status": "not_configured",
+                "ok": False,
+                "missingSetting": "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
+            }
+        try:
+            response = requests.post(
+                webhook_url,
+                json=payload,
+                timeout=max(1, int(cs.DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC)),
+            )
+        except Exception as exc:
+            logger.warning("장비 이상 알림 SMS webhook 호출 실패", exc_info=True)
+            return {"status": "error", "ok": False, "provider": "webhook", "error": type(exc).__name__}
+        if 200 <= int(response.status_code) < 300:
+            return {"status": "sent", "ok": True, "provider": "webhook", "statusCode": int(response.status_code)}
+        return {
+            "status": "error",
+            "ok": False,
+            "provider": "webhook",
+            "statusCode": int(response.status_code),
+            "error": _display_value(response.text, default="")[:300],
+        }
+    return {
+        "status": "not_configured",
+        "ok": False,
+        "missingSetting": "DEVICE_HEALTH_MONITOR_SMS_PROVIDER",
+    }
+
+
+def _build_device_health_monitor_contact_webhook_payload(
+    *,
+    action_id: str,
+    item: dict[str, str],
+    actor_user_id: str,
+    channel_id: str,
+    message_ts: str,
+    now: datetime,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    sms_guide = _build_device_health_monitor_sms_guide(item)
+    if not sms_guide.get("supported"):
+        return None, {
+            "status": "unsupported_issue",
+            "ok": False,
+            "templateId": _display_value(sms_guide.get("templateId"), default="unsupported_issue"),
+            "reason": _display_value(
+                sms_guide.get("reason"),
+                default="hospital_sms_not_supported_for_issue",
+            ),
+        }
+
+    hospital_seq = _extract_device_health_monitor_hospital_seq(item)
+    contact = _lookup_device_health_monitor_hospital_contact(hospital_seq)
+    contact_status = _display_value(contact.get("status"), default="unknown")
+    phone_number, test_mode = _device_health_monitor_sms_target_phone_number(contact)
+    if (contact_status != "ok" and not test_mode) or not phone_number:
+        return None, {
+            "status": contact_status,
+            "ok": False,
+            "templateId": _display_value(sms_guide.get("templateId"), default=""),
+            "hospitalSeq": _display_value(contact.get("hospitalSeq"), default=str(hospital_seq or "")),
+        }
+
+    hospital_name = _display_value(
+        contact.get("hospitalName"),
+        default=_display_value(item.get("hospitalName"), default=_display_value(item.get("hospital"), default="")),
+    )
+    payload = {
+        "actionId": action_id,
+        "actionLabel": _DEVICE_HEALTH_MONITOR_ACTION_LABELS.get(action_id, action_id),
+        "requestType": "sms",
+        "createdAt": now.isoformat(),
+        "actorUserId": actor_user_id,
+        "hospital": {
+            "seq": _display_value(contact.get("hospitalSeq"), default=str(hospital_seq or "")),
+            "name": hospital_name,
+            "phoneNumber": phone_number,
+        },
+        "device": {
+            "name": item["device"],
+            "room": item["room"],
+            "issue": item["issue"],
+            "mdaUrl": item["mdaUrl"],
+        },
+        "sms": {
+            "to": phone_number,
+            "templateId": sms_guide["templateId"],
+            "title": sms_guide["title"],
+            "message": sms_guide["message"],
+            "testMode": test_mode,
+        },
+        "slack": {
+            "channelId": channel_id,
+            "messageTs": message_ts,
+        },
+    }
+    return payload, {
+        "status": "prepared",
+        "ok": True,
+        "templateId": sms_guide["templateId"],
+        "hospitalSeq": _display_value(contact.get("hospitalSeq"), default=str(hospital_seq or "")),
+        "phoneLast4": phone_number[-4:],
+        "testMode": test_mode,
+    }
+
+
+def _post_device_health_monitor_action_webhook(
+    *,
+    action_id: str,
+    item: dict[str, str],
+    actor_user_id: str,
+    channel_id: str,
+    message_ts: str,
+    now: datetime,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    if action_id == _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL:
+        try:
+            payload, prepared_result = _build_device_health_monitor_contact_webhook_payload(
+                action_id=action_id,
+                item=item,
+                actor_user_id=actor_user_id,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                now=now,
+            )
+        except Exception as exc:
+            logger.warning("장비 이상 알림 병원 연락 payload 생성 실패", exc_info=True)
+            return {"status": "error", "ok": False, "error": type(exc).__name__}
+        if payload is None:
+            return prepared_result
+        send_result = _post_device_health_monitor_sms_payload(payload, logger=logger)
+        return {**prepared_result, **send_result}
+    else:
+        webhook_url = _device_health_monitor_action_webhook_url(action_id)
+        if not webhook_url:
+            return {"status": "not_configured", "ok": False}
+        action_label = _DEVICE_HEALTH_MONITOR_ACTION_LABELS.get(action_id, action_id)
+        payload = {
+            "actionId": action_id,
+            "actionLabel": action_label,
+            "createdAt": now.isoformat(),
+            "actorUserId": actor_user_id,
+            "hospital": item["hospital"],
+            "room": item["room"],
+            "device": item["device"],
+            "issue": item["issue"],
+            "mdaUrl": item["mdaUrl"],
+            "slack": {
+                "channelId": channel_id,
+                "messageTs": message_ts,
+            },
+        }
+        prepared_result = {"status": "prepared", "ok": True}
+        try:
+            response = requests.post(
+                webhook_url,
+                json=payload,
+                timeout=max(1, int(cs.DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC)),
+            )
+        except Exception as exc:
+            logger.warning("장비 이상 알림 action webhook 호출 실패 action=%s", action_id, exc_info=True)
+            return {"status": "error", "ok": False, "error": type(exc).__name__}
+
+        if 200 <= int(response.status_code) < 300:
+            return {**prepared_result, "status": "sent", "ok": True, "statusCode": int(response.status_code)}
+        return {
+            **prepared_result,
+            "status": "error",
+            "ok": False,
+            "statusCode": int(response.status_code),
+            "error": _display_value(response.text, default="")[:300],
+        }
+
+
+def _build_device_health_monitor_action_reply(
+    *,
+    action_id: str,
+    item: dict[str, str],
+    actor_user_id: str,
+    result: dict[str, Any],
+) -> str:
+    action_label = _DEVICE_HEALTH_MONITOR_ACTION_LABELS.get(action_id, action_id)
+    target = _format_device_health_monitor_action_target(item)
+    user = f"<@{actor_user_id}>" if actor_user_id else "사용자"
+    status = _display_value(result.get("status"), default="")
+
+    if status == "recorded":
+        return f":white_check_mark: {user} {action_label} 처리했어. `{target}`"
+    if status == "cooldown":
+        remaining_seconds = max(1, int(result.get("remainingSeconds") or 0))
+        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+        return f":hourglass_flowing_sand: {user} 최근에 장비 음성 안내를 보냈어. `{target}`은 약 {remaining_minutes}분 뒤 다시 가능해."
+    if status == "not_implemented":
+        return f":construction: {user} {action_label}은 아직 실행하지 않았어. 마미박스 장비 코드 추가 후 연결해야 해. `{target}`"
+    if status == "sent":
+        if action_id == _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL:
+            template_id = _display_value(result.get("templateId"), default="")
+            return f":white_check_mark: {user} 병원 문자 발송 요청을 보냈어. `{target}` `{template_id}`"
+        return f":white_check_mark: {user} {action_label} 요청을 보냈어. `{target}`"
+    if status == "unsupported_issue":
+        return f":no_entry: {user} 이 이슈는 병원 문자 발송 대상이 아니야. 내부 확인으로 처리해줘. `{target}`"
+    if status == "missing_telephone":
+        return f":warning: {user} 병원 전화번호가 없어 문자를 보낼 수 없어. hospitals.telephone을 확인해줘. `{target}`"
+    if status in {"missing_hospital_seq", "hospital_not_found"}:
+        return f":warning: {user} 병원 정보를 찾지 못해서 문자를 보낼 수 없어. `{target}`"
+    if status == "not_configured":
+        setting_name = _display_value(
+            result.get("missingSetting"),
+            default=_DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS.get(action_id, "webhook"),
+        )
+        return f":warning: {user} {action_label} 버튼은 눌렸지만 `{setting_name}` 설정이 없어. 수동 처리해줘. `{target}`"
+    return f":warning: {user} {action_label} 요청이 실패했어. 수동 처리해줘. `{target}`"
+
+
+def _post_device_health_monitor_action_reply(
+    client: Any,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    text: str,
+    logger: logging.Logger,
+) -> None:
+    normalized_channel_id = str(channel_id or "").strip()
+    if not normalized_channel_id:
+        return
+    try:
+        message_kwargs: dict[str, Any] = {
+            "channel": normalized_channel_id,
+            "text": text,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        normalized_thread_ts = str(thread_ts or "").strip()
+        if normalized_thread_ts:
+            message_kwargs["thread_ts"] = normalized_thread_ts
+        client.chat_postMessage(**message_kwargs)
+    except Exception:
+        logger.warning("장비 이상 알림 action 응답을 Slack에 남기지 못했어", exc_info=True)
+
+
+def _handle_device_health_monitor_alert_action(
+    *,
+    action_id: str,
+    raw_item: Any,
+    actor_user_id: str,
+    channel_id: str,
+    message_ts: str,
+    thread_ts: str,
+    client: Any,
+    logger: logging.Logger,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    local_now = _coerce_daily_device_round_now(now)
+    item = _normalize_device_health_monitor_alert_action_item(raw_item)
+    state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
+    result: dict[str, Any]
+
+    if action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
+        # 실제 재생은 마미박스 장비 agent 쪽 명령 수신/오디오 재생 코드가 들어간 뒤 활성화한다.
+        result = {"status": "not_implemented", "ok": False}
+    else:
+        cooldown = _check_device_health_monitor_action_cooldown(
+            state,
+            action_id=action_id,
+            item=item,
+            now=local_now,
+        )
+        if cooldown.get("active"):
+            result = {"status": "cooldown", "ok": False, **cooldown}
+        elif action_id == _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE:
+            result = {"status": "recorded", "ok": True}
+        elif action_id in _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS:
+            result = _post_device_health_monitor_action_webhook(
+                action_id=action_id,
+                item=item,
+                actor_user_id=actor_user_id,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                now=local_now,
+                logger=logger,
+            )
+        else:
+            result = {"status": "unsupported_action", "ok": False}
+
+    _append_device_health_monitor_event(
+        "alert_action_requested",
+        {
+            "actionId": action_id,
+            "actionLabel": _DEVICE_HEALTH_MONITOR_ACTION_LABELS.get(action_id, action_id),
+            "actorUserId": actor_user_id,
+            "channelId": channel_id,
+            "messageTs": message_ts,
+            "threadTs": thread_ts,
+            "hospital": item["hospital"],
+            "room": item["room"],
+            "device": item["device"],
+            "issue": item["issue"],
+            "mdaUrl": item["mdaUrl"],
+            "result": result,
+        },
+        now=local_now,
+        logger=logger,
+    )
+    _post_device_health_monitor_action_reply(
+        client,
+        channel_id=channel_id,
+        thread_ts=thread_ts or message_ts,
+        text=_build_device_health_monitor_action_reply(
+            action_id=action_id,
+            item=item,
+            actor_user_id=actor_user_id,
+            result=result,
+        ),
+        logger=logger,
+    )
+    return {"item": item, "state": state, "result": result}
+
+
+def _extract_device_health_monitor_slack_action_payload(body: dict[str, Any]) -> dict[str, Any]:
+    actions = body.get("actions") if isinstance(body.get("actions"), list) else []
+    action = actions[0] if actions and isinstance(actions[0], dict) else {}
+    user = body.get("user") if isinstance(body.get("user"), dict) else {}
+    channel = body.get("channel") if isinstance(body.get("channel"), dict) else {}
+    message = body.get("message") if isinstance(body.get("message"), dict) else {}
+    return {
+        "actionId": _display_value(action.get("action_id"), default=""),
+        "value": action.get("value"),
+        "actorUserId": _display_value(user.get("id"), default=""),
+        "channelId": _display_value(channel.get("id"), default=""),
+        "messageTs": _display_value(message.get("ts"), default=""),
+        "threadTs": _display_value(message.get("thread_ts"), default=_display_value(message.get("ts"), default="")),
+    }
+
+
+def _handle_device_health_monitor_slack_action(
+    body: dict[str, Any],
+    client: Any,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    payload = _extract_device_health_monitor_slack_action_payload(body)
+    action_id = _display_value(payload.get("actionId"), default="")
+    if action_id not in _DEVICE_HEALTH_MONITOR_ACTION_IDS:
+        return {"result": {"status": "ignored", "ok": False}}
+    return _handle_device_health_monitor_alert_action(
+        action_id=action_id,
+        raw_item=payload.get("value"),
+        actor_user_id=_display_value(payload.get("actorUserId"), default=""),
+        channel_id=_display_value(payload.get("channelId"), default=""),
+        message_ts=_display_value(payload.get("messageTs"), default=""),
+        thread_ts=_display_value(payload.get("threadTs"), default=""),
+        client=client,
+        logger=logger,
+    )
 
 
 def _filter_device_health_monitor_alert_summary(
@@ -1820,7 +2531,7 @@ def _collect_device_health_monitor_alert_updates(
             }
             continue
 
-        # 캡처보드처럼 순간 인식이 흔들리는 항목은 연속 확인 후에만 Slack으로 올린다.
+        # 기본값은 즉시 알림이다. pending은 나중에 특정 항목만 지연 확인이 필요할 때를 위한 상태다.
         updated_pending_alerts[fingerprint] = {
             "firstSeenAt": str(pending.get("firstSeenAt") or now_text),
             "lastSeenAt": now_text,
@@ -1981,6 +2692,7 @@ def _run_device_health_monitor_once(
         channel_id=channel_id,
         message_ts="",
         logger=logger,
+        include_actions=True,
     )
     _append_device_health_monitor_event(
         "slack_alert_sent",
@@ -2013,6 +2725,20 @@ def _device_health_monitor_loop(client: Any, logger: logging.Logger) -> None:
         time.sleep(poll_interval_sec)
 
 
+def _attach_device_health_monitor_alert_actions(app: Any, logger: logging.Logger) -> None:
+    def _build_action_handler(action_id: str):
+        def _handle_action(ack, body: dict[str, Any], client: Any) -> None:
+            ack()
+            action_body = body if isinstance(body, dict) else {}
+            # Slack action은 즉시 ack한 뒤, 실제 연락/음성 요청은 별도 handler에서 기록하고 처리해.
+            _handle_device_health_monitor_slack_action(action_body, client, logger)
+
+        return _handle_action
+
+    for action_id in sorted(_DEVICE_HEALTH_MONITOR_ACTION_IDS):
+        app.action(action_id)(_build_action_handler(action_id))
+
+
 def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | None = None) -> None:
     if not cs.DEVICE_HEALTH_MONITOR_ENABLED:
         return
@@ -2028,6 +2754,8 @@ def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | 
     if client is None:
         actual_logger.warning("장비 상태 모니터를 시작하지 못했어. Slack client가 없어")
         return
+
+    _attach_device_health_monitor_alert_actions(app, actual_logger)
 
     global _DEVICE_HEALTH_MONITOR_THREAD
     with _DEVICE_HEALTH_MONITOR_THREAD_LOCK:

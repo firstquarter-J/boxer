@@ -29,6 +29,10 @@ _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK = threading.Lock()
 _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
 _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12000
 _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
+_DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = "device_health_alert_contact_hospital"
+_DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
+_DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
+_DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
 _DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS = (
     "activeHospitalSeq",
     "activeHospitalName",
@@ -404,6 +408,8 @@ def _collect_daily_device_round_abnormal_alert_items(
         device_name = _display_value(device_result.get("deviceName"), default="장비명 미확인")
         items.append(
             {
+                "hospitalSeq": str(hospital_seq or ""),
+                "hospitalName": hospital_name,
                 "hospital": _format_daily_device_round_hospital_label(hospital_name, hospital_seq),
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
@@ -461,6 +467,103 @@ def _build_daily_device_round_abnormal_alert_text(
     return "\n".join(lines)
 
 
+def _build_device_health_alert_action_value(item: dict[str, str]) -> str:
+    payload = {
+        "hospitalSeq": _display_value(item.get("hospitalSeq"), default=""),
+        "hospitalName": _display_value(item.get("hospitalName"), default=""),
+        "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
+        "room": _display_value(item.get("room"), default="병실 미확인"),
+        "device": _display_value(item.get("device"), default="장비명 미확인"),
+        "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
+        "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
+    }
+    value = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(value) <= 1900:
+        return value
+
+    # Slack button value는 길이 제한이 있어 긴 이슈 문구만 줄이고 식별 정보는 보존해.
+    payload["issue"] = payload["issue"][:300]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:1900]
+
+
+def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[str, Any]]:
+    item_text_lines = [
+        f"*{item['hospital']}*",
+        f"> *병실*  {item['room']}",
+        f"> *장비*  `{item['device']}`",
+        f"> *이슈*  {item['issue']}",
+    ]
+    if item.get("mdaUrl"):
+        item_text_lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA 에서 장비 확인 바로가기>")
+
+    action_value = _build_device_health_alert_action_value(item)
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "\n".join(item_text_lines),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "병원 문자 보내기"},
+                    "action_id": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                    "value": action_value,
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
+                    "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                    "value": action_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "확인 완료"},
+                    "action_id": _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+                    "value": action_value,
+                },
+            ],
+        },
+    ]
+
+
+def _build_daily_device_round_abnormal_alert_blocks(
+    report_summary: dict[str, Any],
+    permalink: str | None,
+) -> list[dict[str, Any]]:
+    alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": ":rotating_light: *이상 발견 - 확인 요망*"},
+        }
+    ]
+
+    # 버튼은 장비별로 붙이되, Slack block 제한을 넘지 않게 상위 일부만 노출해.
+    for item in alert_items[:_DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT]:
+        blocks.extend(_build_device_health_alert_item_blocks(item))
+
+    omitted_count = max(0, len(alert_items) - _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT)
+    context_parts: list[dict[str, str]] = []
+    if omitted_count:
+        context_parts.append(
+            {
+                "type": "mrkdwn",
+                "text": f"버튼은 상위 {_DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT}건만 표시했어. 나머지 {omitted_count}건은 본문에서 확인해.",
+            }
+        )
+    if permalink:
+        context_parts.append({"type": "mrkdwn", "text": f":link: <{permalink}|상세 리포트 보기>"})
+    if context_parts:
+        blocks.append({"type": "context", "elements": context_parts})
+    return blocks
+
+
 def _post_daily_device_round_abnormal_alert(
     client: Any,
     report_summary: dict[str, Any],
@@ -468,6 +571,7 @@ def _post_daily_device_round_abnormal_alert(
     channel_id: str,
     message_ts: str,
     logger: logging.Logger,
+    include_actions: bool = False,
 ) -> None:
     if not _daily_device_round_has_abnormal_result(report_summary):
         return
@@ -480,12 +584,18 @@ def _post_daily_device_round_abnormal_alert(
     )
     try:
         # 이상 장비가 스레드 안에 묻히지 않도록 같은 채널 루트에도 확인 알림을 남겨.
-        client.chat_postMessage(
-            channel=channel_id,
-            text=_build_daily_device_round_abnormal_alert_text(report_summary, permalink),
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+        message_kwargs: dict[str, Any] = {
+            "channel": channel_id,
+            "text": _build_daily_device_round_abnormal_alert_text(report_summary, permalink),
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        if include_actions:
+            message_kwargs["blocks"] = _build_daily_device_round_abnormal_alert_blocks(
+                report_summary,
+                permalink,
+            )
+        client.chat_postMessage(**message_kwargs)
     except Exception:
         logger.warning(
             "일일 장비 순회 이상 알림을 보내지 못했어 channel=%s message_ts=%s",
