@@ -510,7 +510,7 @@ def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[st
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "병원 문자 보내기"},
+                    "text": {"type": "plain_text", "text": "병원 문자 보내기(테스트중-클릭금지)"},
                     "action_id": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
                     "value": action_value,
                     "style": "primary",
@@ -519,12 +519,6 @@ def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[st
                     "type": "button",
                     "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
                     "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-                    "value": action_value,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "확인 완료"},
-                    "action_id": _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
                     "value": action_value,
                 },
             ],
