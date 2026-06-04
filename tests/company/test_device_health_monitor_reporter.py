@@ -14,10 +14,15 @@ from boxer_company_adapter_slack import device_health_monitor_reporter as report
 class _FakeSlackClient:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
+        self.views: list[dict[str, object]] = []
 
     def chat_postMessage(self, **kwargs) -> dict[str, str]:
         self.messages.append(kwargs)
         return {"ts": f"3000.{len(self.messages):03d}"}
+
+    def views_open(self, **kwargs) -> dict[str, bool]:
+        self.views.append(kwargs)
+        return {"ok": True}
 
 
 class _FakeWebhookResponse:
@@ -296,6 +301,193 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             ["run_summary"],
         )
 
+    def test_contact_action_opens_sms_modal_with_editable_defaults(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.action")
+        item = {
+            "hospitalSeq": "69",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "issue": "캡처보드 USB나 비디오 장치를 찾지 못했어",
+            "mdaUrl": "https://mda.example/device",
+        }
+        body = {
+            "trigger_id": "TRIGGER123",
+            "user": {"id": "U123"},
+            "channel": {"id": "C_HEALTH"},
+            "message": {"ts": "3000.001"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                    "value": json.dumps(item, ensure_ascii=False),
+                }
+            ],
+        }
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._lookup_device_health_monitor_hospital_contact",
+                return_value={
+                    "status": "ok",
+                    "hospitalSeq": "69",
+                    "hospitalName": "수지미래산부인과의원(용인)",
+                    "telephone": "010-1234-4567",
+                    "phoneNumber": "01012344567",
+                },
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+            ),
+        ):
+            result = reporter._handle_device_health_monitor_slack_action(body, client, logger)
+
+        self.assertEqual(result["result"]["status"], "modal_opened")
+        self.assertEqual(len(client.views), 1)
+        self.assertEqual(client.views[0]["trigger_id"], "TRIGGER123")
+        view = client.views[0]["view"]
+        self.assertEqual(view["callback_id"], reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID)
+        metadata = json.loads(view["private_metadata"])
+        self.assertEqual(metadata["channelId"], "C_HEALTH")
+        self.assertEqual(metadata["messageTs"], "3000.001")
+        phone_block = next(
+            block
+            for block in view["blocks"]
+            if block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID
+        )
+        message_block = next(
+            block
+            for block in view["blocks"]
+            if block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID
+        )
+        self.assertEqual(phone_block["element"]["initial_value"], "01012344567")
+        self.assertIn("캡처보드 USB 케이블", message_block["element"]["initial_value"])
+
+    def test_contact_modal_submission_sends_custom_phone_and_message(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.action")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = {
+            "hospitalSeq": "69",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "issue": "LED USB 장치를 찾지 못했어",
+            "mdaUrl": "https://mda.example/device",
+        }
+        body = {
+            "user": {"id": "U999"},
+            "view": {
+                "private_metadata": json.dumps(
+                    {
+                        "actionId": reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                        "actorUserId": "U123",
+                        "channelId": "C_HEALTH",
+                        "messageTs": "3000.001",
+                        "threadTs": "3000.001",
+                        "item": item,
+                    },
+                    ensure_ascii=False,
+                ),
+                "state": {
+                    "values": {
+                        reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID: {
+                            reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_ACTION_ID: {
+                                "value": "+82 10-9999-0000",
+                            }
+                        },
+                        reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID: {
+                            reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_ACTION_ID: {
+                                "value": "직접 작성한 안내 문자입니다.",
+                            }
+                        },
+                    }
+                },
+            },
+        }
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_SMS_PROVIDER", "webhook"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL", "https://hook.example/sms"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC", 3),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
+                return_value={},
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._lookup_device_health_monitor_hospital_contact",
+                return_value={
+                    "status": "ok",
+                    "hospitalSeq": "69",
+                    "hospitalName": "수지미래산부인과의원(용인)",
+                    "telephone": "031-123-4567",
+                    "phoneNumber": "0311234567",
+                },
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter.requests.post",
+                return_value=_FakeWebhookResponse(),
+            ) as post_mock,
+        ):
+            result = reporter._handle_device_health_monitor_contact_modal_submission(
+                body,
+                client,
+                logger,
+                now=local_now,
+            )
+
+        self.assertEqual(result["result"]["status"], "sent")
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertEqual(payload["actorUserId"], "U999")
+        self.assertEqual(payload["hospital"]["phoneNumber"], "01099990000")
+        self.assertEqual(payload["sms"]["to"], "01099990000")
+        self.assertEqual(payload["sms"]["templateId"], "manual")
+        self.assertEqual(payload["sms"]["message"], "직접 작성한 안내 문자입니다.")
+        self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
+
+    def test_contact_modal_submission_validates_phone_and_message(self) -> None:
+        item = {
+            "hospitalSeq": "69",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "issue": "LED USB 장치를 찾지 못했어",
+            "mdaUrl": "",
+        }
+        body = {
+            "view": {
+                "private_metadata": json.dumps({"item": item}, ensure_ascii=False),
+                "state": {
+                    "values": {
+                        reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID: {
+                            reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_ACTION_ID: {
+                                "value": "031-123-4567",
+                            }
+                        },
+                        reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID: {
+                            reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_ACTION_ID: {
+                                "value": "",
+                            }
+                        },
+                    }
+                },
+            }
+        }
+
+        errors = reporter._validate_device_health_monitor_contact_modal_submission(body)
+
+        self.assertEqual(
+            errors[reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID],
+            "휴대전화번호만 입력할 수 있어",
+        )
+        self.assertEqual(
+            errors[reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID],
+            "문자 내용을 입력해줘",
+        )
+
     def test_contact_action_posts_webhook_and_thread_reply(self) -> None:
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor.action")
@@ -326,8 +518,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "status": "ok",
                     "hospitalSeq": "69",
                     "hospitalName": "수지미래산부인과의원(용인)",
-                    "telephone": "031-123-4567",
-                    "phoneNumber": "0311234567",
+                    "telephone": "010-1234-4567",
+                    "phoneNumber": "01012344567",
                 },
             ) as lookup_contact_mock,
             patch(
@@ -356,9 +548,9 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         payload = post_mock.call_args.kwargs["json"]
         self.assertEqual(payload["requestType"], "sms")
         self.assertEqual(payload["actorUserId"], "U123")
-        self.assertEqual(payload["hospital"]["phoneNumber"], "0311234567")
+        self.assertEqual(payload["hospital"]["phoneNumber"], "01012344567")
         self.assertEqual(payload["device"]["name"], "MB2-C00043")
-        self.assertEqual(payload["sms"]["to"], "0311234567")
+        self.assertEqual(payload["sms"]["to"], "01012344567")
         self.assertEqual(payload["sms"]["templateId"], "captureboard_disconnected")
         self.assertIn("캡처보드 USB 케이블", payload["sms"]["message"])
         self.assertEqual(len(client.messages), 1)
@@ -461,6 +653,57 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(result["result"]["status"], "missing_telephone")
         post_mock.assert_not_called()
         self.assertIn("병원 전화번호가 없어", client.messages[0]["text"])
+
+    def test_contact_action_rejects_landline_phone(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.action")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = {
+            "hospitalSeq": "69",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "issue": "LED USB 장치를 찾지 못했어",
+            "mdaUrl": "",
+        }
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_SMS_PROVIDER", "webhook"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL", "https://hook.example/sms"),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
+                return_value={},
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._lookup_device_health_monitor_hospital_contact",
+                return_value={
+                    "status": "ok",
+                    "hospitalSeq": "69",
+                    "hospitalName": "수지미래산부인과의원(용인)",
+                    "telephone": "031-123-4567",
+                    "phoneNumber": "0311234567",
+                },
+            ),
+            patch("boxer_company_adapter_slack.device_health_monitor_reporter.requests.post") as post_mock,
+        ):
+            result = reporter._handle_device_health_monitor_alert_action(
+                action_id=reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                raw_item=item,
+                actor_user_id="U123",
+                channel_id="C_HEALTH",
+                message_ts="3000.001",
+                thread_ts="3000.001",
+                client=client,
+                logger=logger,
+                now=local_now,
+            )
+
+        self.assertEqual(result["result"]["status"], "non_mobile_telephone")
+        post_mock.assert_not_called()
+        self.assertIn("휴대전화번호가 아니라", client.messages[0]["text"])
 
     def test_contact_action_can_send_sms_via_solapi_provider(self) -> None:
         client = _FakeSlackClient()
