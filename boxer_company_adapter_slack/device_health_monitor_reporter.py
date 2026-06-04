@@ -450,6 +450,14 @@ def _device_health_monitor_sms_target_phone_number(contact: dict[str, str]) -> t
     return _display_value(contact.get("phoneNumber"), default=""), False
 
 
+def _device_health_monitor_default_modal_phone_number(contact: dict[str, str]) -> str:
+    # 모달 기본값은 테스트 번호가 아니라 병원 전화번호가 실제 휴대전화일 때만 채운다.
+    phone_number = _display_value(contact.get("phoneNumber"), default="")
+    if not _is_device_health_monitor_mobile_phone_number(phone_number):
+        return ""
+    return _device_health_monitor_korean_national_phone_number(phone_number)
+
+
 def _lookup_device_health_monitor_hospital_contact(
     hospital_seq: int | None,
 ) -> dict[str, str]:
@@ -495,9 +503,10 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
 
     if "캡처보드" in issue or "비디오 장치" in issue or "영상" in issue:
         message = (
-            "[마미박스] "
-            f"{room} {device}에서 영상 입력 장치를 찾지 못하고 있습니다. "
-            "캡처보드 USB 케이블과 초음파 영상 장치 연결 상태를 확인해 주세요."
+            "[마미박스]\n"
+            f"{room} {device}에서 초음파 영상 입력 장치 연결 확인이 필요합니다.\n\n"
+            "먼저 초음파 장비와 마미박스를 연결하는 HDMI 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
+            "케이블이 빠져 있거나 헐거우면 영상이 정상적으로 들어오지 않을 수 있습니다."
         )
         return {
             "supported": True,
@@ -508,9 +517,10 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
 
     if "led" in lowered or "엘이디" in issue:
         message = (
-            "[마미박스] "
-            f"{room} {device}에서 장비 상태 표시등 연결 확인이 필요합니다. "
-            "LED USB 케이블이 빠져 있거나 헐겁지 않은지 확인해 주세요."
+            "[마미박스]\n"
+            f"{room} {device}에서 장비 상태 표시등 연결 확인이 필요합니다.\n\n"
+            "먼저 LED USB 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
+            "케이블이 빠져 있거나 헐거우면 상태 표시등이 정상적으로 동작하지 않을 수 있습니다."
         )
         return {
             "supported": True,
@@ -523,9 +533,10 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
         token in issue for token in ("오디오", "소리", "스피커")
     ):
         message = (
-            "[마미박스] "
-            f"{room} {device}에서 소리 출력 상태 확인이 필요합니다. "
-            "스피커 전원과 오디오 케이블 연결 상태를 확인해 주세요."
+            "[마미박스]\n"
+            f"{room} {device}에서 소리 출력 상태 확인이 필요합니다.\n\n"
+            "먼저 스피커 전원과 오디오 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
+            "케이블이 빠져 있거나 입력 소스가 맞지 않으면 소리가 나오지 않을 수 있습니다."
         )
         return {
             "supported": True,
@@ -1024,9 +1035,7 @@ def _build_device_health_monitor_sms_modal_view(
         contact = _lookup_device_health_monitor_hospital_contact(hospital_seq)
     except Exception:
         contact = {}
-    default_phone_number, _test_mode = _device_health_monitor_sms_target_phone_number(contact)
-    if not _is_device_health_monitor_mobile_phone_number(default_phone_number):
-        default_phone_number = ""
+    default_phone_number = _device_health_monitor_default_modal_phone_number(contact)
     default_message = _display_value(sms_guide.get("message"), default="")
     target = _format_device_health_monitor_action_target(item)
     metadata = {
@@ -1040,7 +1049,7 @@ def _build_device_health_monitor_sms_modal_view(
     phone_element: dict[str, Any] = {
         "type": "plain_text_input",
         "action_id": _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_ACTION_ID,
-        "placeholder": {"type": "plain_text", "text": "01012345678"},
+        "placeholder": {"type": "plain_text", "text": "휴대전화번호 입력 필요"},
     }
     if default_phone_number:
         phone_element["initial_value"] = default_phone_number
