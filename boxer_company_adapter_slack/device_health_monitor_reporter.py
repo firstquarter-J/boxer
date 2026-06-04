@@ -78,6 +78,8 @@ _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID = "device_health_alert_sms_phone
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_ACTION_ID = "phone_number"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID = "device_health_alert_sms_message"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_ACTION_ID = "message"
+# 병원 관계자가 첫 줄에서 발신 주체를 바로 알 수 있게 모든 기본 문자에 같은 인사를 쓴다.
+_DEVICE_HEALTH_MONITOR_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -503,7 +505,7 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
 
     if "캡처보드" in issue or "비디오 장치" in issue or "영상" in issue:
         message = (
-            "[마미박스]\n"
+            f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
             f"{room} {device}에서 초음파 영상 입력 장치 연결 확인이 필요합니다.\n\n"
             "먼저 초음파 장비와 마미박스를 연결하는 HDMI 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
             "케이블이 빠져 있거나 헐거우면 영상이 정상적으로 들어오지 않을 수 있습니다."
@@ -517,7 +519,7 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
 
     if "led" in lowered or "엘이디" in issue:
         message = (
-            "[마미박스]\n"
+            f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
             f"{room} {device}에서 장비 상태 표시등 연결 확인이 필요합니다.\n\n"
             "먼저 LED USB 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
             "케이블이 빠져 있거나 헐거우면 상태 표시등이 정상적으로 동작하지 않을 수 있습니다."
@@ -533,7 +535,7 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
         token in issue for token in ("오디오", "소리", "스피커")
     ):
         message = (
-            "[마미박스]\n"
+            f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
             f"{room} {device}에서 소리 출력 상태 확인이 필요합니다.\n\n"
             "먼저 스피커 전원과 오디오 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
             "케이블이 빠져 있거나 입력 소스가 맞지 않으면 소리가 나오지 않을 수 있습니다."

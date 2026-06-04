@@ -361,6 +361,9 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             if block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID
         )
         self.assertEqual(phone_block["element"]["initial_value"], "01012344567")
+        self.assertTrue(
+            message_block["element"]["initial_value"].startswith("안녕하세요 마미톡입니다. 🌷")
+        )
         self.assertIn("HDMI 케이블을 분리했다가 다시", message_block["element"]["initial_value"])
         self.assertIn("\n\n", message_block["element"]["initial_value"])
 
@@ -407,6 +410,9 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         )
         self.assertNotIn("initial_value", phone_block["element"])
         self.assertEqual(phone_block["element"]["placeholder"]["text"], "휴대전화번호 입력 필요")
+        self.assertTrue(
+            message_block["element"]["initial_value"].startswith("안녕하세요 마미톡입니다. 🌷")
+        )
         self.assertIn("LED USB 케이블을 분리했다가 다시", message_block["element"]["initial_value"])
 
     def test_contact_modal_submission_sends_custom_phone_and_message(self) -> None:
@@ -598,6 +604,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(payload["device"]["name"], "MB2-C00043")
         self.assertEqual(payload["sms"]["to"], "01012344567")
         self.assertEqual(payload["sms"]["templateId"], "captureboard_disconnected")
+        self.assertTrue(payload["sms"]["message"].startswith("안녕하세요 마미톡입니다. 🌷"))
         self.assertIn("HDMI 케이블을 분리했다가 다시", payload["sms"]["message"])
         self.assertEqual(len(client.messages), 1)
         self.assertEqual(client.messages[0]["thread_ts"], "3000.001")
@@ -816,6 +823,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         solapi_payload = post_mock.call_args.kwargs["json"]
         self.assertEqual(solapi_payload["messages"][0]["to"], "01048130831")
         self.assertEqual(solapi_payload["messages"][0]["from"], "0212345678")
+        self.assertTrue(solapi_payload["messages"][0]["text"].startswith("안녕하세요 마미톡입니다. 🌷"))
         self.assertIn("HDMI 케이블을 분리했다가 다시", solapi_payload["messages"][0]["text"])
         self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
 
