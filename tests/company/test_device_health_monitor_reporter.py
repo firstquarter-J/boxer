@@ -101,6 +101,7 @@ def _abnormal_summary() -> dict:
             {
                 "hospitalSeq": 69,
                 "hospitalName": "수지미래산부인과의원(용인)",
+                "hospitalTelephone": "031-123-4567",
                 "roomName": "1진료실",
                 "deviceName": "MB2-C00043",
                 "overallLabel": "이상",
@@ -206,6 +207,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 [
                     ":rotating_light: *이상 발견 - 확인 요망*",
                     "*#69 수지미래산부인과의원(용인)*",
+                    "> *전화*  031-123-4567",
                     "> *병실*  1진료실",
                     "> *장비*  `MB2-C00043`",
                     "> *이슈*  LED USB 장치를 찾지 못했어",
@@ -227,6 +229,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(action_blocks[0]["elements"][1]["text"]["text"], "장비 음성 안내(미구현)")
         self.assertIn("MB2-C00043", action_blocks[0]["elements"][0]["value"])
         self.assertIn('"hospitalSeq":"69"', action_blocks[0]["elements"][0]["value"])
+        self.assertIn('"telephone":"031-123-4567"', action_blocks[0]["elements"][0]["value"])
         saved_state = save_state_mock.call_args.args[0]
         self.assertEqual(saved_state["processedHospitalSeqs"], [])
         self.assertIsNone(saved_state["lastHospitalSeq"])
@@ -808,6 +811,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "deviceName": "MB2-C00043",
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
+            "hospitalTelephone": "031-123-4567",
             "roomName": "1진료실",
         }
         evidence_payload = {
@@ -893,6 +897,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "deviceName": "MB2-C00043",
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
+            "hospitalTelephone": "031-123-4567",
             "roomName": "1진료실",
         }
         redis_client = _FakeRedisStateClient(
@@ -953,6 +958,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "deviceName": "MB2-C00043",
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
+            "hospitalTelephone": "031-123-4567",
             "roomName": "1진료실",
         }
         redis_client = _FakeRedisStateClient(
@@ -1006,6 +1012,32 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(summary["deviceCandidateCachedAt"], cached_at)
         self.assertEqual(summary["statusCounts"]["정상"], 1)
 
+    def test_excludes_number_prefixed_hospitals_from_candidate_cache(self) -> None:
+        # 출고/작업 상태를 병원명 앞 숫자_로 표시하는 가상 병원은 24시간 이상 감시 대상에서 제외해.
+        candidates = reporter._normalize_device_health_monitor_device_candidate_cache(
+            [
+                {
+                    "deviceSeq": 1001,
+                    "deviceName": "MB2-C00805",
+                    "hospitalSeq": 3,
+                    "hospitalName": "3_작업완료 병실 출고대기",
+                    "hospitalTelephone": "031-111-2222",
+                    "roomName": "출고대기",
+                },
+                {
+                    "deviceSeq": 1002,
+                    "deviceName": "MB2-C00043",
+                    "hospitalSeq": 69,
+                    "hospitalName": "수지미래산부인과의원(용인)",
+                    "hospitalTelephone": "031-123-4567",
+                    "roomName": "1진료실",
+                },
+            ]
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["deviceName"], "MB2-C00043")
+
     def test_uses_stale_device_candidate_cache_when_refresh_fails(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
         cached_at = (local_now - timedelta(days=2)).isoformat()
@@ -1014,6 +1046,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "deviceName": "MB2-C00043",
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
+            "hospitalTelephone": "031-123-4567",
             "roomName": "1진료실",
         }
         redis_client = _FakeRedisStateClient(

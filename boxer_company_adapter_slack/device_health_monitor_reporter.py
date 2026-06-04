@@ -72,6 +72,7 @@ _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
 }
 _DEVICE_HEALTH_MONITOR_HOSPITAL_SEQ_PATTERN = re.compile(r"#\s*(\d+)")
+_DEVICE_HEALTH_MONITOR_EXCLUDED_HOSPITAL_NAME_PATTERN = re.compile(r"^\d+_")
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -251,6 +252,10 @@ def _normalize_device_health_monitor_device_candidate_cache(value: Any) -> list[
         device_name = _display_value(raw.get("deviceName"), default="")
         if not device_name or device_name in seen_device_names:
             continue
+        # 숫자_ 접두 병원은 출고/작업 상태용 가상 병원이므로 캐시에서도 감시 대상에서 제외한다.
+        hospital_name = _display_value(raw.get("hospitalName"), default="미확인")
+        if _is_device_health_monitor_excluded_hospital_name(hospital_name):
+            continue
         seen_device_names.add(device_name)
         items.append(
             {
@@ -258,11 +263,17 @@ def _normalize_device_health_monitor_device_candidate_cache(value: Any) -> list[
                 "deviceName": device_name,
                 "hospitalSeq": _coerce_int(raw.get("hospitalSeq")),
                 "hospitalRoomSeq": _coerce_int(raw.get("hospitalRoomSeq")),
-                "hospitalName": _display_value(raw.get("hospitalName"), default="미확인"),
+                "hospitalName": hospital_name,
+                "hospitalTelephone": _display_value(raw.get("hospitalTelephone"), default=""),
                 "roomName": _display_value(raw.get("roomName"), default="미확인"),
             }
         )
     return items
+
+
+def _is_device_health_monitor_excluded_hospital_name(value: Any) -> bool:
+    hospital_name = _display_value(value, default="").strip()
+    return bool(_DEVICE_HEALTH_MONITOR_EXCLUDED_HOSPITAL_NAME_PATTERN.match(hospital_name))
 
 
 def _normalize_device_health_monitor_action_cooldowns(value: Any) -> dict[str, dict[str, Any]]:
@@ -365,6 +376,7 @@ def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, 
         "hospitalSeq": _display_value(item.get("hospitalSeq"), default=""),
         "hospitalName": _display_value(item.get("hospitalName"), default=""),
         "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
+        "telephone": _display_value(item.get("telephone"), default=""),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
@@ -1083,12 +1095,14 @@ def _load_device_health_monitor_device_candidates() -> list[dict[str, Any]]:
                 "d.hospitalSeq AS hospitalSeq, "
                 "d.hospitalRoomSeq AS hospitalRoomSeq, "
                 "h.hospitalName AS hospitalName, "
+                "h.telephone AS hospitalTelephone, "
                 "hr.roomName AS roomName "
                 "FROM devices d "
                 "INNER JOIN hospitals h ON d.hospitalSeq = h.seq "
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE d.hospitalSeq IS NOT NULL "
                 "AND COALESCE(d.deviceName, '') <> '' "
+                "AND COALESCE(h.hospitalName, '') NOT REGEXP '^[0-9]+_' "
                 "AND COALESCE(d.activeFlag, 1) = 1 "
                 "AND COALESCE(d.installFlag, 1) = 1 "
                 "ORDER BY d.hospitalSeq ASC, COALESCE(hr.roomName, '') ASC, d.deviceName ASC, d.seq DESC"
@@ -1103,6 +1117,10 @@ def _load_device_health_monitor_device_candidates() -> list[dict[str, Any]]:
         device_name = _display_value(row.get("deviceName"), default="")
         if not device_name or device_name in seen_device_names:
             continue
+        # SQL 필터를 보강해 row 데이터가 직접 주입되는 테스트/대체 DB에서도 같은 제외 규칙을 유지한다.
+        hospital_name = _display_value(row.get("hospitalName"), default="미확인")
+        if _is_device_health_monitor_excluded_hospital_name(hospital_name):
+            continue
         seen_device_names.add(device_name)
         items.append(
             {
@@ -1110,7 +1128,8 @@ def _load_device_health_monitor_device_candidates() -> list[dict[str, Any]]:
                 "deviceName": device_name,
                 "hospitalSeq": _coerce_int(row.get("hospitalSeq")),
                 "hospitalRoomSeq": _coerce_int(row.get("hospitalRoomSeq")),
-                "hospitalName": _display_value(row.get("hospitalName"), default="미확인"),
+                "hospitalName": hospital_name,
+                "hospitalTelephone": _display_value(row.get("hospitalTelephone"), default=""),
                 "roomName": _display_value(row.get("roomName"), default="미확인"),
             }
         )
@@ -1127,13 +1146,20 @@ def _load_device_health_monitor_device_candidates_cached(
     now: datetime,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     state_payload = state if isinstance(state, dict) else {}
+    raw_cached_devices = state_payload.get("deviceCandidateCache")
     cached_devices = _normalize_device_health_monitor_device_candidate_cache(
-        state_payload.get("deviceCandidateCache")
+        raw_cached_devices
+    )
+    # 전화번호 필드 추가 전의 캐시는 알림 본문에 hospitals.telephone을 채울 수 없어 한 번 새로 조회한다.
+    cache_has_hospital_telephone = isinstance(raw_cached_devices, list) and all(
+        isinstance(raw, dict) and "hospitalTelephone" in raw
+        for raw in raw_cached_devices
     )
     cached_at_text = _display_value(state_payload.get("deviceCandidateCachedAt"), default="")
     cached_at = _parse_device_health_monitor_datetime(cached_at_text)
     cache_is_fresh = bool(
         cached_devices
+        and cache_has_hospital_telephone
         and cached_at is not None
         and now - cached_at < _device_health_monitor_device_cache_ttl_delta()
     )
@@ -1666,6 +1692,7 @@ def _build_device_health_monitor_redis_status_payload(
         "checkInvalidBarcode": (device_state or {}).get("checkInvalidBarcode"),
         "captureBoardType": _display_value((device_state or {}).get("captureBoardType"), default=""),
         "hospitalName": _display_value(device_context.get("hospitalName"), default=""),
+        "hospitalTelephone": _display_value(device_context.get("hospitalTelephone"), default=""),
         "roomName": _display_value(device_context.get("roomName"), default=""),
         "isConnected": bool((device_state or {}).get("isConnected")),
     }
@@ -1715,6 +1742,7 @@ def _build_device_health_monitor_redis_unavailable_status_payload(
             "version": _display_value((device_state or {}).get("version"), default=""),
             "captureBoardType": _display_value((device_state or {}).get("captureBoardType"), default=""),
             "hospitalName": _display_value(device_context.get("hospitalName"), default=""),
+            "hospitalTelephone": _display_value(device_context.get("hospitalTelephone"), default=""),
             "roomName": _display_value(device_context.get("roomName"), default=""),
             "isConnected": bool((device_state or {}).get("isConnected")),
         },
@@ -2197,6 +2225,10 @@ def _build_device_health_monitor_result(
         "hospitalName": _display_value(
             device_context.get("hospitalName"),
             default=_display_value(device_payload.get("hospitalName"), default="미확인"),
+        ),
+        "hospitalTelephone": _display_value(
+            device_context.get("hospitalTelephone"),
+            default=_display_value(device_payload.get("hospitalTelephone"), default=""),
         ),
         "roomName": _display_value(
             device_context.get("roomName"),

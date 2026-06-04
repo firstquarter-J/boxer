@@ -402,6 +402,11 @@ def _collect_daily_device_round_abnormal_alert_items(
         if hospital_seq is None:
             hospital_seq = default_hospital_seq
         hospital_name = _display_value(device_result.get("hospitalName"), default=default_hospital_name)
+        # 루트 이상 알림만 보고도 병원 연락처를 확인할 수 있게 hospitals.telephone을 함께 전달한다.
+        hospital_telephone = _display_value(
+            device_result.get("hospitalTelephone"),
+            default=_display_value(report_summary.get("hospitalTelephone"), default=""),
+        )
         issue = _build_daily_device_round_issue_summary(device_result)
         if not issue:
             issue = _display_value(device_result.get("priorityReason"), default="상세 확인 필요")
@@ -411,6 +416,7 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "hospitalSeq": str(hospital_seq or ""),
                 "hospitalName": hospital_name,
                 "hospital": _format_daily_device_round_hospital_label(hospital_name, hospital_seq),
+                "telephone": hospital_telephone,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
                 "issue": issue,
@@ -454,6 +460,7 @@ def _build_daily_device_round_abnormal_alert_text(
             if len(lines) > 1:
                 lines.append("")
             lines.append(f"*{item['hospital']}*")
+            lines.append(f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}")
             lines.append(f"> *병실*  {item['room']}")
             lines.append(f"> *장비*  `{item['device']}`")
             lines.append(f"> *이슈*  {item['issue']}")
@@ -472,6 +479,7 @@ def _build_device_health_alert_action_value(item: dict[str, str]) -> str:
         "hospitalSeq": _display_value(item.get("hospitalSeq"), default=""),
         "hospitalName": _display_value(item.get("hospitalName"), default=""),
         "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
+        "telephone": _display_value(item.get("telephone"), default=""),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
@@ -489,6 +497,7 @@ def _build_device_health_alert_action_value(item: dict[str, str]) -> str:
 def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[str, Any]]:
     item_text_lines = [
         f"*{item['hospital']}*",
+        f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}",
         f"> *병실*  {item['room']}",
         f"> *장비*  `{item['device']}`",
         f"> *이슈*  {item['issue']}",
