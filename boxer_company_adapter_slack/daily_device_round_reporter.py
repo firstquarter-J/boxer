@@ -517,9 +517,10 @@ def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[st
         {
             "type": "actions",
             "elements": [
+                # 병원 연락 버튼은 입력 모달을 여는 실제 액션이라 운영 라벨 그대로 보여준다.
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "병원 문자 보내기(테스트중-클릭금지)"},
+                    "text": {"type": "plain_text", "text": "병원 문자 보내기"},
                     "action_id": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
                     "value": action_value,
                     "style": "primary",

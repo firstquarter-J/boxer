@@ -230,7 +230,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
             ],
         )
-        self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "병원 문자 보내기(테스트중-클릭금지)")
+        self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "병원 문자 보내기")
         self.assertEqual(action_blocks[0]["elements"][1]["text"]["text"], "장비 음성 안내(미구현)")
         self.assertIn("MB2-C00043", action_blocks[0]["elements"][0]["value"])
         self.assertIn('"hospitalSeq":"69"', action_blocks[0]["elements"][0]["value"])
