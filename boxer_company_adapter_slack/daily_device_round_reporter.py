@@ -33,6 +33,7 @@ _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = "device_health_alert_contact_hosp
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
 _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
 _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
+_DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *이상 발견 - 확인 요망*"
 _DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS = (
     "activeHospitalSeq",
     "activeHospitalName",
@@ -453,7 +454,8 @@ def _build_daily_device_round_abnormal_alert_text(
     permalink: str | None,
 ) -> str:
     alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
-    lines = [":rotating_light: *이상 발견 - 확인 요망*"]
+    # Slack 커스텀 경고 이모지로 루트 이상 알림을 통일해 채널에서 바로 눈에 띄게 한다.
+    lines = [_DEVICE_HEALTH_ALERT_HEADER_TEXT]
     if alert_items:
         # Slack 루트 알림만 보고도 확인 대상을 한눈에 훑을 수 있게 라벨형으로 보여줘.
         for item in alert_items:
@@ -544,7 +546,7 @@ def _build_daily_device_round_abnormal_alert_blocks(
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": ":rotating_light: *이상 발견 - 확인 요망*"},
+            "text": {"type": "mrkdwn", "text": _DEVICE_HEALTH_ALERT_HEADER_TEXT},
         }
     ]
 

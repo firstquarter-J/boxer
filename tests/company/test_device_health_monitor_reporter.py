@@ -210,7 +210,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             client.messages[0]["text"],
             "\n".join(
                 [
-                    ":rotating_light: *이상 발견 - 확인 요망*",
+                    ":alert: *이상 발견 - 확인 요망*",
                     "*#69 수지미래산부인과의원(용인)*",
                     "> *전화*  031-123-4567",
                     "> *병실*  1진료실",
