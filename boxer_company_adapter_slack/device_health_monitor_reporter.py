@@ -80,6 +80,8 @@ _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID = "device_health_alert_sms_mes
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_ACTION_ID = "message"
 # 병원 관계자가 첫 줄에서 발신 주체를 바로 알 수 있게 모든 기본 문자에 같은 인사를 쓴다.
 _DEVICE_HEALTH_MONITOR_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
+_DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
+_DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -272,6 +274,10 @@ def _normalize_device_health_monitor_device_candidate_cache(value: Any) -> list[
                 "hospitalRoomSeq": _coerce_int(raw.get("hospitalRoomSeq")),
                 "hospitalName": hospital_name,
                 "hospitalTelephone": _display_value(raw.get("hospitalTelephone"), default=""),
+                "hospitalDeviceAlertPhone": _display_value(
+                    raw.get("hospitalDeviceAlertPhone"),
+                    default="",
+                ),
                 "roomName": _display_value(raw.get("roomName"), default="미확인"),
             }
         )
@@ -453,7 +459,7 @@ def _device_health_monitor_sms_target_phone_number(contact: dict[str, str]) -> t
 
 
 def _device_health_monitor_default_modal_phone_number(contact: dict[str, str]) -> str:
-    # 모달 기본값은 테스트 번호가 아니라 병원 전화번호가 실제 휴대전화일 때만 채운다.
+    # 모달 기본값은 테스트 번호가 아니라 병원 이상 알림 전용 번호가 휴대전화일 때만 채운다.
     phone_number = _display_value(contact.get("phoneNumber"), default="")
     if not _is_device_health_monitor_mobile_phone_number(phone_number):
         return ""
@@ -464,13 +470,20 @@ def _lookup_device_health_monitor_hospital_contact(
     hospital_seq: int | None,
 ) -> dict[str, str]:
     if hospital_seq is None:
-        return {"status": "missing_hospital_seq", "hospitalSeq": "", "hospitalName": "", "telephone": "", "phoneNumber": ""}
+        return {
+            "status": "missing_hospital_seq",
+            "hospitalSeq": "",
+            "hospitalName": "",
+            "telephone": "",
+            "deviceAlertPhone": "",
+            "phoneNumber": "",
+        }
 
     connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT seq, hospitalName, telephone FROM hospitals WHERE seq = %s LIMIT 1",
+                "SELECT seq, hospitalName, telephone, deviceAlertPhone FROM hospitals WHERE seq = %s LIMIT 1",
                 (int(hospital_seq),),
             )
             row = cursor.fetchone() or {}
@@ -483,16 +496,19 @@ def _lookup_device_health_monitor_hospital_contact(
             "hospitalSeq": str(hospital_seq),
             "hospitalName": "",
             "telephone": "",
+            "deviceAlertPhone": "",
             "phoneNumber": "",
         }
 
     telephone = _display_value(row.get("telephone"), default="")
-    phone_number = _normalize_device_health_monitor_phone_number(telephone)
+    device_alert_phone = _display_value(row.get("deviceAlertPhone"), default="")
+    phone_number = _normalize_device_health_monitor_phone_number(device_alert_phone)
     return {
         "status": "ok" if phone_number else "missing_telephone",
         "hospitalSeq": _display_value(row.get("seq"), default=str(hospital_seq)),
         "hospitalName": _display_value(row.get("hospitalName"), default=""),
         "telephone": telephone,
+        "deviceAlertPhone": device_alert_phone,
         "phoneNumber": phone_number,
     }
 
@@ -507,7 +523,8 @@ def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, An
         message = (
             f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
             f"{room} {device}에서 초음파 영상 입력 장치 연결 확인이 필요합니다.\n\n"
-            "먼저 초음파 장비와 마미박스를 연결하는 HDMI 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
+            "초음파 진단기와 캡처보드, 캡처보드와 마미박스가 각각 HDMI 케이블로 연결되어 있습니다.\n"
+            "먼저 두 HDMI 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
             "케이블이 빠져 있거나 헐거우면 영상이 정상적으로 들어오지 않을 수 있습니다."
         )
         return {
@@ -813,6 +830,7 @@ def _build_device_health_monitor_contact_webhook_payload(
             "templateId": _display_value(sms_guide.get("templateId"), default=""),
             "hospitalSeq": _display_value(contact.get("hospitalSeq"), default=str(hospital_seq or "")),
             "telephone": _display_value(contact.get("telephone"), default=phone_number),
+            "deviceAlertPhone": _display_value(contact.get("deviceAlertPhone"), default=phone_number),
         }
 
     default_message = _display_value(sms_guide.get("message"), default="")
@@ -952,6 +970,122 @@ def _post_device_health_monitor_action_webhook(
         }
 
 
+def _device_health_monitor_auto_sms_phone_number(item: dict[str, str]) -> str:
+    # 자동발송은 이상 알림 전용 휴대전화번호만 사용하고 대표번호나 테스트 번호 fallback은 쓰지 않는다.
+    phone_number = _device_health_monitor_korean_national_phone_number(item.get("deviceAlertPhone"))
+    if not _is_device_health_monitor_mobile_phone_number(phone_number):
+        return ""
+    return phone_number
+
+
+def _send_device_health_monitor_auto_sms_for_item(
+    item: dict[str, str],
+    *,
+    channel_id: str,
+    now: datetime,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    phone_number = _device_health_monitor_auto_sms_phone_number(item)
+    if not phone_number:
+        return {"status": "manual_required", "smsContactActionEnabled": True}
+
+    sms_guide = _build_device_health_monitor_sms_guide(item)
+    if not sms_guide.get("supported") or not _display_value(sms_guide.get("message"), default=""):
+        return {"status": "unsupported_issue", "smsContactActionEnabled": True}
+
+    try:
+        payload, prepared_result = _build_device_health_monitor_contact_webhook_payload(
+            action_id=_DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+            item=item,
+            actor_user_id="",
+            channel_id=channel_id,
+            message_ts="",
+            now=now,
+            sms_phone_number=phone_number,
+        )
+    except Exception as exc:
+        logger.warning("장비 이상 알림 문자 자동발송 payload 생성 실패", exc_info=True)
+        return {
+            "status": "error",
+            "ok": False,
+            "error": type(exc).__name__,
+            "smsStatusText": _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT,
+            "smsContactActionEnabled": True,
+        }
+
+    if payload is None:
+        return {**prepared_result, "smsContactActionEnabled": True}
+
+    send_result = _post_device_health_monitor_sms_payload(payload, logger=logger)
+    result = {**prepared_result, **send_result}
+    sent = bool(result.get("ok")) and _display_value(result.get("status"), default="") == "sent"
+    status_text = (
+        _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT
+        if sent
+        else _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT
+    )
+    _append_device_health_monitor_event(
+        "alert_sms_auto_sent" if sent else "alert_sms_auto_failed",
+        {
+            "actionId": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+            "channelId": channel_id,
+            "hospital": item["hospital"],
+            "room": item["room"],
+            "device": item["device"],
+            "issue": item["issue"],
+            "templateId": _display_value(result.get("templateId"), default=""),
+            "provider": _display_value(result.get("provider"), default=""),
+            "status": _display_value(result.get("status"), default=""),
+            "phoneLast4": _display_value(result.get("phoneLast4"), default=""),
+        },
+        now=now,
+        logger=logger,
+    )
+    return {
+        **result,
+        "smsStatusText": status_text,
+        "smsContactActionEnabled": not sent,
+    }
+
+
+def _apply_device_health_monitor_auto_sms(
+    alert_summary: dict[str, Any],
+    *,
+    channel_id: str,
+    now: datetime,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    device_results = (
+        alert_summary.get("deviceResults")
+        if isinstance(alert_summary.get("deviceResults"), list)
+        else []
+    )
+    next_device_results: list[Any] = []
+    for device_result in device_results:
+        if not isinstance(device_result, dict):
+            next_device_results.append(device_result)
+            continue
+        next_device_result = dict(device_result)
+        if _display_value(device_result.get("overallLabel"), default="") == "이상":
+            single_item_summary = {**alert_summary, "deviceResults": [device_result]}
+            alert_items = _collect_daily_device_round_abnormal_alert_items(single_item_summary)
+            if alert_items:
+                auto_result = _send_device_health_monitor_auto_sms_for_item(
+                    alert_items[0],
+                    channel_id=channel_id,
+                    now=now,
+                    logger=logger,
+                )
+                sms_status_text = _display_value(auto_result.get("smsStatusText"), default="")
+                if sms_status_text:
+                    next_device_result["smsStatusText"] = sms_status_text
+                    next_device_result["smsContactActionEnabled"] = (
+                        "true" if auto_result.get("smsContactActionEnabled", True) else "false"
+                    )
+        next_device_results.append(next_device_result)
+    return {**alert_summary, "deviceResults": next_device_results}
+
+
 def _build_device_health_monitor_action_reply(
     *,
     action_id: str,
@@ -980,9 +1114,9 @@ def _build_device_health_monitor_action_reply(
     if status == "unsupported_issue":
         return f":no_entry: {user} 이 이슈는 병원 문자 발송 대상이 아니야. 내부 확인으로 처리해줘. `{target}`"
     if status == "missing_telephone":
-        return f":warning: {user} 병원 전화번호가 없어 문자를 보낼 수 없어. hospitals.telephone을 확인해줘. `{target}`"
+        return f":warning: {user} 마미박스 이상 알림 전용 연락 번호가 없어 문자를 보낼 수 없어. hospitals.deviceAlertPhone을 확인해줘. `{target}`"
     if status == "non_mobile_telephone":
-        return f":warning: {user} 병원 전화번호가 휴대전화번호가 아니라 문자를 보낼 수 없어. 수동으로 연락해줘. `{target}`"
+        return f":warning: {user} 마미박스 이상 알림 전용 연락 번호가 휴대전화번호가 아니라 문자를 보낼 수 없어. `{target}`"
     if status == "missing_sms_message":
         return f":warning: {user} 문자 내용이 비어 있어서 보낼 수 없어. `{target}`"
     if status in {"missing_hospital_seq", "hospital_not_found"}:
@@ -1429,6 +1563,7 @@ def _load_device_health_monitor_device_candidates() -> list[dict[str, Any]]:
                 "d.hospitalRoomSeq AS hospitalRoomSeq, "
                 "h.hospitalName AS hospitalName, "
                 "h.telephone AS hospitalTelephone, "
+                "h.deviceAlertPhone AS hospitalDeviceAlertPhone, "
                 "hr.roomName AS roomName "
                 "FROM devices d "
                 "INNER JOIN hospitals h ON d.hospitalSeq = h.seq "
@@ -1463,6 +1598,10 @@ def _load_device_health_monitor_device_candidates() -> list[dict[str, Any]]:
                 "hospitalRoomSeq": _coerce_int(row.get("hospitalRoomSeq")),
                 "hospitalName": hospital_name,
                 "hospitalTelephone": _display_value(row.get("hospitalTelephone"), default=""),
+                "hospitalDeviceAlertPhone": _display_value(
+                    row.get("hospitalDeviceAlertPhone"),
+                    default="",
+                ),
                 "roomName": _display_value(row.get("roomName"), default="미확인"),
             }
         )
@@ -1483,16 +1622,16 @@ def _load_device_health_monitor_device_candidates_cached(
     cached_devices = _normalize_device_health_monitor_device_candidate_cache(
         raw_cached_devices
     )
-    # 전화번호 필드 추가 전의 캐시는 알림 본문에 hospitals.telephone을 채울 수 없어 한 번 새로 조회한다.
-    cache_has_hospital_telephone = isinstance(raw_cached_devices, list) and all(
-        isinstance(raw, dict) and "hospitalTelephone" in raw
+    # 연락처 필드 추가 전의 캐시는 알림/자동문자 판단에 필요한 번호를 채울 수 없어 한 번 새로 조회한다.
+    cache_has_hospital_contact_fields = isinstance(raw_cached_devices, list) and all(
+        isinstance(raw, dict) and "hospitalTelephone" in raw and "hospitalDeviceAlertPhone" in raw
         for raw in raw_cached_devices
     )
     cached_at_text = _display_value(state_payload.get("deviceCandidateCachedAt"), default="")
     cached_at = _parse_device_health_monitor_datetime(cached_at_text)
     cache_is_fresh = bool(
         cached_devices
-        and cache_has_hospital_telephone
+        and cache_has_hospital_contact_fields
         and cached_at is not None
         and now - cached_at < _device_health_monitor_device_cache_ttl_delta()
     )
@@ -2026,6 +2165,10 @@ def _build_device_health_monitor_redis_status_payload(
         "captureBoardType": _display_value((device_state or {}).get("captureBoardType"), default=""),
         "hospitalName": _display_value(device_context.get("hospitalName"), default=""),
         "hospitalTelephone": _display_value(device_context.get("hospitalTelephone"), default=""),
+        "hospitalDeviceAlertPhone": _display_value(
+            device_context.get("hospitalDeviceAlertPhone"),
+            default="",
+        ),
         "roomName": _display_value(device_context.get("roomName"), default=""),
         "isConnected": bool((device_state or {}).get("isConnected")),
     }
@@ -2076,6 +2219,10 @@ def _build_device_health_monitor_redis_unavailable_status_payload(
             "captureBoardType": _display_value((device_state or {}).get("captureBoardType"), default=""),
             "hospitalName": _display_value(device_context.get("hospitalName"), default=""),
             "hospitalTelephone": _display_value(device_context.get("hospitalTelephone"), default=""),
+            "hospitalDeviceAlertPhone": _display_value(
+                device_context.get("hospitalDeviceAlertPhone"),
+                default="",
+            ),
             "roomName": _display_value(device_context.get("roomName"), default=""),
             "isConnected": bool((device_state or {}).get("isConnected")),
         },
@@ -2562,6 +2709,10 @@ def _build_device_health_monitor_result(
         "hospitalTelephone": _display_value(
             device_context.get("hospitalTelephone"),
             default=_display_value(device_payload.get("hospitalTelephone"), default=""),
+        ),
+        "hospitalDeviceAlertPhone": _display_value(
+            device_context.get("hospitalDeviceAlertPhone"),
+            default=_display_value(device_payload.get("hospitalDeviceAlertPhone"), default=""),
         ),
         "roomName": _display_value(
             device_context.get("roomName"),
@@ -3051,6 +3202,12 @@ def _run_device_health_monitor_once(
         return False
 
     alert_summary = _filter_device_health_monitor_alert_summary(report_summary, alertable_fingerprints)
+    alert_summary = _apply_device_health_monitor_auto_sms(
+        alert_summary,
+        channel_id=channel_id,
+        now=local_now,
+        logger=logger,
+    )
     _post_daily_device_round_abnormal_alert(
         client,
         alert_summary,

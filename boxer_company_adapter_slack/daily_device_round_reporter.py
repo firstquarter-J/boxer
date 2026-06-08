@@ -386,7 +386,7 @@ def _load_daily_device_round_message_permalink(
 
 def _collect_daily_device_round_abnormal_alert_items(
     report_summary: dict[str, Any],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     device_results = (
         report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
     )
@@ -403,10 +403,19 @@ def _collect_daily_device_round_abnormal_alert_items(
         if hospital_seq is None:
             hospital_seq = default_hospital_seq
         hospital_name = _display_value(device_result.get("hospitalName"), default=default_hospital_name)
-        # 루트 이상 알림만 보고도 병원 연락처를 확인할 수 있게 hospitals.telephone을 함께 전달한다.
+        # 루트 이상 알림만 보고도 병원 대표번호를 확인하고, 자동문자는 전용 휴대전화번호로만 판단하게 둘 다 전달한다.
         hospital_telephone = _display_value(
             device_result.get("hospitalTelephone"),
             default=_display_value(report_summary.get("hospitalTelephone"), default=""),
+        )
+        hospital_device_alert_phone = _display_value(
+            device_result.get("hospitalDeviceAlertPhone"),
+            default=_display_value(report_summary.get("hospitalDeviceAlertPhone"), default=""),
+        )
+        sms_status_text = _display_value(device_result.get("smsStatusText"), default="")
+        sms_contact_action_enabled = _display_value(
+            device_result.get("smsContactActionEnabled"),
+            default="",
         )
         issue = _build_daily_device_round_issue_summary(device_result)
         if not issue:
@@ -418,6 +427,9 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "hospitalName": hospital_name,
                 "hospital": _format_daily_device_round_hospital_label(hospital_name, hospital_seq),
                 "telephone": hospital_telephone,
+                "deviceAlertPhone": hospital_device_alert_phone,
+                "smsStatusText": sms_status_text,
+                "smsContactActionEnabled": sms_contact_action_enabled,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
                 "issue": issue,
@@ -429,6 +441,13 @@ def _collect_daily_device_round_abnormal_alert_items(
         )
 
     return items
+
+
+def _is_device_health_alert_contact_action_enabled(item: dict[str, Any]) -> bool:
+    raw_value = _display_value(item.get("smsContactActionEnabled"), default="")
+    if not raw_value:
+        return True
+    return raw_value.lower() not in {"0", "false", "no", "off"}
 
 
 def _build_daily_device_round_mda_monitoring_url(
@@ -466,6 +485,9 @@ def _build_daily_device_round_abnormal_alert_text(
             lines.append(f"> *병실*  {item['room']}")
             lines.append(f"> *장비*  `{item['device']}`")
             lines.append(f"> *이슈*  {item['issue']}")
+            sms_status_text = _display_value(item.get("smsStatusText"), default="")
+            if sms_status_text:
+                lines.append(f"> *문자*  {sms_status_text}")
             if item.get("mdaUrl"):
                 # 알림 수신자가 링크 목적을 바로 알 수 있게 MDA 장비 확인 문구로 표시한다.
                 lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA 에서 장비 확인 바로가기>")
@@ -476,12 +498,13 @@ def _build_daily_device_round_abnormal_alert_text(
     return "\n".join(lines)
 
 
-def _build_device_health_alert_action_value(item: dict[str, str]) -> str:
+def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
     payload = {
         "hospitalSeq": _display_value(item.get("hospitalSeq"), default=""),
         "hospitalName": _display_value(item.get("hospitalName"), default=""),
         "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
         "telephone": _display_value(item.get("telephone"), default=""),
+        "deviceAlertPhone": _display_value(item.get("deviceAlertPhone"), default=""),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
@@ -496,7 +519,7 @@ def _build_device_health_alert_action_value(item: dict[str, str]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:1900]
 
 
-def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[str, Any]]:
+def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[str, Any]]:
     item_text_lines = [
         f"*{item['hospital']}*",
         f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}",
@@ -504,10 +527,33 @@ def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[st
         f"> *장비*  `{item['device']}`",
         f"> *이슈*  {item['issue']}",
     ]
+    sms_status_text = _display_value(item.get("smsStatusText"), default="")
+    if sms_status_text:
+        item_text_lines.append(f"> *문자*  {sms_status_text}")
     if item.get("mdaUrl"):
         item_text_lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA 에서 장비 확인 바로가기>")
 
     action_value = _build_device_health_alert_action_value(item)
+    action_elements: list[dict[str, Any]] = []
+    if _is_device_health_alert_contact_action_enabled(item):
+        # 자동 발송이 끝난 장비는 같은 문자가 중복 발송되지 않도록 수동 문자 버튼을 숨긴다.
+        action_elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "병원 문자 보내기"},
+                "action_id": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                "value": action_value,
+                "style": "primary",
+            }
+        )
+    action_elements.append(
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
+            "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+            "value": action_value,
+        }
+    )
     return [
         {
             "type": "section",
@@ -518,22 +564,7 @@ def _build_device_health_alert_item_blocks(item: dict[str, str]) -> list[dict[st
         },
         {
             "type": "actions",
-            "elements": [
-                # 병원 연락 버튼은 입력 모달을 여는 실제 액션이라 운영 라벨 그대로 보여준다.
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "병원 문자 보내기"},
-                    "action_id": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
-                    "value": action_value,
-                    "style": "primary",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
-                    "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-                    "value": action_value,
-                },
-            ],
+            "elements": action_elements,
         },
     ]
 

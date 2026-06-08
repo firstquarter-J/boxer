@@ -107,10 +107,24 @@ def _abnormal_summary() -> dict:
                 "hospitalSeq": 69,
                 "hospitalName": "수지미래산부인과의원(용인)",
                 "hospitalTelephone": "031-123-4567",
+                "hospitalDeviceAlertPhone": "",
                 "roomName": "1진료실",
                 "deviceName": "MB2-C00043",
                 "overallLabel": "이상",
                 "priorityReason": "LED USB 장치를 찾지 못했어",
+            }
+        ],
+    }
+
+
+def _mobile_abnormal_summary() -> dict:
+    summary = _abnormal_summary()
+    return {
+        **summary,
+        "deviceResults": [
+            {
+                **summary["deviceResults"][0],
+                "hospitalDeviceAlertPhone": "010-1234-4567",
             }
         ],
     }
@@ -235,6 +249,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertIn("MB2-C00043", action_blocks[0]["elements"][0]["value"])
         self.assertIn('"hospitalSeq":"69"', action_blocks[0]["elements"][0]["value"])
         self.assertIn('"telephone":"031-123-4567"', action_blocks[0]["elements"][0]["value"])
+        self.assertIn('"deviceAlertPhone":""', action_blocks[0]["elements"][0]["value"])
         saved_state = save_state_mock.call_args.args[0]
         self.assertEqual(saved_state["processedHospitalSeqs"], [])
         self.assertIsNone(saved_state["lastHospitalSeq"])
@@ -243,6 +258,81 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary", "slack_alert_sent"],
+        )
+
+    def test_auto_sends_sms_when_device_alert_phone_is_mobile(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "MDA_GRAPHQL_ORIGIN", "https://mda.kr.mmtalkbox.com"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
+                return_value={},
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._build_device_health_monitor_summary",
+                return_value=_mobile_abnormal_summary(),
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._save_device_health_monitor_state"
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._lookup_device_health_monitor_hospital_contact",
+                return_value={
+                    "status": "ok",
+                    "hospitalSeq": "69",
+                    "hospitalName": "수지미래산부인과의원(용인)",
+                    "telephone": "031-123-4567",
+                    "deviceAlertPhone": "010-1234-4567",
+                    "phoneNumber": "01012344567",
+                },
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._post_device_health_monitor_sms_payload",
+                return_value={"status": "sent", "ok": True, "provider": "fake"},
+            ) as post_sms_mock,
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+            ) as append_event_mock,
+        ):
+            sent = reporter._run_device_health_monitor_once(client, logger, now=local_now)
+
+        self.assertTrue(sent)
+        post_sms_mock.assert_called_once()
+        sms_payload = post_sms_mock.call_args.args[0]
+        self.assertEqual(sms_payload["sms"]["to"], "01012344567")
+        self.assertEqual(sms_payload["sms"]["templateId"], "led_disconnected")
+        self.assertTrue(sms_payload["sms"]["message"].startswith("안녕하세요 마미톡입니다. 🌷"))
+        self.assertIn("LED USB 케이블을 분리했다가 다시", sms_payload["sms"]["message"])
+
+        self.assertEqual(len(client.messages), 1)
+        self.assertIn("> *문자*  문자 자동발송 완료", client.messages[0]["text"])
+        blocks = client.messages[0]["blocks"]
+        section_texts = [
+            block["text"]["text"]
+            for block in blocks
+            if block.get("type") == "section" and isinstance(block.get("text"), dict)
+        ]
+        self.assertTrue(any("문자 자동발송 완료" in text for text in section_texts))
+        action_blocks = [block for block in blocks if block["type"] == "actions"]
+        self.assertEqual(len(action_blocks), 1)
+        self.assertEqual(
+            [element["action_id"] for element in action_blocks[0]["elements"]],
+            [reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE],
+        )
+        self.assertEqual(
+            [call.args[0] for call in append_event_mock.call_args_list],
+            ["run_summary", "alert_sms_auto_sent", "slack_alert_sent"],
         )
 
     def test_suppresses_duplicate_alert_until_reminder_window_passes(self) -> None:
@@ -332,7 +422,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "status": "ok",
                     "hospitalSeq": "69",
                     "hospitalName": "수지미래산부인과의원(용인)",
-                    "telephone": "010-1234-4567",
+                    "telephone": "031-123-4567",
+                    "deviceAlertPhone": "010-1234-4567",
                     "phoneNumber": "01012344567",
                 },
             ),
@@ -364,7 +455,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertTrue(
             message_block["element"]["initial_value"].startswith("안녕하세요 마미톡입니다. 🌷")
         )
-        self.assertIn("HDMI 케이블을 분리했다가 다시", message_block["element"]["initial_value"])
+        self.assertIn("초음파 진단기와 캡처보드", message_block["element"]["initial_value"])
+        self.assertIn("두 HDMI 케이블을 분리했다가 다시", message_block["element"]["initial_value"])
         self.assertIn("\n\n", message_block["element"]["initial_value"])
 
     def test_contact_modal_leaves_phone_blank_for_landline_even_with_test_number(self) -> None:
@@ -386,6 +478,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": "404",
                     "hospitalName": "진주경상대학교병원(진주)",
                     "telephone": "055-750-8000",
+                    "deviceAlertPhone": "055-750-8000",
                     "phoneNumber": "0557508000",
                 },
             ),
@@ -476,6 +569,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": "69",
                     "hospitalName": "수지미래산부인과의원(용인)",
                     "telephone": "031-123-4567",
+                    "deviceAlertPhone": "",
                     "phoneNumber": "0311234567",
                 },
             ),
@@ -570,7 +664,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "status": "ok",
                     "hospitalSeq": "69",
                     "hospitalName": "수지미래산부인과의원(용인)",
-                    "telephone": "010-1234-4567",
+                    "telephone": "031-123-4567",
+                    "deviceAlertPhone": "010-1234-4567",
                     "phoneNumber": "01012344567",
                 },
             ) as lookup_contact_mock,
@@ -605,7 +700,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(payload["sms"]["to"], "01012344567")
         self.assertEqual(payload["sms"]["templateId"], "captureboard_disconnected")
         self.assertTrue(payload["sms"]["message"].startswith("안녕하세요 마미톡입니다. 🌷"))
-        self.assertIn("HDMI 케이블을 분리했다가 다시", payload["sms"]["message"])
+        self.assertIn("초음파 진단기와 캡처보드", payload["sms"]["message"])
+        self.assertIn("두 HDMI 케이블을 분리했다가 다시", payload["sms"]["message"])
         self.assertEqual(len(client.messages), 1)
         self.assertEqual(client.messages[0]["thread_ts"], "3000.001")
         self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
@@ -686,6 +782,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": "69",
                     "hospitalName": "수지미래산부인과의원(용인)",
                     "telephone": "",
+                    "deviceAlertPhone": "",
                     "phoneNumber": "",
                 },
             ),
@@ -705,7 +802,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
         self.assertEqual(result["result"]["status"], "missing_telephone")
         post_mock.assert_not_called()
-        self.assertIn("병원 전화번호가 없어", client.messages[0]["text"])
+        self.assertIn("마미박스 이상 알림 전용 연락 번호가 없어", client.messages[0]["text"])
 
     def test_contact_action_rejects_landline_phone(self) -> None:
         client = _FakeSlackClient()
@@ -737,6 +834,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": "69",
                     "hospitalName": "수지미래산부인과의원(용인)",
                     "telephone": "031-123-4567",
+                    "deviceAlertPhone": "031-123-4567",
                     "phoneNumber": "0311234567",
                 },
             ),
@@ -793,6 +891,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": "",
                     "hospitalName": "",
                     "telephone": "",
+                    "deviceAlertPhone": "",
                     "phoneNumber": "",
                 },
             ),
@@ -824,7 +923,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(solapi_payload["messages"][0]["to"], "01048130831")
         self.assertEqual(solapi_payload["messages"][0]["from"], "0212345678")
         self.assertTrue(solapi_payload["messages"][0]["text"].startswith("안녕하세요 마미톡입니다. 🌷"))
-        self.assertIn("HDMI 케이블을 분리했다가 다시", solapi_payload["messages"][0]["text"])
+        self.assertIn("초음파 진단기와 캡처보드", solapi_payload["messages"][0]["text"])
+        self.assertIn("두 HDMI 케이블을 분리했다가 다시", solapi_payload["messages"][0]["text"])
         self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
 
     def test_voice_action_is_marked_not_implemented(self) -> None:
@@ -1109,6 +1209,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
             "hospitalTelephone": "031-123-4567",
+            "hospitalDeviceAlertPhone": "",
             "roomName": "1진료실",
         }
         evidence_payload = {
@@ -1195,6 +1296,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
             "hospitalTelephone": "031-123-4567",
+            "hospitalDeviceAlertPhone": "",
             "roomName": "1진료실",
         }
         redis_client = _FakeRedisStateClient(
@@ -1256,6 +1358,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
             "hospitalTelephone": "031-123-4567",
+            "hospitalDeviceAlertPhone": "",
             "roomName": "1진료실",
         }
         redis_client = _FakeRedisStateClient(
@@ -1319,6 +1422,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": 3,
                     "hospitalName": "3_작업완료 병실 출고대기",
                     "hospitalTelephone": "031-111-2222",
+                    "hospitalDeviceAlertPhone": "010-1111-2222",
                     "roomName": "출고대기",
                 },
                 {
@@ -1327,6 +1431,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "hospitalSeq": 69,
                     "hospitalName": "수지미래산부인과의원(용인)",
                     "hospitalTelephone": "031-123-4567",
+                    "hospitalDeviceAlertPhone": "",
                     "roomName": "1진료실",
                 },
             ]
@@ -1344,6 +1449,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "hospitalSeq": 69,
             "hospitalName": "수지미래산부인과의원(용인)",
             "hospitalTelephone": "031-123-4567",
+            "hospitalDeviceAlertPhone": "",
             "roomName": "1진료실",
         }
         redis_client = _FakeRedisStateClient(
