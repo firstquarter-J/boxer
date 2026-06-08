@@ -229,6 +229,99 @@ class DeviceRouteHandlerTests(unittest.TestCase):
             ],
         )
 
+    def test_device_download_sends_summary_and_each_link_as_separate_dm(self) -> None:
+        replies: list[str] = []
+        dm_messages: list[tuple[str | None, str]] = []
+        long_url_1 = "https://example.invalid/temp/a.motion.mp4?" + "X-Amz-Security-Token=" + "a" * 3500
+        long_url_2 = "https://example.invalid/temp/b.motion.mp4?" + "X-Amz-Security-Token=" + "b" * 3500
+
+        deps = DeviceRoutesDeps(
+            get_s3_client=lambda: None,
+            get_recordings_context=lambda: {"summary": {"recordingCount": 1}, "rows": []},
+            has_recordings_device_mapping=lambda context: True,
+            send_dm_message=lambda user_id, text: dm_messages.append((user_id, text)) or True,
+            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+        )
+
+        payload = {
+            "summary": {"recordCount": 1},
+            "request": {},
+            "records": [
+                {
+                    "deviceName": "MB2-B00046",
+                    "hospitalName": "좋은문화병원(부산)",
+                    "roomName": "2층 15진료실",
+                    "sessions": [
+                        {
+                            "probe": {
+                                "ok": True,
+                                "files": [
+                                    "/home/mommytalk/AppData/Videos/a.motion.mp4",
+                                    "/home/mommytalk/AppData/Videos/b.motion.mp4",
+                                ],
+                            },
+                            "download": {
+                                "downloads": [
+                                    {"ok": True, "fileName": "a.motion.mp4", "url": long_url_1},
+                                    {"ok": True, "fileName": "b.motion.mp4", "url": long_url_2},
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_HOST", "db-host"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_USERNAME", "db-user"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_PASSWORD", "db-pass"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_DATABASE", "db-name"),
+            patch("boxer_company_adapter_slack.device_routes.cs.DEVICE_FILE_DOWNLOAD_BUCKET", "bucket"),
+            patch(
+                "boxer_company_adapter_slack.device_routes._is_device_runtime_configured",
+                return_value=True,
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._extract_log_date_with_presence",
+                return_value=("2026-06-03", True),
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._locate_barcode_file_candidates",
+                return_value=("*장비 영상 다운로드 결과*", payload),
+            ),
+            patch("boxer_company_adapter_slack.device_routes._load_slack_user_name", return_value="Rosa"),
+            patch("boxer_company_adapter_slack.device_routes._log_device_download_activity", return_value=1),
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="23754508923 2026-06-03 영상 다운",
+                    barcode="23754508923",
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                deps,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(dm_messages), 3)
+        self.assertIn("파일별 별도 DM", dm_messages[0][1])
+        self.assertNotIn(long_url_1, dm_messages[0][1])
+        self.assertNotIn(long_url_2, dm_messages[0][1])
+        self.assertIn(f"🎣 <{long_url_1}|a.motion.mp4>", dm_messages[1][1])
+        self.assertIn(f"🎣 <{long_url_2}|b.motion.mp4>", dm_messages[2][1])
+        self.assertEqual(replies[0].count("다운로드 링크: DM으로 보냈어"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -255,10 +255,35 @@ def _render_device_download_dm_text(
         for file_name in file_names:
             lines.append(f"  - `{file_name}`")
         download_links = record.get("downloadLinks") or []
-        lines.append(f"• 다운로드 링크: `{len(download_links)}개` (1시간)")
-        for item in download_links:
-            lines.append(f"  - 🎣 <{item['url']}|{item['fileName']}>")
+        # 긴 S3 presigned URL 여러 개를 한 메시지에 넣으면 Slack이 중간 분할하며 링크 문법을 깨뜨릴 수 있다.
+        lines.append(f"• 다운로드 링크: `{len(download_links)}개` (1시간, 파일별 별도 DM)")
     return "\n".join(lines)
+
+
+def _render_device_download_dm_link_texts(records: list[dict[str, Any]]) -> list[str]:
+    messages: list[str] = []
+    for record in records:
+        device_name = str(record.get("deviceName") or "").strip() or "미확인"
+        for item in record.get("downloadLinks") or []:
+            if not isinstance(item, dict):
+                continue
+            file_name = str(item.get("fileName") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if not file_name or not url:
+                continue
+            # 파일 하나당 URL 하나만 보내서 Slack text 자동 분할이 presigned URL을 자르지 않게 한다.
+            messages.append(
+                "\n".join(
+                    [
+                        "*장비 영상 다운로드 링크*",
+                        f"• 장비: `{device_name}`",
+                        f"• 파일: `{file_name}`",
+                        "• 만료: `1시간`",
+                        f"🎣 <{url}|{file_name}>",
+                    ]
+                )
+            )
+    return messages
 
 
 def _render_device_download_thread_notice(

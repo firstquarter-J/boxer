@@ -88,6 +88,7 @@ from boxer_company_adapter_slack.device_activity import (
     _log_device_download_activity,
     _log_device_update_activity,
     _render_device_download_dm_failure_notice,
+    _render_device_download_dm_link_texts,
     _render_device_download_dm_text,
     _render_device_download_thread_notice,
 )
@@ -407,7 +408,15 @@ def _handle_device_routes(
                         log_date,
                         download_records,
                     )
-                    if deps.send_dm_message(context.user_id, dm_text):
+                    dm_link_texts = _render_device_download_dm_link_texts(download_records)
+                    # 요약과 각 링크를 분리해 Slack이 긴 presigned URL을 자동 분할하지 않게 한다.
+                    dm_sent = deps.send_dm_message(context.user_id, dm_text)
+                    if dm_sent:
+                        for dm_link_text in dm_link_texts:
+                            if not deps.send_dm_message(context.user_id, dm_link_text):
+                                dm_sent = False
+                                break
+                    if dm_sent:
                         requester_name = _load_slack_user_name(
                             context.client,
                             context.workspace_id,

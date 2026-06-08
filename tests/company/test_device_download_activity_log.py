@@ -2,9 +2,40 @@ import json
 import unittest
 
 from boxer_company_adapter_slack.company import _build_device_download_activity_input
+from boxer_company_adapter_slack.device_activity import (
+    _render_device_download_dm_link_texts,
+    _render_device_download_dm_text,
+)
 
 
 class DeviceDownloadActivityLogTests(unittest.TestCase):
+    def test_download_dm_summary_omits_long_urls_and_splits_link_messages(self) -> None:
+        long_url_1 = "https://example.invalid/temp/a.motion.mp4?" + "X-Amz-Security-Token=" + "a" * 3500
+        long_url_2 = "https://example.invalid/temp/b.motion.mp4?" + "X-Amz-Security-Token=" + "b" * 3500
+        records = [
+            {
+                "deviceName": "MB2-D00061",
+                "hospitalName": "애플산부인과의원(안양)",
+                "roomName": "1진료실",
+                "fileNames": ["a.motion.mp4", "b.motion.mp4"],
+                "downloadLinks": [
+                    {"fileName": "a.motion.mp4", "url": long_url_1},
+                    {"fileName": "b.motion.mp4", "url": long_url_2},
+                ],
+            }
+        ]
+
+        # S3 presigned URL은 길어서 요약 DM에 직접 넣지 않고 파일별 메시지로 분리한다.
+        summary = _render_device_download_dm_text("68616387368", "2026-03-28", records)
+        link_messages = _render_device_download_dm_link_texts(records)
+
+        self.assertIn("• 다운로드 링크: `2개` (1시간, 파일별 별도 DM)", summary)
+        self.assertNotIn(long_url_1, summary)
+        self.assertNotIn(long_url_2, summary)
+        self.assertEqual(len(link_messages), 2)
+        self.assertIn(f"🎣 <{long_url_1}|a.motion.mp4>", link_messages[0])
+        self.assertIn(f"🎣 <{long_url_2}|b.motion.mp4>", link_messages[1])
+
     def test_includes_slack_requester_in_description_and_detail_log(self) -> None:
         payload = _build_device_download_activity_input(
             record={

@@ -290,7 +290,12 @@ def create_app() -> App:
                 dm_channel = ((response or {}).get("channel") or {}).get("id")
                 if not dm_channel:
                     return False
-                client.chat_postMessage(channel=dm_channel, text=message_text)
+                client.chat_postMessage(
+                    channel=dm_channel,
+                    text=message_text,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
                 return True
             except Exception:
                 logger.exception("Failed to send DM to user=%s", target_user_id)
