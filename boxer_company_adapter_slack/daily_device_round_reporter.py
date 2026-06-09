@@ -34,6 +34,14 @@ _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voi
 _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
 _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
 _DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *이상 발견 - 확인 요망*"
+_DEVICE_HEALTH_ALERT_COMPONENT_ORDER = ("captureboard", "led", "audio", "pm2", "storage")
+_DEVICE_HEALTH_ALERT_COMPONENT_NAMES = {
+    "captureboard": "캡처보드",
+    "led": "LED",
+    "audio": "스피커",
+    "pm2": "PM2",
+    "storage": "용량",
+}
 _DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS = (
     "activeHospitalSeq",
     "activeHospitalName",
@@ -392,7 +400,7 @@ def _collect_daily_device_round_abnormal_alert_items(
     )
     default_hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     default_hospital_name = _display_value(report_summary.get("hospitalName"), default="병원 미확인")
-    items: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
 
     for device_result in device_results:
         if not isinstance(device_result, dict):
@@ -420,6 +428,10 @@ def _collect_daily_device_round_abnormal_alert_items(
         issue = _build_daily_device_round_issue_summary(device_result)
         if not issue:
             issue = _display_value(device_result.get("priorityReason"), default="상세 확인 필요")
+        problem_components = _build_device_health_alert_problem_components(
+            device_result,
+            issue=issue,
+        )
         device_name = _display_value(device_result.get("deviceName"), default="장비명 미확인")
         items.append(
             {
@@ -430,6 +442,7 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "deviceAlertPhone": hospital_device_alert_phone,
                 "smsStatusText": sms_status_text,
                 "smsContactActionEnabled": sms_contact_action_enabled,
+                "problemComponents": problem_components,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
                 "issue": issue,
@@ -441,6 +454,51 @@ def _collect_daily_device_round_abnormal_alert_items(
         )
 
     return items
+
+
+def _build_device_health_alert_problem_components(
+    device_result: dict[str, Any],
+    *,
+    issue: str,
+) -> list[str]:
+    # componentLabels가 있으면 실제 점검 결과를 우선하고, 테스트/레거시 payload는 이슈 문구로 보강한다.
+    component_labels = (
+        device_result.get("componentLabels")
+        if isinstance(device_result.get("componentLabels"), dict)
+        else {}
+    )
+    components: list[str] = []
+    for key in _DEVICE_HEALTH_ALERT_COMPONENT_ORDER:
+        label = _display_value(component_labels.get(key), default="")
+        if label and label != "정상":
+            components.append(_DEVICE_HEALTH_ALERT_COMPONENT_NAMES.get(key, key))
+
+    issue_text = _display_value(issue, default="")
+    lowered_issue = issue_text.lower()
+    keyword_components = [
+        ("캡처보드", ("캡처보드", "비디오 장치", "영상")),
+        ("LED", ("led", "엘이디", "LED")),
+        ("스피커", ("audio", "sound", "speaker", "오디오", "소리", "스피커")),
+        ("PM2", ("pm2", "프로세스")),
+        ("용량", ("storage", "용량", "디스크", "저장", "trashcan", "trash")),
+    ]
+    for component, keywords in keyword_components:
+        if component in components:
+            continue
+        if any(keyword in lowered_issue or keyword in issue_text for keyword in keywords):
+            components.append(component)
+    return components
+
+
+def _format_device_health_alert_problem_components(components: Any) -> str:
+    if not isinstance(components, list):
+        return ""
+    labels = [
+        _display_value(component, default="")
+        for component in components
+        if _display_value(component, default="")
+    ]
+    return " ".join(f"`{label}`" for label in labels)
 
 
 def _is_device_health_alert_contact_action_enabled(item: dict[str, Any]) -> bool:
@@ -484,6 +542,11 @@ def _build_daily_device_round_abnormal_alert_text(
             lines.append(f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}")
             lines.append(f"> *병실*  {item['room']}")
             lines.append(f"> *장비*  `{item['device']}`")
+            problem_components = _format_device_health_alert_problem_components(
+                item.get("problemComponents")
+            )
+            if problem_components:
+                lines.append(f"> *문제 장치*  {problem_components}")
             lines.append(f"> *이슈*  {item['issue']}")
             sms_status_text = _display_value(item.get("smsStatusText"), default="")
             if sms_status_text:
@@ -525,8 +588,13 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
         f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}",
         f"> *병실*  {item['room']}",
         f"> *장비*  `{item['device']}`",
-        f"> *이슈*  {item['issue']}",
     ]
+    problem_components = _format_device_health_alert_problem_components(
+        item.get("problemComponents")
+    )
+    if problem_components:
+        item_text_lines.append(f"> *문제 장치*  {problem_components}")
+    item_text_lines.append(f"> *이슈*  {item['issue']}")
     sms_status_text = _display_value(item.get("smsStatusText"), default="")
     if sms_status_text:
         item_text_lines.append(f"> *문자*  {sms_status_text}")

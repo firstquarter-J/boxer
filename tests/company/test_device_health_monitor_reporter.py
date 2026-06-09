@@ -8,6 +8,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from boxer_company.redis_device_state import DeviceStateRedisClient
+from boxer_company_adapter_slack import daily_device_round_reporter
 from boxer_company_adapter_slack import device_health_monitor_reporter as reporter
 
 
@@ -159,6 +160,34 @@ def _captureboard_abnormal_summary() -> dict:
     }
 
 
+def _captureboard_led_abnormal_summary() -> dict:
+    summary = _captureboard_abnormal_summary()
+    device_result = summary["deviceResults"][0]
+    return {
+        **summary,
+        "deviceResults": [
+            {
+                **device_result,
+                "priorityReason": "캡처보드/LED 이상",
+                "componentLabels": {
+                    **device_result["componentLabels"],
+                    "led": "이상",
+                },
+                "statusPayload": {
+                    "overview": {
+                        **device_result["statusPayload"]["overview"],
+                        "led": {
+                            "status": "fail",
+                            "label": "이상",
+                            "summary": "LED USB 장치를 찾지 못했어",
+                        },
+                    }
+                },
+            }
+        ],
+    }
+
+
 class DeviceHealthMonitorReporterTests(unittest.TestCase):
     def setUp(self) -> None:
         with reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK:
@@ -229,6 +258,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "> *전화*  031-123-4567",
                     "> *병실*  1진료실",
                     "> *장비*  `MB2-C00043`",
+                    "> *문제 장치*  `LED`",
                     "> *이슈*  LED USB 장치를 찾지 못했어",
                     "> *MDA*  <https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MDA 에서 장비 확인 바로가기>",
                 ]
@@ -258,6 +288,18 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary", "slack_alert_sent"],
+        )
+
+    def test_abnormal_alert_highlights_problem_components(self) -> None:
+        text = daily_device_round_reporter._build_daily_device_round_abnormal_alert_text(
+            _captureboard_led_abnormal_summary(),
+            permalink=None,
+        )
+
+        self.assertIn("> *문제 장치*  `캡처보드` `LED`", text)
+        self.assertIn(
+            "> *이슈*  캡처보드 USB나 비디오 장치를 찾지 못했어 / LED USB 장치를 찾지 못했어",
+            text,
         )
 
     def test_auto_sends_sms_when_device_alert_phone_is_mobile(self) -> None:
@@ -323,6 +365,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             for block in blocks
             if block.get("type") == "section" and isinstance(block.get("text"), dict)
         ]
+        self.assertTrue(any("*문제 장치*  `LED`" in text for text in section_texts))
         self.assertTrue(any("문자 자동발송 완료" in text for text in section_texts))
         action_blocks = [block for block in blocks if block["type"] == "actions"]
         self.assertEqual(len(action_blocks), 1)
