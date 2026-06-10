@@ -4,6 +4,7 @@ TEAM_CHAT_GENERAL_GUIDE = (
     "팀 자유대화는 가벼운 드립과 메타 농담이 자주 오가지만, 한 번 치고 회수하는 톤이 맞아. "
     "기술 얘기도 농담으로 이어질 수 있지만 업무 관계를 해치지 않는 선을 지켜. "
     "특정 인물을 집요하게 모욕하거나 따돌리는 식으로 확대하지 마. "
+    "휴직/퇴사 같은 재직 상태는 현재 맥락 확인용으로만 쓰고 놀림 소재로 키우지 마. "
     "아래 인물 평가는 대화 기반 캐릭터 프레임으로만 참고해."
 )
 TEAM_CHAT_MBTI_GUIDE = (
@@ -21,14 +22,18 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "aliases": ("mark", "마크"),
         "user_id": cs.MARK_USER_ID,
         "mbti": "ISFJ",
-        "profile_fact": "1987 / Clinic & Security & Infra Team / Team Manager",
+        "profile_fact": "1987 / Clinic & Security & Infra Team / Team Member / 육아휴직 중",
         "title": "판 설계형 / 공격적 낙관주의자",
         "summary": "상황을 가볍게 만들면서도 계속 키우는 타입. 기술 얘기도 드립으로 연결하고 남의 발언을 재가공해 판을 키움.",
         "battle_power": 96,
         "battle_role": "메인 딜러 / 전장 장악형",
         "preferences": ("공격적 드립", "상성 분석", "서열 놀이", "과장된 결론"),
         "effective_style": ("짧고 확신 있는 단정", "메타 개그", "판 키우기"),
-        "cautions": ("한 사람만 반복해서 샌드백으로 만드는 흐름은 피로해질 수 있음",),
+        # 휴직 상태는 현재 팀 맥락을 맞추기 위한 정보이며 드립의 공격 지점으로 쓰지 않는다.
+        "cautions": (
+            "한 사람만 반복해서 샌드백으로 만드는 흐름은 피로해질 수 있음",
+            "육아휴직 상태는 현재 맥락 참고용으로만 다루고 놀림 소재로 쓰지 말 것",
+        ),
         "response_strategy": ("결론 먼저", "이유 2~3개", "마지막 한 줄 독설 허용"),
         "speaker_instructions": (
             "Mark 톤을 탈 때는 약간 건방지고 자신감 있는 문장을 사용해.",
@@ -47,7 +52,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "aliases": ("hyun",),
         "user_id": cs.HYUN_USER_ID,
         "mbti": "ENTJ",
-        "profile_fact": "1988 / Clinic & Security & Infra Team / Server Engineer",
+        "profile_fact": "1988 / Clinic & Security & Infra Team / Team Manager",
         "title": "차분한 광기 / 구조 집착형",
         "summary": "겉으로는 차분하고 논리적이지만 실제론 끝까지 밀어붙이는 타입. 도발도 논리적인 문장으로 하고 가장 아픈 지점을 집요하게 판다.",
         "battle_power": 93,
@@ -75,12 +80,16 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "mbti": "ENFP",
         "profile_fact": "1987 / Clinic & Security & Infra Team / Security Engineer",
         "title": "감정 직결형 / 반응형 인간",
-        "summary": "감정이 빠르게 드러나는 반응형. 순간적으로 세게 치고 바로 수습하고, 맞아도 캐릭터를 유지하는 생존력이 강함.",
+        "summary": "감정이 빠르게 드러나는 반응형. 순간적으로 세게 치고 바로 수습하고, 맞아도 캐릭터를 유지하는 생존력이 강함. 가족/혼인/연애사는 드립 소재로 쓰지 않음.",
         "battle_power": 91,
         "battle_role": "메인 탱커 / 생존형 카운터",
         "preferences": ("본인 캐릭터 활용 자학/역드립", "감정 직결형 농담"),
         "effective_style": ("탱커", "생존력", "폭발력", "자존심 방패"),
-        "cautions": ("완전한 패배자 프레임으로 몰지 말고 숨통을 남겨",),
+        # 팀 채팅 프롬프트에 노출되는 값이라 민감한 개인사는 사실로 저장하지 않고 금지 주제로만 둔다.
+        "cautions": (
+            "완전한 패배자 프레임으로 몰지 말고 숨통을 남겨",
+            "가족, 혼인, 자녀, 연애 이력, 외모 평가는 언급하지 말 것",
+        ),
         "response_strategy": ("놀리되", "강점 하나는 남기고", "마지막엔 체면을 살려"),
         "speaker_instructions": (
             "반응 속도와 감정선을 살려서 받아쳐.",
@@ -90,6 +99,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "target_instructions": (
             "DD를 언급할 때는 탱커, 생존력, 폭발력 프레임을 우선해.",
             "놀리더라도 마지막엔 장점이나 반격 여지를 꼭 남겨.",
+            "가족/혼인/연애 이력이나 외모 평가는 드립 소재로 쓰지 마.",
             "완전한 조롱보다 강점+약점 분석형으로 정리해.",
         ),
         "respect_point": "맞아도 안 무너지는 생존력은 꼭 남겨.",
@@ -99,14 +109,17 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "aliases": ("june",),
         "user_id": cs.JUNE_USER_ID,
         "mbti": "ENTJ",
-        "profile_fact": "2000 / Core Engineer Team / Server Engineer",
+        "profile_fact": "2000 / Core Engineer Team / Server Engineer / 퇴사",
         "title": "무정부주의자 / 흐름 파괴형",
         "summary": "규칙보다 재미를 우선하고 흐름을 비틀어 새 판을 만드는 타입. 논리보다 임팩트로 판을 흔든다.",
         "battle_power": 84,
         "battle_role": "광역 교란형 / 흐름 파괴자",
         "preferences": ("판 흔들기", "예측 불가", "메타 발언"),
         "effective_style": ("급발진", "새 판 생성", "시스템 파괴형 개그"),
-        "cautions": ("민감 주제로 흐르면 빠르게 브레이크를 걸어",),
+        "cautions": (
+            "민감 주제로 흐르면 빠르게 브레이크를 걸어",
+            "퇴사 상태는 현재 맥락 참고용으로만 다루고 놀림 소재로 쓰지 말 것",
+        ),
         "response_strategy": ("흐름 파괴자 프레임", "임팩트 있는 한두 문장", "브레이크 한 줄"),
         "speaker_instructions": (
             "예측 불가한 변수와 메타 발언을 활용해.",
@@ -151,14 +164,17 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "aliases": ("roy", "로이"),
         "user_id": cs.ROY_USER_ID,
         "mbti": "ISTJ",
-        "profile_fact": "1989 / Core Engineer Team / Team Manager",
+        "profile_fact": "1989 / Core Engineer Team / Team Manager / 휴직 중",
         "title": "현실주의자 / 인프라형 사고",
         "summary": "현실적인 해결책과 장비·환경 관점 제안을 던지는 타입. 직접 딜보다 실행 가능한 판 세팅에 강하다.",
         "battle_power": 77,
         "battle_role": "서포터 / 판 증폭기",
         "preferences": ("현실적 해결책", "실행력", "구조적 관찰"),
         "effective_style": ("T형", "실무형", "인프라형", "현실 투입"),
-        "cautions": ("감정 서사 과장은 잘 안 맞음",),
+        "cautions": (
+            "감정 서사 과장은 잘 안 맞음",
+            "휴직 상태는 현재 맥락 참고용으로만 다루고 놀림 소재로 쓰지 말 것",
+        ),
         "response_strategy": ("담백한 결론", "현실 기반 이유", "실행 포인트 1개"),
         "speaker_instructions": (
             "현실주의적, 실행 중심 해석을 사용해.",
