@@ -260,7 +260,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     "> *장비*  `MB2-C00043`",
                     "> *문제 장치*  `LED`",
                     "> *이슈*  LED USB 장치를 찾지 못했어",
-                    "> *MDA*  <https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MDA 에서 장비 확인 바로가기>",
+                    "> <https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MDA 에서 장비 확인 바로가기>",
                 ]
             ),
         )

@@ -526,6 +526,11 @@ def _build_daily_device_round_mda_monitoring_url(
     return f"{cs.MDA_GRAPHQL_ORIGIN.rstrip('/')}/monitoring?{query}"
 
 
+def _format_mda_device_check_link(mda_url: str) -> str:
+    # 링크 텍스트가 MDA 확인 목적을 설명하므로 별도 라벨 없이 바로 보여준다.
+    return f"<{mda_url}|MDA 에서 장비 확인 바로가기>"
+
+
 def _build_daily_device_round_abnormal_alert_text(
     report_summary: dict[str, Any],
     permalink: str | None,
@@ -552,8 +557,7 @@ def _build_daily_device_round_abnormal_alert_text(
             if sms_status_text:
                 lines.append(f"> *문자*  {sms_status_text}")
             if item.get("mdaUrl"):
-                # 알림 수신자가 링크 목적을 바로 알 수 있게 MDA 장비 확인 문구로 표시한다.
-                lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA 에서 장비 확인 바로가기>")
+                lines.append(f"> {_format_mda_device_check_link(item['mdaUrl'])}")
     if permalink:
         if alert_items:
             lines.append("")
@@ -599,7 +603,7 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
     if sms_status_text:
         item_text_lines.append(f"> *문자*  {sms_status_text}")
     if item.get("mdaUrl"):
-        item_text_lines.append(f"> *MDA*  <{item['mdaUrl']}|MDA 에서 장비 확인 바로가기>")
+        item_text_lines.append(f"> {_format_mda_device_check_link(item['mdaUrl'])}")
 
     action_value = _build_device_health_alert_action_value(item)
     action_elements: list[dict[str, Any]] = []
