@@ -50,6 +50,7 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+    _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS,
     _collect_daily_device_round_abnormal_alert_items,
     _post_daily_device_round_abnormal_alert,
 )
@@ -62,11 +63,13 @@ _DEVICE_HEALTH_MONITOR_ACTION_IDS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+    _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS,
 }
 _DEVICE_HEALTH_MONITOR_ACTION_LABELS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "병원 문자 보내기",
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE: "장비 음성 안내(미구현)",
     _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE: "확인 완료",
+    _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS: "문자 자동발송 완료",
 }
 _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
@@ -74,10 +77,13 @@ _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS = {
 _DEVICE_HEALTH_MONITOR_HOSPITAL_SEQ_PATTERN = re.compile(r"#\s*(\d+)")
 _DEVICE_HEALTH_MONITOR_EXCLUDED_HOSPITAL_NAME_PATTERN = re.compile(r"^\d+_")
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID = "device_health_alert_contact_hospital_modal"
+_DEVICE_HEALTH_MONITOR_SMS_VIEW_MODAL_CALLBACK_ID = "device_health_alert_auto_sms_view_modal"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID = "device_health_alert_sms_phone"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_ACTION_ID = "phone_number"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID = "device_health_alert_sms_message"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_ACTION_ID = "message"
+_DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND = "send"
+_DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
 # 병원 관계자가 첫 줄에서 발신 주체를 바로 알 수 있게 모든 기본 문자에 같은 인사를 쓴다.
 _DEVICE_HEALTH_MONITOR_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
 _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
@@ -390,11 +396,27 @@ def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, 
         "hospitalName": _display_value(item.get("hospitalName"), default=""),
         "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
         "telephone": _display_value(item.get("telephone"), default=""),
+        "deviceAlertPhone": _display_value(item.get("deviceAlertPhone"), default=""),
+        "smsStatusText": _display_value(item.get("smsStatusText"), default=""),
+        "smsPhoneNumber": _display_value(item.get("smsPhoneNumber"), default=""),
+        "smsMessage": _display_value(item.get("smsMessage"), default=""),
+        "smsTemplateId": _display_value(item.get("smsTemplateId"), default=""),
+        "smsModalMode": _display_value(item.get("smsModalMode"), default=""),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
         "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
     }
+
+
+def _is_device_health_monitor_auto_sent_action_item(item: dict[str, str]) -> bool:
+    # 이전 알림 payload에 smsModalMode가 없어도 자동발송 완료 버튼은 재발송 모달로 열지 않는다.
+    return (
+        _display_value(item.get("smsModalMode"), default="")
+        == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+        or _display_value(item.get("smsStatusText"), default="")
+        == _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT
+    )
 
 
 def _format_device_health_monitor_action_target(item: dict[str, str]) -> str:
@@ -1045,6 +1067,10 @@ def _send_device_health_monitor_auto_sms_for_item(
         **result,
         "smsStatusText": status_text,
         "smsContactActionEnabled": not sent,
+        # 자동발송 완료 버튼에서 실제 발송 대상과 본문을 확인할 수 있게 Slack action payload로 넘긴다.
+        "smsPhoneNumber": _display_value(payload.get("sms", {}).get("to"), default=""),
+        "smsMessage": _display_value(payload.get("sms", {}).get("message"), default=""),
+        "smsTemplateId": _display_value(payload.get("sms", {}).get("templateId"), default=""),
     }
 
 
@@ -1082,6 +1108,10 @@ def _apply_device_health_monitor_auto_sms(
                     next_device_result["smsContactActionEnabled"] = (
                         "true" if auto_result.get("smsContactActionEnabled", True) else "false"
                     )
+                    for key in ("smsPhoneNumber", "smsMessage", "smsTemplateId"):
+                        value = _display_value(auto_result.get(key), default="")
+                        if value:
+                            next_device_result[key] = value
         next_device_results.append(next_device_result)
     return {**alert_summary, "deviceResults": next_device_results}
 
@@ -1163,19 +1193,40 @@ def _build_device_health_monitor_sms_modal_view(
     channel_id: str,
     message_ts: str,
     thread_ts: str,
+    mode: str = _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND,
 ) -> dict[str, Any]:
+    normalized_mode = _display_value(mode, default=_DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND)
+    is_view_auto_sent = normalized_mode == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
     sms_guide = _build_device_health_monitor_sms_guide(item)
     hospital_seq = _extract_device_health_monitor_hospital_seq(item)
-    try:
-        # 기본 번호를 채우는 조회가 실패해도 사용자가 직접 입력할 수 있게 모달은 연다.
-        contact = _lookup_device_health_monitor_hospital_contact(hospital_seq)
-    except Exception:
+    if is_view_auto_sent:
         contact = {}
-    default_phone_number = _device_health_monitor_default_modal_phone_number(contact)
-    default_message = _display_value(sms_guide.get("message"), default="")
+        default_phone_number = _device_health_monitor_korean_national_phone_number(
+            _display_value(
+                item.get("smsPhoneNumber"),
+                default=_display_value(item.get("deviceAlertPhone"), default=""),
+            )
+        )
+        default_message = _display_value(
+            item.get("smsMessage"),
+            default=_display_value(sms_guide.get("message"), default=""),
+        )
+    else:
+        try:
+            # 기본 번호를 채우는 조회가 실패해도 사용자가 직접 입력할 수 있게 모달은 연다.
+            contact = _lookup_device_health_monitor_hospital_contact(hospital_seq)
+        except Exception:
+            contact = {}
+        default_phone_number = _device_health_monitor_default_modal_phone_number(contact)
+        default_message = _display_value(sms_guide.get("message"), default="")
     target = _format_device_health_monitor_action_target(item)
     metadata = {
-        "actionId": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+        "actionId": (
+            _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS
+            if is_view_auto_sent
+            else _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL
+        ),
+        "mode": normalized_mode,
         "actorUserId": actor_user_id,
         "channelId": channel_id,
         "messageTs": message_ts,
@@ -1199,32 +1250,59 @@ def _build_device_health_monitor_sms_modal_view(
     if default_message:
         message_element["initial_value"] = default_message
 
-    return {
+    if is_view_auto_sent:
+        # 자동발송 확인 모달은 재발송 경로가 없도록 입력/submit 없이 발송된 값만 보여준다.
+        return {
+            "type": "modal",
+            "callback_id": _DEVICE_HEALTH_MONITOR_SMS_VIEW_MODAL_CALLBACK_ID,
+            "title": {"type": "plain_text", "text": "병원 문자 확인"},
+            "close": {"type": "plain_text", "text": "닫기"},
+            "private_metadata": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*받는 번호*\n{default_phone_number or '미확인'}",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*문자 내용*\n```{default_message or '미확인'}```",
+                    },
+                },
+            ],
+        }
+
+    view: dict[str, Any] = {
         "type": "modal",
         "callback_id": _DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID,
         "title": {"type": "plain_text", "text": "병원 문자 보내기"},
-        "submit": {"type": "plain_text", "text": "문자 보내기"},
         "close": {"type": "plain_text", "text": "취소"},
         "private_metadata": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
-        "blocks": [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*대상*  `{target}`"},
-            },
-            {
-                "type": "input",
-                "block_id": _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID,
-                "label": {"type": "plain_text", "text": "받는 번호"},
-                "element": phone_element,
-            },
-            {
-                "type": "input",
-                "block_id": _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID,
-                "label": {"type": "plain_text", "text": "문자 내용"},
-                "element": message_element,
-            },
-        ],
     }
+    view["submit"] = {"type": "plain_text", "text": "문자 보내기"}
+    view["blocks"] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*대상*  `{target}`"},
+        },
+        {
+            "type": "input",
+            "block_id": _DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID,
+            "label": {"type": "plain_text", "text": "받는 번호"},
+            "element": phone_element,
+        },
+        {
+            "type": "input",
+            "block_id": _DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID,
+            "label": {"type": "plain_text", "text": "문자 내용"},
+            "element": message_element,
+        },
+    ]
+    return view
 
 
 def _handle_device_health_monitor_contact_modal_action(
@@ -1238,9 +1316,22 @@ def _handle_device_health_monitor_contact_modal_action(
     client: Any,
     logger: logging.Logger,
     now: datetime | None = None,
+    mode: str = _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
     item = _normalize_device_health_monitor_alert_action_item(raw_item)
+    normalized_mode = _display_value(mode, default="")
+    if not normalized_mode:
+        normalized_mode = (
+            _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+            if _is_device_health_monitor_auto_sent_action_item(item)
+            else _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND
+        )
+    action_id = (
+        _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS
+        if normalized_mode == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+        else _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL
+    )
     normalized_trigger_id = _display_value(trigger_id, default="")
     if not normalized_trigger_id:
         result = {"status": "missing_trigger_id", "ok": False}
@@ -1252,6 +1343,7 @@ def _handle_device_health_monitor_contact_modal_action(
                 channel_id=channel_id,
                 message_ts=message_ts,
                 thread_ts=thread_ts,
+                mode=normalized_mode,
             )
             client.views_open(trigger_id=normalized_trigger_id, view=view)
             result = {"status": "modal_opened", "ok": True}
@@ -1262,7 +1354,8 @@ def _handle_device_health_monitor_contact_modal_action(
     _append_device_health_monitor_event(
         "alert_contact_sms_modal_requested",
         {
-            "actionId": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+            "actionId": action_id,
+            "mode": normalized_mode,
             "actorUserId": actor_user_id,
             "channelId": channel_id,
             "messageTs": message_ts,
@@ -1314,6 +1407,10 @@ def _extract_device_health_monitor_contact_modal_submission(body: dict[str, Any]
             metadata.get("actionId"),
             default=_DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
         ),
+        "mode": _display_value(
+            metadata.get("mode"),
+            default=_DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND,
+        ),
         "rawItem": metadata.get("item"),
         "actorUserId": _display_value(
             user.get("id"),
@@ -1337,6 +1434,11 @@ def _extract_device_health_monitor_contact_modal_submission(body: dict[str, Any]
 
 def _validate_device_health_monitor_contact_modal_submission(body: dict[str, Any]) -> dict[str, str]:
     payload = _extract_device_health_monitor_contact_modal_submission(body)
+    if (
+        _display_value(payload.get("mode"), default="")
+        == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+    ):
+        return {}
     errors: dict[str, str] = {}
     phone_number = _display_value(payload.get("smsPhoneNumber"), default="")
     if not phone_number:
@@ -1356,6 +1458,14 @@ def _handle_device_health_monitor_contact_modal_submission(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     payload = _extract_device_health_monitor_contact_modal_submission(body)
+    if (
+        _display_value(payload.get("mode"), default="")
+        == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+    ):
+        return {
+            "item": _normalize_device_health_monitor_alert_action_item(payload.get("rawItem")),
+            "result": {"status": "viewed", "ok": True},
+        }
     return _handle_device_health_monitor_alert_action(
         action_id=_display_value(
             payload.get("actionId"),
@@ -1482,7 +1592,14 @@ def _handle_device_health_monitor_slack_action(
     action_id = _display_value(payload.get("actionId"), default="")
     if action_id not in _DEVICE_HEALTH_MONITOR_ACTION_IDS:
         return {"result": {"status": "ignored", "ok": False}}
-    if action_id == _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL:
+    if action_id in {_DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL, _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS}:
+        action_item = _normalize_device_health_monitor_alert_action_item(payload.get("value"))
+        modal_mode = (
+            _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+            if action_id == _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS
+            or _is_device_health_monitor_auto_sent_action_item(action_item)
+            else _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND
+        )
         return _handle_device_health_monitor_contact_modal_action(
             raw_item=payload.get("value"),
             actor_user_id=_display_value(payload.get("actorUserId"), default=""),
@@ -1492,6 +1609,7 @@ def _handle_device_health_monitor_slack_action(
             trigger_id=_display_value(payload.get("triggerId"), default=""),
             client=client,
             logger=logger,
+            mode=modal_mode,
         )
     return _handle_device_health_monitor_alert_action(
         action_id=action_id,

@@ -30,10 +30,14 @@ _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
 _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12000
 _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
 _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = "device_health_alert_contact_hospital"
+_DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
 _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
 _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
 _DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *이상 발견 - 확인 요망*"
+_DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
+_DEVICE_HEALTH_ALERT_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
+_DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
 _DEVICE_HEALTH_ALERT_COMPONENT_ORDER = ("captureboard", "led", "audio", "pm2", "storage")
 _DEVICE_HEALTH_ALERT_COMPONENT_NAMES = {
     "captureboard": "캡처보드",
@@ -442,6 +446,9 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "deviceAlertPhone": hospital_device_alert_phone,
                 "smsStatusText": sms_status_text,
                 "smsContactActionEnabled": sms_contact_action_enabled,
+                "smsPhoneNumber": _display_value(device_result.get("smsPhoneNumber"), default=""),
+                "smsMessage": _display_value(device_result.get("smsMessage"), default=""),
+                "smsTemplateId": _display_value(device_result.get("smsTemplateId"), default=""),
                 "problemComponents": problem_components,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
@@ -531,6 +538,21 @@ def _format_mda_device_check_link(mda_url: str) -> str:
     return f"<{mda_url}|MDA 에서 장비 확인 바로가기>"
 
 
+def _format_device_health_alert_sms_contact_line(item: dict[str, Any]) -> str:
+    device_alert_phone = _display_value(
+        item.get("deviceAlertPhone"),
+        default=_display_value(item.get("smsPhoneNumber"), default=""),
+    )
+    # 문자 라인은 전화처럼 값만 보여주고, 발송 완료 여부는 별도 버튼으로 확인하게 한다.
+    if device_alert_phone:
+        return f"> *문자*  {device_alert_phone}"
+    return "> *문자*  *저장된 번호 없음. 자동발송 불가*"
+
+
+def _is_device_health_alert_auto_sms_status_button_enabled(item: dict[str, Any]) -> bool:
+    return _display_value(item.get("smsStatusText"), default="") == _DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT
+
+
 def _build_daily_device_round_abnormal_alert_text(
     report_summary: dict[str, Any],
     permalink: str | None,
@@ -545,6 +567,7 @@ def _build_daily_device_round_abnormal_alert_text(
                 lines.append("")
             lines.append(f"*{item['hospital']}*")
             lines.append(f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}")
+            lines.append(_format_device_health_alert_sms_contact_line(item))
             lines.append(f"> *병실*  {item['room']}")
             lines.append(f"> *장비*  `{item['device']}`")
             problem_components = _format_device_health_alert_problem_components(
@@ -553,9 +576,6 @@ def _build_daily_device_round_abnormal_alert_text(
             if problem_components:
                 lines.append(f"> *문제 장치*  {problem_components}")
             lines.append(f"> *이슈*  {item['issue']}")
-            sms_status_text = _display_value(item.get("smsStatusText"), default="")
-            if sms_status_text:
-                lines.append(f"> *문자*  {sms_status_text}")
             if item.get("mdaUrl"):
                 lines.append(f"> {_format_mda_device_check_link(item['mdaUrl'])}")
     if permalink:
@@ -572,6 +592,11 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
         "hospital": _display_value(item.get("hospital"), default="병원 미확인"),
         "telephone": _display_value(item.get("telephone"), default=""),
         "deviceAlertPhone": _display_value(item.get("deviceAlertPhone"), default=""),
+        "smsStatusText": _display_value(item.get("smsStatusText"), default=""),
+        "smsPhoneNumber": _display_value(item.get("smsPhoneNumber"), default=""),
+        "smsMessage": _display_value(item.get("smsMessage"), default=""),
+        "smsTemplateId": _display_value(item.get("smsTemplateId"), default=""),
+        "smsModalMode": _display_value(item.get("smsModalMode"), default=""),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
@@ -590,6 +615,7 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
     item_text_lines = [
         f"*{item['hospital']}*",
         f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}",
+        _format_device_health_alert_sms_contact_line(item),
         f"> *병실*  {item['room']}",
         f"> *장비*  `{item['device']}`",
     ]
@@ -600,14 +626,27 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
         item_text_lines.append(f"> *문제 장치*  {problem_components}")
     item_text_lines.append(f"> *이슈*  {item['issue']}")
     sms_status_text = _display_value(item.get("smsStatusText"), default="")
-    if sms_status_text:
-        item_text_lines.append(f"> *문자*  {sms_status_text}")
+    sms_status_button_enabled = _is_device_health_alert_auto_sms_status_button_enabled(item)
     if item.get("mdaUrl"):
         item_text_lines.append(f"> {_format_mda_device_check_link(item['mdaUrl'])}")
 
     action_value = _build_device_health_alert_action_value(item)
     action_elements: list[dict[str, Any]] = []
-    if _is_device_health_alert_contact_action_enabled(item):
+    if sms_status_button_enabled:
+        # 자동발송 완료는 재발송 버튼 대신 확인 버튼으로 노출해 실제 발송 번호와 문구를 다시 볼 수 있게 한다.
+        sms_status_action_value = _build_device_health_alert_action_value(
+            {**item, "smsModalMode": _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT}
+        )
+        action_elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": sms_status_text},
+                "action_id": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                "value": sms_status_action_value,
+                "style": "primary",
+            }
+        )
+    elif _is_device_health_alert_contact_action_enabled(item):
         # 자동 발송이 끝난 장비는 같은 문자가 중복 발송되지 않도록 수동 문자 버튼을 숨긴다.
         action_elements.append(
             {

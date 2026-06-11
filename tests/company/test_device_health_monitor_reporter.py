@@ -256,6 +256,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     ":alert: *이상 발견 - 확인 요망*",
                     "*#69 수지미래산부인과의원(용인)*",
                     "> *전화*  031-123-4567",
+                    "> *문자*  *저장된 번호 없음. 자동발송 불가*",
                     "> *병실*  1진료실",
                     "> *장비*  `MB2-C00043`",
                     "> *문제 장치*  `LED`",
@@ -358,7 +359,11 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertIn("LED USB 케이블을 분리했다가 다시", sms_payload["sms"]["message"])
 
         self.assertEqual(len(client.messages), 1)
-        self.assertIn("> *문자*  문자 자동발송 완료", client.messages[0]["text"])
+        self.assertIn(
+            "> *문자*  010-1234-4567",
+            client.messages[0]["text"],
+        )
+        self.assertNotIn("> *문자*  문자 자동발송 완료", client.messages[0]["text"])
         blocks = client.messages[0]["blocks"]
         section_texts = [
             block["text"]["text"]
@@ -366,13 +371,29 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             if block.get("type") == "section" and isinstance(block.get("text"), dict)
         ]
         self.assertTrue(any("*문제 장치*  `LED`" in text for text in section_texts))
-        self.assertTrue(any("문자 자동발송 완료" in text for text in section_texts))
+        self.assertTrue(
+            any(
+                "*문자*  010-1234-4567" in text
+                for text in section_texts
+            )
+        )
+        self.assertFalse(any("*문자*  문자 자동발송 완료" in text for text in section_texts))
         action_blocks = [block for block in blocks if block["type"] == "actions"]
         self.assertEqual(len(action_blocks), 1)
         self.assertEqual(
             [element["action_id"] for element in action_blocks[0]["elements"]],
-            [reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE],
+            [
+                reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+            ],
         )
+        self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "문자 자동발송 완료")
+        self.assertIn('"smsPhoneNumber":"01012344567"', action_blocks[0]["elements"][0]["value"])
+        self.assertIn(
+            f'"smsModalMode":"{reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT}"',
+            action_blocks[0]["elements"][0]["value"],
+        )
+        self.assertIn("LED USB 케이블을 분리했다가 다시", action_blocks[0]["elements"][0]["value"])
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary", "alert_sms_auto_sent", "slack_alert_sent"],
@@ -501,6 +522,93 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertIn("초음파 진단기와 캡처보드", message_block["element"]["initial_value"])
         self.assertIn("두 HDMI 케이블을 분리했다가 다시", message_block["element"]["initial_value"])
         self.assertIn("\n\n", message_block["element"]["initial_value"])
+
+    def test_auto_sms_status_action_opens_confirmation_modal_without_resending(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.action")
+        item = {
+            "hospitalSeq": "69",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "issue": "LED USB 장치를 찾지 못했어",
+            "mdaUrl": "https://mda.example/device",
+            "deviceAlertPhone": "010-1234-4567",
+            "smsStatusText": "문자 자동발송 완료",
+            "smsPhoneNumber": "01012344567",
+            "smsMessage": "안녕하세요 마미톡입니다.\n\nLED USB 케이블을 분리했다가 다시 연결해 주세요.",
+            "smsTemplateId": "led_disconnected",
+        }
+        body = {
+            "trigger_id": "TRIGGER456",
+            "user": {"id": "U123"},
+            "channel": {"id": "C_HEALTH"},
+            "message": {"ts": "3000.002"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                    "value": json.dumps(item, ensure_ascii=False),
+                }
+            ],
+        }
+
+        with patch(
+            "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+        ):
+            result = reporter._handle_device_health_monitor_slack_action(body, client, logger)
+
+        self.assertEqual(result["result"]["status"], "modal_opened")
+        self.assertEqual(len(client.views), 1)
+        view = client.views[0]["view"]
+        self.assertEqual(view["callback_id"], reporter._DEVICE_HEALTH_MONITOR_SMS_VIEW_MODAL_CALLBACK_ID)
+        self.assertEqual(view["title"]["text"], "병원 문자 확인")
+        self.assertNotIn("submit", view)
+        metadata = json.loads(view["private_metadata"])
+        self.assertEqual(metadata["actionId"], reporter._DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS)
+        self.assertEqual(metadata["mode"], reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT)
+        phone_block = view["blocks"][0]
+        message_block = view["blocks"][1]
+        self.assertEqual(phone_block["type"], "section")
+        self.assertEqual(message_block["type"], "section")
+        self.assertIn("*받는 번호*\n01012344567", phone_block["text"]["text"])
+        self.assertIn("*문자 내용*", message_block["text"]["text"])
+        self.assertIn(item["smsMessage"], message_block["text"]["text"])
+        self.assertFalse(any(block.get("type") == "input" for block in view["blocks"]))
+        self.assertFalse(
+            any(
+                block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID
+                for block in view["blocks"]
+            )
+        )
+        self.assertFalse(
+            any(
+                block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID
+                for block in view["blocks"]
+            )
+        )
+
+        submission_body = {
+            "user": {"id": "U123"},
+            "view": {
+                "private_metadata": view["private_metadata"],
+                "state": {"values": {}},
+            },
+        }
+        self.assertEqual(
+            reporter._validate_device_health_monitor_contact_modal_submission(submission_body),
+            {},
+        )
+        with patch(
+            "boxer_company_adapter_slack.device_health_monitor_reporter._post_device_health_monitor_sms_payload"
+        ) as post_sms_mock:
+            submission_result = reporter._handle_device_health_monitor_contact_modal_submission(
+                submission_body,
+                client,
+                logger,
+            )
+
+        post_sms_mock.assert_not_called()
+        self.assertEqual(submission_result["result"]["status"], "viewed")
 
     def test_contact_modal_leaves_phone_blank_for_landline_even_with_test_number(self) -> None:
         item = {
