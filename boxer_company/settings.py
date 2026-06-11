@@ -187,6 +187,9 @@ DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS = int(
 DEVICE_HEALTH_MONITOR_ENABLED = (
     os.getenv("DEVICE_HEALTH_MONITOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 )
+DEVICE_HEALTH_MONITOR_ALERTS_ENABLED = (
+    os.getenv("DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
 DEVICE_HEALTH_MONITOR_CHANNEL_ID = os.getenv(
     "DEVICE_HEALTH_MONITOR_CHANNEL_ID",
     os.getenv("DAILY_DEVICE_ROUND_CHANNEL_ID", ""),

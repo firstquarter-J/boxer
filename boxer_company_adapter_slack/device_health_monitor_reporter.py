@@ -3269,7 +3269,8 @@ def _run_device_health_monitor_once(
         return False
 
     channel_id = _device_health_monitor_channel_id()
-    if not channel_id:
+    alert_delivery_enabled = bool(cs.DEVICE_HEALTH_MONITOR_ALERTS_ENABLED)
+    if alert_delivery_enabled and not channel_id:
         next_state = _build_device_health_monitor_next_state(
             state,
             report_summary,
@@ -3316,6 +3317,26 @@ def _run_device_health_monitor_once(
             channel_id,
             report_summary.get("checkedDeviceCount"),
             report_summary.get("abnormalCandidateCount"),
+        )
+        return False
+
+    if not alert_delivery_enabled:
+        # 모니터링은 유지하되 운영자가 알림을 중단한 동안에는 Slack/SMS 전송만 막는다.
+        _append_device_health_monitor_event(
+            "alert_delivery_suppressed",
+            {
+                "alertableCount": len(alertable_fingerprints),
+                "alertFingerprints": sorted(alertable_fingerprints),
+                "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+                "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+            },
+            now=local_now,
+            logger=logger,
+        )
+        logger.info(
+            "Suppressed device health alert delivery checkedDevices=%s alertable=%s",
+            report_summary.get("checkedDeviceCount"),
+            len(alertable_fingerprints),
         )
         return False
 

@@ -208,6 +208,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
         with (
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
             patch.object(reporter.s, "DB_QUERY_ENABLED", True),
             patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
             patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
@@ -310,6 +311,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
         with (
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
             patch.object(reporter.s, "DB_QUERY_ENABLED", True),
             patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
             patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
@@ -397,6 +399,50 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary", "alert_sms_auto_sent", "slack_alert_sent"],
+        )
+
+    def test_suppresses_alert_delivery_when_alerts_are_disabled(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", False),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
+                return_value={},
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._build_device_health_monitor_summary",
+                return_value=_mobile_abnormal_summary(),
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._save_device_health_monitor_state"
+            ) as save_state_mock,
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._post_device_health_monitor_sms_payload"
+            ) as post_sms_mock,
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+            ) as append_event_mock,
+        ):
+            sent = reporter._run_device_health_monitor_once(client, logger, now=local_now)
+
+        self.assertFalse(sent)
+        self.assertEqual(client.messages, [])
+        post_sms_mock.assert_not_called()
+        saved_state = save_state_mock.call_args.args[0]
+        self.assertEqual(len(saved_state["alertFingerprints"]), 1)
+        self.assertEqual(
+            [call.args[0] for call in append_event_mock.call_args_list],
+            ["run_summary", "alert_delivery_suppressed"],
         )
 
     def test_suppresses_duplicate_alert_until_reminder_window_passes(self) -> None:
