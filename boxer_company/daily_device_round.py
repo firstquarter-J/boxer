@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, time, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -30,11 +30,76 @@ _DAILY_DEVICE_ROUND_COMPONENT_NAMES = {
     "captureboard": "캡처보드",
     "led": "LED",
 }
+_DAILY_DEVICE_ROUND_HOSPITAL_SCOPES = {
+    "free_barcode",
+    "non_free_barcode",
+    "all",
+}
+_DAILY_DEVICE_ROUND_HOSPITAL_ORDERS = {
+    "recordings_month_desc",
+    "recordings_month_asc",
+    "hospital_seq_asc",
+}
+_DAILY_DEVICE_ROUND_HOSPITAL_SCOPE_LABELS = {
+    "free_barcode": "free_barcode_hospitals",
+    "non_free_barcode": "non_free_barcode_hospitals",
+    "all": "all_active_installed_hospitals",
+}
 _DailyDeviceRoundProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 def _daily_device_round_timezone() -> ZoneInfo:
     return _DAILY_DEVICE_ROUND_TIMEZONE
+
+
+def _normalize_daily_device_round_hospital_scope(value: Any) -> str:
+    normalized = _display_value(value, default="free_barcode").strip().lower().replace("-", "_")
+    return normalized if normalized in _DAILY_DEVICE_ROUND_HOSPITAL_SCOPES else "free_barcode"
+
+
+def _normalize_daily_device_round_hospital_order(value: Any) -> str:
+    normalized = _display_value(value, default="recordings_month_asc").strip().lower().replace("-", "_")
+    return normalized if normalized in _DAILY_DEVICE_ROUND_HOSPITAL_ORDERS else "recordings_month_asc"
+
+
+def _daily_device_round_hospital_scope() -> str:
+    return _normalize_daily_device_round_hospital_scope(
+        getattr(cs, "DAILY_DEVICE_ROUND_HOSPITAL_SCOPE", "free_barcode")
+    )
+
+
+def _daily_device_round_hospital_order() -> str:
+    return _normalize_daily_device_round_hospital_order(
+        getattr(cs, "DAILY_DEVICE_ROUND_HOSPITAL_ORDER", "recordings_month_asc")
+    )
+
+
+def _daily_device_round_hospital_scope_label(scope: str | None = None) -> str:
+    normalized_scope = _normalize_daily_device_round_hospital_scope(scope or _daily_device_round_hospital_scope())
+    return _DAILY_DEVICE_ROUND_HOSPITAL_SCOPE_LABELS[normalized_scope]
+
+
+def _daily_device_round_empty_scope_summary_line(scope: str) -> str:
+    normalized_scope = _normalize_daily_device_round_hospital_scope(scope)
+    if normalized_scope == "free_barcode":
+        return "무료병원 순회 대상이 없어"
+    if normalized_scope == "non_free_barcode":
+        return "비무료병원 순회 대상이 없어"
+    return "점검 대상 병원이 없어"
+
+
+def _daily_device_round_month_utc_range(now: datetime | None = None) -> tuple[datetime, datetime]:
+    local_now = _coerce_daily_device_round_now(now)
+    local_tz = _daily_device_round_timezone()
+    local_start = datetime.combine(local_now.date().replace(day=1), time.min, tzinfo=local_tz)
+    if local_start.month == 12:
+        local_end = local_start.replace(year=local_start.year + 1, month=1)
+    else:
+        local_end = local_start.replace(month=local_start.month + 1)
+    return (
+        local_start.astimezone(timezone.utc).replace(tzinfo=None),
+        local_end.astimezone(timezone.utc).replace(tzinfo=None),
+    )
 
 
 def _coerce_daily_device_round_now(now: datetime | None = None) -> datetime:
@@ -75,9 +140,40 @@ def _is_daily_device_round_excluded_hospital_name(hospital_name: Any) -> bool:
     return len(normalized_name) >= 2 and normalized_name[0] in "01234567" and normalized_name[1] == "_"
 
 
-def _load_daily_device_round_hospital_candidates() -> list[dict[str, Any]]:
+def _load_daily_device_round_hospital_candidates(
+    *,
+    hospital_scope: str = "all",
+    hospital_order: str = "recordings_month_asc",
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    normalized_scope = _normalize_daily_device_round_hospital_scope(hospital_scope)
+    normalized_order = _normalize_daily_device_round_hospital_order(hospital_order)
+    month_utc_start, month_utc_end = _daily_device_round_month_utc_range(now)
+    where_clauses = [
+        "d.hospitalSeq IS NOT NULL",
+        "COALESCE(d.deviceName, '') <> ''",
+        "COALESCE(d.activeFlag, 1) = 1",
+        "COALESCE(d.installFlag, 1) = 1",
+    ]
+    if normalized_scope == "free_barcode":
+        # 무료 병원 우선 순회를 위해 MDA 병원 설정의 핑크바코드 적용일을 대상 표식으로 본다.
+        where_clauses.append("h.isPinkBarcode IS NOT NULL")
+    elif normalized_scope == "non_free_barcode":
+        # 무료 병원 업데이트가 끝난 뒤 나머지 병원만 이어서 순회할 수 있게 별도 scope를 둔다.
+        where_clauses.append("h.isPinkBarcode IS NULL")
+    where_sql = " AND ".join(where_clauses)
+    order_sql = (
+        "monthlyRecordingCount ASC, d.hospitalSeq ASC"
+        if normalized_order == "recordings_month_asc"
+        else (
+            "d.hospitalSeq ASC"
+            if normalized_order == "hospital_seq_asc"
+            else "monthlyRecordingCount DESC, d.hospitalSeq ASC"
+        )
+    )
 
     connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
     try:
@@ -86,15 +182,23 @@ def _load_daily_device_round_hospital_candidates() -> list[dict[str, Any]]:
                 "SELECT "
                 "d.hospitalSeq AS hospitalSeq, "
                 "h.hospitalName AS hospitalName, "
+                "h.isPinkBarcode AS isPinkBarcode, "
+                "COALESCE(rm.monthlyRecordingCount, 0) AS monthlyRecordingCount, "
                 "COUNT(DISTINCT d.deviceName) AS deviceCount "
                 "FROM devices d "
                 "INNER JOIN hospitals h ON d.hospitalSeq = h.seq "
-                "WHERE d.hospitalSeq IS NOT NULL "
-                "AND COALESCE(d.deviceName, '') <> '' "
-                "AND COALESCE(d.activeFlag, 1) = 1 "
-                "AND COALESCE(d.installFlag, 1) = 1 "
-                "GROUP BY d.hospitalSeq, h.hospitalName "
-                "ORDER BY d.hospitalSeq ASC"
+                "LEFT JOIN ("
+                "SELECT r.hospitalSeq AS hospitalSeq, COUNT(*) AS monthlyRecordingCount "
+                "FROM recordings r "
+                "WHERE r.recordedAt >= %s "
+                "AND r.recordedAt < %s "
+                "AND r.hospitalSeq IS NOT NULL "
+                "GROUP BY r.hospitalSeq"
+                ") rm ON rm.hospitalSeq = d.hospitalSeq "
+                f"WHERE {where_sql} "
+                "GROUP BY d.hospitalSeq, h.hospitalName, h.isPinkBarcode, rm.monthlyRecordingCount "
+                f"ORDER BY {order_sql}",
+                (month_utc_start, month_utc_end),
             )
             rows = cursor.fetchall() or []
     finally:
@@ -112,6 +216,8 @@ def _load_daily_device_round_hospital_candidates() -> list[dict[str, Any]]:
             {
                 "hospitalSeq": hospital_seq,
                 "hospitalName": hospital_name,
+                "isPinkBarcode": row.get("isPinkBarcode"),
+                "monthlyRecordingCount": int(row.get("monthlyRecordingCount") or 0),
                 "deviceCount": int(row.get("deviceCount") or 0),
             }
         )
@@ -125,10 +231,7 @@ def _select_daily_device_round_hospital(
     if not candidates:
         return None
 
-    normalized_candidates = sorted(
-        [item for item in candidates if _coerce_int(item.get("hospitalSeq")) is not None],
-        key=lambda item: int(item.get("hospitalSeq") or 0),
-    )
+    normalized_candidates = [item for item in candidates if _coerce_int(item.get("hospitalSeq")) is not None]
     if not normalized_candidates:
         return None
 
@@ -159,9 +262,19 @@ def _select_daily_device_round_hospital(
     if last_hospital_seq is None:
         return selectable_candidates[0]
 
-    for item in selectable_candidates:
-        if int(item.get("hospitalSeq") or 0) > last_hospital_seq:
-            return item
+    last_index = None
+    for index, item in enumerate(normalized_candidates):
+        if int(item.get("hospitalSeq") or 0) == last_hospital_seq:
+            last_index = index
+            break
+    if last_index is None:
+        return selectable_candidates[0]
+
+    for offset in range(1, len(normalized_candidates) + 1):
+        candidate = normalized_candidates[(last_index + offset) % len(normalized_candidates)]
+        candidate_seq = int(candidate.get("hospitalSeq") or 0)
+        if candidate_seq not in processed_hospital_seqs:
+            return candidate
     return selectable_candidates[0]
 
 
@@ -169,10 +282,7 @@ def _resolve_next_daily_device_round_hospital_seq(
     candidates: list[dict[str, Any]],
     current_hospital_seq: int | None,
 ) -> int | None:
-    normalized_candidates = sorted(
-        [item for item in candidates if _coerce_int(item.get("hospitalSeq")) is not None],
-        key=lambda item: int(item.get("hospitalSeq") or 0),
-    )
+    normalized_candidates = [item for item in candidates if _coerce_int(item.get("hospitalSeq")) is not None]
     if not normalized_candidates:
         return None
     if current_hospital_seq is None:
@@ -1286,7 +1396,14 @@ def _build_daily_device_round_summary(
     progress_callback: _DailyDeviceRoundProgressCallback | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
-    candidates = _load_daily_device_round_hospital_candidates()
+    hospital_scope = _daily_device_round_hospital_scope()
+    hospital_scope_label = _daily_device_round_hospital_scope_label(hospital_scope)
+    hospital_order = _daily_device_round_hospital_order()
+    candidates = _load_daily_device_round_hospital_candidates(
+        hospital_scope=hospital_scope,
+        hospital_order=hospital_order,
+        now=local_now,
+    )
     state_payload = state if isinstance(state, dict) else {}
     processed_hospital_seqs = _coerce_daily_device_round_hospital_seqs(state_payload.get("processedHospitalSeqs"))
     candidate_hospital_seqs = {
@@ -1313,6 +1430,9 @@ def _build_daily_device_round_summary(
             "deviceCount": 0,
             "autoUpdateAgent": bool(auto_update_agent),
             "autoUpdateBox": bool(auto_update_box),
+            "hospitalScope": hospital_scope,
+            "hospitalCandidateScope": hospital_scope_label,
+            "hospitalOrder": hospital_order,
             "autoCleanupTrashCan": bool(auto_cleanup_trashcan),
             "autoPowerOff": bool(auto_power_off),
             "statusCounts": {
@@ -1346,7 +1466,7 @@ def _build_daily_device_round_summary(
             "summaryLine": (
                 "이번 야간 업데이트 창에서 처리할 병원을 모두 끝냈어"
                 if candidate_hospital_seqs and processed_candidate_count >= len(candidate_hospital_seqs)
-                else "점검 대상 병원이 없어"
+                else _daily_device_round_empty_scope_summary_line(hospital_scope)
             ),
         }
 
@@ -1475,6 +1595,9 @@ def _build_daily_device_round_summary(
         "scheduledDeviceCount": int(hospital.get("deviceCount") or len(device_results)),
         "autoUpdateAgent": bool(auto_update_agent),
         "autoUpdateBox": bool(auto_update_box),
+        "hospitalScope": hospital_scope,
+        "hospitalCandidateScope": hospital_scope_label,
+        "hospitalOrder": hospital_order,
         "autoCleanupTrashCan": bool(auto_cleanup_trashcan),
         "autoPowerOff": bool(auto_power_off),
         "statusCounts": status_counts,

@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from boxer_company import daily_device_round as rounder
@@ -123,6 +123,24 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
             10,
         )
 
+    def test_selects_next_hospital_by_candidate_order_not_seq(self) -> None:
+        candidates = [
+            {"hospitalSeq": 30, "hospitalName": "C", "monthlyRecordingCount": 90},
+            {"hospitalSeq": 10, "hospitalName": "A", "monthlyRecordingCount": 80},
+            {"hospitalSeq": 20, "hospitalName": "B", "monthlyRecordingCount": 70},
+        ]
+
+        selected = rounder._select_daily_device_round_hospital(
+            candidates,
+            state={"lastHospitalSeq": 30},
+        )
+
+        self.assertEqual(selected["hospitalSeq"], 10)
+        self.assertEqual(
+            rounder._resolve_next_daily_device_round_hospital_seq(candidates, 10),
+            20,
+        )
+
     def test_skips_already_processed_hospitals_in_same_window(self) -> None:
         candidates = [
             {"hospitalSeq": 10, "hospitalName": "A", "deviceCount": 2},
@@ -168,6 +186,104 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(selected["hospitalSeq"], 20)
+
+    @patch("boxer_company.daily_device_round._create_db_connection")
+    def test_load_candidates_can_limit_to_free_barcode_hospitals(
+        self,
+        mock_create_db_connection,
+    ) -> None:
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            {
+                "hospitalSeq": 10,
+                "hospitalName": "무료병원",
+                "isPinkBarcode": "2026-06-01",
+                "deviceCount": 2,
+            },
+            {
+                "hospitalSeq": 20,
+                "hospitalName": "4_입고",
+                "isPinkBarcode": "2026-06-01",
+                "deviceCount": 1,
+            },
+        ]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        mock_create_db_connection.return_value = connection
+
+        with (
+            patch.object(rounder.s, "DB_HOST", "db.example"),
+            patch.object(rounder.s, "DB_USERNAME", "user"),
+            patch.object(rounder.s, "DB_PASSWORD", "password"),
+            patch.object(rounder.s, "DB_DATABASE", "box"),
+        ):
+            candidates = rounder._load_daily_device_round_hospital_candidates(
+                hospital_scope="free_barcode",
+                hospital_order="recordings_month_desc",
+                now=datetime(2026, 6, 12, 10, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+            )
+
+        executed_sql = cursor.execute.call_args.args[0]
+        params = cursor.execute.call_args.args[1]
+        self.assertIn("h.isPinkBarcode AS isPinkBarcode", executed_sql)
+        self.assertIn("h.isPinkBarcode IS NOT NULL", executed_sql)
+        self.assertIn("FROM recordings r", executed_sql)
+        self.assertIn("COUNT(*) AS monthlyRecordingCount", executed_sql)
+        self.assertIn("ORDER BY monthlyRecordingCount DESC, d.hospitalSeq ASC", executed_sql)
+        self.assertEqual(
+            params,
+            (
+                datetime(2026, 5, 31, 15, 0),
+                datetime(2026, 6, 30, 15, 0),
+            ),
+        )
+        self.assertEqual(
+            candidates,
+            [
+                {
+                    "hospitalSeq": 10,
+                    "hospitalName": "무료병원",
+                    "isPinkBarcode": "2026-06-01",
+                    "monthlyRecordingCount": 0,
+                    "deviceCount": 2,
+                }
+            ],
+        )
+        connection.close.assert_called_once()
+
+    @patch("boxer_company.daily_device_round._create_db_connection")
+    def test_load_candidates_can_target_non_free_or_all_hospitals(
+        self,
+        mock_create_db_connection,
+    ) -> None:
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        mock_create_db_connection.return_value = connection
+
+        with (
+            patch.object(rounder.s, "DB_HOST", "db.example"),
+            patch.object(rounder.s, "DB_USERNAME", "user"),
+            patch.object(rounder.s, "DB_PASSWORD", "password"),
+            patch.object(rounder.s, "DB_DATABASE", "box"),
+        ):
+            rounder._load_daily_device_round_hospital_candidates(
+                hospital_scope="non_free_barcode",
+                hospital_order="recordings_month_asc",
+            )
+            rounder._load_daily_device_round_hospital_candidates(
+                hospital_scope="all",
+                hospital_order="hospital_seq_asc",
+            )
+
+        non_free_sql = cursor.execute.call_args_list[0].args[0]
+        all_sql = cursor.execute.call_args_list[1].args[0]
+        self.assertIn("h.isPinkBarcode IS NULL", non_free_sql)
+        self.assertIn("ORDER BY monthlyRecordingCount ASC, d.hospitalSeq ASC", non_free_sql)
+        self.assertNotIn("h.isPinkBarcode IS NULL", all_sql)
+        self.assertNotIn("h.isPinkBarcode IS NOT NULL", all_sql)
+        self.assertIn("ORDER BY d.hospitalSeq ASC", all_sql)
 
 
 class DailyDeviceRoundExecutionTests(unittest.TestCase):
@@ -866,6 +982,14 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertEqual(summary["cleanupCounts"]["candidates"], 1)
         self.assertEqual(summary["cleanupCounts"]["executed"], 1)
         self.assertEqual(summary["nextHospitalSeq"], 10)
+        self.assertEqual(summary["hospitalScope"], "free_barcode")
+        self.assertEqual(summary["hospitalCandidateScope"], "free_barcode_hospitals")
+        self.assertEqual(summary["hospitalOrder"], "recordings_month_asc")
+        mock_load_hospitals.assert_called_once_with(
+            hospital_scope="free_barcode",
+            hospital_order="recordings_month_asc",
+            now=datetime(2026, 4, 8, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
 
     @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
     @patch("boxer_company.daily_device_round._load_daily_device_round_devices")
@@ -919,6 +1043,69 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertEqual(events[2][0], "device_started")
         self.assertEqual(events[2][1]["deviceIndex"], 2)
         self.assertEqual(summary["hospitalSeq"], 20)
+        self.assertEqual(summary["hospitalScope"], "free_barcode")
+        self.assertEqual(summary["hospitalCandidateScope"], "free_barcode_hospitals")
+        self.assertEqual(summary["hospitalOrder"], "recordings_month_asc")
+        mock_load_candidates.assert_called_once_with(
+            hospital_scope="free_barcode",
+            hospital_order="recordings_month_asc",
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+    @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_devices")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_hospital_candidates")
+    def test_builds_summary_limits_candidates_to_free_barcode_hospitals_by_default(
+        self,
+        mock_load_candidates,
+        mock_load_devices,
+        mock_run_daily_device_round_for_device,
+    ) -> None:
+        mock_load_candidates.return_value = [
+            {
+                "hospitalSeq": 20,
+                "hospitalName": "무료병원",
+                "isPinkBarcode": "2026-06-01",
+                "deviceCount": 1,
+            },
+        ]
+        mock_load_devices.return_value = [
+            {"deviceName": "MB2-C00001", "hospitalSeq": 20, "hospitalName": "무료병원", "roomName": "1진료실"},
+        ]
+        mock_run_daily_device_round_for_device.return_value = {
+            "overallLabel": "정상",
+            "initialPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": True}},
+            "finalPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+            "trashcanCleanup": {"required": False, "executed": False, "status": "disabled"},
+            "agentAction": None,
+            "boxAction": {"ok": True, "status": "completed"},
+        }
+
+        summary = rounder._build_daily_device_round_summary(
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            state={},
+            auto_update_agent=True,
+            auto_update_box=True,
+        )
+
+        self.assertEqual(summary["hospitalSeq"], 20)
+        self.assertEqual(summary["hospitalScope"], "free_barcode")
+        self.assertEqual(summary["hospitalCandidateScope"], "free_barcode_hospitals")
+        self.assertEqual(summary["hospitalOrder"], "recordings_month_asc")
+        self.assertEqual(summary["updateCounts"]["boxCandidates"], 1)
+        self.assertEqual(summary["updateCounts"]["boxUpdated"], 1)
+        mock_load_candidates.assert_called_once_with(
+            hospital_scope="free_barcode",
+            hospital_order="recordings_month_asc",
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+        mock_run_daily_device_round_for_device.assert_called_once_with(
+            "MB2-C00001",
+            auto_update_agent=True,
+            auto_update_box=True,
+            auto_cleanup_trashcan=False,
+            auto_power_off=False,
+        )
 
     def test_formats_report_with_hospital_label_and_multiline_device_lines(self) -> None:
         report_text = rounder._format_daily_device_round_report(

@@ -101,6 +101,8 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
                     "lastHospitalSeq": 604,
                     "nextHospitalSeq": 604,
                     "lastRunDate": "2026-04-08",
+                    "hospitalScope": "free_barcode",
+                    "hospitalOrder": "recordings_month_asc",
                     "activeHospitalSeq": 601,
                     "activeHospitalName": "A병원",
                     "activeDeviceIndex": 3,
@@ -141,21 +143,104 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
             self.assertTrue(
                 reporter._is_daily_device_round_due(
                     datetime(2026, 4, 9, 4, 59, tzinfo=local_tz),
-                    {"windowKey": "2026-04-08", "processedHospitalSeqs": [10]},
+                    {
+                        "windowKey": "2026-04-08",
+                        "hospitalScope": "free_barcode",
+                        "hospitalOrder": "recordings_month_asc",
+                        "processedHospitalSeqs": [10],
+                    },
                 )
             )
             self.assertFalse(
                 reporter._is_daily_device_round_due(
                     datetime(2026, 4, 9, 5, 0, tzinfo=local_tz),
-                    {"windowKey": "2026-04-08", "processedHospitalSeqs": [10]},
+                    {
+                        "windowKey": "2026-04-08",
+                        "hospitalScope": "free_barcode",
+                        "hospitalOrder": "recordings_month_asc",
+                        "processedHospitalSeqs": [10],
+                    },
                 )
             )
             self.assertFalse(
                 reporter._is_daily_device_round_due(
                     datetime(2026, 4, 9, 1, 0, tzinfo=local_tz),
-                    {"windowKey": "2026-04-08", "windowCompletedAt": "2026-04-09T00:30:00+09:00"},
+                    {
+                        "windowKey": "2026-04-08",
+                        "hospitalScope": "free_barcode",
+                        "hospitalOrder": "recordings_month_asc",
+                        "windowCompletedAt": "2026-04-09T00:30:00+09:00",
+                    },
                 )
             )
+
+    def test_resets_window_progress_when_hospital_scope_changes(self) -> None:
+        local_tz = ZoneInfo("Asia/Seoul")
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOSPITAL_SCOPE", "non_free_barcode"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+        ):
+            normalized = reporter._normalize_daily_device_round_state(
+                {
+                    "windowKey": "2026-04-08",
+                    "hospitalScope": "free_barcode",
+                    "hospitalOrder": "recordings_month_asc",
+                    "processedHospitalSeqs": [10, 20],
+                    "lastHospitalSeq": 20,
+                    "nextHospitalSeq": 30,
+                    "windowCompletedAt": "2026-04-09T00:30:00+09:00",
+                    "windowThreadTs": "2000.001",
+                    "windowThreadChannelId": "C_DAILY",
+                },
+                now=datetime(2026, 4, 9, 1, 0, tzinfo=local_tz),
+            )
+
+        self.assertEqual(normalized["windowKey"], "2026-04-08")
+        self.assertEqual(normalized["hospitalScope"], "non_free_barcode")
+        self.assertEqual(normalized["hospitalOrder"], "recordings_month_asc")
+        self.assertIsNone(normalized["lastHospitalSeq"])
+        self.assertIsNone(normalized["nextHospitalSeq"])
+        self.assertEqual(normalized["processedHospitalSeqs"], [])
+        self.assertNotIn("windowCompletedAt", normalized)
+        self.assertEqual(normalized["windowThreadTs"], "")
+        self.assertEqual(normalized["windowThreadChannelId"], "")
+
+    def test_resets_window_progress_when_hospital_order_changes(self) -> None:
+        local_tz = ZoneInfo("Asia/Seoul")
+
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOSPITAL_SCOPE", "free_barcode"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOSPITAL_ORDER", "recordings_month_asc"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+        ):
+            normalized = reporter._normalize_daily_device_round_state(
+                {
+                    "windowKey": "2026-04-08",
+                    "hospitalScope": "free_barcode",
+                    "hospitalOrder": "recordings_month_desc",
+                    "processedHospitalSeqs": [10, 20],
+                    "lastHospitalSeq": 20,
+                    "nextHospitalSeq": 30,
+                    "windowThreadTs": "2000.001",
+                    "windowThreadChannelId": "C_DAILY",
+                },
+                now=datetime(2026, 4, 9, 1, 0, tzinfo=local_tz),
+            )
+
+        self.assertEqual(normalized["hospitalScope"], "free_barcode")
+        self.assertEqual(normalized["hospitalOrder"], "recordings_month_asc")
+        self.assertIsNone(normalized["lastHospitalSeq"])
+        self.assertIsNone(normalized["nextHospitalSeq"])
+        self.assertEqual(normalized["processedHospitalSeqs"], [])
+        self.assertEqual(normalized["windowThreadTs"], "")
+        self.assertEqual(normalized["windowThreadChannelId"], "")
 
 
 class DailyDeviceRoundReporterRunTests(unittest.TestCase):
@@ -221,6 +306,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
                 return_value={
                     "windowKey": "2026-04-08",
+                    "hospitalScope": "free_barcode",
+                    "hospitalOrder": "recordings_month_asc",
                     "processedHospitalSeqs": [10],
                     "lastHospitalSeq": 10,
                     "nextHospitalSeq": 20,
@@ -253,6 +340,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             now=local_now,
             state={
                 "windowKey": "2026-04-08",
+                "hospitalScope": "free_barcode",
+                "hospitalOrder": "recordings_month_asc",
                 "processedHospitalSeqs": [10],
                 "lastHospitalSeq": 10,
                 "nextHospitalSeq": 20,
@@ -282,6 +371,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             save_state_mock.call_args_list[0].args[0],
             {
                 "windowKey": "2026-04-08",
+                "hospitalScope": "free_barcode",
+                "hospitalOrder": "recordings_month_asc",
                 "processedHospitalSeqs": [10],
                 "lastHospitalSeq": 10,
                 "nextHospitalSeq": 20,
@@ -300,6 +391,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "lastSentAt": local_now.isoformat(),
                 "channelId": "C_DAILY",
                 "windowKey": "2026-04-08",
+                "hospitalScope": "free_barcode",
+                "hospitalOrder": "recordings_month_asc",
                 "windowThreadTs": "2000.001",
                 "windowThreadChannelId": "C_DAILY",
                 "processedHospitalSeqs": [10, 20],
@@ -524,6 +617,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
                 return_value={
                     "windowKey": "2026-04-08",
+                    "hospitalScope": "free_barcode",
+                    "hospitalOrder": "recordings_month_asc",
                     "processedHospitalSeqs": [10, 20],
                     "lastHospitalSeq": 20,
                     "nextHospitalSeq": 30,
@@ -562,6 +657,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             save_state_mock.call_args_list[0].args[0],
             {
                 "windowKey": "2026-04-08",
+                "hospitalScope": "free_barcode",
+                "hospitalOrder": "recordings_month_asc",
                 "processedHospitalSeqs": [10, 20, 30],
                 "lastHospitalSeq": 30,
                 "lastHospitalName": "C병원",
@@ -1012,6 +1109,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
                 return_value={
                     "windowKey": "2026-04-08",
+                    "hospitalScope": "free_barcode",
+                    "hospitalOrder": "recordings_month_asc",
                     "processedHospitalSeqs": [10, 20],
                     "lastHospitalSeq": 20,
                     "nextHospitalSeq": 30,
@@ -1036,6 +1135,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
         save_state_mock.assert_called_once_with(
             {
                 "windowKey": "2026-04-08",
+                "hospitalScope": "free_barcode",
+                "hospitalOrder": "recordings_month_asc",
                 "processedHospitalSeqs": [10, 20],
                 "windowCompletedAt": local_now.isoformat(),
                 "lastRunDate": "2026-04-09",

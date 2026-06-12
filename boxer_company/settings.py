@@ -162,6 +162,22 @@ DAILY_DEVICE_ROUND_STATE_PATH = os.getenv(
     "DAILY_DEVICE_ROUND_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "daily_device_round_state.json"),
 ).strip()
+_DAILY_DEVICE_ROUND_HOSPITAL_SCOPE = (
+    os.getenv("DAILY_DEVICE_ROUND_HOSPITAL_SCOPE", "free_barcode").strip().lower().replace("-", "_")
+)
+DAILY_DEVICE_ROUND_HOSPITAL_SCOPE = (
+    _DAILY_DEVICE_ROUND_HOSPITAL_SCOPE
+    if _DAILY_DEVICE_ROUND_HOSPITAL_SCOPE in {"free_barcode", "non_free_barcode", "all"}
+    else "free_barcode"
+)
+_DAILY_DEVICE_ROUND_HOSPITAL_ORDER = (
+    os.getenv("DAILY_DEVICE_ROUND_HOSPITAL_ORDER", "recordings_month_asc").strip().lower().replace("-", "_")
+)
+DAILY_DEVICE_ROUND_HOSPITAL_ORDER = (
+    _DAILY_DEVICE_ROUND_HOSPITAL_ORDER
+    if _DAILY_DEVICE_ROUND_HOSPITAL_ORDER in {"recordings_month_desc", "recordings_month_asc", "hospital_seq_asc"}
+    else "recordings_month_asc"
+)
 DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT = (
     os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

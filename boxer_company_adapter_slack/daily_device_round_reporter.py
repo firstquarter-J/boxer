@@ -17,9 +17,13 @@ from boxer_company.daily_device_round import (
     _coerce_daily_device_round_hospital_seqs,
     _coerce_daily_device_round_now,
     _coerce_int,
+    _daily_device_round_hospital_order,
+    _daily_device_round_hospital_scope,
     _daily_device_round_timezone,
     _format_daily_device_round_hospital_label,
     _format_daily_device_round_report,
+    _normalize_daily_device_round_hospital_order,
+    _normalize_daily_device_round_hospital_scope,
 )
 
 _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
@@ -288,8 +292,12 @@ def _normalize_daily_device_round_state(
     state_payload = state if isinstance(state, dict) else {}
     normalized_state = dict(state_payload)
     current_window_key = _daily_device_round_window_key(now)
+    current_hospital_scope = _daily_device_round_hospital_scope()
+    current_hospital_order = _daily_device_round_hospital_order()
     normalized_state["lastHospitalSeq"] = _coerce_int(state_payload.get("lastHospitalSeq"))
     normalized_state["nextHospitalSeq"] = _coerce_int(state_payload.get("nextHospitalSeq"))
+    normalized_state["hospitalScope"] = current_hospital_scope
+    normalized_state["hospitalOrder"] = current_hospital_order
     normalized_state["windowThreadTs"] = str(state_payload.get("windowThreadTs") or "").strip()
     normalized_state["windowThreadChannelId"] = str(state_payload.get("windowThreadChannelId") or "").strip()
     normalized_state["processedHospitalSeqs"] = _coerce_daily_device_round_hospital_seqs(
@@ -320,12 +328,29 @@ def _normalize_daily_device_round_state(
         return _clear_daily_device_round_active_progress(normalized_state)
 
     previous_window_key = str(state_payload.get("windowKey") or "").strip()
+    previous_hospital_scope_raw = str(state_payload.get("hospitalScope") or "").strip()
+    previous_hospital_scope = (
+        _normalize_daily_device_round_hospital_scope(previous_hospital_scope_raw)
+        if previous_hospital_scope_raw
+        else ""
+    )
+    previous_hospital_order_raw = str(state_payload.get("hospitalOrder") or "").strip()
+    previous_hospital_order = (
+        _normalize_daily_device_round_hospital_order(previous_hospital_order_raw)
+        if previous_hospital_order_raw
+        else ""
+    )
     normalized_state["windowKey"] = current_window_key
-    if previous_window_key != current_window_key:
+    hospital_scope_changed = previous_hospital_scope != current_hospital_scope
+    hospital_order_changed = previous_hospital_order != current_hospital_order
+    if previous_window_key != current_window_key or hospital_scope_changed or hospital_order_changed:
         normalized_state["processedHospitalSeqs"] = []
         normalized_state.pop("windowCompletedAt", None)
         normalized_state["windowThreadTs"] = ""
         normalized_state["windowThreadChannelId"] = ""
+        if hospital_scope_changed or hospital_order_changed:
+            normalized_state["lastHospitalSeq"] = None
+            normalized_state["nextHospitalSeq"] = None
         # Legacy fixed-target mode persisted the same hospital as both last/next.
         # Clear that self-loop on a new window so the first run can rotate forward.
         if normalized_state.get("nextHospitalSeq") == normalized_state.get("lastHospitalSeq"):
@@ -813,6 +838,8 @@ def _run_daily_device_round_if_due(
             {
                 **state,
                 "windowKey": window_key,
+                "hospitalScope": _daily_device_round_hospital_scope(),
+                "hospitalOrder": _daily_device_round_hospital_order(),
                 "windowThreadTs": thread_ts,
                 "windowThreadChannelId": channel_id,
                 "channelId": channel_id,
@@ -840,6 +867,8 @@ def _run_daily_device_round_if_due(
                 {
                     **state,
                     "windowKey": window_key,
+                    "hospitalScope": _daily_device_round_hospital_scope(),
+                    "hospitalOrder": _daily_device_round_hospital_order(),
                     "windowThreadTs": thread_ts,
                     "windowThreadChannelId": channel_id,
                     "channelId": channel_id,
@@ -900,6 +929,8 @@ def _run_daily_device_round_if_due(
     next_state = {
         **base_state,
         "windowKey": window_key,
+        "hospitalScope": _daily_device_round_hospital_scope(),
+        "hospitalOrder": _daily_device_round_hospital_order(),
         "processedHospitalSeqs": processed_hospital_seqs,
         "windowThreadTs": thread_ts,
         "windowThreadChannelId": thread_channel_id,
