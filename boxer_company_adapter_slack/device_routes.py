@@ -92,6 +92,11 @@ from boxer_company_adapter_slack.device_activity import (
     _render_device_download_dm_text,
     _render_device_download_thread_notice,
 )
+from boxer_company_adapter_slack.daily_device_round_reporter import (
+    _build_daily_device_round_auto_update_status,
+    _format_daily_device_round_auto_update_status,
+    _set_daily_device_round_auto_update,
+)
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,45 @@ def _build_device_download_barcode_required_message() -> str:
     )
 
 
+def _normalize_daily_device_round_control_question(question: str) -> str:
+    return " ".join(str(question or "").strip().lower().split())
+
+
+def _extract_daily_device_round_auto_update_control(
+    question: str,
+) -> tuple[str, str] | None:
+    normalized = _normalize_daily_device_round_control_question(question)
+    if not normalized:
+        return None
+    if "자동" not in normalized or "업데이트" not in normalized:
+        return None
+    has_agent_target = "에이전트" in normalized or "agent" in normalized
+    has_box_target = any(token in normalized for token in ("마미박스", "박스", "box"))
+    has_daily_context = any(token in normalized for token in ("데일리", "일일", "순회"))
+    if not (has_agent_target or has_box_target or has_daily_context):
+        return None
+
+    # 운영자가 자연어로 켜고 끌 수 있게 하되, 상태 조회는 실행 변경보다 뒤에 둔다.
+    if any(token in normalized for token in ("꺼", "끄", "off", "disable", "비활성", "중단", "멈춰", "정지")):
+        action = "disable"
+    elif any(token in normalized for token in ("켜", "on", "enable", "활성", "재개", "시작")):
+        action = "enable"
+    elif any(token in normalized for token in ("상태", "확인", "조회", "알려", "보여")):
+        action = "status"
+    else:
+        return None
+
+    if action == "status":
+        return "all", action
+    if has_agent_target and not has_box_target:
+        return "agent", action
+    if has_box_target and not has_agent_target:
+        return "box", action
+    if has_agent_target and has_box_target:
+        return "all", action
+    return "unknown", action
+
+
 def _handle_device_routes(
     context: DeviceRoutesContext,
     deps: DeviceRoutesDeps,
@@ -179,6 +223,53 @@ def _handle_device_routes(
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
+    auto_update_control = _extract_daily_device_round_auto_update_control(question)
+
+    if auto_update_control:
+        auto_update_target, auto_update_action = auto_update_control
+        try:
+            _set_request_log_route(
+                context.payload,
+                "daily device round auto update control",
+                handler_type="router",
+            )
+            if auto_update_action == "status":
+                status_payload = _build_daily_device_round_auto_update_status()
+            elif auto_update_target == "unknown":
+                context.reply("자동 업데이트 켜고 끄기는 `박스` 또는 `에이전트` 중 대상을 같이 써줘")
+                return True
+            elif auto_update_target == "all":
+                enabled = auto_update_action == "enable"
+                status_payload = _set_daily_device_round_auto_update(
+                    "box",
+                    enabled,
+                    user_id=context.user_id,
+                )
+                status_payload = _set_daily_device_round_auto_update(
+                    "agent",
+                    enabled,
+                    user_id=context.user_id,
+                )
+            else:
+                status_payload = _set_daily_device_round_auto_update(
+                    auto_update_target,
+                    auto_update_action == "enable",
+                    user_id=context.user_id,
+                )
+            context.reply(
+                _format_daily_device_round_auto_update_status(status_payload),
+                mention_user=False,
+            )
+            context.logger.info(
+                "Responded with daily auto update control in thread_ts=%s target=%s action=%s",
+                context.thread_ts,
+                auto_update_target,
+                auto_update_action,
+            )
+        except Exception:
+            context.logger.exception("Daily auto update control failed")
+            context.reply("마미박스 자동 업데이트 설정 변경 중 오류가 발생했어. 상태 파일 권한을 확인해줘")
+        return True
 
     if _is_missing_barcode_device_download_request(question, barcode):
         # 다운로드는 세션 단위 작업이라 병원/병실/날짜만으로 확정하지 않는다.

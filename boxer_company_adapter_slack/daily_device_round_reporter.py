@@ -33,6 +33,12 @@ _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK = threading.Lock()
 _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
 _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12000
 _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_OVERRIDE_KEY = "autoUpdateAgentOverride"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_AT_KEY = "autoUpdateAgentUpdatedAt"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_BY_KEY = "autoUpdateAgentUpdatedBy"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_OVERRIDE_KEY = "autoUpdateBoxOverride"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_AT_KEY = "autoUpdateBoxUpdatedAt"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_BY_KEY = "autoUpdateBoxUpdatedBy"
 _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = "device_health_alert_contact_hospital"
 _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
@@ -130,6 +136,189 @@ def _persist_daily_device_round_state_best_effort(
         if logger is not None:
             logger.warning("일일 장비 순회 상태를 즉시 저장하지 못했어", exc_info=True)
     return normalized_state
+
+
+def _coerce_daily_device_round_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    return None
+
+
+def _daily_device_round_auto_update_keys(target: str) -> tuple[str, str, str]:
+    if target == "agent":
+        return (
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_OVERRIDE_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_AT_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_BY_KEY,
+        )
+    if target == "box":
+        return (
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_OVERRIDE_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_AT_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_BY_KEY,
+        )
+    raise ValueError(f"지원하지 않는 자동 업데이트 대상이야: {target}")
+
+
+def _daily_device_round_auto_update_env_default(target: str) -> bool:
+    if target == "agent":
+        return bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT)
+    if target == "box":
+        return bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX)
+    raise ValueError(f"지원하지 않는 자동 업데이트 대상이야: {target}")
+
+
+def _daily_device_round_auto_update_label(target: str) -> str:
+    if target == "agent":
+        return "에이전트"
+    if target == "box":
+        return "마미박스"
+    return target
+
+
+def _resolve_daily_device_round_auto_update(
+    target: str,
+    state: dict[str, Any] | None = None,
+) -> bool:
+    state_payload = state if isinstance(state, dict) else _load_daily_device_round_state()
+    override_key, _, _ = _daily_device_round_auto_update_keys(target)
+    override = _coerce_daily_device_round_optional_bool(
+        state_payload.get(override_key)
+    )
+    # Slack 명령 override가 있으면 env보다 우선하고, 없으면 기존 env 기본값을 그대로 쓴다.
+    if override is not None:
+        return override
+    return _daily_device_round_auto_update_env_default(target)
+
+
+def _resolve_daily_device_round_auto_update_agent(
+    state: dict[str, Any] | None = None,
+) -> bool:
+    return _resolve_daily_device_round_auto_update("agent", state)
+
+
+def _resolve_daily_device_round_auto_update_box(
+    state: dict[str, Any] | None = None,
+) -> bool:
+    return _resolve_daily_device_round_auto_update("box", state)
+
+
+def _build_daily_device_round_auto_update_target_status(
+    target: str,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state_payload = state if isinstance(state, dict) else _load_daily_device_round_state()
+    override_key, updated_at_key, updated_by_key = _daily_device_round_auto_update_keys(target)
+    override = _coerce_daily_device_round_optional_bool(
+        state_payload.get(override_key)
+    )
+    return {
+        "target": target,
+        "label": _daily_device_round_auto_update_label(target),
+        "enabled": _resolve_daily_device_round_auto_update(target, state_payload),
+        "envDefault": _daily_device_round_auto_update_env_default(target),
+        "override": override,
+        "source": "slack_override" if override is not None else "env",
+        "updatedAt": str(state_payload.get(updated_at_key) or "").strip(),
+        "updatedBy": str(state_payload.get(updated_by_key) or "").strip(),
+    }
+
+
+def _build_daily_device_round_auto_update_status(
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state_payload = state if isinstance(state, dict) else _load_daily_device_round_state()
+    return {
+        "agent": _build_daily_device_round_auto_update_target_status("agent", state_payload),
+        "box": _build_daily_device_round_auto_update_target_status("box", state_payload),
+    }
+
+
+def _build_daily_device_round_auto_update_box_status(
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _build_daily_device_round_auto_update_target_status("box", state)
+
+
+def _set_daily_device_round_auto_update(
+    target: str,
+    enabled: bool,
+    *,
+    user_id: str | None = None,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    local_now = _coerce_daily_device_round_now(now)
+    state = _load_daily_device_round_state(logger=logger)
+    override_key, updated_at_key, updated_by_key = _daily_device_round_auto_update_keys(target)
+    next_state = {
+        **state,
+        override_key: bool(enabled),
+        updated_at_key: local_now.isoformat(),
+        updated_by_key: str(user_id or "").strip(),
+    }
+    # 사용자가 직접 켜고 끄는 설정은 저장 실패를 숨기지 말고 호출자에게 알려야 한다.
+    persisted_state = _remember_daily_device_round_runtime_state(next_state, now=local_now)
+    _save_daily_device_round_state(persisted_state)
+    return _build_daily_device_round_auto_update_status(persisted_state)
+
+
+def _set_daily_device_round_auto_update_box(
+    enabled: bool,
+    *,
+    user_id: str | None = None,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    return _set_daily_device_round_auto_update(
+        "box",
+        enabled,
+        user_id=user_id,
+        now=now,
+        logger=logger,
+    )["box"]
+
+
+def _format_daily_device_round_auto_update_target_line(status: dict[str, Any]) -> list[str]:
+    label = str(status.get("label") or "대상").strip()
+    enabled = bool(status.get("enabled"))
+    env_default = bool(status.get("envDefault"))
+    source = str(status.get("source") or "").strip()
+    updated_at = str(status.get("updatedAt") or "").strip()
+    updated_by = str(status.get("updatedBy") or "").strip()
+    source_label = "Slack 명령" if source == "slack_override" else ".env 기본값"
+    lines = [
+        f"• {label}: *{'켜짐' if enabled else '꺼짐'}* "
+        f"| 기준 `{source_label}` | .env `{'true' if env_default else 'false'}`"
+    ]
+    if updated_at:
+        actor = f" / <@{updated_by}>" if updated_by else ""
+        lines.append(f"  - 마지막 변경: `{updated_at}`{actor}")
+    return lines
+
+
+def _format_daily_device_round_auto_update_status(status: dict[str, Any]) -> str:
+    agent_status = status.get("agent") if isinstance(status.get("agent"), dict) else {}
+    box_status = status.get("box") if isinstance(status.get("box"), dict) else {}
+    lines = ["*데일리 자동 업데이트 설정*"]
+    lines.extend(_format_daily_device_round_auto_update_target_line(box_status))
+    lines.extend(_format_daily_device_round_auto_update_target_line(agent_status))
+    lines.append("• 적용: 다음 데일리 순회부터")
+    return "\n".join(lines)
+
+
+def _format_daily_device_round_auto_update_box_status(status: dict[str, Any]) -> str:
+    return _format_daily_device_round_auto_update_status(
+        {
+            "box": status,
+            "agent": _build_daily_device_round_auto_update_target_status("agent"),
+        }
+    )
 
 
 def _clear_daily_device_round_active_progress(
@@ -914,8 +1103,8 @@ def _run_daily_device_round_if_due(
     report_summary = _build_daily_device_round_summary(
         now=local_now,
         state=state,
-        auto_update_agent=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT),
-        auto_update_box=bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX),
+        auto_update_agent=_resolve_daily_device_round_auto_update_agent(state),
+        auto_update_box=_resolve_daily_device_round_auto_update_box(state),
         auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
         auto_power_off=bool(cs.DAILY_DEVICE_ROUND_AUTO_POWER_OFF),
         progress_callback=_handle_daily_device_round_progress,

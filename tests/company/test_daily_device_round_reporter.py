@@ -1,6 +1,9 @@
+import json
 import logging
 import unittest
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import ANY, patch
 from zoneinfo import ZoneInfo
 
@@ -86,6 +89,63 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
     def setUp(self) -> None:
         with reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
             reporter._DAILY_DEVICE_ROUND_RUNTIME_STATE.clear()
+
+    def test_box_auto_update_override_beats_env_default(self) -> None:
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", True),
+        ):
+            status = reporter._build_daily_device_round_auto_update_status(
+                {
+                    "autoUpdateAgentOverride": False,
+                    "autoUpdateBoxOverride": False,
+                }
+            )
+
+        self.assertFalse(status["agent"]["enabled"])
+        self.assertTrue(status["agent"]["envDefault"])
+        self.assertEqual(status["agent"]["source"], "slack_override")
+        self.assertFalse(status["box"]["enabled"])
+        self.assertTrue(status["box"]["envDefault"])
+        self.assertEqual(status["box"]["source"], "slack_override")
+
+    def test_sets_auto_update_override_in_state_file(self) -> None:
+        local_now = datetime(2026, 4, 8, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "daily_device_round_state.json"
+            with (
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_STATE_PATH", str(state_path)),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            ):
+                status = reporter._set_daily_device_round_auto_update(
+                    "box",
+                    True,
+                    user_id="U123",
+                    now=local_now,
+                )
+                status = reporter._set_daily_device_round_auto_update(
+                    "agent",
+                    False,
+                    user_id="U123",
+                    now=local_now,
+                )
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(status["agent"]["enabled"])
+        self.assertTrue(status["agent"]["envDefault"])
+        self.assertEqual(status["agent"]["updatedBy"], "U123")
+        self.assertTrue(status["box"]["enabled"])
+        self.assertFalse(status["box"]["envDefault"])
+        self.assertEqual(status["box"]["updatedBy"], "U123")
+        self.assertFalse(saved["autoUpdateAgentOverride"])
+        self.assertEqual(saved["autoUpdateAgentUpdatedAt"], local_now.isoformat())
+        self.assertEqual(saved["autoUpdateAgentUpdatedBy"], "U123")
+        self.assertTrue(saved["autoUpdateBoxOverride"])
+        self.assertEqual(saved["autoUpdateBoxUpdatedAt"], local_now.isoformat())
+        self.assertEqual(saved["autoUpdateBoxUpdatedBy"], "U123")
 
     def test_clears_legacy_fixed_target_self_loop_on_new_window(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")
@@ -1079,7 +1139,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             },
             "deviceResults": [],
             "autoUpdateAgent": True,
-            "autoUpdateBox": True,
+            "autoUpdateBox": False,
             "autoCleanupTrashCan": False,
             "autoPowerOff": False,
             "powerCounts": {
@@ -1102,6 +1162,7 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", True),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
@@ -1114,12 +1175,13 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                     "processedHospitalSeqs": [10, 20],
                     "lastHospitalSeq": 20,
                     "nextHospitalSeq": 30,
+                    "autoUpdateBoxOverride": False,
                 },
             ),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
                 return_value=summary,
-            ),
+            ) as build_summary_mock,
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
             ) as save_state_mock,
@@ -1132,12 +1194,32 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
 
         self.assertFalse(sent)
         self.assertEqual(client.messages, [])
+        build_summary_mock.assert_called_once_with(
+            now=local_now,
+            state={
+                "windowKey": "2026-04-08",
+                "hospitalScope": "free_barcode",
+                "hospitalOrder": "recordings_month_asc",
+                "processedHospitalSeqs": [10, 20],
+                "lastHospitalSeq": 20,
+                "nextHospitalSeq": 30,
+                "autoUpdateBoxOverride": False,
+                "windowThreadTs": "",
+                "windowThreadChannelId": "",
+            },
+            auto_update_agent=True,
+            auto_update_box=False,
+            auto_cleanup_trashcan=False,
+            auto_power_off=False,
+            progress_callback=ANY,
+        )
         save_state_mock.assert_called_once_with(
             {
                 "windowKey": "2026-04-08",
                 "hospitalScope": "free_barcode",
                 "hospitalOrder": "recordings_month_asc",
                 "processedHospitalSeqs": [10, 20],
+                "autoUpdateBoxOverride": False,
                 "windowCompletedAt": local_now.isoformat(),
                 "lastRunDate": "2026-04-09",
                 "lastHospitalSeq": None,

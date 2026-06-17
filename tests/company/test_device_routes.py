@@ -21,7 +21,166 @@ def _payload() -> dict[str, object]:
     }
 
 
+def _deps() -> DeviceRoutesDeps:
+    return DeviceRoutesDeps(
+        get_s3_client=lambda: None,
+        get_recordings_context=lambda: {},
+        has_recordings_device_mapping=lambda context: False,
+        send_dm_message=lambda user_id, text: False,
+        build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+        reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+    )
+
+
 class DeviceRouteHandlerTests(unittest.TestCase):
+    def test_daily_box_auto_update_enable_command_updates_runtime_setting(self) -> None:
+        replies: list[str] = []
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes._set_daily_device_round_auto_update",
+            return_value={
+                "box": {
+                    "label": "마미박스",
+                    "enabled": True,
+                    "envDefault": False,
+                    "source": "slack_override",
+                    "updatedAt": "2026-06-17T10:00:00+09:00",
+                    "updatedBy": "U123",
+                },
+                "agent": {
+                    "label": "에이전트",
+                    "enabled": True,
+                    "envDefault": True,
+                    "source": "env",
+                    "updatedAt": "",
+                    "updatedBy": "",
+                },
+            },
+        ) as set_auto_update:
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="박스 자동 업데이트 켜",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                _deps(),
+            )
+
+        self.assertTrue(handled)
+        set_auto_update.assert_called_once_with("box", True, user_id="U123")
+        self.assertIn("마미박스: *켜짐*", replies[0])
+        self.assertIn("에이전트: *켜짐*", replies[0])
+        self.assertIn("적용: 다음 데일리 순회부터", replies[0])
+
+    def test_daily_agent_auto_update_disable_command_updates_runtime_setting(self) -> None:
+        replies: list[str] = []
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes._set_daily_device_round_auto_update",
+            return_value={
+                "box": {
+                    "label": "마미박스",
+                    "enabled": False,
+                    "envDefault": False,
+                    "source": "env",
+                    "updatedAt": "",
+                    "updatedBy": "",
+                },
+                "agent": {
+                    "label": "에이전트",
+                    "enabled": False,
+                    "envDefault": True,
+                    "source": "slack_override",
+                    "updatedAt": "2026-06-17T10:00:00+09:00",
+                    "updatedBy": "U123",
+                },
+            },
+        ) as set_auto_update:
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="에이전트 자동 업데이트 꺼",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                _deps(),
+            )
+
+        self.assertTrue(handled)
+        set_auto_update.assert_called_once_with("agent", False, user_id="U123")
+        self.assertIn("마미박스: *꺼짐*", replies[0])
+        self.assertIn("에이전트: *꺼짐*", replies[0])
+
+    def test_daily_box_auto_update_status_command_does_not_change_setting(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.device_routes._build_daily_device_round_auto_update_status",
+                return_value={
+                    "box": {
+                        "label": "마미박스",
+                        "enabled": False,
+                        "envDefault": False,
+                        "source": "env",
+                        "updatedAt": "",
+                        "updatedBy": "",
+                    },
+                    "agent": {
+                        "label": "에이전트",
+                        "enabled": True,
+                        "envDefault": True,
+                        "source": "env",
+                        "updatedAt": "",
+                        "updatedBy": "",
+                    },
+                },
+            ) as build_status,
+            patch(
+                "boxer_company_adapter_slack.device_routes._set_daily_device_round_auto_update"
+            ) as set_auto_update,
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="데일리 자동 업데이트 상태",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                _deps(),
+            )
+
+        self.assertTrue(handled)
+        build_status.assert_called_once_with()
+        set_auto_update.assert_not_called()
+        self.assertIn("마미박스: *꺼짐*", replies[0])
+        self.assertIn("에이전트: *켜짐*", replies[0])
+
     def test_monthly_streaming_restore_request_bypasses_device_recovery(self) -> None:
         replies: list[str] = []
 
