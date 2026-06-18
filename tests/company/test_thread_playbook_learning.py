@@ -67,6 +67,7 @@ def _payload() -> dict[str, object]:
 
 class ThreadPlaybookLearningTests(unittest.TestCase):
     def test_detects_thread_learning_request(self) -> None:
+        self.assertTrue(_is_thread_playbook_learning_request("스레드 학습"))
         self.assertTrue(_is_thread_playbook_learning_request("이 스레드 학습"))
         self.assertTrue(_is_thread_playbook_learning_request("thread 학습해줘"))
         self.assertFalse(_is_thread_playbook_learning_request("스레드 내용을 요약해줘"))

@@ -49,6 +49,7 @@ def _is_thread_playbook_learning_request(question: str) -> bool:
         token in normalized
         for token in (
             "이스레드학습",
+            "스레드학습",
             "스레드학습해",
             "스레드학습저장",
             "스레드학습시켜",
