@@ -47,6 +47,32 @@ if _raw_request_log_query_ids.strip():
 else:
     REQUEST_LOG_QUERY_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
 
+THREAD_PLAYBOOK_LEARNING_ENABLED = (
+    os.getenv("THREAD_PLAYBOOK_LEARNING_ENABLED", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_raw_thread_playbook_learning_ids = os.getenv("THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS", "")
+if _raw_thread_playbook_learning_ids.strip():
+    THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS = {
+        item.strip()
+        for item in _raw_thread_playbook_learning_ids.split(",")
+        if item.strip()
+    }
+else:
+    THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS = set(CLAUDE_ALLOWED_USER_IDS)
+THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID = os.getenv("THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID", "").strip()
+THREAD_PLAYBOOK_NOTION_SECTION = os.getenv(
+    "THREAD_PLAYBOOK_NOTION_SECTION",
+    "마미박스 장애 대응",
+).strip()
+THREAD_PLAYBOOK_NOTION_KIND = os.getenv("THREAD_PLAYBOOK_NOTION_KIND", "runbook").strip()
+THREAD_PLAYBOOK_NOTION_PRIORITY = os.getenv("THREAD_PLAYBOOK_NOTION_PRIORITY", "high").strip()
+THREAD_PLAYBOOK_LEARNING_FETCH_LIMIT = int(os.getenv("THREAD_PLAYBOOK_LEARNING_FETCH_LIMIT", "100"))
+THREAD_PLAYBOOK_LEARNING_MAX_THREAD_CHARS = int(
+    os.getenv("THREAD_PLAYBOOK_LEARNING_MAX_THREAD_CHARS", "12000")
+)
+THREAD_PLAYBOOK_LEARNING_MAX_TOKENS = int(os.getenv("THREAD_PLAYBOOK_LEARNING_MAX_TOKENS", "900"))
+
 RECORDING_STREAMING_RESTORE_ENABLED = (
     os.getenv("RECORDING_STREAMING_RESTORE_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}

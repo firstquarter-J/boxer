@@ -84,6 +84,10 @@ from boxer_company_adapter_slack.structured_routes import (
     StructuredRoutesContext,
     _handle_structured_routes,
 )
+from boxer_company_adapter_slack.thread_learning_routes import (
+    ThreadLearningRoutesContext,
+    _handle_thread_learning_routes,
+)
 from boxer_company_adapter_slack.daily_device_round_reporter import attach_daily_device_round_reporter
 from boxer_company_adapter_slack.device_health_monitor_reporter import attach_device_health_monitor_reporter
 from boxer_company_adapter_slack.weekly_reports import (
@@ -573,6 +577,22 @@ def create_app() -> App:
             except Exception:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
                 reply(fallback_with_references)
+
+        if _handle_thread_learning_routes(
+            ThreadLearningRoutesContext(
+                question=question,
+                payload=payload,
+                user_id=user_id,
+                channel_id=channel_id,
+                current_ts=current_ts,
+                thread_ts=thread_ts,
+                reply=reply,
+                logger=logger,
+                client=client,
+                claude_client=claude_client,
+            )
+        ):
+            return
 
         if _handle_admin_routes(
             AdminRoutesContext(

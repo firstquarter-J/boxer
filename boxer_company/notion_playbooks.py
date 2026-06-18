@@ -1242,3 +1242,21 @@ def _select_notion_references(
             break
 
     return selected[:limit]
+
+
+def _invalidate_notion_playbook_cache(root_page_id: str | None = None) -> None:
+    normalized_root_id = ""
+    if root_page_id:
+        try:
+            normalized_root_id = _normalize_notion_id(root_page_id)
+        except ValueError:
+            normalized_root_id = ""
+
+    if not normalized_root_id or _NOTION_INDEX_CACHE.get("root_page_id") == normalized_root_id:
+        _NOTION_INDEX_CACHE.update(
+            {
+                "root_page_id": "",
+                "expires_at": 0.0,
+                "entries": [],
+            }
+        )
