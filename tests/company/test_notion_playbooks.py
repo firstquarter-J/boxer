@@ -55,6 +55,26 @@ class NotionPlaybooksTests(unittest.TestCase):
         self.assertTrue(any("10초 이상" in line for line in references[0]["previewLines"]))
 
     @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
+    def test_local_motion_disabled_auto_recording_playbook_is_selected_without_notion(self, _: object) -> None:
+        references = _select_notion_references(
+            "모션감지 사용안함 설정 상태에서 자동으로 녹화시작 되는 이유는?",
+            evidence_payload={
+                "route": "notion_playbook_qa",
+                "request": {
+                    "question": "모션감지 사용안함 설정 상태에서 자동으로 녹화시작 되는 이유는?",
+                },
+            },
+        )
+
+        self.assertTrue(references)
+        self.assertEqual(
+            references[0]["title"],
+            "모션감지 사용안함 상태에서 바코드 스캔 후 1시간 뒤 자동 녹화 시작",
+        )
+        self.assertTrue(any("v2.11.300" in line for line in references[0]["previewLines"]))
+        self.assertFalse(any("파란 LED는 모션 감지 대기" in line for line in references[0]["previewLines"]))
+
+    @patch("boxer_company.notion_playbooks._is_notion_configured", return_value=False)
     def test_local_pink_barcode_overview_playbook_is_selected_for_overview_query(self, _: object) -> None:
         references = _select_notion_references(
             "핑크 바코드 전체 정리해줘",
