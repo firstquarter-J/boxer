@@ -1,8 +1,15 @@
 import os
 import re
+import shlex
+import socket
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
+
+try:
+    import paramiko
+except ImportError:  # pragma: no cover - runtime guard
+    paramiko = None
 
 from boxer_company import settings as cs
 from boxer.core import settings as s
@@ -13,7 +20,12 @@ from boxer_company.routers.box_db import (
     _lookup_device_contexts_by_barcode,
     _lookup_device_contexts_by_hospital_seqs,
 )
+from boxer_company.routers.mda_graphql import (
+    _is_mda_graphql_configured,
+    _wait_for_mda_device_agent_ssh,
+)
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
+from boxer_company.routers.ssh_command import _close_ssh_streams, _wait_for_ssh_exit_status
 
 _NUMERIC_YMD_PATTERN = re.compile(r"(?<!\d)(\d{2,4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})(?!\d)")
 _KOREAN_YMD_PATTERN = re.compile(
@@ -36,6 +48,14 @@ _RESTART_APP_VERSION_PATTERN = re.compile(r"app version:\s*(.+)$", re.IGNORECASE
 _RESTART_NODE_VERSION_PATTERN = re.compile(r"node\.js version:\s*(.+)$", re.IGNORECASE)
 _RESTART_PLATFORM_PATTERN = re.compile(r"platform:\s*(.+)$", re.IGNORECASE)
 _RESTART_START_TIME_PATTERN = re.compile(r"start time:\s*(.+)$", re.IGNORECASE)
+_DEVICE_BOOT_START_PATTERN = re.compile(r"(?:^|\s)linux version\s+\d", re.IGNORECASE)
+_OS_LIFECYCLE_JOURNAL_GREP_PATTERN = (
+    "power key pressed|powering off|system is powering down|stopping pm2 process manager|"
+    "all applications stopped|pm2 daemon stopped|reached target shutdown|starting power-off|"
+    "systemd-shutdown|-- reboot --|linux version"
+)
+_OS_LIFECYCLE_PRE_WINDOW_SEC = 180
+_OS_LIFECYCLE_POST_WINDOW_SEC = 420
 _HOSPITAL_SCOPE_PATTERN = re.compile(
     r"(?:^|\s)병원(?:명)?\s*[:=]?\s*(.+?)(?=\s*(?:병실(?:명)?|진료실명|장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)\s*[:=]?|$)",
     re.IGNORECASE,
@@ -1201,6 +1221,39 @@ def _extract_restart_events_with_line_no(lines: list[str]) -> list[dict[str, Any
     return events
 
 
+def _classify_session_lifecycle_event(stripped_line: str) -> tuple[str, str]:
+    lowered = stripped_line.lower()
+
+    # OS/journal 로그가 함께 들어온 경우에는 앱 SIGINT보다 앞선 종료 원인을 우선 보여준다.
+    if "power key pressed" in lowered:
+        return "power_key_shutdown", "전원 버튼 종료 요청"
+    if "powering off" in lowered or "system is powering down" in lowered:
+        return "os_powering_off", "OS 전원 종료 진행"
+    if "stopping pm2 process manager" in lowered or "all applications stopped" in lowered:
+        return "pm2_shutdown", "PM2 앱 종료 진행"
+    if "pm2 daemon stopped" in lowered:
+        return "pm2_shutdown", "PM2 데몬 종료"
+    if "reached target shutdown" in lowered or "starting power-off" in lowered or "systemd-shutdown" in lowered:
+        return "os_shutdown", "OS 종료 단계"
+    if stripped_line.strip() == "-- Reboot --":
+        return "device_reboot", "장비 재부팅 구간"
+    if _DEVICE_BOOT_START_PATTERN.search(stripped_line):
+        return "device_boot", "장비 부팅 시작"
+
+    if "sigint received app exiting" in lowered or "app cleanup" in lowered:
+        return "app_sigint", "앱 종료 신호(SIGINT)"
+    if "cleanup finished, sending sigterm" in lowered:
+        return "app_sigterm", "앱 종료 완료(SIGTERM)"
+    if _RESTART_START_PATTERN.search(stripped_line):
+        return "app_restart", "앱 재시작 감지"
+    if "uploadable recording: none" in lowered:
+        return "upload_none", "업로드 대상 없음"
+    if "rebooting" in lowered or "system reboot" in lowered or "system is reboot" in lowered:
+        return "device_reboot", "장비 재부팅 로그"
+
+    return "", ""
+
+
 def _extract_session_lifecycle_events(
     lines: list[str],
     session: dict[str, Any],
@@ -1228,40 +1281,279 @@ def _extract_session_lifecycle_events(
         (next_barcode_line_no - 1) if next_barcode_line_no else len(lines),
     )
     events: list[dict[str, Any]] = []
-    seen_labels_by_line: set[tuple[int, str]] = set()
+    seen_labels_by_time: set[tuple[str, str]] = set()
 
     for line_no in range(start_line_no, upper_bound + 1):
         raw_line = lines[line_no - 1]
         stripped = _strip_leading_log_timestamp(raw_line)
-        lowered = stripped.lower()
-        label = ""
-        if "sigint received app exiting" in lowered or "app cleanup" in lowered:
-            label = "앱 종료 감지(SIGINT)"
-        elif "cleanup finished, sending sigterm" in lowered:
-            label = "앱 종료 완료(SIGTERM)"
-        elif _RESTART_START_PATTERN.search(stripped):
-            label = "앱 재시작 감지"
-        elif "uploadable recording: none" in lowered:
-            label = "업로드 대상 없음"
-        elif "rebooting" in lowered or "system reboot" in lowered or "system is reboot" in lowered:
-            label = "장비 재부팅 로그"
+        event_type, label = _classify_session_lifecycle_event(stripped)
         if not label:
             continue
 
-        dedupe_key = (line_no, label)
-        if dedupe_key in seen_labels_by_line:
+        time_label = _extract_time_label_from_line(raw_line)
+        dedupe_time = time_label if time_label != "시간미상" else str(line_no)
+        dedupe_key = (dedupe_time, label)
+        if dedupe_key in seen_labels_by_time:
             continue
-        seen_labels_by_line.add(dedupe_key)
+        seen_labels_by_time.add(dedupe_key)
         events.append(
             {
                 "line_no": line_no,
-                "time_label": _extract_time_label_from_line(raw_line),
+                "time_label": time_label,
+                "event_type": event_type,
                 "label": label,
                 "raw_line": stripped,
             }
         )
 
     return events
+
+
+def _summarize_session_shutdown_method(lifecycle_events: list[dict[str, Any]] | None) -> str:
+    event_types = {
+        str(event.get("event_type") or "").strip()
+        for event in lifecycle_events or []
+        if str(event.get("event_type") or "").strip()
+    }
+    if not event_types:
+        return ""
+
+    # 물리 전원 버튼 여부를 묻는 케이스가 많아서 가장 구체적인 OS 원인을 먼저 요약한다.
+    suffix = " → 앱 종료 신호(SIGINT)" if "app_sigint" in event_types else ""
+    if "power_key_shutdown" in event_types:
+        return f"전원 버튼 종료 요청(OS 로그){suffix}"
+    if "os_powering_off" in event_types or "os_shutdown" in event_types:
+        return f"OS 전원 종료 진행(OS 로그){suffix}"
+    if "pm2_shutdown" in event_types:
+        return f"PM2 앱 종료 진행{suffix}"
+    if "app_sigint" in event_types:
+        return "앱 종료 신호(SIGINT, 원인은 OS 로그 필요)"
+    if "device_reboot" in event_types or "device_boot" in event_types:
+        return "장비 재부팅 로그 감지"
+    if "app_sigterm" in event_types:
+        return "앱 종료 완료(SIGTERM)"
+    return ""
+
+
+def _seconds_to_time_label(total_seconds: int) -> str:
+    bounded = max(0, min(86399, int(total_seconds)))
+    hour = bounded // 3600
+    minute = (bounded % 3600) // 60
+    second = bounded % 60
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
+def _build_os_lifecycle_probe_windows(
+    source_lines: list[str],
+    sessions: list[dict[str, Any]],
+    scan_events: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    windows: list[dict[str, int]] = []
+    for index, session in enumerate(sessions, start=1):
+        lifecycle_events = _extract_session_lifecycle_events(source_lines, session, scan_events)
+        for event in lifecycle_events:
+            if event.get("event_type") != "app_sigint":
+                continue
+            sigint_seconds = _time_label_to_seconds(_display_value(event.get("time_label"), default=""))
+            if sigint_seconds is None:
+                continue
+            windows.append(
+                {
+                    "sessionIndex": index,
+                    "start": max(0, sigint_seconds - _OS_LIFECYCLE_PRE_WINDOW_SEC),
+                    "end": min(86399, sigint_seconds + _OS_LIFECYCLE_POST_WINDOW_SEC),
+                }
+            )
+    return windows
+
+
+def _merge_os_lifecycle_time_windows(windows: list[dict[str, int]]) -> list[tuple[int, int]]:
+    sorted_windows = sorted(
+        [(int(window["start"]), int(window["end"])) for window in windows],
+        key=lambda item: item[0],
+    )
+    merged: list[tuple[int, int]] = []
+    for start_seconds, end_seconds in sorted_windows:
+        if not merged or start_seconds > merged[-1][1] + 1:
+            merged.append((start_seconds, end_seconds))
+            continue
+        prev_start, prev_end = merged[-1]
+        merged[-1] = (prev_start, max(prev_end, end_seconds))
+    return merged
+
+
+def _build_os_lifecycle_journal_command(log_date: str, windows: list[dict[str, int]]) -> str:
+    merged_windows = _merge_os_lifecycle_time_windows(windows)
+    commands: list[str] = []
+    for start_seconds, end_seconds in merged_windows:
+        since = f"{log_date} {_seconds_to_time_label(start_seconds)}"
+        until = f"{log_date} {_seconds_to_time_label(end_seconds)}"
+        commands.append(
+            "journalctl "
+            f"--since {shlex.quote(since)} "
+            f"--until {shlex.quote(until)} "
+            "--no-pager -o short-iso 2>/dev/null"
+        )
+
+    joined_commands = "; ".join(commands) if commands else "true"
+    grep_pattern = shlex.quote(_OS_LIFECYCLE_JOURNAL_GREP_PATTERN)
+    shell_body = f"{{ {joined_commands}; }} | grep -Ei {grep_pattern} | head -240 || true"
+    return f"sh -lc {shlex.quote(shell_body)}"
+
+
+def _connect_device_ssh_for_barcode_log(device_name: str) -> dict[str, Any]:
+    if paramiko is None:
+        return {"ok": False, "reason": "paramiko_missing"}
+    if not _is_mda_graphql_configured():
+        return {"ok": False, "reason": "mda_config_missing"}
+    if not cs.DEVICE_SSH_PASSWORD:
+        return {"ok": False, "reason": "missing_password"}
+
+    wait_result = _wait_for_mda_device_agent_ssh(
+        device_name,
+        poll_timeout_sec=min(20, max(1, int(cs.MDA_SSH_POLL_TIMEOUT_SEC or 20))),
+        poll_interval_sec=min(2, max(1, int(cs.MDA_SSH_POLL_INTERVAL_SEC or 2))),
+    )
+    agent_ssh = ((wait_result.get("device") or {}).get("agentSsh") or {}) if isinstance(wait_result, dict) else {}
+    host = _display_value(agent_ssh.get("host"), default="").strip()
+    port_value = agent_ssh.get("port")
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        port = 0
+    if not bool(wait_result.get("ready")) or not host or port <= 0:
+        return {"ok": False, "reason": "agent_ssh_not_ready"}
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host,
+            port=port,
+            username=cs.DEVICE_SSH_USER,
+            password=cs.DEVICE_SSH_PASSWORD,
+            timeout=max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC),
+            banner_timeout=max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC),
+            auth_timeout=max(1, cs.DEVICE_SSH_CONNECT_TIMEOUT_SEC),
+            look_for_keys=False,
+            allow_agent=False,
+        )
+    except paramiko.AuthenticationException:
+        client.close()
+        return {"ok": False, "reason": "ssh_auth_failed"}
+    except (
+        paramiko.SSHException,
+        paramiko.ssh_exception.NoValidConnectionsError,
+        socket.timeout,
+        TimeoutError,
+        OSError,
+    ) as exc:
+        client.close()
+        return {"ok": False, "reason": type(exc).__name__.lower()}
+
+    return {"ok": True, "client": client}
+
+
+def _run_device_ssh_command_for_barcode_log(client: Any, command: str, timeout_sec: int) -> dict[str, Any]:
+    stdin = None
+    stdout = None
+    stderr = None
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=max(1, timeout_sec))
+        exit_status = _wait_for_ssh_exit_status(stdout, stderr, timeout_sec=max(1, timeout_sec))
+        stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
+        stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
+        return {
+            "ok": exit_status == 0,
+            "exitStatus": exit_status,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+        }
+    except Exception as exc:  # pragma: no cover - network/remote dependent
+        return {
+            "ok": False,
+            "exitStatus": None,
+            "stdout": "",
+            "stderr": "",
+            "reason": "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__.lower(),
+        }
+    finally:
+        _close_ssh_streams(stdin, stdout, stderr)
+
+
+def _assign_os_lifecycle_events_to_sessions(
+    journal_output: str,
+    windows: list[dict[str, int]],
+) -> dict[int, list[dict[str, Any]]]:
+    events_by_session: dict[int, list[dict[str, Any]]] = {}
+    seen: set[tuple[int, str, str, str]] = set()
+    for output_index, raw_line in enumerate((journal_output or "").splitlines(), start=1):
+        stripped = _strip_leading_log_timestamp(raw_line)
+        event_type, label = _classify_session_lifecycle_event(stripped)
+        if not event_type or not label:
+            continue
+        time_label = _extract_time_label_from_line(raw_line)
+        event_seconds = _time_label_to_seconds(time_label)
+        target_session_indexes: list[int] = []
+        for window in windows:
+            session_index = int(window.get("sessionIndex") or 0)
+            if session_index <= 0:
+                continue
+            if event_seconds is None:
+                target_session_indexes.append(session_index)
+                continue
+            if int(window["start"]) <= event_seconds <= int(window["end"]):
+                target_session_indexes.append(session_index)
+
+        for session_index in sorted(set(target_session_indexes)):
+            dedupe_key = (session_index, time_label, label, stripped)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            events_by_session.setdefault(session_index, []).append(
+                {
+                    "line_no": 1_000_000 + output_index,
+                    "time_label": time_label,
+                    "event_type": event_type,
+                    "label": label,
+                    "raw_line": stripped,
+                }
+            )
+    return events_by_session
+
+
+def _fetch_device_os_lifecycle_events_for_sessions(
+    *,
+    device_name: str,
+    log_date: str,
+    source_lines: list[str],
+    sessions: list[dict[str, Any]],
+    scan_events: list[dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    windows = _build_os_lifecycle_probe_windows(source_lines, sessions, scan_events)
+    if not windows:
+        return {}
+
+    connection = _connect_device_ssh_for_barcode_log(device_name)
+    if not connection.get("ok"):
+        return {}
+
+    client = connection["client"]
+    try:
+        command = _build_os_lifecycle_journal_command(log_date, windows)
+        result = _run_device_ssh_command_for_barcode_log(
+            client,
+            command,
+            timeout_sec=max(5, min(20, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 20))),
+        )
+        if not result.get("ok") and not result.get("stdout"):
+            return {}
+        return _assign_os_lifecycle_events_to_sessions(_display_value(result.get("stdout"), default=""), windows)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def _summarize_motion_session(
@@ -3119,6 +3411,7 @@ def _append_session_card(
     diagnostic_scan_events: list[dict[str, Any]],
     recordings_on_date_count: int | None,
     session_recordings_rows: list[dict[str, Any]] | None = None,
+    extra_lifecycle_events: list[dict[str, Any]] | None = None,
 ) -> None:
     session_context = _build_session_card_context(
         source_lines,
@@ -3133,11 +3426,21 @@ def _append_session_card(
     start_time = _display_value(session.get("start_time_label"), default="시간미상")
     stop_time = _display_value(session.get("stop_time_label"), default="미확인")
     session_recordings_rows = session_recordings_rows or []
+    session_lifecycle_events = _extract_session_lifecycle_events(
+        source_lines,
+        session,
+        diagnostic_scan_events,
+    )
+    if extra_lifecycle_events:
+        session_lifecycle_events = [*session_lifecycle_events, *extra_lifecycle_events]
+    shutdown_method = _summarize_session_shutdown_method(session_lifecycle_events)
 
     lines.append("")
     lines.append(f"*세션 {index}*")
     lines.append(f"• 시간: `{start_time}` ~ `{stop_time}`")
     lines.append(f"• 종료 상태: {session_context['terminationStatus']}")
+    if shutdown_method:
+        lines.append(f"• 종료 방식: {shutdown_method}")
     lines.append(f"• 영상 상태: {session_context['videoStatus']}")
     lines.append(f"• 핵심 이상 징후: {session_context['anomalyText']}")
     if recordings_on_date_count is not None:
@@ -3145,11 +3448,6 @@ def _append_session_card(
     video_length_line = _build_recordings_video_length_line(session_recordings_rows)
     if video_length_line:
         lines.append(video_length_line)
-    session_lifecycle_events = _extract_session_lifecycle_events(
-        source_lines,
-        session,
-        diagnostic_scan_events,
-    )
     _append_restart_events_section(lines, session_restart_events)
     _append_scan_events_section(lines, session_scan_events, session_motion_events, session_lifecycle_events)
     _append_error_lines_section(lines, session_error_lines, show_all=True)
@@ -3166,8 +3464,10 @@ def _append_session_sections(
     diagnostic_scan_events: list[dict[str, Any]] | None = None,
     recordings_on_date_count: int | None = None,
     recordings_on_date_rows: list[dict[str, Any]] | None = None,
+    extra_lifecycle_events_by_session: dict[int, list[dict[str, Any]]] | None = None,
 ) -> None:
     diagnostic_scan_events = diagnostic_scan_events or scan_events
+    extra_lifecycle_events_by_session = extra_lifecycle_events_by_session or {}
     if not sessions:
         _append_session_state_summary(
             lines,
@@ -3207,6 +3507,7 @@ def _append_session_sections(
             diagnostic_scan_events=diagnostic_scan_events,
             recordings_on_date_count=recordings_on_date_count,
             session_recordings_rows=session_recordings_map.get(index, []),
+            extra_lifecycle_events=extra_lifecycle_events_by_session.get(index, []),
         )
 
 
@@ -3655,7 +3956,11 @@ def _append_scan_events_section(
         lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")
 
     timeline_rows: list[str] = []
-    for _, time_label, label, detail in sorted(timeline, key=lambda item: item[0]):
+    def _timeline_sort_key(item: tuple[int, str, str, str]) -> tuple[int, int]:
+        parsed_seconds = _time_label_to_seconds(item[1])
+        return (parsed_seconds if parsed_seconds is not None else 1_000_000, item[0])
+
+    for _, time_label, label, detail in sorted(timeline, key=_timeline_sort_key):
         base = f"{time_label:>8}  {label}"
         if detail:
             base = f"{base} | {detail}"
@@ -3879,6 +4184,13 @@ def _analyze_barcode_log_phase1_window(
             if not sessions:
                 continue
 
+            extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
+                device_name=device_name,
+                log_date=date_label,
+                source_lines=source_lines,
+                sessions=sessions,
+                scan_events=events,
+            )
             matched_scope_count += 1
             total_sessions += len(sessions)
             devices_with_session += 1
@@ -3948,6 +4260,7 @@ def _analyze_barcode_log_phase1_window(
                 diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
                 recordings_on_date_rows=recordings_on_date_rows,
+                extra_lifecycle_events_by_session=extra_lifecycle_events_by_session,
             )
 
     if found_log_files == 0:
@@ -4097,6 +4410,13 @@ def _analyze_barcode_log_scan_events(
             if session_count == 0:
                 continue
 
+            extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
+                device_name=device_name,
+                log_date=log_date,
+                source_lines=source_lines,
+                sessions=sessions,
+                scan_events=events,
+            )
             logs_with_session += 1
             devices_with_session += 1
             displayed_device_index += 1
@@ -4145,6 +4465,7 @@ def _analyze_barcode_log_scan_events(
                 diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
                 recordings_on_date_rows=recordings_on_date_rows,
+                extra_lifecycle_events_by_session=extra_lifecycle_events_by_session,
             )
 
     _analyze_device_context_batch(target_device_contexts)
@@ -4297,6 +4618,13 @@ def _analyze_barcode_log_errors(
             if session_count == 0:
                 continue
 
+            extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
+                device_name=device_name,
+                log_date=log_date,
+                source_lines=source_lines,
+                sessions=sessions,
+                scan_events=events,
+            )
             logs_with_session += 1
             devices_with_session += 1
             displayed_device_index += 1
@@ -4346,6 +4674,7 @@ def _analyze_barcode_log_errors(
                 diagnostic_scan_events=events,
                 recordings_on_date_count=len(recordings_on_date_rows),
                 recordings_on_date_rows=recordings_on_date_rows,
+                extra_lifecycle_events_by_session=extra_lifecycle_events_by_session,
             )
 
     _analyze_device_context_batch(target_device_contexts)

@@ -2,6 +2,7 @@ from datetime import datetime
 import unittest
 
 from boxer_company.routers.barcode_log import (
+    _analyze_barcode_log_scan_events,
     _append_session_card,
     _build_log_analysis_record,
     _build_session_card_context,
@@ -9,9 +10,11 @@ from boxer_company.routers.barcode_log import (
     _extract_motion_events_with_line_no,
     _extract_restart_events_with_line_no,
     _extract_scan_events_with_line_no,
+    _fetch_device_os_lifecycle_events_for_sessions,
     _is_normal_video_status,
     _match_recordings_rows_to_sessions,
 )
+from unittest.mock import patch
 
 
 def _build_session() -> dict[str, object]:
@@ -184,11 +187,183 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         )
         rendered_card = "\n".join(card_lines)
 
+        self.assertIn("• 종료 방식: 앱 종료 신호(SIGINT, 원인은 OS 로그 필요)", rendered_card)
         self.assertIn("• scanned 이벤트: *2건* (앱/상태 이벤트 *4건* 함께 표시)", rendered_card)
-        self.assertIn("12:27:59  앱 종료 감지(SIGINT)", rendered_card)
+        self.assertIn("12:27:59  앱 종료 신호(SIGINT)", rendered_card)
         self.assertIn("12:28:04  앱 종료 완료(SIGTERM)", rendered_card)
         self.assertIn("12:30:40  앱 재시작 감지", rendered_card)
         self.assertIn("12:30:45  업로드 대상 없음", rendered_card)
+
+    def test_os_power_key_shutdown_method_is_displayed_when_journal_lines_exist(self) -> None:
+        # OS 로그까지 확보된 분석에서는 앱 SIGINT의 상위 원인인 전원 버튼 종료를 함께 보여준다.
+        source_lines = [
+            "[12:20:29] Scanned : 33682817209",
+            "[12:24:22] Scanned : C_STOPSESS",
+            "2026-05-26T12:27:58+0900 mommytalk systemd-logind[678]: Power key pressed.",
+            "2026-05-26T12:27:58+0900 mommytalk systemd-logind[678]: Powering Off...",
+            "2026-05-26T12:27:58+0900 mommytalk systemd[1]: Stopping PM2 process manager...",
+            "[12:27:59] SIGINT received App Exiting. code : SIGINT : app cleanup, sending log",
+            "[12:28:04] cleanup finished, sending SIGTERM...",
+            "2026-05-26T12:28:05+0900 mommytalk systemd[1]: Reached target Shutdown.",
+            "-- Reboot --",
+            "2026-05-26T12:30:35+0900 mommytalk kernel: Linux version 4.15.0-147-generic",
+            "[12:30:40] Initializing Mommybox - MB2-C01040",
+        ]
+        scan_events = _extract_scan_events_with_line_no(source_lines)
+        session = {
+            "start_line_no": 1,
+            "start_time_label": "12:20:29",
+            "stop_line_no": 2,
+            "stop_time_label": "12:24:22",
+            "stop_token": "C_STOPSESS",
+            "end_line_no": len(source_lines),
+        }
+        card_lines: list[str] = []
+
+        _append_session_card(
+            card_lines,
+            index=1,
+            source_lines=source_lines,
+            session=session,
+            session_scan_events=scan_events,
+            session_motion_events=[],
+            session_restart_events=[],
+            session_error_lines=[],
+            diagnostic_scan_events=scan_events,
+            recordings_on_date_count=0,
+            session_recordings_rows=[],
+        )
+        rendered_card = "\n".join(card_lines)
+
+        self.assertIn("• 종료 방식: 전원 버튼 종료 요청(OS 로그) → 앱 종료 신호(SIGINT)", rendered_card)
+        self.assertIn("12:27:58  전원 버튼 종료 요청", rendered_card)
+        self.assertIn("12:27:58  OS 전원 종료 진행", rendered_card)
+        self.assertIn("12:27:58  PM2 앱 종료 진행", rendered_card)
+        self.assertIn("12:27:59  앱 종료 신호(SIGINT)", rendered_card)
+        self.assertIn("12:28:05  OS 종료 단계", rendered_card)
+        self.assertIn("시간미상  장비 재부팅 구간", rendered_card)
+        self.assertIn("12:30:35  장비 부팅 시작", rendered_card)
+
+    def test_os_lifecycle_events_are_fetched_only_for_sigint_sessions(self) -> None:
+        # 앱 SIGINT가 있는 세션만 장비 OS 로그 조회 대상으로 삼는다.
+        source_lines = [
+            "[12:20:29] Scanned : 33682817209",
+            "[12:24:22] Scanned : C_STOPSESS",
+            "[12:27:59] SIGINT received App Exiting. code : SIGINT : app cleanup, sending log",
+        ]
+        scan_events = _extract_scan_events_with_line_no(source_lines)
+        sessions = [
+            {
+                "start_line_no": 1,
+                "start_time_label": "12:20:29",
+                "stop_line_no": 2,
+                "stop_time_label": "12:24:22",
+                "stop_token": "C_STOPSESS",
+                "end_line_no": len(source_lines),
+            }
+        ]
+        journal_output = "\n".join(
+            [
+                "2026-05-26T12:27:58+0900 mommytalk systemd-logind[678]: Power key pressed.",
+                "2026-05-26T12:27:58+0900 mommytalk systemd-logind[678]: System is powering down.",
+                "2026-05-26T12:28:05+0900 mommytalk systemd[1]: Reached target Shutdown.",
+                "-- Reboot --",
+                "2026-05-26T12:30:35+0900 mommytalk kernel: Linux version 4.15.0-147-generic",
+            ]
+        )
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake_client = FakeClient()
+        with (
+            patch(
+                "boxer_company.routers.barcode_log._connect_device_ssh_for_barcode_log",
+                return_value={"ok": True, "client": fake_client},
+            ) as connect,
+            patch(
+                "boxer_company.routers.barcode_log._run_device_ssh_command_for_barcode_log",
+                return_value={"ok": True, "stdout": journal_output, "stderr": "", "exitStatus": 0},
+            ) as run_command,
+        ):
+            events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
+                device_name="MB2-C01040",
+                log_date="2026-05-26",
+                source_lines=source_lines,
+                sessions=sessions,
+                scan_events=scan_events,
+            )
+
+        connect.assert_called_once_with("MB2-C01040")
+        run_command.assert_called_once()
+        command = run_command.call_args.args[1]
+        self.assertIn("journalctl", command)
+        self.assertIn("2026-05-26 12:24:59", command)
+        self.assertIn("2026-05-26 12:34:59", command)
+        self.assertTrue(fake_client.closed)
+        self.assertEqual(
+            [event["event_type"] for event in events_by_session[1]],
+            ["power_key_shutdown", "os_powering_off", "os_shutdown", "device_reboot", "device_boot"],
+        )
+
+    def test_log_analysis_merges_fetched_os_lifecycle_events_into_session_card(self) -> None:
+        # S3 앱 로그에 SIGINT만 있어도 SSH로 얻은 OS 로그가 있으면 종료 방식을 확정 표시한다.
+        source_lines = [
+            "[12:20:29] Scanned : 33682817209",
+            "[12:22:16] Started recording : en3xakpqa0ppx56v | 33682817209 ||| segment : 0",
+            "[12:24:22] Scanned : C_STOPSESS",
+            "[12:27:59] SIGINT received App Exiting. code : SIGINT : app cleanup, sending log",
+            "[12:28:04] cleanup finished, sending SIGTERM...",
+        ]
+        os_events = {
+            1: [
+                {
+                    "line_no": 1_000_001,
+                    "time_label": "12:27:58",
+                    "event_type": "power_key_shutdown",
+                    "label": "전원 버튼 종료 요청",
+                    "raw_line": "mommytalk systemd-logind[678]: Power key pressed.",
+                },
+            ]
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.barcode_log._fetch_s3_device_log_lines",
+                return_value={
+                    "found": True,
+                    "lines": source_lines,
+                    "key": "MB2-C01040/log-2026-05-26.log",
+                    "content_length": 1234,
+                },
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._fetch_device_os_lifecycle_events_for_sessions",
+                return_value=os_events,
+            ) as fetch_os_events,
+        ):
+            result_text, _ = _analyze_barcode_log_scan_events(
+                None,
+                "33682817209",
+                "2026-05-26",
+                recordings_context=None,
+                device_contexts=[
+                    {
+                        "deviceName": "MB2-C01040",
+                        "hospitalName": "미즈맘의원(당진)",
+                        "roomName": "1진료실",
+                    }
+                ],
+            )
+
+        fetch_os_events.assert_called_once()
+        self.assertIn("• 종료 방식: 전원 버튼 종료 요청(OS 로그) → 앱 종료 신호(SIGINT)", result_text)
+        self.assertIn("12:27:58  전원 버튼 종료 요청", result_text)
+        self.assertIn("12:27:59  앱 종료 신호(SIGINT)", result_text)
 
     def test_initializing_mommybox_is_treated_as_restart_event(self) -> None:
         restart_events = _extract_restart_events_with_line_no(
