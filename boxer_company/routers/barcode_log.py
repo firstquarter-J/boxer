@@ -52,7 +52,7 @@ _DEVICE_BOOT_START_PATTERN = re.compile(r"(?:^|\s)linux version\s+\d", re.IGNORE
 _OS_LIFECYCLE_JOURNAL_GREP_PATTERN = (
     "power key pressed|powering off|system is powering down|stopping pm2 process manager|"
     "all applications stopped|pm2 daemon stopped|reached target shutdown|starting power-off|"
-    "systemd-shutdown|-- reboot --|linux version"
+    "systemd-shutdown|-- reboot --|linux version|uncaught|unhandled|exited with code \\[[1-9]"
 )
 _OS_LIFECYCLE_PRE_WINDOW_SEC = 180
 _OS_LIFECYCLE_POST_WINDOW_SEC = 420
@@ -1239,6 +1239,14 @@ def _classify_session_lifecycle_event(stripped_line: str) -> tuple[str, str]:
         return "device_reboot", "장비 재부팅 구간"
     if _DEVICE_BOOT_START_PATTERN.search(stripped_line):
         return "device_boot", "장비 부팅 시작"
+    if (
+        "uncaughtexception" in lowered
+        or "unhandledrejection" in lowered
+        or "unhandledexception" in lowered
+        or "unhandled exception" in lowered
+        or re.search(r"exited with code \[[1-9]\d*\]", stripped_line, flags=re.IGNORECASE)
+    ):
+        return "app_crash", "앱 크래시/비정상 종료"
 
     if "sigint received app exiting" in lowered or "app cleanup" in lowered:
         return "app_sigint", "앱 종료 신호(SIGINT)"
@@ -1319,20 +1327,100 @@ def _summarize_session_shutdown_method(lifecycle_events: list[dict[str, Any]] | 
         return ""
 
     # 물리 전원 버튼 여부를 묻는 케이스가 많아서 가장 구체적인 OS 원인을 먼저 요약한다.
-    suffix = " → 앱 종료 신호(SIGINT)" if "app_sigint" in event_types else ""
     if "power_key_shutdown" in event_types:
-        return f"전원 버튼 종료 요청(OS 로그){suffix}"
+        return "전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)"
     if "os_powering_off" in event_types or "os_shutdown" in event_types:
-        return f"OS 전원 종료 진행(OS 로그){suffix}"
+        return "OS 종료/재부팅(OS 로그, 앱 크래시 아님)"
     if "pm2_shutdown" in event_types:
-        return f"PM2 앱 종료 진행{suffix}"
+        return "PM2 앱 종료 진행(앱 크래시 아님)"
+    if "app_crash" in event_types:
+        return "앱 크래시/비정상 종료"
     if "app_sigint" in event_types:
-        return "앱 종료 신호(SIGINT, 원인은 OS 로그 필요)"
+        return "앱 종료 신호(SIGINT, 앱 크래시 아님, 원인은 OS 로그 필요)"
     if "device_reboot" in event_types or "device_boot" in event_types:
         return "장비 재부팅 로그 감지"
     if "app_sigterm" in event_types:
         return "앱 종료 완료(SIGTERM)"
     return ""
+
+
+def _lifecycle_sort_key(event: dict[str, Any]) -> tuple[int, int]:
+    parsed_seconds = _time_label_to_seconds(_display_value(event.get("time_label"), default=""))
+    return (
+        parsed_seconds if parsed_seconds is not None else 1_000_000,
+        int(event.get("line_no") or 0),
+    )
+
+
+def _first_lifecycle_event(
+    events: list[dict[str, Any]],
+    event_types: set[str],
+) -> dict[str, Any] | None:
+    for event in sorted(events, key=_lifecycle_sort_key):
+        if str(event.get("event_type") or "").strip() in event_types:
+            return event
+    return None
+
+
+def _build_lifecycle_summary_events(
+    lifecycle_events: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    events = sorted((lifecycle_events or []), key=_lifecycle_sort_key)
+    if not events:
+        return []
+    event_types = {
+        str(event.get("event_type") or "").strip()
+        for event in events
+        if str(event.get("event_type") or "").strip()
+    }
+
+    # 세부 systemd/PM2 단계는 숨기고, 현장에서 필요한 종료 시각과 원인만 남긴다.
+    if "power_key_shutdown" in event_types:
+        source = _first_lifecycle_event(events, {"power_key_shutdown"}) or events[0]
+        return [
+            {
+                **source,
+                "label": "종료 원인: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)",
+                "raw_line": "",
+            }
+        ]
+    if "os_powering_off" in event_types or "os_shutdown" in event_types:
+        source = _first_lifecycle_event(events, {"os_powering_off", "os_shutdown"}) or events[0]
+        return [
+            {
+                **source,
+                "label": "종료 원인: OS 종료/재부팅(앱 크래시 아님)",
+                "raw_line": "",
+            }
+        ]
+    if "app_crash" in event_types:
+        source = _first_lifecycle_event(events, {"app_crash"}) or events[0]
+        return [
+            {
+                **source,
+                "label": "종료 원인: 앱 크래시/비정상 종료",
+                "raw_line": "",
+            }
+        ]
+    if "app_sigint" in event_types:
+        source = _first_lifecycle_event(events, {"app_sigint"}) or events[0]
+        return [
+            {
+                **source,
+                "label": "종료 원인: 앱 종료 신호(SIGINT, 앱 크래시 아님)",
+                "raw_line": "OS 종료 방식 확인 필요",
+            }
+        ]
+    if "app_restart" in event_types:
+        source = _first_lifecycle_event(events, {"app_restart"}) or events[0]
+        return [
+            {
+                **source,
+                "label": "종료 원인: 앱 재시작 감지(앱 크래시 가능성 확인 필요)",
+                "raw_line": "",
+            }
+        ]
+    return []
 
 
 def _seconds_to_time_label(total_seconds: int) -> str:
@@ -3913,7 +4001,7 @@ def _append_scan_events_section(
 ) -> None:
     ordered_scans = sorted(scan_events, key=lambda item: int(item.get("line_no") or 0))
     ordered_motions = sorted((motion_events or []), key=lambda item: int(item.get("line_no") or 0))
-    ordered_lifecycle_events = sorted((lifecycle_events or []), key=lambda item: int(item.get("line_no") or 0))
+    ordered_lifecycle_events = _build_lifecycle_summary_events(lifecycle_events)
 
     timeline: list[tuple[int, str, str, str]] = []
     for event in ordered_scans:
@@ -3950,7 +4038,7 @@ def _append_scan_events_section(
     if ordered_lifecycle_events:
         lines.append(
             f"• scanned 이벤트: *{len(ordered_scans)}건* "
-            f"(앱/상태 이벤트 *{len(ordered_lifecycle_events)}건* 함께 표시)"
+            f"(종료 원인 *{len(ordered_lifecycle_events)}건* 함께 표시)"
         )
     else:
         lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")

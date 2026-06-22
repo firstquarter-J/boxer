@@ -187,12 +187,13 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         )
         rendered_card = "\n".join(card_lines)
 
-        self.assertIn("• 종료 방식: 앱 종료 신호(SIGINT, 원인은 OS 로그 필요)", rendered_card)
-        self.assertIn("• scanned 이벤트: *2건* (앱/상태 이벤트 *4건* 함께 표시)", rendered_card)
-        self.assertIn("12:27:59  앱 종료 신호(SIGINT)", rendered_card)
-        self.assertIn("12:28:04  앱 종료 완료(SIGTERM)", rendered_card)
-        self.assertIn("12:30:40  앱 재시작 감지", rendered_card)
-        self.assertIn("12:30:45  업로드 대상 없음", rendered_card)
+        self.assertIn("• 종료 방식: 앱 종료 신호(SIGINT, 앱 크래시 아님, 원인은 OS 로그 필요)", rendered_card)
+        self.assertIn("• scanned 이벤트: *2건* (종료 원인 *1건* 함께 표시)", rendered_card)
+        self.assertIn("12:27:59  종료 원인: 앱 종료 신호(SIGINT, 앱 크래시 아님)", rendered_card)
+        self.assertIn("OS 종료 방식 확인 필요", rendered_card)
+        self.assertNotIn("12:28:04  앱 종료 완료(SIGTERM)", rendered_card)
+        self.assertNotIn("12:30:40  앱 재시작 감지", rendered_card)
+        self.assertNotIn("12:30:45  업로드 대상 없음", rendered_card)
 
     def test_os_power_key_shutdown_method_is_displayed_when_journal_lines_exist(self) -> None:
         # OS 로그까지 확보된 분석에서는 앱 SIGINT의 상위 원인인 전원 버튼 종료를 함께 보여준다.
@@ -235,14 +236,15 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         )
         rendered_card = "\n".join(card_lines)
 
-        self.assertIn("• 종료 방식: 전원 버튼 종료 요청(OS 로그) → 앱 종료 신호(SIGINT)", rendered_card)
-        self.assertIn("12:27:58  전원 버튼 종료 요청", rendered_card)
-        self.assertIn("12:27:58  OS 전원 종료 진행", rendered_card)
-        self.assertIn("12:27:58  PM2 앱 종료 진행", rendered_card)
-        self.assertIn("12:27:59  앱 종료 신호(SIGINT)", rendered_card)
-        self.assertIn("12:28:05  OS 종료 단계", rendered_card)
-        self.assertIn("시간미상  장비 재부팅 구간", rendered_card)
-        self.assertIn("12:30:35  장비 부팅 시작", rendered_card)
+        self.assertIn("• 종료 방식: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)", rendered_card)
+        self.assertIn("• scanned 이벤트: *2건* (종료 원인 *1건* 함께 표시)", rendered_card)
+        self.assertIn("12:27:58  종료 원인: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)", rendered_card)
+        self.assertNotIn("OS 전원 종료 진행", rendered_card)
+        self.assertNotIn("PM2 앱 종료 진행", rendered_card)
+        self.assertNotIn("앱 종료 신호(SIGINT) |", rendered_card)
+        self.assertNotIn("OS 종료 단계", rendered_card)
+        self.assertNotIn("장비 재부팅 구간", rendered_card)
+        self.assertNotIn("장비 부팅 시작", rendered_card)
 
     def test_os_lifecycle_events_are_fetched_only_for_sigint_sessions(self) -> None:
         # 앱 SIGINT가 있는 세션만 장비 OS 로그 조회 대상으로 삼는다.
@@ -361,9 +363,47 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
             )
 
         fetch_os_events.assert_called_once()
-        self.assertIn("• 종료 방식: 전원 버튼 종료 요청(OS 로그) → 앱 종료 신호(SIGINT)", result_text)
-        self.assertIn("12:27:58  전원 버튼 종료 요청", result_text)
-        self.assertIn("12:27:59  앱 종료 신호(SIGINT)", result_text)
+        self.assertIn("• 종료 방식: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)", result_text)
+        self.assertIn("12:27:58  종료 원인: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)", result_text)
+        self.assertNotIn("12:27:59  앱 종료 신호(SIGINT)", result_text)
+
+    def test_app_crash_lifecycle_is_displayed_as_single_shutdown_cause(self) -> None:
+        # 앱 비정상 종료 단서가 있으면 상세 로그 대신 크래시 여부만 한 줄로 남긴다.
+        source_lines = [
+            "[12:20:29] Scanned : 33682817209",
+            "[12:24:22] Scanned : C_STOPSESS",
+            "[12:27:59] UnhandledException: Cannot read property 'emit' of undefined",
+            "[12:28:01] Initializing Mommybox - MB2-C01040",
+        ]
+        scan_events = _extract_scan_events_with_line_no(source_lines)
+        session = {
+            "start_line_no": 1,
+            "start_time_label": "12:20:29",
+            "stop_line_no": 2,
+            "stop_time_label": "12:24:22",
+            "stop_token": "C_STOPSESS",
+            "end_line_no": len(source_lines),
+        }
+        card_lines: list[str] = []
+
+        _append_session_card(
+            card_lines,
+            index=1,
+            source_lines=source_lines,
+            session=session,
+            session_scan_events=scan_events,
+            session_motion_events=[],
+            session_restart_events=[],
+            session_error_lines=[],
+            diagnostic_scan_events=scan_events,
+            recordings_on_date_count=0,
+            session_recordings_rows=[],
+        )
+        rendered_card = "\n".join(card_lines)
+
+        self.assertIn("• 종료 방식: 앱 크래시/비정상 종료", rendered_card)
+        self.assertIn("12:27:59  종료 원인: 앱 크래시/비정상 종료", rendered_card)
+        self.assertNotIn("12:28:01  앱 재시작 감지", rendered_card)
 
     def test_initializing_mommybox_is_treated_as_restart_event(self) -> None:
         restart_events = _extract_restart_events_with_line_no(
