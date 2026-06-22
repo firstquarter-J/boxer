@@ -31,7 +31,7 @@ _MOTION_STOP_STATUS_PATTERN = re.compile(
     r"Motion detected:\s*(true|false)\s*,\s*Error:\s*(true|false)",
     re.IGNORECASE,
 )
-_RESTART_START_PATTERN = re.compile(r"mommybox starting", re.IGNORECASE)
+_RESTART_START_PATTERN = re.compile(r"(?:mommybox starting|initializing mommybox)", re.IGNORECASE)
 _RESTART_APP_VERSION_PATTERN = re.compile(r"app version:\s*(.+)$", re.IGNORECASE)
 _RESTART_NODE_VERSION_PATTERN = re.compile(r"node\.js version:\s*(.+)$", re.IGNORECASE)
 _RESTART_PLATFORM_PATTERN = re.compile(r"platform:\s*(.+)$", re.IGNORECASE)
@@ -1982,9 +1982,10 @@ def _find_session_post_stop_context(
             next_barcode_line_no = event_line_no
             break
 
+    # 종료 직후 upload/finalize 흐름은 restart 뒤에 이어지는 경우가 있어 기본 안전 줄수보다 넓게 본다.
     upper_bound = min(
         len(lines),
-        stop_line_no + max(1, cs.LOG_POST_STOP_MAX_LINES),
+        stop_line_no + max(1, cs.LOG_POST_STOP_MAX_LINES, 160),
         (next_barcode_line_no - 1) if next_barcode_line_no else len(lines),
     )
     finish_line_no: int | None = None
@@ -2031,11 +2032,43 @@ def _find_session_post_stop_context(
 
     device_error_upper_bound = min(len(lines), max(finish_line_no or upper_bound, upper_bound))
     post_stop_device_errors: list[dict[str, Any]] = []
+    app_exit_line_no: int | None = None
+    app_exit_time_label = ""
+    restart_line_no: int | None = None
+    restart_time_label = ""
+    upload_check_line_no: int | None = None
+    uploadable_none_line_no: int | None = None
+    upload_success_line_no: int | None = None
+    stopping_recording_line_no: int | None = None
     for line_no in range(stop_line_no + 1, device_error_upper_bound + 1):
         raw_line = lines[line_no - 1]
         stripped = _strip_leading_log_timestamp(raw_line)
         lowered = stripped.lower()
         explicit_level = _extract_explicit_log_level(raw_line)
+
+        if stopping_recording_line_no is None and "stopping recording" in lowered:
+            stopping_recording_line_no = line_no
+        if app_exit_line_no is None and (
+            "sigint received app exiting" in lowered
+            or "app cleanup" in lowered
+            or "cleanup finished, sending sigterm" in lowered
+        ):
+            app_exit_line_no = line_no
+            app_exit_time_label = _extract_time_label_from_line(raw_line)
+        if restart_line_no is None and _RESTART_START_PATTERN.search(stripped):
+            restart_line_no = line_no
+            restart_time_label = _extract_time_label_from_line(raw_line)
+        if upload_check_line_no is None and "check upload available recording" in lowered:
+            upload_check_line_no = line_no
+        if uploadable_none_line_no is None and "uploadable recording: none" in lowered:
+            uploadable_none_line_no = line_no
+        if file_id_lower and upload_success_line_no is None and (
+            f"uploadedrecording({file_id_lower})" in lowered
+            or f"| {file_id_lower} has been sent" in lowered
+            or (f"/{file_id_lower}." in lowered and "moved to trash" in lowered)
+        ):
+            upload_success_line_no = line_no
+
         has_device_error = (
             (explicit_level in {"error", "fatal", "panic"} and (
                 "/dev/video0" in lowered or "no such file or directory" in lowered
@@ -2055,12 +2088,33 @@ def _find_session_post_stop_context(
         )
 
     abnormal_parts: list[str] = []
+    tags: list[str] = []
     if finish_delay_seconds is not None and finish_delay_seconds >= 30 and finish_delay_label:
         abnormal_parts.append(f"종료 처리 지연 `{finish_delay_label}`")
     if len(post_stop_device_errors) > 0:
         abnormal_parts.append(f"종료 후 장치 오류 `{len(post_stop_device_errors)}건`")
+        tags.append("post_stop_device_error")
     if finish_count > 1:
         abnormal_parts.append(f"finishRecording 중복 `{finish_count}회`")
+
+    recording_interrupted_before_upload = (
+        stopping_recording_line_no is not None
+        and app_exit_line_no is not None
+        and upload_success_line_no is None
+    )
+    post_restart_upload_none = (
+        restart_line_no is not None
+        and uploadable_none_line_no is not None
+        and upload_success_line_no is None
+    )
+    if recording_interrupted_before_upload:
+        # 세션 종료 스캔 뒤 앱이 내려가면 mp4 finalize가 끝나지 않아 0바이트 파일로 남는 운영 사례가 있다.
+        abnormal_parts.append("세션 종료 스캔 후 녹화 파일 마무리·업로드 처리 전 앱 종료/재시작")
+        abnormal_parts.append("본 mp4 미완성·0바이트 가능성")
+        tags.append("recording_interrupted_before_upload")
+    if post_restart_upload_none:
+        abnormal_parts.append("재시작 후 업로드 대상 없음")
+        tags.append("post_restart_upload_none")
 
     severity = "normal"
     if abnormal_parts:
@@ -2080,6 +2134,16 @@ def _find_session_post_stop_context(
         "postStopSnapCount": post_stop_snap_count,
         "postStopDeviceErrorCount": len(post_stop_device_errors),
         "postStopDeviceErrors": post_stop_device_errors,
+        "appExitLineNo": app_exit_line_no,
+        "appExitTimeLabel": app_exit_time_label,
+        "restartLineNo": restart_line_no,
+        "restartTimeLabel": restart_time_label,
+        "uploadCheckLineNo": upload_check_line_no,
+        "uploadableNoneLineNo": uploadable_none_line_no,
+        "uploadSuccessLineNo": upload_success_line_no,
+        "recordingInterruptedBeforeUpload": recording_interrupted_before_upload,
+        "postRestartUploadNone": post_restart_upload_none,
+        "tags": tags,
         "severity": severity,
         "displayText": ", ".join(abnormal_parts),
     }
@@ -2225,6 +2289,29 @@ def _build_session_recording_result_text(
         if elapsed:
             detail_parts.append(f"세션 시작 후 `{elapsed}`")
         return f"영상 손상 가능성 의심 ({', '.join(detail_parts)})", recovery_context, post_stop_context
+    post_stop_tags = {
+        str(tag or "").strip()
+        for tag in ((post_stop_context or {}).get("tags") or [])
+        if str(tag or "").strip()
+    } if isinstance(post_stop_context, dict) else set()
+    if session_db_row_missing and (
+        "recording_interrupted_before_upload" in post_stop_tags
+        or "post_restart_upload_none" in post_stop_tags
+    ):
+        detail_parts: list[str] = []
+        if recording_start_evidence:
+            detail_parts.append(recording_start_evidence)
+        elif has_motion_success:
+            detail_parts.append("모션 감지 성공")
+        anomaly_text = str((post_stop_context or {}).get("displayText") or "").strip()
+        if anomaly_text:
+            detail_parts.append(anomaly_text)
+        detail_parts.append("세션 기준 DB 영상 기록 없음")
+        return (
+            f"녹화 & 업로드 실패로 판단 ({', '.join(detail_parts)})",
+            recovery_context,
+            post_stop_context,
+        )
     if isinstance(post_stop_context, dict) and str(post_stop_context.get("severity") or "") == "high":
         detail_parts: list[str] = []
         anomaly_text = str(post_stop_context.get("displayText") or "").strip()
@@ -2722,6 +2809,11 @@ def _build_log_analysis_record(
                 "postStopStopCount": int((post_stop_context or {}).get("postStopStopCount") or 0),
                 "postStopSnapCount": int((post_stop_context or {}).get("postStopSnapCount") or 0),
                 "postStopDeviceErrorCount": int((post_stop_context or {}).get("postStopDeviceErrorCount") or 0),
+                "recordingInterruptedBeforeUpload": bool(
+                    (post_stop_context or {}).get("recordingInterruptedBeforeUpload")
+                ),
+                "postRestartUploadNone": bool((post_stop_context or {}).get("postRestartUploadNone")),
+                "tags": list((post_stop_context or {}).get("tags") or []),
                 "displayText": _display_value((post_stop_context or {}).get("displayText"), default=""),
             }
         )

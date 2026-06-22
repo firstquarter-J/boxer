@@ -7,6 +7,7 @@ from boxer_company.routers.barcode_log import (
     _build_session_card_context,
     _build_session_recording_result_text,
     _extract_motion_events_with_line_no,
+    _extract_restart_events_with_line_no,
     _extract_scan_events_with_line_no,
     _is_normal_video_status,
     _match_recordings_rows_to_sessions,
@@ -103,6 +104,80 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         self.assertIn("영상 생성 확인, 업로드 확인 안 됨", result)
         self.assertIn("실녹화 시작 로그 확인", result)
         self.assertFalse(_is_normal_video_status(result))
+
+    def test_post_stop_app_restart_without_upload_marks_zero_byte_suspicion(self) -> None:
+        # 세션 종료 스캔 뒤 파일 마무리 전에 앱이 내려가면 0바이트/미완성 파일 가능성을 드러낸다.
+        source_lines = [
+            "[12:20:29] Scanned : 33682817209",
+            "[12:20:32] addRecording(en3xakpqa0ppx56v)",
+            "[12:22:13] motion detection passed",
+            "[12:22:16] Started recording : en3xakpqa0ppx56v | 33682817209 ||| segment : 0",
+            "[12:22:16] Spawned RECORDING ffmpeg with command : ffmpeg /home/mommytalk/AppData/Videos/en3xakpqa0ppx56v.mp4",
+            "[12:24:22] Scanned : C_STOPSESS",
+            "[12:24:24] Stopping recording...",
+            "[12:27:59] SIGINT received App Exiting. code : SIGINT : app cleanup, sending log",
+            "[12:28:04] cleanup finished, sending SIGTERM...",
+            "[12:30:40] Initializing Mommybox - MB2-C01040",
+            "[12:30:45] Checking for available uploads after endpoint connection...",
+            "[12:30:45] Check upload available recording",
+            "[12:30:45] Uploadable Recording: none",
+        ]
+        scan_events = _extract_scan_events_with_line_no(source_lines)
+        motion_events = _extract_motion_events_with_line_no(source_lines)
+        session = {
+            "start_line_no": 1,
+            "start_time_label": "12:20:29",
+            "stop_line_no": 6,
+            "stop_time_label": "12:24:22",
+            "stop_token": "C_STOPSESS",
+            "end_line_no": len(source_lines),
+        }
+
+        result, _, post_stop_context = _build_session_recording_result_text(
+            source_lines,
+            session,
+            [],
+            [],
+            scan_events,
+            recordings_on_date_count=0,
+            session_motion_events=motion_events,
+            session_recordings_rows=[],
+        )
+
+        self.assertIn("녹화 & 업로드 실패로 판단", result)
+        self.assertIn("세션 종료 스캔 후 녹화 파일 마무리·업로드 처리 전 앱 종료/재시작", result)
+        self.assertIn("본 mp4 미완성·0바이트 가능성", result)
+        self.assertIn("재시작 후 업로드 대상 없음", result)
+        self.assertFalse(_is_normal_video_status(result))
+        self.assertEqual(post_stop_context["severity"], "high")
+        self.assertIn("recording_interrupted_before_upload", post_stop_context["tags"])
+        self.assertIn("post_restart_upload_none", post_stop_context["tags"])
+
+        context = _build_session_card_context(
+            source_lines,
+            session,
+            motion_events,
+            [],
+            [],
+            scan_events,
+            recordings_on_date_count=0,
+            session_recordings_rows=[],
+        )
+
+        self.assertIn("세션 종료 스캔 후 녹화 파일 마무리·업로드 처리 전 앱 종료/재시작", context["anomalyText"])
+        self.assertIn("본 mp4 미완성·0바이트 가능성", context["anomalyText"])
+        self.assertIn("재시작 후 업로드 대상 없음", context["anomalyText"])
+
+    def test_initializing_mommybox_is_treated_as_restart_event(self) -> None:
+        restart_events = _extract_restart_events_with_line_no(
+            [
+                "[12:30:40] Initializing Mommybox - MB2-C01040",
+                "[12:30:40] App Version : 2.11.293",
+            ]
+        )
+
+        self.assertEqual(len(restart_events), 1)
+        self.assertEqual(restart_events[0]["time_label"], "12:30:40")
 
     def test_add_recording_only_before_motion_stop_is_canceled_failure(self) -> None:
         source_lines = [
