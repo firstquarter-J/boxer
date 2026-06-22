@@ -1201,6 +1201,69 @@ def _extract_restart_events_with_line_no(lines: list[str]) -> list[dict[str, Any
     return events
 
 
+def _extract_session_lifecycle_events(
+    lines: list[str],
+    session: dict[str, Any],
+    scan_events: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    start_line_no = int(session.get("start_line_no") or 0)
+    stop_line_no = int(session.get("stop_line_no") or 0)
+    if start_line_no <= 0:
+        return []
+
+    next_barcode_line_no: int | None = None
+    if stop_line_no > 0:
+        for event in scan_events or []:
+            event_line_no = int(event.get("line_no") or 0)
+            if event_line_no <= stop_line_no:
+                continue
+            token = str(event.get("token") or "").strip()
+            if cs.BARCODE_PATTERN.fullmatch(token):
+                next_barcode_line_no = event_line_no
+                break
+
+    upper_bound = min(
+        len(lines),
+        max(stop_line_no or start_line_no, start_line_no) + max(1, cs.LOG_POST_STOP_MAX_LINES, 160),
+        (next_barcode_line_no - 1) if next_barcode_line_no else len(lines),
+    )
+    events: list[dict[str, Any]] = []
+    seen_labels_by_line: set[tuple[int, str]] = set()
+
+    for line_no in range(start_line_no, upper_bound + 1):
+        raw_line = lines[line_no - 1]
+        stripped = _strip_leading_log_timestamp(raw_line)
+        lowered = stripped.lower()
+        label = ""
+        if "sigint received app exiting" in lowered or "app cleanup" in lowered:
+            label = "앱 종료 감지(SIGINT)"
+        elif "cleanup finished, sending sigterm" in lowered:
+            label = "앱 종료 완료(SIGTERM)"
+        elif _RESTART_START_PATTERN.search(stripped):
+            label = "앱 재시작 감지"
+        elif "uploadable recording: none" in lowered:
+            label = "업로드 대상 없음"
+        elif "rebooting" in lowered or "system reboot" in lowered or "system is reboot" in lowered:
+            label = "장비 재부팅 로그"
+        if not label:
+            continue
+
+        dedupe_key = (line_no, label)
+        if dedupe_key in seen_labels_by_line:
+            continue
+        seen_labels_by_line.add(dedupe_key)
+        events.append(
+            {
+                "line_no": line_no,
+                "time_label": _extract_time_label_from_line(raw_line),
+                "label": label,
+                "raw_line": stripped,
+            }
+        )
+
+    return events
+
+
 def _summarize_motion_session(
     motion_events: list[dict[str, Any]],
 ) -> dict[str, str]:
@@ -3082,8 +3145,13 @@ def _append_session_card(
     video_length_line = _build_recordings_video_length_line(session_recordings_rows)
     if video_length_line:
         lines.append(video_length_line)
+    session_lifecycle_events = _extract_session_lifecycle_events(
+        source_lines,
+        session,
+        diagnostic_scan_events,
+    )
     _append_restart_events_section(lines, session_restart_events)
-    _append_scan_events_section(lines, session_scan_events, session_motion_events)
+    _append_scan_events_section(lines, session_scan_events, session_motion_events, session_lifecycle_events)
     _append_error_lines_section(lines, session_error_lines, show_all=True)
 
 
@@ -3540,9 +3608,11 @@ def _append_scan_events_section(
     lines: list[str],
     scan_events: list[dict[str, Any]],
     motion_events: list[dict[str, Any]] | None = None,
+    lifecycle_events: list[dict[str, Any]] | None = None,
 ) -> None:
     ordered_scans = sorted(scan_events, key=lambda item: int(item.get("line_no") or 0))
     ordered_motions = sorted((motion_events or []), key=lambda item: int(item.get("line_no") or 0))
+    ordered_lifecycle_events = sorted((lifecycle_events or []), key=lambda item: int(item.get("line_no") or 0))
 
     timeline: list[tuple[int, str, str, str]] = []
     for event in ordered_scans:
@@ -3564,11 +3634,25 @@ def _append_scan_events_section(
                 )
         timeline.append((int(event.get("line_no") or 0), time_label, label, detail))
 
+    for event in ordered_lifecycle_events:
+        time_label = _display_value(event.get("time_label"), default="시간미상")
+        label = _display_value(event.get("label"), default="앱/상태 이벤트")
+        raw_line = _display_value(event.get("raw_line"), default="")
+        if len(raw_line) > 180:
+            raw_line = f"{raw_line[:180]}...(truncated)"
+        timeline.append((int(event.get("line_no") or 0), time_label, label, raw_line))
+
     if not timeline:
         lines.append("• scanned 이벤트: 없음")
         return
 
-    lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")
+    if ordered_lifecycle_events:
+        lines.append(
+            f"• scanned 이벤트: *{len(ordered_scans)}건* "
+            f"(앱/상태 이벤트 *{len(ordered_lifecycle_events)}건* 함께 표시)"
+        )
+    else:
+        lines.append(f"• scanned 이벤트: *{len(ordered_scans)}건*")
 
     timeline_rows: list[str] = []
     for _, time_label, label, detail in sorted(timeline, key=lambda item: item[0]):

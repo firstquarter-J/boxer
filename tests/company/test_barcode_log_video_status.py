@@ -168,6 +168,28 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         self.assertIn("본 mp4 미완성·0바이트 가능성", context["anomalyText"])
         self.assertIn("재시작 후 업로드 대상 없음", context["anomalyText"])
 
+        card_lines: list[str] = []
+        _append_session_card(
+            card_lines,
+            index=1,
+            source_lines=source_lines,
+            session=session,
+            session_scan_events=scan_events,
+            session_motion_events=motion_events,
+            session_restart_events=[],
+            session_error_lines=[],
+            diagnostic_scan_events=scan_events,
+            recordings_on_date_count=0,
+            session_recordings_rows=[],
+        )
+        rendered_card = "\n".join(card_lines)
+
+        self.assertIn("• scanned 이벤트: *2건* (앱/상태 이벤트 *4건* 함께 표시)", rendered_card)
+        self.assertIn("12:27:59  앱 종료 감지(SIGINT)", rendered_card)
+        self.assertIn("12:28:04  앱 종료 완료(SIGTERM)", rendered_card)
+        self.assertIn("12:30:40  앱 재시작 감지", rendered_card)
+        self.assertIn("12:30:45  업로드 대상 없음", rendered_card)
+
     def test_initializing_mommybox_is_treated_as_restart_event(self) -> None:
         restart_events = _extract_restart_events_with_line_no(
             [
