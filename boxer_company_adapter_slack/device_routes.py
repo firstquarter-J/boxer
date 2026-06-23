@@ -21,6 +21,14 @@ from boxer_company.routers.device_audio_probe import (
     _is_device_audio_probe_request,
     _probe_device_audio_output,
 )
+from boxer_company.routers.device_diagnostics import (
+    _build_device_diagnostic_config_message,
+    _build_device_diagnostic_device_required_message,
+    _extract_device_name_for_diagnostic_start,
+    _has_device_diagnostic_start_hint,
+    _is_device_diagnostic_start_request,
+    _start_device_diagnostic_snapshot,
+)
 from boxer_company.routers.device_file_probe import (
     _build_device_file_download_config_message,
     _build_device_file_probe_config_message,
@@ -223,6 +231,7 @@ def _handle_device_routes(
     audio_probe_device_name = _extract_device_name_for_audio_probe(question) or structured_device_name
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
+    diagnostic_device_name = _extract_device_name_for_diagnostic_start(question) or structured_device_name
     auto_update_control = _extract_daily_device_round_auto_update_control(question)
 
     if auto_update_control:
@@ -298,6 +307,40 @@ def _handle_device_routes(
             context.thread_ts,
             len(notion_references),
         )
+        return True
+
+    if _has_device_diagnostic_start_hint(question) and not diagnostic_device_name:
+        context.reply(_build_device_diagnostic_device_required_message())
+        return True
+
+    if _is_device_diagnostic_start_request(question, device_name=diagnostic_device_name):
+        if not _is_device_runtime_configured():
+            context.reply(_build_device_diagnostic_config_message())
+            return True
+        try:
+            _set_request_log_route(context.payload, "device diagnostic snapshot", handler_type="router")
+            result_text, _ = _start_device_diagnostic_snapshot(
+                device_name=diagnostic_device_name or "",
+                question=question,
+                workspace_id=context.workspace_id,
+                channel_id=context.channel_id,
+                thread_ts=context.thread_ts,
+                requested_by=context.user_id,
+            )
+            context.reply(result_text)
+            context.logger.info(
+                "Responded with device diagnostic snapshot in thread_ts=%s deviceName=%s",
+                context.thread_ts,
+                diagnostic_device_name,
+            )
+        except ValueError as exc:
+            context.reply(f"장비 진단 시작 요청 형식 오류: {exc}")
+        except RuntimeError as exc:
+            context.logger.exception("Device diagnostic snapshot failed")
+            context.reply(deps.build_dependency_failure_reply("장비 진단", exc))
+        except Exception:
+            context.logger.exception("Device diagnostic snapshot failed")
+            context.reply("장비 진단 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if _is_device_log_upload_check_request(question, device_name=log_upload_device_name):

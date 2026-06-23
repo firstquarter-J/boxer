@@ -20,6 +20,16 @@ from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
 )
+from boxer_company.routers.device_diagnostics import (
+    _build_device_diagnostic_followup_evidence,
+    _build_device_diagnostic_followup_fallback,
+    _build_device_diagnostic_config_message,
+    _extract_device_name_for_diagnostic_freeform,
+    _is_device_diagnostic_freeform_request,
+    _is_device_diagnostic_runtime_configured,
+    _load_device_diagnostic_snapshot,
+    _start_device_diagnostic_freeform_analysis,
+)
 from boxer_company_adapter_slack.notion_freeform import (
     _build_freeform_chat_system_prompt,
     _build_notion_doc_fallback,
@@ -117,6 +127,27 @@ def _handle_knowledge_routes(
     question = context.question
     provider = (s.LLM_PROVIDER or "").lower().strip()
 
+    # 장비 진단 thread에서는 자유질문도 방금 수집한 read-only 스냅샷을 우선 근거로 답한다.
+    diagnostic_snapshot = _load_device_diagnostic_snapshot(
+        workspace_id=str(context.payload.get("workspace_id") or "").strip(),
+        channel_id=context.channel_id,
+        thread_ts=context.thread_ts,
+    )
+    if diagnostic_snapshot is not None and question:
+        diagnostic_evidence = _build_device_diagnostic_followup_evidence(question, diagnostic_snapshot)
+        fallback_text = _build_device_diagnostic_followup_fallback(question, diagnostic_evidence)
+        deps.reply_with_retrieval_synthesis(
+            fallback_text,
+            diagnostic_evidence,
+            route_name="device diagnostic followup",
+            max_tokens=500,
+        )
+        context.logger.info(
+            "Responded with device diagnostic followup in thread_ts=%s",
+            context.thread_ts,
+        )
+        return True
+
     notion_thread_context = ""
     is_notion_doc_question = _looks_like_notion_doc_question(question)
     if not is_notion_doc_question and context.thread_ts:
@@ -191,6 +222,41 @@ def _handle_knowledge_routes(
         except Exception:
             context.logger.exception("Notion doc answer failed")
             context.reply("문서 기반 답변 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+            return True
+
+    diagnostic_device_name = _extract_device_name_for_diagnostic_freeform(question)
+    if _is_device_diagnostic_freeform_request(question, device_name=diagnostic_device_name):
+        if not _is_device_diagnostic_runtime_configured():
+            context.reply(_build_device_diagnostic_config_message())
+            return True
+        try:
+            _set_request_log_route(context.payload, "device diagnostic freeform", handler_type="router")
+            fallback_text, diagnostic_evidence = _start_device_diagnostic_freeform_analysis(
+                question=question,
+                device_name=diagnostic_device_name or "",
+                workspace_id=str(context.payload.get("workspace_id") or "").strip(),
+                channel_id=context.channel_id,
+                thread_ts=context.thread_ts,
+                requested_by=context.user_id,
+            )
+            deps.reply_with_retrieval_synthesis(
+                fallback_text,
+                diagnostic_evidence,
+                route_name="device diagnostic freeform",
+                max_tokens=500,
+            )
+            context.logger.info(
+                "Responded with device diagnostic freeform in thread_ts=%s deviceName=%s",
+                context.thread_ts,
+                diagnostic_device_name,
+            )
+            return True
+        except ValueError as exc:
+            context.reply(f"장비 진단 요청 형식 오류: {exc}")
+            return True
+        except Exception:
+            context.logger.exception("Device diagnostic freeform failed")
+            context.reply("장비 진단 중 오류가 발생했어. 잠시 후 다시 시도해줘")
             return True
 
     if provider == "claude" and not context.claude_client:
