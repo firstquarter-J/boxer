@@ -50,17 +50,20 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
                     "ORIGIN_MAIN=253cea0c888fb788f3cb803af0d0b23cb08777c2",
                     "BRANCH=main",
                     "PKG_VERSION=2.0.0",
+                    "ORIGIN_PKG_VERSION=2.0.1",
                 ]
             )
         )
 
         self.assertTrue(parsed["available"])
         self.assertEqual(parsed["packageVersion"], "2.0.0")
+        self.assertEqual(parsed["originPackageVersion"], "2.0.1")
         self.assertTrue(parsed["latest"])
 
     def test_agent_git_status_command_avoids_node_command_substitution(self) -> None:
         self.assertNotIn("$(node ", _AGENT_GIT_STATUS_COMMAND)
         self.assertIn('sed "s/^/PKG_VERSION=/"', _AGENT_GIT_STATUS_COMMAND)
+        self.assertIn('sed "s/^/ORIGIN_PKG_VERSION=/"', _AGENT_GIT_STATUS_COMMAND)
 
     @patch("boxer_company.routers.device_update._wait_for_box_update_completion")
     @patch("boxer_company.routers.device_update._update_mda_device_box")

@@ -559,10 +559,18 @@ def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dic
     )
     current_agent_version = _resolve_agent_runtime_version(agent_runtime)
     agent_repo_available = bool(agent_repo.get("available"))
+    agent_repo_latest = bool(agent_repo.get("latest"))
+    agent_repo_confirmed_latest = bool(agent_repo_available and agent_repo_latest)
+    agent_repo_needs_update = not agent_repo_confirmed_latest
+    agent_repo_reason = _display_value(agent_repo.get("reason"), default="")
+    target_agent_version = _display_value(agent_repo.get("originPackageVersion"), default="")
     agent_runtime_status = _display_value(agent_process.get("status"), default="").strip().lower()
     agent_box_ready = bool(agent_gate.get("ok"))
-    # install-agent 스크립트 기준에 맞춰 에이전트는 repo 최신 여부보다 실행 가능 상태를 우선 본다.
+    # agent는 항상 origin/main 기준 최신 checkout을 유지해야 한다. 그래서 PM2가 online이고
+    # 박스 업데이트 최소 버전을 만족해도, repo 최신 여부가 확인되지 않으면 업데이트 대상으로 둔다.
     agent_healthy = bool(device_connected and agent_runtime_status == "online" and agent_box_ready)
+    agent_latest = bool(agent_healthy and agent_repo_confirmed_latest)
+    agent_should_update = bool(device_connected and (not agent_healthy or agent_repo_needs_update))
     box_already_latest = bool(latest_box_version and current_box_version == latest_box_version)
     agent_gate_version = _display_value(agent_gate.get("version"), default="")
 
@@ -578,6 +586,14 @@ def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dic
         agent_reason = f"에이전트 {agent_gate_version} 업데이트 필요"
     elif not agent_box_ready:
         agent_reason = "에이전트 버전 확인 필요"
+    elif not agent_repo_available and agent_repo_reason == "repo_missing":
+        agent_reason = "에이전트 repo 없음"
+    elif not agent_repo_available:
+        agent_reason = "에이전트 repo 최신 확인 불가"
+    elif not agent_repo_latest and target_agent_version:
+        agent_reason = f"에이전트 {current_agent_version or '미확인'} -> {target_agent_version}"
+    elif not agent_repo_latest:
+        agent_reason = "에이전트 repo 최신 아님"
     elif agent_healthy:
         agent_reason = "에이전트 정상"
     else:
@@ -599,9 +615,9 @@ def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dic
             "currentVersion": current_agent_version,
             "connected": device_connected,
             "repoAvailable": agent_repo_available,
-            "isLatest": agent_healthy,
+            "isLatest": agent_latest,
             "isHealthy": agent_healthy,
-            "shouldUpdate": bool(device_connected and not agent_healthy),
+            "shouldUpdate": agent_should_update,
             "reason": agent_reason,
             "runtimeStatus": _display_value(agent_process.get("status"), default=""),
         },
@@ -661,10 +677,10 @@ def _describe_daily_device_round_action(
         return "박스 업데이트 확인 필요"
 
     if route_kind == "agent":
-        if plan.get("isHealthy") or plan.get("isLatest"):
-            return "에이전트 정상"
         if plan.get("shouldUpdate"):
             return "에이전트 업데이트 후보"
+        if plan.get("isHealthy") or plan.get("isLatest"):
+            return "에이전트 정상"
         return _display_value(plan.get("reason"), default="에이전트 확인 필요")
 
     if plan.get("alreadyLatest"):

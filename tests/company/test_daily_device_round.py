@@ -80,6 +80,7 @@ def _build_update_payload(
                 "originMain": "abcdef0" if agent_latest else "1234567",
                 "branch": "main",
                 "packageVersion": agent_version,
+                "originPackageVersion": agent_version if agent_latest else "2.0.1",
                 "latest": agent_latest,
             },
         },
@@ -489,7 +490,7 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertTrue(plan["box"]["shouldUpdate"])
         self.assertEqual(plan["box"]["reason"], "박스 2.11.299 -> 2.11.300")
 
-    def test_build_update_plan_does_not_repeat_agent_install_for_online_v2_runtime(self) -> None:
+    def test_build_update_plan_updates_online_v2_runtime_when_repo_is_outdated(self) -> None:
         plan = rounder._build_daily_device_round_update_plan(
             {
                 "device": {
@@ -515,6 +516,7 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
                         "available": True,
                         "latest": False,
                         "packageVersion": "2.0.0",
+                        "originPackageVersion": "2.0.1",
                     },
                 },
                 "agentGate": {
@@ -528,8 +530,61 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         )
 
         self.assertTrue(plan["agent"]["isHealthy"])
-        self.assertFalse(plan["agent"]["shouldUpdate"])
-        self.assertEqual(plan["agent"]["reason"], "에이전트 정상")
+        self.assertFalse(plan["agent"]["isLatest"])
+        self.assertTrue(plan["agent"]["shouldUpdate"])
+        self.assertEqual(plan["agent"]["reason"], "에이전트 2.0.0 -> 2.0.1")
+
+    def test_build_update_plan_updates_online_v2_runtime_when_repo_is_missing(self) -> None:
+        plan = rounder._build_daily_device_round_update_plan(
+            {
+                "device": {
+                    "deviceName": "MB2-C00419",
+                    "version": "2.11.299",
+                    "isConnected": True,
+                },
+                "latestVersion": "2.11.300",
+                "boxRuntime": {
+                    "process": {
+                        "name": "mommybox-v2",
+                        "status": "online",
+                        "version": "2.11.299",
+                    }
+                },
+                "agentRuntime": {
+                    "process": {
+                        "name": "mommybox-agent",
+                        "status": "online",
+                        "version": "2.0.0",
+                    },
+                    "repo": {
+                        "available": False,
+                        "reason": "repo_missing",
+                        "packageVersion": "",
+                        "latest": False,
+                    },
+                },
+                "agentGate": {
+                    "ok": True,
+                    "version": "2.0.0",
+                    "source": "pm2",
+                    "reason": "에이전트 2.0.0 확인돼서 박스 업데이트 진행 가능해",
+                    "minimumVersion": "2.0.0",
+                },
+            }
+        )
+
+        self.assertTrue(plan["agent"]["isHealthy"])
+        self.assertFalse(plan["agent"]["isLatest"])
+        self.assertTrue(plan["agent"]["shouldUpdate"])
+        self.assertEqual(plan["agent"]["reason"], "에이전트 repo 없음")
+        self.assertEqual(
+            rounder._describe_daily_device_round_action(
+                None,
+                route_kind="agent",
+                plan=plan["agent"],
+            ),
+            "에이전트 업데이트 후보",
+        )
 
     def test_build_update_plan_updates_agent_when_repo_missing_but_pm2_version_is_too_old(self) -> None:
         plan = rounder._build_daily_device_round_update_plan(

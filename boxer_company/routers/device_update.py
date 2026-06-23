@@ -24,7 +24,7 @@ _LEADING_DEVICE_UPDATE_SCOPE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _SEMVER_PATTERN = re.compile(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)")
-_AGENT_GIT_KV_PATTERN = re.compile(r"^(HEAD|ORIGIN_MAIN|BRANCH|PKG_VERSION)=(.*)$")
+_AGENT_GIT_KV_PATTERN = re.compile(r"^(HEAD|ORIGIN_MAIN|BRANCH|PKG_VERSION|ORIGIN_PKG_VERSION)=(.*)$")
 
 _UPDATE_HINTS = (
     "업데이트",
@@ -97,6 +97,9 @@ _AGENT_GIT_STATUS_COMMAND = (
     "node -e \"console.log((JSON.parse(require(\\\"fs\\\").readFileSync(\\\"package.json\\\",\\\"utf8\\\")).version)||\\\"\\\")\" 2>/dev/null "
     "| sed \"s/^/PKG_VERSION=/\"; "
     "fi; "
+    "git show origin/main:package.json 2>/dev/null "
+    "| node -e \"let s=\\\"\\\";process.stdin.on(\\\"data\\\",d=>s+=d);process.stdin.on(\\\"end\\\",()=>{try{console.log((JSON.parse(s).version)||\\\"\\\")}catch(_){}})\" 2>/dev/null "
+    "| sed \"s/^/ORIGIN_PKG_VERSION=/\"; "
     "else echo repo_missing; fi'"
 )
 _AGENT_INSTALL_SCRIPT_URL = "https://mmb-release.s3.ap-northeast-2.amazonaws.com/provision/install-agent.sh"
@@ -387,6 +390,7 @@ def _parse_agent_repo_state(output: str) -> dict[str, Any]:
             "originMain": "",
             "branch": "",
             "packageVersion": "",
+            "originPackageVersion": "",
             "latest": False,
         }
 
@@ -401,6 +405,7 @@ def _parse_agent_repo_state(output: str) -> dict[str, Any]:
     origin_main = values.get("ORIGIN_MAIN", "")
     branch = values.get("BRANCH", "")
     package_version = values.get("PKG_VERSION", "")
+    origin_package_version = values.get("ORIGIN_PKG_VERSION", "")
     return {
         "available": bool(head or origin_main or branch),
         "reason": "ok" if head or origin_main or branch else "parse_failed",
@@ -408,6 +413,7 @@ def _parse_agent_repo_state(output: str) -> dict[str, Any]:
         "originMain": origin_main,
         "branch": branch,
         "packageVersion": package_version,
+        "originPackageVersion": origin_package_version,
         "latest": bool(head and origin_main and head == origin_main and branch == "main"),
     }
 
@@ -449,6 +455,7 @@ def _read_agent_runtime_state(device_name: str) -> dict[str, Any]:
             "originMain": "",
             "branch": "",
             "packageVersion": "",
+            "originPackageVersion": "",
             "latest": False,
         },
     }
@@ -482,6 +489,7 @@ def _read_agent_runtime_state(device_name: str) -> dict[str, Any]:
             "originMain": "",
             "branch": "",
             "packageVersion": "",
+            "originPackageVersion": "",
             "latest": False,
         }
     return state
@@ -507,9 +515,12 @@ def _format_agent_repo_line(repo: dict[str, Any]) -> str:
     origin_main = _display_value(repo.get("originMain"), default="")
     branch = _display_value(repo.get("branch"), default="")
     package_version = _display_value(repo.get("packageVersion"), default="")
+    origin_package_version = _display_value(repo.get("originPackageVersion"), default="")
     parts = [f"branch `{branch or '미확인'}`"]
     if package_version:
         parts.append(f"pkg `{package_version}`")
+    if origin_package_version and origin_package_version != package_version:
+        parts.append(f"origin pkg `{origin_package_version}`")
     if head:
         parts.append(f"head `{head[:7]}`")
     if origin_main:
