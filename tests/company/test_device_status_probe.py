@@ -23,6 +23,7 @@ from boxer_company.routers.device_status_probe import (
     _parse_pm2_memory_restart_values,
     _parse_pm2_processes,
     _parse_usb_devices,
+    _parse_voice_config,
     _probe_device_remote_access,
     _probe_device_status_overview,
     _render_device_status_overview_result,
@@ -33,6 +34,7 @@ from boxer_company.routers.device_status_probe import (
     _summarize_audio_path_probe,
     _summarize_pm2_probe,
     _summarize_storage_probe,
+    _summarize_voice_set_probe,
 )
 
 
@@ -302,6 +304,35 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("87%", summary["evidence"])
         self.assertIn("오디오 장치", summary["evidence"])
 
+    def test_summarizes_legacy_voice_set_as_missing_free_barcode_voice(self) -> None:
+        summary = _summarize_voice_set_probe(
+            _parse_voice_config(
+                "\n".join(
+                    [
+                        "VOICE_TYPE=ln",
+                        "LOCALE=ko_KR",
+                        "SILENT_START=",
+                        "AUDIO_FILE=expired_barcode.wav:0",
+                        "AUDIO_FILE=invalid_barcode.wav:0",
+                        "AUDIO_FILE=n_expired_barcode.wav:1",
+                        "AUDIO_FILE=s_expired_barcode.wav:1",
+                        "AUDIO_FILE=ln_expired_barcode.wav:0",
+                        "AUDIO_FILE=ls_expired_barcode.wav:0",
+                        "AUDIO_FILE=ln_invalid_barcode.wav:1",
+                        "AUDIO_FILE=ls_invalid_barcode.wav:1",
+                    ]
+                )
+            )
+        )
+
+        self.assertEqual(summary["status"], "warning")
+        self.assertEqual(summary["voiceType"], "ln")
+        self.assertEqual(summary["voiceSetLabel"], "구형 1번(ln)")
+        self.assertFalse(summary["freeBarcodeVoiceSupported"])
+        self.assertTrue(summary["invalidBarcodeVoiceSupported"])
+        self.assertIn("FREE/핑크 바코드 차단 음성이 빠져", summary["summary"])
+        self.assertIn("`ln` 구형 기본 안내, 유효성/만료 차단, FREE/핑크 차단 음성 없음", summary["supportAreasText"])
+
     def test_overview_render_mentions_each_component(self) -> None:
         rendered = _render_device_status_overview_result(
             device_name="MB2-C00419",
@@ -325,6 +356,16 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "overviewDetail": "오디오 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`",
                 "deviceLabelsText": "`Generic Analog`, `Generic Digital`",
                 "volumeText": "`Master 87% on, PCM 100%`",
+            },
+            voice_summary={
+                "label": "확인 필요",
+                "status": "warning",
+                "summary": "현재 음성 세트는 FREE/핑크 바코드 차단 음성이 빠져 있어",
+                "voiceType": "ln",
+                "voiceSetLabel": "구형 1번(ln)",
+                "locale": "ko_KR",
+                "freeBarcodeVoiceSupported": False,
+                "supportAreasText": "`n` 기본 안내, 유효성/만료 차단, FREE/핑크 차단 / `ln` 구형 기본 안내, 유효성/만료 차단, FREE/핑크 차단 음성 없음",
             },
             pm2_summary={
                 "label": "정상",
@@ -359,6 +400,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*장비 상태 점검*", rendered)
         self.assertIn("*오디오*", rendered)
         self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
+        self.assertIn("• 음성 세트: *구형 1번(ln)* | 값 `ln` / locale `ko_KR` / FREE/핑크 차단 음성 `미지원`", rendered)
+        self.assertIn("• 음성 세트별 지원: `n` 기본 안내, 유효성/만료 차단, FREE/핑크 차단", rendered)
         self.assertIn("*런타임*", rendered)
         self.assertIn("• ping 전송 여부: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
         self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
@@ -401,6 +444,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• ping 전송 여부: 🔴 *실패* | 장비 offline", rendered)
         self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
+        self.assertIn("• 음성 세트: *점검 불가*", rendered)
+        self.assertIn("• 음성 세트별 지원: `n` 기본 안내, 유효성/만료 차단, FREE/핑크 차단", rendered)
         self.assertIn("• 디스크 용량: *점검 불가*", rendered)
         self.assertIn("• TrashCan 용량: *점검 불가*", rendered)
         self.assertIn("• 산모수첩 캡처 사용(캡처 기능): ⚪ *꺼짐*", rendered)
@@ -492,6 +537,7 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
         self.assertFalse(evidence["ping"]["status"])
         self.assertEqual(evidence["notionReferences"][0]["title"], "병원 방화벽으로 MDA/원격 접속이 안 될 때")
         self.assertEqual(evidence["overview"]["audio"], None)
+        self.assertEqual(evidence["overview"]["voice"], None)
 
     def test_remote_access_probe_handles_ping_success_without_detail_state(self) -> None:
         with (

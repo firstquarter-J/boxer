@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 from typing import Any
@@ -201,6 +202,37 @@ _CAPTUREBOARD_USB_SIGNATURES = {
 _LED_USB_SIGNATURES = {
     (0x1A86, 0x7523): "MmtLEDv3",
 }
+_VOICE_SET_SPECS: dict[str, dict[str, Any]] = {
+    "n": {
+        "label": "기본 1번(n)",
+        "baseArea": "기본 안내",
+        "legacy": False,
+        "invalidBarcodeVoice": True,
+        "freeBarcodeVoice": True,
+    },
+    "s": {
+        "label": "기본 2번(s)",
+        "baseArea": "기본 안내",
+        "legacy": False,
+        "invalidBarcodeVoice": True,
+        "freeBarcodeVoice": True,
+    },
+    "ln": {
+        "label": "구형 1번(ln)",
+        "baseArea": "구형 기본 안내",
+        "legacy": True,
+        "invalidBarcodeVoice": True,
+        "freeBarcodeVoice": False,
+    },
+    "ls": {
+        "label": "구형 2번(ls)",
+        "baseArea": "구형 기본 안내",
+        "legacy": True,
+        "invalidBarcodeVoice": True,
+        "freeBarcodeVoice": False,
+    },
+}
+_VOICE_SET_ORDER = ("n", "s", "ln", "ls")
 _PM2_TARGET_APP_ALIASES = {
     "mommybox-v2": "mommybox-v2",
     "mommybox-v2-agent": "mommybox-agent",
@@ -300,6 +332,45 @@ def _build_trashcan_delete_command(age_days: int) -> str:
         "else echo path_missing; fi'"
     )
 
+
+def _build_voice_config_command() -> str:
+    # voice_type은 MDA device DTO에 없어서 장비 로컬 SQLite 설정을 직접 읽는다.
+    js = (
+        'try{'
+        'const sqlite3=require("sqlite3").verbose();'
+        'const path=require("path");'
+        'const fs=require("fs");'
+        'const dbPath=path.join(process.env.HOME||"/home/mommytalk","AppData/db/mommybox.sqlite");'
+        'const names=["voice_type","locale","silent_start"];'
+        'function clean(v){try{return JSON.parse(v)}catch(e){return v}}'
+        'const db=new sqlite3.Database(dbPath,sqlite3.OPEN_READONLY,function(err){'
+        'if(err){console.log("VOICE_CONFIG_ERROR="+err.message);process.exit(0)}});'
+        'db.all("SELECT name, value FROM configs WHERE name IN (?,?,?)",names,function(err,rows){'
+        'if(err){console.log("VOICE_CONFIG_ERROR="+err.message);db.close();return}'
+        'const values={};'
+        'for(const row of Array.isArray(rows)?rows:[]){values[row.name]=clean(row.value)}'
+        'const voiceType=Object.prototype.hasOwnProperty.call(values,"voice_type")?values.voice_type:"n";'
+        'const locale=Object.prototype.hasOwnProperty.call(values,"locale")?values.locale:"ko_KR";'
+        'const silentStart=Object.prototype.hasOwnProperty.call(values,"silent_start")?values.silent_start:"";'
+        'console.log("VOICE_TYPE="+String(voiceType));'
+        'console.log("LOCALE="+String(locale));'
+        'console.log("SILENT_START="+String(silentStart));'
+        'const files=["expired_barcode.wav","invalid_barcode.wav","n_expired_barcode.wav","s_expired_barcode.wav","ln_expired_barcode.wav","ls_expired_barcode.wav","n_invalid_barcode.wav","s_invalid_barcode.wav","ln_invalid_barcode.wav","ls_invalid_barcode.wav"];'
+        'for(const file of files){const exists=fs.existsSync(path.join("assets/audio",String(locale),file))?"1":"0";'
+        'console.log("AUDIO_FILE="+file+":"+exists)}'
+        'db.close()});'
+        '}catch(e){console.log("VOICE_CONFIG_ERROR="+e.message)}'
+    )
+    script_b64 = base64.b64encode(js.encode("utf-8")).decode("ascii")
+    return (
+        "bash -lc '"
+        'cd "$HOME/mommybox-v2" 2>/dev/null '
+        '|| cd /home/mommytalk/mommybox-v2 2>/dev/null '
+        '|| { echo VOICE_CONFIG_ERROR=app_missing; exit 0; }; '
+        f"printf %s {script_b64} | base64 -d | node"
+        "'"
+    )
+
 _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
     "tools": {
         "summary": "점검 도구 확인",
@@ -347,6 +418,11 @@ _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
             "pactl info 2>&1; "
             "else echo pactl_missing; fi'"
         ),
+    },
+    "voice_config": {
+        "summary": "음성 세트 설정 확인",
+        "timeout_sec": 12,
+        "command": _build_voice_config_command(),
     },
     "pm2_jlist": {
         "summary": "PM2 앱 상태 확인",
@@ -423,6 +499,7 @@ _PROBE_COMPONENT_COMMAND_KEYS = {
         "master_mixer",
         "pcm_mixer",
         "pactl_info",
+        "voice_config",
         "pm2_jlist",
         "disk_usage_root",
         "trashcan_dir_usage",
@@ -1138,6 +1215,112 @@ def _parse_pm2_memory_restart_values(text: str) -> dict[str, Any]:
     }
 
 
+def _parse_voice_config(text: str) -> dict[str, Any]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return {
+            "available": False,
+            "reason": "empty_output",
+            "voiceType": "",
+            "locale": "",
+            "silentStart": None,
+            "audioFiles": {},
+        }
+
+    values: dict[str, str] = {}
+    audio_files: dict[str, bool] = {}
+    errors: list[str] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("AUDIO_FILE="):
+            file_payload = line.split("=", 1)[1]
+            file_name, _, exists_text = file_payload.partition(":")
+            file_name = file_name.strip()
+            if file_name:
+                audio_files[file_name] = exists_text.strip() == "1"
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        if key == "VOICE_CONFIG_ERROR":
+            errors.append(value.strip())
+        else:
+            values[key] = value.strip()
+
+    if errors:
+        return {
+            "available": False,
+            "reason": errors[0] or "voice_config_error",
+            "voiceType": "",
+            "locale": "",
+            "silentStart": None,
+            "audioFiles": audio_files,
+        }
+
+    voice_type = values.get("VOICE_TYPE", "").strip().lower()
+    silent_raw = values.get("SILENT_START", "").strip().lower()
+    silent_start = True if silent_raw in {"1", "true", "yes", "on"} else False if silent_raw in {"0", "false", "no", "off"} else None
+    return {
+        "available": bool(voice_type),
+        "reason": "ok" if voice_type else "voice_type_missing",
+        "voiceType": voice_type,
+        "locale": values.get("LOCALE", "").strip() or "ko_KR",
+        "silentStart": silent_start,
+        "audioFiles": audio_files,
+    }
+
+
+def _voice_set_label(voice_type: str) -> str:
+    normalized = str(voice_type or "").strip().lower()
+    spec = _VOICE_SET_SPECS.get(normalized)
+    if spec:
+        return _display_value(spec.get("label"), default=normalized)
+    return f"알 수 없는 세트({normalized or '미확인'})"
+
+
+def _voice_file_supported(
+    audio_files: dict[str, bool] | None,
+    voice_type: str,
+    name: str,
+) -> bool:
+    normalized_type = str(voice_type or "").strip().lower()
+    normalized_name = str(name or "").strip()
+    if not normalized_type or not normalized_name:
+        return False
+    files = audio_files or {}
+    typed_file = f"{normalized_type}_{normalized_name}.wav"
+    generic_file = f"{normalized_name}.wav"
+    if typed_file in files or generic_file in files:
+        return bool(files.get(typed_file)) or bool(files.get(generic_file))
+
+    spec = _VOICE_SET_SPECS.get(normalized_type, {})
+    if normalized_name == "invalid_barcode":
+        return bool(spec.get("invalidBarcodeVoice"))
+    if normalized_name == "expired_barcode":
+        return bool(spec.get("freeBarcodeVoice"))
+    return False
+
+
+def _format_voice_support_areas(audio_files: dict[str, bool] | None = None) -> str:
+    # 장비 파일 목록이 있으면 실제 자산 기준으로, 없으면 릴리즈 기준 기본 지원 범위로 표시한다.
+    items: list[str] = []
+    for voice_type in _VOICE_SET_ORDER:
+        spec = _VOICE_SET_SPECS[voice_type]
+        areas = [_display_value(spec.get("baseArea"), default="기본 안내")]
+        if _voice_file_supported(audio_files, voice_type, "invalid_barcode"):
+            areas.append("유효성/만료 차단")
+        else:
+            areas.append("유효성/만료 차단 음성 없음")
+        if _voice_file_supported(audio_files, voice_type, "expired_barcode"):
+            areas.append("FREE/핑크 차단")
+        else:
+            areas.append("FREE/핑크 차단 음성 없음")
+        items.append(f"`{voice_type}` {', '.join(areas)}")
+    return " / ".join(items)
+
+
 def _find_usb_signature_matches(
     usb_devices: dict[str, Any],
     signatures: dict[tuple[int, int], str],
@@ -1466,6 +1649,64 @@ def _summarize_audio_path_probe(checks: dict[str, dict[str, Any]]) -> dict[str, 
         "volumeText": f"`{mixer_summary}`" if mixer_summary else "",
         "sinkText": f"`{_display_value(default_sink.get('defaultSink'), default='미확인')}`" if default_sink.get("available") else "",
         "action": "실제 소리 재생 확인은 `장비 소리 출력 점검`으로 따로 점검해",
+    }
+
+
+def _summarize_voice_set_probe(voice_config: dict[str, Any]) -> dict[str, Any]:
+    if not voice_config.get("available"):
+        reason = _display_value(voice_config.get("reason"), default="voice_config_unavailable")
+        return {
+            "status": "check_needed",
+            "label": "미확인",
+            "summary": "장비 로컬 설정에서 음성 세트를 읽지 못했어",
+            "evidence": f"reason `{reason}`",
+            "overviewDetail": f"reason `{reason}`",
+            "voiceType": "",
+            "voiceSetLabel": "미확인",
+            "locale": "",
+            "silentStart": None,
+            "invalidBarcodeVoiceSupported": None,
+            "freeBarcodeVoiceSupported": None,
+            "supportAreasText": _format_voice_support_areas(),
+        }
+
+    voice_type = _display_value(voice_config.get("voiceType"), default="").lower()
+    locale = _display_value(voice_config.get("locale"), default="ko_KR")
+    audio_files = voice_config.get("audioFiles") if isinstance(voice_config.get("audioFiles"), dict) else {}
+    silent_start = voice_config.get("silentStart")
+    invalid_supported = _voice_file_supported(audio_files, voice_type, "invalid_barcode")
+    free_supported = _voice_file_supported(audio_files, voice_type, "expired_barcode")
+    status = "pass" if free_supported else "warning"
+    label = "정상" if status == "pass" else "확인 필요"
+    voice_label = _voice_set_label(voice_type)
+    silent_text = "켜짐" if silent_start is True else "꺼짐" if silent_start is False else "미확인"
+    free_text = "지원" if free_supported else "미지원"
+    invalid_text = "지원" if invalid_supported else "미지원"
+    detail_parts = [
+        f"현재 `{voice_type}`({voice_label})",
+        f"locale `{locale}`",
+        f"silent_start `{silent_text}`",
+        f"유효성/만료 차단 음성 `{invalid_text}`",
+        f"FREE/핑크 차단 음성 `{free_text}`",
+    ]
+    summary = (
+        "현재 음성 세트는 FREE/핑크 바코드 차단 음성을 낼 수 있어"
+        if free_supported
+        else "현재 음성 세트는 FREE/핑크 바코드 차단 음성이 빠져 있어"
+    )
+    return {
+        "status": status,
+        "label": label,
+        "summary": summary,
+        "evidence": " / ".join(detail_parts),
+        "overviewDetail": " / ".join(detail_parts),
+        "voiceType": voice_type,
+        "voiceSetLabel": voice_label,
+        "locale": locale,
+        "silentStart": silent_start,
+        "invalidBarcodeVoiceSupported": invalid_supported,
+        "freeBarcodeVoiceSupported": free_supported,
+        "supportAreasText": _format_voice_support_areas(audio_files),
     }
 
 
@@ -2378,6 +2619,7 @@ def _render_device_status_overview_result(
     storage_summary: dict[str, Any] | None,
     captureboard_summary: dict[str, Any] | None,
     led_summary: dict[str, Any] | None,
+    voice_summary: dict[str, Any] | None = None,
 ) -> str:
     lines = _build_device_header_lines(
         title="*장비 상태 점검*",
@@ -2395,6 +2637,8 @@ def _render_device_status_overview_result(
         lines.append(f"• SSH 연결 상태: {_format_probe_ssh_status_display(False)}")
         lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(False)}")
         lines.append("• 소리 출력 경로: *점검 불가*")
+        lines.append("• 음성 세트: *점검 불가*")
+        lines.append(f"• 음성 세트별 지원: {_format_voice_support_areas()}")
         lines.append("• pm2 앱: *점검 불가*")
         lines.append("• 디스크 용량: *점검 불가*")
         lines.append("• TrashCan 용량: *점검 불가*")
@@ -2439,6 +2683,24 @@ def _render_device_status_overview_result(
         audio_parts.append(f"장치 {audio_device_labels}")
     if audio_volume_text:
         audio_parts.append(f"음량 {audio_volume_text}")
+    voice_payload = voice_summary or {}
+    voice_label = _display_value(voice_payload.get("voiceSetLabel"), default="미확인")
+    voice_type = _display_value(voice_payload.get("voiceType"), default="")
+    voice_locale = _display_value(voice_payload.get("locale"), default="")
+    voice_free_supported = voice_payload.get("freeBarcodeVoiceSupported")
+    voice_support_text = _display_value(
+        voice_payload.get("supportAreasText"),
+        default=_format_voice_support_areas(),
+    )
+    voice_parts: list[str] = []
+    if voice_type:
+        voice_parts.append(f"값 `{voice_type}`")
+    if voice_locale:
+        voice_parts.append(f"locale `{voice_locale}`")
+    if voice_free_supported is True:
+        voice_parts.append("FREE/핑크 차단 음성 `지원`")
+    elif voice_free_supported is False:
+        voice_parts.append("FREE/핑크 차단 음성 `미지원`")
 
     pm2_payload = pm2_summary or {}
     pm2_label = _display_value(pm2_payload.get("label"), default="확인 필요")
@@ -2468,6 +2730,11 @@ def _render_device_status_overview_result(
     if audio_parts:
         audio_line = f"{audio_line} | {' / '.join(audio_parts)}"
     lines.append(audio_line)
+    voice_line = f"• 음성 세트: *{voice_label}*"
+    if voice_parts:
+        voice_line = f"{voice_line} | {' / '.join(voice_parts)}"
+    lines.append(voice_line)
+    lines.append(f"• 음성 세트별 지원: {voice_support_text}")
 
     lines.append("")
     lines.append("*런타임*")
@@ -2648,12 +2915,16 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
     notion_references = _select_remote_access_notion_references() if not ssh_ready else []
 
     audio_summary = None
+    voice_summary = None
     pm2_summary = None
     storage_summary = None
     captureboard_summary = None
     led_summary = None
     if ssh_ready:
         audio_summary = _summarize_audio_path_probe(checks)
+        voice_summary = _summarize_voice_set_probe(
+            _parse_voice_config(_display_value((checks.get("voice_config") or {}).get("output"), default=""))
+        )
         pm2_summary = _summarize_pm2_probe(
             _parse_pm2_processes(_display_value((checks.get("pm2_jlist") or {}).get("output"), default=""))
         )
@@ -2681,6 +2952,7 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
 
     evidence_payload["overview"] = {
         "audio": audio_summary,
+        "voice": voice_summary,
         "pm2": pm2_summary,
         "storage": storage_summary,
         "captureboard": captureboard_summary,
@@ -2700,6 +2972,7 @@ def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]
         storage_summary=storage_summary,
         captureboard_summary=captureboard_summary,
         led_summary=led_summary,
+        voice_summary=voice_summary,
     )
     if notion_references:
         result_text = _append_remote_access_notion_section(result_text, notion_references)
