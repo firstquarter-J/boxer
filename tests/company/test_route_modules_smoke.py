@@ -187,6 +187,32 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(replies, ["*바코드 유효성 검사 확인*\n• 결론: 테스트"])
 
+    def test_barcode_query_routes_handles_pink_classification_reason_question(self) -> None:
+        replies: list[str] = []
+
+        with patch(
+            "boxer_company_adapter_slack.barcode_query_routes._query_barcode_pink_classification_reason",
+            return_value="*핑크/환불 바코드 분류 근거*\n• 판단: 테스트",
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question="58291583958 왜 핑크바코드로 분류되지 않았어?",
+                    barcode="58291583958",
+                    user_id="U123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=lambda evidence, context: None,
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*핑크/환불 바코드 분류 근거*\n• 판단: 테스트"])
+
     def test_barcode_query_routes_handles_recording_streaming_restore_request(self) -> None:
         replies: list[str] = []
 

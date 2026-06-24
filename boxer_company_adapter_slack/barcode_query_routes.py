@@ -8,7 +8,9 @@ from boxer_adapter_slack.common import SlackReplyFn
 from boxer_company import settings as cs
 from boxer_company.routers.app_user import _lookup_app_user_by_barcode, _should_lookup_barcode
 from boxer_company.routers.barcode_validation import (
+    _is_barcode_pink_classification_reason_request,
     _is_barcode_validation_status_request,
+    _query_barcode_pink_classification_reason,
     _query_barcode_validation_status,
 )
 from boxer_company.routers.recording_streaming_restore import (
@@ -65,6 +67,25 @@ def _handle_barcode_query_routes(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if _is_barcode_pink_classification_reason_request(question, barcode):
+        try:
+            result_text = _query_barcode_pink_classification_reason(barcode or "")
+            context.reply(result_text)
+            context.logger.info(
+                "Responded with barcode pink classification reason in thread_ts=%s barcode=%s",
+                context.thread_ts,
+                barcode,
+            )
+        except ValueError as exc:
+            context.reply(f"핑크 바코드 분류 근거 확인 요청 형식 오류: {exc}")
+        except RuntimeError:
+            context.logger.exception("Barcode pink classification reason query failed")
+            context.reply("핑크 바코드 분류 근거 확인 중 오류가 발생했어. DB/MDA 연결 상태를 확인해줘")
+        except Exception:
+            context.logger.exception("Barcode pink classification reason query failed")
+            context.reply("핑크 바코드 분류 근거 확인 중 오류가 발생했어. 잠시 후 다시 시도해줘")
+        return True
 
     if _is_barcode_validation_status_request(question, barcode):
         try:
