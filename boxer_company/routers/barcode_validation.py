@@ -148,6 +148,16 @@ def _format_special_barcode_rows(rows: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _format_pink_activity_change(value: Any) -> str:
+    text = _display_value(value, default="").strip()
+    marker = "수정 내용: ["
+    if marker in text:
+        change = text.split(marker, 1)[1].split("]", 1)[0].strip()
+        if change:
+            return change
+    return text or "내용 없음"
+
+
 def _load_barcode_pink_classification_context(barcode: str) -> dict[str, Any]:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
@@ -248,7 +258,6 @@ def _query_barcode_validation_status(barcode: str) -> str:
                 f"• 바코드: `{normalized_barcode}`",
                 "• 결론: 현재 운영 제한 목록 기준으로는 유효성 검사에 걸리는 바코드로 확인되지 않았어",
                 "• 확인: 무료/핑크 바코드나 환불 처리 바코드 목록에는 없어",
-                "• 조치: 다만 일반 바코드 만료 여부까지는 여기서 바로 단정 못 해서, 꼭 확정이 필요하면 실제 장비에서 확인해",
             )
         )
 
@@ -305,21 +314,25 @@ def _query_barcode_pink_classification_reason(barcode: str) -> str:
     }
     is_blocked_special = bool(special_types & set(_BLOCKING_SPECIAL_TYPE_LABELS))
 
-    lines = [
-        "*핑크/환불 바코드 분류 근거*",
-        f"• 바코드: `{normalized_barcode}`",
-    ]
+    # Slack 답변은 결론, 원인, 근거를 분리해 긴 DB 근거도 먼저 읽히는 부분이 흐려지지 않게 한다.
+    lines = ["*핑크바코드 분류 확인*", f"• 바코드: `{normalized_barcode}`"]
     if is_blocked_special:
-        lines.append("• 결론: 이미 운영 제한 목록에 등록돼 있어")
+        lines.append("• 결론: 이미 핑크/환불 제한 목록에 등록돼 있어")
+        lines.append("")
+        lines.append("*등록 내역*")
         lines.extend(_format_special_barcode_rows(special_rows))
     else:
-        lines.append("• 결론: 현재 `special_barcodes`에는 `FREE`/`REFUND`로 등록돼 있지 않아")
+        lines.append("• 결론: 현재는 핑크바코드(`FREE`)나 환불 바코드(`REFUND`)가 아니야")
 
     if not first_recording:
         lines.extend(
             (
-                "• 첫 녹화: recordings 기록 없음",
-                "• 판단: 첫 녹화 병원 기준 핑크 분류 여부를 계산할 근거가 부족해",
+                "",
+                "*왜 아니냐면*",
+                "• 첫 녹화 기록이 없어서 첫 병원 기준 핑크 분류 여부를 계산할 근거가 부족해",
+                "",
+                "*근거*",
+                "• recordings 기록 없음",
             )
         )
         return "\n".join(lines)
@@ -329,52 +342,66 @@ def _query_barcode_pink_classification_reason(barcode: str) -> str:
     hospital_pink_at = _parse_db_datetime(first_recording.get("hospitalPinkBarcodeAt"))
     history_created_at = _parse_db_datetime(first_history.get("createdAt"))
     pink_activity_created_at = _parse_db_datetime(first_pink_activity.get("createdAt"))
-
-    lines.extend(
-        (
-            f"• 첫 녹화: recordedAt(KST) `{_format_kst(recorded_at)}` / createdAt(KST) `{_format_kst(created_at)}`",
-            f"• 첫 녹화 병원: `{_display_value(first_recording.get('hospitalName'), default='미확인')}`"
-            f" / 장비 `{_display_value(first_recording.get('deviceName'), default='미확인')}`",
-            f"• 병원 현재 핑크 적용일: `{_format_kst(hospital_pink_at)}`",
-        )
+    is_history_before_pink = (
+        history_created_at is not None
+        and hospital_pink_at is not None
+        and history_created_at < hospital_pink_at
     )
-    if first_history:
-        lines.append(
-            f"• 최초 병원 매핑 이력: `{_display_value(first_history.get('hospitalName'), default='미확인')}`"
-            f" / createdAt(KST) `{_format_kst(history_created_at)}`"
-        )
-    else:
-        lines.append("• 최초 병원 매핑 이력: 없음")
 
-    if first_pink_activity:
-        lines.append(
-            f"• 핑크 설정 변경 로그: `{_format_kst(pink_activity_created_at)}`"
-            f" / {_display_value(first_pink_activity.get('description'), default='내용 없음')}"
-        )
-    else:
-        lines.append("• 핑크 설정 변경 로그: 확인 안 됨")
-
+    reason_lines: list[str]
     if is_blocked_special:
-        lines.append("• 판단: 이미 제한 목록에 있으니 미분류 케이스는 아니야")
+        reason_lines = ["이미 제한 목록에 있으니 미분류 케이스는 아니야"]
     elif (
         pink_activity_created_at is not None
         and created_at is not None
         and pink_activity_created_at > created_at
     ):
-        lines.append(
-            "• 판단: 현재 적용일은 첫 녹화보다 앞서 보이지만, 실제 핑크 설정 변경은 첫 녹화 이후에 들어갔어. "
-            "업로드 당시 병원 값이 없었고 기존 바코드 backfill이 없어 `special_barcodes`에 생성되지 않은 케이스로 봐"
-        )
+        reason_lines = [
+            f"병원의 핑크바코드 설정은 `{_format_kst(pink_activity_created_at)}`에 첫 녹화 이후 변경됐어",
+            f"현재 적용일은 `{_format_kst(hospital_pink_at)}`로 보이지만, 나중에 소급 입력된 값이야",
+            "기존 바코드 backfill이 없어 `special_barcodes`에 생성되지 않았어",
+        ]
     elif hospital_pink_at is None:
-        lines.append("• 판단: 첫 녹화 병원의 핑크 적용일이 없어서 FREE로 분류될 조건이 아니야")
+        reason_lines = ["첫 녹화 병원의 핑크 적용일이 없어서 `FREE`로 분류될 조건이 아니야"]
     elif recorded_at is not None and hospital_pink_at is not None and recorded_at < hospital_pink_at:
-        lines.append("• 판단: 첫 녹화 시각이 병원 핑크 적용일보다 빨라서 FREE로 분류될 조건이 아니야")
-    elif history_created_at is not None and hospital_pink_at is not None and history_created_at < hospital_pink_at:
-        lines.append("• 판단: 최초 병원 매핑 이력이 병원 핑크 적용일보다 빨라서 앱 표시 기준으로도 핑크가 아니야")
+        reason_lines = ["첫 녹화 시각이 병원 핑크 적용일보다 빨라서 `FREE`로 분류될 조건이 아니야"]
+    elif is_history_before_pink:
+        reason_lines = ["최초 병원 매핑 이력이 병원 핑크 적용일보다 빨라서 앱 표시 기준으로도 핑크가 아니야"]
     else:
-        lines.append(
-            "• 판단: 현재 값만 보면 핑크 조건에 가까워 보여. 그래도 제한 목록에 없다면 설정이 나중에 소급 입력됐거나 "
-            "업로드 경로가 핑크 등록 분기를 타지 않았는지 확인이 필요해"
+        reason_lines = [
+            "현재 값만 보면 핑크 조건에 가까워 보여",
+            "그래도 제한 목록에 없다면 설정 소급 입력이나 업로드 경로의 핑크 등록 분기 누락을 확인해야 해",
+        ]
+
+    lines.append("")
+    lines.append("*정리*" if is_blocked_special else "*왜 아니냐면*")
+    lines.extend(f"• {line}" for line in reason_lines)
+
+    lines.extend(
+        (
+            "",
+            "*근거*",
+            f"• 첫 녹화: `{_format_kst(recorded_at)}`",
+            f"• 첫 녹화 병원/장비: `{_display_value(first_recording.get('hospitalName'), default='미확인')}`"
+            f" / `{_display_value(first_recording.get('deviceName'), default='미확인')}`",
+            f"• 업로드 기록 생성: `{_format_kst(created_at)}`",
+            f"• 병원 현재 핑크 적용일: `{_format_kst(hospital_pink_at)}`",
         )
+    )
+    if first_history and is_history_before_pink:
+        lines.append(
+            f"• 최초 병원 매핑: `{_display_value(first_history.get('hospitalName'), default='미확인')}`"
+            f" / `{_format_kst(history_created_at)}`"
+        )
+
+    if first_pink_activity:
+        lines.extend(
+            (
+                f"• 핑크 설정 변경: `{_format_kst(pink_activity_created_at)}`",
+                f"• 변경 내용: `{_format_pink_activity_change(first_pink_activity.get('description'))}`",
+            )
+        )
+    else:
+        lines.append("• 핑크 설정 변경 로그: 확인 안 됨")
 
     return "\n".join(lines)
