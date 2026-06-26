@@ -233,6 +233,10 @@ _VOICE_SET_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 _VOICE_SET_ORDER = ("n", "s", "ln", "ls")
+_VOICE_SUPPORT_CHECKS = (
+    ("invalid_barcode", "유효성/만료 차단"),
+    ("expired_barcode", "FREE/핑크 차단"),
+)
 _PM2_TARGET_APP_ALIASES = {
     "mommybox-v2": "mommybox-v2",
     "mommybox-v2-agent": "mommybox-agent",
@@ -340,7 +344,8 @@ def _build_voice_config_command() -> str:
         'const sqlite3=require("sqlite3").verbose();'
         'const path=require("path");'
         'const fs=require("fs");'
-        'const dbPath=path.join(process.env.HOME||"/home/mommytalk","AppData/db/mommybox.sqlite");'
+        'const dbCandidates=[path.join(process.env.HOME||"/home/mommytalk","AppData/db/mommybox.sqlite"),"/home/mommytalk/AppData/db/mommybox.sqlite"];'
+        'const dbPath=dbCandidates.find(function(p){return fs.existsSync(p)})||dbCandidates[0];'
         'const names=["voice_type","locale","silent_start"];'
         'function clean(v){try{return JSON.parse(v)}catch(e){return v}}'
         'const db=new sqlite3.Database(dbPath,sqlite3.OPEN_READONLY,function(err){'
@@ -1280,6 +1285,16 @@ def _voice_set_label(voice_type: str) -> str:
     return f"알 수 없는 세트({normalized or '미확인'})"
 
 
+def _is_latest_voice_set(
+    voice_type: str,
+    missing_voice_labels: list[str] | None = None,
+) -> bool:
+    # 최신 세트는 구형 플래그가 없고 현재 필요한 차단 음성이 모두 있는 상태로 본다.
+    normalized = str(voice_type or "").strip().lower()
+    spec = _VOICE_SET_SPECS.get(normalized)
+    return bool(spec) and not bool(spec.get("legacy")) and not bool(missing_voice_labels)
+
+
 def _voice_file_supported(
     audio_files: dict[str, bool] | None,
     voice_type: str,
@@ -1301,6 +1316,19 @@ def _voice_file_supported(
     if normalized_name == "expired_barcode":
         return bool(spec.get("freeBarcodeVoice"))
     return False
+
+
+def _missing_voice_labels(audio_files: dict[str, bool] | None, voice_type: str) -> list[str]:
+    # 현재 세트 기준으로 실제 출력되지 않을 차단 음성만 추려 렌더링에서 짧게 보여준다.
+    return [
+        label
+        for file_key, label in _VOICE_SUPPORT_CHECKS
+        if not _voice_file_supported(audio_files, voice_type, file_key)
+    ]
+
+
+def _format_missing_voice_text(labels: list[str]) -> str:
+    return ", ".join(f"`{label}`" for label in labels)
 
 
 def _format_voice_support_areas(audio_files: dict[str, bool] | None = None) -> str:
@@ -1665,8 +1693,13 @@ def _summarize_voice_set_probe(voice_config: dict[str, Any]) -> dict[str, Any]:
             "voiceSetLabel": "미확인",
             "locale": "",
             "silentStart": None,
+            "reason": reason,
             "invalidBarcodeVoiceSupported": None,
             "freeBarcodeVoiceSupported": None,
+            "isLatestVoiceSet": None,
+            "missingVoiceLabels": [],
+            "missingVoiceText": "",
+            "showMissingVoiceDetail": False,
             "supportAreasText": _format_voice_support_areas(),
         }
 
@@ -1676,7 +1709,9 @@ def _summarize_voice_set_probe(voice_config: dict[str, Any]) -> dict[str, Any]:
     silent_start = voice_config.get("silentStart")
     invalid_supported = _voice_file_supported(audio_files, voice_type, "invalid_barcode")
     free_supported = _voice_file_supported(audio_files, voice_type, "expired_barcode")
-    status = "pass" if free_supported else "warning"
+    missing_labels = _missing_voice_labels(audio_files, voice_type)
+    is_latest = _is_latest_voice_set(voice_type, missing_labels)
+    status = "pass" if not missing_labels else "warning"
     label = "정상" if status == "pass" else "확인 필요"
     voice_label = _voice_set_label(voice_type)
     silent_text = "켜짐" if silent_start is True else "꺼짐" if silent_start is False else "미확인"
@@ -1690,9 +1725,9 @@ def _summarize_voice_set_probe(voice_config: dict[str, Any]) -> dict[str, Any]:
         f"FREE/핑크 차단 음성 `{free_text}`",
     ]
     summary = (
-        "현재 음성 세트는 FREE/핑크 바코드 차단 음성을 낼 수 있어"
-        if free_supported
-        else "현재 음성 세트는 FREE/핑크 바코드 차단 음성이 빠져 있어"
+        "현재 음성 세트는 필요한 차단 음성을 낼 수 있어"
+        if not missing_labels
+        else "현재 음성 세트에서 일부 차단 음성이 빠져 있어"
     )
     return {
         "status": status,
@@ -1704,8 +1739,13 @@ def _summarize_voice_set_probe(voice_config: dict[str, Any]) -> dict[str, Any]:
         "voiceSetLabel": voice_label,
         "locale": locale,
         "silentStart": silent_start,
+        "reason": "ok",
         "invalidBarcodeVoiceSupported": invalid_supported,
         "freeBarcodeVoiceSupported": free_supported,
+        "isLatestVoiceSet": is_latest,
+        "missingVoiceLabels": missing_labels,
+        "missingVoiceText": _format_missing_voice_text(missing_labels),
+        "showMissingVoiceDetail": bool(missing_labels) and not is_latest,
         "supportAreasText": _format_voice_support_areas(audio_files),
     }
 
@@ -2638,7 +2678,6 @@ def _render_device_status_overview_result(
         lines.append(f"• 초음파 영상 다운로드 가능 상태: {_format_probe_download_availability_display(False)}")
         lines.append("• 소리 출력 경로: *점검 불가*")
         lines.append("• 음성 세트: *점검 불가*")
-        lines.append(f"• 음성 세트별 지원: {_format_voice_support_areas()}")
         lines.append("• pm2 앱: *점검 불가*")
         lines.append("• 디스크 용량: *점검 불가*")
         lines.append("• TrashCan 용량: *점검 불가*")
@@ -2688,10 +2727,9 @@ def _render_device_status_overview_result(
     voice_type = _display_value(voice_payload.get("voiceType"), default="")
     voice_locale = _display_value(voice_payload.get("locale"), default="")
     voice_free_supported = voice_payload.get("freeBarcodeVoiceSupported")
-    voice_support_text = _display_value(
-        voice_payload.get("supportAreasText"),
-        default=_format_voice_support_areas(),
-    )
+    voice_reason = _display_value(voice_payload.get("reason"), default="")
+    missing_voice_text = _display_value(voice_payload.get("missingVoiceText"), default="")
+    show_missing_voice_detail = bool(voice_payload.get("showMissingVoiceDetail")) and bool(missing_voice_text)
     voice_parts: list[str] = []
     if voice_type:
         voice_parts.append(f"값 `{voice_type}`")
@@ -2701,6 +2739,8 @@ def _render_device_status_overview_result(
         voice_parts.append("FREE/핑크 차단 음성 `지원`")
     elif voice_free_supported is False:
         voice_parts.append("FREE/핑크 차단 음성 `미지원`")
+    if voice_label == "미확인" and voice_reason and voice_reason != "ok":
+        voice_parts.append(f"확인 실패 `{_truncate_text(voice_reason, 80)}`")
 
     pm2_payload = pm2_summary or {}
     pm2_label = _display_value(pm2_payload.get("label"), default="확인 필요")
@@ -2734,7 +2774,8 @@ def _render_device_status_overview_result(
     if voice_parts:
         voice_line = f"{voice_line} | {' / '.join(voice_parts)}"
     lines.append(voice_line)
-    lines.append(f"• 음성 세트별 지원: {voice_support_text}")
+    if show_missing_voice_detail:
+        lines.append(f"• 미출력 음성: {missing_voice_text}")
 
     lines.append("")
     lines.append("*런타임*")

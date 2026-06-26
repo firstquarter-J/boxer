@@ -330,8 +330,34 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertEqual(summary["voiceSetLabel"], "구형 1번(ln)")
         self.assertFalse(summary["freeBarcodeVoiceSupported"])
         self.assertTrue(summary["invalidBarcodeVoiceSupported"])
-        self.assertIn("FREE/핑크 바코드 차단 음성이 빠져", summary["summary"])
+        self.assertFalse(summary["isLatestVoiceSet"])
+        self.assertEqual(summary["missingVoiceLabels"], ["FREE/핑크 차단"])
+        self.assertEqual(summary["missingVoiceText"], "`FREE/핑크 차단`")
+        self.assertTrue(summary["showMissingVoiceDetail"])
+        self.assertIn("일부 차단 음성이 빠져", summary["summary"])
         self.assertIn("`ln` 구형 기본 안내, 유효성/만료 차단, FREE/핑크 차단 음성 없음", summary["supportAreasText"])
+
+    def test_summarizes_latest_voice_set_without_missing_voice_detail(self) -> None:
+        # 최신 계열 세트가 필요한 차단 음성을 모두 갖추면 별도 누락 안내를 숨긴다.
+        summary = _summarize_voice_set_probe(
+            _parse_voice_config(
+                "\n".join(
+                    [
+                        "VOICE_TYPE=n",
+                        "LOCALE=ko_KR",
+                        "SILENT_START=false",
+                        "AUDIO_FILE=n_expired_barcode.wav:1",
+                        "AUDIO_FILE=n_invalid_barcode.wav:1",
+                    ]
+                )
+            )
+        )
+
+        self.assertEqual(summary["status"], "pass")
+        self.assertTrue(summary["isLatestVoiceSet"])
+        self.assertEqual(summary["missingVoiceLabels"], [])
+        self.assertEqual(summary["missingVoiceText"], "")
+        self.assertFalse(summary["showMissingVoiceDetail"])
 
     def test_overview_render_mentions_each_component(self) -> None:
         rendered = _render_device_status_overview_result(
@@ -365,6 +391,9 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "voiceSetLabel": "구형 1번(ln)",
                 "locale": "ko_KR",
                 "freeBarcodeVoiceSupported": False,
+                "reason": "ok",
+                "missingVoiceText": "`FREE/핑크 차단`",
+                "showMissingVoiceDetail": True,
                 "supportAreasText": "`n` 기본 안내, 유효성/만료 차단, FREE/핑크 차단 / `ln` 구형 기본 안내, 유효성/만료 차단, FREE/핑크 차단 음성 없음",
             },
             pm2_summary={
@@ -401,7 +430,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*오디오*", rendered)
         self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
         self.assertIn("• 음성 세트: *구형 1번(ln)* | 값 `ln` / locale `ko_KR` / FREE/핑크 차단 음성 `미지원`", rendered)
-        self.assertIn("• 음성 세트별 지원: `n` 기본 안내, 유효성/만료 차단, FREE/핑크 차단", rendered)
+        self.assertIn("• 미출력 음성: `FREE/핑크 차단`", rendered)
+        self.assertNotIn("• 음성 세트별 지원:", rendered)
         self.assertIn("*런타임*", rendered)
         self.assertIn("• ping 전송 여부: 🔵 *성공* | 장비로 ping 전송 완료", rendered)
         self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
@@ -445,7 +475,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• SSH 연결 상태: 🔴 *연결 불가*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔴 *불가*", rendered)
         self.assertIn("• 음성 세트: *점검 불가*", rendered)
-        self.assertIn("• 음성 세트별 지원: `n` 기본 안내, 유효성/만료 차단, FREE/핑크 차단", rendered)
+        self.assertNotIn("• 음성 세트별 지원:", rendered)
         self.assertIn("• 디스크 용량: *점검 불가*", rendered)
         self.assertIn("• TrashCan 용량: *점검 불가*", rendered)
         self.assertIn("• 산모수첩 캡처 사용(캡처 기능): ⚪ *꺼짐*", rendered)
