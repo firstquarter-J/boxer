@@ -461,6 +461,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "roomName": "2진료실",
                 "useDiaryCapture": True,
                 "checkInvalidBarcode": False,
+                "checkExpiredBarcode": 1,
+                "checkPinkBarcode": 0,
             },
             ping_result={
                 "status": True,
@@ -534,7 +536,13 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• TrashCan 용량: *정상* | 경로 `AppData/TrashCan` / 폴더 `2.8 GB` (`0.6%`) / 파일 `167개` / 30일 초과 `0개`", rendered)
         self.assertIn("*설정*", rendered)
         self.assertIn("• 산모수첩 캡처 사용(캡처 기능): 🔵 *켜짐*", rendered)
-        self.assertIn("• 바코드 유효성 검사: ⚪ *꺼짐*", rendered)
+        self.assertIn("• 기존 바코드 유효성 검사: ⚪ *꺼짐*", rendered)
+        self.assertIn(
+            "• 바코드 차단 정책(2.11.307+): `1년 지난 바코드 차단`/`핑크바코드 차단`이 분리 설정된 항목은 기존 값을 대신하고, `-1`은 기존 바코드 유효성 검사를 적용해",
+            rendered,
+        )
+        self.assertIn("• 1년 지난 바코드 차단: 🔵 *켜짐* | 분리 설정", rendered)
+        self.assertIn("• 핑크바코드 차단: ⚪ *꺼짐* | 분리 설정", rendered)
         self.assertIn("*하드웨어*", rendered)
         self.assertIn("• 캡처보드: *정상* | MDA 타입 `YUH01` / USB `YUH01` / /dev/video `1개`", rendered)
         self.assertIn("• LED: *정상* | LED USB 감지 / 시리얼 경로 `1개`", rendered)
@@ -550,6 +558,8 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "isConnected": False,
                 "useDiaryCapture": False,
                 "checkInvalidBarcode": True,
+                "checkExpiredBarcode": -1,
+                "checkPinkBarcode": None,
             },
             ping_result={
                 "status": False,
@@ -572,7 +582,9 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("• 디스크 용량: *점검 불가*", rendered)
         self.assertIn("• TrashCan 용량: *점검 불가*", rendered)
         self.assertIn("• 산모수첩 캡처 사용(캡처 기능): ⚪ *꺼짐*", rendered)
-        self.assertIn("• 바코드 유효성 검사: 🔵 *켜짐*", rendered)
+        self.assertIn("• 기존 바코드 유효성 검사: 🔵 *켜짐*", rendered)
+        self.assertIn("• 1년 지난 바코드 차단: ⚪ *기존 바코드 유효성 검사 적용* | 분리 미설정", rendered)
+        self.assertIn("• 핑크바코드 차단: ⚪ *미확인*", rendered)
         self.assertIn("• 판단: 박서가 직접 ping도 못 보냈어. 장비 자체가 MDA 기준 offline이라 병원 네트워크나 장비 연결 문제를 먼저 봐야 해", rendered)
         self.assertIn("• 조치: 장비 전원, 병원 네트워크, 앱 연결 상태를 먼저 확인한 뒤 다시 점검해", rendered)
 

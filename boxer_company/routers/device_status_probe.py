@@ -2454,11 +2454,34 @@ def _format_probe_config_enabled_display(value: Any) -> str:
     return "⚪ *미확인*"
 
 
+def _coerce_split_barcode_check_value(value: Any) -> int | None:
+    # 2.11.307+ 분리 바코드 차단 설정은 -1/0/1 3-state 값으로 내려온다.
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized in {-1, 0, 1} else None
+
+
+def _format_split_barcode_check_display(value: Any) -> str:
+    normalized = _coerce_split_barcode_check_value(value)
+    if normalized == 1:
+        return "🔵 *켜짐* | 분리 설정"
+    if normalized == 0:
+        return "⚪ *꺼짐* | 분리 설정"
+    if normalized == -1:
+        return "⚪ *기존 바코드 유효성 검사 적용* | 분리 미설정"
+    return "⚪ *미확인*"
+
+
 def _build_device_config_lines(device_info: dict[str, Any]) -> list[str]:
     return [
         "*설정*",
         f"• 산모수첩 캡처 사용(캡처 기능): {_format_probe_config_enabled_display(device_info.get('useDiaryCapture'))}",
-        f"• 바코드 유효성 검사: {_format_probe_config_enabled_display(device_info.get('checkInvalidBarcode'))}",
+        f"• 기존 바코드 유효성 검사: {_format_probe_config_enabled_display(device_info.get('checkInvalidBarcode'))}",
+        "• 바코드 차단 정책(2.11.307+): `1년 지난 바코드 차단`/`핑크바코드 차단`이 분리 설정된 항목은 기존 값을 대신하고, `-1`은 기존 바코드 유효성 검사를 적용해",
+        f"• 1년 지난 바코드 차단: {_format_split_barcode_check_display(device_info.get('checkExpiredBarcode'))}",
+        f"• 핑크바코드 차단: {_format_split_barcode_check_display(device_info.get('checkPinkBarcode'))}",
     ]
 
 
@@ -3072,6 +3095,8 @@ def _build_runtime_probe_payload(
             "version": _display_value(device_info.get("version"), default=""),
             "useDiaryCapture": device_info.get("useDiaryCapture"),
             "checkInvalidBarcode": device_info.get("checkInvalidBarcode"),
+            "checkExpiredBarcode": device_info.get("checkExpiredBarcode"),
+            "checkPinkBarcode": device_info.get("checkPinkBarcode"),
             "captureBoardType": _display_value(device_info.get("captureBoardType"), default=""),
             "hospitalName": _display_value(device_info.get("hospitalName"), default=""),
             "roomName": _display_value(device_info.get("roomName"), default=""),

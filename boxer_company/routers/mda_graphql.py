@@ -95,6 +95,8 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
       version
       cfg1_use_diary_capture
       cfg1_check_invalid_barcode
+      cfg1_check_expired_barcode
+      cfg1_check_pink_barcode
       deviceState {
         captureBoardType
         isConnected
@@ -341,6 +343,19 @@ def _normalize_optional_mda_boolean(value: Any) -> bool | None:
     return _normalize_mda_boolean(value)
 
 
+def _normalize_optional_mda_int(value: Any) -> int | None:
+    # MDA의 신규 장비 설정은 bool이 아니라 -1/0/1 숫자 상태를 유지해야 한다.
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"", "null", "none"}:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _extract_device_row(data: dict[str, Any], device_name: str) -> dict[str, Any] | None:
     paginated = data.get("paginatedDevices")
     if not isinstance(paginated, dict):
@@ -379,6 +394,8 @@ def _normalize_mda_device_detail(row: dict[str, Any], *, device_name: str) -> di
         "version": version,
         "useDiaryCapture": _normalize_optional_mda_boolean(row.get("cfg1_use_diary_capture")),
         "checkInvalidBarcode": _normalize_optional_mda_boolean(row.get("cfg1_check_invalid_barcode")),
+        "checkExpiredBarcode": _normalize_optional_mda_int(row.get("cfg1_check_expired_barcode")),
+        "checkPinkBarcode": _normalize_optional_mda_int(row.get("cfg1_check_pink_barcode")),
         "captureBoardType": _normalize_mda_state_text(device_state.get("captureBoardType")),
         "hospitalName": _display_value(hospital.get("hospitalName"), default="미확인"),
         "roomName": _display_value(hospital_room.get("roomName"), default="미확인"),

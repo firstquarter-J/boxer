@@ -54,6 +54,8 @@ class MdaDeviceDetailNormalizationTests(unittest.TestCase):
                 "version": "2.11.300",
                 "cfg1_use_diary_capture": 1,
                 "cfg1_check_invalid_barcode": 0,
+                "cfg1_check_expired_barcode": "1",
+                "cfg1_check_pink_barcode": -1,
                 "deviceState": {},
                 "hospital": {},
                 "hospitalRoom": {},
@@ -64,6 +66,8 @@ class MdaDeviceDetailNormalizationTests(unittest.TestCase):
 
         self.assertTrue(result["useDiaryCapture"])
         self.assertFalse(result["checkInvalidBarcode"])
+        self.assertEqual(result["checkExpiredBarcode"], 1)
+        self.assertEqual(result["checkPinkBarcode"], -1)
 
 
 class MdaStoppedRecordingRestoreTests(unittest.TestCase):
