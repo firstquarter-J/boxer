@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -44,7 +45,8 @@ _PM2_JLIST_OUTPUT = """[
     "pm2_env": {
       "status": "online",
       "restart_time": 1,
-      "version": "2.11.300"
+      "version": "2.11.300",
+      "max_memory_restart": 4294967296
     },
     "monit": {
       "cpu": 0,
@@ -76,6 +78,35 @@ _DF_ROOT_OUTPUT = """Filesystem     1024-blocks      Used Available Capacity Mou
 """
 
 _DU_TRASHCAN_OUTPUT = "2981888\t/home/mommytalk/AppData/TrashCan\n"
+
+
+def _pm2_memory_jlist(
+    max_memory_restart: int | str | None,
+    env_max_memory_restart: int | str | None = None,
+) -> str:
+    pm2_env: dict[str, object] = {
+        "status": "online",
+        "restart_time": 1,
+        "version": "2.11.300",
+    }
+    if max_memory_restart is not None:
+        pm2_env["max_memory_restart"] = max_memory_restart
+    if env_max_memory_restart is not None:
+        pm2_env["env"] = {
+            "max_memory_restart": env_max_memory_restart,
+        }
+    return json.dumps(
+        [
+            {
+                "name": "mommybox-v2",
+                "pm2_env": pm2_env,
+                "monit": {
+                    "cpu": 0,
+                    "memory": 12345678,
+                },
+            }
+        ]
+    )
 
 
 class DeviceStatusProbeRoutingTests(unittest.TestCase):
@@ -129,6 +160,10 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertEqual(parsed["processes"][0]["name"], "mommybox-v2")
         self.assertEqual(parsed["processes"][0]["status"], "online")
         self.assertEqual(parsed["processes"][0]["version"], "2.11.300")
+        self.assertEqual(parsed["processes"][0]["memory"], 12345678)
+        self.assertEqual(parsed["processes"][0]["memoryRestartLimitBytes"], 4294967296)
+        self.assertIsNone(parsed["processes"][0]["envMemoryRestartLimitBytes"])
+        self.assertFalse(parsed["processes"][0]["hasStaleMemoryRestartEnv"])
         self.assertEqual(parsed["processes"][1]["name"], "mommybox-v2-agent")
         self.assertEqual(parsed["processes"][1]["version"], "1.2.0")
 
@@ -139,6 +174,53 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("정상 실행", summary["summary"])
         self.assertIn("2.11.300", summary["evidence"])
         self.assertIn("1.2.0", summary["evidence"])
+        self.assertIn(
+            "mommybox-v2 v2.11.300 online (메모리 사용 `11.8 MB` / 제한 `4.0 GB`)",
+            summary["overviewDetail"],
+        )
+
+    def test_summarizes_pm2_memory_as_warning_when_stale_env_override_exists(self) -> None:
+        payload = json.dumps(
+            [
+                {
+                    "name": "mommybox-v2",
+                    "pm2_env": {
+                        "status": "online",
+                        "restart_time": 1,
+                        "version": "2.11.300",
+                        "max_memory_restart": 4294967296,
+                        "env": {
+                            "max_memory_restart": 209715200,
+                        },
+                    },
+                    "monit": {
+                        "cpu": 0,
+                        "memory": 12345678,
+                    },
+                },
+                {
+                    "name": "mommybox-v2-agent",
+                    "pm2_env": {
+                        "status": "online",
+                        "restart_time": 0,
+                        "versioning": {
+                            "version": "2.0.0",
+                        },
+                    },
+                    "monit": {
+                        "cpu": 1,
+                        "memory": 2345678,
+                    },
+                },
+            ]
+        )
+
+        summary = _summarize_pm2_probe(_parse_pm2_processes(payload))
+
+        self.assertEqual(summary["status"], "warning")
+        self.assertIn("예전 메모리 제한", summary["summary"])
+        self.assertIn("env 제한 `200.0 MB`", summary["overviewDetail"])
+        self.assertIn("top-level `4.0 GB`", summary["overviewDetail"])
 
     def test_summarizes_pm2_as_warning_when_agent_app_is_missing(self) -> None:
         summary = _summarize_pm2_probe(
@@ -166,6 +248,17 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertEqual(parsed["values"], [4294967296])
         self.assertTrue(parsed["hasExpectedLimit"])
         self.assertIn("4.0 GB", parsed["display"])
+
+    def test_parses_pm2_memory_restart_stale_env_override_from_jlist(self) -> None:
+        parsed = _parse_pm2_memory_restart_values(_pm2_memory_jlist(4294967296, 209715200))
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["values"], [4294967296, 209715200])
+        self.assertFalse(parsed["hasExpectedLimit"])
+        self.assertTrue(parsed["hasStaleEnvOverride"])
+        self.assertEqual(parsed["topLevelValue"], 4294967296)
+        self.assertEqual(parsed["envValue"], 209715200)
+        self.assertIn("pm2_env.env.max_memory_restart=209715200 (200.0 MB)", parsed["display"])
 
     def test_parses_root_disk_usage(self) -> None:
         parsed = _parse_disk_usage(_DF_ROOT_OUTPUT)
@@ -706,7 +799,7 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
             [
                 {
                     "exit_status": 0,
-                    "stdout": "max_memory_restart: 209715200",
+                    "stdout": _pm2_memory_jlist(209715200),
                     "stderr": "",
                 },
                 {
@@ -716,7 +809,7 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
                 },
                 {
                     "exit_status": 0,
-                    "stdout": "max_memory_restart: 4294967296",
+                    "stdout": _pm2_memory_jlist(4294967296),
                     "stderr": "",
                 },
             ]
@@ -753,21 +846,80 @@ class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
 
         self.assertIn("*장비 메모리 패치*", result_text)
         self.assertIn("• 판정: *완료*", result_text)
-        self.assertIn("• 사전 확인: `max_memory_restart=209715200 (200.0 MB)`", result_text)
-        self.assertIn("• 실행 후 확인: `max_memory_restart=4294967296 (4.0 GB)`", result_text)
-        self.assertEqual(evidence["precheck"]["display"], "209715200 (200.0 MB)")
+        self.assertIn("• 사전 확인: `pm2_env.max_memory_restart=209715200 (200.0 MB)`", result_text)
+        self.assertIn("• 실행 후 확인: `pm2_env.max_memory_restart=4294967296 (4.0 GB)`", result_text)
+        self.assertEqual(evidence["precheck"]["display"], "pm2_env.max_memory_restart=209715200 (200.0 MB)")
         self.assertEqual(evidence["execution"]["summary"], "메모리 패치 실행")
         self.assertTrue(evidence["verification"]["hasExpectedLimit"])
         self.assertEqual(len(client.commands), 3)
-        self.assertIn("pm2 prettylist | grep max_memory_restart", client.commands[0])
+        self.assertIn("pm2 jlist", client.commands[0])
+        self.assertIn("delete app[key].max_memory_restart", client.commands[1])
+        self.assertIn("--only mommybox-v2", client.commands[1])
         self.assertTrue(client.closed)
+
+    def test_patches_device_memory_when_stale_pm2_env_override_exists(self) -> None:
+        client = _FakeSshClient(
+            [
+                {
+                    "exit_status": 0,
+                    "stdout": _pm2_memory_jlist(4294967296, 209715200),
+                    "stderr": "",
+                },
+                {
+                    "exit_status": 0,
+                    "stdout": "deleted\nstarted\nsaved",
+                    "stderr": "",
+                },
+                {
+                    "exit_status": 0,
+                    "stdout": _pm2_memory_jlist(4294967296),
+                    "stderr": "",
+                },
+            ]
+        )
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                return_value={
+                    "ready": True,
+                    "pollCount": 0,
+                    "reusedExisting": True,
+                    "device": {
+                        "deviceName": "MB2-C00419",
+                        "version": "2.11.300",
+                        "hospitalName": "아이사랑산부인과의원(부산)",
+                        "roomName": "2진료실",
+                        "agentSsh": {
+                            "host": "127.0.0.1",
+                            "port": 22,
+                        },
+                    },
+                },
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                return_value={
+                    "ok": True,
+                    "client": client,
+                },
+            ),
+        ):
+            result_text, evidence = _patch_device_pm2_memory("MB2-C00419")
+
+        self.assertIn("• 판정: *완료*", result_text)
+        self.assertTrue(evidence["precheck"]["hasStaleEnvOverride"])
+        self.assertFalse(evidence["verification"]["hasStaleEnvOverride"])
+        self.assertTrue(evidence["verification"]["hasExpectedLimit"])
+        self.assertIn("pm2_env.env.max_memory_restart=209715200 (200.0 MB)", result_text)
+        self.assertIn("delete app[key].max_memory_restart", client.commands[1])
 
     def test_skips_memory_patch_when_precheck_is_already_4gb(self) -> None:
         client = _FakeSshClient(
             [
                 {
                     "exit_status": 0,
-                    "stdout": "max_memory_restart: 4294967296",
+                    "stdout": _pm2_memory_jlist(4294967296),
                     "stderr": "",
                 },
             ]

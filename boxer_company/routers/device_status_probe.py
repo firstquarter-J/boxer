@@ -248,16 +248,53 @@ _PM2_TRANSITION_STATUSES = {"launching", "waiting restart", "stopping"}
 _LOGIN_SHELL_USER_PATH_EXPORT = 'export PATH="$HOME/.npm-global/bin:$HOME/bin:/usr/local/bin:$PATH"; '
 _MEMORY_PATCH_EXPECTED_BYTES = 4 * 1024 * 1024 * 1024
 _MEMORY_PATCH_VALUE_PATTERN = re.compile(r"\b(\d{6,})\b")
+_MEMORY_PATCH_UNIT_VALUE_PATTERN = re.compile(r"\b(\d+(?:\.\d+)?)\s*([kmgt]i?b?|bytes?)\b", re.IGNORECASE)
+# 기존 PM2 env의 max_memory_restart가 top-level 4GB 설정을 덮어쓰는 케이스를 피하려고,
+# 임시 ecosystem에서 env 키를 제거한 뒤 mommybox-v2만 재등록한다.
 _MEMORY_PATCH_EXECUTION_COMMAND = (
     "bash -lc '"
     f"{_LOGIN_SHELL_USER_PATH_EXPORT}"
-    "cd mommybox-v2 && (pm2 delete mommybox-v2 || true) && pm2 start --env production && pm2 save'"
+    "set -e; "
+    "cd mommybox-v2; "
+    "tmp=\".boxer-memory-patch.ecosystem.$$.config.js\"; "
+    "cleanup() { rm -f \"$tmp\"; }; "
+    "trap cleanup EXIT; "
+    "node -e \""
+    "const fs=require(\\\"fs\\\");"
+    "const path=require(\\\"path\\\");"
+    "const src=fs.existsSync(\\\"ecosystem.config.js\\\")?path.resolve(\\\"ecosystem.config.js\\\"):\\\"\\\";"
+    "if(!src){process.stderr.write(\\\"ecosystem_config_missing\\\\n\\\");process.exit(10);}"
+    "const config=require(src);"
+    "const apps=Array.isArray(config)?config:(Array.isArray(config.apps)?config.apps:[config]);"
+    "let touched=false;"
+    "for(const app of apps){"
+    "if(!app||typeof app!==\\\"object\\\")continue;"
+    "if(String(app.name||\\\"\\\")!==\\\"mommybox-v2\\\")continue;"
+    "app.max_memory_restart=\\\"4G\\\";"
+    "for(const key of [\\\"env\\\",\\\"env_production\\\",\\\"env_development\\\"]){"
+    "if(app[key]&&typeof app[key]===\\\"object\\\"){"
+    "delete app[key].max_memory_restart;"
+    "delete app[key].MAX_MEMORY_RESTART;"
+    "}"
+    "}"
+    "touched=true;"
+    "}"
+    "if(!touched){process.stderr.write(\\\"mommybox_v2_app_missing\\\\n\\\");process.exit(11);}"
+    "fs.writeFileSync(process.argv[1],\\\"module.exports = \\\"+JSON.stringify(config,null,2)+\\\"\\\\n\\\");"
+    "\" \"$tmp\"; "
+    "if [ -f \"$HOME/.pm2/dump.pm2\" ]; then "
+    "cp \"$HOME/.pm2/dump.pm2\" \"$HOME/.pm2/dump.pm2.boxer-memory-patch-$(date +%Y%m%d%H%M%S)\"; "
+    "fi; "
+    "(pm2 delete mommybox-v2 || true); "
+    "unset max_memory_restart MAX_MEMORY_RESTART; "
+    "pm2 start \"$tmp\" --only mommybox-v2 --env production; "
+    "pm2 save --force'"
 )
 _MEMORY_PATCH_VERIFY_COMMAND = (
     "bash -lc '"
     f"{_LOGIN_SHELL_USER_PATH_EXPORT}"
     "if command -v pm2 >/dev/null 2>&1; then "
-    "pm2 prettylist | grep max_memory_restart || true; "
+    "pm2 jlist 2>&1; "
     "else echo pm2_missing; fi'"
 )
 
@@ -1128,6 +1165,22 @@ def _build_trashcan_storage_usage(
     }
 
 
+def _load_pm2_jlist_payload(text: str) -> list[dict[str, Any]] | None:
+    normalized = str(text or "").strip()
+    start = normalized.find("[")
+    end = normalized.rfind("]")
+    if start < 0 or end < start:
+        return None
+
+    try:
+        payload = json.loads(normalized[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [item for item in payload if isinstance(item, dict)]
+
+
 def _parse_pm2_processes(text: str) -> dict[str, Any]:
     normalized = str(text or "").strip()
     if normalized == "pm2_missing":
@@ -1137,18 +1190,8 @@ def _parse_pm2_processes(text: str) -> dict[str, Any]:
             "processes": [],
         }
 
-    start = normalized.find("[")
-    end = normalized.rfind("]")
-    if start < 0 or end < start:
-        return {
-            "available": True,
-            "reason": "json_parse_failed",
-            "processes": [],
-        }
-
-    try:
-        payload = json.loads(normalized[start : end + 1])
-    except json.JSONDecodeError:
+    payload = _load_pm2_jlist_payload(normalized)
+    if payload is None:
         return {
             "available": True,
             "reason": "json_parse_failed",
@@ -1156,42 +1199,162 @@ def _parse_pm2_processes(text: str) -> dict[str, Any]:
         }
 
     processes: list[dict[str, Any]] = []
-    if isinstance(payload, list):
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            env = item.get("pm2_env") if isinstance(item.get("pm2_env"), dict) else {}
-            monit = item.get("monit") if isinstance(item.get("monit"), dict) else {}
-            processes.append(
-                {
-                    "name": _display_value(item.get("name"), default=""),
-                    "status": _display_value(env.get("status"), default=""),
-                    "version": (
-                        _display_value(env.get("version"), default="")
-                        or _display_value(
-                            (env.get("versioning") or {}).get("version")
-                            if isinstance(env.get("versioning"), dict)
-                            else "",
-                            default="",
-                        )
-                        or _display_value(
-                            (env.get("versioning") or {}).get("revision")
-                            if isinstance(env.get("versioning"), dict)
-                            else "",
-                            default="",
-                        )
-                    ),
-                    "restartCount": int(env.get("restart_time") or 0),
-                    "cpu": monit.get("cpu"),
-                    "memory": monit.get("memory"),
-                }
-            )
+    for item in payload:
+        env = item.get("pm2_env") if isinstance(item.get("pm2_env"), dict) else {}
+        nested_env = env.get("env") if isinstance(env.get("env"), dict) else {}
+        monit = item.get("monit") if isinstance(item.get("monit"), dict) else {}
+        memory_restart_limit = _coerce_pm2_memory_restart_bytes(env.get("max_memory_restart"))
+        env_memory_restart_limit = _coerce_pm2_memory_restart_bytes(nested_env.get("max_memory_restart"))
+        processes.append(
+            {
+                "name": _display_value(item.get("name"), default=""),
+                "status": _display_value(env.get("status"), default=""),
+                "version": (
+                    _display_value(env.get("version"), default="")
+                    or _display_value(
+                        (env.get("versioning") or {}).get("version")
+                        if isinstance(env.get("versioning"), dict)
+                        else "",
+                        default="",
+                    )
+                    or _display_value(
+                        (env.get("versioning") or {}).get("revision")
+                        if isinstance(env.get("versioning"), dict)
+                        else "",
+                        default="",
+                    )
+                ),
+                "restartCount": int(env.get("restart_time") or 0),
+                "cpu": monit.get("cpu"),
+                "memory": monit.get("memory"),
+                "memoryRestartLimitBytes": memory_restart_limit,
+                "envMemoryRestartLimitBytes": env_memory_restart_limit,
+                "hasStaleMemoryRestartEnv": (
+                    env_memory_restart_limit is not None
+                    and env_memory_restart_limit < _MEMORY_PATCH_EXPECTED_BYTES
+                ),
+            }
+        )
 
     return {
         "available": True,
         "reason": "ok",
         "processes": processes,
     }
+
+
+def _coerce_pm2_memory_restart_bytes(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).strip().strip("\"'")
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]i?b?|bytes?)", text, re.IGNORECASE)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = 1
+    if unit.startswith("k"):
+        multiplier = 1024
+    elif unit.startswith("m"):
+        multiplier = 1024 ** 2
+    elif unit.startswith("g"):
+        multiplier = 1024 ** 3
+    elif unit.startswith("t"):
+        multiplier = 1024 ** 4
+    return int(number * multiplier)
+
+
+def _format_memory_restart_value(value: int | None) -> str:
+    if value is None:
+        return ""
+    return f"{value} ({_format_size(value)})"
+
+
+def _append_unique_memory_restart_value(values: list[int], value: int | None) -> None:
+    if value is not None and value not in values:
+        values.append(value)
+
+
+def _build_pm2_memory_restart_payload(
+    *,
+    values: list[int],
+    display_parts: list[str],
+    reason: str = "ok",
+    top_level_value: int | None = None,
+    env_value: int | None = None,
+) -> dict[str, Any]:
+    has_stale_env = env_value is not None and env_value < _MEMORY_PATCH_EXPECTED_BYTES
+    has_expected_limit = bool(values) and all(value >= _MEMORY_PATCH_EXPECTED_BYTES for value in values)
+    if has_stale_env:
+        reason = "stale_env_max_memory_restart"
+        has_expected_limit = False
+
+    return {
+        "available": True,
+        "reason": reason if values else "value_missing",
+        "values": values,
+        "display": ", ".join(display_parts),
+        "hasExpectedLimit": has_expected_limit,
+        "hasStaleEnvOverride": has_stale_env,
+        "topLevelValue": top_level_value,
+        "envValue": env_value,
+    }
+
+
+def _parse_pm2_memory_restart_from_jlist(text: str) -> dict[str, Any] | None:
+    payload = _load_pm2_jlist_payload(text)
+    if payload is None:
+        return None
+
+    target: dict[str, Any] | None = None
+    for item in payload:
+        item_name = _display_value(item.get("name"), default="")
+        env = item.get("pm2_env") if isinstance(item.get("pm2_env"), dict) else {}
+        env_name = _display_value(env.get("name"), default="")
+        if item_name == "mommybox-v2" or env_name == "mommybox-v2":
+            target = item
+            break
+
+    if target is None:
+        return {
+            "available": True,
+            "reason": "pm2_app_missing",
+            "values": [],
+            "display": "",
+            "hasExpectedLimit": False,
+            "hasStaleEnvOverride": False,
+            "topLevelValue": None,
+            "envValue": None,
+        }
+
+    pm2_env = target.get("pm2_env") if isinstance(target.get("pm2_env"), dict) else {}
+    nested_env = pm2_env.get("env") if isinstance(pm2_env.get("env"), dict) else {}
+    top_level_value = _coerce_pm2_memory_restart_bytes(pm2_env.get("max_memory_restart"))
+    env_value = _coerce_pm2_memory_restart_bytes(nested_env.get("max_memory_restart"))
+
+    values: list[int] = []
+    display_parts: list[str] = []
+    if top_level_value is not None:
+        _append_unique_memory_restart_value(values, top_level_value)
+        display_parts.append(f"pm2_env.max_memory_restart={_format_memory_restart_value(top_level_value)}")
+    if env_value is not None:
+        _append_unique_memory_restart_value(values, env_value)
+        display_parts.append(f"pm2_env.env.max_memory_restart={_format_memory_restart_value(env_value)}")
+
+    return _build_pm2_memory_restart_payload(
+        values=values,
+        display_parts=display_parts,
+        top_level_value=top_level_value,
+        env_value=env_value,
+    )
 
 
 def _parse_pm2_memory_restart_values(text: str) -> dict[str, Any]:
@@ -1205,19 +1368,28 @@ def _parse_pm2_memory_restart_values(text: str) -> dict[str, Any]:
             "hasExpectedLimit": False,
         }
 
-    raw_values = [int(match) for match in _MEMORY_PATCH_VALUE_PATTERN.findall(normalized)]
+    jlist_payload = _parse_pm2_memory_restart_from_jlist(normalized)
+    if jlist_payload is not None:
+        return jlist_payload
+
+    raw_values: list[int] = []
+    for match in _MEMORY_PATCH_VALUE_PATTERN.findall(normalized):
+        raw_values.append(int(match))
+    for match in _MEMORY_PATCH_UNIT_VALUE_PATTERN.finditer(normalized):
+        parsed = _coerce_pm2_memory_restart_bytes("".join(match.groups()))
+        if parsed is not None:
+            raw_values.append(parsed)
+
     values: list[int] = []
     for value in raw_values:
-        if value not in values:
-            values.append(value)
+        _append_unique_memory_restart_value(values, value)
 
-    return {
-        "available": True,
-        "reason": "ok" if values else "value_missing",
-        "values": values,
-        "display": ", ".join(f"{value} ({_format_size(value)})" for value in values),
-        "hasExpectedLimit": bool(values) and all(value >= _MEMORY_PATCH_EXPECTED_BYTES for value in values),
-    }
+    display_parts = [f"max_memory_restart={_format_memory_restart_value(value)}" for value in values]
+
+    return _build_pm2_memory_restart_payload(
+        values=values,
+        display_parts=display_parts,
+    )
 
 
 def _parse_voice_config(text: str) -> dict[str, Any]:
@@ -1378,7 +1550,38 @@ def _format_pm2_target_evidence(canonical_name: str, process: dict[str, Any]) ->
     if version:
         details.append(f"v{version}")
     details.append(f"재시작 {restart_count}회")
+    memory_detail = _format_pm2_target_memory_detail(process, with_backticks=False)
+    if memory_detail:
+        details.append(memory_detail)
     return f"{canonical_name}={actual_name}({' / '.join(details)})"
+
+
+def _format_pm2_target_memory_detail(process: dict[str, Any], *, with_backticks: bool) -> str:
+    def format_value(value: Any) -> str:
+        if value is None:
+            return ""
+        try:
+            formatted = _format_size(int(value))
+        except (TypeError, ValueError):
+            return ""
+        return f"`{formatted}`" if with_backticks else formatted
+
+    # mommybox-v2는 실제 사용량과 재시작 제한값이 운영 판단에 중요해서 상태 라인에 함께 노출한다.
+    parts: list[str] = []
+    memory_usage = process.get("memory")
+    if memory_usage is not None:
+        parts.append(f"사용 {format_value(memory_usage)}")
+
+    top_level_limit = process.get("memoryRestartLimitBytes")
+    env_limit = process.get("envMemoryRestartLimitBytes")
+    effective_limit = env_limit if env_limit is not None else top_level_limit
+    if effective_limit is not None:
+        label = "env 제한" if env_limit is not None else "제한"
+        parts.append(f"{label} {format_value(effective_limit)}")
+    if top_level_limit is not None and env_limit is not None and top_level_limit != env_limit:
+        parts.append(f"top-level {format_value(top_level_limit)}")
+
+    return f"메모리 {' / '.join(parts)}" if parts else ""
 
 
 def _format_pm2_target_overview(canonical_name: str, process: dict[str, Any]) -> str:
@@ -1389,7 +1592,12 @@ def _format_pm2_target_overview(canonical_name: str, process: dict[str, Any]) ->
         parts.append(f"v{version}")
     if status:
         parts.append(status)
-    return " ".join(parts)
+    overview = " ".join(parts)
+    if canonical_name == "mommybox-v2":
+        memory_detail = _format_pm2_target_memory_detail(process, with_backticks=True)
+        if memory_detail:
+            overview = f"{overview} ({memory_detail})"
+    return overview
 
 
 def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
@@ -1469,6 +1677,20 @@ def _summarize_pm2_probe(pm2_processes: dict[str, Any]) -> dict[str, Any]:
         canonical_name: _display_value(item.get("status"), default="").strip().lower()
         for canonical_name, item in selected_targets.items()
     }
+    stale_memory_targets = [
+        canonical_name
+        for canonical_name, item in selected_targets.items()
+        if canonical_name == "mommybox-v2" and bool(item.get("hasStaleMemoryRestartEnv"))
+    ]
+    if stale_memory_targets and all(status == "online" for status in statuses.values()):
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "mommybox-v2 PM2 env에 예전 메모리 제한이 남아 있어",
+            "evidence": " / ".join(evidence_parts),
+            "overviewDetail": overview_detail,
+            "action": "메모리패치로 env.max_memory_restart를 청소해",
+        }
     if all(status == "online" for status in statuses.values()):
         return {
             "status": "pass",
@@ -2526,6 +2748,13 @@ def _summarize_device_memory_patch(
             "summary": _display_device_memory_patch_reason(execution.get("reason")),
             "action": "장비 경로, PM2 상태, 권한을 확인하고 다시 시도해",
         }
+    if verification.get("hasStaleEnvOverride"):
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "명령은 끝났지만 PM2 env에 예전 max_memory_restart가 남아 있어",
+            "action": "임시 ecosystem 생성 결과와 `pm2 jlist`의 env.max_memory_restart 값을 다시 확인해",
+        }
     if verification.get("hasExpectedLimit"):
         return {
             "status": "pass",
@@ -2538,13 +2767,13 @@ def _summarize_device_memory_patch(
             "status": "warning",
             "label": "확인 필요",
             "summary": "명령은 끝났지만 4GB 메모리 설정으로 보이지 않아",
-            "action": "PM2 ecosystem 설정과 prettylist 결과를 다시 확인해",
+            "action": "PM2 ecosystem 설정과 `pm2 jlist` 결과를 다시 확인해",
         }
     return {
         "status": "warning",
         "label": "확인 필요",
         "summary": "명령은 끝났지만 max_memory_restart 값을 확인하지 못했어",
-        "action": "장비에서 `pm2 prettylist | grep max_memory_restart` 결과를 다시 확인해",
+        "action": "장비에서 `pm2 jlist` 결과를 다시 확인해",
     }
 
 
@@ -2581,7 +2810,7 @@ def _render_device_memory_patch_result(
 
     precheck_display = _display_value(precheck_payload.get("display"), default="")
     if precheck_display:
-        lines.append(f"• 사전 확인: `max_memory_restart={precheck_display}`")
+        lines.append(f"• 사전 확인: `{precheck_display}`")
     elif precheck_payload.get("reason") == "pm2_missing":
         lines.append("• 사전 확인: `pm2` 명령을 찾지 못했어")
     elif not precheck_payload.get("ok"):
@@ -2599,7 +2828,7 @@ def _render_device_memory_patch_result(
     if execution_payload:
         verification_display = _display_value(verification_payload.get("display"), default="")
         if verification_display:
-            lines.append(f"• 실행 후 확인: `max_memory_restart={verification_display}`")
+            lines.append(f"• 실행 후 확인: `{verification_display}`")
         elif verification_payload.get("reason") == "pm2_missing":
             lines.append("• 실행 후 확인: `pm2` 명령을 찾지 못해 `max_memory_restart`를 읽지 못했어")
         else:
@@ -2641,7 +2870,7 @@ def _build_memory_patch_check_payload(command_result: dict[str, Any]) -> dict[st
         }
 
     parsed = _parse_pm2_memory_restart_values(output)
-    parsed["output"] = output
+    parsed["output"] = _display_value(parsed.get("display"), default=output)
     parsed["ok"] = True
     parsed["exitStatus"] = command_result.get("exitStatus")
     return parsed
