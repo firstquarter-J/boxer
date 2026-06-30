@@ -287,14 +287,14 @@ def _set_daily_device_round_auto_update_box(
 def _format_daily_device_round_auto_update_target_line(status: dict[str, Any]) -> list[str]:
     label = str(status.get("label") or "대상").strip()
     enabled = bool(status.get("enabled"))
-    env_default = bool(status.get("envDefault"))
     source = str(status.get("source") or "").strip()
     updated_at = str(status.get("updatedAt") or "").strip()
     updated_by = str(status.get("updatedBy") or "").strip()
-    source_label = "Slack 명령" if source == "slack_override" else ".env 기본값"
+    # 운영자가 보는 기준은 최종 적용값 하나여야 해서 .env 기본값은 응답에 섞어 보여주지 않는다.
+    source_label = "저장 설정" if source == "slack_override" else "초기 기본값"
     lines = [
         f"• {label}: *{'켜짐' if enabled else '꺼짐'}* "
-        f"| 기준 `{source_label}` | .env `{'true' if env_default else 'false'}`"
+        f"| 기준 `{source_label}`"
     ]
     if updated_at:
         actor = f" / <@{updated_by}>" if updated_by else ""

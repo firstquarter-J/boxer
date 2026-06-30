@@ -109,6 +109,33 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
         self.assertTrue(status["box"]["envDefault"])
         self.assertEqual(status["box"]["source"], "slack_override")
 
+    def test_auto_update_status_shows_single_effective_source(self) -> None:
+        rendered = reporter._format_daily_device_round_auto_update_status(
+            {
+                "box": {
+                    "label": "마미박스",
+                    "enabled": False,
+                    "envDefault": True,
+                    "source": "slack_override",
+                    "updatedAt": "2026-06-30T15:18:44+09:00",
+                    "updatedBy": "U123",
+                },
+                "agent": {
+                    "label": "에이전트",
+                    "enabled": True,
+                    "envDefault": True,
+                    "source": "env",
+                    "updatedAt": "",
+                    "updatedBy": "",
+                },
+            }
+        )
+
+        self.assertIn("마미박스: *꺼짐* | 기준 `저장 설정`", rendered)
+        self.assertIn("에이전트: *켜짐* | 기준 `초기 기본값`", rendered)
+        self.assertNotIn(".env `true`", rendered)
+        self.assertNotIn(".env `false`", rendered)
+
     def test_sets_auto_update_override_in_state_file(self) -> None:
         local_now = datetime(2026, 4, 8, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
 
