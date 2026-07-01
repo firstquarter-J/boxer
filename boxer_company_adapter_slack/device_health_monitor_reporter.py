@@ -379,7 +379,28 @@ def _build_device_health_monitor_alert_fingerprint(item: dict[str, str]) -> str:
     )
 
 
-def _device_health_monitor_required_confirmation_polls(item: dict[str, str]) -> int:
+def _device_health_monitor_required_confirmation_polls(item: dict[str, Any]) -> int:
+    # USB 장치 계열은 순간 재인식/플래핑이 잦아서 두 번 연속 감지될 때만 신규 알림을 보낸다.
+    issue = _display_value(item.get("issue"), default="")
+    problem_components = (
+        item.get("problemComponents") if isinstance(item.get("problemComponents"), list) else []
+    )
+    component_labels = {
+        _display_value(component, default="")
+        for component in problem_components
+        if _display_value(component, default="")
+    }
+    if {"캡처보드", "LED"} & component_labels:
+        return 2
+
+    lowered_issue = issue.lower()
+    if (
+        "캡처보드" in issue
+        or "비디오 장치" in issue
+        or "led" in lowered_issue
+        or "엘이디" in issue
+    ):
+        return 2
     return 1
 
 

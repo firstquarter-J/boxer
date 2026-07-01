@@ -188,6 +188,30 @@ def _captureboard_led_abnormal_summary() -> dict:
     }
 
 
+_LED_ALERT_FINGERPRINT = (
+    "#69 수지미래산부인과의원(용인)|1진료실|"
+    "MB2-C00043|LED USB 장치를 찾지 못했어"
+)
+_CAPTUREBOARD_ALERT_FINGERPRINT = (
+    "#69 수지미래산부인과의원(용인)|1진료실|"
+    "MB2-C00043|캡처보드 USB나 비디오 장치를 찾지 못했어"
+)
+
+
+def _pending_alert_state(fingerprint: str, seen_at: datetime) -> dict:
+    # 2회 연속 확인이 필요한 장비 이슈를 두 번째 poll에서 발송하는 상태로 만든다.
+    seen_at_text = seen_at.isoformat()
+    return {
+        "pendingAlertFingerprints": {
+            fingerprint: {
+                "firstSeenAt": seen_at_text,
+                "lastSeenAt": seen_at_text,
+                "count": 1,
+            }
+        }
+    }
+
+
 class DeviceHealthMonitorReporterTests(unittest.TestCase):
     def setUp(self) -> None:
         with reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK:
@@ -205,6 +229,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor")
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        pending_state = _pending_alert_state(
+            _LED_ALERT_FINGERPRINT,
+            local_now - timedelta(minutes=1),
+        )
 
         with (
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
@@ -219,7 +247,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
-                return_value={},
+                return_value=pending_state,
             ),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._build_device_health_monitor_summary",
@@ -242,7 +270,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 "nextHospitalSeq": None,
                 "processedHospitalSeqs": [],
                 "alertFingerprints": {},
-                "pendingAlertFingerprints": {},
+                "pendingAlertFingerprints": pending_state["pendingAlertFingerprints"],
                 "sshTunnelRecords": {},
                 "deviceCandidateCache": [],
                 "deviceCandidateCachedAt": "",
@@ -308,6 +336,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor")
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        pending_state = _pending_alert_state(
+            _LED_ALERT_FINGERPRINT,
+            local_now - timedelta(minutes=1),
+        )
 
         with (
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
@@ -322,7 +354,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
-                return_value={},
+                return_value=pending_state,
             ),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._build_device_health_monitor_summary",
@@ -405,6 +437,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor")
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        pending_state = _pending_alert_state(
+            _LED_ALERT_FINGERPRINT,
+            local_now - timedelta(minutes=1),
+        )
 
         with (
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
@@ -417,7 +453,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
-                return_value={},
+                return_value=pending_state,
             ),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._build_device_health_monitor_summary",
@@ -1167,10 +1203,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
     def test_retains_recent_alert_when_issue_temporarily_disappears(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-        fingerprint = (
-            "#69 수지미래산부인과의원(용인)|1진료실|"
-            "MB2-C00043|LED USB 장치를 찾지 못했어"
-        )
+        fingerprint = _LED_ALERT_FINGERPRINT
         previous_alert_at = (local_now - timedelta(minutes=2)).isoformat()
         previous_state = {
             "alertFingerprints": {
@@ -1216,10 +1249,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
     def test_prunes_inactive_alert_after_reminder_window(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-        fingerprint = (
-            "#69 수지미래산부인과의원(용인)|1진료실|"
-            "MB2-C00043|LED USB 장치를 찾지 못했어"
-        )
+        fingerprint = _LED_ALERT_FINGERPRINT
         previous_alert_at = (local_now - timedelta(hours=7)).isoformat()
         normal_summary = {
             **_abnormal_summary(),
@@ -1247,33 +1277,37 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertNotIn(fingerprint, retained_alerts)
         self.assertEqual(retained_pending, {})
 
-    def test_alerts_immediately_when_captureboard_failure_is_confirmed(self) -> None:
+    def test_led_alert_waits_until_second_consecutive_poll(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-        fingerprint = (
-            "#69 수지미래산부인과의원(용인)|1진료실|"
-            "MB2-C00043|캡처보드 USB나 비디오 장치를 찾지 못했어"
-        )
+        fingerprint = _LED_ALERT_FINGERPRINT
 
         with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6):
             first_alertable, first_alerts, first_pending = (
                 reporter._collect_device_health_monitor_alert_updates(
-                    _captureboard_abnormal_summary(),
+                    _abnormal_summary(),
                     {},
                     now=local_now,
                 )
             )
+            second_alertable, second_alerts, second_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _abnormal_summary(),
+                    {"pendingAlertFingerprints": first_pending},
+                    now=local_now + timedelta(minutes=1),
+                )
+            )
 
-        self.assertEqual(first_alertable, {fingerprint})
-        self.assertIn(fingerprint, first_alerts)
-        self.assertEqual(first_alerts[fingerprint]["lastAlertedAt"], local_now.isoformat())
-        self.assertEqual(first_pending, {})
+        self.assertEqual(first_alertable, set())
+        self.assertEqual(first_alerts, {})
+        self.assertEqual(first_pending[fingerprint]["count"], 1)
+        self.assertEqual(second_alertable, {fingerprint})
+        self.assertIn(fingerprint, second_alerts)
+        self.assertEqual(second_alerts[fingerprint]["lastAlertedAt"], (local_now + timedelta(minutes=1)).isoformat())
+        self.assertEqual(second_pending, {})
 
-    def test_captureboard_alert_still_uses_reminder_suppression(self) -> None:
+    def test_alerts_when_captureboard_failure_is_confirmed_twice(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-        fingerprint = (
-            "#69 수지미래산부인과의원(용인)|1진료실|"
-            "MB2-C00043|캡처보드 USB나 비디오 장치를 찾지 못했어"
-        )
+        fingerprint = _CAPTUREBOARD_ALERT_FINGERPRINT
 
         with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6):
             first_alertable, first_alerts, first_pending = (
@@ -1286,18 +1320,55 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             second_alertable, second_alerts, second_pending = (
                 reporter._collect_device_health_monitor_alert_updates(
                     _captureboard_abnormal_summary(),
-                    {
-                        "alertFingerprints": first_alerts,
-                        "pendingAlertFingerprints": first_pending,
-                    },
+                    {"pendingAlertFingerprints": first_pending},
                     now=local_now + timedelta(minutes=1),
                 )
             )
 
-        self.assertEqual(first_alertable, {fingerprint})
-        self.assertEqual(second_alertable, set())
-        self.assertEqual(second_alerts[fingerprint]["lastAlertedAt"], local_now.isoformat())
+        self.assertEqual(first_alertable, set())
+        self.assertEqual(first_alerts, {})
+        self.assertEqual(first_pending[fingerprint]["count"], 1)
+        self.assertEqual(second_alertable, {fingerprint})
+        self.assertIn(fingerprint, second_alerts)
+        self.assertEqual(second_alerts[fingerprint]["lastAlertedAt"], (local_now + timedelta(minutes=1)).isoformat())
         self.assertEqual(second_pending, {})
+
+    def test_captureboard_alert_still_uses_reminder_suppression(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        fingerprint = _CAPTUREBOARD_ALERT_FINGERPRINT
+
+        with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6):
+            first_alertable, first_alerts, first_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _captureboard_abnormal_summary(),
+                    {},
+                    now=local_now,
+                )
+            )
+            second_alertable, second_alerts, second_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _captureboard_abnormal_summary(),
+                    {"pendingAlertFingerprints": first_pending},
+                    now=local_now + timedelta(minutes=1),
+                )
+            )
+            third_alertable, third_alerts, third_pending = (
+                reporter._collect_device_health_monitor_alert_updates(
+                    _captureboard_abnormal_summary(),
+                    {
+                        "alertFingerprints": second_alerts,
+                        "pendingAlertFingerprints": second_pending,
+                    },
+                    now=local_now + timedelta(minutes=2),
+                )
+            )
+
+        self.assertEqual(first_alertable, set())
+        self.assertEqual(first_alerts, {})
+        self.assertEqual(second_alertable, {fingerprint})
+        self.assertEqual(third_alertable, set())
+        self.assertEqual(third_alerts[fingerprint]["lastAlertedAt"], (local_now + timedelta(minutes=1)).isoformat())
+        self.assertEqual(third_pending, {})
 
     def test_appends_device_health_monitor_event_log_jsonl(self) -> None:
         logger = logging.getLogger("test.device_health_monitor")
