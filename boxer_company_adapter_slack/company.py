@@ -80,6 +80,12 @@ from boxer_company_adapter_slack.recording_failure_routes import (
     RecordingFailureRouteDeps,
     _handle_recording_failure_analysis_request,
 )
+from boxer_company_adapter_slack.security_review_routes import (
+    SecurityReviewMessageContext,
+    SecurityReviewRoutesContext,
+    _handle_security_review_bot_message,
+    _handle_security_review_request,
+)
 from boxer_company_adapter_slack.structured_routes import (
     StructuredRoutesContext,
     _handle_structured_routes,
@@ -594,6 +600,20 @@ def create_app() -> App:
         ):
             return
 
+        if _handle_security_review_request(
+            SecurityReviewRoutesContext(
+                question=question,
+                payload=payload,
+                user_id=user_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                reply=reply,
+                client=client,
+                logger=logger,
+            )
+        ):
+            return
+
         if _handle_admin_routes(
             AdminRoutesContext(
                 question=question,
@@ -890,6 +910,16 @@ def create_app() -> App:
         client: Any,
         logger: logging.Logger,
     ) -> None:
+        if _handle_security_review_bot_message(
+            SecurityReviewMessageContext(
+                payload=payload,
+                reply=reply,
+                client=client,
+                logger=logger,
+            )
+        ):
+            return
+
         handle_fun_message(
             payload,
             reply,

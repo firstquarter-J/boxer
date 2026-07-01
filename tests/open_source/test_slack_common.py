@@ -63,6 +63,46 @@ class SlackCommonTests(unittest.TestCase):
         )
         self.assertEqual(say_calls[0]["thread_ts"], "123.456")
 
+    def test_message_event_preserves_bot_user_id(self) -> None:
+        payloads: list[dict[str, Any]] = []
+
+        def mention_handler(payload, reply, client, logger: logging.Logger) -> None:
+            raise AssertionError("mention handler should not run")
+
+        def message_handler(payload, reply, client, logger: logging.Logger) -> None:
+            payloads.append(payload)
+
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(mention_handler, message_handler)
+            event_handler = app.handlers["message"]
+            event_handler(
+                {
+                    "text": "bot reply",
+                    "subtype": "bot_message",
+                    "bot_id": "B_TARGET",
+                    "bot_profile": {
+                        "user_id": "UTARGET",
+                        "name": "buddy",
+                        "app_id": "A_TARGET",
+                    },
+                    "channel": "C_TEST",
+                    "ts": "123.456",
+                    "team": "T_TEST",
+                },
+                lambda **kwargs: None,
+                object(),
+            )
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["bot_user_id"], "UTARGET")
+        self.assertEqual(payloads[0]["bot_id"], "B_TARGET")
+
 
 if __name__ == "__main__":
     unittest.main()

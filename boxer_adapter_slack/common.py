@@ -50,6 +50,7 @@ class MessagePayload(TypedDict):
     raw_text: str
     text: str
     user_id: str | None
+    bot_user_id: str
     workspace_id: str
     channel_id: str
     current_ts: str
@@ -449,6 +450,12 @@ def create_slack_app(
         bot_id = str(event.get("bot_id") or "").strip()
         bot_profile = event.get("bot_profile")
         bot_profile_dict = bot_profile if isinstance(bot_profile, dict) else {}
+        # 봇 간 워크플로는 bot_id/app_id만으로 식별이 안 되는 이벤트가 있어서 bot user id도 보존한다.
+        bot_user_id = str(
+            bot_profile_dict.get("user_id")
+            or (event.get("user") if subtype == "bot_message" else "")
+            or ""
+        ).strip()
         bot_name = str(
             event.get("username")
             or bot_profile_dict.get("name")
@@ -469,6 +476,7 @@ def create_slack_app(
             "raw_text": raw_text,
             "text": raw_text.lower(),
             "user_id": user_id,
+            "bot_user_id": bot_user_id,
             "workspace_id": workspace_id,
             "channel_id": event.get("channel") or "",
             "current_ts": event.get("ts") or "",
