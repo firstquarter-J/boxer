@@ -1137,10 +1137,7 @@ def _extract_scan_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
 
 
 def _normalize_blocking_barcode_result(raw_result: str) -> str:
-    normalized = _display_value(raw_result, default="").strip().upper()
-    if normalized in {"FREE", "REFUND", "INVALID", "BLOCKED"}:
-        return normalized
-    return normalized
+    return _display_value(raw_result, default="").strip().upper()
 
 
 def _blocking_barcode_result_label(result: str) -> str:
@@ -3611,6 +3608,9 @@ def _find_scan_only_records_by_date_log_search(
                     continue
                 records.append(record)
                 if len(records) >= _SCAN_ONLY_FALLBACK_MAX_RECORDS:
+                    # 충분한 근거를 찾으면 아직 시작되지 않은 로그 조회를 취소해 S3 호출을 줄인다.
+                    for queued_future in futures:
+                        queued_future.cancel()
                     break
         if records:
             break
