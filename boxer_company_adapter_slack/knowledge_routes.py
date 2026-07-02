@@ -71,17 +71,23 @@ class KnowledgeRoutesDeps:
 
 def _build_claude_api_key_missing_reply() -> str:
     # 키 설정 문제는 일반 장애 문구로 숨기지 않고 운영자가 바로 조치할 수 있게 노출한다.
-    return "API 키가 설정되지 않아 지금은 AI 답변을 생성할 수 없어. 서버의 `ANTHROPIC_API_KEY`를 확인해줘"
+    return (
+        "인증값이 설정되지 않아 지금은 AI 답변을 생성할 수 없어. "
+        "서버의 `ANTHROPIC_API_KEY` 또는 `ANTHROPIC_AUTH_TOKEN`을 확인해줘"
+    )
 
 
 def _build_claude_api_key_invalid_reply() -> str:
-    return "API 키가 유효하지 않아 지금은 AI 답변을 생성할 수 없어. 서버의 `ANTHROPIC_API_KEY`를 확인해줘"
+    return (
+        "인증값이 유효하지 않아 지금은 AI 답변을 생성할 수 없어. "
+        "서버의 `ANTHROPIC_API_KEY` 또는 `ANTHROPIC_AUTH_TOKEN`을 확인해줘"
+    )
 
 
 def _build_claude_permission_denied_reply() -> str:
     return (
-        "API 키 권한이 없어 지금은 AI 답변을 생성할 수 없어. "
-        "서버의 `ANTHROPIC_API_KEY`를 확인해줘"
+        "인증값 권한이 없어 지금은 AI 답변을 생성할 수 없어. "
+        "서버의 `ANTHROPIC_API_KEY` 또는 `ANTHROPIC_AUTH_TOKEN`을 확인해줘"
     )
 
 

@@ -642,9 +642,10 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(len(replies), 1)
-        self.assertIn("API 키가 설정되지 않아", replies[0])
+        self.assertIn("인증값이 설정되지 않아", replies[0])
         self.assertNotIn("Claude", replies[0])
         self.assertIn("ANTHROPIC_API_KEY", replies[0])
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", replies[0])
 
     def test_knowledge_routes_reports_claude_auth_error_as_api_key_issue(self) -> None:
         replies: list[str] = []
@@ -683,7 +684,7 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(len(replies), 1)
-        self.assertIn("API 키가 유효하지 않아", replies[0])
+        self.assertIn("인증값이 유효하지 않아", replies[0])
         self.assertNotIn("Claude", replies[0])
         self.assertNotIn("AI 응답 중 오류", replies[0])
 

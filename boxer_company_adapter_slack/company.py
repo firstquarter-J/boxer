@@ -2,7 +2,6 @@ import logging
 from typing import Any
 
 import pymysql
-from anthropic import Anthropic
 from botocore.exceptions import BotoCoreError, ClientError
 from slack_bolt import App
 
@@ -117,7 +116,13 @@ from boxer_company import settings as cs
 from boxer_company.utils import _extract_barcode
 from boxer.context.builder import _build_model_input
 from boxer.core import settings as s
-from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_claude_health, _check_ollama_health
+from boxer.core.llm import (
+    _ask_claude,
+    _ask_ollama_chat,
+    _build_claude_client,
+    _check_claude_health,
+    _check_ollama_health,
+)
 from boxer.core.utils import _validate_tokens
 from boxer.retrieval.connectors.notion import _is_notion_configured
 from boxer.retrieval.connectors.s3 import _build_s3_client
@@ -201,14 +206,13 @@ from boxer_company.routers.usage_help import (
 def create_app() -> App:
     _validate_ec2_runtime_aws_env()
     _validate_tokens(include_llm=True, include_data_sources=True)
-    claude_client = (
-        Anthropic(
-            api_key=s.ANTHROPIC_API_KEY,
-            timeout=s.ANTHROPIC_TIMEOUT_SEC,
-        )
-        if s.LLM_PROVIDER == "claude"
-        else None
-    )
+    app_logger = logging.getLogger(__name__)
+    claude_client = None
+    if s.LLM_PROVIDER == "claude":
+        try:
+            claude_client = _build_claude_client(timeout_sec=s.ANTHROPIC_TIMEOUT_SEC)
+        except Exception:
+            app_logger.warning("Failed to initialize Claude client; continuing without it", exc_info=True)
     s3_client: Any | None = None
 
     def _get_s3_client() -> Any:
@@ -929,7 +933,7 @@ def create_app() -> App:
         )
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
-    attach_weekly_recordings_reporter(app, logger=logging.getLogger(__name__))
-    attach_device_health_monitor_reporter(app, logger=logging.getLogger(__name__))
-    attach_daily_device_round_reporter(app, logger=logging.getLogger(__name__))
+    attach_weekly_recordings_reporter(app, logger=app_logger)
+    attach_device_health_monitor_reporter(app, logger=app_logger)
+    attach_daily_device_round_reporter(app, logger=app_logger)
     return app

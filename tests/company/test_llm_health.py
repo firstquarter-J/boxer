@@ -1,10 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import pymysql
 from botocore.exceptions import ClientError
 
 from boxer_company_adapter_slack.company import _build_dependency_failure_reply, _format_ping_llm_status
-from boxer.core.llm import _check_claude_health
+from boxer.core.llm import _build_claude_client, _check_claude_health, _resolve_anthropic_auth_token
 
 
 class _FakeMessages:
@@ -30,6 +31,52 @@ class PingStatusTests(unittest.TestCase):
 
 
 class ClaudeHealthTests(unittest.TestCase):
+    def test_builds_oauth_claude_client_without_api_key_header(self) -> None:
+        with (
+            patch("boxer.core.llm.s.ANTHROPIC_API_KEY", "sk-ant-low-credit"),
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN", "oauth-token"),
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN_COMMAND", ""),
+        ):
+            client = _build_claude_client(timeout_sec=1)
+
+        self.assertEqual(client.auth_headers, {"Authorization": "Bearer oauth-token"})
+
+    def test_oauth_token_command_empty_output_is_explicit_error(self) -> None:
+        # Helper command가 설정됐는데 빈 토큰이면 API key fallback보다 원인을 바로 드러낸다.
+        completed = type("Completed", (), {"returncode": 0, "stdout": "\n", "stderr": ""})()
+        with (
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN", ""),
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN_COMMAND", "helper"),
+            patch("boxer.core.llm.subprocess.run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "empty token"):
+                _resolve_anthropic_auth_token()
+
+    def test_oauth_token_command_failure_does_not_leak_output(self) -> None:
+        completed = type("Completed", (), {"returncode": 1, "stdout": "secret-token", "stderr": "secret-error"})()
+        with (
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN", ""),
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN_COMMAND", "helper"),
+            patch("boxer.core.llm.subprocess.run", return_value=completed),
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                _resolve_anthropic_auth_token()
+
+        self.assertIn("exit code 1", str(context.exception))
+        self.assertNotIn("secret-token", str(context.exception))
+        self.assertNotIn("secret-error", str(context.exception))
+
+    def test_health_check_skips_second_refresh_for_new_client(self) -> None:
+        fake_client = _FakeClaudeClient()
+        with (
+            patch("boxer.core.llm._build_claude_client", return_value=fake_client),
+            patch("boxer.core.llm._refresh_claude_oauth_token") as refresh_mock,
+        ):
+            result = _check_claude_health()
+
+        self.assertTrue(result["ok"])
+        refresh_mock.assert_not_called()
+
     def test_reports_ok_for_successful_claude_call(self) -> None:
         result = _check_claude_health(_FakeClaudeClient())
 

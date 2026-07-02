@@ -1,6 +1,9 @@
 import json
 import re
+import shlex
+import subprocess
 import time
+from typing import Any
 from urllib import error, request
 
 import anthropic
@@ -20,6 +23,87 @@ _FINAL_SECTION_MARKERS = (
     "• 핵심 원인:",
     "핵심 원인:",
 )
+
+
+def _flatten_error_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(_flatten_error_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_flatten_error_text(item) for item in value)
+    return str(value or "")
+
+
+def _is_anthropic_credit_unavailable_error(exc: Exception) -> bool:
+    body_text = _flatten_error_text(getattr(exc, "body", None))
+    combined = f"{body_text} {getattr(exc, 'message', '')} {str(exc)}".lower()
+    return any(
+        token in combined
+        for token in (
+            "credit balance",
+            "credits",
+            "insufficient_quota",
+            "insufficient quota",
+            "quota_exceeded",
+            "billing",
+            "payment",
+            "prepaid",
+        )
+    )
+
+
+def _resolve_anthropic_auth_token() -> str:
+    static_token = (s.ANTHROPIC_AUTH_TOKEN or "").strip()
+    if static_token:
+        return static_token
+
+    command = (s.ANTHROPIC_AUTH_TOKEN_COMMAND or "").strip()
+    if not command:
+        return ""
+
+    # OAuth 토큰은 만료될 수 있어서, 필요한 경우 외부 helper가 최신 토큰을 stdout으로 돌려준다.
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(1, s.ANTHROPIC_AUTH_TOKEN_COMMAND_TIMEOUT_SEC),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Anthropic OAuth token command timed out") from exc
+    except OSError as exc:
+        raise RuntimeError("Failed to execute Anthropic OAuth token command") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Anthropic OAuth token command failed with exit code {result.returncode}"
+        )
+    token_lines = (result.stdout or "").strip().splitlines()
+    token = token_lines[0].strip() if token_lines else ""
+    if not token:
+        raise RuntimeError("Anthropic OAuth token command returned an empty token")
+    return token
+
+
+def _build_claude_client(*, timeout_sec: int | None = None) -> Anthropic:
+    actual_timeout = timeout_sec if timeout_sec is not None else s.ANTHROPIC_TIMEOUT_SEC
+    auth_token = _resolve_anthropic_auth_token()
+    if auth_token:
+        client = Anthropic(auth_token=auth_token, timeout=actual_timeout)
+        # SDK는 env의 ANTHROPIC_API_KEY도 자동으로 읽으므로 OAuth 사용 시 API key 헤더를 명시적으로 끈다.
+        client.api_key = None
+        return client
+    return Anthropic(api_key=s.ANTHROPIC_API_KEY, timeout=actual_timeout)
+
+
+def _refresh_claude_oauth_token(client: Anthropic) -> None:
+    if not (s.ANTHROPIC_AUTH_TOKEN or s.ANTHROPIC_AUTH_TOKEN_COMMAND):
+        return
+    auth_token = _resolve_anthropic_auth_token()
+    if not auth_token:
+        return
+    # 장기 실행 서버에서 helper가 갱신한 OAuth 토큰을 다음 호출에 반영한다.
+    client.auth_token = auth_token
+    client.api_key = None
 
 
 def _sanitize_ollama_output(text: str) -> str:
@@ -80,6 +164,7 @@ def _ask_claude_with_meta(
     *,
     max_tokens: int | None = None,
 ) -> dict[str, str]:
+    _refresh_claude_oauth_token(client)
     prompt = (system_prompt or s.DEFAULT_SYSTEM_PROMPT).strip()
     result = client.messages.create(
         model=s.ANTHROPIC_MODEL,
@@ -110,12 +195,11 @@ def _check_claude_health(
     )
     started_at = time.monotonic()
     configured_model = (model or s.ANTHROPIC_MODEL or "").strip()
-    health_client = client or Anthropic(
-        api_key=s.ANTHROPIC_API_KEY,
-        timeout=actual_timeout,
-    )
 
     try:
+        health_client = client or _build_claude_client(timeout_sec=actual_timeout)
+        if client is not None:
+            _refresh_claude_oauth_token(health_client)
         health_client.messages.create(
             model=configured_model,
             max_tokens=1,
@@ -131,12 +215,22 @@ def _check_claude_health(
             "ok": False,
             "summary": "인증 실패",
         }
-    except anthropic.PermissionDeniedError:
+    except anthropic.PermissionDeniedError as exc:
+        if _is_anthropic_credit_unavailable_error(exc):
+            return {
+                "ok": False,
+                "summary": "크레딧 부족",
+            }
         return {
             "ok": False,
             "summary": "권한 없음",
         }
-    except anthropic.RateLimitError:
+    except anthropic.RateLimitError as exc:
+        if _is_anthropic_credit_unavailable_error(exc):
+            return {
+                "ok": False,
+                "summary": "크레딧 부족",
+            }
         return {
             "ok": False,
             "summary": "호출 제한",
@@ -147,6 +241,11 @@ def _check_claude_health(
             "summary": f"연결 실패 ({str(exc) or 'connection failed'})",
         }
     except anthropic.BadRequestError as exc:
+        if _is_anthropic_credit_unavailable_error(exc):
+            return {
+                "ok": False,
+                "summary": "크레딧 부족",
+            }
         return {
             "ok": False,
             "summary": f"요청 실패 ({exc.status_code})",
