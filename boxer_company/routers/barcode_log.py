@@ -2,6 +2,7 @@ import os
 import re
 import shlex
 import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,10 +19,12 @@ from boxer_company.routers.box_db import (
     _format_video_length,
     _load_recordings_rows_on_date_by_barcode,
     _lookup_device_contexts_by_barcode,
+    _lookup_device_contexts_by_device_names,
     _lookup_device_contexts_by_hospital_seqs,
 )
 from boxer_company.routers.mda_graphql import (
     _is_mda_graphql_configured,
+    _lookup_mda_special_barcodes_by_barcode,
     _wait_for_mda_device_agent_ssh,
 )
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
@@ -65,7 +68,10 @@ _ROOM_SCOPE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ROOM_TOKEN_PATTERN = re.compile(
-    r"([^\s`'\",]*(?:초음파실|진료실|병실|분만실|수술실|원장실)[^\s`'\",]*)"
+    r"("
+    r"[^\s`'\",]*(?:초음파실|진료실|병실|분만실|수술실|원장실)[^\s`'\",]*"
+    r"|(?<!\d)\d+\s*호(?![A-Za-z0-9가-힣])"
+    r")"
 )
 _ROOM_PREFIX_PATTERN = re.compile(r"((?:(?:\d+\s*층|[A-Za-z0-9가-힣]+동|\d+\s*-\s*\d+)\s*)+)$")
 _LEADING_HOSPITAL_SCOPE_PATTERN = re.compile(
@@ -135,6 +141,30 @@ _RAW_LOG_LEVEL_PATTERN = re.compile(
 _NORMALIZED_LOG_LEVEL_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}[_ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\[[^\]]+\]\s+([A-Za-z]+):",
     re.IGNORECASE,
+)
+_BARCODE_VALIDATION_RESULT_PATTERN = re.compile(
+    r"barcode validation result:\s*barcode\s*=\s*(\d{11})\s*,\s*result\s*=\s*([A-Za-z_]+)",
+    re.IGNORECASE,
+)
+_SPECIAL_BARCODE_BLOCK_PATTERN = re.compile(
+    r"(free|refund|invalid)\s+barcode detected:\s*(\d{11}).*blocking recording",
+    re.IGNORECASE,
+)
+_BLOCKING_BARCODE_RESULT_LABELS = {
+    "FREE": "무료 바코드",
+    "REFUND": "환불 처리 바코드",
+    "INVALID": "유효하지 않은 바코드",
+    "BLOCKED": "차단 대상 바코드",
+}
+_SCAN_ONLY_BLOCK_LOOKAHEAD_LINES = 10
+_SCAN_ONLY_FALLBACK_BATCH_SIZE = 128
+_SCAN_ONLY_FALLBACK_MAX_WORKERS = 32
+_SCAN_ONLY_FALLBACK_MAX_LOG_FILES = 2500
+_SCAN_ONLY_FALLBACK_MAX_RECORDS = 5
+_SCAN_ONLY_DISPLAY_MAX_EVENTS = 20
+_SCAN_ONLY_GLOBAL_FALLBACK_ENABLED = (
+    os.getenv("BARCODE_LOG_GLOBAL_SCAN_FALLBACK_ENABLED", "").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
 _TODAY_HINTS = ("오늘", "금일", "today")
 _DAY_BEFORE_YESTERDAY_HINTS = ("그제", "엊그제", "day before yesterday")
@@ -1106,6 +1136,125 @@ def _extract_scan_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
     return events
 
 
+def _normalize_blocking_barcode_result(raw_result: str) -> str:
+    normalized = _display_value(raw_result, default="").strip().upper()
+    if normalized in {"FREE", "REFUND", "INVALID", "BLOCKED"}:
+        return normalized
+    return normalized
+
+
+def _blocking_barcode_result_label(result: str) -> str:
+    normalized = _normalize_blocking_barcode_result(result)
+    return _BLOCKING_BARCODE_RESULT_LABELS.get(normalized, normalized or "차단 대상 바코드")
+
+
+def _scan_event_matches_barcode(event: dict[str, Any], barcode: str) -> bool:
+    normalized_barcode = str(barcode or "").strip()
+    if not normalized_barcode:
+        return False
+    return str(event.get("token") or "").strip() == normalized_barcode
+
+
+def _find_barcode_scan_block_context(
+    lines: list[str],
+    scan_event: dict[str, Any],
+    barcode: str,
+) -> dict[str, Any] | None:
+    normalized_barcode = str(barcode or "").strip()
+    if not normalized_barcode:
+        return None
+
+    start_line_no = int(scan_event.get("line_no") or 0)
+    if start_line_no <= 0:
+        return None
+
+    result = ""
+    block_line_no: int | None = None
+    result_line_no: int | None = None
+    raw_lines: list[dict[str, Any]] = []
+    end_line_no = min(len(lines), start_line_no + _SCAN_ONLY_BLOCK_LOOKAHEAD_LINES)
+    for line_no in range(start_line_no, end_line_no + 1):
+        raw_line = lines[line_no - 1]
+        stripped = _strip_leading_log_timestamp(raw_line)
+        lowered = stripped.lower()
+        parsed_scan = _parse_scanned_event(raw_line)
+        if line_no > start_line_no and parsed_scan and parsed_scan != normalized_barcode:
+            break
+
+        line_mentions_barcode = normalized_barcode in stripped
+        validation_match = _BARCODE_VALIDATION_RESULT_PATTERN.search(stripped)
+        if validation_match and validation_match.group(1) == normalized_barcode:
+            result = _normalize_blocking_barcode_result(validation_match.group(2))
+            result_line_no = line_no
+            raw_lines.append(
+                {
+                    "lineNo": line_no,
+                    "timeLabel": _extract_time_label_from_line(raw_line),
+                    "rawLine": stripped,
+                }
+            )
+            continue
+
+        block_match = _SPECIAL_BARCODE_BLOCK_PATTERN.search(stripped)
+        if block_match and block_match.group(2) == normalized_barcode:
+            result = _normalize_blocking_barcode_result(block_match.group(1))
+            block_line_no = line_no
+            raw_lines.append(
+                {
+                    "lineNo": line_no,
+                    "timeLabel": _extract_time_label_from_line(raw_line),
+                    "rawLine": stripped,
+                }
+            )
+            continue
+
+        if line_mentions_barcode and "blocking recording" in lowered:
+            if not result:
+                result = "BLOCKED"
+            block_line_no = line_no
+            raw_lines.append(
+                {
+                    "lineNo": line_no,
+                    "timeLabel": _extract_time_label_from_line(raw_line),
+                    "rawLine": stripped,
+                }
+            )
+            continue
+
+        if line_mentions_barcode and "free barcode" in lowered:
+            if not result:
+                result = "FREE"
+            raw_lines.append(
+                {
+                    "lineNo": line_no,
+                    "timeLabel": _extract_time_label_from_line(raw_line),
+                    "rawLine": stripped,
+                }
+            )
+
+    if not result and block_line_no is None:
+        return None
+
+    # 바코드 검증 차단은 scan 이벤트는 남지만 녹화 세션은 생성되지 않는 별도 흐름이다.
+    return {
+        "scanLineNo": start_line_no,
+        "scanTimeLabel": _display_value(scan_event.get("time_label"), default="시간미상"),
+        "result": result or "BLOCKED",
+        "resultLabel": _blocking_barcode_result_label(result or "BLOCKED"),
+        "blockLineNo": block_line_no,
+        "resultLineNo": result_line_no,
+        "rawLines": raw_lines,
+    }
+
+
+def _scan_event_is_blocked_before_recording(
+    lines: list[str],
+    scan_event: dict[str, Any],
+    barcode: str,
+) -> bool:
+    return _find_barcode_scan_block_context(lines, scan_event, barcode) is not None
+
+
 def _extract_motion_events_with_line_no(lines: list[str]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     latest_time_label: str | None = None
@@ -2041,6 +2190,12 @@ def _extract_recording_sessions(
             active = None
 
         if token == normalized_barcode:
+            # FREE/REFUND/INVALID 차단은 스캔 로그만 남고 세션으로 이어지지 않는다.
+            if _scan_event_is_blocked_before_recording(lines, event, normalized_barcode):
+                continue
+            # ignore period 중복 스캔도 녹화 시작으로 처리되지 않는다.
+            if _duplicate_scan_was_ignored(lines, line_no):
+                continue
             if active is not None:
                 if _should_merge_same_barcode_rescan(
                     lines,
@@ -3137,6 +3292,347 @@ def _build_error_groups(error_items: list[dict[str, Any]]) -> list[dict[str, Any
     return ordered[:12]
 
 
+def _build_scan_only_reason_text(block_contexts: list[dict[str, Any]]) -> str:
+    results: list[str] = []
+    for context in block_contexts:
+        result = _normalize_blocking_barcode_result(context.get("result"))
+        if result and result not in results:
+            results.append(result)
+
+    if "FREE" in results:
+        return "무료 바코드로 검증되어 장비가 녹화를 차단했어 (`result=FREE`, `Blocking recording`)"
+    if "REFUND" in results:
+        return "환불 처리 바코드로 검증되어 장비가 녹화를 차단했어 (`result=REFUND`, `Blocking recording`)"
+    if "INVALID" in results:
+        return "유효하지 않은 바코드로 검증되어 장비가 녹화를 차단했어 (`result=INVALID`, `Blocking recording`)"
+    if results:
+        rendered = " / ".join(f"`{result}`" for result in results)
+        return f"바코드 검증 결과 {rendered}로 녹화가 차단됐어"
+    return "바코드 스캔은 확인됐지만 녹화 세션 생성 로그는 없어"
+
+
+def _build_scan_only_log_analysis_record(
+    *,
+    source_lines: list[str],
+    device_name: str,
+    hospital_name: str,
+    room_name: str,
+    log_key: str,
+    log_date: str,
+    barcode: str,
+    scan_events: list[dict[str, Any]],
+    recordings_on_date_count: int | None = None,
+) -> dict[str, Any] | None:
+    matching_scan_events = [
+        event
+        for event in scan_events
+        if _scan_event_matches_barcode(event, barcode)
+    ]
+    if not matching_scan_events:
+        return None
+
+    block_contexts = [
+        context
+        for event in matching_scan_events
+        if (context := _find_barcode_scan_block_context(source_lines, event, barcode)) is not None
+    ]
+    if not block_contexts:
+        return None
+
+    display_scan_events = matching_scan_events[:_SCAN_ONLY_DISPLAY_MAX_EVENTS]
+    display_block_contexts = block_contexts[:_SCAN_ONLY_DISPLAY_MAX_EVENTS]
+    first_scan = matching_scan_events[0]
+    last_scan = matching_scan_events[-1]
+    result_text = _build_scan_only_reason_text(block_contexts)
+    result_values = []
+    for context in block_contexts:
+        result = _normalize_blocking_barcode_result(context.get("result"))
+        if result and result not in result_values:
+            result_values.append(result)
+
+    # scan-only record는 세션/업로드 근거 없이 검증 차단 근거만 있는 로그를 payload에 남긴다.
+    return {
+        "scanOnly": True,
+        "deviceName": device_name,
+        "hospitalName": hospital_name,
+        "roomName": room_name,
+        "date": log_date,
+        "logKey": log_key,
+        "lineCount": len(source_lines),
+        "sessions": {
+            "sessionCount": 0,
+            "normalCount": 0,
+            "abnormalCount": 0,
+            "canceledCount": 0,
+            "restartCount": 0,
+            "stopMissingCount": 0,
+            "allClosedNormally": False,
+        },
+        "scanEventCount": len(matching_scan_events),
+        "scanEvents": _serialize_scan_events_for_evidence(display_scan_events),
+        "displayedScanEventCount": len(display_scan_events),
+        "firstScanTime": _display_value(first_scan.get("time_label"), default="시간미상"),
+        "lastScanTime": _display_value(last_scan.get("time_label"), default="시간미상"),
+        "scanOnlyReason": result_text,
+        "blockingResults": result_values,
+        "blockingContexts": display_block_contexts,
+        "blockingContextCount": len(block_contexts),
+        "restartEventCount": 0,
+        "restartDetected": False,
+        "restartEvents": [],
+        "errorLineCount": 0,
+        "errorLines": [],
+        "errorGroups": [],
+        "firstFfmpegError": None,
+        "sessionDiagnostics": [],
+        "sessionDetails": [],
+        "recordingsOnDateCount": recordings_on_date_count,
+        "recordingsOnDateStatuses": [],
+    }
+
+
+def _apply_device_context_to_scan_only_record(
+    record: dict[str, Any],
+    device_context: dict[str, Any] | None,
+) -> None:
+    if not isinstance(device_context, dict):
+        return
+
+    for key in ("deviceSeq", "hospitalSeq", "hospitalRoomSeq", "hospitalName", "roomName"):
+        value = device_context.get(key)
+        if value is not None and _display_value(value, default=""):
+            record[key] = value
+
+
+def _append_scan_only_record_section(
+    lines: list[str],
+    record: dict[str, Any],
+    *,
+    index: int,
+) -> None:
+    device_name = _display_value(record.get("deviceName"), default="미확인")
+    hospital_name = _display_value(record.get("hospitalName"), default="미확인")
+    room_name = _display_value(record.get("roomName"), default="미확인")
+    scan_count = int(record.get("scanEventCount") or 0)
+    displayed_count = int(record.get("displayedScanEventCount") or 0)
+    blocking_context_count = int(record.get("blockingContextCount") or 0)
+
+    lines.append("")
+    lines.append(f"*장비 {index}*")
+    lines.append(f"• 장비: `{device_name}`")
+    lines.append(f"• 파일: `{_display_value(record.get('logKey'), default='미확인')}`")
+    lines.append(f"• 병원: `{hospital_name}`")
+    lines.append(f"• 병실: `{room_name}`")
+    lines.append(f"• 날짜: `{_display_value(record.get('date'), default='미확인')}`")
+    lines.append("• 세션 수: `0건`")
+    lines.append(f"• 스캔 수: `{scan_count}건`")
+    lines.append("• 결과: 바코드 스캔은 확인됐지만 녹화 세션은 생성되지 않았어")
+    lines.append(f"• 원인: {_display_value(record.get('scanOnlyReason'), default='확인 필요')}")
+    recordings_count = record.get("recordingsOnDateCount")
+    if recordings_count is not None:
+        lines.append(f"• DB 영상 기록(날짜 기준): `{int(recordings_count or 0)}개`")
+    if scan_count > displayed_count:
+        lines.append(f"• 참고: 스캔이 많아서 처음 `{displayed_count}건`만 표시해")
+
+    scan_events = [
+        {
+            "line_no": item.get("lineNo"),
+            "time_label": item.get("timeLabel"),
+            "token": item.get("token"),
+            "raw_line": item.get("rawLine"),
+        }
+        for item in record.get("scanEvents") or []
+    ]
+    _append_scan_events_section(lines, scan_events)
+
+    sample_lines: list[str] = []
+    for context in record.get("blockingContexts") or []:
+        for raw_item in context.get("rawLines") or []:
+            raw_line = _display_value(raw_item.get("rawLine"), default="")
+            time_label = _display_value(raw_item.get("timeLabel"), default="시간미상")
+            if not raw_line:
+                continue
+            rendered = f"{time_label:>8}  {raw_line}"
+            if rendered not in sample_lines:
+                sample_lines.append(rendered)
+            if len(sample_lines) >= 8:
+                break
+        if len(sample_lines) >= 8:
+            break
+    if sample_lines:
+        suffix = ""
+        if blocking_context_count > len(record.get("blockingContexts") or []):
+            suffix = f" (총 `{blocking_context_count}건` 중 일부)"
+        lines.append(f"• 차단 근거{suffix}:")
+        lines.append("```")
+        lines.extend(sample_lines)
+        lines.append("```")
+
+
+def _extract_device_name_from_log_key(key: str) -> str:
+    return str(key or "").split("/", 1)[0].strip()
+
+
+def _fetch_s3_log_lines_by_key(s3_client: Any, key: str) -> dict[str, Any]:
+    response = s3_client.get_object(Bucket=s.S3_LOG_BUCKET, Key=key)
+    body = response["Body"].read()
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body or "")
+    return {
+        "found": True,
+        "lines": text.splitlines(),
+        "key": key,
+        "content_length": int(response.get("ContentLength") or len(body)),
+    }
+
+
+def _list_s3_date_log_keys(
+    s3_client: Any,
+    log_date: str,
+    *,
+    max_log_files: int,
+) -> tuple[list[str], bool]:
+    suffix = f"/log-{log_date}.log"
+    keys: list[str] = []
+    truncated = False
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=s.S3_LOG_BUCKET):
+        for obj in page.get("Contents", []) or []:
+            key = str(obj.get("Key") or "")
+            if not key.endswith(suffix):
+                continue
+            keys.append(key)
+            if len(keys) >= max_log_files:
+                truncated = True
+                return keys, truncated
+    return keys, truncated
+
+
+def _iter_chunks(items: list[str], size: int) -> list[list[str]]:
+    chunk_size = max(1, size)
+    return [
+        items[index:index + chunk_size]
+        for index in range(0, len(items), chunk_size)
+    ]
+
+
+def _build_scan_only_record_from_s3_key(
+    s3_client: Any,
+    key: str,
+    *,
+    barcode: str,
+    log_date: str,
+) -> dict[str, Any] | None:
+    log_data = _fetch_s3_log_lines_by_key(s3_client, key)
+    source_lines = log_data["lines"]
+    events = _extract_scan_events_with_line_no(source_lines)
+    if not any(_scan_event_matches_barcode(event, barcode) for event in events):
+        return None
+
+    sessions = _extract_recording_sessions(
+        source_lines,
+        barcode,
+        cs.LOG_SESSION_SAFETY_LINES,
+        scan_events=events,
+    )
+    if sessions:
+        return None
+
+    device_name = _extract_device_name_from_log_key(key)
+    return _build_scan_only_log_analysis_record(
+        source_lines=source_lines,
+        device_name=device_name,
+        hospital_name="미확인",
+        room_name="미확인",
+        log_key=key,
+        log_date=log_date,
+        barcode=barcode,
+        scan_events=events,
+        recordings_on_date_count=None,
+    )
+
+
+def _find_scan_only_records_by_date_log_search(
+    s3_client: Any,
+    *,
+    barcode: str,
+    log_date: str,
+    excluded_device_names: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    max_log_files = max(1, min(s.S3_QUERY_MAX_KEYS, _SCAN_ONLY_FALLBACK_MAX_LOG_FILES))
+    meta: dict[str, Any] = {
+        "candidateLogCount": 0,
+        "searchedLogCount": 0,
+        "truncated": False,
+        "error": "",
+    }
+    try:
+        keys, truncated = _list_s3_date_log_keys(
+            s3_client,
+            log_date,
+            max_log_files=max_log_files,
+        )
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return [], meta
+
+    filtered_keys = [
+        key
+        for key in keys
+        if _extract_device_name_from_log_key(key) not in excluded_device_names
+    ]
+    meta["candidateLogCount"] = len(filtered_keys)
+    meta["truncated"] = truncated
+
+    records: list[dict[str, Any]] = []
+    # 매핑 범위 밖 scan-only 증거는 로그 인덱스가 없어서 일자 파일을 batch로 제한 검색한다.
+    for chunk in _iter_chunks(filtered_keys, _SCAN_ONLY_FALLBACK_BATCH_SIZE):
+        meta["searchedLogCount"] = int(meta["searchedLogCount"]) + len(chunk)
+        worker_count = min(_SCAN_ONLY_FALLBACK_MAX_WORKERS, len(chunk))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _build_scan_only_record_from_s3_key,
+                    s3_client,
+                    key,
+                    barcode=barcode,
+                    log_date=log_date,
+                )
+                for key in chunk
+            ]
+            for future in as_completed(futures):
+                try:
+                    record = future.result()
+                except Exception:
+                    continue
+                if record is None:
+                    continue
+                records.append(record)
+                if len(records) >= _SCAN_ONLY_FALLBACK_MAX_RECORDS:
+                    break
+        if records:
+            break
+
+    if records:
+        device_contexts = {
+            _display_value(context.get("deviceName"), default=""): context
+            for context in _lookup_device_contexts_by_device_names(
+                [
+                    _display_value(record.get("deviceName"), default="")
+                    for record in records
+                ]
+            )
+        }
+        for record in records:
+            _apply_device_context_to_scan_only_record(
+                record,
+                device_contexts.get(_display_value(record.get("deviceName"), default="")),
+            )
+    return records, meta
+
+
 def _build_log_analysis_record(
     *,
     source_lines: list[str],
@@ -3804,6 +4300,84 @@ def _build_barcode_log_empty_result(
     return "\n".join(lines)
 
 
+def _lookup_blocking_special_barcode_context(barcode: str) -> dict[str, Any] | None:
+    normalized_barcode = str(barcode or "").strip()
+    if not normalized_barcode or not _is_mda_graphql_configured():
+        return None
+    try:
+        rows = _lookup_mda_special_barcodes_by_barcode(normalized_barcode)
+    except Exception:
+        return None
+
+    for row in rows:
+        special_type = _normalize_blocking_barcode_result(row.get("type"))
+        if special_type not in _BLOCKING_BARCODE_RESULT_LABELS:
+            continue
+        return {
+            "barcode": normalized_barcode,
+            "type": special_type,
+            "typeLabel": _blocking_barcode_result_label(special_type),
+            "reason": _display_value(row.get("reason"), default=""),
+            "createdAt": _display_value(row.get("createdAt"), default=""),
+            "updatedAt": _display_value(row.get("updatedAt"), default=""),
+        }
+    return None
+
+
+def _build_validation_block_log_result(
+    *,
+    barcode: str,
+    log_date: str,
+    mapped_device_count: int,
+    logs_found_any: int,
+    used_expanded_scope: bool,
+    validation_context: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    special_type = _display_value(validation_context.get("type"), default="BLOCKED")
+    type_label = _display_value(validation_context.get("typeLabel"), default="차단 대상 바코드")
+    reason = _display_value(validation_context.get("reason"), default="")
+    lines = [
+        "*로그 분석 결과*",
+        f"• 바코드: `{barcode}`",
+        f"• 날짜: `{log_date}`",
+        f"• 매핑 장비: `{mapped_device_count}개`",
+        f"• 확인한 로그 파일(매핑/병원 범위): `{logs_found_any}개`",
+        "• 결과: 요청 바코드 녹화 세션은 찾지 못했어",
+        f"• 원인 후보: 운영 제한 목록에서 `{type_label}`(`{special_type}`)로 등록돼 있어",
+        "• 영향: 유효성 검사가 켜진 장비에서는 스캔 직후 녹화가 시작되지 않고 차단돼",
+    ]
+    if reason:
+        lines.append(f"• 등록 사유: `{reason}`")
+    if used_expanded_scope:
+        lines.append("• 참고: 매핑 장비 외 같은 병원 장비도 함께 검색했어")
+    lines.append("• 참고: 실제 스캔 장비가 매핑 병원 밖이면 장비명/병원명을 같이 주면 해당 로그까지 바로 좁혀볼 수 있어")
+
+    # MDA 제한 목록 근거만으로 빠르게 원인을 알려주고, 느린 전수 S3 검색은 기본 경로에서 제외한다.
+    record = {
+        "validationBlock": True,
+        "barcode": barcode,
+        "date": log_date,
+        "validation": validation_context,
+        "sessions": {
+            "sessionCount": 0,
+            "normalCount": 0,
+            "abnormalCount": 0,
+            "allClosedNormally": False,
+        },
+        "scanEventCount": 0,
+        "restartEventCount": 0,
+        "errorLineCount": 0,
+        "errorLines": [],
+    }
+    return "\n".join(lines), _build_log_analysis_payload(
+        mode="scan",
+        barcode=barcode,
+        request_date=log_date,
+        date_range=None,
+        records=[record],
+    )
+
+
 def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]:
     text = (question or "").strip()
     hospital_match = _HOSPITAL_SCOPE_PATTERN.search(text)
@@ -3812,7 +4386,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     def _clean(value: str) -> str:
         normalized = re.sub(r"<@[^>]+>", " ", str(value or ""))
         normalized = re.sub(r"(?<!\S)@\S+", " ", normalized)
-        normalized = " ".join(normalized.split()).strip().strip("`'\"")
+        normalized = " ".join(normalized.split()).strip().strip("`'\"[]")
         normalized = re.sub(r"(?<!\d)\d{11}(?!\d)", "", normalized)
         normalized = re.sub(r"\s+\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*$", "", normalized)
         normalized = re.sub(r"\s+\d{1,2}\s*월\s*\d{1,2}\s*일\s*$", "", normalized)
@@ -4427,8 +5001,11 @@ def _analyze_barcode_log_scan_events(
     logs_found_any = 0
     logs_with_session = 0
     devices_with_session = 0
+    devices_with_scan_only = 0
+    total_scan_only_count = 0
     displayed_device_index = 0
     analysis_records: list[dict[str, Any]] = []
+    fallback_scan_search_meta: dict[str, Any] | None = None
 
     lines = [
         "*로그 분석 결과*",
@@ -4443,7 +5020,8 @@ def _analyze_barcode_log_scan_events(
     header_line_count = len(lines)
 
     def _analyze_device_context_batch(device_context_batch: list[dict[str, Any]]) -> None:
-        nonlocal total_session_count, logs_found_any, logs_with_session, devices_with_session, displayed_device_index
+        nonlocal total_session_count, logs_found_any, logs_with_session, devices_with_session
+        nonlocal devices_with_scan_only, total_scan_only_count, displayed_device_index
 
         for device_context in device_context_batch:
             device_name = str(device_context.get("deviceName") or "")
@@ -4494,8 +5072,32 @@ def _analyze_barcode_log_scan_events(
             session_motion_events = _events_in_sessions(motion_events, sessions)
             session_restart_events = _events_in_sessions(restart_events, sessions)
             session_error_lines = _error_lines_in_sessions(error_lines, sessions)
+            hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
+            room_name = _display_value(device_context.get("roomName"), default="미확인")
 
             if session_count == 0:
+                scan_only_record = _build_scan_only_log_analysis_record(
+                    source_lines=source_lines,
+                    device_name=device_name,
+                    hospital_name=hospital_name,
+                    room_name=room_name,
+                    log_key=str(log_data["key"]),
+                    log_date=log_date,
+                    barcode=barcode,
+                    scan_events=events,
+                    recordings_on_date_count=len(recordings_on_date_rows),
+                )
+                if scan_only_record is not None:
+                    _apply_device_context_to_scan_only_record(scan_only_record, device_context)
+                    analysis_records.append(scan_only_record)
+                    devices_with_scan_only += 1
+                    total_scan_only_count += int(scan_only_record.get("scanEventCount") or 0)
+                    displayed_device_index += 1
+                    _append_scan_only_record_section(
+                        lines,
+                        scan_only_record,
+                        index=displayed_device_index,
+                    )
                 continue
 
             extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
@@ -4512,8 +5114,6 @@ def _analyze_barcode_log_scan_events(
             lines.append(f"*장비 {displayed_device_index}*")
             lines.append(f"• 장비: `{device_name}`")
 
-            hospital_name = _display_value(device_context.get("hospitalName"), default="미확인")
-            room_name = _display_value(device_context.get("roomName"), default="미확인")
             analysis_records.append(
                 _build_log_analysis_record(
                     source_lines=source_lines,
@@ -4558,7 +5158,62 @@ def _analyze_barcode_log_scan_events(
 
     _analyze_device_context_batch(target_device_contexts)
 
-    if logs_with_session == 0:
+    if logs_with_session == 0 and devices_with_scan_only == 0:
+        validation_context = _lookup_blocking_special_barcode_context(barcode)
+        if validation_context is not None:
+            return _build_validation_block_log_result(
+                barcode=barcode,
+                log_date=log_date,
+                mapped_device_count=mapped_device_count,
+                logs_found_any=logs_found_any,
+                used_expanded_scope=used_expanded_scope,
+                validation_context=validation_context,
+            )
+
+    if (
+        _SCAN_ONLY_GLOBAL_FALLBACK_ENABLED
+        and logs_with_session == 0
+        and devices_with_scan_only == 0
+        and logs_found_any > 0
+    ):
+        excluded_device_names = {
+            _display_value(device_context.get("deviceName"), default="")
+            for device_context in target_device_contexts
+            if _display_value(device_context.get("deviceName"), default="")
+        }
+        fallback_records, fallback_scan_search_meta = _find_scan_only_records_by_date_log_search(
+            s3_client,
+            barcode=barcode,
+            log_date=log_date,
+            excluded_device_names=excluded_device_names,
+        )
+        if fallback_records:
+            try:
+                date_recordings_count = len(_load_recordings_rows_on_date_by_barcode(barcode, log_date))
+            except Exception:
+                date_recordings_count = None
+            lines.append("• 참고: 매핑/같은 병원 범위에서 세션이 없어 전체 일자 로그에서 스캔만 추가 검색했어")
+            searched_count = int((fallback_scan_search_meta or {}).get("searchedLogCount") or 0)
+            candidate_count = int((fallback_scan_search_meta or {}).get("candidateLogCount") or 0)
+            if searched_count > 0:
+                lines.append(
+                    f"• 전체 일자 로그 추가 검색: `{searched_count}/{candidate_count}개` 확인, "
+                    f"`{len(fallback_records)}개` 로그에서 스캔 확인"
+                )
+            for record in fallback_records:
+                if date_recordings_count is not None:
+                    record["recordingsOnDateCount"] = date_recordings_count
+                analysis_records.append(record)
+                devices_with_scan_only += 1
+                total_scan_only_count += int(record.get("scanEventCount") or 0)
+                displayed_device_index += 1
+                _append_scan_only_record_section(
+                    lines,
+                    record,
+                    index=displayed_device_index,
+                )
+
+    if logs_with_session == 0 and devices_with_scan_only == 0:
         result_text = _build_barcode_log_empty_result(
             title="*로그 분석 결과*",
             barcode=barcode,
@@ -4576,10 +5231,21 @@ def _analyze_barcode_log_scan_events(
             records=[],
         )
     abnormal_sessions = _count_abnormal_sessions_in_records(analysis_records)
-    lines[header_line_count:header_line_count] = [
-        f"• 확인 장비: `{devices_with_session}개`",
+    summary_lines = [
+        f"• 확인 장비: `{devices_with_session + devices_with_scan_only}개`",
         f"• 확인 세션: `{total_session_count}건`",
-        f"• 이상 세션: `{abnormal_sessions}건`",
+    ]
+    if devices_with_scan_only > 0:
+        if logs_with_session == 0:
+            summary_lines.append("• 결과: 바코드 스캔은 확인됐지만 녹화 세션은 생성되지 않았어")
+        summary_lines.append(
+            f"• 스캔만 확인: `{total_scan_only_count}건` (`{devices_with_scan_only}개` 장비)"
+        )
+    summary_lines.append(f"• 이상 세션: `{abnormal_sessions}건`")
+    if fallback_scan_search_meta is not None:
+        summary_lines.append(f"• 확인한 로그 파일(매핑/병원 범위): `{logs_found_any}개`")
+    lines[header_line_count:header_line_count] = [
+        *summary_lines,
     ]
     max_result_chars = max(s.S3_QUERY_MAX_RESULT_CHARS, 38000)
     result_text = _truncate_text("\n".join(lines), max_result_chars)

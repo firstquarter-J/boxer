@@ -62,6 +62,174 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         self.assertEqual(context["terminationStatus"], "정상 종료 (`C_STOPSESS` 확인)")
         self.assertEqual(context["videoStatus"], result)
 
+    def test_free_barcode_blocked_scan_is_reported_as_scan_only(self) -> None:
+        # 무료 바코드 차단은 Scanned 로그가 있어도 녹화 세션으로 만들면 안 된다.
+        source_lines = [
+            "2026-06-22_16:34:26.585 [app] info: Scanned : 43078716167",
+            "2026-06-22_16:34:26.595 [BarcodeManager] info: Free barcode detected: 43078716167. Blocking recording.",
+            "2026-06-22_16:34:26.596 [app] info: Barcode validation result: barcode=43078716167, result=FREE",
+            "2026-06-22_16:34:26.596 [app] info: Free Barcode: 43078716167",
+        ]
+
+        with patch(
+            "boxer_company.routers.barcode_log._fetch_s3_device_log_lines",
+            return_value={
+                "found": True,
+                "lines": source_lines,
+                "key": "MB2-C00375/log-2026-06-22.log",
+                "content_length": 1234,
+            },
+        ):
+            result_text, payload = _analyze_barcode_log_scan_events(
+                None,
+                "43078716167",
+                "2026-06-22",
+                recordings_context=None,
+                device_contexts=[
+                    {
+                        "deviceName": "MB2-C00375",
+                        "hospitalName": "에덴메디여성병원(수원)",
+                        "roomName": "입체초음파",
+                    }
+                ],
+            )
+
+        self.assertIn("바코드 스캔은 확인됐지만 녹화 세션은 생성되지 않았어", result_text)
+        self.assertIn("무료 바코드로 검증되어 장비가 녹화를 차단했어", result_text)
+        self.assertIn("result=FREE", result_text)
+        self.assertEqual(payload["summary"]["sessionCount"], 0)
+        self.assertEqual(payload["summary"]["scanEventCount"], 1)
+        self.assertTrue(payload["records"][0]["scanOnly"])
+
+    def test_scan_only_fallback_reports_outside_mapped_scope(self) -> None:
+        # 과거 recordings 매핑 병원 밖에서 스캔된 무료 바코드는 전체 일자 로그 fallback으로 보강한다.
+        fallback_record = {
+            "scanOnly": True,
+            "deviceName": "MB2-C00375",
+            "hospitalName": "에덴메디여성병원(수원)",
+            "roomName": "입체초음파",
+            "date": "2026-06-22",
+            "logKey": "MB2-C00375/log-2026-06-22.log",
+            "lineCount": 7000,
+            "sessions": {"sessionCount": 0, "normalCount": 0, "abnormalCount": 0},
+            "scanEventCount": 2,
+            "displayedScanEventCount": 2,
+            "scanEvents": [
+                {
+                    "lineNo": 1,
+                    "timeLabel": "16:34:26",
+                    "token": "43078716167",
+                    "rawLine": "[app] info: Scanned : 43078716167",
+                },
+                {
+                    "lineNo": 5,
+                    "timeLabel": "16:34:28",
+                    "token": "43078716167",
+                    "rawLine": "[app] info: Scanned : 43078716167",
+                },
+            ],
+            "scanOnlyReason": "무료 바코드로 검증되어 장비가 녹화를 차단했어 (`result=FREE`, `Blocking recording`)",
+            "blockingContextCount": 1,
+            "blockingContexts": [
+                {
+                    "result": "FREE",
+                    "rawLines": [
+                        {
+                            "timeLabel": "16:34:26",
+                            "rawLine": "[BarcodeManager] info: Free barcode detected: 43078716167. Blocking recording.",
+                        }
+                    ],
+                }
+            ],
+            "restartEventCount": 0,
+            "errorLineCount": 0,
+            "errorLines": [],
+            "errorGroups": [],
+            "sessionDetails": [],
+            "sessionDiagnostics": [],
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.barcode_log._fetch_s3_device_log_lines",
+                return_value={
+                    "found": True,
+                    "lines": ["[09:00:00] Scanned : 11111111111"],
+                    "key": "MB2-C00830/log-2026-06-22.log",
+                    "content_length": 1234,
+                },
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._find_scan_only_records_by_date_log_search",
+                return_value=([fallback_record], {"searchedLogCount": 384, "candidateLogCount": 1878}),
+            ),
+            patch("boxer_company.routers.barcode_log._lookup_blocking_special_barcode_context", return_value=None),
+            patch("boxer_company.routers.barcode_log._SCAN_ONLY_GLOBAL_FALLBACK_ENABLED", True),
+        ):
+            result_text, payload = _analyze_barcode_log_scan_events(
+                None,
+                "43078716167",
+                "2026-06-22",
+                recordings_context=None,
+                device_contexts=[
+                    {
+                        "deviceName": "MB2-C00830",
+                        "hospitalName": "아이오라여성의원(수원)",
+                        "roomName": "3진료실",
+                    }
+                ],
+            )
+
+        self.assertIn("전체 일자 로그 추가 검색", result_text)
+        self.assertIn("MB2-C00375", result_text)
+        self.assertIn("무료 바코드로 검증되어 장비가 녹화를 차단했어", result_text)
+        self.assertEqual(payload["summary"]["scanEventCount"], 2)
+        self.assertTrue(payload["records"][0]["scanOnly"])
+
+    def test_blocking_special_barcode_context_short_circuits_global_fallback(self) -> None:
+        # 전체 S3 검색 전에 MDA 제한 목록으로 FREE 차단 원인을 빠르게 설명한다.
+        with (
+            patch(
+                "boxer_company.routers.barcode_log._fetch_s3_device_log_lines",
+                return_value={
+                    "found": True,
+                    "lines": ["[09:00:00] Scanned : 11111111111"],
+                    "key": "MB2-C00830/log-2026-06-22.log",
+                    "content_length": 1234,
+                },
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._lookup_blocking_special_barcode_context",
+                return_value={
+                    "barcode": "43078716167",
+                    "type": "FREE",
+                    "typeLabel": "무료 바코드",
+                    "reason": "아이오라여성의원(수원)",
+                },
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._find_scan_only_records_by_date_log_search",
+            ) as fallback_search,
+        ):
+            result_text, payload = _analyze_barcode_log_scan_events(
+                None,
+                "43078716167",
+                "2026-06-22",
+                recordings_context=None,
+                device_contexts=[
+                    {
+                        "deviceName": "MB2-C00830",
+                        "hospitalName": "아이오라여성의원(수원)",
+                        "roomName": "3진료실",
+                    }
+                ],
+            )
+
+        fallback_search.assert_not_called()
+        self.assertIn("운영 제한 목록에서 `무료 바코드`(`FREE`)로 등록", result_text)
+        self.assertIn("유효성 검사가 켜진 장비에서는 스캔 직후 녹화가 시작되지 않고 차단", result_text)
+        self.assertTrue(payload["records"][0]["validationBlock"])
+
     def test_motion_success_without_db_row_is_not_normal(self) -> None:
         source_lines = [
             "[09:37:58] Scanned : 87752940438",
