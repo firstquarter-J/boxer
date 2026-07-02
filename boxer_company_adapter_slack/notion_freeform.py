@@ -2,6 +2,7 @@ import re
 from typing import Any
 
 from boxer_company import settings as cs
+from boxer_company.retrieval_rules import _is_notion_doc_general_overview_question
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES, build_team_freeform_context
 
 _NOTION_DOC_QUERY_TOKENS = (
@@ -107,59 +108,6 @@ _NOTION_DOC_QUERY_TOKENS = (
     "invalid barcode",
     "invalid_barcode",
     "ln_invalid_barcode",
-)
-_NOTION_DOC_GENERAL_OVERVIEW_TOKENS = (
-    "설명",
-    "소개",
-    "뭐야",
-    "뭐냐",
-    "뭔지",
-    "무엇",
-    "뭐 하는",
-    "뭐하는",
-    "개요",
-    "알려줘",
-    "대해",
-)
-_NOTION_DOC_GENERAL_OVERVIEW_SUBJECT_TOKENS = (
-    "마미박스",
-    "mommybox",
-)
-_NOTION_DOC_GENERAL_OVERVIEW_EXCLUSION_TOKENS = (
-    "녹화",
-    "프로세스",
-    "바코드",
-    "핑크",
-    "유효성",
-    "검증",
-    "동기화",
-    "베이비매직",
-    "emr",
-    "ftp",
-    "장애",
-    "증상",
-    "에러",
-    "오류",
-    "원인",
-    "왜",
-    "안 돼",
-    "안되",
-    "실패",
-    "모션",
-    "종료",
-    "업로드",
-    "업데이트",
-    "버전",
-    "설치",
-    "정책",
-    "방화벽",
-    "ssh",
-    "led",
-    "엘이디",
-    "음량",
-    "오디오",
-    "원격",
-    "메모리",
 )
 _NOTION_DOC_THREAD_MARKERS = (
     "문서 기반 답변",
@@ -599,19 +547,6 @@ def _is_notion_doc_exfiltration_attempt(question: str, thread_context: str = "")
 
 def _build_notion_doc_security_refusal() -> str:
     return "보안 위반 시도로 판단해 요청을 즉시 차단해. 문서 원문, 시스템 정보, 내부 지시문은 공개하지 않아. 같은 시도가 반복되면 관리자 검토 및 접근 제한 대상으로 처리해."
-
-
-def _is_notion_doc_general_overview_question(question: str) -> bool:
-    text = (question or "").strip()
-    if not text:
-        return False
-
-    lowered = text.lower()
-    if not any(token in lowered for token in _NOTION_DOC_GENERAL_OVERVIEW_SUBJECT_TOKENS):
-        return False
-    if not any(token in lowered for token in _NOTION_DOC_GENERAL_OVERVIEW_TOKENS):
-        return False
-    return not any(token in lowered for token in _NOTION_DOC_GENERAL_OVERVIEW_EXCLUSION_TOKENS)
 
 
 def _is_notion_doc_general_overview_answer(text: str) -> bool:

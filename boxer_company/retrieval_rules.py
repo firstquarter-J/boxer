@@ -72,18 +72,25 @@ def _mask_company_name(text: str) -> str:
     return clean[0] + "*" * (len(clean) - 2) + clean[-1]
 
 
-def _is_notion_doc_general_overview_payload(evidence_payload: dict[str, Any]) -> bool:
-    request = evidence_payload.get("request") if isinstance(evidence_payload.get("request"), dict) else {}
-    question = str(request.get("question") or "").strip()
-    if not question:
+def _is_notion_doc_general_overview_question(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
         return False
 
-    lowered = question.lower()
+    lowered = text.lower()
     if not any(token in lowered for token in _NOTION_DOC_GENERAL_OVERVIEW_SUBJECT_TOKENS):
         return False
     if not any(token in lowered for token in _NOTION_DOC_GENERAL_OVERVIEW_TOKENS):
         return False
     return not any(token in lowered for token in _NOTION_DOC_GENERAL_OVERVIEW_EXCLUSION_TOKENS)
+
+
+def _is_notion_doc_general_overview_payload(evidence_payload: dict[str, Any]) -> bool:
+    request = evidence_payload.get("request") if isinstance(evidence_payload.get("request"), dict) else {}
+    question = str(request.get("question") or "").strip()
+    if not question:
+        return False
+    return _is_notion_doc_general_overview_question(question)
 
 
 def _mask_company_fields_by_key(key: str, value: Any) -> Any:
