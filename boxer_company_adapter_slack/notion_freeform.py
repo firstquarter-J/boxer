@@ -2,6 +2,7 @@ import re
 from typing import Any
 
 from boxer_company import settings as cs
+from boxer_company.retrieval_rules import _is_notion_doc_general_overview_question
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES, build_team_freeform_context
 
 _NOTION_DOC_QUERY_TOKENS = (
@@ -548,6 +549,22 @@ def _build_notion_doc_security_refusal() -> str:
     return "보안 위반 시도로 판단해 요청을 즉시 차단해. 문서 원문, 시스템 정보, 내부 지시문은 공개하지 않아. 같은 시도가 반복되면 관리자 검토 및 접근 제한 대상으로 처리해."
 
 
+def _is_notion_doc_general_overview_answer(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized.startswith("*문서 기반 답변*"):
+        return False
+    lowered = normalized.lower()
+    return "마미박스" in normalized and any(
+        token in lowered
+        for token in (
+            "운영 장비",
+            "녹화",
+            "업로드",
+            "병원",
+        )
+    )
+
+
 def _classify_freeform_response_mode(question: str, thread_context: str = "") -> str:
     normalized = f"{question or ''}\n{thread_context or ''}".lower()
     if any(token in normalized for token in _FREEFORM_COMPARISON_HINTS):
@@ -662,6 +679,34 @@ def _needs_notion_doc_security_refusal(text: str, route_name: str) -> bool:
     return False
 
 
+def _build_notion_doc_general_overview_fallback(
+    references: list[dict[str, Any]],
+    preview_fragments: list[str],
+) -> str:
+    lines = ["*문서 기반 답변*"]
+    lines.append("마미박스는 병원에서 산모 영상을 녹화하고 서버로 업로드하는 운영 장비야.")
+    lines.append("")
+    lines.append("바코드 스캔으로 촬영 세션을 시작하고, 장비 설정 업데이트와 로그 업로드 같은 운영 흐름을 같이 처리해.")
+
+    has_babymagic = any("베이비매직" in fragment for fragment in preview_fragments)
+    has_emr = any("EMR" in fragment or "emr" in fragment.lower() or "FTP" in fragment or "ftp" in fragment.lower() for fragment in preview_fragments)
+    extension_parts = []
+    if has_babymagic:
+        extension_parts.append("베이비매직 연동")
+    if has_emr:
+        extension_parts.append("EMR 연동")
+    extension_text = ", ".join(extension_parts)
+    if extension_text:
+        lines.append(f"운영 문서에는 녹화/업로드, 장애 대응, {extension_text}, 설치와 업데이트 기준이 같이 정리돼 있어.")
+    else:
+        lines.append("운영 문서에는 녹화/업로드, 장애 대응, 연동 기능, 설치와 업데이트 기준이 같이 정리돼 있어.")
+
+    if any(str(item.get("kind") or "").strip() == "overview" for item in references):
+        # 개요 질문은 사용자가 바로 이해할 수 있는 설명을 우선하고, 세부 점검 항목은 참고 문서 링크로 넘긴다.
+        lines.append("세부 장애나 정책을 물으면 그때 관련 문서 기준으로 좁혀서 답하면 돼.")
+    return "\n".join(lines)
+
+
 def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] | None) -> str:
     def _clean_preview_line(text: str) -> str:
         line = re.sub(r"^#+\s*", "", str(text or "").strip())
@@ -762,6 +807,9 @@ def _build_notion_doc_fallback(question: str, references: list[dict[str, Any]] |
                 break
         if len(preview_fragments) >= 8:
             break
+
+    if _is_notion_doc_general_overview_question(question):
+        return _build_notion_doc_general_overview_fallback(items, preview_fragments)
 
     is_pink_barcode_overview_doc = primary_title == _PINK_BARCODE_OVERVIEW_TITLE
     is_mommybox_recording_process_doc = primary_title == _MOMMYBOX_RECORDING_PROCESS_TITLE
@@ -1020,6 +1068,9 @@ def _needs_notion_doc_fallback(text: str, route_name: str, fallback_text: str = 
         return True
     if "https ping 응답이 오는데 ssh만 안 되면" in fallback_lowered and "ssh만 안 되면" not in lowered:
         return True
+
+    if _is_notion_doc_general_overview_answer(fallback_normalized):
+        return not _is_notion_doc_general_overview_answer(normalized)
 
     required_bullets = (
         "• 결론:",

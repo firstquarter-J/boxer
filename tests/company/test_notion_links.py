@@ -33,6 +33,32 @@ class NotionLinksTests(unittest.TestCase):
         titles = [doc["title"] for doc in docs]
         self.assertIn("바코드 검증: 핑크 바코드만 예외 허용할 수 있는지", titles)
 
+    def test_direct_playbook_link_prevents_lower_ranked_doc_link_leak(self) -> None:
+        docs = select_company_notion_doc_links(
+            "모션감지 사용안함 설정 상태에서 자동으로 녹화시작 되는 이유는?",
+            notion_playbooks=[
+                {
+                    "title": "모션감지 사용안함 상태에서 바코드 스캔 후 1시간 뒤 자동 녹화 시작",
+                    "matchedKeywords": ["모션감지 사용안함", "자동 녹화"],
+                },
+                {
+                    "title": "모션감지 사용안함 설정 시 바코드 스캔 후 자동 녹화 시작",
+                    "url": "https://app.notion.com/p/383cf826870c81d68f82e63f3835fa24",
+                    "matchedKeywords": ["모션감지 사용안함", "자동 녹화"],
+                },
+                {
+                    "title": "초음파 영상 확인",
+                    "url": "https://www.notion.so/928b6cfcb7c7463d92c787c69d0ca7f1?pvs=21",
+                    "matchedKeywords": ["녹화"],
+                },
+            ],
+        )
+
+        self.assertEqual(
+            [doc["title"] for doc in docs],
+            ["모션감지 사용안함 설정 시 바코드 스캔 후 자동 녹화 시작"],
+        )
+
     def test_firewall_reference_doc_is_excluded_from_company_links(self) -> None:
         docs = select_company_notion_doc_links(
             "장비 ssh 연결이 안 되면 뭘 해야 해?",
