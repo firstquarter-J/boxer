@@ -197,9 +197,6 @@ from boxer_company.routers.usage_help import (
     _is_usage_help_request,
 )
 
-_FORCE_NOTION_KNOWLEDGE_FAILURE_ON_MENTION = True
-_FORCED_NOTION_KNOWLEDGE_FAILURE_REPLY = "노션 지식보관소 연동에 실패해 답변할 수 없습니다."
-
 
 def create_app() -> App:
     _validate_ec2_runtime_aws_env()
@@ -233,13 +230,6 @@ def create_app() -> App:
         channel_id = payload["channel_id"]
         current_ts = payload["current_ts"]
         thread_ts = payload["thread_ts"]
-
-        if _FORCE_NOTION_KNOWLEDGE_FAILURE_ON_MENTION:
-            # 임시 장애 공지 모드: 모든 멘션은 라우터/조회/LLM을 타지 않고 고정 문구만 반환한다.
-            _set_request_log_route(payload, "forced_notion_knowledge_failure", route_mode="guard")
-            reply(_FORCED_NOTION_KNOWLEDGE_FAILURE_REPLY)
-            logger.info("Responded with forced Notion knowledge failure in thread_ts=%s", thread_ts)
-            return
 
         if "ping" in text:
             _set_request_log_route(payload, "ping")
