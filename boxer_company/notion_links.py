@@ -381,6 +381,41 @@ def _build_seed_titles(playbooks: list[dict[str, Any]] | None) -> list[str]:
     return titles
 
 
+def _company_doc_by_normalized_title() -> dict[str, dict[str, Any]]:
+    docs: dict[str, dict[str, Any]] = {}
+    for entry in _COMPANY_NOTION_DOCS:
+        title = _normalize_lookup_text(str(entry.get("title") or ""))
+        if title:
+            docs[title] = entry
+    return docs
+
+
+def _build_direct_playbook_doc_links(
+    playbooks: list[dict[str, Any]] | None,
+    *,
+    max_results: int,
+) -> list[dict[str, str]]:
+    title_to_doc = _company_doc_by_normalized_title()
+    selected: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in playbooks or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not title or not url or url in seen_urls:
+            continue
+        company_doc = title_to_doc.get(_normalize_lookup_text(title))
+        if isinstance(company_doc, dict) and company_doc.get("includeInCompanyLinks") is False:
+            continue
+        seen_urls.add(url)
+        selected.append({"title": title, "url": url})
+        # 문서 Q&A에서는 상위 플레이북 하나가 실제 근거다. 하위 후보 링크까지 붙이면 과매칭 문서가 노출된다.
+        if len(selected) >= max(1, max_results):
+            break
+    return selected
+
+
 def _build_seed_terms(question: str, playbooks: list[dict[str, Any]] | None) -> tuple[str, set[str]]:
     normalized_question = _normalize_lookup_text(question)
     terms = set(_extract_lookup_terms(question))
@@ -407,6 +442,13 @@ def select_company_notion_doc_links(
 
     seed_titles = _build_seed_titles(notion_playbooks)
     has_overview_intent = any(token in normalized_question for token in _COMPANY_DOC_OVERVIEW_TOKENS)
+    direct_playbook_links = _build_direct_playbook_doc_links(
+        notion_playbooks,
+        max_results=1,
+    )
+    if direct_playbook_links and not has_overview_intent:
+        return direct_playbook_links
+
     require_exact_title_match = bool(seed_titles) and not has_overview_intent
     scored: list[tuple[int, dict[str, Any]]] = []
 

@@ -1,5 +1,6 @@
 import unittest
 
+from boxer_company.retrieval_rules import _build_company_retrieval_rules
 from boxer_company_adapter_slack.company import (
     _build_notion_doc_fallback,
     _needs_notion_doc_fallback,
@@ -74,9 +75,58 @@ _REMOTE_ACCESS_FIREWALL_REFERENCES = [
         ],
     }
 ]
+_MOMMYBOX_OVERVIEW_REFERENCES = [
+    {
+        "title": "마미박스 프로세스 순서",
+        "previewLines": [
+            "순서: 바코드 스캔 후 준비 음성이 나오고 세션이 생성된 뒤 모션 감지가 시작돼",
+        ],
+    },
+    {
+        "title": "마미박스",
+        "kind": "overview",
+        "previewLines": [
+            "마미박스",
+            "장애 대응: 운영 장애와 장비 확인 기준",
+            "베이비매직 연동: 베이비매직 생성과 재전송 기준",
+            "설치: 장비 설치와 업데이트 기준",
+            "EMR 연동(FTP): 병원 EMR 파일 연동 기준",
+        ],
+    },
+]
 
 
 class NotionDocFallbackTests(unittest.TestCase):
+    def test_mommybox_general_overview_uses_natural_explanation(self) -> None:
+        # 자유 설명형 질문은 점검/조치 포맷보다 바로 이해되는 개요가 먼저다.
+        text = _build_notion_doc_fallback(
+            "마미박스에 대해 설명해",
+            _MOMMYBOX_OVERVIEW_REFERENCES,
+        )
+
+        self.assertIn("*문서 기반 답변*", text)
+        self.assertIn("마미박스는 병원에서 산모 영상을 녹화하고 서버로 업로드하는 운영 장비야.", text)
+        self.assertIn("베이비매직 연동", text)
+        self.assertIn("EMR 연동", text)
+        self.assertNotIn("• 확인:", text)
+        self.assertNotIn("• 조치:", text)
+        self.assertFalse(_needs_notion_doc_fallback(text, "notion playbook qa", text))
+
+        synthesized_text = "*문서 기반 답변*\n마미박스는 병원에서 산모 영상을 녹화하고 업로드하는 운영 장비야."
+        self.assertFalse(_needs_notion_doc_fallback(synthesized_text, "notion playbook qa", text))
+
+    def test_mommybox_general_overview_rules_do_not_force_check_action(self) -> None:
+        rules = _build_company_retrieval_rules(
+            {
+                "route": "notion_playbook_qa",
+                "request": {"question": "마미박스가 뭐야?"},
+                "notionReferences": _MOMMYBOX_OVERVIEW_REFERENCES,
+            }
+        )
+
+        self.assertIn("자유 설명형이면 점검 체크리스트로 만들지 마", rules)
+        self.assertIn("`확인`, `조치`, `권장 조치` 섹션을 만들지 마", rules)
+
     def test_mommybox_recording_process_explains_session_recording_and_upload(self) -> None:
         text = _build_notion_doc_fallback(
             "마미박스 녹화 프로세스 설명",
