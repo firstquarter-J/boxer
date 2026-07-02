@@ -1941,6 +1941,53 @@ def _lookup_device_contexts_by_barcode_on_date(
     return _lookup_device_contexts_from_recording_rows(recording_rows)
 
 
+def _lookup_device_contexts_by_device_names(
+    device_names: list[str] | tuple[str, ...] | set[str],
+) -> list[dict[str, Any]]:
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    ordered_names: list[str] = []
+    seen_names: set[str] = set()
+    for raw_name in device_names:
+        normalized_name = str(raw_name or "").strip()
+        if not normalized_name or normalized_name in seen_names:
+            continue
+        seen_names.add(normalized_name)
+        ordered_names.append(normalized_name)
+    if not ordered_names:
+        return []
+
+    placeholders = ", ".join(["%s"] * len(ordered_names))
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            # 로그 키에서 찾은 장비명을 DB 메타와 다시 결합해서 병원/병실 근거를 함께 보여준다.
+            cursor.execute(
+                "SELECT "
+                "d.seq AS deviceSeq, "
+                "d.deviceName AS deviceName, "
+                "d.hospitalSeq AS hospitalSeq, "
+                "d.hospitalRoomSeq AS hospitalRoomSeq, "
+                "h.hospitalName AS hospitalName, "
+                "hr.roomName AS roomName "
+                "FROM devices d "
+                "LEFT JOIN hospitals h ON d.hospitalSeq = h.seq "
+                "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
+                f"WHERE d.deviceName IN ({placeholders})",
+                tuple(ordered_names),
+            )
+            rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    order_map = {name: index for index, name in enumerate(ordered_names)}
+    return sorted(
+        rows,
+        key=lambda row: order_map.get(str(row.get("deviceName") or "").strip(), len(order_map)),
+    )
+
+
 def _lookup_device_contexts_from_recording_rows(
     recording_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:

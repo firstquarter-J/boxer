@@ -115,6 +115,31 @@ class BarcodeLogHelperTests(unittest.TestCase):
         self.assertEqual(hospital_name, "분당제일여성병원(성남)")
         self.assertEqual(room_name, "5층 4진료실")
 
+    def test_extract_hospital_room_scope_handles_numeric_room_followup(self) -> None:
+        hospital_name, room_name = _extract_hospital_room_scope(
+            "@Boxer 60771998678 산본제일병원(군포) 209호 2026-06-27 파일 다운로드"
+        )
+
+        self.assertEqual(hospital_name, "산본제일병원(군포)")
+        self.assertEqual(room_name, "209호")
+
+    def test_extract_hospital_room_scope_cleans_mda_recovery_labels(self) -> None:
+        hospital_name, room_name = _extract_hospital_room_scope(
+            "\n".join(
+                [
+                    "업로드 실패한 마미박스 초음파 영상을 모두 낚았습니다!",
+                    "바코드: [60771998678]",
+                    "촬영일: [2026-06-27:14:34:14]",
+                    "병원명: [산본제일병원(군포)]",
+                    "병실명: [209호]",
+                    "장비명: [MB2-C00900]",
+                ]
+            )
+        )
+
+        self.assertEqual(hospital_name, "산본제일병원(군포)")
+        self.assertEqual(room_name, "209호")
+
     def test_extract_hospital_room_scope_preserves_room_prefix_for_ultrasound_room(self) -> None:
         hospital_name, room_name = _extract_hospital_room_scope(
             "<@U123> 23318551080 분당제일여성병원(성남) 3층 C동 초음파실3 2026-04-07 로그 분석"
