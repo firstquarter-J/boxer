@@ -7,8 +7,14 @@ from boxer.core import settings as s
 
 def _validate_llm_tokens(missing: list[str]) -> None:
     if s.LLM_PROVIDER == "claude":
-        if not s.ANTHROPIC_API_KEY or "REPLACE_ME" in s.ANTHROPIC_API_KEY:
-            missing.append("ANTHROPIC_API_KEY")
+        has_api_key = bool(s.ANTHROPIC_API_KEY and "REPLACE_ME" not in s.ANTHROPIC_API_KEY)
+        has_oauth_token = bool(s.ANTHROPIC_AUTH_TOKEN and "REPLACE_ME" not in s.ANTHROPIC_AUTH_TOKEN)
+        has_oauth_command = bool(
+            s.ANTHROPIC_AUTH_TOKEN_COMMAND
+            and "REPLACE_ME" not in s.ANTHROPIC_AUTH_TOKEN_COMMAND
+        )
+        if not (has_api_key or has_oauth_token or has_oauth_command):
+            missing.append("ANTHROPIC_API_KEY 또는 ANTHROPIC_AUTH_TOKEN")
         if not s.ANTHROPIC_MODEL or "REPLACE_ME" in s.ANTHROPIC_MODEL:
             missing.append("ANTHROPIC_MODEL")
 

@@ -1,10 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import pymysql
 from botocore.exceptions import ClientError
 
 from boxer_company_adapter_slack.company import _build_dependency_failure_reply, _format_ping_llm_status
-from boxer.core.llm import _check_claude_health
+from boxer.core.llm import _build_claude_client, _check_claude_health
 
 
 class _FakeMessages:
@@ -30,6 +31,16 @@ class PingStatusTests(unittest.TestCase):
 
 
 class ClaudeHealthTests(unittest.TestCase):
+    def test_builds_oauth_claude_client_without_api_key_header(self) -> None:
+        with (
+            patch("boxer.core.llm.s.ANTHROPIC_API_KEY", "sk-ant-low-credit"),
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN", "oauth-token"),
+            patch("boxer.core.llm.s.ANTHROPIC_AUTH_TOKEN_COMMAND", ""),
+        ):
+            client = _build_claude_client(timeout_sec=1)
+
+        self.assertEqual(client.auth_headers, {"Authorization": "Bearer oauth-token"})
+
     def test_reports_ok_for_successful_claude_call(self) -> None:
         result = _check_claude_health(_FakeClaudeClient())
 
