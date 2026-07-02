@@ -61,18 +61,27 @@ def _resolve_anthropic_auth_token() -> str:
         return ""
 
     # OAuth 토큰은 만료될 수 있어서, 필요한 경우 외부 helper가 최신 토큰을 stdout으로 돌려준다.
-    result = subprocess.run(
-        shlex.split(command),
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=max(1, s.ANTHROPIC_AUTH_TOKEN_COMMAND_TIMEOUT_SEC),
-    )
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(1, s.ANTHROPIC_AUTH_TOKEN_COMMAND_TIMEOUT_SEC),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Anthropic OAuth token command timed out") from exc
+    except OSError as exc:
+        raise RuntimeError("Failed to execute Anthropic OAuth token command") from exc
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"Anthropic OAuth token command failed: {detail[:200]}")
+        raise RuntimeError(
+            f"Anthropic OAuth token command failed with exit code {result.returncode}"
+        )
     token_lines = (result.stdout or "").strip().splitlines()
-    return token_lines[0].strip() if token_lines else ""
+    token = token_lines[0].strip() if token_lines else ""
+    if not token:
+        raise RuntimeError("Anthropic OAuth token command returned an empty token")
+    return token
 
 
 def _build_claude_client(*, timeout_sec: int | None = None) -> Anthropic:
@@ -189,7 +198,8 @@ def _check_claude_health(
 
     try:
         health_client = client or _build_claude_client(timeout_sec=actual_timeout)
-        _refresh_claude_oauth_token(health_client)
+        if client is not None:
+            _refresh_claude_oauth_token(health_client)
         health_client.messages.create(
             model=configured_model,
             max_tokens=1,

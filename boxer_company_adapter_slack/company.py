@@ -209,11 +209,13 @@ _FORCED_NOTION_KNOWLEDGE_FAILURE_REPLY = "노션 지식보관소 연동에 실�
 def create_app() -> App:
     _validate_ec2_runtime_aws_env()
     _validate_tokens(include_llm=True, include_data_sources=True)
-    claude_client = (
-        _build_claude_client(timeout_sec=s.ANTHROPIC_TIMEOUT_SEC)
-        if s.LLM_PROVIDER == "claude"
-        else None
-    )
+    app_logger = logging.getLogger(__name__)
+    claude_client = None
+    if s.LLM_PROVIDER == "claude":
+        try:
+            claude_client = _build_claude_client(timeout_sec=s.ANTHROPIC_TIMEOUT_SEC)
+        except Exception:
+            app_logger.warning("Failed to initialize Claude client; continuing without it", exc_info=True)
     s3_client: Any | None = None
 
     def _get_s3_client() -> Any:
@@ -941,7 +943,7 @@ def create_app() -> App:
         )
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
-    attach_weekly_recordings_reporter(app, logger=logging.getLogger(__name__))
-    attach_device_health_monitor_reporter(app, logger=logging.getLogger(__name__))
-    attach_daily_device_round_reporter(app, logger=logging.getLogger(__name__))
+    attach_weekly_recordings_reporter(app, logger=app_logger)
+    attach_device_health_monitor_reporter(app, logger=app_logger)
+    attach_daily_device_round_reporter(app, logger=app_logger)
     return app
