@@ -165,6 +165,15 @@ def _build_device_download_barcode_required_message() -> str:
     )
 
 
+def _build_device_download_date_required_message() -> str:
+    # 다운로드 요청에는 다운로드 예시를 보여줘서 날짜 보강 입력을 바로 이어가게 한다.
+    return (
+        "영상 다운로드는 날짜 없이는 특정할 수 없어.\n"
+        "11자리 바코드랑 날짜를 같이 보내줘. "
+        "예: `12345678910 2026-04-28 영상 다운로드`"
+    )
+
+
 def _normalize_daily_device_round_control_question(question: str) -> str:
     return " ".join(str(question or "").strip().lower().split())
 
@@ -473,7 +482,10 @@ def _handle_device_routes(
         try:
             log_date, has_requested_date = _extract_log_date_with_presence(question)
             if not has_requested_date:
-                context.reply("파일 확인 대상 세션 조회는 날짜가 필요해. 예: `48194663047 2026-03-06 파일 있나`")
+                if download_remote_files:
+                    context.reply(_build_device_download_date_required_message())
+                else:
+                    context.reply("파일 확인 대상 세션 조회는 날짜가 필요해. 예: `48194663047 2026-03-06 파일 있나`")
                 return True
 
             recordings_context = deps.get_recordings_context()

@@ -260,6 +260,61 @@ class DeviceRouteHandlerTests(unittest.TestCase):
             ],
         )
 
+    def test_video_extract_keyword_without_date_asks_for_date_before_lookup(self) -> None:
+        replies: list[str] = []
+
+        deps = DeviceRoutesDeps(
+            get_s3_client=lambda: self.fail("S3 lookup should not run without requested date"),
+            get_recordings_context=lambda: self.fail(
+                "recordings lookup should not run without requested date"
+            ),
+            has_recordings_device_mapping=lambda context: False,
+            send_dm_message=lambda user_id, text: False,
+            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+        )
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_HOST", "db-host"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_USERNAME", "db-user"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_PASSWORD", "db-pass"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_DATABASE", "db-name"),
+            patch("boxer_company_adapter_slack.device_routes.cs.DEVICE_FILE_DOWNLOAD_BUCKET", "bucket"),
+            patch(
+                "boxer_company_adapter_slack.device_routes._is_device_runtime_configured",
+                return_value=True,
+            ),
+        ):
+            # "영상 꺼내"는 다운로드 의도지만, 날짜가 없으면 장비 조회 전에 보강 입력을 요청한다.
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="장유산부인과의원(김해) 6진료실 45707511017 18:37:36 영상 꺼내와주세요",
+                    barcode="45707511017",
+                    phase2_hospital_name="장유산부인과의원(김해)",
+                    phase2_room_name="6진료실",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                deps,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            replies,
+            [
+                "영상 다운로드는 날짜 없이는 특정할 수 없어.\n"
+                "11자리 바코드랑 날짜를 같이 보내줘. "
+                "예: `12345678910 2026-04-28 영상 다운로드`"
+            ],
+        )
+
     def test_uses_recordings_scope_fallback_for_dated_device_file_probe(self) -> None:
         replies: list[str] = []
 
