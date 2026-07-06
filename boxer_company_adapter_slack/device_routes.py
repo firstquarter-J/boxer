@@ -53,6 +53,11 @@ from boxer_company.routers.device_log_upload import (
     _extract_latest_hospital_room_scope_from_thread_context,
     _is_device_log_upload_check_request,
 )
+from boxer_company.routers.device_led_log import (
+    _analyze_device_led_log,
+    _format_led_log_date_required_message,
+    _is_device_led_log_analysis_request,
+)
 from boxer_company.routers.device_status_probe import (
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
@@ -292,6 +297,46 @@ def _handle_device_routes(
     if _is_missing_barcode_device_download_request(question, barcode):
         # 다운로드는 세션 단위 작업이라 병원/병실/날짜만으로 확정하지 않는다.
         context.reply(_build_device_download_barcode_required_message())
+        return True
+
+    if _is_device_led_log_analysis_request(question, device_name=structured_device_name):
+        if not s.S3_QUERY_ENABLED:
+            context.reply("LED 로그 확인 기능이 꺼져 있어. .env에서 S3_QUERY_ENABLED=true로 설정해줘")
+            return True
+        try:
+            log_date, has_requested_date = _extract_log_date_with_presence(question)
+            if not has_requested_date:
+                context.reply(_format_led_log_date_required_message(structured_device_name))
+                return True
+            resolved_device_name = structured_device_name or ""
+            _set_request_log_route(
+                context.payload,
+                "device led log analysis",
+                handler_type="router",
+                subject_type="device",
+                subject_key=resolved_device_name,
+                requested_date=log_date,
+            )
+            result_text, _ = _analyze_device_led_log(
+                deps.get_s3_client(),
+                resolved_device_name,
+                log_date,
+            )
+            context.reply(result_text)
+            context.logger.info(
+                "Responded with device led log analysis in thread_ts=%s deviceName=%s date=%s",
+                context.thread_ts,
+                resolved_device_name,
+                log_date,
+            )
+        except ValueError as exc:
+            context.reply(f"LED 로그 확인 요청 형식 오류: {exc}")
+        except (BotoCoreError, ClientError, RuntimeError) as exc:
+            context.logger.exception("Device LED log analysis failed")
+            context.reply(deps.build_dependency_failure_reply("LED 로그 확인", exc))
+        except Exception:
+            context.logger.exception("Device LED log analysis failed")
+            context.reply("LED 로그 확인 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if _is_device_led_pattern_help_request(question):

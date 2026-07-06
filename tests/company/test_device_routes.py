@@ -33,6 +33,52 @@ def _deps() -> DeviceRoutesDeps:
 
 
 class DeviceRouteHandlerTests(unittest.TestCase):
+    def test_device_led_log_question_uses_log_analysis_before_pattern_guide(self) -> None:
+        replies: list[str] = []
+        synth_calls: list[tuple[object, ...]] = []
+
+        deps = DeviceRoutesDeps(
+            get_s3_client=lambda: "s3-client",
+            get_recordings_context=lambda: {},
+            has_recordings_device_mapping=lambda context: False,
+            send_dm_message=lambda user_id, text: False,
+            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+            reply_with_retrieval_synthesis=lambda *args, **kwargs: synth_calls.append(args),
+        )
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch(
+                "boxer_company_adapter_slack.device_routes._analyze_device_led_log",
+                return_value=("*장비 LED 로그 확인*\n• 결론: 테스트", {"route": "device_led_log_analysis"}),
+            ) as analyze_led_log,
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question=(
+                        "MB2-C00570 2026-07-04 LED 이상 조사. "
+                        "대기모드일때는 초록색만 나와야하는데 전원오프상태의 led가 표시됐다고 해"
+                    ),
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                deps,
+            )
+
+        self.assertTrue(handled)
+        analyze_led_log.assert_called_once_with("s3-client", "MB2-C00570", "2026-07-04")
+        self.assertEqual(replies, ["*장비 LED 로그 확인*\n• 결론: 테스트"])
+        self.assertEqual(synth_calls, [])
+
     def test_daily_box_auto_update_enable_command_updates_runtime_setting(self) -> None:
         replies: list[str] = []
 
