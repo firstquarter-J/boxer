@@ -8,11 +8,14 @@ from boxer_company.routers.barcode_log import (
     _build_session_card_context,
     _build_session_recording_result_text,
     _extract_motion_events_with_line_no,
+    _extract_recording_sessions,
     _extract_restart_events_with_line_no,
     _extract_scan_events_with_line_no,
     _fetch_device_os_lifecycle_events_for_sessions,
+    _find_recording_recovery_context,
     _is_normal_video_status,
     _match_recordings_rows_to_sessions,
+    _scan_event_is_blocked_before_recording,
 )
 from unittest.mock import patch
 
@@ -100,6 +103,34 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["sessionCount"], 0)
         self.assertEqual(payload["summary"]["scanEventCount"], 1)
         self.assertTrue(payload["records"][0]["scanOnly"])
+
+    def test_valid_barcode_validation_result_keeps_recording_session(self) -> None:
+        # VALID 검증 결과는 차단이 아니므로 addRecording/motion 로그를 세션으로 이어야 한다.
+        source_lines = [
+            "2026-07-06_12:12:08.439 [app] info: Scanned : 22320534406",
+            "2026-07-06_12:12:08.448 [app] info: "
+            "Barcode validation result: barcode=22320534406, result=VALID",
+            "2026-07-06_12:12:08.783 [SqliteStorage] info: addRecording(tcetslmmgzn1s8v3)",
+            "2026-07-06_12:12:08.923 [FfmpegController] info: "
+            "Spawned MOTION ffmpeg with command: "
+            "ffmpeg /home/mommytalk/AppData/Videos/tcetslmmgzn1s8v3.motion.mp4",
+            "2026-07-06_12:25:35.405 [app] info: Scanned : C_STOPSESS",
+            "2026-07-06_12:25:35.845 [app] warn: Motion detection ended abnormally, moving to trash can",
+        ]
+        scan_events = _extract_scan_events_with_line_no(source_lines)
+
+        self.assertFalse(
+            _scan_event_is_blocked_before_recording(source_lines, scan_events[0], "22320534406")
+        )
+
+        sessions = _extract_recording_sessions(source_lines, "22320534406", 20, scan_events=scan_events)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["stop_token"], "C_STOPSESS")
+
+        recovery_context = _find_recording_recovery_context(source_lines, sessions[0])
+        self.assertIsNotNone(recovery_context)
+        self.assertEqual(recovery_context["fileId"], "tcetslmmgzn1s8v3")
 
     def test_scan_only_fallback_reports_outside_mapped_scope(self) -> None:
         # 과거 recordings 매핑 병원 밖에서 스캔된 무료 바코드는 전체 일자 로그 fallback으로 보강한다.

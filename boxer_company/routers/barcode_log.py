@@ -156,6 +156,7 @@ _BLOCKING_BARCODE_RESULT_LABELS = {
     "INVALID": "유효하지 않은 바코드",
     "BLOCKED": "차단 대상 바코드",
 }
+_BLOCKING_BARCODE_RESULTS = frozenset(_BLOCKING_BARCODE_RESULT_LABELS)
 _SCAN_ONLY_BLOCK_LOOKAHEAD_LINES = 10
 _SCAN_ONLY_FALLBACK_BATCH_SIZE = 128
 _SCAN_ONLY_FALLBACK_MAX_WORKERS = 32
@@ -1181,7 +1182,11 @@ def _find_barcode_scan_block_context(
         line_mentions_barcode = normalized_barcode in stripped
         validation_match = _BARCODE_VALIDATION_RESULT_PATTERN.search(stripped)
         if validation_match and validation_match.group(1) == normalized_barcode:
-            result = _normalize_blocking_barcode_result(validation_match.group(2))
+            normalized_result = _normalize_blocking_barcode_result(validation_match.group(2))
+            # VALID는 녹화 진행 신호다. 차단 결과만 scan-only 차단 컨텍스트로 남긴다.
+            if normalized_result not in _BLOCKING_BARCODE_RESULTS:
+                continue
+            result = normalized_result
             result_line_no = line_no
             raw_lines.append(
                 {
