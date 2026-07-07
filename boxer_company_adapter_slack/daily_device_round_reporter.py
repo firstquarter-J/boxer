@@ -671,6 +671,9 @@ def _collect_daily_device_round_abnormal_alert_items(
                     device_name=device_name,
                     hospital_seq=hospital_seq,
                 ),
+                "mdaHospitalEditUrl": _build_daily_device_round_mda_hospital_edit_url(
+                    hospital_name=hospital_name,
+                ),
             }
         )
 
@@ -747,9 +750,24 @@ def _build_daily_device_round_mda_monitoring_url(
     return f"{cs.MDA_GRAPHQL_ORIGIN.rstrip('/')}/monitoring?{query}"
 
 
+def _build_daily_device_round_mda_hospital_edit_url(*, hospital_name: str) -> str:
+    normalized_hospital_name = _display_value(hospital_name, default="")
+    if not normalized_hospital_name or normalized_hospital_name == "병원 미확인":
+        return ""
+
+    # MDA 병원 리스트는 search query를 병원명 LIKE 검색으로 처리하므로 병원명을 바로 넘긴다.
+    query = urlencode({"search": normalized_hospital_name})
+    return f"{cs.MDA_GRAPHQL_ORIGIN.rstrip('/')}/hospital/list?{query}"
+
+
 def _format_mda_device_check_link(mda_url: str) -> str:
     # 링크 텍스트가 MDA 확인 목적을 설명하므로 별도 라벨 없이 바로 보여준다.
     return f"<{mda_url}|MDA 에서 장비 확인 바로가기>"
+
+
+def _format_mda_hospital_contact_link(mda_url: str) -> str:
+    # 문자 라인 안에서 짧은 CTA만 보여주고, 목적지는 병원 정보 수정 화면으로 보낸다.
+    return f"<{mda_url}|번호 추가하기>"
 
 
 def _format_device_health_alert_sms_contact_line(item: dict[str, Any]) -> str:
@@ -761,6 +779,23 @@ def _format_device_health_alert_sms_contact_line(item: dict[str, Any]) -> str:
     if device_alert_phone:
         return f"> *문자*  {device_alert_phone}"
     return "> *문자*  *저장된 번호 없음. 자동발송 불가*"
+
+
+def _format_device_health_alert_sms_contact_lines(item: dict[str, Any]) -> list[str]:
+    device_alert_phone = _display_value(
+        item.get("deviceAlertPhone"),
+        default=_display_value(item.get("smsPhoneNumber"), default=""),
+    )
+    if device_alert_phone:
+        return [_format_device_health_alert_sms_contact_line(item)]
+
+    mda_hospital_edit_url = _display_value(item.get("mdaHospitalEditUrl"), default="")
+    if mda_hospital_edit_url:
+        return [
+            "> *문자*  *저장된 번호 없음. 자동발송 불가.* "
+            f"{_format_mda_hospital_contact_link(mda_hospital_edit_url)}"
+        ]
+    return [_format_device_health_alert_sms_contact_line(item)]
 
 
 def _is_device_health_alert_auto_sms_status_button_enabled(item: dict[str, Any]) -> bool:
@@ -781,7 +816,7 @@ def _build_daily_device_round_abnormal_alert_text(
                 lines.append("")
             lines.append(f"*{item['hospital']}*")
             lines.append(f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}")
-            lines.append(_format_device_health_alert_sms_contact_line(item))
+            lines.extend(_format_device_health_alert_sms_contact_lines(item))
             lines.append(f"> *병실*  {item['room']}")
             lines.append(f"> *장비*  `{item['device']}`")
             problem_components = _format_device_health_alert_problem_components(
@@ -815,6 +850,7 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
         "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
+        "mdaHospitalEditUrl": _display_value(item.get("mdaHospitalEditUrl"), default=""),
     }
     value = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     if len(value) <= 1900:
@@ -829,7 +865,7 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
     item_text_lines = [
         f"*{item['hospital']}*",
         f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}",
-        _format_device_health_alert_sms_contact_line(item),
+        *_format_device_health_alert_sms_contact_lines(item),
         f"> *병실*  {item['room']}",
         f"> *장비*  `{item['device']}`",
     ]

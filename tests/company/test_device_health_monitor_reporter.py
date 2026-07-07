@@ -285,7 +285,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     ":alert: *이상 발견 - 확인 요망*",
                     "*#69 수지미래산부인과의원(용인)*",
                     "> *전화*  031-123-4567",
-                    "> *문자*  *저장된 번호 없음. 자동발송 불가*",
+                    "> *문자*  *저장된 번호 없음. 자동발송 불가.* <https://mda.kr.mmtalkbox.com/hospital/list?search=%EC%88%98%EC%A7%80%EB%AF%B8%EB%9E%98%EC%82%B0%EB%B6%80%EC%9D%B8%EA%B3%BC%EC%9D%98%EC%9B%90%28%EC%9A%A9%EC%9D%B8%29|번호 추가하기>",
                     "> *병실*  1진료실",
                     "> *장비*  `MB2-C00043`",
                     "> *문제 장치*  `LED`",
