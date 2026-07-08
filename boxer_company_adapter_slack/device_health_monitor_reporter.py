@@ -313,6 +313,16 @@ def _normalize_device_health_monitor_action_cooldowns(value: Any) -> dict[str, d
     return cooldowns
 
 
+def _normalize_device_health_monitor_alert_delivery_override(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or "enabled" not in value:
+        return None
+    return {
+        "enabled": bool(value.get("enabled")),
+        "updatedAt": str(value.get("updatedAt") or "").strip(),
+        "updatedBy": str(value.get("updatedBy") or "").strip(),
+    }
+
+
 def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, Any]:
     state_payload = state if isinstance(state, dict) else {}
     normalized_state = dict(state_payload)
@@ -338,7 +348,67 @@ def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, A
         normalized_state["alertActionCooldowns"] = _normalize_device_health_monitor_action_cooldowns(
             state_payload.get("alertActionCooldowns")
         )
+    alert_delivery_override = _normalize_device_health_monitor_alert_delivery_override(
+        state_payload.get("alertDeliveryOverride")
+    )
+    if alert_delivery_override is None:
+        normalized_state.pop("alertDeliveryOverride", None)
+    else:
+        normalized_state["alertDeliveryOverride"] = alert_delivery_override
     return normalized_state
+
+
+def _resolve_device_health_monitor_alert_delivery_status(
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_state = (
+        _normalize_device_health_monitor_state(state)
+        if isinstance(state, dict)
+        else _normalize_device_health_monitor_state(_load_device_health_monitor_state())
+    )
+    override = _normalize_device_health_monitor_alert_delivery_override(
+        normalized_state.get("alertDeliveryOverride")
+    )
+    env_default = bool(cs.DEVICE_HEALTH_MONITOR_ALERTS_ENABLED)
+    enabled = bool(override["enabled"]) if override is not None else env_default
+    return {
+        "enabled": enabled,
+        "label": "켜짐" if enabled else "꺼짐",
+        "envDefault": env_default,
+        "source": "slack_override" if override is not None else "env",
+        "updatedAt": _display_value((override or {}).get("updatedAt"), default=""),
+        "updatedBy": _display_value((override or {}).get("updatedBy"), default=""),
+        "monitorEnabled": bool(cs.DEVICE_HEALTH_MONITOR_ENABLED),
+    }
+
+
+def _set_device_health_monitor_alert_delivery_enabled(
+    enabled: bool,
+    *,
+    user_id: str | None = None,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    local_now = _coerce_daily_device_round_now(now)
+    state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
+    state["alertDeliveryOverride"] = {
+        "enabled": bool(enabled),
+        "updatedAt": local_now.isoformat(),
+        "updatedBy": _display_value(user_id, default=""),
+    }
+    # Slack 명령으로 바꾼 발송 설정은 재시작 뒤에도 유지되게 상태 파일에 저장한다.
+    persisted_state = _persist_device_health_monitor_state_best_effort(state, logger=logger)
+    _append_device_health_monitor_event(
+        "alert_delivery_control_changed",
+        {
+            "enabled": bool(enabled),
+            "updatedBy": _display_value(user_id, default=""),
+            "source": "slack_mention",
+        },
+        now=local_now,
+        logger=logger,
+    )
+    return _resolve_device_health_monitor_alert_delivery_status(persisted_state)
 
 
 def _is_device_health_monitor_runtime_configured() -> bool:
@@ -3196,6 +3266,63 @@ def _collect_device_health_monitor_alert_updates(
     return alertable_fingerprints, updated_alerts, updated_pending_alerts
 
 
+def _collect_device_health_monitor_suppressed_alert_updates(
+    report_summary: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    now: datetime,
+) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    alert_fingerprints = _normalize_device_health_monitor_alerts(state.get("alertFingerprints"))
+    pending_fingerprints = _normalize_device_health_monitor_pending_alerts(
+        state.get("pendingAlertFingerprints")
+    )
+    current_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
+    current_items_by_fingerprint = {
+        _build_device_health_monitor_alert_fingerprint(item): item
+        for item in current_items
+    }
+    current_fingerprints = set(current_items_by_fingerprint)
+    reminder_delta = _device_health_monitor_alert_reminder_delta()
+    now_text = now.isoformat()
+    suppressed_alertable_fingerprints: set[str] = set()
+    updated_alerts: dict[str, dict[str, Any]] = {}
+    updated_pending_alerts: dict[str, dict[str, Any]] = {}
+
+    for fingerprint, previous in alert_fingerprints.items():
+        last_alerted_at = _parse_device_health_monitor_datetime(previous.get("lastAlertedAt"))
+        if fingerprint in current_fingerprints:
+            if last_alerted_at is not None and now - last_alerted_at >= reminder_delta:
+                suppressed_alertable_fingerprints.add(fingerprint)
+            updated_alerts[fingerprint] = {
+                "firstAlertedAt": str(previous.get("firstAlertedAt") or now_text),
+                "lastAlertedAt": str(previous.get("lastAlertedAt") or ""),
+                "lastSeenAt": now_text,
+                "count": max(0, int(previous.get("count") or 0)) + 1,
+            }
+            continue
+        if last_alerted_at is not None and now - last_alerted_at < reminder_delta:
+            updated_alerts[fingerprint] = previous
+
+    for fingerprint in current_fingerprints:
+        if fingerprint in updated_alerts:
+            continue
+        pending = pending_fingerprints.get(fingerprint, {})
+        pending_count = max(0, int(pending.get("count") or 0)) + 1
+        required_confirmation_polls = _device_health_monitor_required_confirmation_polls(
+            current_items_by_fingerprint.get(fingerprint, {})
+        )
+        if pending_count >= required_confirmation_polls:
+            suppressed_alertable_fingerprints.add(fingerprint)
+        # 발송이 꺼진 동안에는 알림 완료로 기록하지 않고 pending만 유지해서 다시 켜면 즉시 발송될 수 있게 한다.
+        updated_pending_alerts[fingerprint] = {
+            "firstSeenAt": str(pending.get("firstSeenAt") or now_text),
+            "lastSeenAt": now_text,
+            "count": pending_count,
+        }
+
+    return suppressed_alertable_fingerprints, updated_alerts, updated_pending_alerts
+
+
 def _build_device_health_monitor_next_state(
     state: dict[str, Any],
     report_summary: dict[str, Any],
@@ -3290,7 +3417,8 @@ def _run_device_health_monitor_once(
         return False
 
     channel_id = _device_health_monitor_channel_id()
-    alert_delivery_enabled = bool(cs.DEVICE_HEALTH_MONITOR_ALERTS_ENABLED)
+    alert_delivery_status = _resolve_device_health_monitor_alert_delivery_status(state)
+    alert_delivery_enabled = bool(alert_delivery_status.get("enabled"))
     if alert_delivery_enabled and not channel_id:
         next_state = _build_device_health_monitor_next_state(
             state,
@@ -3309,6 +3437,52 @@ def _run_device_health_monitor_once(
             channel_missing=True,
         )
         logger.warning("장비 상태 모니터 채널 ID가 없어. DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘")
+        return False
+
+    if not alert_delivery_enabled:
+        (
+            suppressed_alertable_fingerprints,
+            updated_alerts,
+            updated_pending_alerts,
+        ) = _collect_device_health_monitor_suppressed_alert_updates(
+            report_summary,
+            state,
+            now=local_now,
+        )
+        next_state = _build_device_health_monitor_next_state(
+            state,
+            report_summary,
+            now=local_now,
+            alert_fingerprints=updated_alerts,
+            pending_alert_fingerprints=updated_pending_alerts,
+        )
+        _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
+        _log_device_health_monitor_run_events(
+            report_summary,
+            now=local_now,
+            logger=logger,
+            channel_id=channel_id,
+            alertable_fingerprints=suppressed_alertable_fingerprints,
+        )
+        if suppressed_alertable_fingerprints:
+            _append_device_health_monitor_event(
+                "alert_delivery_suppressed",
+                {
+                    "alertableCount": len(suppressed_alertable_fingerprints),
+                    "alertFingerprints": sorted(suppressed_alertable_fingerprints),
+                    "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+                    "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+                    "source": _display_value(alert_delivery_status.get("source"), default=""),
+                },
+                now=local_now,
+                logger=logger,
+            )
+        logger.info(
+            "Suppressed device health alert delivery checkedDevices=%s alertable=%s source=%s",
+            report_summary.get("checkedDeviceCount"),
+            len(suppressed_alertable_fingerprints),
+            alert_delivery_status.get("source"),
+        )
         return False
 
     alertable_fingerprints, updated_alerts, updated_pending_alerts = _collect_device_health_monitor_alert_updates(
@@ -3338,26 +3512,6 @@ def _run_device_health_monitor_once(
             channel_id,
             report_summary.get("checkedDeviceCount"),
             report_summary.get("abnormalCandidateCount"),
-        )
-        return False
-
-    if not alert_delivery_enabled:
-        # 모니터링은 유지하되 운영자가 알림을 중단한 동안에는 Slack/SMS 전송만 막는다.
-        _append_device_health_monitor_event(
-            "alert_delivery_suppressed",
-            {
-                "alertableCount": len(alertable_fingerprints),
-                "alertFingerprints": sorted(alertable_fingerprints),
-                "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
-                "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
-            },
-            now=local_now,
-            logger=logger,
-        )
-        logger.info(
-            "Suppressed device health alert delivery checkedDevices=%s alertable=%s",
-            report_summary.get("checkedDeviceCount"),
-            len(alertable_fingerprints),
         )
         return False
 

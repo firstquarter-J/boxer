@@ -33,6 +33,90 @@ def _deps() -> DeviceRoutesDeps:
 
 
 class DeviceRouteHandlerTests(unittest.TestCase):
+    def test_device_health_alert_delivery_enable_command_updates_runtime_setting(self) -> None:
+        replies: list[str] = []
+        logger = logging.getLogger(__name__)
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled",
+            return_value={
+                "enabled": True,
+                "envDefault": False,
+                "source": "slack_override",
+                "updatedAt": "2026-07-08T10:00:00+09:00",
+                "updatedBy": "U123",
+                "monitorEnabled": True,
+            },
+        ) as set_alert_delivery:
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="이상 알림 메시지 보내기 켜",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logger,
+                ),
+                _deps(),
+            )
+
+        self.assertTrue(handled)
+        self.assertTrue(set_alert_delivery.call_args.args[0])
+        self.assertEqual(set_alert_delivery.call_args.kwargs["user_id"], "U123")
+        self.assertIs(set_alert_delivery.call_args.kwargs["logger"], logger)
+        self.assertIn("상태: *켜짐*", replies[0])
+        self.assertIn("Slack 명령", replies[0])
+        self.assertIn("다음 장비 상태 모니터 poll부터", replies[0])
+
+    def test_device_health_alert_delivery_status_command_does_not_change_setting(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.device_routes._resolve_device_health_monitor_alert_delivery_status",
+                return_value={
+                    "enabled": False,
+                    "envDefault": True,
+                    "source": "slack_override",
+                    "updatedAt": "2026-07-08T10:00:00+09:00",
+                    "updatedBy": "U123",
+                    "monitorEnabled": False,
+                },
+            ) as resolve_status,
+            patch(
+                "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled"
+            ) as set_alert_delivery,
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="이상 알림 상태 확인",
+                    barcode=None,
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=None,
+                    logger=logging.getLogger(__name__),
+                ),
+                _deps(),
+            )
+
+        self.assertTrue(handled)
+        resolve_status.assert_called_once_with()
+        set_alert_delivery.assert_not_called()
+        self.assertIn("상태: *꺼짐*", replies[0])
+        self.assertIn("DEVICE_HEALTH_MONITOR_ENABLED=true", replies[0])
+
     def test_device_led_log_question_uses_log_analysis_before_pattern_guide(self) -> None:
         replies: list[str] = []
         synth_calls: list[tuple[object, ...]] = []

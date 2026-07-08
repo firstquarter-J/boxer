@@ -8,6 +8,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _load_slack_user_name, _set_request_log_route
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.core import settings as s
+from boxer.core.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.barcode_log import _extract_device_name_scope, _extract_log_date_with_presence
@@ -109,6 +110,10 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
     _build_daily_device_round_auto_update_status,
     _format_daily_device_round_auto_update_status,
     _set_daily_device_round_auto_update,
+)
+from boxer_company_adapter_slack.device_health_monitor_reporter import (
+    _resolve_device_health_monitor_alert_delivery_status,
+    _set_device_health_monitor_alert_delivery_enabled,
 )
 
 
@@ -218,6 +223,56 @@ def _extract_daily_device_round_auto_update_control(
     return "unknown", action
 
 
+def _extract_device_health_monitor_alert_delivery_control(question: str) -> str | None:
+    normalized = _normalize_daily_device_round_control_question(question)
+    compact = normalized.replace(" ", "")
+    if not normalized:
+        return None
+
+    alert_context_hints = (
+        "이상 알림",
+        "이상알림",
+        "이상 발견",
+        "장비 이상",
+        "장비상태모니터알림",
+        "device health alert",
+        "health alert",
+    )
+    has_alert_context = any(hint in normalized or hint.replace(" ", "") in compact for hint in alert_context_hints)
+    if not has_alert_context:
+        return None
+
+    # 발송 설정 변경은 명시적인 켜기/끄기/상태 확인 표현이 있을 때만 실행한다.
+    if any(token in normalized for token in ("꺼", "끄", "off", "disable", "비활성", "중단", "멈춰", "정지")):
+        return "disable"
+    if any(token in normalized for token in ("켜", "on", "enable", "활성", "재개", "시작")):
+        return "enable"
+    if any(token in normalized for token in ("상태", "확인", "조회", "알려", "보여")):
+        return "status"
+    return None
+
+
+def _format_device_health_monitor_alert_delivery_status(status_payload: dict[str, Any]) -> str:
+    enabled = bool(status_payload.get("enabled"))
+    env_default = bool(status_payload.get("envDefault"))
+    source = _display_value(status_payload.get("source"), default="env")
+    source_label = "Slack 명령" if source == "slack_override" else ".env 기본값"
+    lines = [
+        "*이상 알림 발송 설정*",
+        f"• 상태: *{'켜짐' if enabled else '꺼짐'}*",
+        f"• 기준: {source_label}",
+        f"• .env 기본값: `{'켜짐' if env_default else '꺼짐'}`",
+        "• 적용: 다음 장비 상태 모니터 poll부터",
+    ]
+    updated_at = _display_value(status_payload.get("updatedAt"), default="")
+    updated_by = _display_value(status_payload.get("updatedBy"), default="")
+    if source == "slack_override" and (updated_at or updated_by):
+        lines.append(f"• 마지막 변경: `{updated_at or '미확인'}` / `{updated_by or '미확인'}`")
+    if not bool(status_payload.get("monitorEnabled")):
+        lines.append("• 참고: 장비 상태 모니터 자체가 꺼져 있어. `DEVICE_HEALTH_MONITOR_ENABLED=true`가 필요해")
+    return "\n".join(lines)
+
+
 def _handle_device_routes(
     context: DeviceRoutesContext,
     deps: DeviceRoutesDeps,
@@ -246,7 +301,37 @@ def _handle_device_routes(
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
     diagnostic_device_name = _extract_device_name_for_diagnostic_start(question) or structured_device_name
+    alert_delivery_control = _extract_device_health_monitor_alert_delivery_control(question)
     auto_update_control = _extract_daily_device_round_auto_update_control(question)
+
+    if alert_delivery_control:
+        try:
+            _set_request_log_route(
+                context.payload,
+                "device health alert delivery control",
+                handler_type="router",
+            )
+            if alert_delivery_control == "status":
+                status_payload = _resolve_device_health_monitor_alert_delivery_status()
+            else:
+                status_payload = _set_device_health_monitor_alert_delivery_enabled(
+                    alert_delivery_control == "enable",
+                    user_id=context.user_id,
+                    logger=context.logger,
+                )
+            context.reply(
+                _format_device_health_monitor_alert_delivery_status(status_payload),
+                mention_user=False,
+            )
+            context.logger.info(
+                "Responded with device health alert delivery control in thread_ts=%s action=%s",
+                context.thread_ts,
+                alert_delivery_control,
+            )
+        except Exception:
+            context.logger.exception("Device health alert delivery control failed")
+            context.reply("이상 알림 발송 설정 변경 중 오류가 발생했어. 상태 파일 권한을 확인해줘")
+        return True
 
     if auto_update_control:
         auto_update_target, auto_update_action = auto_update_control

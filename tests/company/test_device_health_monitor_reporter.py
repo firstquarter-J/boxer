@@ -225,6 +225,46 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self._sms_test_phone_patcher.start()
         self.addCleanup(self._sms_test_phone_patcher.stop)
 
+    def test_sets_alert_delivery_override_in_monitor_state(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.control")
+        local_now = datetime(2026, 7, 8, 10, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", False),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
+                return_value={},
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._save_device_health_monitor_state"
+            ) as save_state_mock,
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
+            ) as append_event_mock,
+        ):
+            status = reporter._set_device_health_monitor_alert_delivery_enabled(
+                True,
+                user_id="U123",
+                now=local_now,
+                logger=logger,
+            )
+
+        saved_state = save_state_mock.call_args.args[0]
+        self.assertEqual(
+            saved_state["alertDeliveryOverride"],
+            {
+                "enabled": True,
+                "updatedAt": local_now.isoformat(),
+                "updatedBy": "U123",
+            },
+        )
+        self.assertTrue(status["enabled"])
+        self.assertFalse(status["envDefault"])
+        self.assertEqual(status["source"], "slack_override")
+        self.assertTrue(status["monitorEnabled"])
+        self.assertEqual(append_event_mock.call_args.args[0], "alert_delivery_control_changed")
+
     def test_posts_abnormal_alert_without_running_maintenance_actions(self) -> None:
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor")
@@ -475,7 +515,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(client.messages, [])
         post_sms_mock.assert_not_called()
         saved_state = save_state_mock.call_args.args[0]
-        self.assertEqual(len(saved_state["alertFingerprints"]), 1)
+        self.assertEqual(saved_state["alertFingerprints"], {})
+        self.assertEqual(saved_state["pendingAlertFingerprints"][_LED_ALERT_FINGERPRINT]["count"], 2)
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary", "alert_delivery_suppressed"],
