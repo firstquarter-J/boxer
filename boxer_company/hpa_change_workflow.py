@@ -53,8 +53,40 @@ _SENSITIVE_KEY_PATTERN = re.compile(
     r"aws[_-]?(?:secret[_-]?access[_-]?key|session[_-]?token))",
     re.IGNORECASE,
 )
-_RESULT_PR_URL_PATTERN = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/[0-9]+/?$")
+_RESULT_PR_URL_PATTERN = re.compile(
+    r"^https://github\.com/mmtalk-app/"
+    r"(?:mmb-hospital-admin-server|mmb-hospital-admin-client)/pull/[0-9]+/?$"
+)
+_RESULT_REQUEST_ITEM_ID_PATTERN = re.compile(r"^REQ-[0-9]{2}$")
+_NO_CHANGE_RESULT_COMBINATIONS = {
+    (
+        "already_satisfied",
+        "existing_hpa_capability",
+        "existing_capability_reused",
+    ),
+    ("already_satisfied", "existing_hpa_capability", "no_change_needed"),
+    ("not_applicable", "not_applicable", "not_in_scope"),
+    ("not_applicable", "not_applicable", "no_change_needed"),
+}
+_RESULT_QUALITY_GATE_KEYS = (
+    "verificationPassed",
+    "independentReviewPassed",
+    "requestCoveragePassed",
+    "initialRequestCoveragePassed",
+)
 _UNSET = object()
+
+
+def _has_declared_pr_payload(result: Mapping[str, Any]) -> bool:
+    """legacy 완료 상태에서 실제 PR 처리 또는 malformed 검증이 필요한지 판별한다."""
+
+    for key in ("prs", "pr_urls", "pull_requests"):
+        if key not in result:
+            continue
+        value = result.get(key)
+        if not isinstance(value, list) or bool(value):
+            return True
+    return False
 
 
 def _utc_now() -> datetime:
@@ -170,6 +202,7 @@ class HpaChangeStatus(str, Enum):
     REVIEW_POSTED = "review_posted"
     NEEDS_CLARIFICATION = "needs_clarification"
     PR_CREATED = "pr_created"
+    NO_CHANGE_NEEDED = "no_change_needed"
     FAILED = "failed"
     CANCELED = "canceled"
 
@@ -215,6 +248,7 @@ _ALLOWED_STATUS_TRANSITIONS: dict[HpaChangeStatus, frozenset[HpaChangeStatus]] =
             HpaChangeStatus.REVIEW_READY,
             HpaChangeStatus.NEEDS_CLARIFICATION,
             HpaChangeStatus.PR_CREATED,
+            HpaChangeStatus.NO_CHANGE_NEEDED,
             HpaChangeStatus.FAILED,
             HpaChangeStatus.CANCELED,
         }
@@ -238,6 +272,7 @@ _ALLOWED_STATUS_TRANSITIONS: dict[HpaChangeStatus, frozenset[HpaChangeStatus]] =
         {HpaChangeStatus.DISPATCHING, HpaChangeStatus.FAILED, HpaChangeStatus.CANCELED}
     ),
     HpaChangeStatus.PR_CREATED: frozenset(),
+    HpaChangeStatus.NO_CHANGE_NEEDED: frozenset(),
     HpaChangeStatus.FAILED: frozenset(
         {HpaChangeStatus.DISPATCHING, HpaChangeStatus.CANCELED}
     ),
@@ -306,6 +341,7 @@ class HpaChangePollState(str, Enum):
     REVIEW_READY = "review_ready"
     NEEDS_CLARIFICATION = "needs_clarification"
     PR_OPENED = "pr_opened"
+    NO_CHANGE_NEEDED = "no_change_needed"
     FAILED = "failed"
 
 
@@ -583,6 +619,8 @@ class HpaChangeJobStore:
             HpaChangePollState.NEEDS_CLARIFICATION.value,
             HpaChangeStatus.PR_CREATED.value,
             HpaChangePollState.PR_OPENED.value,
+            HpaChangeStatus.NO_CHANGE_NEEDED.value,
+            HpaChangePollState.NO_CHANGE_NEEDED.value,
             HpaChangeStatus.FAILED.value,
             HpaChangeStatus.CANCELED.value,
             HpaChangePollState.FAILED.value,
@@ -594,6 +632,7 @@ class HpaChangeJobStore:
                 SELECT *
                 FROM hpa_change_jobs
                 WHERE status IN ({placeholders})
+                   OR (status = ? AND notified_status != ?)
                    OR (status = ? AND notified_status != ?)
                    OR (status = ? AND notified_status != ?)
                    OR (status IN (?, ?) AND notified_status != ?)
@@ -933,12 +972,32 @@ class HpaChangeJobStore:
         message: str = "HPA 변경 PR 생성 완료",
         result: Mapping[str, Any] | None = None,
     ) -> HpaChangeJob:
-        if not pr_urls:
+        normalized_pr_urls = tuple(str(item or "").strip() for item in pr_urls)
+        if not normalized_pr_urls:
             raise ValueError("PR 생성 완료 상태에는 PR URL이 하나 이상 필요해")
+        if any(not _RESULT_PR_URL_PATTERN.fullmatch(url) for url in normalized_pr_urls):
+            raise ValueError("PR 생성 완료 상태에는 허용된 HPA 저장소 PR URL만 사용할 수 있어")
         return self.transition(
             task_id,
             HpaChangeStatus.PR_CREATED,
-            pr_urls=pr_urls,
+            pr_urls=normalized_pr_urls,
+            result=result or {},
+            status_message=message,
+        )
+
+    def mark_no_change_needed(
+        self,
+        task_id: str,
+        *,
+        message: str = "HPA 기존 기능으로 요청 충족 확인",
+        result: Mapping[str, Any] | None = None,
+    ) -> HpaChangeJob:
+        """코드 변경과 PR 없이 요청 목적이 이미 충족된 정상 종료를 기록한다."""
+
+        return self.transition(
+            task_id,
+            HpaChangeStatus.NO_CHANGE_NEEDED,
+            pr_urls=(),
             result=result or {},
             status_message=message,
         )
@@ -1733,6 +1792,7 @@ class HpaChangeWorkflowService:
         job = self.store.get_job(task_id)
         if job.status in {
             HpaChangeStatus.PR_CREATED,
+            HpaChangeStatus.NO_CHANGE_NEEDED,
             HpaChangeStatus.NEEDS_CLARIFICATION,
             HpaChangeStatus.REVIEW_READY,
             HpaChangeStatus.REVIEW_POSTED,
@@ -1799,6 +1859,31 @@ class HpaChangeWorkflowService:
             except GitHubArtifactNotReady:
                 # workflow 완료 직후 artifact 목록 반영이 늦을 수 있어서 다음 poll에서 재시도한다.
                 job = self.store.get_job(task_id)
+        if job.status == HpaChangeStatus.RESULT_READY and job.result:
+            # artifact 저장 직후 프로세스가 종료돼도 저장된 공개 결과만으로
+            # terminal 상태 전이를 다시 적용할 수 있게 한다.
+            raw_status = str(job.result.get("status") or "").strip().lower().replace("-", "_")
+            recoverable = raw_status in {
+                "needs_clarification",
+                "clarification_required",
+                "blocked",
+                "pr_opened",
+                "pr_created",
+                "failed",
+                "error",
+                "canceled",
+                "cancelled",
+                "no_change_needed",
+            } or (
+                raw_status in {"completed", "success"}
+                and _has_declared_pr_payload(job.result)
+            )
+            if recoverable:
+                try:
+                    job = self.apply_result_payload(task_id, job.result)
+                except Exception as exc:
+                    self.store.mark_failed(task_id, str(exc))
+                    raise
         return self._build_poll_result(job)
 
     def consume_result_artifact(self, task_id: str) -> HpaChangeJob:
@@ -1869,6 +1954,20 @@ class HpaChangeWorkflowService:
                 status_message=summary or "workflow 결과 확인 완료",
             )
 
+        if raw_status == "no_change_needed":
+            if self._extract_pr_urls(safe_result) or any(
+                bool(safe_result.get(key))
+                for key in ("prs", "pr_urls", "pull_requests")
+            ):
+                raise GitHubArtifactError("변경 불필요 결과에는 PR URL이 없어야 해")
+            if not self._is_valid_no_change_result(safe_result):
+                raise GitHubArtifactError("변경 불필요 결과의 공개 검증 계약이 올바르지 않아")
+            return self.store.mark_no_change_needed(
+                task_id,
+                message=summary or "HPA 기존 기능으로 요청 충족 확인",
+                result=safe_result,
+            )
+
         if raw_status in {"failed", "error"}:
             error_message = str(
                 safe_result.get("error")
@@ -1890,9 +1989,13 @@ class HpaChangeWorkflowService:
     def _extract_pr_urls(result: Mapping[str, Any]) -> tuple[str, ...]:
         candidates: list[Any] = []
         raw_urls = result.get("pr_urls")
+        if "pr_urls" in result and not isinstance(raw_urls, list):
+            raise GitHubArtifactError("결과 artifact의 pr_urls 형식이 올바르지 않아")
         if isinstance(raw_urls, list):
             candidates.extend(raw_urls)
         raw_prs = result.get("pull_requests")
+        if "pull_requests" in result and not isinstance(raw_prs, list):
+            raise GitHubArtifactError("결과 artifact의 pull_requests 형식이 올바르지 않아")
         if isinstance(raw_prs, list):
             for item in raw_prs:
                 if isinstance(item, Mapping):
@@ -1900,6 +2003,8 @@ class HpaChangeWorkflowService:
                 else:
                     candidates.append(item)
         contract_prs = result.get("prs")
+        if "prs" in result and not isinstance(contract_prs, list):
+            raise GitHubArtifactError("결과 artifact의 prs 형식이 올바르지 않아")
         if isinstance(contract_prs, list):
             for item in contract_prs:
                 if isinstance(item, Mapping):
@@ -1907,10 +2012,82 @@ class HpaChangeWorkflowService:
         unique_urls: list[str] = []
         for candidate in candidates:
             url = str(candidate or "").strip()
-            if not _RESULT_PR_URL_PATTERN.fullmatch(url) or url in unique_urls:
+            if not _RESULT_PR_URL_PATTERN.fullmatch(url):
+                raise GitHubArtifactError("결과 artifact에 허용되지 않은 PR URL이 있어")
+            if url in unique_urls:
                 continue
             unique_urls.append(url)
         return tuple(unique_urls)
+
+    @staticmethod
+    def _is_valid_no_change_result(result: Mapping[str, Any]) -> bool:
+        """PR 없는 성공 artifact가 원 검토와 네 개 품질 게이트를 모두 충족하는지 확인한다."""
+
+        quality_gates = result.get("qualityGates") or result.get("quality_gates")
+        if not isinstance(quality_gates, Mapping) or any(
+            quality_gates.get(key) is not True for key in _RESULT_QUALITY_GATE_KEYS
+        ):
+            return False
+        review = result.get("review")
+        requester_view = (
+            review.get("requesterView") or review.get("requester_view")
+            if isinstance(review, Mapping)
+            else None
+        )
+        implementation = result.get("implementation")
+        expected_items = (
+            requester_view.get("requestItems") or requester_view.get("request_items")
+            if isinstance(requester_view, Mapping)
+            else None
+        )
+        actual_items = (
+            implementation.get("appliedResults") or implementation.get("applied_results")
+            if isinstance(implementation, Mapping)
+            else None
+        )
+        if (
+            not isinstance(expected_items, list)
+            or not isinstance(actual_items, list)
+            or not 1 <= len(expected_items) <= 10
+            or len(actual_items) != len(expected_items)
+        ):
+            return False
+        for index, (expected, actual) in enumerate(zip(expected_items, actual_items, strict=True), 1):
+            if not isinstance(expected, Mapping) or not isinstance(actual, Mapping):
+                return False
+            item_id = str(expected.get("itemId") or expected.get("item_id") or "")
+            request = str(expected.get("request") or "").strip()
+            expected_reason = str(expected.get("reasonCode") or expected.get("reason_code") or "")
+            expected_application = str(
+                expected.get("applicationCode") or expected.get("application_code") or ""
+            )
+            if (
+                item_id != f"REQ-{index:02d}"
+                or not _RESULT_REQUEST_ITEM_ID_PATTERN.fullmatch(item_id)
+                or not request
+                or str(expected.get("handling") or "") != "not_needed"
+                or expected_reason not in {"existing_hpa_capability", "not_applicable"}
+                or (
+                    expected_reason == "existing_hpa_capability"
+                    and expected_application
+                    not in {"reuse_existing_capability", "no_change_needed"}
+                )
+                or (
+                    expected_reason == "not_applicable"
+                    and expected_application != "no_change_needed"
+                )
+                or str(actual.get("itemId") or actual.get("item_id") or "") != item_id
+                or str(actual.get("request") or "").strip() != request
+            ):
+                return False
+            combination = (
+                str(actual.get("status") or ""),
+                str(actual.get("reasonCode") or actual.get("reason_code") or ""),
+                str(actual.get("resultCode") or actual.get("result_code") or ""),
+            )
+            if combination not in _NO_CHANGE_RESULT_COMBINATIONS or combination[1] != expected_reason:
+                return False
+        return True
 
     @staticmethod
     def _build_poll_result(job: HpaChangeJob) -> HpaChangePollResult:
@@ -1920,6 +2097,8 @@ class HpaChangeWorkflowService:
             state = HpaChangePollState.NEEDS_CLARIFICATION
         elif job.status == HpaChangeStatus.PR_CREATED:
             state = HpaChangePollState.PR_OPENED
+        elif job.status == HpaChangeStatus.NO_CHANGE_NEEDED:
+            state = HpaChangePollState.NO_CHANGE_NEEDED
         elif job.status in {HpaChangeStatus.FAILED, HpaChangeStatus.CANCELED}:
             state = HpaChangePollState.FAILED
         elif job.status in {

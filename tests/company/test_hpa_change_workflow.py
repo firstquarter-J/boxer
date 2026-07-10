@@ -229,7 +229,7 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         with self.assertRaises(InvalidHpaChangeTransition):
             self.store.mark_pr_created(
                 job.task_id,
-                ["https://github.com/mmtalk-app/repo/pull/1"],
+                ["https://github.com/mmtalk-app/mmb-hospital-admin-server/pull/1"],
             )
 
         self.store.begin_dispatch(job.task_id)
@@ -351,6 +351,10 @@ class HpaChangeJobStoreTests(unittest.TestCase):
             self.store,
             event_ts="1720580400.000303",
         ).job
+        no_change = _register(
+            self.store,
+            event_ts="1720580400.000305",
+        ).job
         failed = _register(
             self.store,
             event_ts="1720580400.000304",
@@ -364,7 +368,7 @@ class HpaChangeJobStoreTests(unittest.TestCase):
             sha256="a" * 64,
             content=b"zip",
         )
-        for job in (clarification, pr_created):
+        for job in (clarification, pr_created, no_change):
             self.store.begin_dispatch(job.task_id)
             self.store.mark_dispatched(job.task_id)
             self.store.mark_running(job.task_id, _workflow_run())
@@ -376,9 +380,15 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         self.store.mark_needs_clarification(clarification.task_id, "질문")
         self.store.mark_pr_created(
             pr_created.task_id,
-            ["https://github.com/mmtalk-app/repo/pull/1"],
+            ["https://github.com/mmtalk-app/mmb-hospital-admin-server/pull/1"],
         )
+        self.store.mark_no_change_needed(no_change.task_id)
+
+        before_notification = {job.task_id for job in self.store.list_reportable_jobs()}
+        self.assertIn(no_change.task_id, before_notification)
+
         self.store.mark_notified(pr_created.task_id, HpaChangePollState.PR_OPENED)
+        self.store.mark_notified(no_change.task_id, HpaChangePollState.NO_CHANGE_NEEDED)
         self.store.mark_failed(failed.task_id, "실패")
         self.store.mark_notified(failed.task_id, HpaChangePollState.FAILED)
 
@@ -785,6 +795,45 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
 
+    @staticmethod
+    def _no_change_result(task_id: str) -> dict[str, Any]:
+        request = "Bonus 프롬프트와 생성 설정 변경"
+        return {
+            "task_id": task_id,
+            "status": "no_change_needed",
+            "review": {
+                "requesterView": {
+                    "requestItems": [
+                        {
+                            "itemId": "REQ-01",
+                            "request": request,
+                            "handling": "not_needed",
+                            "reasonCode": "existing_hpa_capability",
+                            "applicationCode": "no_change_needed",
+                        }
+                    ]
+                }
+            },
+            "implementation": {
+                "appliedResults": [
+                    {
+                        "itemId": "REQ-01",
+                        "request": request,
+                        "status": "already_satisfied",
+                        "reasonCode": "existing_hpa_capability",
+                        "resultCode": "existing_capability_reused",
+                    }
+                ]
+            },
+            "qualityGates": {
+                "verificationPassed": True,
+                "independentReviewPassed": True,
+                "requestCoveragePassed": True,
+                "initialRequestCoveragePassed": True,
+            },
+            "prs": [],
+        }
+
     def test_submit_dispatches_once_and_returns_existing_job_for_duplicate_event(self) -> None:
         first_job, first_created = self.service.submit(self.request)
         duplicate_job, duplicate_created = self.service.submit(self.request)
@@ -910,6 +959,27 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         notified = self.store.mark_notified(job.task_id, completed.state)
         self.assertEqual(notified.notified_status, "pr_opened")
 
+    def test_poll_rejects_pr_from_non_hpa_repository(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        self.coordinator.result = {
+            "task_id": job.task_id,
+            "status": "pr_opened",
+            "prs": [{"url": "https://github.com/another-org/private-repo/pull/777"}],
+        }
+
+        with self.assertRaises(GitHubArtifactError):
+            self.service.poll_job(job.task_id)
+
+        self.assertEqual(
+            self.store.get_job(job.task_id).status,
+            HpaChangeStatus.FAILED,
+        )
+
     def test_poll_maps_clarification_result(self) -> None:
         job, _ = self.service.submit(self.request)
         self.store.mark_running(job.task_id, _workflow_run())
@@ -927,6 +997,194 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
 
         self.assertEqual(result.state, HpaChangePollState.NEEDS_CLARIFICATION)
         self.assertIn("Basic", result.message)
+
+    def test_poll_maps_verified_no_change_result_without_pr(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        self.coordinator.result = self._no_change_result(job.task_id)
+
+        result = self.service.poll_job(job.task_id)
+
+        self.assertEqual(result.state, HpaChangePollState.NO_CHANGE_NEEDED)
+        self.assertEqual(result.job.status, HpaChangeStatus.NO_CHANGE_NEEDED)
+        self.assertEqual(result.pr_urls, ())
+
+    def test_poll_recovers_saved_no_change_result_after_process_restart(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        archive = GitHubArtifactArchive(
+            artifact_id=701,
+            workflow_run_id=501,
+            name=f"boxer-hpa-result-{job.task_id}",
+            size_in_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            content=b"{}",
+        )
+        self.store.mark_result_ready(
+            job.task_id,
+            archive,
+            result=self._no_change_result(job.task_id),
+        )
+
+        recovered = self.service.poll_job(job.task_id)
+
+        self.assertEqual(recovered.state, HpaChangePollState.NO_CHANGE_NEEDED)
+        self.assertEqual(recovered.job.status, HpaChangeStatus.NO_CHANGE_NEEDED)
+
+    def test_poll_recovers_saved_legacy_success_with_hpa_pr(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        archive = GitHubArtifactArchive(
+            artifact_id=702,
+            workflow_run_id=501,
+            name=f"boxer-hpa-result-{job.task_id}",
+            size_in_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            content=b"{}",
+        )
+        self.store.mark_result_ready(
+            job.task_id,
+            archive,
+            result={
+                "task_id": job.task_id,
+                "status": "success",
+                "prs": [
+                    {
+                        "url": (
+                            "https://github.com/mmtalk-app/"
+                            "mmb-hospital-admin-server/pull/801"
+                        )
+                    }
+                ],
+            },
+        )
+
+        recovered = self.service.poll_job(job.task_id)
+
+        self.assertEqual(recovered.state, HpaChangePollState.PR_OPENED)
+        self.assertEqual(recovered.job.status, HpaChangeStatus.PR_CREATED)
+
+    def test_poll_rejects_malformed_saved_legacy_pr_payload(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        archive = GitHubArtifactArchive(
+            artifact_id=703,
+            workflow_run_id=501,
+            name=f"boxer-hpa-result-{job.task_id}",
+            size_in_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            content=b"{}",
+        )
+        self.store.mark_result_ready(
+            job.task_id,
+            archive,
+            result={
+                "task_id": job.task_id,
+                "status": "success",
+                "prs": {
+                    "url": (
+                        "https://github.com/mmtalk-app/"
+                        "mmb-hospital-admin-server/pull/802"
+                    )
+                },
+            },
+        )
+
+        with self.assertRaises(GitHubArtifactError):
+            self.service.poll_job(job.task_id)
+
+        self.assertEqual(
+            self.store.get_job(job.task_id).status,
+            HpaChangeStatus.FAILED,
+        )
+
+    def test_poll_rejects_null_saved_legacy_pr_payload(self) -> None:
+        request = HpaChangeRequest(
+            **{
+                **self.request.__dict__,
+                "event_ts": "1720580400.000299",
+            }
+        )
+        job, _ = self.service.submit(request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        archive = GitHubArtifactArchive(
+            artifact_id=704,
+            workflow_run_id=501,
+            name=f"boxer-hpa-result-{job.task_id}",
+            size_in_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            content=b"{}",
+        )
+        self.store.mark_result_ready(
+            job.task_id,
+            archive,
+            result={"task_id": job.task_id, "status": "success", "prs": None},
+        )
+
+        with self.assertRaises(GitHubArtifactError):
+            self.service.poll_job(job.task_id)
+
+        self.assertEqual(
+            self.store.get_job(job.task_id).status,
+            HpaChangeStatus.FAILED,
+        )
+
+    def test_no_change_result_fails_closed_when_public_contract_is_invalid(self) -> None:
+        invalid_results: list[tuple[str, Any]] = [
+            ("qualityGates.verificationPassed", False),
+            ("implementation.appliedResults.0.status", "applied"),
+            ("implementation.appliedResults.0.request", "다른 요청"),
+            ("review.requesterView.requestItems.0.handling", "adapted"),
+            ("prs", [{"url": "https://invalid.example/pull/1"}]),
+        ]
+        for index, (field, value) in enumerate(invalid_results, 1):
+            with self.subTest(field=field):
+                request = HpaChangeRequest(
+                    **{
+                        **self.request.__dict__,
+                        "event_ts": f"1720580400.{index + 100:06d}",
+                    }
+                )
+                job, _ = self.service.submit(request)
+                self.store.mark_running(job.task_id, _workflow_run())
+                self.store.mark_workflow_succeeded(
+                    job.task_id,
+                    _workflow_run(status="completed", conclusion="success"),
+                )
+                result = self._no_change_result(job.task_id)
+                target: Any = result
+                parts = field.split(".")
+                for part in parts[:-1]:
+                    target = target[int(part)] if part.isdigit() else target[part]
+                target[parts[-1]] = value
+                self.coordinator.result = result
+
+                with self.assertRaises(GitHubArtifactError):
+                    self.service.poll_job(job.task_id)
+                self.assertEqual(
+                    self.store.get_job(job.task_id).status,
+                    HpaChangeStatus.FAILED,
+                )
 
     def test_review_ready_waits_for_slack_post_before_implementation_dispatch(self) -> None:
         job, _ = self.service.submit(self.request)
