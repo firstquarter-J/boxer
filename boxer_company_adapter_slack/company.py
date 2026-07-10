@@ -47,6 +47,13 @@ from boxer_company_adapter_slack.health import (
     _build_dependency_failure_reply,
     _format_ping_llm_status,
 )
+from boxer_company_adapter_slack.hpa_change_reporter import attach_hpa_change_reporter
+from boxer_company_adapter_slack.hpa_change_routes import (
+    HpaChangeRoutesContext,
+    HpaChangeRoutesDeps,
+    _handle_hpa_change_request,
+)
+from boxer_company_adapter_slack.hpa_change_runtime import create_hpa_change_runtime
 from boxer_company_adapter_slack.knowledge_routes import (
     KnowledgeRoutesContext,
     KnowledgeRoutesDeps,
@@ -213,6 +220,7 @@ def create_app() -> App:
             claude_client = _build_claude_client(timeout_sec=s.ANTHROPIC_TIMEOUT_SEC)
         except Exception:
             app_logger.warning("Failed to initialize Claude client; continuing without it", exc_info=True)
+    hpa_change_runtime = create_hpa_change_runtime(logger=app_logger)
     s3_client: Any | None = None
 
     def _get_s3_client() -> Any:
@@ -234,6 +242,25 @@ def create_app() -> App:
         channel_id = payload["channel_id"]
         current_ts = payload["current_ts"]
         thread_ts = payload["thread_ts"]
+
+        # 코드 변경 요청은 일반 질의나 ping보다 먼저 격리 worker intake로 고정한다.
+        if _handle_hpa_change_request(
+            HpaChangeRoutesContext(
+                question=question,
+                payload=payload,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                current_ts=current_ts,
+                thread_ts=thread_ts,
+                reply=reply,
+                client=client,
+                logger=logger,
+            ),
+            hpa_change_runtime.routes_config,
+            HpaChangeRoutesDeps(submit_request=hpa_change_runtime.submit_request),
+        ):
+            return
 
         if "ping" in text:
             _set_request_log_route(payload, "ping")
@@ -933,6 +960,7 @@ def create_app() -> App:
         )
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
+    attach_hpa_change_reporter(app, hpa_change_runtime, logger=app_logger)
     attach_weekly_recordings_reporter(app, logger=app_logger)
     attach_device_health_monitor_reporter(app, logger=app_logger)
     attach_daily_device_round_reporter(app, logger=app_logger)

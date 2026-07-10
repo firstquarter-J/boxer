@@ -398,7 +398,8 @@ def create_slack_app(
                 "status": "handled",
             },
         }
-        logger.info("Received app_mention: user=%s text=%s", user_id, text)
+        # Slack 본문에는 코드나 비밀값이 포함될 수 있어 운영 로그에는 내용 대신 길이만 남긴다.
+        logger.info("Received app_mention: user=%s text_length=%s", user_id, len(raw_text))
 
         def reply(
             reply_text: str,
@@ -491,12 +492,13 @@ def create_slack_app(
                 "status": "handled",
             },
         }
+        # 일반 message 이벤트도 원문을 로그로 복제하지 않고 라우팅에 필요한 메타데이터만 남긴다.
         logger.info(
-            "Received message: user=%s bot=%s subtype=%s text=%s",
+            "Received message: user=%s bot=%s subtype=%s text_length=%s",
             user_id or "unknown",
             bot_id or "none",
             subtype or "none",
-            payload["text"],
+            len(raw_text),
         )
 
         def reply(reply_text: str, *, thread: bool = False) -> None:

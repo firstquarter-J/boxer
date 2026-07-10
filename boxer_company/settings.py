@@ -73,6 +73,58 @@ THREAD_PLAYBOOK_LEARNING_MAX_THREAD_CHARS = int(
 )
 THREAD_PLAYBOOK_LEARNING_MAX_TOKENS = int(os.getenv("THREAD_PLAYBOOK_LEARNING_MAX_TOKENS", "900"))
 
+# HPA 코드 변경 요청은 운영 Boxer에서 직접 코드를 실행하지 않고, 격리된 GitHub Actions worker로만 보낸다.
+HPA_CHANGE_REQUEST_ENABLED = (
+    os.getenv("HPA_CHANGE_REQUEST_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_raw_hpa_change_request_ids = os.getenv("HPA_CHANGE_REQUEST_ALLOWED_USER_IDS", "")
+HPA_CHANGE_REQUEST_ALLOWED_USER_IDS = {
+    item.strip()
+    for item in _raw_hpa_change_request_ids.split(",")
+    if item.strip()
+}
+_raw_hpa_change_channel_ids = os.getenv("HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS", "")
+HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS = {
+    item.strip()
+    for item in _raw_hpa_change_channel_ids.split(",")
+    if item.strip()
+}
+HPA_CHANGE_GITHUB_COORDINATOR_REPOSITORY = os.getenv(
+    "HPA_CHANGE_GITHUB_COORDINATOR_REPOSITORY",
+    "mmtalk-app/mmb-hospital-admin-server",
+).strip()
+HPA_CHANGE_GITHUB_WORKFLOW_FILE = os.getenv(
+    "HPA_CHANGE_GITHUB_WORKFLOW_FILE",
+    "boxer-hpa-change.yml",
+).strip()
+HPA_CHANGE_GITHUB_API_URL = os.getenv(
+    "HPA_CHANGE_GITHUB_API_URL",
+    "https://api.github.com",
+).strip().rstrip("/")
+HPA_CHANGE_GITHUB_TOKEN = os.getenv("HPA_CHANGE_GITHUB_TOKEN", "").strip()
+HPA_CHANGE_GITHUB_APP_ID = os.getenv("HPA_CHANGE_GITHUB_APP_ID", "").strip()
+HPA_CHANGE_GITHUB_APP_INSTALLATION_ID = os.getenv(
+    "HPA_CHANGE_GITHUB_APP_INSTALLATION_ID",
+    "",
+).strip()
+HPA_CHANGE_GITHUB_APP_PRIVATE_KEY_PATH = os.getenv(
+    "HPA_CHANGE_GITHUB_APP_PRIVATE_KEY_PATH",
+    "",
+).strip()
+HPA_CHANGE_JOB_DB_PATH = os.getenv(
+    "HPA_CHANGE_JOB_DB_PATH",
+    str(core_settings.PROJECT_ROOT / "data" / "hpa_change_jobs.sqlite3"),
+).strip()
+HPA_CHANGE_POLL_INTERVAL_SEC = int(os.getenv("HPA_CHANGE_POLL_INTERVAL_SEC", "20"))
+HPA_CHANGE_RUN_TIMEOUT_SEC = int(os.getenv("HPA_CHANGE_RUN_TIMEOUT_SEC", "5400"))
+HPA_CHANGE_MAX_THREAD_CHARS = int(os.getenv("HPA_CHANGE_MAX_THREAD_CHARS", "30000"))
+HPA_CHANGE_MAX_FILES = int(os.getenv("HPA_CHANGE_MAX_FILES", "5"))
+HPA_CHANGE_MAX_FILE_BYTES = int(os.getenv("HPA_CHANGE_MAX_FILE_BYTES", "12000"))
+HPA_CHANGE_MAX_TOTAL_ATTACHMENT_BYTES = int(
+    os.getenv("HPA_CHANGE_MAX_TOTAL_ATTACHMENT_BYTES", "24000")
+)
+
 RECORDING_STREAMING_RESTORE_ENABLED = (
     os.getenv("RECORDING_STREAMING_RESTORE_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}
