@@ -188,7 +188,14 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                     }
                 ],
             )
-            self.assertEqual(runtime.workflow.github.config.workflow_run_name_prefix, "Boxer HPA")
+        self.assertEqual(
+            runtime.workflow.github.config.workflow_run_name_prefix,
+            "Boxer HPA Review",
+        )
+        self.assertEqual(
+            runtime.workflow.github.config.implementation_workflow_run_name_prefix,
+            "Boxer HPA Implementation",
+        )
 
     def test_invalid_private_key_path_fails_before_runtime_starts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

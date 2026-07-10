@@ -117,7 +117,7 @@ HPA_CHANGE_JOB_DB_PATH = os.getenv(
     str(core_settings.PROJECT_ROOT / "data" / "hpa_change_jobs.sqlite3"),
 ).strip()
 HPA_CHANGE_POLL_INTERVAL_SEC = int(os.getenv("HPA_CHANGE_POLL_INTERVAL_SEC", "20"))
-HPA_CHANGE_RUN_TIMEOUT_SEC = int(os.getenv("HPA_CHANGE_RUN_TIMEOUT_SEC", "5400"))
+HPA_CHANGE_RUN_TIMEOUT_SEC = int(os.getenv("HPA_CHANGE_RUN_TIMEOUT_SEC", "10800"))
 HPA_CHANGE_MAX_THREAD_CHARS = int(os.getenv("HPA_CHANGE_MAX_THREAD_CHARS", "30000"))
 HPA_CHANGE_MAX_FILES = int(os.getenv("HPA_CHANGE_MAX_FILES", "5"))
 # HPA 코드 첨부는 실제 파일 단위로 전달하므로 작은 snippet이 아닌 파일도 수용한다.

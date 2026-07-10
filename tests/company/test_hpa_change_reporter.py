@@ -20,12 +20,15 @@ from boxer_company_adapter_slack.hpa_change_runtime import HpaChangeRuntime
 
 
 class _FakeSlackClient:
-    def __init__(self, *, fail_count: int = 0) -> None:
+    def __init__(self, *, fail_count: int = 0, event_log: list[str] | None = None) -> None:
         self.fail_count = fail_count
         self.calls: list[dict[str, Any]] = []
+        self.event_log = event_log
 
     def chat_postMessage(self, **kwargs: Any) -> dict[str, str]:
         self.calls.append(kwargs)
+        if self.event_log is not None:
+            self.event_log.append("slack_post")
         if self.fail_count > 0:
             self.fail_count -= 1
             raise RuntimeError("xoxb-secret-response")
@@ -36,6 +39,15 @@ class _FakeWorkflow:
     def __init__(self, store: HpaChangeJobStore) -> None:
         self.store = store
         self.poll_calls: list[str] = []
+        self.implementation_dispatches: list[str] = []
+        self.event_log: list[str] | None = None
+
+    def dispatch_implementation(self, task_id: str):
+        self.implementation_dispatches.append(task_id)
+        if self.event_log is not None:
+            self.event_log.append("implementation_dispatch")
+        self.store.claim_implementation_dispatch(task_id)
+        return self.store.mark_dispatched(task_id)
 
     def poll_job(self, task_id: str) -> HpaChangePollResult:
         self.poll_calls.append(task_id)
@@ -48,6 +60,8 @@ class _FakeWorkflow:
             HpaChangeStatus.RUNNING: HpaChangePollState.RUNNING,
             HpaChangeStatus.WORKFLOW_SUCCEEDED: HpaChangePollState.RUNNING,
             HpaChangeStatus.RESULT_READY: HpaChangePollState.RUNNING,
+            HpaChangeStatus.REVIEW_READY: HpaChangePollState.REVIEW_READY,
+            HpaChangeStatus.REVIEW_POSTED: HpaChangePollState.QUEUED,
         }.get(job.status, HpaChangePollState.QUEUED)
         return HpaChangePollResult(
             task_id=job.task_id,
@@ -122,6 +136,12 @@ class HpaChangeReporterTests(unittest.TestCase):
         self.store.mark_workflow_succeeded(self.task_id, run)
         self.store.mark_result_ready(self.task_id, _artifact(self.task_id), result=result)
 
+    def _mark_review_ready(self, result: dict[str, Any]) -> None:
+        self._mark_running()
+        run = _workflow_run(self.task_id)
+        self.store.mark_workflow_succeeded(self.task_id, run)
+        self.store.mark_review_ready(self.task_id, _artifact(self.task_id), result=result)
+
     def test_running_status_is_posted_to_same_thread_once(self) -> None:
         self._mark_running()
         client = _FakeSlackClient()
@@ -166,6 +186,87 @@ class HpaChangeReporterTests(unittest.TestCase):
         )
         self.assertEqual(len(client.calls), 2)
 
+    def test_review_is_posted_before_implementation_dispatch(self) -> None:
+        result = {
+            "review": {
+                "summary": "CR Web 요청을 HPA 구조에 맞게 변환할 수 있어",
+                "corrections": [
+                    {
+                        "claim": "첨부 파일을 그대로 복사하면 된다",
+                        "correction": "HPA는 NestJS 서비스와 주입형 설정을 사용한다",
+                        "evidence": "src/app/crystal-reveal/crystal-reveal.service.ts:1",
+                    }
+                ],
+                "requesterGuidance": "CR Web과 HPA의 스택과 배포 구조가 달라 그대로 사용할 수 없어",
+                "hpaDecision": "HPA 생성 서비스 경계에 맞춘 유틸로 변환한다",
+                "hpaAdaptations": ["ExternalConfigService의 API 키 주입을 재사용한다"],
+            }
+        }
+        self._mark_review_ready(result)
+        event_log: list[str] = []
+        self.workflow.event_log = event_log
+        client = _FakeSlackClient(event_log=event_log)
+
+        sent = run_hpa_change_reporter_once(self.runtime, client)
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(client.calls), 1)
+        message = client.calls[0]["text"]
+        self.assertIn("*잘못된 전제*", message)
+        self.assertIn("*HPA 실제 구조*", message)
+        self.assertIn("*CR Web 코드를 그대로 못 쓰는 이유*", message)
+        self.assertIn("*HPA에서 사용할 변환 구현안*", message)
+        self.assertEqual(self.workflow.implementation_dispatches, [self.task_id])
+        self.assertEqual(event_log, ["slack_post", "implementation_dispatch"])
+        job = self.store.get_job(self.task_id)
+        self.assertEqual(job.status, HpaChangeStatus.DISPATCHED)
+        self.assertEqual(job.notified_status, HpaChangePollState.REVIEW_READY.value)
+
+    def test_review_post_failure_does_not_start_implementation(self) -> None:
+        self._mark_review_ready(
+            {
+                "review": {
+                    "requesterGuidance": "HPA 구조에 맞춰 변환해야 해",
+                    "hpaDecision": "HPA 서비스에 맞춘 구현안을 적용해",
+                }
+            }
+        )
+        client = _FakeSlackClient(fail_count=1)
+        silent_logger = logging.getLogger(f"{__name__}.review-retry")
+        silent_logger.setLevel(logging.CRITICAL)
+
+        sent = run_hpa_change_reporter_once(
+            self.runtime,
+            client,
+            logger=silent_logger,
+        )
+
+        self.assertEqual(sent, 0)
+        self.assertEqual(self.workflow.implementation_dispatches, [])
+        self.assertEqual(self.store.get_job(self.task_id).status, HpaChangeStatus.REVIEW_READY)
+
+    def test_completed_review_is_posted_even_when_original_phase_age_exceeds_timeout(self) -> None:
+        self._mark_review_ready(
+            {
+                "review": {
+                    "requesterGuidance": "CR Web과 HPA 구조가 달라 변환이 필요해",
+                    "hpaDecision": "HPA 서비스 경계에 맞춰 구현해",
+                }
+            }
+        )
+        created_at = self.store.get_job(self.task_id).created_at
+        self.runtime.run_timeout_sec = 1
+        client = _FakeSlackClient()
+
+        sent = run_hpa_change_reporter_once(
+            self.runtime,
+            client,
+            now=created_at + timedelta(seconds=120),
+        )
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(self.workflow.implementation_dispatches, [self.task_id])
+
     def test_review_corrections_and_blocking_questions_are_short_and_redacted(self) -> None:
         result = {
             "review": {
@@ -203,14 +304,13 @@ class HpaChangeReporterTests(unittest.TestCase):
 
         review_message = client.calls[0]["text"]
         question_message = client.calls[1]["text"]
-        self.assertIn("*요청자 안내*\n• 첨부 코드는 CR Web 기준이라 그대로 사용할 수 없어", review_message)
-        self.assertIn("\n\n*HPA 최종 적용안*", review_message)
+        self.assertIn("*CR Web 코드를 그대로 못 쓰는 이유*\n• 첨부 코드는 CR Web 기준이라 그대로 사용할 수 없어", review_message)
+        self.assertIn("\n\n*HPA에서 사용할 변환 구현안*", review_message)
         self.assertIn("\n\n*질문 1*", question_message)
-        self.assertIn("*HPA 기준 정정*\n• 요청 전제:", review_message)
-        self.assertIn("*HPA 최종 적용안*", review_message)
-        self.assertIn("HPA 적용:", review_message)
+        self.assertIn("*잘못된 전제*\n• CR Web의 Vercel 설정을 그대로 옮기면 돼", review_message)
+        self.assertIn("*HPA 실제 구조*", review_message)
         self.assertIn("근거: server/package.json:1", review_message)
-        self.assertIn("*HPA 적용 방식*", review_message)
+        self.assertIn("*HPA에서 사용할 변환 구현안*", review_message)
         self.assertNotIn("질문 1:", review_message)
         self.assertIn("*질문 1*", question_message)
         self.assertIn("*질문 2*", question_message)

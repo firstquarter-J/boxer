@@ -24,6 +24,8 @@ _REPORTABLE_STATUSES = (
     HpaChangeStatus.RUNNING,
     HpaChangeStatus.WORKFLOW_SUCCEEDED,
     HpaChangeStatus.RESULT_READY,
+    HpaChangeStatus.REVIEW_READY,
+    HpaChangeStatus.REVIEW_POSTED,
     HpaChangeStatus.NEEDS_CLARIFICATION,
     HpaChangeStatus.PR_CREATED,
     HpaChangeStatus.FAILED,
@@ -152,6 +154,25 @@ def _format_correction(item: Any) -> str:
     return " | ".join(parts) or _safe_review_line(item)
 
 
+def _correction_claim(item: Any) -> str:
+    if isinstance(item, Mapping):
+        return _safe_review_line(item.get("claim"), max_chars=240)
+    return _safe_review_line(item, max_chars=240)
+
+
+def _correction_hpa_condition(item: Any) -> str:
+    if not isinstance(item, Mapping):
+        return _safe_review_line(item, max_chars=420)
+    correction = _safe_review_line(
+        item.get("correction") or item.get("summary") or item.get("message"),
+        max_chars=420,
+    )
+    evidence = _safe_review_line(item.get("evidence"), max_chars=180)
+    if correction and evidence:
+        return f"{correction} (근거: {evidence})"
+    return correction or evidence
+
+
 def _review_summary(result: Mapping[str, Any]) -> str:
     values = _collect_review_items(
         result,
@@ -223,6 +244,51 @@ def _append_message_section(
     lines.extend(values)
 
 
+def _append_review_structure(
+    lines: list[str],
+    *,
+    corrections: Sequence[Any],
+    requester_guidance: str,
+    decision: str,
+    adaptations: Sequence[str],
+) -> None:
+    """요청자가 HPA 전환 판단을 순서대로 읽을 수 있게 고정된 네 문단으로 표시한다."""
+
+    wrong_assumptions = [
+        f"• {value}"
+        for value in (_correction_claim(item) for item in corrections)
+        if value
+    ]
+    hpa_conditions = [
+        f"• {value}"
+        for value in (_correction_hpa_condition(item) for item in corrections)
+        if value
+    ]
+    _append_message_section(
+        lines,
+        "잘못된 전제",
+        wrong_assumptions or ["• 잘못된 전제 없음"],
+    )
+    _append_message_section(
+        lines,
+        "HPA 실제 구조",
+        hpa_conditions or ["• HPA 코드 기준으로 적용 경로를 확인했어"],
+    )
+    _append_message_section(
+        lines,
+        "CR Web 코드를 그대로 못 쓰는 이유",
+        [f"• {requester_guidance}"],
+    )
+    implementation = ([f"• {decision}"] if decision else []) + [
+        f"• {item}" for item in adaptations
+    ]
+    _append_message_section(
+        lines,
+        "HPA에서 사용할 변환 구현안",
+        implementation or ["• HPA 실제 코드 경계에 맞춰 변환 적용할게"],
+    )
+
+
 def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
     task_id = _safe_review_line(poll.task_id, max_chars=80)
     base_lines = [f"• 요청 ID: `{task_id}`"]
@@ -259,6 +325,29 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
     if poll.state is HpaChangePollState.RUNNING:
         return ["\n".join(["*HPA 코드 변경 작업 진행 중*", *base_lines])]
 
+    if poll.state is HpaChangePollState.REVIEW_READY:
+        lines = [
+            "*HPA 코드 변경 검토 결과*",
+            "",
+            "• 상태: 검토 완료 · 구현 시작 전",
+            *base_lines,
+        ]
+        if summary:
+            _append_message_section(lines, "검토 요약", [f"• {summary}"])
+        _append_review_structure(
+            lines,
+            corrections=corrections,
+            requester_guidance=requester_guidance,
+            decision=decision,
+            adaptations=adaptations,
+        )
+        _append_message_section(
+            lines,
+            "다음 단계",
+            ["• 이 검토 결과가 스레드에 게시된 뒤 HPA 구현을 시작해"],
+        )
+        return ["\n".join(lines)]
+
     if poll.state is HpaChangePollState.NEEDS_CLARIFICATION:
         review_lines = [
             "*HPA 코드 변경 검토 결과*",
@@ -266,20 +355,14 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
             "• 상태: 추가 확인 필요",
             *base_lines,
         ]
-        _append_message_section(review_lines, "요청자 안내", [f"• {requester_guidance}"])
         if summary:
             _append_message_section(review_lines, "검토 요약", [f"• {summary}"])
-        if decision:
-            _append_message_section(review_lines, "HPA 최종 적용안", [f"• {decision}"])
-        _append_message_section(
+        _append_review_structure(
             review_lines,
-            "HPA 기준 정정",
-            [f"• {_format_correction(item)}" for item in corrections],
-        )
-        _append_message_section(
-            review_lines,
-            "HPA 적용 방식",
-            [f"• {item}" for item in adaptations],
+            corrections=corrections,
+            requester_guidance=requester_guidance,
+            decision=decision,
+            adaptations=adaptations,
         )
         if not summary and not corrections and not adaptations:
             _append_message_section(
@@ -354,11 +437,11 @@ def _format_hpa_change_poll_message(poll: HpaChangePollResult) -> str:
 def _is_timed_out(job: HpaChangeJob, runtime: HpaChangeRuntime, now: datetime) -> bool:
     if job.status not in _ACTIVE_STATUSES:
         return False
-    created_at = job.created_at
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
+    phase_started_at = job.phase_started_at
+    if phase_started_at.tzinfo is None:
+        phase_started_at = phase_started_at.replace(tzinfo=timezone.utc)
     elapsed_seconds = (
-        now.astimezone(timezone.utc) - created_at.astimezone(timezone.utc)
+        now.astimezone(timezone.utc) - phase_started_at.astimezone(timezone.utc)
     ).total_seconds()
     return elapsed_seconds > max(1, int(runtime.run_timeout_sec))
 
@@ -433,9 +516,16 @@ def run_hpa_change_reporter_once(
             # 어느 한 댓글이라도 실패하면 notified를 남기지 않아 다음 poll에서 재시도한다.
             for message in messages:
                 _post_hpa_change_message(client, poll.job, message)
-            # Slack 발송이 성공한 뒤에만 표시해서
-            # 재시작·일시 오류 시 알림이 유실되지 않게 한다.
-            runtime.store.mark_notified(poll.task_id, poll.state)
+            # 검토 결과 게시를 영속화한 뒤에만 별도 구현 workflow를 시작한다.
+            # 게시 직후 프로세스가 내려가도 REVIEW_POSTED 상태에서 dispatch를 재개한다.
+            if poll.state is HpaChangePollState.REVIEW_READY:
+                runtime.store.mark_review_posted(poll.task_id)
+                runtime.store.mark_notified(poll.task_id, poll.state)
+                runtime.workflow.dispatch_implementation(poll.task_id)
+            else:
+                # Slack 발송이 성공한 뒤에만 표시해서
+                # 재시작·일시 오류 시 알림이 유실되지 않게 한다.
+                runtime.store.mark_notified(poll.task_id, poll.state)
             sent_count += 1
         except Exception as exc:
             # request/result 원문과 GitHub 응답을 로그에 흘리지 않는다.

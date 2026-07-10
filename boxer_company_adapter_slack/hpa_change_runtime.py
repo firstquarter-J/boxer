@@ -31,7 +31,8 @@ from boxer_company_adapter_slack.hpa_change_routes import (
 
 
 _GITHUB_EVENT_TYPE = "boxer-hpa-change"
-_GITHUB_RUN_NAME_PREFIX = "Boxer HPA"
+_GITHUB_RUN_NAME_PREFIX = "Boxer HPA Review"
+_GITHUB_IMPLEMENTATION_RUN_NAME_PREFIX = "Boxer HPA Implementation"
 
 
 @dataclass
@@ -303,7 +304,7 @@ def create_hpa_change_runtime(
             ),
             run_timeout_sec=max(
                 1,
-                int(_setting(settings, "HPA_CHANGE_RUN_TIMEOUT_SEC", 5_400) or 5_400),
+                int(_setting(settings, "HPA_CHANGE_RUN_TIMEOUT_SEC", 10_800) or 10_800),
             ),
             logger=logger,
         )
@@ -343,6 +344,7 @@ def create_hpa_change_runtime(
         workflow_id=workflow_id,
         event_type=_GITHUB_EVENT_TYPE,
         workflow_run_name_prefix=_GITHUB_RUN_NAME_PREFIX,
+        implementation_workflow_run_name_prefix=_GITHUB_IMPLEMENTATION_RUN_NAME_PREFIX,
         api_base_url=api_url,
     )
     token_provider, auth_mode = _build_token_provider(

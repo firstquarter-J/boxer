@@ -166,6 +166,8 @@ class HpaChangeStatus(str, Enum):
     RUNNING = "running"
     WORKFLOW_SUCCEEDED = "workflow_succeeded"
     RESULT_READY = "result_ready"
+    REVIEW_READY = "review_ready"
+    REVIEW_POSTED = "review_posted"
     NEEDS_CLARIFICATION = "needs_clarification"
     PR_CREATED = "pr_created"
     FAILED = "failed"
@@ -180,6 +182,7 @@ _ALLOWED_STATUS_TRANSITIONS: dict[HpaChangeStatus, frozenset[HpaChangeStatus]] =
         {
             HpaChangeStatus.DISPATCHED,
             HpaChangeStatus.RUNNING,
+            HpaChangeStatus.WORKFLOW_SUCCEEDED,
             HpaChangeStatus.FAILED,
             HpaChangeStatus.CANCELED,
         }
@@ -200,12 +203,33 @@ _ALLOWED_STATUS_TRANSITIONS: dict[HpaChangeStatus, frozenset[HpaChangeStatus]] =
         }
     ),
     HpaChangeStatus.WORKFLOW_SUCCEEDED: frozenset(
-        {HpaChangeStatus.RESULT_READY, HpaChangeStatus.FAILED, HpaChangeStatus.CANCELED}
+        {
+            HpaChangeStatus.RESULT_READY,
+            HpaChangeStatus.REVIEW_READY,
+            HpaChangeStatus.FAILED,
+            HpaChangeStatus.CANCELED,
+        }
     ),
     HpaChangeStatus.RESULT_READY: frozenset(
         {
+            HpaChangeStatus.REVIEW_READY,
             HpaChangeStatus.NEEDS_CLARIFICATION,
             HpaChangeStatus.PR_CREATED,
+            HpaChangeStatus.FAILED,
+            HpaChangeStatus.CANCELED,
+        }
+    ),
+    HpaChangeStatus.REVIEW_READY: frozenset(
+        {
+            HpaChangeStatus.REVIEW_POSTED,
+            HpaChangeStatus.NEEDS_CLARIFICATION,
+            HpaChangeStatus.FAILED,
+            HpaChangeStatus.CANCELED,
+        }
+    ),
+    HpaChangeStatus.REVIEW_POSTED: frozenset(
+        {
+            HpaChangeStatus.DISPATCHING,
             HpaChangeStatus.FAILED,
             HpaChangeStatus.CANCELED,
         }
@@ -234,6 +258,8 @@ class HpaChangeJob:
     attachments: tuple[HpaChangeAttachment, ...]
     status: HpaChangeStatus
     metadata: dict[str, Any]
+    workflow_phase: str
+    phase_started_at: datetime
     workflow_run_id: int | None
     workflow_run_url: str
     artifact_id: int | None
@@ -277,6 +303,7 @@ class HpaChangeRequest:
 class HpaChangePollState(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    REVIEW_READY = "review_ready"
     NEEDS_CLARIFICATION = "needs_clarification"
     PR_OPENED = "pr_opened"
     FAILED = "failed"
@@ -361,6 +388,8 @@ class HpaChangeJobStore:
             attachments_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}',
+            workflow_phase TEXT NOT NULL DEFAULT '',
+            phase_started_at TEXT NOT NULL DEFAULT '',
             workflow_run_id INTEGER,
             workflow_run_url TEXT NOT NULL DEFAULT '',
             artifact_id INTEGER,
@@ -380,6 +409,21 @@ class HpaChangeJobStore:
         """
         with self._lock:
             self._connection.executescript(schema)
+            # 기존 운영 DB도 재시작만으로 phase 추적 필드를 추가한다.
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(hpa_change_jobs)"
+                ).fetchall()
+            }
+            if "workflow_phase" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE hpa_change_jobs ADD COLUMN workflow_phase TEXT NOT NULL DEFAULT ''"
+                )
+            if "phase_started_at" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE hpa_change_jobs ADD COLUMN phase_started_at TEXT NOT NULL DEFAULT ''"
+                )
 
     def register_job(
         self,
@@ -529,6 +573,8 @@ class HpaChangeJobStore:
             HpaChangeStatus.RUNNING.value,
             HpaChangeStatus.WORKFLOW_SUCCEEDED.value,
             HpaChangeStatus.RESULT_READY.value,
+            HpaChangeStatus.REVIEW_READY.value,
+            HpaChangeStatus.REVIEW_POSTED.value,
         )
         placeholders = ", ".join("?" for _ in active_statuses)
         params: list[Any] = [
@@ -571,6 +617,8 @@ class HpaChangeJobStore:
         pr_urls: Sequence[str] | object = _UNSET,
         status_message: str | object = _UNSET,
         error_message: str | object = _UNSET,
+        workflow_phase: str | object = _UNSET,
+        reset_phase_started_at: bool = False,
         increment_dispatch_count: bool = False,
         clear_execution: bool = False,
     ) -> HpaChangeJob:
@@ -633,6 +681,13 @@ class HpaChangeJobStore:
                     updates["status_message"] = redact_sensitive_text(str(status_message))
                 if error_message is not _UNSET:
                     updates["error_message"] = redact_sensitive_text(str(error_message))
+                if workflow_phase is not _UNSET:
+                    normalized_phase = str(workflow_phase or "").strip().lower()
+                    if normalized_phase not in {"", "review", "implementation"}:
+                        raise ValueError("HPA workflow phase가 올바르지 않아")
+                    updates["workflow_phase"] = normalized_phase
+                if reset_phase_started_at:
+                    updates["phase_started_at"] = now_text
                 if increment_dispatch_count:
                     updates["dispatch_count"] = int(row["dispatch_count"] or 0) + 1
 
@@ -648,13 +703,86 @@ class HpaChangeJobStore:
         return self.get_job(normalized_task_id)
 
     def begin_dispatch(self, task_id: str) -> HpaChangeJob:
-        return self.transition(
-            task_id,
-            HpaChangeStatus.DISPATCHING,
-            increment_dispatch_count=True,
-            clear_execution=True,
-            status_message="GitHub coordinator dispatch 준비 중",
-        )
+        claimed = self.claim_review_dispatch(task_id)
+        if claimed is None:
+            return self.get_job(task_id)
+        return claimed
+
+    def claim_review_dispatch(
+        self,
+        task_id: str,
+        *,
+        allow_recovery: bool = False,
+        retry_after_sec: int = 60,
+    ) -> HpaChangeJob | None:
+        """review dispatch도 원자적으로 소유하고 중단된 전송만 재시도한다."""
+
+        normalized_task_id = str(task_id or "").strip()
+        now = _coerce_utc(self._clock())
+        now_text = _datetime_to_text(now)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT * FROM hpa_change_jobs WHERE task_id = ?",
+                    (normalized_task_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"HPA 변경 작업을 찾지 못했어: {normalized_task_id}")
+                current = HpaChangeStatus(str(row["status"]))
+                first_claim = current in {
+                    HpaChangeStatus.RECEIVED,
+                    HpaChangeStatus.NEEDS_CLARIFICATION,
+                    HpaChangeStatus.FAILED,
+                }
+                recoverable = (
+                    allow_recovery
+                    and str(row["workflow_phase"] or "") == "review"
+                    and current in {HpaChangeStatus.DISPATCHING, HpaChangeStatus.DISPATCHED}
+                )
+                if not first_claim and not recoverable:
+                    if allow_recovery:
+                        self._connection.execute("COMMIT")
+                        return None
+                    raise InvalidHpaChangeTransition(
+                        f"review dispatch를 시작할 수 없는 상태야: {current.value}"
+                    )
+                if recoverable:
+                    last_attempt = _datetime_from_text(str(row["updated_at"]))
+                    if (now - last_attempt).total_seconds() < max(1, int(retry_after_sec)):
+                        self._connection.execute("COMMIT")
+                        return None
+
+                updates = {
+                    "status": HpaChangeStatus.DISPATCHING.value,
+                    "workflow_phase": "review",
+                    "updated_at": now_text,
+                    "status_message": "GitHub coordinator review dispatch 준비 중",
+                    "dispatch_count": int(row["dispatch_count"] or 0) + 1,
+                }
+                if first_claim:
+                    updates.update(
+                        {
+                            "phase_started_at": now_text,
+                            "workflow_run_id": None,
+                            "workflow_run_url": "",
+                            "artifact_id": None,
+                            "artifact_name": "",
+                            "result_json": "{}",
+                            "pr_urls_json": "[]",
+                            "error_message": "",
+                        }
+                    )
+                assignments = ", ".join(f"{name} = ?" for name in updates)
+                self._connection.execute(
+                    f"UPDATE hpa_change_jobs SET {assignments} WHERE task_id = ?",
+                    [*updates.values(), normalized_task_id],
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return self.get_job(normalized_task_id)
 
     def mark_dispatched(self, task_id: str) -> HpaChangeJob:
         return self.transition(
@@ -696,6 +824,92 @@ class HpaChangeJobStore:
             result=result or {},
             status_message="GitHub workflow 결과 artifact 수집 완료",
         )
+
+    def mark_review_ready(
+        self,
+        task_id: str,
+        archive: GitHubArtifactArchive,
+        *,
+        result: Mapping[str, Any] | None = None,
+    ) -> HpaChangeJob:
+        """검토 artifact를 수집했지만 구현은 아직 시작하지 않은 상태로 남긴다."""
+
+        return self.transition(
+            task_id,
+            HpaChangeStatus.REVIEW_READY,
+            artifact_id=archive.artifact_id,
+            artifact_name=archive.name,
+            result=result or {},
+            status_message="검토 결과 게시 전 대기",
+        )
+
+    def mark_review_posted(self, task_id: str) -> HpaChangeJob:
+        return self.transition(
+            task_id,
+            HpaChangeStatus.REVIEW_POSTED,
+            status_message="Slack 검토 결과 게시 완료, 구현 dispatch 준비 중",
+        )
+
+    def claim_implementation_dispatch(
+        self,
+        task_id: str,
+        *,
+        allow_recovery: bool = False,
+        retry_after_sec: int = 60,
+    ) -> HpaChangeJob | None:
+        """한 poller만 구현 dispatch를 소유하고, 오래된 시도만 재소유하게 한다."""
+
+        normalized_task_id = str(task_id or "").strip()
+        now = _coerce_utc(self._clock())
+        now_text = _datetime_to_text(now)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT * FROM hpa_change_jobs WHERE task_id = ?",
+                    (normalized_task_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"HPA 변경 작업을 찾지 못했어: {normalized_task_id}")
+                current = HpaChangeStatus(str(row["status"]))
+                first_claim = current is HpaChangeStatus.REVIEW_POSTED
+                recoverable = (
+                    allow_recovery
+                    and str(row["workflow_phase"] or "") == "implementation"
+                    and current in {HpaChangeStatus.DISPATCHING, HpaChangeStatus.DISPATCHED}
+                )
+                if not first_claim and not recoverable:
+                    if allow_recovery:
+                        self._connection.execute("COMMIT")
+                        return None
+                    raise InvalidHpaChangeTransition(
+                        f"검토 게시 전에는 구현을 시작할 수 없어: {current.value}"
+                    )
+                if recoverable:
+                    last_attempt = _datetime_from_text(str(row["updated_at"]))
+                    if (now - last_attempt).total_seconds() < max(1, int(retry_after_sec)):
+                        self._connection.execute("COMMIT")
+                        return None
+
+                updates = {
+                    "status": HpaChangeStatus.DISPATCHING.value,
+                    "workflow_phase": "implementation",
+                    "updated_at": now_text,
+                    "status_message": "검토 게시 후 HPA 구현 dispatch 준비 중",
+                    "dispatch_count": int(row["dispatch_count"] or 0) + 1,
+                }
+                if first_claim:
+                    updates["phase_started_at"] = now_text
+                assignments = ", ".join(f"{name} = ?" for name in updates)
+                self._connection.execute(
+                    f"UPDATE hpa_change_jobs SET {assignments} WHERE task_id = ?",
+                    [*updates.values(), normalized_task_id],
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return self.get_job(normalized_task_id)
 
     def mark_needs_clarification(
         self,
@@ -790,6 +1004,12 @@ class HpaChangeJobStore:
             ),
             status=HpaChangeStatus(str(row["status"])),
             metadata=metadata if isinstance(metadata, dict) else {},
+            workflow_phase=str(row["workflow_phase"] or ""),
+            phase_started_at=(
+                _datetime_from_text(str(row["phase_started_at"]))
+                if str(row["phase_started_at"] or "").strip()
+                else _datetime_from_text(str(row["created_at"]))
+            ),
             workflow_run_id=(
                 int(row["workflow_run_id"]) if row["workflow_run_id"] is not None else None
             ),
@@ -990,7 +1210,9 @@ class GitHubCoordinatorConfig:
     repository: str
     workflow_id: str
     event_type: str = "boxer-hpa-change"
-    workflow_run_name_prefix: str = "HPA Change"
+    implementation_event_type: str = "boxer-hpa-implement"
+    workflow_run_name_prefix: str = "HPA Change Review"
+    implementation_workflow_run_name_prefix: str = "HPA Change Implementation"
     result_artifact_name_prefix: str = "boxer-hpa-result"
     result_member_name: str = "result.json"
     api_base_url: str = "https://api.github.com"
@@ -1009,8 +1231,12 @@ class GitHubCoordinatorConfig:
             raise ValueError("GitHub coordinator workflow_id 형식이 올바르지 않아")
         if not _GITHUB_EVENT_TYPE_PATTERN.fullmatch(self.event_type):
             raise ValueError("GitHub repository_dispatch event_type 형식이 올바르지 않아")
+        if not _GITHUB_EVENT_TYPE_PATTERN.fullmatch(self.implementation_event_type):
+            raise ValueError("GitHub implementation event_type 형식이 올바르지 않아")
         if not self.workflow_run_name_prefix.strip():
             raise ValueError("GitHub workflow run-name prefix가 없어")
+        if not self.implementation_workflow_run_name_prefix.strip():
+            raise ValueError("GitHub implementation run-name prefix가 없어")
         if not _GITHUB_SLUG_PATTERN.fullmatch(self.result_artifact_name_prefix):
             raise ValueError("GitHub result artifact prefix 형식이 올바르지 않아")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", self.result_member_name):
@@ -1020,8 +1246,13 @@ class GitHubCoordinatorConfig:
     def repository_path(self) -> str:
         return f"repos/{self.owner}/{self.repository}"
 
-    def expected_run_title(self, task_id: str) -> str:
-        return f"{self.workflow_run_name_prefix.strip()} - {task_id}"
+    def expected_run_title(self, task_id: str, *, phase: str = "review") -> str:
+        prefix = (
+            self.implementation_workflow_run_name_prefix
+            if str(phase).strip().lower() == "implementation"
+            else self.workflow_run_name_prefix
+        )
+        return f"{prefix.strip()} - {task_id}"
 
     def result_artifact_name(self, task_id: str) -> str:
         if not _TASK_ID_PATTERN.fullmatch(str(task_id or "").strip()):
@@ -1118,14 +1349,57 @@ class GitHubCoordinatorClient:
             dispatched_at=_coerce_utc(self._clock()),
         )
 
+    def dispatch_implementation(
+        self,
+        job: HpaChangeJob,
+        *,
+        review_run_id: int,
+    ) -> GitHubDispatchReceipt:
+        """Slack에 검토 결과를 게시한 뒤에만 구현 workflow를 시작한다."""
+
+        if not _TASK_ID_PATTERN.fullmatch(job.task_id):
+            raise ValueError("구현 dispatch할 HPA task id 형식이 올바르지 않아")
+        if int(review_run_id) <= 0:
+            raise ValueError("구현 dispatch에 필요한 review run id가 없어")
+
+        # 원 요청과 검토 결과는 review run의 검증된 artifact에서만 가져온다.
+        # 두 번째 dispatch에는 Slack 원문이나 첨부를 다시 싣지 않는다.
+        client_payload: dict[str, Any] = {
+            "task_id": job.task_id,
+            "review_run_id": int(review_run_id),
+        }
+        body = {
+            "event_type": self.config.implementation_event_type,
+            "client_payload": client_payload,
+        }
+        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > max(1, self.config.max_dispatch_payload_bytes):
+            raise ValueError("GitHub implementation dispatch payload가 허용 크기를 넘었어")
+
+        self._request(
+            "POST",
+            f"/{self.config.repository_path}/dispatches",
+            expected_statuses={204},
+            json_body=body,
+        )
+        return GitHubDispatchReceipt(
+            task_id=job.task_id,
+            event_type=self.config.implementation_event_type,
+            dispatched_at=_coerce_utc(self._clock()),
+        )
+
     def find_workflow_run(
         self,
         task_id: str,
         *,
+        phase: str = "review",
         created_after: datetime | None = None,
         max_pages: int = 3,
     ) -> GitHubWorkflowRun | None:
-        expected_title = self.config.expected_run_title(task_id)
+        normalized_phase = str(phase or "").strip().lower()
+        if normalized_phase not in {"review", "implementation"}:
+            raise ValueError("조회할 HPA workflow phase가 올바르지 않아")
+        expected_title = self.config.expected_run_title(task_id, phase=normalized_phase)
         candidates: list[GitHubWorkflowRun] = []
         for page in range(1, max(1, min(10, int(max_pages))) + 1):
             data = self._request_json(
@@ -1157,13 +1431,12 @@ class GitHubCoordinatorClient:
                 break
         if not candidates:
             return None
-        return max(
-            candidates,
-            key=lambda item: (
-                item.created_at or datetime.min.replace(tzinfo=timezone.utc),
-                item.run_id,
-            ),
+        key = lambda item: (
+            item.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            item.run_id,
         )
+        # dispatch 응답 유실로 같은 phase가 재전송돼도 최초 run만 정식 실행으로 추적한다.
+        return min(candidates, key=key)
 
     def get_workflow_run(self, run_id: int) -> GitHubWorkflowRun:
         data = self._request_json(
@@ -1403,10 +1676,54 @@ class HpaChangeWorkflowService:
     def dispatch(
         self,
         task_id: str,
+        *,
+        allow_recovery: bool = False,
     ) -> HpaChangeJob:
-        job = self.store.begin_dispatch(task_id)
+        job = self.store.claim_review_dispatch(
+            task_id,
+            allow_recovery=allow_recovery,
+        )
+        if job is None:
+            return self.store.get_job(task_id)
         try:
             self.github.dispatch_job(job)
+        except GitHubApiError as exc:
+            # POST가 수락된 뒤 응답만 유실됐을 수 있으므로 transport 오류는
+            # 실패로 확정하지 않고 run 조회·stale 재전송으로 reconciliation한다.
+            if exc.status_code is None:
+                return self.store.get_job(task_id)
+            self.store.mark_failed(task_id, str(exc))
+            raise
+        except Exception as exc:
+            self.store.mark_failed(task_id, str(exc))
+            raise
+        return self.store.mark_dispatched(task_id)
+
+    def dispatch_implementation(
+        self,
+        task_id: str,
+        *,
+        allow_recovery: bool = False,
+    ) -> HpaChangeJob:
+        """Slack 검토 게시가 영속화된 작업만 구현 phase로 넘긴다."""
+
+        current = self.store.get_job(task_id)
+        if current.workflow_run_id is None:
+            raise HpaChangeWorkflowError("구현에 사용할 review workflow run id가 없어")
+        review_run_id = current.workflow_run_id
+        job = self.store.claim_implementation_dispatch(
+            task_id,
+            allow_recovery=allow_recovery,
+        )
+        if job is None:
+            return self.store.get_job(task_id)
+        try:
+            self.github.dispatch_implementation(job, review_run_id=review_run_id)
+        except GitHubApiError as exc:
+            if exc.status_code is None:
+                return self.store.get_job(task_id)
+            self.store.mark_failed(task_id, str(exc))
+            raise
         except Exception as exc:
             self.store.mark_failed(task_id, str(exc))
             raise
@@ -1417,6 +1734,8 @@ class HpaChangeWorkflowService:
         if job.status in {
             HpaChangeStatus.PR_CREATED,
             HpaChangeStatus.NEEDS_CLARIFICATION,
+            HpaChangeStatus.REVIEW_READY,
+            HpaChangeStatus.REVIEW_POSTED,
             HpaChangeStatus.RESULT_READY,
             HpaChangeStatus.WORKFLOW_SUCCEEDED,
             HpaChangeStatus.FAILED,
@@ -1425,6 +1744,7 @@ class HpaChangeWorkflowService:
             return job
         run = self.github.find_workflow_run(
             task_id,
+            phase=job.workflow_phase or "review",
             created_after=job.created_at - timedelta(minutes=1),
         )
         if run is None:
@@ -1452,12 +1772,27 @@ class HpaChangeWorkflowService:
         if job.status == HpaChangeStatus.RECEIVED:
             # register 직후 프로세스가 종료된 작업도 재시작한 poller가 coordinator에 전달한다.
             job = self.dispatch(task_id)
+        if job.status == HpaChangeStatus.REVIEW_POSTED:
+            # Slack 게시 직후 프로세스가 재시작돼도 구현 dispatch를 이어간다.
+            job = self.dispatch_implementation(task_id)
         if job.status in {
             HpaChangeStatus.DISPATCHING,
             HpaChangeStatus.DISPATCHED,
             HpaChangeStatus.RUNNING,
         }:
             job = self.refresh(task_id)
+        if (
+            job.workflow_phase == "review"
+            and job.status in {HpaChangeStatus.DISPATCHING, HpaChangeStatus.DISPATCHED}
+        ):
+            job = self.dispatch(task_id, allow_recovery=True)
+        if (
+            job.workflow_phase == "implementation"
+            and job.status in {HpaChangeStatus.DISPATCHING, HpaChangeStatus.DISPATCHED}
+        ):
+            # API 수락 전후에 프로세스가 종료된 경우 일정 시간 뒤 안전하게 재전송한다.
+            # workflow 쪽 최초-run gate가 중복 repository_dispatch의 실제 구현을 막는다.
+            job = self.dispatch_implementation(task_id, allow_recovery=True)
         if job.status == HpaChangeStatus.WORKFLOW_SUCCEEDED:
             try:
                 job = self.consume_result_artifact(task_id)
@@ -1476,6 +1811,9 @@ class HpaChangeWorkflowService:
             result_task_id = str(result.get("task_id") or "").strip()
             if result_task_id and result_task_id != task_id:
                 raise GitHubArtifactError("result artifact task id가 요청 작업과 달라")
+            raw_status = str(result.get("status") or "").strip().lower().replace("-", "_")
+            if raw_status == "review_ready":
+                return self.store.mark_review_ready(task_id, archive, result=result)
             self.store.mark_result_ready(task_id, archive, result=result)
             return self.apply_result_payload(task_id, result)
         except GitHubArtifactNotReady:
@@ -1496,6 +1834,10 @@ class HpaChangeWorkflowService:
             or safe_result.get("message")
             or ""
         ).strip()
+
+        if raw_status == "review_ready":
+            # consume_result_artifact가 archive 정보와 함께 처리해야 하는 상태다.
+            raise GitHubArtifactError("review_ready 결과는 artifact 수집 경로로 처리해야 해")
 
         if raw_status in {"needs_clarification", "clarification_required", "blocked"}:
             questions = safe_result.get("questions")
@@ -1572,7 +1914,9 @@ class HpaChangeWorkflowService:
 
     @staticmethod
     def _build_poll_result(job: HpaChangeJob) -> HpaChangePollResult:
-        if job.status == HpaChangeStatus.NEEDS_CLARIFICATION:
+        if job.status == HpaChangeStatus.REVIEW_READY:
+            state = HpaChangePollState.REVIEW_READY
+        elif job.status == HpaChangeStatus.NEEDS_CLARIFICATION:
             state = HpaChangePollState.NEEDS_CLARIFICATION
         elif job.status == HpaChangeStatus.PR_CREATED:
             state = HpaChangePollState.PR_OPENED
@@ -1582,6 +1926,7 @@ class HpaChangeWorkflowService:
             HpaChangeStatus.RUNNING,
             HpaChangeStatus.WORKFLOW_SUCCEEDED,
             HpaChangeStatus.RESULT_READY,
+            HpaChangeStatus.REVIEW_POSTED,
         }:
             state = HpaChangePollState.RUNNING
         else:

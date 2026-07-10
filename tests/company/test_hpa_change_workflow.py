@@ -255,6 +255,56 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         self.assertEqual(redispatching.dispatch_count, 2)
         self.assertIsNone(redispatching.workflow_run_id)
 
+    def test_implementation_dispatch_claim_is_single_owner_and_recovers_when_stale(self) -> None:
+        now = [_NOW]
+        store = HpaChangeJobStore(
+            ":memory:",
+            clock=lambda: now[0],
+            task_id_factory=_TaskIdFactory(),
+        )
+        try:
+            job = _register(store, event_ts="1720580400.000109").job
+            store.begin_dispatch(job.task_id)
+            store.mark_dispatched(job.task_id)
+            store.mark_running(job.task_id, _workflow_run(run_id=501))
+            store.mark_workflow_succeeded(
+                job.task_id,
+                _workflow_run(run_id=501, status="completed", conclusion="success"),
+            )
+            archive = GitHubArtifactArchive(
+                artifact_id=10,
+                workflow_run_id=501,
+                name=f"boxer-hpa-result-{job.task_id}",
+                size_in_bytes=20,
+                sha256="a" * 64,
+                content=b"zip",
+            )
+            store.mark_review_ready(job.task_id, archive, result={"status": "review_ready"})
+            store.mark_review_posted(job.task_id)
+
+            first = store.claim_implementation_dispatch(job.task_id)
+            duplicate = store.claim_implementation_dispatch(
+                job.task_id,
+                allow_recovery=True,
+                retry_after_sec=60,
+            )
+            now[0] = _NOW + timedelta(seconds=61)
+            recovered = store.claim_implementation_dispatch(
+                job.task_id,
+                allow_recovery=True,
+                retry_after_sec=60,
+            )
+
+            self.assertIsNotNone(first)
+            self.assertIsNone(duplicate)
+            self.assertIsNotNone(recovered)
+            self.assertEqual(first.workflow_phase, "implementation")
+            self.assertEqual(first.phase_started_at, _NOW)
+            self.assertEqual(recovered.dispatch_count, 3)
+            self.assertEqual(recovered.phase_started_at, _NOW)
+        finally:
+            store.close()
+
     def test_attachment_rejects_path_traversal_and_wrong_hash(self) -> None:
         with self.assertRaisesRegex(ValueError, "경로 없는 이름"):
             _register(self.store, attachments=(_attachment("../request.ts"),))
@@ -474,6 +524,19 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
         self.assertNotIn("channel_id", json.dumps(body))
         self.assertNotIn("event_ts", json.dumps(body))
 
+    def test_implementation_dispatch_links_review_run_and_uses_separate_event(self) -> None:
+        session = _FakeSession(_FakeResponse(204))
+        client = self._client(session)
+
+        receipt = client.dispatch_implementation(self.job, review_run_id=501)
+
+        body = session.calls[0]["json"]
+        self.assertEqual(receipt.event_type, "boxer-hpa-implement")
+        self.assertEqual(body["event_type"], "boxer-hpa-implement")
+        self.assertEqual(body["client_payload"]["task_id"], self.job.task_id)
+        self.assertEqual(body["client_payload"]["review_run_id"], 501)
+        self.assertEqual(set(body["client_payload"]), {"task_id", "review_run_id"})
+
     def test_finds_only_exact_task_run_title_in_fixed_workflow(self) -> None:
         expected_title = self.config.expected_run_title(self.job.task_id)
         session = _FakeSession(
@@ -513,6 +576,43 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
             session.calls[0]["url"],
         )
         self.assertEqual(session.calls[0]["params"]["event"], "repository_dispatch")
+
+    def test_finds_earliest_implementation_run_by_phase_specific_title(self) -> None:
+        expected_title = self.config.expected_run_title(
+            self.job.task_id,
+            phase="implementation",
+        )
+        session = _FakeSession(
+            _FakeResponse(
+                200,
+                json_data={
+                    "workflow_runs": [
+                        {
+                            "id": 202,
+                            "display_title": expected_title,
+                            "status": "in_progress",
+                            "created_at": "2026-07-10T03:02:00Z",
+                        },
+                        {
+                            "id": 201,
+                            "display_title": expected_title,
+                            "status": "in_progress",
+                            "created_at": "2026-07-10T03:01:00Z",
+                        },
+                    ]
+                },
+            )
+        )
+        client = self._client(session)
+
+        run = client.find_workflow_run(
+            self.job.task_id,
+            phase="implementation",
+            created_after=_NOW,
+        )
+
+        self.assertIsNotNone(run)
+        self.assertEqual(run.run_id, 201)
 
     def test_downloads_dynamic_result_zip_from_fixed_artifact_url(self) -> None:
         content = _zip_result(
@@ -616,15 +716,33 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
 class _FakeCoordinator:
     def __init__(self) -> None:
         self.dispatches: list[str] = []
+        self.implementation_dispatches: list[tuple[str, int]] = []
+        self.find_phases: list[str] = []
         self.runs: list[GitHubWorkflowRun | None] = []
         self.result: dict[str, Any] = {}
         self.artifact_not_ready = False
+        self.dispatch_error: Exception | None = None
+        self.implementation_dispatch_error: Exception | None = None
 
     def dispatch_job(self, job) -> None:
+        if self.dispatch_error is not None:
+            raise self.dispatch_error
         self.dispatches.append(job.task_id)
 
-    def find_workflow_run(self, _task_id: str, *, created_after: datetime):
+    def dispatch_implementation(self, job, *, review_run_id: int) -> None:
+        if self.implementation_dispatch_error is not None:
+            raise self.implementation_dispatch_error
+        self.implementation_dispatches.append((job.task_id, review_run_id))
+
+    def find_workflow_run(
+        self,
+        _task_id: str,
+        *,
+        phase: str = "review",
+        created_after: datetime,
+    ):
         del created_after
+        self.find_phases.append(phase)
         return self.runs.pop(0) if self.runs else None
 
     def download_result_artifact_zip(self, run_id: int, task_id: str) -> GitHubArtifactArchive:
@@ -677,6 +795,28 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         self.assertEqual(duplicate_job.task_id, first_job.task_id)
         self.assertEqual(self.coordinator.dispatches, [first_job.task_id])
 
+    def test_review_transport_error_stays_dispatching_for_reconciliation(self) -> None:
+        self.coordinator.dispatch_error = GitHubApiError("timeout", status_code=None)
+
+        job, created = self.service.submit(self.request)
+
+        self.assertTrue(created)
+        self.assertEqual(job.status, HpaChangeStatus.DISPATCHING)
+        self.assertEqual(job.workflow_phase, "review")
+
+    def test_review_http_error_is_terminal(self) -> None:
+        self.coordinator.dispatch_error = GitHubApiError("forbidden", status_code=403)
+
+        with self.assertRaises(GitHubApiError):
+            self.service.submit(self.request)
+
+        job = self.store.get_job_by_event_ts(
+            self.request.workspace_id,
+            self.request.event_ts,
+        )
+        self.assertIsNotNone(job)
+        self.assertEqual(job.status, HpaChangeStatus.FAILED)
+
     def test_poll_dispatches_job_left_received_by_process_restart(self) -> None:
         registration = _register(
             self.store,
@@ -688,6 +828,44 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         self.assertEqual(result.state, HpaChangePollState.QUEUED)
         self.assertEqual(result.job.status, HpaChangeStatus.DISPATCHED)
         self.assertEqual(self.coordinator.dispatches, [registration.job.task_id])
+
+    def test_stale_review_claim_is_redispatched_after_process_restart(self) -> None:
+        now = [_NOW]
+        self.store._clock = lambda: now[0]
+        registration = _register(
+            self.store,
+            event_ts="1720580400.000201",
+        )
+        # 외부 GitHub 호출 직전에 프로세스가 종료된 상태를 만든다.
+        self.store.claim_review_dispatch(registration.job.task_id)
+        now[0] = _NOW + timedelta(seconds=61)
+
+        recovered = self.service.poll_job(registration.job.task_id)
+
+        self.assertEqual(recovered.job.status, HpaChangeStatus.DISPATCHED)
+        self.assertEqual(self.coordinator.dispatches, [registration.job.task_id])
+        self.assertEqual(recovered.job.dispatch_count, 2)
+
+    def test_dispatching_job_accepts_already_completed_workflow_after_response_loss(self) -> None:
+        registration = _register(
+            self.store,
+            event_ts="1720580400.000202",
+        )
+        self.store.claim_review_dispatch(registration.job.task_id)
+        self.coordinator.runs.append(
+            _workflow_run(run_id=501, status="completed", conclusion="success")
+        )
+        self.coordinator.result = {
+            "task_id": registration.job.task_id,
+            "status": "review_ready",
+            "review": {"summary": "응답 유실 뒤에도 검토 결과 복구"},
+        }
+
+        recovered = self.service.poll_job(registration.job.task_id)
+
+        self.assertEqual(recovered.state, HpaChangePollState.REVIEW_READY)
+        self.assertEqual(recovered.job.status, HpaChangeStatus.REVIEW_READY)
+        self.assertEqual(recovered.job.workflow_run_id, 501)
 
     def test_poll_moves_queued_running_and_pr_opened_with_prs_contract(self) -> None:
         job, _ = self.service.submit(self.request)
@@ -749,6 +927,133 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
 
         self.assertEqual(result.state, HpaChangePollState.NEEDS_CLARIFICATION)
         self.assertIn("Basic", result.message)
+
+    def test_review_ready_waits_for_slack_post_before_implementation_dispatch(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        self.coordinator.result = {
+            "task_id": job.task_id,
+            "status": "review_ready",
+            "review": {
+                "summary": "HPA 구조 기준 변환안을 확정했어",
+                "blockingQuestions": [],
+            },
+        }
+
+        reviewed = self.service.poll_job(job.task_id)
+
+        self.assertEqual(reviewed.state, HpaChangePollState.REVIEW_READY)
+        self.assertEqual(reviewed.job.status, HpaChangeStatus.REVIEW_READY)
+        self.assertEqual(self.coordinator.implementation_dispatches, [])
+        with self.assertRaises(InvalidHpaChangeTransition):
+            self.service.dispatch_implementation(job.task_id)
+
+        self.store.mark_review_posted(job.task_id)
+        dispatched = self.service.dispatch_implementation(job.task_id)
+
+        self.assertEqual(dispatched.status, HpaChangeStatus.DISPATCHED)
+        self.assertEqual(
+            self.coordinator.implementation_dispatches,
+            [(job.task_id, 501)],
+        )
+        self.assertEqual(dispatched.result["review"]["summary"], "HPA 구조 기준 변환안을 확정했어")
+
+    def test_implementation_transport_error_stays_dispatching_for_reconciliation(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        self.coordinator.result = {
+            "task_id": job.task_id,
+            "status": "review_ready",
+            "review": {"summary": "검토 완료"},
+        }
+        self.service.poll_job(job.task_id)
+        self.store.mark_review_posted(job.task_id)
+        self.coordinator.implementation_dispatch_error = GitHubApiError(
+            "timeout",
+            status_code=None,
+        )
+
+        dispatching = self.service.dispatch_implementation(job.task_id)
+
+        self.assertEqual(dispatching.status, HpaChangeStatus.DISPATCHING)
+        self.assertEqual(dispatching.workflow_phase, "implementation")
+
+    def test_poll_recovers_implementation_dispatch_after_review_post(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run())
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(status="completed", conclusion="success"),
+        )
+        self.coordinator.result = {
+            "task_id": job.task_id,
+            "status": "review_ready",
+            "review": {"summary": "검토 완료"},
+        }
+        self.service.poll_job(job.task_id)
+        self.store.mark_review_posted(job.task_id)
+
+        recovered = self.service.poll_job(job.task_id)
+
+        self.assertEqual(recovered.job.status, HpaChangeStatus.DISPATCHED)
+        self.assertEqual(self.coordinator.implementation_dispatches, [(job.task_id, 501)])
+
+    def test_implementation_poll_uses_phase_specific_run_lookup(self) -> None:
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run(run_id=501))
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(run_id=501, status="completed", conclusion="success"),
+        )
+        self.coordinator.result = {
+            "task_id": job.task_id,
+            "status": "review_ready",
+            "review": {"summary": "검토 완료"},
+        }
+        self.service.poll_job(job.task_id)
+        self.store.mark_review_posted(job.task_id)
+        self.service.dispatch_implementation(job.task_id)
+        self.coordinator.runs.append(_workflow_run(run_id=502, status="in_progress"))
+
+        running = self.service.poll_job(job.task_id)
+
+        self.assertEqual(running.job.status, HpaChangeStatus.RUNNING)
+        self.assertEqual(running.job.workflow_run_id, 502)
+        self.assertEqual(self.coordinator.find_phases[-1], "implementation")
+
+    def test_stale_implementation_claim_is_redispatched_after_process_restart(self) -> None:
+        now = [_NOW]
+        self.store._clock = lambda: now[0]
+        job, _ = self.service.submit(self.request)
+        self.store.mark_running(job.task_id, _workflow_run(run_id=501))
+        self.store.mark_workflow_succeeded(
+            job.task_id,
+            _workflow_run(run_id=501, status="completed", conclusion="success"),
+        )
+        self.coordinator.result = {
+            "task_id": job.task_id,
+            "status": "review_ready",
+            "review": {"summary": "검토 완료"},
+        }
+        self.service.poll_job(job.task_id)
+        self.store.mark_review_posted(job.task_id)
+        # 외부 GitHub 호출 직전에 프로세스가 종료된 상태를 만든다.
+        self.store.claim_implementation_dispatch(job.task_id)
+        now[0] = _NOW + timedelta(seconds=61)
+
+        recovered = self.service.poll_job(job.task_id)
+
+        self.assertEqual(recovered.job.status, HpaChangeStatus.DISPATCHED)
+        self.assertEqual(self.coordinator.implementation_dispatches, [(job.task_id, 501)])
+        self.assertEqual(recovered.job.dispatch_count, 3)
 
     def test_poll_keeps_successful_workflow_running_while_artifact_is_not_ready(self) -> None:
         job, _ = self.service.submit(self.request)
