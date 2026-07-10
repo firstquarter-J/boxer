@@ -171,14 +171,20 @@ class HpaChangeReporterTests(unittest.TestCase):
             "review": {
                 "corrections": [
                     {
+                        "claim": "CR Web의 Vercel 설정을 그대로 옮기면 돼",
                         "correction": (
-                            "Vercel 설정은 HPA에 필요 없어. "
-                            "api_key=github_pat_abcdefghijklmnopqrstuvwxyz123456"
-                        )
+                            "HPA Server는 Vercel이 아닌 NestJS/PM2 구조라 실제 생성 메서드와 "
+                            "서버 의존성에 맞춰 변환해야 해. api_key=github_pat_abcdefghijklmnopqrstuvwxyz123456"
+                        ),
+                        "evidence": "server/package.json:1",
                     }
                 ],
+                "hpaAdaptations": [
+                    "sharp를 HPA Server package.json과 lockfile에 추가하고 서버 빌드에서 확인해",
+                ],
                 "blocking_questions": [
-                    {"question": "<@UOTHER> Basic과 Bonus를 병원별로 나눌까?"}
+                    {"question": "<@UOTHER> Basic과 Bonus를 병원별로 나눌까?"},
+                    {"question": "재시도 QA 실패 시 Bonus를 FAILED 처리할까?"},
                 ],
             },
             "request_echo": "ORIGINAL REQUEST",
@@ -194,8 +200,12 @@ class HpaChangeReporterTests(unittest.TestCase):
         run_hpa_change_reporter_once(self.runtime, client)
 
         message = client.calls[0]["text"]
-        self.assertIn("정정: Vercel 설정은 HPA에 필요 없어", message)
-        self.assertIn("확인 질문:", message)
+        self.assertIn("HPA 기준 정정: 요청 전제:", message)
+        self.assertIn("HPA 적용:", message)
+        self.assertIn("근거: server/package.json:1", message)
+        self.assertIn("HPA 적용 방식:", message)
+        self.assertIn("질문 1:", message)
+        self.assertIn("질문 2:", message)
         self.assertIn("‹@UOTHER›", message)
         self.assertNotIn("github_pat_", message)
         self.assertNotIn("ORIGINAL REQUEST", message)

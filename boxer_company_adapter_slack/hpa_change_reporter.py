@@ -95,6 +95,67 @@ def _collect_review_items(
     return rendered
 
 
+def _collect_review_entries(
+    result: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+    limit: int = 3,
+) -> list[Any]:
+    """구조화된 정정 항목의 claim/correction/evidence를 보존해 표시한다."""
+
+    review = result.get("review")
+    containers = [result]
+    if isinstance(review, Mapping):
+        containers.append(review)
+
+    rendered: list[Any] = []
+    seen: set[str] = set()
+    for container in containers:
+        for key in keys:
+            raw_items = container.get(key)
+            if raw_items is None:
+                continue
+            candidates = raw_items if isinstance(raw_items, (list, tuple)) else [raw_items]
+            for item in candidates:
+                fingerprint = repr(item)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                rendered.append(item)
+                if len(rendered) >= limit:
+                    return rendered
+    return rendered
+
+
+def _format_correction(item: Any) -> str:
+    if not isinstance(item, Mapping):
+        return _safe_review_line(item)
+    claim = _safe_review_line(item.get("claim"), max_chars=160)
+    correction = _safe_review_line(
+        item.get("correction") or item.get("summary") or item.get("message"),
+        max_chars=240,
+    )
+    evidence = _safe_review_line(item.get("evidence"), max_chars=180)
+    parts: list[str] = []
+    if claim:
+        parts.append(f"요청 전제: {claim}")
+    if correction:
+        parts.append(f"HPA 적용: {correction}")
+    if evidence:
+        parts.append(f"근거: {evidence}")
+    return " | ".join(parts) or _safe_review_line(item)
+
+
+def _review_summary(result: Mapping[str, Any]) -> str:
+    values = _collect_review_items(
+        result,
+        keys=("summary",),
+        preferred_keys=("summary", "message", "title"),
+        limit=1,
+    )
+    return values[0] if values else ""
+
+
 def _safe_pr_urls(values: Sequence[Any]) -> list[str]:
     urls: list[str] = []
     for value in values:
@@ -122,34 +183,52 @@ def _format_hpa_change_poll_message(poll: HpaChangePollResult) -> str:
     # 요청 원문·첨부·오류 원문은 출력하지 않고
     # worker가 구조화한 review 항목만 짧게 보여준다.
     result = poll.result if isinstance(poll.result, Mapping) else {}
-    corrections = _collect_review_items(
+    corrections = _collect_review_entries(
         result,
         keys=("corrections",),
-        preferred_keys=("correction", "summary", "message", "title"),
+    )
+    adaptations = _collect_review_items(
+        result,
+        keys=(
+            "hpaAdaptations",
+            "hpa_adaptations",
+            "productizationNotes",
+            "productization_notes",
+        ),
+        preferred_keys=("adaptation", "summary", "message", "title"),
+        limit=5,
     )
     questions = _collect_review_items(
         result,
         keys=("blocking_questions", "blockingQuestions", "questions"),
         preferred_keys=("question", "summary", "message", "title"),
+        limit=5,
     )
+    summary = _review_summary(result)
 
     if poll.state is HpaChangePollState.RUNNING:
         return "\n".join(["*HPA 코드 변경 작업 진행 중*", *base_lines])
 
     if poll.state is HpaChangePollState.NEEDS_CLARIFICATION:
         lines = ["*HPA 코드 변경 검토 중 추가 확인이 필요해*", *base_lines]
-        lines.extend(f"• 정정: {item}" for item in corrections)
-        lines.extend(f"• 확인 질문: {item}" for item in questions)
+        if summary:
+            lines.append(f"• 검토 요약: {summary}")
+        lines.extend(f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections)
+        lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
+        lines.extend(f"• 질문 {index}: {item}" for index, item in enumerate(questions, 1))
         if not corrections and not questions:
             lines.append(
-                "• 확인 질문: 구현 전에 결정할 내용이 있어. "
+                "• 질문 1: 구현 전에 결정할 내용이 있어. "
                 "요청 담당자가 결과를 확인해줘"
             )
         return "\n".join(lines)
 
     if poll.state is HpaChangePollState.PR_OPENED:
         lines = ["*HPA 코드 변경 PR 준비 완료*", *base_lines]
-        lines.extend(f"• 정정: {item}" for item in corrections)
+        if summary:
+            lines.append(f"• 검토 요약: {summary}")
+        lines.extend(f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections)
+        lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
         pr_urls = _safe_pr_urls(poll.pr_urls)
         lines.extend(f"• PR: {url}" for url in pr_urls)
         if not pr_urls:
