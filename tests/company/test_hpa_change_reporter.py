@@ -134,6 +134,8 @@ class HpaChangeReporterTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["channel"], "CHPA")
         self.assertEqual(client.calls[0]["thread_ts"], "1720580000.000001")
+        # 진행 상태도 원 요청자에게 직접 알림이 가야 한다.
+        self.assertTrue(client.calls[0]["text"].startswith("<@UJUSTIN> "))
         self.assertEqual(
             self.store.get_job(self.task_id).notified_status,
             HpaChangePollState.RUNNING.value,

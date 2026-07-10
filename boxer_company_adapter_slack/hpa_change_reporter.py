@@ -42,6 +42,7 @@ _ACTIVE_STATUSES = frozenset(
 _SAFE_PR_URL_RE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+/?$"
 )
+_SAFE_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{5,20}$")
 _REPORTER_THREAD: threading.Thread | None = None
 _REPORTER_THREAD_LOCK = threading.Lock()
 
@@ -103,6 +104,15 @@ def _safe_pr_urls(values: Sequence[Any]) -> list[str]:
         if len(urls) >= 4:
             break
     return urls
+
+
+def _requester_mention(job: HpaChangeJob) -> str:
+    """결과·정정·추가 질문을 원 요청자에게 직접 전달하되 Slack ID를 검증한다."""
+
+    requester_id = str(job.requested_by or "").strip()
+    if not _SAFE_SLACK_USER_ID_RE.fullmatch(requester_id):
+        return ""
+    return f"<@{requester_id}>"
 
 
 def _format_hpa_change_poll_message(poll: HpaChangePollResult) -> str:
@@ -175,10 +185,13 @@ def _is_timed_out(job: HpaChangeJob, runtime: HpaChangeRuntime, now: datetime) -
 
 
 def _post_hpa_change_message(client: Any, job: HpaChangeJob, text: str) -> None:
+    # 자동 결과가 thread에서 묻히지 않도록 요청자를 먼저 멘션한다.
+    mention = _requester_mention(job)
+    message = f"{mention} {text}" if mention else text
     client.chat_postMessage(
         channel=job.channel_id,
         thread_ts=job.thread_ts,
-        text=text,
+        text=message,
         unfurl_links=False,
         unfurl_media=False,
     )
