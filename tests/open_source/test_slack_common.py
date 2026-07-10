@@ -63,6 +63,35 @@ class SlackCommonTests(unittest.TestCase):
         )
         self.assertEqual(say_calls[0]["thread_ts"], "123.456")
 
+    def test_app_mention_reply_stays_in_existing_thread(self) -> None:
+        say_calls: list[dict[str, Any]] = []
+
+        def mention_handler(payload, reply, client, logger: logging.Logger) -> None:
+            reply("검토 결과", mention_user=False)
+
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(mention_handler)
+            app.handlers["app_mention"](
+                {
+                    "text": "<@U_BOT> HPA 변경 요청 검토",
+                    "user": "U_TEST",
+                    "channel": "C_TEST",
+                    "ts": "222.222",
+                    "thread_ts": "111.111",
+                    "team": "T_TEST",
+                },
+                lambda **kwargs: say_calls.append(kwargs),
+                object(),
+            )
+
+        self.assertEqual(say_calls[0]["thread_ts"], "111.111")
+
     def test_message_event_preserves_bot_user_id(self) -> None:
         payloads: list[dict[str, Any]] = []
 

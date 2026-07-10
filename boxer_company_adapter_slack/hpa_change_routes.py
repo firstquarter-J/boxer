@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
 
@@ -23,6 +23,12 @@ _TARGET_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])(hpa|cr)(?![0-9A-Za-z])", re.IGN
 _ACTION_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])pr(?![0-9A-Za-z])", re.IGNORECASE)
 _TARGET_KOREAN_TOKENS = ("내재화",)
 _ACTION_KOREAN_TOKENS = ("검토", "반영", "구현")
+_URL_TOKEN_RE = re.compile(r"https?://[^\s<>|]+", re.IGNORECASE)
+_SLACK_ARCHIVE_PATH_RE = re.compile(
+    r"^/archives/(?P<channel>[A-Z0-9]{6,30})/p(?P<timestamp>[0-9]{7,26})/?$"
+)
+_SLACK_TIMESTAMP_RE = re.compile(r"^[0-9]{1,20}\.[0-9]{6}$")
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{5,20}$")
 _ALLOWED_ATTACHMENT_SUFFIXES = frozenset(
     {".ts", ".tsx", ".js", ".jsx", ".json", ".txt", ".md"}
 )
@@ -50,6 +56,7 @@ class HpaChangeRequest:
     workspace_id: str
     channel_id: str
     thread_ts: str
+    # worker가 검토 근거로 사용할 현재 thread 또는 선택 댓글 permalink야.
     thread_url: str
     event_ts: str
     requester_user_id: str
@@ -57,6 +64,12 @@ class HpaChangeRequest:
     thread_text: str
     thread_message_count: int
     attachments: tuple[HpaChangeAttachment, ...]
+    # 링크 선택 모드에서는 질문 대상과 실행 요청자를 분리해 보존한다.
+    initiator_user_id: str = ""
+    source_channel_id: str = ""
+    source_message_ts: str = ""
+    selection_mode: str = "thread"
+    response_thread_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,6 +135,15 @@ class HpaChangeIntakeError(RuntimeError):
     """Slack intake에서 사용자에게 안전한 문구만 전달하기 위한 오류야."""
 
 
+@dataclass(frozen=True)
+class _SlackMessagePermalinkTarget:
+    workspace_hostname: str
+    channel_id: str
+    message_ts: str
+    thread_ts: str
+    permalink: str
+
+
 def _looks_like_hpa_change_request(question: str) -> bool:
     text = str(question or "").strip()
     if not text:
@@ -146,6 +168,113 @@ def _build_request_key(
 ) -> str:
     # Slack retry는 같은 event timestamp를 유지하므로 이 키를 작업 큐의 idempotency key로 쓴다.
     return f"slack:{workspace_id}:{channel_id}:{event_ts}"
+
+
+def _timestamp_from_permalink_token(value: str) -> str:
+    digits = str(value or "").strip()
+    if not digits.isdigit() or len(digits) < 7:
+        raise HpaChangeIntakeError("Slack 댓글 링크의 메시지 시간을 확인하지 못했어")
+    timestamp = f"{digits[:-6]}.{digits[-6:]}"
+    if not _SLACK_TIMESTAMP_RE.fullmatch(timestamp):
+        raise HpaChangeIntakeError("Slack 댓글 링크의 메시지 시간을 확인하지 못했어")
+    return timestamp
+
+
+def _parse_slack_message_permalink(value: str) -> _SlackMessagePermalinkTarget:
+    permalink = str(value or "").strip().rstrip(".,);]")
+    try:
+        parsed = urlsplit(permalink)
+        port = parsed.port
+    except ValueError:
+        raise HpaChangeIntakeError("Slack 댓글 링크 형식이 올바르지 않아") from None
+    hostname = str(parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname.endswith(".slack.com")
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or bool(parsed.fragment)
+    ):
+        raise HpaChangeIntakeError("Slack 댓글 링크는 HTTPS Slack permalink만 사용할 수 있어")
+    path_match = _SLACK_ARCHIVE_PATH_RE.fullmatch(parsed.path)
+    if path_match is None:
+        raise HpaChangeIntakeError("Slack 댓글 링크에서 채널과 메시지를 확인하지 못했어")
+
+    channel_id = path_match.group("channel")
+    message_ts = _timestamp_from_permalink_token(path_match.group("timestamp"))
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    cid_values = [str(item or "").strip() for item in query.get("cid", [])]
+    if cid_values and (len(cid_values) != 1 or cid_values[0] != channel_id):
+        raise HpaChangeIntakeError("Slack 댓글 링크의 채널 정보가 서로 달라")
+    thread_values = [str(item or "").strip() for item in query.get("thread_ts", [])]
+    if len(thread_values) > 1:
+        raise HpaChangeIntakeError("Slack 댓글 링크의 스레드 정보가 중복돼 있어")
+    thread_ts = thread_values[0] if thread_values else message_ts
+    if not _SLACK_TIMESTAMP_RE.fullmatch(thread_ts):
+        raise HpaChangeIntakeError("Slack 댓글 링크의 스레드 시간을 확인하지 못했어")
+    return _SlackMessagePermalinkTarget(
+        workspace_hostname=hostname,
+        channel_id=channel_id,
+        message_ts=message_ts,
+        thread_ts=thread_ts,
+        permalink=permalink,
+    )
+
+
+def _extract_linked_message_target(question: str) -> _SlackMessagePermalinkTarget | None:
+    targets: dict[tuple[str, str, str, str], _SlackMessagePermalinkTarget] = {}
+    for match in _URL_TOKEN_RE.finditer(str(question or "")):
+        raw_url = match.group(0)
+        try:
+            parsed = urlsplit(raw_url.rstrip(".,);]"))
+        except ValueError:
+            # Slack 댓글 선택자로 보이는 링크가 깨졌다면 전체 스레드 모드로
+            # 조용히 되돌아가지 않고 명시적으로 거절한다.
+            if ".slack.com" in raw_url.lower() or "/archives/" in raw_url:
+                raise HpaChangeIntakeError(
+                    "Slack 댓글 링크 형식이 올바르지 않아"
+                ) from None
+            continue
+        hostname = str(parsed.hostname or "").lower()
+        looks_like_selector = hostname.endswith(".slack.com") or "/archives/" in parsed.path
+        if not looks_like_selector:
+            continue
+        target = _parse_slack_message_permalink(raw_url)
+        targets[
+            (
+                target.workspace_hostname,
+                target.channel_id,
+                target.message_ts,
+                target.thread_ts,
+            )
+        ] = target
+    if len(targets) > 1:
+        raise HpaChangeIntakeError("한 번에 검토할 Slack 댓글 링크는 하나만 지정해줘")
+    return next(iter(targets.values()), None)
+
+
+def _select_linked_message(
+    messages: list[dict[str, Any]],
+    target: _SlackMessagePermalinkTarget,
+) -> dict[str, Any]:
+    for message in messages:
+        if str(message.get("ts") or "").strip() != target.message_ts:
+            continue
+        actual_thread_ts = str(
+            message.get("thread_ts") or message.get("ts") or ""
+        ).strip()
+        if actual_thread_ts != target.thread_ts:
+            raise HpaChangeIntakeError("Slack 댓글 링크와 실제 스레드 정보가 일치하지 않아")
+        author_id = str(message.get("user") or "").strip()
+        if (
+            not _SLACK_USER_ID_RE.fullmatch(author_id)
+            or bool(str(message.get("bot_id") or "").strip())
+            or str(message.get("subtype") or "").strip() == "bot_message"
+        ):
+            raise HpaChangeIntakeError("링크된 Slack 댓글 작성자를 확인하지 못했어")
+        return message
+    raise HpaChangeIntakeError("링크된 Slack 댓글을 해당 스레드에서 찾지 못했어")
 
 
 def _fetch_all_thread_messages(
@@ -492,6 +621,7 @@ def _format_submission_reply(
     *,
     message_count: int,
     attachment_count: int,
+    selected_message: bool = False,
 ) -> str:
     request_id = str(result.request_id or "").strip()
     request_id_line = f"\n• 요청 ID: `{request_id}`" if request_id else ""
@@ -499,10 +629,11 @@ def _format_submission_reply(
     detail_line = f"\n• 안내: {detail}" if detail else ""
 
     if result.status is HpaChangeSubmissionStatus.ACCEPTED:
+        source_label = "선택 댓글" if selected_message else "스레드"
         return (
             "*HPA 코드 변경 요청 접수*\n"
             "• 상태: 요구사항과 HPA 코드를 검토할 작업 큐에 등록했어"
-            f"\n• 수집: 스레드 {message_count}개, 코드 첨부 {attachment_count}개"
+            f"\n• 수집: {source_label} {message_count}개, 코드 첨부 {attachment_count}개"
             f"{request_id_line}{detail_line}"
         )
     if result.status is HpaChangeSubmissionStatus.DUPLICATE:
@@ -567,14 +698,56 @@ def _handle_hpa_change_request(
 
     request_key = _build_request_key(workspace_id, channel_id, event_ts)
     try:
+        linked_target = _extract_linked_message_target(context.question)
+        source_channel_id = channel_id
+        source_thread_ts = thread_ts
+        source_message_ts = thread_ts
+        source_permalink = ""
+        requester_user_id = str(context.user_id or "").strip()
+        selection_mode = "thread"
+        if linked_target is not None:
+            if linked_target.channel_id not in allowed_channel_ids:
+                raise HpaChangeIntakeError(
+                    "링크된 Slack 댓글 채널은 HPA 변경 요청 허용 채널이 아니야"
+                )
+            source_channel_id = linked_target.channel_id
+            source_thread_ts = linked_target.thread_ts
+            source_message_ts = linked_target.message_ts
+            selection_mode = "linked_message"
+            canonical_permalink = _load_slack_permalink(
+                context.client,
+                source_channel_id,
+                source_message_ts,
+                context.logger,
+            )
+            if not canonical_permalink:
+                raise HpaChangeIntakeError(
+                    "링크된 Slack 댓글의 canonical permalink를 확인하지 못했어"
+                )
+            canonical_target = _parse_slack_message_permalink(canonical_permalink)
+            if (
+                canonical_target.workspace_hostname != linked_target.workspace_hostname
+                or canonical_target.channel_id != linked_target.channel_id
+                or canonical_target.message_ts != linked_target.message_ts
+                or canonical_target.thread_ts != linked_target.thread_ts
+            ):
+                raise HpaChangeIntakeError(
+                    "링크된 Slack 댓글이 현재 워크스페이스 메시지와 일치하지 않아"
+                )
+            source_permalink = canonical_target.permalink
+
         messages = _fetch_all_thread_messages(
             context.client,
-            channel_id=channel_id,
-            thread_ts=thread_ts,
+            channel_id=source_channel_id,
+            thread_ts=source_thread_ts,
             logger=context.logger,
         )
         if not messages:
             raise HpaChangeIntakeError("검토할 Slack 스레드 내용을 찾지 못했어")
+        if linked_target is not None:
+            selected_message = _select_linked_message(messages, linked_target)
+            messages = [selected_message]
+            requester_user_id = str(selected_message.get("user") or "").strip()
         thread_text = _render_thread_text(messages)
         if not thread_text:
             raise HpaChangeIntakeError("검토할 Slack 스레드 텍스트를 찾지 못했어")
@@ -583,7 +756,7 @@ def _handle_hpa_change_request(
             # 임의 절단은 요구사항을 바꿀 수 있으므로
             # dispatch 한도를 넘으면 명확히 다시 요청받는다.
             raise HpaChangeIntakeError(
-                f"Slack 스레드가 {max_thread_chars}자 제한을 초과했어. "
+                f"Slack 검토 입력이 {max_thread_chars}자 제한을 초과했어. "
                 "핵심 요구사항을 새 스레드로 정리해서 다시 요청해줘"
             )
         attachments = _collect_attachments(
@@ -593,28 +766,44 @@ def _handle_hpa_change_request(
             download_file=deps.download_file,
             logger=context.logger,
         )
+        if not source_permalink:
+            source_permalink = _load_slack_permalink(
+                context.client,
+                source_channel_id,
+                source_message_ts,
+                context.logger,
+            ) or ""
+        if source_channel_id == channel_id and source_message_ts == thread_ts:
+            response_thread_url = source_permalink
+        else:
+            response_thread_url = _load_slack_permalink(
+                context.client,
+                channel_id,
+                thread_ts,
+                context.logger,
+            ) or ""
     except HpaChangeIntakeError as exc:
         context.reply(str(exc), mention_user=False)
         return True
 
-    thread_url = _load_slack_permalink(
-        context.client,
-        channel_id,
-        thread_ts,
-        context.logger,
-    ) or ""
     request = HpaChangeRequest(
         request_key=request_key,
         workspace_id=workspace_id,
+        # 응답 목적지는 링크가 아니라 박서를 멘션한 현재 메시지의 스레드로 고정한다.
         channel_id=channel_id,
         thread_ts=thread_ts,
-        thread_url=thread_url,
+        thread_url=source_permalink,
         event_ts=event_ts,
-        requester_user_id=context.user_id,
+        requester_user_id=requester_user_id,
         question=str(context.question or "").strip(),
         thread_text=thread_text,
         thread_message_count=len(messages),
         attachments=attachments,
+        initiator_user_id=str(context.user_id or "").strip(),
+        source_channel_id=source_channel_id,
+        source_message_ts=source_message_ts,
+        selection_mode=selection_mode,
+        response_thread_url=response_thread_url,
     )
     try:
         # 동일 event_ts의 중복 판정은 영속 큐가 원자적으로 처리하고 결과로 알려준다.
@@ -637,6 +826,7 @@ def _handle_hpa_change_request(
         hpaChangeRequestId=str(result.request_id or "").strip() or None,
         hpaChangeSubmissionStatus=result.status.value,
         threadMessageCount=len(messages),
+        sourceSelectionMode=selection_mode,
         attachmentCount=len(attachments),
         attachmentBytes=sum(item.size_bytes for item in attachments),
     )
@@ -645,6 +835,7 @@ def _handle_hpa_change_request(
             result,
             message_count=len(messages),
             attachment_count=len(attachments),
+            selected_message=selection_mode == "linked_message",
         ),
         mention_user=False,
     )

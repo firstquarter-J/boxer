@@ -23,6 +23,7 @@ class _FakeSlackClient:
         pages: dict[str, dict[str, Any]] | None = None,
         *,
         file_info: dict[str, dict[str, Any]] | None = None,
+        permalinks: dict[str, str] | None = None,
         fetch_error: Exception | None = None,
     ) -> None:
         self.pages = pages or {
@@ -38,6 +39,7 @@ class _FakeSlackClient:
             }
         }
         self.file_info = file_info or {}
+        self.permalinks = permalinks or {}
         self.fetch_error = fetch_error
         self.reply_calls: list[dict[str, Any]] = []
         self.files_info_calls: list[str] = []
@@ -56,6 +58,8 @@ class _FakeSlackClient:
 
     def chat_getPermalink(self, *, channel: str, message_ts: str) -> dict[str, str]:
         self.permalink_calls.append({"channel": channel, "message_ts": message_ts})
+        if message_ts in self.permalinks:
+            return {"permalink": self.permalinks[message_ts]}
         return {"permalink": f"https://workspace.slack.com/archives/{channel}/p{message_ts}"}
 
 
@@ -342,6 +346,336 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertEqual(metadata["attachmentCount"], 2)
         self.assertNotIn("thread_text", metadata)
         self.assertNotIn("scan-precrop.ts", str(metadata))
+
+    def test_linked_reply_selects_only_that_message_and_keeps_command_thread(self) -> None:
+        root_ts = "1720580000.000001"
+        target_ts = "1720580000.000023"
+        command_ts = "1800000000.000001"
+        permalink = (
+            "https://workspace.slack.com/archives/CSOURCE/p1720580000000023"
+            "?thread_ts=1720580000.000001&cid=CSOURCE"
+        )
+        target_content = b"export const delivery = 'basic-only';\n"
+        pages = {
+            "": {
+                "messages": [
+                    {
+                        "ts": root_ts,
+                        "user": "UOTHER",
+                        "text": "Bonus 프롬프트 변경 요청",
+                        "files": [
+                            {
+                                "id": "F_ROOT",
+                                "name": "root.ts",
+                                "mimetype": "text/plain",
+                                "size": 3,
+                                "url_private": "https://files.slack.com/files-pri/F_ROOT",
+                            }
+                        ],
+                    },
+                    {
+                        "ts": target_ts,
+                        "thread_ts": root_ts,
+                        "user": "UJUSTIN",
+                        "text": "Basic만 발송할 수 있게 분리 요청",
+                        "files": [
+                            {
+                                "id": "F_TARGET",
+                                "name": "basic-only.ts",
+                                "mimetype": "text/plain",
+                                "size": len(target_content),
+                                "url_private": "https://files.slack.com/files-pri/F_TARGET",
+                            }
+                        ],
+                    },
+                    {
+                        "ts": "1720580000.000024",
+                        "thread_ts": root_ts,
+                        "user": "UOTHER",
+                        "text": "Motion 변경 요청",
+                    },
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        }
+        client = _FakeSlackClient(
+            pages,
+            permalinks={target_ts: permalink},
+        )
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+        downloaded: list[str] = []
+
+        def download_file(_client: Any, item: dict[str, Any], _limit: int) -> bytes:
+            downloaded.append(str(item["name"]))
+            return target_content
+
+        handled = _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=f"HPA 변경 요청 검토 이 댓글만 <{permalink}|저스틴 댓글>",
+                user_id="UHYUN",
+                channel_id="CHPA",
+                current_ts=command_ts,
+                thread_ts=command_ts,
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)
+                or HpaChangeSubmissionResult(
+                    HpaChangeSubmissionStatus.ACCEPTED,
+                    request_id="TASK-LINKED",
+                ),
+                download_file=download_file,
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(submitted), 1)
+        request = submitted[0]
+        # 링크는 입력만 고르고 응답 목적지는 새로 멘션한 글의 thread로 유지한다.
+        self.assertEqual(request.channel_id, "CHPA")
+        self.assertEqual(request.thread_ts, command_ts)
+        self.assertEqual(request.requester_user_id, "UJUSTIN")
+        self.assertEqual(request.initiator_user_id, "UHYUN")
+        self.assertEqual(request.source_channel_id, "CSOURCE")
+        self.assertEqual(request.source_message_ts, target_ts)
+        self.assertEqual(request.selection_mode, "linked_message")
+        self.assertEqual(request.thread_url, permalink)
+        self.assertIn("/archives/CHPA/", request.response_thread_url)
+        self.assertIn("Basic만 발송", request.thread_text)
+        self.assertNotIn("Bonus 프롬프트", request.thread_text)
+        self.assertNotIn("Motion 변경", request.thread_text)
+        self.assertEqual([item.name for item in request.attachments], ["basic-only.ts"])
+        self.assertEqual(downloaded, ["basic-only.ts"])
+        self.assertEqual(client.reply_calls[0]["channel"], "CSOURCE")
+        self.assertEqual(client.reply_calls[0]["ts"], root_ts)
+        self.assertEqual(
+            client.permalink_calls,
+            [
+                {"channel": "CSOURCE", "message_ts": target_ts},
+                {"channel": "CHPA", "message_ts": command_ts},
+            ],
+        )
+        self.assertIn("선택 댓글 1개", replies[0][0])
+
+    def test_linked_reply_rejects_unallowed_channel_before_fetch(self) -> None:
+        permalink = "https://workspace.slack.com/archives/COTHER/p1720580000000023"
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        handled = _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=f"HPA 변경 요청 검토 {permalink}",
+                user_id="UHYUN",
+            ),
+            _config(allowed_user_ids=frozenset({"UHYUN"})),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertIn("허용 채널이 아니야", replies[0][0])
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
+
+    def test_malformed_permalink_does_not_fall_back_to_full_thread(self) -> None:
+        malformed = "https://workspace.slack.com/archives/CSOURCE/not-a-message"
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=f"HPA 변경 요청 검토 {malformed}",
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+
+        self.assertIn("채널과 메시지를 확인하지 못했어", replies[-1][0])
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
+
+        # URL parser 자체가 실패하는 링크도 일반 스레드 요청으로 처리하지 않는다.
+        replies = []
+        _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=(
+                    "HPA 변경 요청 검토 "
+                    "https://[broken.slack.com/archives/CSOURCE/p1720580000000023"
+                ),
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+
+        self.assertIn("링크 형식이 올바르지 않아", replies[-1][0])
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
+
+    def test_linked_reply_rejects_multiple_links_and_workspace_mismatch(self) -> None:
+        root_ts = "1720580000.000001"
+        target_ts = "1720580000.000023"
+        first = (
+            "https://workspace.slack.com/archives/CSOURCE/p1720580000000023"
+            "?thread_ts=1720580000.000001&cid=CSOURCE"
+        )
+        second = "https://workspace.slack.com/archives/CSOURCE/p1720580000000024"
+
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+        multiple_client = _FakeSlackClient()
+        _handle_hpa_change_request(
+            _context(
+                multiple_client,
+                replies,
+                question=f"HPA 변경 요청 검토 {first} {second}",
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+        self.assertIn("하나만 지정", replies[-1][0])
+        self.assertEqual(multiple_client.reply_calls, [])
+
+        # workspace만 다른 같은 channel/message 링크도 하나로 합치지 않는다.
+        cross_workspace_client = _FakeSlackClient()
+        replies = []
+        other_workspace_same_target = first.replace(
+            "workspace.slack.com",
+            "other.slack.com",
+        )
+        _handle_hpa_change_request(
+            _context(
+                cross_workspace_client,
+                replies,
+                question=(
+                    f"HPA 변경 요청 검토 {first} {other_workspace_same_target}"
+                ),
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+        self.assertIn("하나만 지정", replies[-1][0])
+        self.assertEqual(cross_workspace_client.reply_calls, [])
+
+        mismatch_pages = {
+            "": {
+                "messages": [
+                    {
+                        "ts": root_ts,
+                        "user": "UOTHER",
+                        "text": "root",
+                    },
+                    {
+                        "ts": target_ts,
+                        "thread_ts": root_ts,
+                        "user": "UJUSTIN",
+                        "text": "Basic 분리 요청",
+                    },
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        }
+        mismatch_permalink = first.replace("workspace.slack.com", "other.slack.com")
+        mismatch_client = _FakeSlackClient(
+            mismatch_pages,
+            permalinks={target_ts: mismatch_permalink},
+        )
+        replies = []
+        _handle_hpa_change_request(
+            _context(
+                mismatch_client,
+                replies,
+                question=f"HPA 변경 요청 검토 {first}",
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+        self.assertIn("현재 워크스페이스 메시지와 일치하지 않아", replies[-1][0])
+        self.assertEqual(submitted, [])
+
+    def test_linked_reply_rejects_bot_author(self) -> None:
+        target_ts = "1720580000.000023"
+        permalink = "https://workspace.slack.com/archives/CSOURCE/p1720580000000023"
+        pages = {
+            "": {
+                "messages": [
+                    {
+                        "ts": target_ts,
+                        "user": "UJUSTIN",
+                        "bot_id": "BBOXER",
+                        "subtype": "bot_message",
+                        "text": "자동 생성 요청",
+                    }
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        }
+        client = _FakeSlackClient(pages, permalinks={target_ts: permalink})
+        replies: list[tuple[str, dict[str, Any]]] = []
+
+        _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=f"HPA 변경 요청 검토 {permalink}",
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: HpaChangeSubmissionResult(
+                    HpaChangeSubmissionStatus.ACCEPTED
+                )
+            ),
+        )
+
+        self.assertIn("댓글 작성자를 확인하지 못했어", replies[-1][0])
 
     def test_rejects_thread_over_dispatch_character_limit(self) -> None:
         pages = {

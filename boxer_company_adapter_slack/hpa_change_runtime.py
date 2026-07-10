@@ -78,7 +78,16 @@ class HpaChangeRuntime:
             request_text=request.thread_text,
             thread_url=request.thread_url,
             attachments=attachments,
-            metadata={"source": "slack", "request_key": request.request_key},
+            metadata={
+                "source": "slack",
+                "request_key": request.request_key,
+                "initiator_user_id": request.initiator_user_id
+                or request.requester_user_id,
+                "source_channel_id": request.source_channel_id or request.channel_id,
+                "source_message_ts": request.source_message_ts or request.thread_ts,
+                "selection_mode": request.selection_mode,
+                "response_thread_url": request.response_thread_url,
+            },
         )
         try:
             job, created = self.workflow.submit(workflow_request)

@@ -82,6 +82,13 @@ def _route_request() -> HpaChangeRequest:
                 message_ts="1720580000.000001",
             ),
         ),
+        initiator_user_id="UHYUN",
+        source_channel_id="CSOURCE",
+        source_message_ts="1720580000.000001",
+        selection_mode="linked_message",
+        response_thread_url=(
+            "https://lifexio.slack.com/archives/CHPA/p1720580000000001"
+        ),
     )
 
 
@@ -188,6 +195,14 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                     }
                 ],
             )
+            job = runtime.store.get_job(first.request_id)
+            self.assertEqual(job.channel_id, "CHPA")
+            self.assertEqual(job.thread_ts, "1720580000.000001")
+            self.assertEqual(job.requested_by, "UJUSTIN")
+            self.assertEqual(job.metadata["initiator_user_id"], "UHYUN")
+            self.assertEqual(job.metadata["source_channel_id"], "CSOURCE")
+            self.assertEqual(job.metadata["selection_mode"], "linked_message")
+            self.assertIn("/archives/CHPA/", job.metadata["response_thread_url"])
         self.assertEqual(
             runtime.workflow.github.config.workflow_run_name_prefix,
             "Boxer HPA Review",
