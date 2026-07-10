@@ -173,6 +173,20 @@ def _review_decision(result: Mapping[str, Any]) -> str:
     return values[0] if values else ""
 
 
+def _review_requester_guidance(result: Mapping[str, Any]) -> str:
+    values = _collect_review_items(
+        result,
+        keys=("requesterGuidance", "requester_guidance", "migrationGuidance"),
+        preferred_keys=("guidance", "summary", "message", "title"),
+        limit=1,
+        item_max_chars=500,
+    )
+    return values[0] if values else (
+        "CR Web 코드는 HPA에 그대로 사용할 수 없어. "
+        "HPA의 실제 구조에 맞춰 의도만 변환해서 적용할게."
+    )
+
+
 def _safe_pr_urls(values: Sequence[Any]) -> list[str]:
     urls: list[str] = []
     for value in values:
@@ -224,12 +238,14 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
     )
     summary = _review_summary(result)
     decision = _review_decision(result)
+    requester_guidance = _review_requester_guidance(result)
 
     if poll.state is HpaChangePollState.RUNNING:
         return ["\n".join(["*HPA 코드 변경 작업 진행 중*", *base_lines])]
 
     if poll.state is HpaChangePollState.NEEDS_CLARIFICATION:
         review_lines = ["*HPA 코드 변경 검토 결과*", "• 상태: 추가 확인 필요", *base_lines]
+        review_lines.append(f"• 요청자 안내: {requester_guidance}")
         if summary:
             review_lines.append(f"• 검토 요약: {summary}")
         if decision:
@@ -254,6 +270,7 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
 
     if poll.state is HpaChangePollState.PR_OPENED:
         lines = ["*HPA 코드 변경 PR 준비 완료*", *base_lines]
+        lines.append(f"• 요청자 안내: {requester_guidance}")
         if summary:
             lines.append(f"• 검토 요약: {summary}")
         if decision:

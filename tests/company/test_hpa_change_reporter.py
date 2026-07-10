@@ -180,6 +180,7 @@ class HpaChangeReporterTests(unittest.TestCase):
                     }
                 ],
                 "hpaDecision": "HPA에서는 CR Web 파일을 그대로 복사하지 않고 HPA 생성 경로에 맞춰 유틸과 의존성을 재구성해.",
+                "requesterGuidance": "첨부 코드는 CR Web 기준이라 그대로 사용할 수 없어. HPA의 NestJS와 ECS 구조에 맞춰 변환 적용해.",
                 "hpaAdaptations": [
                     "sharp를 HPA Server package.json과 lockfile에 추가하고 서버 빌드에서 확인해",
                 ],
@@ -202,6 +203,7 @@ class HpaChangeReporterTests(unittest.TestCase):
 
         review_message = client.calls[0]["text"]
         question_message = client.calls[1]["text"]
+        self.assertIn("요청자 안내: 첨부 코드는 CR Web 기준이라 그대로 사용할 수 없어", review_message)
         self.assertIn("HPA 기준 정정: 요청 전제:", review_message)
         self.assertIn("HPA 최종 적용안:", review_message)
         self.assertIn("HPA 적용:", review_message)
