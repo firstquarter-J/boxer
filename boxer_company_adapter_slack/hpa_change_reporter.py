@@ -207,6 +207,22 @@ def _requester_mention(job: HpaChangeJob) -> str:
     return f"<@{requester_id}>"
 
 
+def _append_message_section(
+    lines: list[str],
+    title: str,
+    content: Sequence[str],
+) -> None:
+    """Slack 문단 사이에 빈 줄을 넣어 긴 검토 결과를 섹션으로 분리한다."""
+
+    values = [str(item).strip() for item in content if str(item).strip()]
+    if not values:
+        return
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.append(f"*{title}*")
+    lines.extend(values)
+
+
 def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
     task_id = _safe_review_line(poll.task_id, max_chars=80)
     base_lines = [f"• 요청 ID: `{task_id}`"]
@@ -244,58 +260,83 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
         return ["\n".join(["*HPA 코드 변경 작업 진행 중*", *base_lines])]
 
     if poll.state is HpaChangePollState.NEEDS_CLARIFICATION:
-        review_lines = ["*HPA 코드 변경 검토 결과*", "• 상태: 추가 확인 필요", *base_lines]
-        review_lines.append(f"• 요청자 안내: {requester_guidance}")
+        review_lines = [
+            "*HPA 코드 변경 검토 결과*",
+            "",
+            "• 상태: 추가 확인 필요",
+            *base_lines,
+        ]
+        _append_message_section(review_lines, "요청자 안내", [f"• {requester_guidance}"])
         if summary:
-            review_lines.append(f"• 검토 요약: {summary}")
+            _append_message_section(review_lines, "검토 요약", [f"• {summary}"])
         if decision:
-            review_lines.append(f"• HPA 최종 적용안: {decision}")
-        review_lines.extend(
-            f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections
+            _append_message_section(review_lines, "HPA 최종 적용안", [f"• {decision}"])
+        _append_message_section(
+            review_lines,
+            "HPA 기준 정정",
+            [f"• {_format_correction(item)}" for item in corrections],
         )
-        review_lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
+        _append_message_section(
+            review_lines,
+            "HPA 적용 방식",
+            [f"• {item}" for item in adaptations],
+        )
         if not summary and not corrections and not adaptations:
-            review_lines.append("• 검토 내용: HPA 실제 코드 확인이 더 필요해")
-
-        question_lines = ["*HPA 추가 확인 질문*", *base_lines]
-        if questions:
-            question_lines.extend(
-                f"• 질문 {index}: {item}" for index, item in enumerate(questions, 1)
+            _append_message_section(
+                review_lines,
+                "검토 내용",
+                ["• HPA 실제 코드 확인이 더 필요해"],
             )
+
+        question_lines = ["*HPA 추가 확인 질문*", "", *base_lines]
+        if questions:
+            for index, item in enumerate(questions, 1):
+                question_lines.extend(["", f"*질문 {index}*", item])
         else:
-            question_lines.append(
-                "• 질문 1: 구현 전에 결정할 내용이 있어. 요청 담당자가 결과를 확인해줘"
+            question_lines.extend(
+                ["", "*질문 1*", "구현 전에 결정할 내용이 있어. 요청 담당자가 결과를 확인해줘"]
             )
         return ["\n".join(review_lines), "\n".join(question_lines)]
 
     if poll.state is HpaChangePollState.PR_OPENED:
-        lines = ["*HPA 코드 변경 PR 준비 완료*", *base_lines]
-        lines.append(f"• 요청자 안내: {requester_guidance}")
+        lines = ["*HPA 코드 변경 PR 준비 완료*", "", *base_lines]
+        _append_message_section(lines, "요청자 안내", [f"• {requester_guidance}"])
         if summary:
-            lines.append(f"• 검토 요약: {summary}")
+            _append_message_section(lines, "검토 요약", [f"• {summary}"])
         if decision:
-            lines.append(f"• HPA 최종 적용안: {decision}")
-        lines.extend(
-            f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections
+            _append_message_section(lines, "HPA 최종 적용안", [f"• {decision}"])
+        _append_message_section(
+            lines,
+            "HPA 기준 정정",
+            [f"• {_format_correction(item)}" for item in corrections],
         )
-        lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
+        _append_message_section(
+            lines,
+            "HPA 적용 방식",
+            [f"• {item}" for item in adaptations],
+        )
         pr_urls = _safe_pr_urls(poll.pr_urls)
-        lines.extend(f"• PR: {url}" for url in pr_urls)
-        if not pr_urls:
-            lines.append("• PR: 유효한 PR 링크를 확인하지 못했어")
-        lines.append("• 다음 단계: 현 승인 후 머지·배포")
+        _append_message_section(
+            lines,
+            "PR",
+            [f"• {url}" for url in pr_urls]
+            or ["• 유효한 PR 링크를 확인하지 못했어"],
+        )
+        _append_message_section(lines, "다음 단계", ["• 현 승인 후 머지·배포"])
         return ["\n".join(lines)]
 
     if poll.state is HpaChangePollState.FAILED:
         return [
             "\n".join(
                 [
-                "*HPA 코드 변경 자동화가 완료되지 못했어*",
-                *base_lines,
-                (
-                    "• 안내: 내부 오류 원문은 노출하지 않았어. "
-                    "운영 로그와 worker 상태를 확인해줘"
-                ),
+                    "*HPA 코드 변경 자동화가 완료되지 못했어*",
+                    "",
+                    *base_lines,
+                    "",
+                    (
+                        "• 안내: 내부 오류 원문은 노출하지 않았어. "
+                        "운영 로그와 worker 상태를 확인해줘"
+                    ),
                 ]
             )
         ]
