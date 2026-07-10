@@ -1,6 +1,7 @@
 import logging
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRequest,
@@ -11,6 +12,7 @@ from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeSubmissionStatus,
     _handle_hpa_change_request,
     _looks_like_hpa_change_request,
+    _download_slack_file,
     _validate_slack_file_url,
 )
 
@@ -55,6 +57,30 @@ class _FakeSlackClient:
     def chat_getPermalink(self, *, channel: str, message_ts: str) -> dict[str, str]:
         self.permalink_calls.append({"channel": channel, "message_ts": message_ts})
         return {"permalink": f"https://workspace.slack.com/archives/{channel}/p{message_ts}"}
+
+
+class _FakeDownloadResponse:
+    def __init__(
+        self,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        chunks: list[bytes] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {"Content-Length": "3"}
+        self._chunks = chunks or [b"abc"]
+
+    def __enter__(self) -> "_FakeDownloadResponse":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, *, chunk_size: int) -> list[bytes]:
+        return self._chunks
 
 
 def _payload() -> dict[str, Any]:
@@ -573,6 +599,47 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIn("식별 정보가 부족", replies[0][0])
         self.assertEqual(submitted, [])
+
+    @patch("boxer_company_adapter_slack.hpa_change_routes.requests.get")
+    def test_downloads_slack_file_without_forwarding_auth_on_redirect(
+        self,
+        get_request: Any,
+    ) -> None:
+        # Slack 파일 endpoint의 redirect도 허용 호스트 안에서만 따라가고 토큰은 첫 요청에만 보낸다.
+        get_request.side_effect = [
+            _FakeDownloadResponse(
+                status_code=302,
+                headers={"Location": "https://files-origin.slack.com/files-pri/F_TS/download"},
+                chunks=[],
+            ),
+            _FakeDownloadResponse(),
+        ]
+
+        content = _download_slack_file(
+            _FakeSlackClient(),
+            {"url_private_download": "https://files.slack.com/files-pri/F_TS/download"},
+            10,
+        )
+
+        self.assertEqual(content, b"abc")
+        self.assertEqual(get_request.call_args_list[0].kwargs, {
+            "headers": {"Authorization": "Bearer xoxb-test-token"},
+            "stream": True,
+            "timeout": 10,
+            "allow_redirects": False,
+        })
+        self.assertEqual(get_request.call_args_list[1].kwargs, {
+            "headers": {},
+            "stream": True,
+            "timeout": 10,
+            "allow_redirects": False,
+        })
+        self.assertEqual(get_request.call_args_list[0].args, (
+            "https://files.slack.com/files-pri/F_TS/download",
+        ))
+        self.assertEqual(get_request.call_args_list[1].args, (
+            "https://files-origin.slack.com/files-pri/F_TS/download",
+        ))
 
     def test_file_url_validation_allows_only_slack_file_hosts(self) -> None:
         for url in (

@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Protocol
-from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import urljoin, urlsplit
+
+import requests
 
 from boxer_adapter_slack.common import (
     MentionPayload,
@@ -114,12 +115,6 @@ class HpaChangeRoutesContext:
 
 class HpaChangeIntakeError(RuntimeError):
     """Slack intake에서 사용자에게 안전한 문구만 전달하기 위한 오류야."""
-
-
-class _NoRedirectHandler(HTTPRedirectHandler):
-    # Authorization 헤더가 다른 호스트로 전달되지 않도록 파일 다운로드 redirect를 차단한다.
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        return None
 
 
 def _looks_like_hpa_change_request(question: str) -> bool:
@@ -357,24 +352,48 @@ def _download_slack_file(
     if not token:
         raise HpaChangeIntakeError("Slack 첨부 파일을 읽을 bot token이 없어")
 
-    request = Request(url, headers={"Authorization": f"Bearer {token}"})
-    opener = build_opener(_NoRedirectHandler())
-    with opener.open(request, timeout=10) as response:  # noqa: S310 - Slack HTTPS URL만 허용한다.
-        content_length = _parse_file_size(response.headers.get("Content-Length"))
-        if content_length > max_bytes:
-            raise HpaChangeIntakeError("Slack 첨부 파일 하나의 허용 크기를 초과했어")
+    # Slack 파일 URL은 files.slack.com에서 files-origin.slack.com으로 redirect될 수 있다.
+    # requests로 redirect를 직접 검증하고, 첫 요청 이후에는 Authorization을 제거해 토큰 유출을 막는다.
+    current_url = url
+    for redirect_count in range(3):
+        _validate_slack_file_url(current_url)
+        headers = {"Authorization": f"Bearer {token}"} if redirect_count == 0 else {}
+        with requests.get(
+            current_url,
+            headers=headers,
+            stream=True,
+            timeout=10,
+            allow_redirects=False,
+        ) as response:
+            if 300 <= response.status_code < 400:
+                location = str(response.headers.get("Location") or "").strip()
+                if not location or redirect_count >= 2:
+                    raise HpaChangeIntakeError("Slack 첨부 파일 redirect를 확인하지 못했어")
+                current_url = urljoin(current_url, location)
+                continue
 
-        chunks: list[bytes] = []
-        downloaded = 0
-        while True:
-            chunk = response.read(min(64 * 1024, max_bytes + 1 - downloaded))
-            if not chunk:
-                break
-            downloaded += len(chunk)
-            if downloaded > max_bytes:
+            if response.status_code in {401, 403}:
+                raise HpaChangeIntakeError(
+                    "Slack 첨부 파일 권한이 없어. files:read 권한과 앱 재설치를 확인해줘"
+                )
+            response.raise_for_status()
+
+            content_length = _parse_file_size(response.headers.get("Content-Length"))
+            if content_length > max_bytes:
                 raise HpaChangeIntakeError("Slack 첨부 파일 하나의 허용 크기를 초과했어")
-            chunks.append(chunk)
-        return b"".join(chunks)
+
+            chunks: list[bytes] = []
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise HpaChangeIntakeError("Slack 첨부 파일 하나의 허용 크기를 초과했어")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+    raise HpaChangeIntakeError("Slack 첨부 파일 redirect가 너무 많아")
 
 
 def _collect_attachments(
