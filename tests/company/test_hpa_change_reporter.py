@@ -179,6 +179,7 @@ class HpaChangeReporterTests(unittest.TestCase):
                         "evidence": "server/package.json:1",
                     }
                 ],
+                "hpaDecision": "HPA에서는 CR Web 파일을 그대로 복사하지 않고 HPA 생성 경로에 맞춰 유틸과 의존성을 재구성해.",
                 "hpaAdaptations": [
                     "sharp를 HPA Server package.json과 lockfile에 추가하고 서버 빌드에서 확인해",
                 ],
@@ -202,6 +203,7 @@ class HpaChangeReporterTests(unittest.TestCase):
         review_message = client.calls[0]["text"]
         question_message = client.calls[1]["text"]
         self.assertIn("HPA 기준 정정: 요청 전제:", review_message)
+        self.assertIn("HPA 최종 적용안:", review_message)
         self.assertIn("HPA 적용:", review_message)
         self.assertIn("근거: server/package.json:1", review_message)
         self.assertIn("HPA 적용 방식:", review_message)
