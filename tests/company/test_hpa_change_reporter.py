@@ -199,17 +199,19 @@ class HpaChangeReporterTests(unittest.TestCase):
 
         run_hpa_change_reporter_once(self.runtime, client)
 
-        message = client.calls[0]["text"]
-        self.assertIn("HPA 기준 정정: 요청 전제:", message)
-        self.assertIn("HPA 적용:", message)
-        self.assertIn("근거: server/package.json:1", message)
-        self.assertIn("HPA 적용 방식:", message)
-        self.assertIn("질문 1:", message)
-        self.assertIn("질문 2:", message)
-        self.assertIn("‹@UOTHER›", message)
-        self.assertNotIn("github_pat_", message)
-        self.assertNotIn("ORIGINAL REQUEST", message)
-        self.assertNotIn("원문을 그대로", message)
+        review_message = client.calls[0]["text"]
+        question_message = client.calls[1]["text"]
+        self.assertIn("HPA 기준 정정: 요청 전제:", review_message)
+        self.assertIn("HPA 적용:", review_message)
+        self.assertIn("근거: server/package.json:1", review_message)
+        self.assertIn("HPA 적용 방식:", review_message)
+        self.assertNotIn("질문 1:", review_message)
+        self.assertIn("질문 1:", question_message)
+        self.assertIn("질문 2:", question_message)
+        self.assertIn("‹@UOTHER›", question_message)
+        self.assertNotIn("github_pat_", review_message + question_message)
+        self.assertNotIn("ORIGINAL REQUEST", review_message + question_message)
+        self.assertNotIn("원문을 그대로", review_message + question_message)
 
     def test_pr_notification_only_contains_valid_pr_urls_and_requires_hyun_review(self) -> None:
         result = {"review": {"corrections": ["서버 timeout은 기존 설정을 재사용했어"]}}

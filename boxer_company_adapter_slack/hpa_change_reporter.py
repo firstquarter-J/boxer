@@ -57,14 +57,19 @@ def _safe_review_line(value: Any, *, max_chars: int = 240) -> str:
     return text[:max_chars]
 
 
-def _item_text(item: Any, preferred_keys: Sequence[str]) -> str:
+def _item_text(
+    item: Any,
+    preferred_keys: Sequence[str],
+    *,
+    max_chars: int = 240,
+) -> str:
     if isinstance(item, Mapping):
         for key in preferred_keys:
             value = item.get(key)
             if value is not None and str(value).strip():
-                return _safe_review_line(value)
+                return _safe_review_line(value, max_chars=max_chars)
         return ""
-    return _safe_review_line(item)
+    return _safe_review_line(item, max_chars=max_chars)
 
 
 def _collect_review_items(
@@ -73,6 +78,7 @@ def _collect_review_items(
     keys: Sequence[str],
     preferred_keys: Sequence[str],
     limit: int = 3,
+    item_max_chars: int = 240,
 ) -> list[str]:
     review = result.get("review")
     containers = [result]
@@ -87,7 +93,7 @@ def _collect_review_items(
                 continue
             candidates = raw_items if isinstance(raw_items, (list, tuple)) else [raw_items]
             for item in candidates:
-                text = _item_text(item, preferred_keys)
+                text = _item_text(item, preferred_keys, max_chars=item_max_chars)
                 if text and text not in rendered:
                     rendered.append(text)
                 if len(rendered) >= limit:
@@ -176,7 +182,7 @@ def _requester_mention(job: HpaChangeJob) -> str:
     return f"<@{requester_id}>"
 
 
-def _format_hpa_change_poll_message(poll: HpaChangePollResult) -> str:
+def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
     task_id = _safe_review_line(poll.task_id, max_chars=80)
     base_lines = [f"• 요청 ID: `{task_id}`"]
 
@@ -203,52 +209,72 @@ def _format_hpa_change_poll_message(poll: HpaChangePollResult) -> str:
         keys=("blocking_questions", "blockingQuestions", "questions"),
         preferred_keys=("question", "summary", "message", "title"),
         limit=5,
+        item_max_chars=600,
     )
     summary = _review_summary(result)
 
     if poll.state is HpaChangePollState.RUNNING:
-        return "\n".join(["*HPA 코드 변경 작업 진행 중*", *base_lines])
+        return ["\n".join(["*HPA 코드 변경 작업 진행 중*", *base_lines])]
 
     if poll.state is HpaChangePollState.NEEDS_CLARIFICATION:
-        lines = ["*HPA 코드 변경 검토 중 추가 확인이 필요해*", *base_lines]
+        review_lines = ["*HPA 코드 변경 검토 결과*", "• 상태: 추가 확인 필요", *base_lines]
         if summary:
-            lines.append(f"• 검토 요약: {summary}")
-        lines.extend(f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections)
-        lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
-        lines.extend(f"• 질문 {index}: {item}" for index, item in enumerate(questions, 1))
-        if not corrections and not questions:
-            lines.append(
-                "• 질문 1: 구현 전에 결정할 내용이 있어. "
-                "요청 담당자가 결과를 확인해줘"
+            review_lines.append(f"• 검토 요약: {summary}")
+        review_lines.extend(
+            f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections
+        )
+        review_lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
+        if not summary and not corrections and not adaptations:
+            review_lines.append("• 검토 내용: HPA 실제 코드 확인이 더 필요해")
+
+        question_lines = ["*HPA 추가 확인 질문*", *base_lines]
+        if questions:
+            question_lines.extend(
+                f"• 질문 {index}: {item}" for index, item in enumerate(questions, 1)
             )
-        return "\n".join(lines)
+        else:
+            question_lines.append(
+                "• 질문 1: 구현 전에 결정할 내용이 있어. 요청 담당자가 결과를 확인해줘"
+            )
+        return ["\n".join(review_lines), "\n".join(question_lines)]
 
     if poll.state is HpaChangePollState.PR_OPENED:
         lines = ["*HPA 코드 변경 PR 준비 완료*", *base_lines]
         if summary:
             lines.append(f"• 검토 요약: {summary}")
-        lines.extend(f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections)
+        lines.extend(
+            f"• HPA 기준 정정: {_format_correction(item)}" for item in corrections
+        )
         lines.extend(f"• HPA 적용 방식: {item}" for item in adaptations)
         pr_urls = _safe_pr_urls(poll.pr_urls)
         lines.extend(f"• PR: {url}" for url in pr_urls)
         if not pr_urls:
             lines.append("• PR: 유효한 PR 링크를 확인하지 못했어")
         lines.append("• 다음 단계: 현 승인 후 머지·배포")
-        return "\n".join(lines)
+        return ["\n".join(lines)]
 
     if poll.state is HpaChangePollState.FAILED:
-        return "\n".join(
-            [
+        return [
+            "\n".join(
+                [
                 "*HPA 코드 변경 자동화가 완료되지 못했어*",
                 *base_lines,
                 (
                     "• 안내: 내부 오류 원문은 노출하지 않았어. "
                     "운영 로그와 worker 상태를 확인해줘"
                 ),
-            ]
-        )
+                ]
+            )
+        ]
 
-    return ""
+    return []
+
+
+def _format_hpa_change_poll_message(poll: HpaChangePollResult) -> str:
+    """호출부 호환을 위해 첫 번째(검토 요약) 댓글만 반환한다."""
+
+    messages = _format_hpa_change_poll_messages(poll)
+    return messages[0] if messages else ""
 
 
 def _is_timed_out(job: HpaChangeJob, runtime: HpaChangeRuntime, now: datetime) -> bool:
@@ -326,10 +352,13 @@ def run_hpa_change_reporter_once(
             if poll.job.notified_status == poll.state.value:
                 continue
 
-            message = _format_hpa_change_poll_message(poll)
-            if not message:
+            messages = _format_hpa_change_poll_messages(poll)
+            if not messages:
                 continue
-            _post_hpa_change_message(client, poll.job, message)
+            # 검토 요약을 먼저 올리고, 추가 질문은 다음 thread 댓글로 분리한다.
+            # 어느 한 댓글이라도 실패하면 notified를 남기지 않아 다음 poll에서 재시도한다.
+            for message in messages:
+                _post_hpa_change_message(client, poll.job, message)
             # Slack 발송이 성공한 뒤에만 표시해서
             # 재시작·일시 오류 시 알림이 유실되지 않게 한다.
             runtime.store.mark_notified(poll.task_id, poll.state)
