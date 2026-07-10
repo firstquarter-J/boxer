@@ -286,11 +286,11 @@ def create_hpa_change_runtime(
         ),
         max_attachment_bytes=max(
             0,
-            int(_setting(settings, "HPA_CHANGE_MAX_FILE_BYTES", 12_000) or 0),
+            int(_setting(settings, "HPA_CHANGE_MAX_FILE_BYTES", 131_072) or 0),
         ),
         max_total_attachment_bytes=max(
             0,
-            int(_setting(settings, "HPA_CHANGE_MAX_TOTAL_ATTACHMENT_BYTES", 24_000) or 0),
+            int(_setting(settings, "HPA_CHANGE_MAX_TOTAL_ATTACHMENT_BYTES", 524_288) or 0),
         ),
     )
     if not enabled:

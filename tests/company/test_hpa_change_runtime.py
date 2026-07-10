@@ -53,8 +53,8 @@ def _settings(db_path: str, **overrides: Any) -> SimpleNamespace:
         "HPA_CHANGE_RUN_TIMEOUT_SEC": 5_400,
         "HPA_CHANGE_MAX_THREAD_CHARS": 30_000,
         "HPA_CHANGE_MAX_FILES": 5,
-        "HPA_CHANGE_MAX_FILE_BYTES": 12_000,
-        "HPA_CHANGE_MAX_TOTAL_ATTACHMENT_BYTES": 24_000,
+        "HPA_CHANGE_MAX_FILE_BYTES": 131_072,
+        "HPA_CHANGE_MAX_TOTAL_ATTACHMENT_BYTES": 524_288,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
