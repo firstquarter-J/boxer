@@ -96,7 +96,12 @@ class HpaChangeRoutesDeps:
     # 이 콜백은 분석이나 구현을 직접 하지 않고
     # 영속 작업 큐에 넣은 뒤 바로 반환해야 한다.
     submit_request: HpaChangeSubmitRequest
-    download_file: HpaChangeFileDownloader = field(default=lambda: _download_slack_file)
+    # 함수가 아래에서 정의되므로 default_factory로 인스턴스 생성 시점에
+    # 실제 다운로더를 참조한다. 반환 함수를 만드는 일반 default 람다는
+    # intake 호출 시 인자 3개를 받지 못해 모든 Slack 첨부를 TypeError로 만든다.
+    download_file: HpaChangeFileDownloader = field(
+        default_factory=lambda: _download_slack_file
+    )
 
 
 @dataclass(frozen=True)

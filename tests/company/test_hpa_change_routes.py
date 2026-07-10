@@ -139,6 +139,16 @@ def _context(
 
 
 class HpaChangeRoutesTests(unittest.TestCase):
+    def test_default_downloader_is_callable_with_route_arguments(self) -> None:
+        # 운영 intake가 기본값을 사용할 때도 실제 파일 다운로더가 직접 호출돼야 한다.
+        deps = HpaChangeRoutesDeps(
+            submit_request=lambda request: HpaChangeSubmissionResult(
+                HpaChangeSubmissionStatus.ACCEPTED,
+            )
+        )
+
+        self.assertIs(deps.download_file, _download_slack_file)
+
     def test_trigger_requires_product_and_action_tokens(self) -> None:
         cases = {
             "HPA 반영 요청": True,
