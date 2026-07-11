@@ -421,7 +421,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 thread_ts=command_ts,
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
+                allowed_user_ids=frozenset({"UHYUN", "UJUSTIN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -635,6 +635,45 @@ class HpaChangeRoutesTests(unittest.TestCase):
             ),
         )
         self.assertIn("현재 워크스페이스 메시지와 일치하지 않아", replies[-1][0])
+        self.assertEqual(submitted, [])
+
+    def test_linked_reply_rejects_unallowed_human_author(self) -> None:
+        target_ts = "1720580000.000023"
+        permalink = "https://workspace.slack.com/archives/CSOURCE/p1720580000000023"
+        pages = {
+            "": {
+                "messages": [
+                    {
+                        "ts": target_ts,
+                        "user": "UOTHER",
+                        "text": "HPA 변경 요청",
+                    }
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        }
+        client = _FakeSlackClient(pages, permalinks={target_ts: permalink})
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=f"HPA 변경 요청 검토 {permalink}",
+                user_id="UHYUN",
+            ),
+            _config(
+                allowed_user_ids=frozenset({"UHYUN", "UJUSTIN"}),
+                allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
+            ),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
+        )
+
+        self.assertIn("댓글 작성자는", replies[-1][0])
+        self.assertIn("허용 사용자가 아니야", replies[-1][0])
         self.assertEqual(submitted, [])
 
     def test_linked_reply_rejects_bot_author(self) -> None:

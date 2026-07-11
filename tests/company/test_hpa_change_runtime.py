@@ -4,6 +4,7 @@ import hashlib
 import logging
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +19,11 @@ from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRoutesConfig,
     HpaChangeSubmissionStatus,
 )
-from boxer_company_adapter_slack.hpa_change_runtime import create_hpa_change_runtime
+from boxer_company_adapter_slack.hpa_change_runtime import (
+    HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS,
+    HPA_CHANGE_POLICY_ALLOWED_USER_IDS,
+    create_hpa_change_runtime,
+)
 from boxer_company_adapter_slack import company
 
 
@@ -39,8 +44,12 @@ class _FakeSession:
 def _settings(db_path: str, **overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
         "HPA_CHANGE_REQUEST_ENABLED": True,
-        "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": {"UJUSTIN"},
-        "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": {"CHPA"},
+        "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": set(
+            HPA_CHANGE_POLICY_ALLOWED_USER_IDS
+        ),
+        "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": set(
+            HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
+        ),
         "HPA_CHANGE_GITHUB_COORDINATOR_REPOSITORY": "mmtalk-app/mmb-hospital-admin-server",
         "HPA_CHANGE_GITHUB_WORKFLOW_FILE": "boxer-hpa-change.yml",
         "HPA_CHANGE_GITHUB_API_URL": "https://api.github.com",
@@ -62,15 +71,21 @@ def _settings(db_path: str, **overrides: Any) -> SimpleNamespace:
 
 def _route_request() -> HpaChangeRequest:
     return HpaChangeRequest(
-        request_key="slack:TWORK:CHPA:1720580400.000100",
+        request_key="slack:TWORK:C02C08K7YEN:1720580400.000100",
         workspace_id="TWORK",
-        channel_id="CHPA",
+        channel_id="C02C08K7YEN",
         thread_ts="1720580000.000001",
-        thread_url="https://lifexio.slack.com/archives/CHPA/p1720580000000001",
+        thread_url=(
+            "https://lifexio.slack.com/archives/C068FVD5V7Y/"
+            "p1720580000000001"
+        ),
         event_ts="1720580400.000100",
-        requester_user_id="UJUSTIN",
+        requester_user_id="U07A5FM5XPD",
         question="HPA CR 반영 요청",
-        thread_text="[1720580000.000001] UJUSTIN\nBonus 프롬프트 변경을 검토해줘",
+        thread_text=(
+            "[1720580000.000001] U07A5FM5XPD\n"
+            "Bonus 프롬프트 변경을 검토해줘"
+        ),
         thread_message_count=1,
         attachments=(
             HpaChangeAttachment(
@@ -82,12 +97,13 @@ def _route_request() -> HpaChangeRequest:
                 message_ts="1720580000.000001",
             ),
         ),
-        initiator_user_id="UHYUN",
-        source_channel_id="CSOURCE",
+        initiator_user_id="U0629HDSJHG",
+        source_channel_id="C068FVD5V7Y",
         source_message_ts="1720580000.000001",
         selection_mode="linked_message",
         response_thread_url=(
-            "https://lifexio.slack.com/archives/CHPA/p1720580000000001"
+            "https://lifexio.slack.com/archives/C02C08K7YEN/"
+            "p1720580000000001"
         ),
     )
 
@@ -113,9 +129,44 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "allowlist"):
                 create_hpa_change_runtime(settings=settings)
 
-            settings.HPA_CHANGE_REQUEST_ALLOWED_USER_IDS = {"UJUSTIN"}
+            settings.HPA_CHANGE_REQUEST_ALLOWED_USER_IDS = set(
+                HPA_CHANGE_POLICY_ALLOWED_USER_IDS
+            )
             with self.assertRaisesRegex(ValueError, "GitHub App 또는 static token"):
                 create_hpa_change_runtime(settings=settings)
+
+    def test_enabled_runtime_requires_exact_company_policy_allowlists(self) -> None:
+        cases = (
+            {
+                "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": (
+                    set(HPA_CHANGE_POLICY_ALLOWED_USER_IDS) | {"UOTHER"}
+                )
+            },
+            {
+                "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": {"U0629HDSJHG"}
+            },
+            {
+                "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": (
+                    set(HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS) | {"COTHER"}
+                )
+            },
+            {
+                "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": {"C02C08K7YEN"}
+            },
+        )
+
+        for index, overrides in enumerate(cases):
+            with (
+                self.subTest(overrides=overrides),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                settings = _settings(
+                    str(Path(temp_dir) / f"jobs-{index}.sqlite3"),
+                    **overrides,
+                )
+
+                with self.assertRaisesRegex(ValueError, "회사 고정"):
+                    create_hpa_change_runtime(settings=settings)
 
     def test_partial_github_app_config_does_not_fallback_to_static_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,7 +235,10 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                 {"text", "requester_slack_user_id", "thread_url", "attachments"},
             )
             self.assertEqual(worker_request["text"], _route_request().thread_text)
-            self.assertEqual(worker_request["requester_slack_user_id"], "UJUSTIN")
+            self.assertEqual(
+                worker_request["requester_slack_user_id"],
+                "U07A5FM5XPD",
+            )
             self.assertEqual(
                 worker_request["attachments"],
                 [
@@ -196,13 +250,16 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                 ],
             )
             job = runtime.store.get_job(first.request_id)
-            self.assertEqual(job.channel_id, "CHPA")
+            self.assertEqual(job.channel_id, "C02C08K7YEN")
             self.assertEqual(job.thread_ts, "1720580000.000001")
-            self.assertEqual(job.requested_by, "UJUSTIN")
-            self.assertEqual(job.metadata["initiator_user_id"], "UHYUN")
-            self.assertEqual(job.metadata["source_channel_id"], "CSOURCE")
+            self.assertEqual(job.requested_by, "U07A5FM5XPD")
+            self.assertEqual(job.metadata["initiator_user_id"], "U0629HDSJHG")
+            self.assertEqual(job.metadata["source_channel_id"], "C068FVD5V7Y")
             self.assertEqual(job.metadata["selection_mode"], "linked_message")
-            self.assertIn("/archives/CHPA/", job.metadata["response_thread_url"])
+            self.assertIn(
+                "/archives/C02C08K7YEN/",
+                job.metadata["response_thread_url"],
+            )
         self.assertEqual(
             runtime.workflow.github.config.workflow_run_name_prefix,
             "Boxer HPA Review",
@@ -211,6 +268,35 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             runtime.workflow.github.config.implementation_workflow_run_name_prefix,
             "Boxer HPA Implementation",
         )
+
+    def test_submit_rejects_request_outside_company_policy_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = _FakeSession()
+            runtime = create_hpa_change_runtime(
+                settings=_settings(str(Path(temp_dir) / "jobs.sqlite3")),
+                session=session,
+            )
+            self.addCleanup(runtime.close)
+            base_request = _route_request()
+            cases = (
+                replace(base_request, requester_user_id="UOTHER"),
+                replace(base_request, initiator_user_id="UOTHER"),
+                replace(base_request, initiator_user_id=""),
+                replace(base_request, channel_id="COTHER"),
+                replace(base_request, source_channel_id="COTHER"),
+                replace(base_request, source_channel_id=""),
+            )
+
+            for request in cases:
+                with self.subTest(request=request):
+                    result = runtime.submit_request(request)
+                    self.assertEqual(
+                        result.status,
+                        HpaChangeSubmissionStatus.REJECTED,
+                    )
+                    self.assertIn("정책을 충족하지 않아", result.user_message)
+
+            self.assertEqual(session.calls, [])
 
     def test_invalid_private_key_path_fails_before_runtime_starts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

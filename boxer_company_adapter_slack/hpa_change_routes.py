@@ -748,6 +748,10 @@ def _handle_hpa_change_request(
             selected_message = _select_linked_message(messages, linked_target)
             messages = [selected_message]
             requester_user_id = str(selected_message.get("user") or "").strip()
+            if requester_user_id not in allowed_user_ids:
+                raise HpaChangeIntakeError(
+                    "링크된 Slack 댓글 작성자는 HPA 변경 요청 허용 사용자가 아니야"
+                )
         thread_text = _render_thread_text(messages)
         if not thread_text:
             raise HpaChangeIntakeError("검토할 Slack 스레드 텍스트를 찾지 못했어")

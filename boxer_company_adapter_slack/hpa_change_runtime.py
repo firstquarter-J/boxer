@@ -34,6 +34,15 @@ _GITHUB_EVENT_TYPE = "boxer-hpa-change"
 _GITHUB_RUN_NAME_PREFIX = "Boxer HPA Review"
 _GITHUB_IMPLEMENTATION_RUN_NAME_PREFIX = "Boxer HPA Implementation"
 
+# HPA CR 자동 PR은 회사가 승인한 두 사용자와 두 채널에서만 동작한다.
+# 환경변수는 기능 on/off가 아니라 이 고정 정책과의 일치 여부를 검증하는 용도다.
+HPA_CHANGE_POLICY_ALLOWED_USER_IDS = frozenset(
+    {"U0629HDSJHG", "U07A5FM5XPD"}
+)
+HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS = frozenset(
+    {"C02C08K7YEN", "C068FVD5V7Y"}
+)
+
 
 @dataclass
 class HpaChangeRuntime:
@@ -56,6 +65,24 @@ class HpaChangeRuntime:
             return HpaChangeSubmissionResult(
                 status=HpaChangeSubmissionStatus.REJECTED,
                 user_message="HPA 코드 변경 작업 큐가 활성화되지 않았어",
+            )
+
+        # Slack route를 우회해 runtime이 직접 호출돼도 요청자·실행자와
+        # 응답·원문 채널이 모두 회사 고정 정책 안에 있어야 dispatch한다.
+        initiator_user_id = str(request.initiator_user_id or "").strip()
+        source_channel_id = str(request.source_channel_id or "").strip()
+        if not initiator_user_id or not source_channel_id or {
+            request.requester_user_id,
+            initiator_user_id,
+        } - HPA_CHANGE_POLICY_ALLOWED_USER_IDS or {
+            request.channel_id,
+            source_channel_id,
+        } - HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS:
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message=(
+                    "HPA 코드 변경 요청의 사용자·채널 정책을 충족하지 않아"
+                ),
             )
 
         # worker에는 정규화한 스레드 요구사항과 텍스트 첨부만 전달한다.
@@ -323,6 +350,13 @@ def create_hpa_change_runtime(
     if not allowed_user_ids or not allowed_channel_ids:
         raise ValueError(
             "HPA 코드 변경 요청의 사용자·채널 allowlist가 모두 필요해"
+        )
+    if (
+        allowed_user_ids != HPA_CHANGE_POLICY_ALLOWED_USER_IDS
+        or allowed_channel_ids != HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
+    ):
+        raise ValueError(
+            "HPA 코드 변경 요청 allowlist가 회사 고정 사용자·채널 정책과 달라"
         )
     poll_interval_sec = _positive_int(settings, "HPA_CHANGE_POLL_INTERVAL_SEC")
     run_timeout_sec = _positive_int(settings, "HPA_CHANGE_RUN_TIMEOUT_SEC")
