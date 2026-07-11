@@ -34,10 +34,11 @@ _GITHUB_EVENT_TYPE = "boxer-hpa-change"
 _GITHUB_RUN_NAME_PREFIX = "Boxer HPA Review"
 _GITHUB_IMPLEMENTATION_RUN_NAME_PREFIX = "Boxer HPA Implementation"
 
-# HPA CR 자동 PR은 회사가 승인한 두 사용자와 두 채널에서만 동작한다.
+# HPA CR 자동 PR은 회사가 승인한 두 사람과 두 채널에서만 동작한다.
+# 저스틴은 Slack 계정이 두 개라 두 user ID를 동일한 허용 대상으로 관리한다.
 # 환경변수는 기능 on/off가 아니라 이 고정 정책과의 일치 여부를 검증하는 용도다.
 HPA_CHANGE_POLICY_ALLOWED_USER_IDS = frozenset(
-    {"U0629HDSJHG", "U07A5FM5XPD"}
+    {"U0629HDSJHG", "U07A5FM5XPD", "U096JA81T6X"}
 )
 HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS = frozenset(
     {"C02C08K7YEN", "C068FVD5V7Y"}

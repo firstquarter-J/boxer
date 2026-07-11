@@ -69,7 +69,9 @@ def _settings(db_path: str, **overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def _route_request() -> HpaChangeRequest:
+def _route_request(
+    *, requester_user_id: str = "U07A5FM5XPD"
+) -> HpaChangeRequest:
     return HpaChangeRequest(
         request_key="slack:TWORK:C02C08K7YEN:1720580400.000100",
         workspace_id="TWORK",
@@ -80,10 +82,10 @@ def _route_request() -> HpaChangeRequest:
             "p1720580000000001"
         ),
         event_ts="1720580400.000100",
-        requester_user_id="U07A5FM5XPD",
+        requester_user_id=requester_user_id,
         question="HPA CR 반영 요청",
         thread_text=(
-            "[1720580000.000001] U07A5FM5XPD\n"
+            f"[1720580000.000001] {requester_user_id}\n"
             "Bonus 프롬프트 변경을 검토해줘"
         ),
         thread_message_count=1,
@@ -144,6 +146,13 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             },
             {
                 "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": {"U0629HDSJHG"}
+            },
+            {
+                # 저스틴의 보조 Slack 계정이 누락된 기존 운영 설정도 거부한다.
+                "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": {
+                    "U0629HDSJHG",
+                    "U07A5FM5XPD",
+                }
             },
             {
                 "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": (
@@ -297,6 +306,45 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                     self.assertIn("정책을 충족하지 않아", result.user_message)
 
             self.assertEqual(session.calls, [])
+
+    def test_submit_accepts_both_justin_slack_accounts(self) -> None:
+        # 동일한 요청자가 사용하는 두 Slack 계정 모두 HPA 작업 큐에 들어가야 한다.
+        for index, requester_user_id in enumerate(
+            ("U07A5FM5XPD", "U096JA81T6X")
+        ):
+            with (
+                self.subTest(requester_user_id=requester_user_id),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                session = _FakeSession()
+                runtime = create_hpa_change_runtime(
+                    settings=_settings(
+                        str(Path(temp_dir) / f"jobs-{index}.sqlite3")
+                    ),
+                    session=session,
+                )
+                self.addCleanup(runtime.close)
+                self.assertIn(
+                    requester_user_id,
+                    runtime.routes_config.allowed_user_ids,
+                )
+
+                result = runtime.submit_request(
+                    _route_request(requester_user_id=requester_user_id)
+                )
+
+                self.assertEqual(
+                    result.status,
+                    HpaChangeSubmissionStatus.ACCEPTED,
+                )
+                self.assertEqual(len(session.calls), 1)
+                worker_request = session.calls[0]["json"]["client_payload"][
+                    "request"
+                ]
+                self.assertEqual(
+                    worker_request["requester_slack_user_id"],
+                    requester_user_id,
+                )
 
     def test_invalid_private_key_path_fails_before_runtime_starts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
