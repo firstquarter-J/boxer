@@ -23,6 +23,13 @@ _TARGET_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])(hpa|cr)(?![0-9A-Za-z])", re.IGN
 _ACTION_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])pr(?![0-9A-Za-z])", re.IGNORECASE)
 _TARGET_KOREAN_TOKENS = ("내재화",)
 _ACTION_KOREAN_TOKENS = ("검토", "반영", "구현")
+# 허용된 HPA 채널에서 새 글에 요구사항을 직접 적을 때 쓰는 명시적 명령이다.
+# 일반 대화의 "요구사항 검토 결과"까지 가로채지 않도록 메시지 시작과 구분자를 고정한다.
+_DIRECT_REQUIREMENTS_REVIEW_RE = re.compile(
+    r"^\s*요구\s*사항\s*검토"
+    r"(?:\s*(?:해\s*줘|해\s*주세요|해주세요|부탁(?:해|드립니다)?))?"
+    r"\s*(?::|：|-|\r?\n|$)"
+)
 _URL_TOKEN_RE = re.compile(r"https?://[^\s<>|]+", re.IGNORECASE)
 _SLACK_ARCHIVE_PATH_RE = re.compile(
     r"^/archives/(?P<channel>[A-Z0-9]{6,30})/p(?P<timestamp>[0-9]{7,26})/?$"
@@ -148,6 +155,8 @@ def _looks_like_hpa_change_request(question: str) -> bool:
     text = str(question or "").strip()
     if not text:
         return False
+    if _DIRECT_REQUIREMENTS_REVIEW_RE.search(text):
+        return True
     has_target = bool(_TARGET_TOKEN_RE.search(text)) or any(
         token in text for token in _TARGET_KOREAN_TOKENS
     )

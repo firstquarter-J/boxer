@@ -159,10 +159,15 @@ class HpaChangeRoutesTests(unittest.TestCase):
             "CR 코드 검토해줘": True,
             "내재화 구현 부탁": True,
             "hpa PR 만들어줘": True,
+            "요구사항 검토\nBasic과 Bonus 발송 버튼 분리": True,
+            "요구 사항 검토: 이미지 다운로드 형식 선택 추가": True,
+            "요구사항 검토 해줘\n- Bonus 생성 전 손 QA 추가": True,
             "HPA 현재 상태 알려줘": False,
             "이 코드 반영해줘": False,
             "create 함수 구현": False,
             "critical 오류 검토": False,
+            "어제 요구사항 검토 결과 알려줘": False,
+            "요구사항 검토 결과만 알려줘": False,
         }
 
         for question, expected in cases.items():
@@ -186,6 +191,81 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertEqual(client.reply_calls, [])
         self.assertEqual(replies, [])
         self.assertEqual(submitted, [])
+
+    def test_direct_requirements_review_collects_current_message_without_link(self) -> None:
+        requirement = "Basic과 Bonus 발송 버튼을 분리하고 Basic만 발송할 수 있게 해줘"
+        pages = {
+            "": {
+                "messages": [
+                    {
+                        "ts": "2.0",
+                        "user": "UJUSTIN",
+                        "text": f"<@UBOXER> 요구사항 검토\n\n- {requirement}",
+                    }
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        }
+        client = _FakeSlackClient(pages)
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        def submit_request(request: HpaChangeRequest) -> HpaChangeSubmissionResult:
+            submitted.append(request)
+            return HpaChangeSubmissionResult(
+                HpaChangeSubmissionStatus.ACCEPTED,
+                request_id="TASK-DIRECT",
+            )
+
+        handled = _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question=f"요구사항 검토\n\n- {requirement}",
+                current_ts="2.0",
+                thread_ts="2.0",
+            ),
+            _config(),
+            HpaChangeRoutesDeps(submit_request=submit_request),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(submitted), 1)
+        request = submitted[0]
+        self.assertEqual(request.selection_mode, "thread")
+        self.assertEqual(request.requester_user_id, "UJUSTIN")
+        self.assertEqual(request.source_channel_id, "CHPA")
+        self.assertEqual(request.thread_message_count, 1)
+        self.assertIn(requirement, request.thread_text)
+        self.assertNotIn("slack.com", request.question)
+        self.assertIn("TASK-DIRECT", replies[0][0])
+        self.assertIn("스레드 1개", replies[0][0])
+
+    def test_direct_requirements_review_keeps_user_and_channel_allowlists(self) -> None:
+        question = "요구사항 검토\n- Basic과 Bonus 발송 버튼 분리"
+        cases = (
+            ({"user_id": "UOTHER"}, "권한이 없어"),
+            ({"channel_id": "COTHER"}, "이 채널에서는"),
+        )
+
+        for overrides, expected_text in cases:
+            with self.subTest(overrides=overrides):
+                client = _FakeSlackClient()
+                replies: list[tuple[str, dict[str, Any]]] = []
+                submitted: list[HpaChangeRequest] = []
+
+                handled = _handle_hpa_change_request(
+                    _context(client, replies, question=question, **overrides),
+                    _config(),
+                    HpaChangeRoutesDeps(
+                        submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+                    ),
+                )
+
+                self.assertTrue(handled)
+                self.assertIn(expected_text, replies[0][0])
+                self.assertEqual(client.reply_calls, [])
+                self.assertEqual(submitted, [])
 
     def test_disabled_and_empty_allowlists_fail_closed(self) -> None:
         cases = (
