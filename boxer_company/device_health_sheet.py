@@ -10,6 +10,7 @@ _GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 _GOOGLE_SHEETS_API_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 _GOOGLE_SHEETS_SERIAL_EPOCH = datetime(1899, 12, 30)
 _KST = ZoneInfo("Asia/Seoul")
+_NON_DEVICE_PROBLEM_COMPONENTS = {"용량", "storage", "디스크", "저장공간", "trashcan"}
 
 
 def _build_device_health_sheet_authorized_session() -> Any:
@@ -45,11 +46,13 @@ def _build_device_health_sheet_rows(
                 _display_value(component, default="")
                 for component in problem_components
                 if _display_value(component, default="")
+                and _display_value(component, default="").lower()
+                not in _NON_DEVICE_PROBLEM_COMPONENTS
             )
             if isinstance(problem_components, list)
             else ""
         )
-        # G~N은 TA 수동 처리 영역이고 처리상태만 신규 장애의 기본값인 대기로 채운다.
+        # G~O는 TA 수동 처리 영역이고 처리상태만 신규 장애의 기본값인 대기로 채운다.
         rows.append(
             [
                 detected_at_serial,

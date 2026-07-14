@@ -41,7 +41,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
                     "device": "MB2-C00043",
                     "hospitalName": "수지미래산부인과의원(용인)",
                     "room": "1진료실",
-                    "problemComponents": ["캡처보드", "LED"],
+                    "problemComponents": ["캡처보드", "LED", "용량"],
                     "issue": "캡처보드와 LED를 찾지 못했어",
                 }
             ],

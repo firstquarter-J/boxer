@@ -393,6 +393,19 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             text,
         )
 
+    def test_storage_capacity_is_not_classified_as_problem_device(self) -> None:
+        components = daily_device_round_reporter._build_device_health_alert_problem_components(
+            {
+                "componentLabels": {
+                    "captureboard": "이상",
+                    "storage": "확인 필요",
+                }
+            },
+            issue="TrashCan 용량이 빠르게 커지고 있고 캡처보드를 찾지 못했어",
+        )
+
+        self.assertEqual(components, ["캡처보드"])
+
     def test_sheet_failure_does_not_escape_after_slack_delivery(self) -> None:
         logger = logging.getLogger("test.device_health_monitor.sheet")
         local_now = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))

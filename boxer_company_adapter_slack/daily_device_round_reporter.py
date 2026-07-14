@@ -48,13 +48,12 @@ _DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *이상 발견 - 확인 요망*"
 _DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
 _DEVICE_HEALTH_ALERT_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
-_DEVICE_HEALTH_ALERT_COMPONENT_ORDER = ("captureboard", "led", "audio", "pm2", "storage")
+_DEVICE_HEALTH_ALERT_COMPONENT_ORDER = ("captureboard", "led", "audio", "pm2")
 _DEVICE_HEALTH_ALERT_COMPONENT_NAMES = {
     "captureboard": "캡처보드",
     "led": "LED",
     "audio": "스피커",
     "pm2": "PM2",
-    "storage": "용량",
 }
 _DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS = (
     "activeHospitalSeq",
@@ -704,7 +703,6 @@ def _build_device_health_alert_problem_components(
         ("LED", ("led", "엘이디", "LED")),
         ("스피커", ("audio", "sound", "speaker", "오디오", "소리", "스피커")),
         ("PM2", ("pm2", "프로세스")),
-        ("용량", ("storage", "용량", "디스크", "저장", "trashcan", "trash")),
     ]
     for component, keywords in keyword_components:
         if component in components:
