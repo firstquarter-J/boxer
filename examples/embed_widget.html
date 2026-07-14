@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Boxer Widget Embed Example</title>
+  </head>
+  <body>
+    <h1>Boxer Widget Embed Example</h1>
+    <button id="open-widget" type="button">Open widget</button>
+    <button id="identify-widget" type="button">Identify</button>
+
+    <script type="module">
+      import { boot } from "../widget/dist/sdk/index.js";
+
+      const controller = boot({
+        widgetUrl: "../widget/dist/widget/",
+        boxerWebUrl: "http://localhost:8000",
+        autoOpen: false,
+      });
+
+      document.getElementById("open-widget")?.addEventListener("click", () => {
+        controller.open();
+      });
+
+      document.getElementById("identify-widget")?.addEventListener("click", () => {
+        controller.identify({
+          id: "demo@example.com",
+          email: "demo@example.com",
+          name: "Demo User",
+        });
+      });
+    </script>
+  </body>
+</html>

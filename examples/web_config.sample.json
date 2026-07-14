@@ -1,0 +1,99 @@
+{
+  "welcomeTitle": "Support desk",
+  "welcomeMessage": "Welcome to the help center.\n\nBusiness hours\nWeekdays: 09:00-18:00\nSaturday: 09:00-13:00",
+  "welcomeTimeZones": {
+    "ko": "Asia/Seoul",
+    "en": "America/Los_Angeles"
+  },
+  "widgetAllowedOrigins": [
+    "https://www.example.com",
+    "https://app.example.com"
+  ],
+  "adminCookieSecure": true,
+  "wsRateLimitPerMinute": 120,
+  "handoffPolicy": {
+    "onMissingEvidence": true,
+    "promptBeforeQueue": false
+  },
+  "starterEntries": [
+    {
+      "key": "account_access",
+      "label": "Account access"
+    },
+    {
+      "key": "billing_issue",
+      "label": "Billing issue"
+    },
+    {
+      "key": "delivery_request",
+      "label": "Delivery request"
+    }
+  ],
+  "workflows": {
+    "account_access": {
+      "label": {
+        "en": "Account access",
+        "ko": "계정 확인"
+      },
+      "steps": [
+        {
+          "field": "email",
+          "prompt": {
+            "en": "Which account email should support check?",
+            "ko": "확인할 계정 이메일을 입력해 줘."
+          },
+          "validationRegex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+          "retryPrompt": {
+            "en": "Enter a valid email address.",
+            "ko": "올바른 이메일 형식으로 다시 입력해 줘."
+          }
+        },
+        {
+          "field": "issue_type",
+          "prompt": {
+            "en": "Which issue matches best?",
+            "ko": "가장 가까운 문제 유형을 골라 줘."
+          },
+          "choices": [
+            "password_reset",
+            "login_blocked"
+          ],
+          "choiceLabels": {
+            "password_reset": {
+              "en": "Password reset",
+              "ko": "비밀번호 재설정"
+            },
+            "login_blocked": {
+              "en": "Login blocked",
+              "ko": "로그인 차단"
+            }
+          },
+          "branches": {
+            "password_reset": "reset_details",
+            "login_blocked": "blocked_details"
+          }
+        },
+        {
+          "field": "reset_details",
+          "prompt": {
+            "en": "Tell me what happened during password reset.",
+            "ko": "비밀번호 재설정 중 어떤 문제가 있었는지 적어 줘."
+          },
+          "skipAllowed": true
+        },
+        {
+          "field": "blocked_details",
+          "prompt": {
+            "en": "Tell me what happened when login was blocked.",
+            "ko": "로그인 차단 상황을 적어 줘."
+          },
+          "action": "support_case.capture_login_block"
+        }
+      ],
+      "completionMessage": {
+        "en": "Captured. Support will continue.",
+        "ko": "접수했어. 상담원이 이어서 확인할게."
+      }
+    }
+  }
+}

@@ -48,7 +48,7 @@ jobs:
           rm -rf "${public_root}"
           mkdir -p "${public_root}/tests"
           cp pyproject.toml README.md LICENSE .env.example "${public_root}/"
-          cp -R boxer boxer_adapter_slack examples scripts "${public_root}/"
+          cp -R boxer boxer_adapter_slack boxer_adapter_web widget examples scripts "${public_root}/"
           cp -R tests/open_source "${public_root}/tests/open_source"
 
       - name: Install public packages only
@@ -57,6 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -e ./boxer_adapter_slack
+          python -m pip install -e ./boxer_adapter_web
 
       - name: Assert company packages are unavailable
         working-directory: /tmp/boxer-public-checkout
@@ -74,6 +75,30 @@ jobs:
         env:
           BOXER_SKIP_DOTENV: "true"
         run: python -m unittest discover -s tests/open_source -q
+
+  widget-build:
+    name: Widget Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install widget dependencies
+        working-directory: widget
+        run: pnpm install --frozen-lockfile
+
+      - name: Build widget
+        working-directory: widget
+        run: pnpm build
 
   company-tests:
     name: Company Tests

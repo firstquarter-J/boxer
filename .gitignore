@@ -17,3 +17,6 @@ data/*.sqlite3
 data/*.jsonl
 data/*-wal
 data/*-shm
+widget/node_modules/
+widget/dist/
+widget/*.tsbuildinfo

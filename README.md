@@ -18,22 +18,22 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 
 - `boxer/`: 채널 중립 RAG core
 - `boxer_adapter_slack/`: 공개 Slack reference adapter
-- `boxer_adapter_web/`: 웹 API / BFF 자리
-- `widget/`: 브라우저 채팅 UI 자리
+- `boxer_adapter_web/`: 공개 FastAPI 기반 웹 adapter
+- `widget/`: 공개 iframe SDK + 서비스 호스팅용 widget SPA + 분리된 admin 빌드
 
-핵심 공개 설치 단위는 현재 2개다.
+핵심 공개 설치 단위는 현재 4개다.
 
 - `boxer`
 - `boxer_adapter_slack`
-
-`boxer_adapter_web`, `widget`은 공개 확장 자리만 잡혀 있는 experimental placeholder고 아직 설치 단위는 아니다.
+- `boxer_adapter_web`
+- `widget`
 
 ## Support Status
 
 - `boxer`: 지금 설치해서 쓸 수 있는 open core
 - `boxer_adapter_slack`: 지금 설치해서 쓸 수 있는 공개 Slack reference adapter
-- `boxer_adapter_web`: 구조와 문서만 있는 experimental placeholder
-- `widget`: 구조와 문서만 있는 experimental placeholder
+- `boxer_adapter_web`: 지금 설치해서 쓸 수 있는 공개 웹 adapter alpha
+- `widget`: 지금 빌드해서 쓸 수 있는 공개 웹 widget alpha
 
 ## Monorepo Layout
 
@@ -46,10 +46,16 @@ boxer/
     observability/
     retrieval/
       connectors/
+      knowledge.py
   boxer_adapter_slack/
     pyproject.toml
   boxer_adapter_web/
+    pyproject.toml
+    runtime.py
+    app.py
   widget/
+    package.json
+    src/
   examples/
   tests/
 ```
@@ -66,8 +72,11 @@ open core 내부 구조:
 - `boxer/context`: entries / builder / windowing
 - `boxer/observability`: request log / audit / sqlite snapshot helper
 - `boxer/retrieval/connectors`: DB/S3/Notion connector
+- `boxer/retrieval/knowledge.py`: Markdown / Notion knowledge source contract
 - `boxer/retrieval/synthesis.py`: retrieval evidence masking / serialization / synthesis
 - `boxer_adapter_slack/context.py`: Slack thread/history loader
+- `boxer_adapter_web`: FastAPI runtime / SQLite store / admin auth / knowledge sync / widget chat
+- `widget`: 서비스에 설치하는 iframe SDK / widget SPA와 Boxer Web용 admin 빌드
 
 ## 환경 파일
 
@@ -79,6 +88,16 @@ open core 내부 구조:
 별도 설정이 없으면 retrieval synthesis 기본 응답 언어는 `질문 언어를 따라가고`, request log timezone 기본값은 `UTC`다.
 S3 connector를 켜면 `AWS_REGION`은 명시적으로 넣어야 한다.
 패키지 의존성 기준으로는 LLM은 기본 설치에 포함되고, DB/S3 connector만 optional extra로 분리돼 있다.
+웹 adapter를 쓸 때는 아래 env를 추가로 사용한다.
+
+- `BOXER_WEB_HOST`
+- `BOXER_WEB_PORT`
+- `BOXER_WEB_SECRET_KEY`
+- `BOXER_WEB_DATA_PATH`
+- `BOXER_WEB_KNOWLEDGE_SOURCE`
+- `BOXER_WEB_MARKDOWN_ROOT`
+- `BOXER_WEB_ADMIN_DIST_PATH`
+- `BOXER_WEB_WIDGET_ALLOWED_ORIGINS`
 
 ## 빠른 시작
 
@@ -104,7 +123,7 @@ cp .env.example .env
 선택:
 
 - `ADAPTER_ENTRYPOINT=boxer_adapter_slack.sample:create_app`
-- LLM 기능을 실험할 때만 `LLM_PROVIDER`와 provider별 env(`ANTHROPIC_API_KEY`, `OLLAMA_*`) 추가
+- LLM 기능을 실험할 때만 `LLM_PROVIDER`와 provider별 env(`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `OLLAMA_*`) 추가
 
 참고:
 
@@ -122,6 +141,54 @@ boxer-slack
 예시:
 
 - `@Bot ping`
+
+### Web Chat Alpha
+
+실제 서비스가 widget을 호스팅하고 Boxer Web이 API/WebSocket과 `/admin`을 제공하는 공개 웹 채널 alpha다.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+pip install -e ./boxer_adapter_web
+pnpm --prefix widget install
+pnpm --prefix widget build
+cp .env.example .env
+```
+
+최소 환경 변수:
+
+- `BOXER_WEB_SECRET_KEY`
+- `LLM_PROVIDER`
+- provider별 key (`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` 또는 `OLLAMA_*`)
+
+Markdown FAQ로 바로 시작할 때:
+
+```bash
+BOXER_WEB_KNOWLEDGE_SOURCE=markdown
+BOXER_WEB_MARKDOWN_ROOT=examples/web_knowledge/markdown
+```
+
+첫 관리자 계정 생성:
+
+```bash
+boxer-web-bootstrap-admin --email admin@example.com --password admin1234 --name "Boxer Admin"
+```
+
+실행:
+
+```bash
+boxer-web
+```
+
+기본 경로:
+
+- admin: `http://127.0.0.1:8000/admin/`
+- health: `http://127.0.0.1:8000/api/health`
+
+widget은 별도 터미널에서 `pnpm --prefix widget dev`로 띄운 뒤
+`http://127.0.0.1:4173/?boxerWebUrl=http://127.0.0.1:8000`으로 확인한다.
+실제 서비스의 iframe embed 예시는 [`examples/embed_widget.html`](examples/embed_widget.html)에 들어 있다.
 
 ## 내 Slack Adapter를 붙이는 방법
 
@@ -200,14 +267,19 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 이 위에 어떤 질문을 어떤 connector로 처리할지는 각 adapter가 정한다.
 
-## Web Modules
+## Web Chat Alpha
 
-현재 저장소에는 `boxer_adapter_web/`, `widget/` 폴더가 함께 존재한다.
+`boxer_adapter_web`와 `widget`은 같이 동작하는 공개 웹 채널 alpha다.
 
-- `boxer_adapter_web/`: 추후 Node/TypeScript 기반 웹 adapter 구현 자리
-- `widget/`: 추후 Node/TypeScript 기반 브라우저 위젯 구현 자리
+- hosting: widget SDK/UI는 실제 서비스, admin UI/API는 Boxer Web
+- transport: WebSocket
+- persistence: SQLite
+- knowledge source: Markdown 또는 Notion
+- admin 기능: 로컬 계정 로그인, knowledge sync/status/preview, conversation log 조회
+- widget 기능: 서비스 호스팅 iframe, Boxer Web URL 주입, session restore, 대화 이력 복구, FAQ 기반 답변, `EN/KO` 언어 선택, small talk 고정 응답
 
-지금 단계에서는 폴더와 문서 경계만 잡아둔 experimental placeholder고, 실제 구현은 이후 단계에서 진행한다.
+이번 alpha 범위는 FAQ 검색 + grounded answer + conversation log까지다.
+handoff, 상담사 reply, multi-tenant는 아직 포함하지 않는다.
 
 ## Packaging And Install
 
@@ -215,6 +287,8 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 - 루트 `pyproject.toml`: `boxer`
 - `boxer_adapter_slack/pyproject.toml`: `boxer-adapter-slack`
+- `boxer_adapter_web/pyproject.toml`: `boxer-adapter-web`
+- `widget/package.json`: `boxer-widget`
 
 설치 예시:
 
@@ -239,6 +313,16 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
   pip install -e .
   pip install -e ./boxer_adapter_slack
   ```
+- 공개 웹 adapter까지 필요할 때:
+  ```bash
+  pip install -e .
+  pip install -e ./boxer_adapter_web
+  ```
+- 서비스에 widget SDK / SPA를 설치할 때:
+  ```bash
+  pnpm --prefix widget install
+  pnpm --prefix widget build
+  ```
 
 패키징 기준:
 
@@ -253,6 +337,9 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 
 - 루트 `pyproject.toml`은 `boxer`만 포함한다
 - 공개 Slack adapter는 `boxer_adapter_slack/pyproject.toml`에서 따로 빌드한다
+- 공개 웹 adapter는 `boxer_adapter_web/pyproject.toml`에서 따로 빌드한다
+- 공개 widget은 `widget/package.json`에서 빌드하며 npm 배포물에는 `dist/sdk`, `dist/widget`만 포함한다
+- `dist/admin`은 Boxer Web 배포물에만 포함한다
 
 ## 검증 스크립트
 
@@ -273,6 +360,12 @@ scripts/verify_open_core_boundary.sh
 ```
 
 - 공개 패키지 기본 회귀 테스트
+
+```bash
+pnpm --prefix widget build
+```
+
+- 공개 widget 빌드 검증
 
 ```bash
 ./.venv/bin/python -m unittest discover -s tests

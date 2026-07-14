@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxer-adapter-web"
+version = "0.1.0"
+description = "Public web adapter package for Boxer."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boxer>=0.1.0",
+  "fastapi==0.116.1",
+  "uvicorn==0.35.0",
+  "websockets==15.0.1",
+  "itsdangerous==2.2.0",
+  "httpx==0.28.1",
+]
+
+[project.urls]
+Repository = "https://github.com/firstquarter-J/boxer"
+
+[project.scripts]
+boxer-web = "boxer_adapter_web.runtime:main"
+boxer-web-bootstrap-admin = "boxer_adapter_web.bootstrap_admin:main"
+
+[tool.setuptools]
+packages = ["boxer_adapter_web"]
+
+[tool.setuptools.package-dir]
+boxer_adapter_web = "."
