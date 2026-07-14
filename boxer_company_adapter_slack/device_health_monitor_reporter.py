@@ -58,6 +58,9 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
     _collect_daily_device_round_abnormal_alert_items,
     _post_daily_device_round_abnormal_alert,
 )
+from boxer_company_adapter_slack.device_notification_alert_reporter import (
+    _load_recent_captureboard_notification_alerts,
+)
 
 _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
 _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
@@ -3219,6 +3222,30 @@ def _collect_device_health_monitor_alert_updates(
     alertable_fingerprints: set[str] = set()
     updated_alerts: dict[str, dict[str, Any]] = {}
     updated_pending_alerts: dict[str, dict[str, Any]] = {}
+
+    # 확정 이벤트가 이미 Slack으로 전달된 장비는 같은 캡처보드 장애를 reminder 동안 다시 보내지 않는다.
+    recent_event_alerts = _load_recent_captureboard_notification_alerts(now=now)
+    for fingerprint, item in current_items_by_fingerprint.items():
+        problem_components = (
+            item.get("problemComponents")
+            if isinstance(item.get("problemComponents"), list)
+            else []
+        )
+        device_name = _display_value(item.get("device"), default="")
+        event_alerted_at = recent_event_alerts.get(device_name)
+        if "캡처보드" not in problem_components or event_alerted_at is None:
+            continue
+        previous = alert_fingerprints.get(fingerprint, {})
+        previous_alerted_at = _parse_device_health_monitor_datetime(
+            previous.get("lastAlertedAt")
+        )
+        if previous_alerted_at is None or event_alerted_at > previous_alerted_at:
+            alert_fingerprints[fingerprint] = {
+                "firstAlertedAt": str(previous.get("firstAlertedAt") or event_alerted_at.isoformat()),
+                "lastAlertedAt": event_alerted_at.isoformat(),
+                "lastSeenAt": now_text,
+                "count": max(1, int(previous.get("count") or 0)),
+            }
 
     for fingerprint, previous in alert_fingerprints.items():
         if fingerprint in current_fingerprints:

@@ -102,6 +102,9 @@ from boxer_company_adapter_slack.thread_learning_routes import (
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import attach_daily_device_round_reporter
 from boxer_company_adapter_slack.device_health_monitor_reporter import attach_device_health_monitor_reporter
+from boxer_company_adapter_slack.device_notification_alert_reporter import (
+    attach_device_notification_alert_reporter,
+)
 from boxer_company_adapter_slack.weekly_reports import (
     _build_weekly_recordings_report_reply_payload,
     _extract_optional_requested_date,
@@ -963,5 +966,6 @@ def create_app() -> App:
     attach_hpa_change_reporter(app, hpa_change_runtime, logger=app_logger)
     attach_weekly_recordings_reporter(app, logger=app_logger)
     attach_device_health_monitor_reporter(app, logger=app_logger)
+    attach_device_notification_alert_reporter(app, logger=app_logger)
     attach_daily_device_round_reporter(app, logger=app_logger)
     return app

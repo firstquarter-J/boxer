@@ -310,6 +310,22 @@ DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR = os.getenv(
     "DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR",
     str(core_settings.PROJECT_ROOT / "data"),
 ).strip()
+# MDA가 영속화한 확정 장비 이벤트는 기존 상태 스냅샷 감시와 분리해 증분 처리한다.
+DEVICE_NOTIFICATION_ALERT_ENABLED = (
+    os.getenv("DEVICE_NOTIFICATION_ALERT_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEVICE_NOTIFICATION_ALERT_CHANNEL_ID = (
+    os.getenv("DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", "").strip()
+    or DEVICE_HEALTH_MONITOR_CHANNEL_ID
+)
+DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC = int(
+    os.getenv("DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC", "30")
+)
+DEVICE_NOTIFICATION_ALERT_STATE_PATH = os.getenv(
+    "DEVICE_NOTIFICATION_ALERT_STATE_PATH",
+    str(core_settings.PROJECT_ROOT / "data" / "device_notification_alert_state.json"),
+).strip()
 DEVICE_HEALTH_SHEET_ENABLED = (
     os.getenv("DEVICE_HEALTH_SHEET_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}
