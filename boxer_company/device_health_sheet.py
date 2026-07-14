@@ -105,7 +105,8 @@ def _append_device_health_sheet_alerts(
         url,
         params={
             "valueInputOption": "USER_ENTERED",
-            "insertDataOption": "INSERT_ROWS",
+            # 미리 준비한 날짜 형식·드롭다운·행 색상을 유지하고 헤더 서식 복제를 막는다.
+            "insertDataOption": "OVERWRITE",
         },
         json={"majorDimension": "ROWS", "values": rows},
         timeout=max(1, int(cs.DEVICE_HEALTH_SHEET_TIMEOUT_SEC)),

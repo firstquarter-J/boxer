@@ -90,7 +90,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertTrue(call["url"].endswith(":append"))
         self.assertEqual(
             call["params"],
-            {"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            {"valueInputOption": "USER_ENTERED", "insertDataOption": "OVERWRITE"},
         )
         self.assertEqual(call["json"]["majorDimension"], "ROWS")
         self.assertEqual(call["json"]["values"][0][1], "MB2-C00043")
