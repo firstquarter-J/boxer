@@ -46,6 +46,7 @@ from boxer_company.routers.mda_graphql import (
     _get_mda_device_agent_ssh,
     _open_mda_device_ssh,
 )
+from boxer_company.device_health_sheet import _append_device_health_sheet_alerts
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
@@ -3374,6 +3375,52 @@ def _build_device_health_monitor_next_state(
     }
 
 
+def _record_device_health_sheet_alerts_best_effort(
+    alert_summary: dict[str, Any],
+    *,
+    detected_at: datetime,
+    slack_permalink: str,
+    logger: logging.Logger,
+) -> None:
+    try:
+        # Slack 발송 성공 후에만 기록하고, Sheets 장애는 이미 전달된 운영 알림을 실패로 바꾸지 않는다.
+        sheet_row_count = _append_device_health_sheet_alerts(
+            _collect_daily_device_round_abnormal_alert_items(alert_summary),
+            detected_at=detected_at,
+            slack_permalink=slack_permalink,
+        )
+        if sheet_row_count is None:
+            return
+        _append_device_health_monitor_event(
+            "sheet_alert_rows_written",
+            {
+                "spreadsheetId": _display_value(
+                    cs.DEVICE_HEALTH_SHEET_SPREADSHEET_ID,
+                    default="",
+                ),
+                "sheetName": _display_value(cs.DEVICE_HEALTH_SHEET_TAB_NAME, default=""),
+                "rowCount": max(0, int(sheet_row_count)),
+            },
+            now=detected_at,
+            logger=logger,
+        )
+    except Exception as exc:
+        _append_device_health_monitor_event(
+            "sheet_alert_write_failed",
+            {
+                "spreadsheetId": _display_value(
+                    cs.DEVICE_HEALTH_SHEET_SPREADSHEET_ID,
+                    default="",
+                ),
+                "sheetName": _display_value(cs.DEVICE_HEALTH_SHEET_TAB_NAME, default=""),
+                "errorType": type(exc).__name__,
+            },
+            now=detected_at,
+            logger=logger,
+        )
+        logger.warning("장비 이상 알림을 Google Sheets에 기록하지 못했어", exc_info=True)
+
+
 def _run_device_health_monitor_once(
     client: Any,
     logger: logging.Logger,
@@ -3522,7 +3569,7 @@ def _run_device_health_monitor_once(
         now=local_now,
         logger=logger,
     )
-    _post_daily_device_round_abnormal_alert(
+    slack_delivery = _post_daily_device_round_abnormal_alert(
         client,
         alert_summary,
         channel_id=channel_id,
@@ -3530,16 +3577,31 @@ def _run_device_health_monitor_once(
         logger=logger,
         include_actions=True,
     )
+    if slack_delivery is None:
+        logger.warning(
+            "Device health Slack alert delivery failed channel=%s alertable=%s",
+            channel_id,
+            len(alertable_fingerprints),
+        )
+        return False
     _append_device_health_monitor_event(
         "slack_alert_sent",
         {
             "channelId": channel_id,
+            "messageTs": _display_value(slack_delivery.get("messageTs"), default=""),
+            "permalink": _display_value(slack_delivery.get("permalink"), default=""),
             "alertableCount": len(alertable_fingerprints),
             "alertFingerprints": sorted(alertable_fingerprints),
             "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
             "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
         },
         now=local_now,
+        logger=logger,
+    )
+    _record_device_health_sheet_alerts_best_effort(
+        alert_summary,
+        detected_at=local_now,
+        slack_permalink=_display_value(slack_delivery.get("permalink"), default=""),
         logger=logger,
     )
     logger.info(

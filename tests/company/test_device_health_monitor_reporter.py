@@ -21,6 +21,14 @@ class _FakeSlackClient:
         self.messages.append(kwargs)
         return {"ts": f"3000.{len(self.messages):03d}"}
 
+    def chat_getPermalink(self, **kwargs) -> dict[str, str]:
+        return {
+            "permalink": (
+                "https://lifexio.slack.com/archives/"
+                f"{kwargs['channel']}/p{str(kwargs['message_ts']).replace('.', '')}"
+            )
+        }
+
     def views_open(self, **kwargs) -> dict[str, bool]:
         self.views.append(kwargs)
         return {"ok": True}
@@ -299,6 +307,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
             ) as append_event_mock,
+            patch(
+                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_sheet_alerts",
+                return_value=1,
+            ) as append_sheet_mock,
         ):
             sent = reporter._run_device_health_monitor_once(client, logger, now=local_now)
 
@@ -355,9 +367,18 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertIsNone(saved_state["lastHospitalSeq"])
         self.assertIsNone(saved_state["nextHospitalSeq"])
         self.assertEqual(len(saved_state["alertFingerprints"]), 1)
+        append_sheet_mock.assert_called_once()
+        sheet_alert_items = append_sheet_mock.call_args.args[0]
+        self.assertEqual(sheet_alert_items[0]["device"], "MB2-C00043")
+        self.assertEqual(sheet_alert_items[0]["room"], "1진료실")
+        self.assertEqual(append_sheet_mock.call_args.kwargs["detected_at"], local_now)
+        self.assertEqual(
+            append_sheet_mock.call_args.kwargs["slack_permalink"],
+            "https://lifexio.slack.com/archives/C_HEALTH/p3000001",
+        )
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
-            ["run_summary", "slack_alert_sent"],
+            ["run_summary", "slack_alert_sent", "sheet_alert_rows_written"],
         )
 
     def test_abnormal_alert_highlights_problem_components(self) -> None:
@@ -371,6 +392,29 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "> *이슈*  캡처보드 USB나 비디오 장치를 찾지 못했어 / LED USB 장치를 찾지 못했어",
             text,
         )
+
+    def test_sheet_failure_does_not_escape_after_slack_delivery(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.sheet")
+        local_now = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with (
+            patch.object(
+                reporter,
+                "_append_device_health_sheet_alerts",
+                side_effect=RuntimeError("sheets unavailable"),
+            ),
+            patch.object(reporter, "_append_device_health_monitor_event") as append_event_mock,
+        ):
+            reporter._record_device_health_sheet_alerts_best_effort(
+                _abnormal_summary(),
+                detected_at=local_now,
+                slack_permalink="https://lifexio.slack.com/archives/C_HEALTH/p3000001",
+                logger=logger,
+            )
+
+        append_event_mock.assert_called_once()
+        self.assertEqual(append_event_mock.call_args.args[0], "sheet_alert_write_failed")
+        self.assertEqual(append_event_mock.call_args.args[1]["errorType"], "RuntimeError")
 
     def test_auto_sends_sms_when_device_alert_phone_is_mobile(self) -> None:
         client = _FakeSlackClient()

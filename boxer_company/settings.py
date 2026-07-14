@@ -310,6 +310,21 @@ DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR = os.getenv(
     "DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR",
     str(core_settings.PROJECT_ROOT / "data"),
 ).strip()
+DEVICE_HEALTH_SHEET_ENABLED = (
+    os.getenv("DEVICE_HEALTH_SHEET_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEVICE_HEALTH_SHEET_SPREADSHEET_ID = os.getenv(
+    "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+    "",
+).strip()
+DEVICE_HEALTH_SHEET_TAB_NAME = os.getenv(
+    "DEVICE_HEALTH_SHEET_TAB_NAME",
+    "Boxer 장애 감지 처리 현황",
+).strip()
+DEVICE_HEALTH_SHEET_TIMEOUT_SEC = int(
+    os.getenv("DEVICE_HEALTH_SHEET_TIMEOUT_SEC", "10")
+)
 DEVICE_HEALTH_MONITOR_CONTACT_WEBHOOK_URL = os.getenv(
     "DEVICE_HEALTH_MONITOR_CONTACT_WEBHOOK_URL",
     "",

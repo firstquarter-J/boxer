@@ -970,7 +970,7 @@ def _post_daily_device_round_abnormal_alert(
     message_ts: str,
     logger: logging.Logger,
     include_actions: bool = False,
-) -> None:
+) -> dict[str, str] | None:
     if not _daily_device_round_has_abnormal_result(report_summary):
         return
 
@@ -993,7 +993,19 @@ def _post_daily_device_round_abnormal_alert(
                 report_summary,
                 permalink,
             )
-        client.chat_postMessage(**message_kwargs)
+        response = client.chat_postMessage(**message_kwargs)
+        posted_message_ts = _extract_daily_device_round_thread_ts(response)
+        posted_permalink = _load_daily_device_round_message_permalink(
+            client,
+            channel_id=channel_id,
+            message_ts=posted_message_ts,
+            logger=logger,
+        )
+        return {
+            "channelId": str(channel_id or "").strip(),
+            "messageTs": posted_message_ts,
+            "permalink": str(posted_permalink or "").strip(),
+        }
     except Exception:
         logger.warning(
             "일일 장비 순회 이상 알림을 보내지 못했어 channel=%s message_ts=%s",
@@ -1001,6 +1013,7 @@ def _post_daily_device_round_abnormal_alert(
             message_ts,
             exc_info=True,
         )
+        return None
 
 
 def _is_daily_device_round_due(
