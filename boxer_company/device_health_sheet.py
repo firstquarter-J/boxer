@@ -28,6 +28,20 @@ def _device_health_sheet_serial_datetime(value: datetime) -> float:
     return (local_naive - _GOOGLE_SHEETS_SERIAL_EPOCH).total_seconds() / 86400
 
 
+def _format_device_health_sheet_duration(duration_minutes: float) -> str:
+    total_seconds = max(0, int(round(duration_minutes * 60)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}시간")
+    if minutes:
+        parts.append(f"{minutes}분")
+    if seconds or not parts:
+        parts.append(f"{seconds}초")
+    return " ".join(parts)
+
+
 def _build_device_health_sheet_rows(
     alert_items: list[dict[str, Any]],
     *,
@@ -52,7 +66,7 @@ def _build_device_health_sheet_rows(
             if isinstance(problem_components, list)
             else ""
         )
-        # G~O는 TA 수동 처리 영역이고 처리상태만 신규 장애의 기본값인 대기로 채운다.
+        # G~N은 TA 처리 영역이며 신규 장애의 처리상태는 담당자가 선택하도록 비워 둔다.
         rows.append(
             [
                 detected_at_serial,
@@ -62,7 +76,6 @@ def _build_device_health_sheet_rows(
                 problem_device,
                 _display_value(item.get("issue"), default="상세 확인 필요"),
                 "",
-                "대기",
                 "",
                 "",
                 "",
@@ -99,7 +112,7 @@ def _append_device_health_sheet_alerts(
 
     # 탭 이름의 작은따옴표를 Sheets A1 규칙에 맞게 이스케이프하고 URL path도 별도로 인코딩한다.
     quoted_tab_name = tab_name.replace("'", "''")
-    append_range = quote(f"'{quoted_tab_name}'!A:O", safe="")
+    append_range = quote(f"'{quoted_tab_name}'!A:N", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{append_range}:append"
@@ -132,7 +145,7 @@ def _stamp_device_health_sheet_status_times(
         raise ValueError("장비 장애 시트 ID 또는 탭 이름이 비어 있어")
 
     quoted_tab_name = tab_name.replace("'", "''")
-    status_range = quote(f"'{quoted_tab_name}'!H2:J", safe="")
+    status_range = quote(f"'{quoted_tab_name}'!A2:N", safe="")
     base_url = f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
     session = authorized_session or _build_device_health_sheet_authorized_session()
     response = session.get(
@@ -144,16 +157,46 @@ def _stamp_device_health_sheet_status_times(
 
     timestamp = _device_health_sheet_serial_datetime(now)
     updates: list[dict[str, Any]] = []
+    updated_row_count = 0
     for row_number, row in enumerate(response.json().get("values", []), start=2):
-        if not isinstance(row, list) or not row:
+        if not isinstance(row, list) or len(row) <= 7:
             continue
-        status = _display_value(row[0], default="")
-        started_at = row[1] if len(row) > 1 else ""
-        completed_at = row[2] if len(row) > 2 else ""
-        if status == "시작" and started_at in {"", None}:
-            updates.append({"range": f"'{quoted_tab_name}'!I{row_number}", "values": [[timestamp]]})
-        elif status == "완료" and completed_at in {"", None}:
-            updates.append({"range": f"'{quoted_tab_name}'!J{row_number}", "values": [[timestamp]]})
+        status = _display_value(row[7], default="")
+        if status != "완료":
+            continue
+
+        detected_at = row[0] if isinstance(row[0], (int, float)) else None
+        completed_at = row[8] if len(row) > 8 and isinstance(row[8], (int, float)) else None
+        work_duration = row[9] if len(row) > 9 else ""
+        work_duration_minutes = row[13] if len(row) > 13 else ""
+        effective_completed_at = completed_at if completed_at is not None else timestamp
+        row_updated = False
+        if completed_at is None:
+            updates.append(
+                {"range": f"'{quoted_tab_name}'!I{row_number}", "values": [[effective_completed_at]]}
+            )
+            row_updated = True
+
+        if detected_at is not None and effective_completed_at >= detected_at:
+            duration_minutes = (effective_completed_at - detected_at) * 1440
+            if work_duration in {"", None}:
+                updates.append(
+                    {
+                        "range": f"'{quoted_tab_name}'!J{row_number}",
+                        "values": [[_format_device_health_sheet_duration(duration_minutes)]],
+                    }
+                )
+                row_updated = True
+            if work_duration_minutes in {"", None}:
+                updates.append(
+                    {
+                        "range": f"'{quoted_tab_name}'!N{row_number}",
+                        "values": [[round(duration_minutes, 1)]],
+                    }
+                )
+                row_updated = True
+        if row_updated:
+            updated_row_count += 1
 
     if not updates:
         return 0
@@ -163,4 +206,4 @@ def _stamp_device_health_sheet_status_times(
         timeout=max(1, int(cs.DEVICE_HEALTH_SHEET_TIMEOUT_SEC)),
     )
     update_response.raise_for_status()
-    return len(updates)
+    return updated_row_count
