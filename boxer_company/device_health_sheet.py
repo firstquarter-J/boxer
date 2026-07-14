@@ -64,6 +64,7 @@ def _build_device_health_sheet_rows(
                 "",
                 "",
                 "",
+                "",
                 permalink,
                 "",
             ]
@@ -95,7 +96,7 @@ def _append_device_health_sheet_alerts(
 
     # 탭 이름의 작은따옴표를 Sheets A1 규칙에 맞게 이스케이프하고 URL path도 별도로 인코딩한다.
     quoted_tab_name = tab_name.replace("'", "''")
-    append_range = quote(f"'{quoted_tab_name}'!A:N", safe="")
+    append_range = quote(f"'{quoted_tab_name}'!A:O", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{append_range}:append"
@@ -113,3 +114,50 @@ def _append_device_health_sheet_alerts(
     )
     response.raise_for_status()
     return len(rows)
+
+
+def _stamp_device_health_sheet_status_times(
+    *,
+    now: datetime,
+    authorized_session: Any | None = None,
+) -> int | None:
+    if not cs.DEVICE_HEALTH_SHEET_ENABLED:
+        return None
+    spreadsheet_id = str(cs.DEVICE_HEALTH_SHEET_SPREADSHEET_ID or "").strip()
+    tab_name = str(cs.DEVICE_HEALTH_SHEET_TAB_NAME or "").strip()
+    if not spreadsheet_id or not tab_name:
+        raise ValueError("장비 장애 시트 ID 또는 탭 이름이 비어 있어")
+
+    quoted_tab_name = tab_name.replace("'", "''")
+    status_range = quote(f"'{quoted_tab_name}'!H2:J", safe="")
+    base_url = f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
+    session = authorized_session or _build_device_health_sheet_authorized_session()
+    response = session.get(
+        f"{base_url}/values/{status_range}",
+        params={"majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE"},
+        timeout=max(1, int(cs.DEVICE_HEALTH_SHEET_TIMEOUT_SEC)),
+    )
+    response.raise_for_status()
+
+    timestamp = _device_health_sheet_serial_datetime(now)
+    updates: list[dict[str, Any]] = []
+    for row_number, row in enumerate(response.json().get("values", []), start=2):
+        if not isinstance(row, list) or not row:
+            continue
+        status = _display_value(row[0], default="")
+        started_at = row[1] if len(row) > 1 else ""
+        completed_at = row[2] if len(row) > 2 else ""
+        if status == "시작" and started_at in {"", None}:
+            updates.append({"range": f"'{quoted_tab_name}'!I{row_number}", "values": [[timestamp]]})
+        elif status == "완료" and completed_at in {"", None}:
+            updates.append({"range": f"'{quoted_tab_name}'!J{row_number}", "values": [[timestamp]]})
+
+    if not updates:
+        return 0
+    update_response = session.post(
+        f"{base_url}/values:batchUpdate",
+        json={"valueInputOption": "USER_ENTERED", "data": updates},
+        timeout=max(1, int(cs.DEVICE_HEALTH_SHEET_TIMEOUT_SEC)),
+    )
+    update_response.raise_for_status()
+    return len(updates)
