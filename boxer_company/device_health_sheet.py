@@ -11,6 +11,22 @@ _GOOGLE_SHEETS_API_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 _GOOGLE_SHEETS_SERIAL_EPOCH = datetime(1899, 12, 30)
 _KST = ZoneInfo("Asia/Seoul")
 _NON_DEVICE_PROBLEM_COMPONENTS = {"용량", "storage", "디스크", "저장공간", "trashcan"}
+# 시트 반복 계산(최대 1회)과 함께 사용해 완료 선택 순간을 셀 자체에 고정한다.
+_COMPLETED_AT_FORMULA = (
+    '=IF(INDIRECT("H"&ROW())="완료",'
+    'IF(INDIRECT("I"&ROW())="",NOW()+9/24,INDIRECT("I"&ROW())),"")'
+)
+_WORK_DURATION_FORMULA = (
+    '=IF(OR(INDIRECT("A"&ROW())="",INDIRECT("I"&ROW())=""),"",'
+    'LET(total,ROUND((INDIRECT("I"&ROW())-INDIRECT("A"&ROW()))*86400),'
+    'hours,INT(total/3600),minutes,INT(MOD(total,3600)/60),seconds,MOD(total,60),'
+    'TRIM(IF(hours>0,hours&"시간 ","")&IF(minutes>0,minutes&"분 ","")&'
+    'IF(OR(seconds>0,AND(hours=0,minutes=0)),seconds&"초",""))))'
+)
+_WORK_DURATION_MINUTES_FORMULA = (
+    '=IF(OR(INDIRECT("A"&ROW())="",INDIRECT("I"&ROW())=""),"",'
+    'ROUND((INDIRECT("I"&ROW())-INDIRECT("A"&ROW()))*1440,1))'
+)
 
 
 def _build_device_health_sheet_authorized_session() -> Any:
@@ -66,7 +82,7 @@ def _build_device_health_sheet_rows(
             if isinstance(problem_components, list)
             else ""
         )
-        # G~N은 TA 처리 영역이며 신규 장애는 대기 상태로 시작한다.
+        # G~N은 TA 처리 영역이며 신규 장애는 대기로 시작하고 완료 계산은 시트가 즉시 수행한다.
         rows.append(
             [
                 detected_at_serial,
@@ -77,12 +93,12 @@ def _build_device_health_sheet_rows(
                 _display_value(item.get("issue"), default="상세 확인 필요"),
                 "",
                 "대기",
-                "",
-                "",
+                _COMPLETED_AT_FORMULA,
+                _WORK_DURATION_FORMULA,
                 "",
                 "",
                 permalink,
-                "",
+                _WORK_DURATION_MINUTES_FORMULA,
             ]
         )
     return rows

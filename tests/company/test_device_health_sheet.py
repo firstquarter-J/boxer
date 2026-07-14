@@ -59,7 +59,10 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(rows[0][5], "캡처보드와 LED를 찾지 못했어")
         self.assertEqual(rows[0][6], "")
         self.assertEqual(rows[0][7], "대기")
+        self.assertIn('INDIRECT("H"&ROW())="완료"', rows[0][8])
+        self.assertIn("LET(total", rows[0][9])
         self.assertEqual(rows[0][12], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
+        self.assertIn("*1440", rows[0][13])
 
     def test_appends_rows_with_adc_authorized_session(self) -> None:
         session = _FakeAuthorizedSession()
@@ -105,6 +108,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
         )
         self.assertEqual(call["json"]["majorDimension"], "ROWS")
         self.assertEqual(call["json"]["values"][0][1], "MB2-C00043")
+        self.assertTrue(call["json"]["values"][0][8].startswith("=IF("))
+        self.assertTrue(call["json"]["values"][0][9].startswith("=IF("))
+        self.assertTrue(call["json"]["values"][0][13].startswith("=IF("))
         self.assertEqual(call["timeout"], 7)
 
     def test_stamps_completion_and_calculates_duration(self) -> None:

@@ -48,7 +48,6 @@ from boxer_company.routers.mda_graphql import (
 )
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
-    _stamp_device_health_sheet_status_times,
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
@@ -3646,12 +3645,6 @@ def _run_device_health_monitor_once(
 def _device_health_monitor_loop(client: Any, logger: logging.Logger) -> None:
     poll_interval_sec = max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC))
     while True:
-        try:
-            stamped_count = _stamp_device_health_sheet_status_times(now=datetime.now(timezone.utc))
-            if stamped_count:
-                logger.info("장애 처리 상태 시간 기록 완료 count=%s", stamped_count)
-        except Exception:
-            logger.exception("장애 처리 상태 시간을 Google Sheets에 기록하지 못했어")
         try:
             _run_device_health_monitor_once(client, logger)
         except Exception:
