@@ -32,7 +32,7 @@ class _FakeAuthorizedSession:
 
 
 class DeviceHealthSheetTests(unittest.TestCase):
-    def test_builds_fourteen_column_row_with_empty_status(self) -> None:
+    def test_builds_fourteen_column_row_with_pending_status(self) -> None:
         detected_at = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
 
         rows = device_health_sheet._build_device_health_sheet_rows(
@@ -58,7 +58,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(rows[0][4], "캡처보드 LED")
         self.assertEqual(rows[0][5], "캡처보드와 LED를 찾지 못했어")
         self.assertEqual(rows[0][6], "")
-        self.assertEqual(rows[0][7], "")
+        self.assertEqual(rows[0][7], "대기")
         self.assertEqual(rows[0][12], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
 
     def test_appends_rows_with_adc_authorized_session(self) -> None:

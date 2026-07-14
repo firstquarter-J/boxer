@@ -66,7 +66,7 @@ def _build_device_health_sheet_rows(
             if isinstance(problem_components, list)
             else ""
         )
-        # G~N은 TA 처리 영역이며 신규 장애의 처리상태는 담당자가 선택하도록 비워 둔다.
+        # G~N은 TA 처리 영역이며 신규 장애는 대기 상태로 시작한다.
         rows.append(
             [
                 detected_at_serial,
@@ -76,7 +76,7 @@ def _build_device_health_sheet_rows(
                 problem_device,
                 _display_value(item.get("issue"), default="상세 확인 필요"),
                 "",
-                "",
+                "대기",
                 "",
                 "",
                 "",
