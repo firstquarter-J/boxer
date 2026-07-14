@@ -32,7 +32,7 @@ class _FakeAuthorizedSession:
 
 
 class DeviceHealthSheetTests(unittest.TestCase):
-    def test_builds_fourteen_column_row_with_pending_status(self) -> None:
+    def test_builds_thirteen_column_row_with_pending_status(self) -> None:
         detected_at = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
 
         rows = device_health_sheet._build_device_health_sheet_rows(
@@ -50,7 +50,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(len(rows[0]), 14)
+        self.assertEqual(len(rows[0]), 13)
         self.assertIsInstance(rows[0][0], float)
         self.assertEqual(rows[0][1], "MB2-C00043")
         self.assertEqual(rows[0][2], "수지미래산부인과의원(용인)")
@@ -62,7 +62,6 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertIn('INDIRECT("H"&ROW())="완료"', rows[0][8])
         self.assertIn("LET(total", rows[0][9])
         self.assertEqual(rows[0][12], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
-        self.assertIn("*1440", rows[0][13])
 
     def test_appends_rows_with_adc_authorized_session(self) -> None:
         session = _FakeAuthorizedSession()
@@ -110,70 +109,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(call["json"]["values"][0][1], "MB2-C00043")
         self.assertTrue(call["json"]["values"][0][8].startswith("=IF("))
         self.assertTrue(call["json"]["values"][0][9].startswith("=IF("))
-        self.assertTrue(call["json"]["values"][0][13].startswith("=IF("))
         self.assertEqual(call["timeout"], 7)
-
-    def test_stamps_completion_and_calculates_duration(self) -> None:
-        session = _FakeAuthorizedSession(
-            get_payload={
-                "values": [
-                    [46217.5, "장비1", "", "", "", "", "", "완료"],
-                    [46217.5, "장비2", "", "", "", "", "", "완료", 46217.6],
-                    [46217.5, "장비3", "", "", "", "", "", "이상없음"],
-                    [
-                        46217.5,
-                        "장비4",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "완료",
-                        46217.6,
-                        "2시간 24분",
-                        "",
-                        "",
-                        "",
-                        144,
-                    ],
-                ]
-            }
-        )
-
-        with (
-            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
-            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_SPREADSHEET_ID", "spreadsheet-id"),
-            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "처리 현황"),
-            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TIMEOUT_SEC", 7),
-        ):
-            stamped_count = device_health_sheet._stamp_device_health_sheet_status_times(
-                now=datetime(2026, 7, 14, 17, 0, tzinfo=ZoneInfo("Asia/Seoul")),
-                authorized_session=session,
-            )
-
-        self.assertEqual(stamped_count, 2)
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(session.calls[0]["method"], "GET")
-        update_call = session.calls[1]
-        self.assertEqual(update_call["method"], "POST")
-        self.assertTrue(update_call["url"].endswith("/values:batchUpdate"))
-        update_data = update_call["json"]["data"]
-        self.assertEqual(
-            [item["range"] for item in update_data],
-            ["'처리 현황'!I2", "'처리 현황'!J2", "'처리 현황'!N2", "'처리 현황'!J3", "'처리 현황'!N3"],
-        )
-        self.assertEqual(update_data[1]["values"], [["5시간"]])
-        self.assertEqual(update_data[2]["values"], [[300.0]])
-        self.assertEqual(update_data[3]["values"], [["2시간 24분"]])
-        self.assertEqual(update_data[4]["values"], [[144.0]])
-        self.assertEqual(update_call["json"]["valueInputOption"], "USER_ENTERED")
-
-    def test_formats_duration_with_seconds(self) -> None:
-        self.assertEqual(device_health_sheet._format_device_health_sheet_duration(0.5), "30초")
-        self.assertEqual(
-            device_health_sheet._format_device_health_sheet_duration(61.5),
-            "1시간 1분 30초",
-        )
 
     def test_skips_sheet_when_feature_is_disabled(self) -> None:
         session = _FakeAuthorizedSession()
