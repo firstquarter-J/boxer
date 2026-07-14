@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
+  "packageManager": "pnpm@9.15.9",
   "description": "Public browser widget SDK and service-hosted UI for Boxer.",
   "main": "dist/sdk/index.js",
   "types": "dist/sdk/index.d.ts",
