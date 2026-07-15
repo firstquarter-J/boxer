@@ -336,19 +336,44 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 [
                     ":alert: *장비 이상 감지*",
                     "*#69 수지미래산부인과의원(용인)*",
-                    "*장비*  `MB2-C00043`  ·  *병실*  1진료실",
-                    ":rotating_light: *문제 장치*  →  `LED`",
-                    "> :warning: LED USB 장치를 찾지 못했어",
+                    "🖥️ *장비*  *<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*  ·  🚪 *병실*  `1진료실`",
                     "",
-                    "*연락처*",
-                    "• *전화*  031-123-4567",
-                    "• *문자*  :warning: 저장된 번호 없음 · 자동발송 불가  <https://mda.kr.mmtalkbox.com/hospital/list?search=%EC%88%98%EC%A7%80%EB%AF%B8%EB%9E%98%EC%82%B0%EB%B6%80%EC%9D%B8%EA%B3%BC%EC%9D%98%EC%9B%90%28%EC%9A%A9%EC%9D%B8%29|번호 추가하기>",
+                    ":rotating_light: *문제 장치*\n`LED`",
+                    "🔎 *감지 내용*\n`LED USB 장치를 찾지 못했어`",
                     "",
-                    "<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MDA에서 장비 확인하기 →>",
+                    "📞 *전화*\n031-123-4567",
+                    "💬 *문자*\n저장된 번호 없음 · 자동발송 불가\n<https://mda.kr.mmtalkbox.com/hospital/list?search=%EC%88%98%EC%A7%80%EB%AF%B8%EB%9E%98%EC%82%B0%EB%B6%80%EC%9D%B8%EA%B3%BC%EC%9D%98%EC%9B%90%28%EC%9A%A9%EC%9D%B8%29|번호 추가하기>",
                 ]
             ),
         )
+        self.assertFalse(client.messages[0]["unfurl_links"])
+        self.assertFalse(client.messages[0]["unfurl_media"])
         blocks = client.messages[0]["blocks"]
+        self.assertEqual(blocks[0]["type"], "header")
+        self.assertEqual(blocks[0]["text"]["text"], ":alert: 장비 이상 감지")
+        item_summary_block = blocks[1]
+        self.assertEqual(item_summary_block["text"]["text"], "*#69 수지미래산부인과의원(용인)*")
+        self.assertEqual(
+            [field["text"] for field in item_summary_block["fields"]],
+            [
+                "🖥️ *장비*\n*<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*",
+                "🚪 *병실*\n`1진료실`",
+            ],
+        )
+        self.assertEqual(
+            [field["text"] for field in blocks[2]["fields"]],
+            [
+                ":rotating_light: *문제 장치*\n`LED`",
+                "🔎 *감지 내용*\n`LED USB 장치를 찾지 못했어`",
+            ],
+        )
+        self.assertEqual(
+            [field["text"] for field in blocks[3]["fields"]],
+            [
+                "📞 *전화*\n031-123-4567",
+                "💬 *문자*\n저장된 번호 없음 · 자동발송 불가\n<https://mda.kr.mmtalkbox.com/hospital/list?search=%EC%88%98%EC%A7%80%EB%AF%B8%EB%9E%98%EC%82%B0%EB%B6%80%EC%9D%B8%EA%B3%BC%EC%9D%98%EC%9B%90%28%EC%9A%A9%EC%9D%B8%29|번호 추가하기>",
+            ],
+        )
         action_blocks = [block for block in blocks if block["type"] == "actions"]
         self.assertEqual(len(action_blocks), 1)
         self.assertEqual(
@@ -389,9 +414,9 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             permalink=None,
         )
 
-        self.assertIn(":rotating_light: *문제 장치*  →  `캡처보드` `LED`", text)
+        self.assertIn(":rotating_light: *문제 장치*\n`캡처보드` `LED`", text)
         self.assertIn(
-            "> :warning: 캡처보드 USB나 비디오 장치를 찾지 못했어 / LED USB 장치를 찾지 못했어",
+            "🔎 *감지 내용*\n`캡처보드 USB나 비디오 장치를 찾지 못했어 / LED USB 장치를 찾지 못했어`",
             text,
         )
 
@@ -493,26 +518,32 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
         self.assertEqual(len(client.messages), 1)
         self.assertIn(
-            "• *문자*  010-1234-4567",
+            "💬 *문자*\n010-1234-4567",
             client.messages[0]["text"],
         )
-        self.assertNotIn("• *문자*  문자 자동발송 완료", client.messages[0]["text"])
+        self.assertNotIn("💬 *문자*\n문자 자동발송 완료", client.messages[0]["text"])
         blocks = client.messages[0]["blocks"]
         section_texts = [
             block["text"]["text"]
             for block in blocks
             if block.get("type") == "section" and isinstance(block.get("text"), dict)
         ]
+        field_texts = [
+            field["text"]
+            for block in blocks
+            for field in block.get("fields", [])
+            if isinstance(field, dict)
+        ]
         self.assertTrue(
-            any(":rotating_light: *문제 장치*  →  `LED`" in text for text in section_texts)
+            any(":rotating_light: *문제 장치*\n`LED`" in text for text in field_texts)
         )
         self.assertTrue(
             any(
-                "• *문자*  010-1234-4567" in text
-                for text in section_texts
+                "💬 *문자*\n010-1234-4567" in text
+                for text in field_texts
             )
         )
-        self.assertFalse(any("• *문자*  문자 자동발송 완료" in text for text in section_texts))
+        self.assertFalse(any("💬 *문자*\n문자 자동발송 완료" in text for text in field_texts))
         action_blocks = [block for block in blocks if block["type"] == "actions"]
         self.assertEqual(len(action_blocks), 1)
         self.assertEqual(

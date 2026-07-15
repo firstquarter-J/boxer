@@ -758,9 +758,13 @@ def _build_daily_device_round_mda_hospital_edit_url(*, hospital_name: str) -> st
     return f"{cs.MDA_GRAPHQL_ORIGIN.rstrip('/')}/hospital/list?{query}"
 
 
-def _format_mda_device_check_link(mda_url: str) -> str:
-    # 행동이 바로 보이는 짧은 CTA로 장비 정보와 장애 확인 화면을 연결해.
-    return f"<{mda_url}|MDA에서 장비 확인하기 →>"
+def _format_device_health_alert_device_name(item: dict[str, Any]) -> str:
+    device_name = _display_value(item.get("device"), default="장비명 미확인")
+    mda_url = _display_value(item.get("mdaUrl"), default="")
+    # MDA 확인 목적지가 장비 자체이므로 별도 CTA 대신 장비명에 링크를 직접 걸어.
+    if mda_url:
+        return f"*<{mda_url}|{device_name}>*"
+    return f"`{device_name}`"
 
 
 def _format_mda_hospital_contact_link(mda_url: str) -> str:
@@ -768,57 +772,51 @@ def _format_mda_hospital_contact_link(mda_url: str) -> str:
     return f"<{mda_url}|번호 추가하기>"
 
 
-def _format_device_health_alert_sms_contact_line(item: dict[str, Any]) -> str:
+def _format_device_health_alert_sms_contact_value(item: dict[str, Any]) -> str:
     device_alert_phone = _display_value(
         item.get("deviceAlertPhone"),
         default=_display_value(item.get("smsPhoneNumber"), default=""),
     )
-    # 문자 라인은 전화처럼 값만 보여주고, 발송 완료 여부는 별도 버튼으로 확인하게 한다.
+    # 전화와 같은 2열 필드에 넣을 수 있도록 문자 값과 보조 링크만 반환해.
     if device_alert_phone:
-        return f"• *문자*  {device_alert_phone}"
-    return "• *문자*  :warning: 저장된 번호 없음 · 자동발송 불가"
-
-
-def _format_device_health_alert_sms_contact_lines(item: dict[str, Any]) -> list[str]:
-    device_alert_phone = _display_value(
-        item.get("deviceAlertPhone"),
-        default=_display_value(item.get("smsPhoneNumber"), default=""),
-    )
-    if device_alert_phone:
-        return [_format_device_health_alert_sms_contact_line(item)]
+        return device_alert_phone
 
     mda_hospital_edit_url = _display_value(item.get("mdaHospitalEditUrl"), default="")
     if mda_hospital_edit_url:
-        return [
-            "• *문자*  :warning: 저장된 번호 없음 · 자동발송 불가  "
+        return (
+            "저장된 번호 없음 · 자동발송 불가\n"
             f"{_format_mda_hospital_contact_link(mda_hospital_edit_url)}"
-        ]
-    return [_format_device_health_alert_sms_contact_line(item)]
+        )
+    return "저장된 번호 없음 · 자동발송 불가"
 
 
 def _build_device_health_alert_item_text_lines(item: dict[str, Any]) -> list[str]:
     # 식별 정보, 장애 내용, 연락처, 행동 순으로 묶어 Slack에서 빠르게 훑을 수 있게 해.
     lines = [
         f"*{item['hospital']}*",
-        f"*장비*  `{item['device']}`  ·  *병실*  {item['room']}",
+        f"🖥️ *장비*  {_format_device_health_alert_device_name(item)}  ·  🚪 *병실*  `{item['room']}`",
+        "",
     ]
     problem_components = _format_device_health_alert_problem_components(
         item.get("problemComponents")
     )
     if problem_components:
         # 장애 부품이 병원·장비 식별 정보 다음으로 가장 먼저 눈에 들어오게 강조해.
-        lines.append(f":rotating_light: *문제 장치*  →  {problem_components}")
+        lines.extend(
+            [
+                f":rotating_light: *문제 장치*\n{problem_components}",
+                f"🔎 *감지 내용*\n`{item['issue']}`",
+            ]
+        )
+    else:
+        lines.append(f"🔎 *감지 내용*\n`{item['issue']}`")
     lines.extend(
         [
-            f"> :warning: {item['issue']}",
             "",
-            "*연락처*",
-            f"• *전화*  {_display_value(item.get('telephone'), default='미확인')}",
-            *_format_device_health_alert_sms_contact_lines(item),
+            f"📞 *전화*\n{_display_value(item.get('telephone'), default='미확인')}",
+            f"💬 *문자*\n{_format_device_health_alert_sms_contact_value(item)}",
         ]
     )
-    if item.get("mdaUrl"):
-        lines.extend(["", _format_mda_device_check_link(item["mdaUrl"])])
     return lines
 
 
@@ -874,7 +872,30 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
 
 
 def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[str, Any]]:
-    item_text_lines = _build_device_health_alert_item_text_lines(item)
+    problem_components = _format_device_health_alert_problem_components(
+        item.get("problemComponents")
+    )
+    # 문제 장치와 감지 내용도 장비·병실처럼 라벨 아래 값을 두는 2열로 맞춰.
+    issue_fields = []
+    if problem_components:
+        issue_fields.append(
+            {"type": "mrkdwn", "text": f":rotating_light: *문제 장치*\n{problem_components}"}
+        )
+    issue_fields.append(
+        {"type": "mrkdwn", "text": f"🔎 *감지 내용*\n`{item['issue']}`"}
+    )
+
+    contact_fields = [
+        {
+            "type": "mrkdwn",
+            "text": f"📞 *전화*\n{_display_value(item.get('telephone'), default='미확인')}",
+        },
+        {
+            "type": "mrkdwn",
+            "text": f"💬 *문자*\n{_format_device_health_alert_sms_contact_value(item)}",
+        },
+    ]
+
     sms_status_text = _display_value(item.get("smsStatusText"), default="")
     sms_status_button_enabled = _is_device_health_alert_auto_sms_status_button_enabled(item)
 
@@ -916,10 +937,22 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
     return [
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "\n".join(item_text_lines),
-            },
+            "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"🖥️ *장비*\n{_format_device_health_alert_device_name(item)}",
+                },
+                {"type": "mrkdwn", "text": f"🚪 *병실*\n`{item['room']}`"},
+            ],
+        },
+        {
+            "type": "section",
+            "fields": issue_fields,
+        },
+        {
+            "type": "section",
+            "fields": contact_fields,
         },
         {
             "type": "actions",
@@ -935,8 +968,8 @@ def _build_daily_device_round_abnormal_alert_blocks(
     alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
     blocks: list[dict[str, Any]] = [
         {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": _DEVICE_HEALTH_ALERT_HEADER_TEXT},
+            "type": "header",
+            "text": {"type": "plain_text", "text": ":alert: 장비 이상 감지", "emoji": True},
         }
     ]
 
