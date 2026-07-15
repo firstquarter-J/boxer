@@ -96,6 +96,21 @@ def _recording_stall_event(
     }
 
 
+def _segmented_recordings_merge_error_event(notification_id: int = 15) -> dict:
+    return {
+        **_captureboard_event(notification_id),
+        "code": "segmented_recordings_merge_error",
+        "message": "분할된 녹화 파일 병합 중 오류가 발생했습니다",
+        "fileId": "recording-20260709-123431",
+        "details": {
+            "error": "ffmpeg exited with code 1",
+            "targetPath": "/home/pi/AppData/Videos/recording.mp4",
+            "segmentCount": 3,
+            "listPath": "/tmp/recording-merge-list.txt",
+        },
+    }
+
+
 class DeviceNotificationAlertReporterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.logger = logging.getLogger("test.device_notification_alert_reporter")
@@ -296,7 +311,68 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
         }
 
         self.assertIsNotNone(reporter._normalize_pending_event(stalled_event))
+        self.assertIsNotNone(
+            reporter._normalize_pending_event(
+                _segmented_recordings_merge_error_event()
+            )
+        )
         self.assertIsNone(reporter._normalize_pending_event(unsupported_event))
+
+    def test_segmented_recordings_merge_error_posts_immediate_root_alert(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            event = _segmented_recordings_merge_error_event()
+            state = reporter._normalize_device_notification_alert_state(
+                {
+                    "initialized": True,
+                    "lastSeenId": event["notificationId"],
+                    "pendingEvents": [event],
+                }
+            )
+
+            with patch.object(
+                reporter,
+                "_post_daily_device_round_abnormal_alert",
+                return_value={
+                    "channelId": "C094UC05PQW",
+                    "messageTs": "1000.010",
+                    "permalink": "https://example.com/merge-error",
+                },
+            ) as post_mock:
+                result_state, sent_count = (
+                    reporter._deliver_pending_device_notification_alerts(
+                        Mock(),
+                        self.logger,
+                        state,
+                        channel_id="C094UC05PQW",
+                        now=self.now,
+                        state_path=state_path,
+                    )
+                )
+
+            self.assertEqual(sent_count, 1)
+            self.assertEqual(result_state["pendingEvents"], [])
+            self.assertEqual(result_state["recentCaptureboardAlerts"], {})
+            alert_summary = post_mock.call_args.args[1]
+            device_result = alert_summary["deviceResults"][0]
+            self.assertEqual(device_result["deviceName"], "MB2-C00992")
+            self.assertIn("분할 파일 3개", device_result["priorityReason"])
+            self.assertIn(
+                "ffmpeg exited with code 1",
+                device_result["priorityReason"],
+            )
+            self.assertIn(
+                "2026-07-09 12:34:31 KST",
+                device_result["priorityReason"],
+            )
+            self.assertEqual(
+                device_result["componentLabels"]["captureboard"],
+                "정상",
+            )
+            self.assertEqual(post_mock.call_args.kwargs["channel_id"], "C094UC05PQW")
+            self.assertFalse(post_mock.call_args.kwargs["include_actions"])
 
     def test_confirmed_recording_stall_posts_root_then_repeats_as_thread_replies(
         self,
@@ -565,6 +641,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 30,
                 "captureboard_connection_error",
                 "recording_critically_stalled",
+                "segmented_recordings_merge_error",
                 200,
             ),
         )

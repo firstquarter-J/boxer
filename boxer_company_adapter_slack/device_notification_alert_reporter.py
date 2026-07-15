@@ -16,9 +16,11 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
 
 _CAPTUREBOARD_CONNECTION_ERROR = "captureboard_connection_error"
 _RECORDING_CRITICALLY_STALLED = "recording_critically_stalled"
+_SEGMENTED_RECORDINGS_MERGE_ERROR = "segmented_recordings_merge_error"
 _SUPPORTED_DEVICE_NOTIFICATION_CODES = (
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
+    _SEGMENTED_RECORDINGS_MERGE_ERROR,
 )
 _DEVICE_NOTIFICATION_ALERT_BATCH_SIZE = 200
 _DEVICE_NOTIFICATION_ALERT_TIMEZONE = ZoneInfo("Asia/Seoul")
@@ -323,7 +325,7 @@ def _load_device_notification_batch(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s) "
+                "AND n.code IN (%s, %s, %s) "
                 "ORDER BY n.id ASC "
                 "LIMIT %s",
                 (
@@ -331,6 +333,7 @@ def _load_device_notification_batch(
                     latest_id,
                     _CAPTUREBOARD_CONNECTION_ERROR,
                     _RECORDING_CRITICALLY_STALLED,
+                    _SEGMENTED_RECORDINGS_MERGE_ERROR,
                     normalized_batch_size,
                 ),
             )
@@ -441,6 +444,65 @@ def _build_captureboard_notification_alert_summary(
                             "summary": issue,
                         }
                     }
+                },
+            }
+        ],
+    }
+
+
+def _build_segmented_recordings_merge_alert_summary(
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    hospital_seq = _coerce_int(event.get("hospitalSeq")) or None
+    hospital_name = str(event.get("hospitalName") or "").strip() or "병원 미확인"
+    room_name = str(event.get("roomName") or "").strip() or "병실 미확인"
+    device_name = str(event.get("deviceName") or "").strip() or "장비명 미확인"
+    details = _normalize_json_object(event.get("details"))
+    segment_count = _coerce_optional_int(details.get("segmentCount"))
+    error_detail = str(details.get("error") or "").strip()
+    if len(error_detail) > 300:
+        error_detail = f"{error_detail[:297]}..."
+
+    issue_parts = [
+        str(event.get("message") or "").strip()
+        or "분할된 녹화 파일 병합에 실패했어"
+    ]
+    if isinstance(segment_count, int) and segment_count > 0:
+        issue_parts.append(f"분할 파일 {segment_count}개")
+    if error_detail:
+        issue_parts.append(f"오류: {error_detail}")
+    occurred_at = _format_device_notification_occurred_at(event.get("occurredAt"))
+    issue = f"{' / '.join(issue_parts)} (발생 `{occurred_at}`)"
+
+    return {
+        "hospitalSeq": hospital_seq,
+        "hospitalName": hospital_name,
+        "statusCounts": {
+            "정상": 0,
+            "확인 필요": 0,
+            "이상": 1,
+            "점검 불가": 0,
+        },
+        "deviceResults": [
+            {
+                "hospitalSeq": hospital_seq,
+                "hospitalName": hospital_name,
+                "hospitalTelephone": str(event.get("hospitalTelephone") or "").strip(),
+                "hospitalDeviceAlertPhone": str(
+                    event.get("hospitalDeviceAlertPhone") or ""
+                ).strip(),
+                "hospitalRoomSeq": _coerce_int(event.get("hospitalRoomSeq")) or None,
+                "roomName": room_name,
+                "deviceName": device_name,
+                "overallLabel": "이상",
+                "priorityReason": issue,
+                # 병합 실패만으로 캡처보드나 저장장치 원인을 단정하지 않는다.
+                "componentLabels": {
+                    "audio": "정상",
+                    "pm2": "정상",
+                    "storage": "정상",
+                    "captureboard": "정상",
+                    "led": "정상",
                 },
             }
         ],
@@ -842,6 +904,27 @@ def _deliver_pending_device_notification_alerts(
             if processed is None:
                 break
             next_state, slack_sent, delivery = processed
+        elif code == _SEGMENTED_RECORDINGS_MERGE_ERROR:
+            # 실제 FFmpeg 병합 실패 이벤트이므로 추가 장비 검증 없이 즉시 알린다.
+            alert_summary = _build_segmented_recordings_merge_alert_summary(event)
+            posted = _post_daily_device_round_abnormal_alert(
+                client,
+                alert_summary,
+                channel_id=channel_id,
+                message_ts="",
+                logger=logger,
+                include_actions=False,
+            )
+            if posted is None:
+                logger.warning(
+                    "분할 녹화 병합 실패 Slack 알림을 보내지 못했어 "
+                    "notification_id=%s code=%s",
+                    event.get("notificationId"),
+                    code,
+                )
+                break
+            delivery = posted
+            slack_sent = True
         else:
             logger.warning(
                 "지원하지 않는 장비 이벤트가 대기열에 있어 제거할게 notification_id=%s code=%s",
