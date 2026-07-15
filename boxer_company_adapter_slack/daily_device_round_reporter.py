@@ -44,7 +44,7 @@ _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
 _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
 _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
-_DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *이상 발견 - 확인 요망*"
+_DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *장비 이상 감지*"
 _DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
 _DEVICE_HEALTH_ALERT_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
@@ -759,8 +759,8 @@ def _build_daily_device_round_mda_hospital_edit_url(*, hospital_name: str) -> st
 
 
 def _format_mda_device_check_link(mda_url: str) -> str:
-    # 링크 텍스트가 MDA 확인 목적을 설명하므로 별도 라벨 없이 바로 보여준다.
-    return f"<{mda_url}|MDA 에서 장비 확인 바로가기>"
+    # 행동이 바로 보이는 짧은 CTA로 장비 정보와 장애 확인 화면을 연결해.
+    return f"<{mda_url}|MDA에서 장비 확인하기 →>"
 
 
 def _format_mda_hospital_contact_link(mda_url: str) -> str:
@@ -775,8 +775,8 @@ def _format_device_health_alert_sms_contact_line(item: dict[str, Any]) -> str:
     )
     # 문자 라인은 전화처럼 값만 보여주고, 발송 완료 여부는 별도 버튼으로 확인하게 한다.
     if device_alert_phone:
-        return f"> *문자*  {device_alert_phone}"
-    return "> *문자*  *저장된 번호 없음. 자동발송 불가*"
+        return f"• *문자*  {device_alert_phone}"
+    return "• *문자*  :warning: 저장된 번호 없음 · 자동발송 불가"
 
 
 def _format_device_health_alert_sms_contact_lines(item: dict[str, Any]) -> list[str]:
@@ -790,10 +790,36 @@ def _format_device_health_alert_sms_contact_lines(item: dict[str, Any]) -> list[
     mda_hospital_edit_url = _display_value(item.get("mdaHospitalEditUrl"), default="")
     if mda_hospital_edit_url:
         return [
-            "> *문자*  *저장된 번호 없음. 자동발송 불가.* "
+            "• *문자*  :warning: 저장된 번호 없음 · 자동발송 불가  "
             f"{_format_mda_hospital_contact_link(mda_hospital_edit_url)}"
         ]
     return [_format_device_health_alert_sms_contact_line(item)]
+
+
+def _build_device_health_alert_item_text_lines(item: dict[str, Any]) -> list[str]:
+    # 식별 정보, 장애 내용, 연락처, 행동 순으로 묶어 Slack에서 빠르게 훑을 수 있게 해.
+    lines = [
+        f"*{item['hospital']}*",
+        f"*장비*  `{item['device']}`  ·  *병실*  {item['room']}",
+    ]
+    problem_components = _format_device_health_alert_problem_components(
+        item.get("problemComponents")
+    )
+    if problem_components:
+        # 장애 부품이 병원·장비 식별 정보 다음으로 가장 먼저 눈에 들어오게 강조해.
+        lines.append(f":rotating_light: *문제 장치*  →  {problem_components}")
+    lines.extend(
+        [
+            f"> :warning: {item['issue']}",
+            "",
+            "*연락처*",
+            f"• *전화*  {_display_value(item.get('telephone'), default='미확인')}",
+            *_format_device_health_alert_sms_contact_lines(item),
+        ]
+    )
+    if item.get("mdaUrl"):
+        lines.extend(["", _format_mda_device_check_link(item["mdaUrl"])])
+    return lines
 
 
 def _is_device_health_alert_auto_sms_status_button_enabled(item: dict[str, Any]) -> bool:
@@ -808,23 +834,11 @@ def _build_daily_device_round_abnormal_alert_text(
     # Slack 커스텀 경고 이모지로 루트 이상 알림을 통일해 채널에서 바로 눈에 띄게 한다.
     lines = [_DEVICE_HEALTH_ALERT_HEADER_TEXT]
     if alert_items:
-        # Slack 루트 알림만 보고도 확인 대상을 한눈에 훑을 수 있게 라벨형으로 보여줘.
+        # 실제 block과 fallback text가 같은 정보 구조를 유지하게 공통 formatter를 사용해.
         for item in alert_items:
             if len(lines) > 1:
                 lines.append("")
-            lines.append(f"*{item['hospital']}*")
-            lines.append(f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}")
-            lines.extend(_format_device_health_alert_sms_contact_lines(item))
-            lines.append(f"> *병실*  {item['room']}")
-            lines.append(f"> *장비*  `{item['device']}`")
-            problem_components = _format_device_health_alert_problem_components(
-                item.get("problemComponents")
-            )
-            if problem_components:
-                lines.append(f"> *문제 장치*  {problem_components}")
-            lines.append(f"> *이슈*  {item['issue']}")
-            if item.get("mdaUrl"):
-                lines.append(f"> {_format_mda_device_check_link(item['mdaUrl'])}")
+            lines.extend(_build_device_health_alert_item_text_lines(item))
     if permalink:
         if alert_items:
             lines.append("")
@@ -860,23 +874,9 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
 
 
 def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[str, Any]]:
-    item_text_lines = [
-        f"*{item['hospital']}*",
-        f"> *전화*  {_display_value(item.get('telephone'), default='미확인')}",
-        *_format_device_health_alert_sms_contact_lines(item),
-        f"> *병실*  {item['room']}",
-        f"> *장비*  `{item['device']}`",
-    ]
-    problem_components = _format_device_health_alert_problem_components(
-        item.get("problemComponents")
-    )
-    if problem_components:
-        item_text_lines.append(f"> *문제 장치*  {problem_components}")
-    item_text_lines.append(f"> *이슈*  {item['issue']}")
+    item_text_lines = _build_device_health_alert_item_text_lines(item)
     sms_status_text = _display_value(item.get("smsStatusText"), default="")
     sms_status_button_enabled = _is_device_health_alert_auto_sms_status_button_enabled(item)
-    if item.get("mdaUrl"):
-        item_text_lines.append(f"> {_format_mda_device_check_link(item['mdaUrl'])}")
 
     action_value = _build_device_health_alert_action_value(item)
     action_elements: list[dict[str, Any]] = []
