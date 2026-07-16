@@ -2074,7 +2074,6 @@ def _summarize_storage_probe(storage_usage: dict[str, Any]) -> dict[str, Any]:
             "cleanupAgeDays": age_days,
         }
 
-    warning_threshold = max(1, threshold_percent - 20)
     if float(directory_share_percent) >= threshold_percent:
         summary = f"TrashCan 용량이 자동 정리 기준 `{threshold_percent}%`를 넘겼어"
         if expired_file_count <= 0:
@@ -2104,32 +2103,7 @@ def _summarize_storage_probe(storage_usage: dict[str, Any]) -> dict[str, Any]:
             "cleanupThresholdPercent": threshold_percent,
             "cleanupAgeDays": age_days,
         }
-    if float(directory_share_percent) >= warning_threshold:
-        return {
-            "status": "warning",
-            "label": "확인 필요",
-            "summary": "TrashCan 용량이 빠르게 커지고 있어",
-            "evidence": evidence_text,
-            "overviewDetail": trashcan_overview_detail,
-            "diskStatus": disk_status,
-            "diskLabel": disk_label,
-            "diskOverviewDetail": disk_overview_detail,
-            "trashcanStatus": "warning",
-            "trashcanLabel": "확인 필요",
-            "trashcanOverviewDetail": trashcan_overview_detail,
-            "action": f"기준 `{threshold_percent}%` 전이라도 `{age_days}일` 지난 파일 수를 같이 봐",
-            "path": _device_trashcan_path(),
-            "displayPath": path_label,
-            "directorySizeBytes": directory_size_bytes,
-            "directorySharePercent": directory_share_percent,
-            "filesystemSizeBytes": filesystem_size_bytes,
-            "filesystemAvailableBytes": filesystem_available_bytes,
-            "filesystemUsedPercent": filesystem_used_percent,
-            "fileCount": file_count,
-            "expiredFileCount": expired_file_count,
-            "cleanupThresholdPercent": threshold_percent,
-            "cleanupAgeDays": age_days,
-        }
+    # 정리 기준 전의 사전 경고는 장치 장애와 섞지 않고, 실제 기준 도달 시점부터만 정리 대상으로 다룬다.
     return {
         "status": "pass",
         "label": "정상",

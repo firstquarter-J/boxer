@@ -303,6 +303,30 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("경로 `/`", summary["diskOverviewDetail"])
         self.assertIn("경로 `AppData/TrashCan`", summary["trashcanOverviewDetail"])
 
+    def test_summarizes_storage_as_pass_below_cleanup_threshold_without_early_warning(self) -> None:
+        # 자동 정리 기준 전에는 장치 이상 알림에 TrashCan 사전 경고를 섞지 않는다.
+        summary = _summarize_storage_probe(
+            _build_trashcan_storage_usage(
+                filesystem_usage=_parse_disk_usage(
+                    "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                    "/dev/nvme0n1p2 102400000 35840000 66560000 35% /\n"
+                ),
+                directory_usage=_parse_directory_usage(
+                    "43315200\t/home/mommytalk/AppData/TrashCan\n"
+                ),
+                file_count=_parse_count_value("1200"),
+                expired_file_count=_parse_count_value("758"),
+                cleanup_threshold_percent=60,
+                cleanup_age_days=30,
+            )
+        )
+
+        self.assertEqual(summary["directorySharePercent"], 42.3)
+        self.assertEqual(summary["status"], "pass")
+        self.assertEqual(summary["trashcanLabel"], "정상")
+        self.assertEqual(summary["summary"], "TrashCan 용량은 아직 안정 범위야")
+        self.assertNotIn("빠르게 커지고", summary["summary"])
+
     def test_marks_trashcan_cleanup_candidate_without_execute(self) -> None:
         cleanup = _run_device_trashcan_cleanup(
             {
