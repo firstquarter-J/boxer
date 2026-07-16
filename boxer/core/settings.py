@@ -81,7 +81,12 @@ THREAD_CONTEXT_MAX_CHARS = int(os.getenv("THREAD_CONTEXT_MAX_CHARS", "5000"))
 
 NOTION_API_BASE_URL = os.getenv("NOTION_API_BASE_URL", "https://api.notion.com/v1").rstrip("/")
 NOTION_API_VERSION = os.getenv("NOTION_API_VERSION", "2022-06-28").strip()
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
+# 개인/회사 integration을 분리하되 기존 설치의 NOTION_TOKEN도 읽어 마이그레이션 중 장애를 막는다.
+NOTION_TOKEN_PERSONAL = (
+    os.getenv("NOTION_TOKEN_PERSONAL", "").strip()
+    or os.getenv("NOTION_TOKEN", "").strip()
+)
+NOTION_TOKEN = NOTION_TOKEN_PERSONAL
 NOTION_API_TIMEOUT_SEC = int(os.getenv("NOTION_API_TIMEOUT_SEC", "10"))
 NOTION_TEST_PAGE_ID = os.getenv("NOTION_TEST_PAGE_ID", "").strip()
 NOTION_MAX_BLOCKS = int(os.getenv("NOTION_MAX_BLOCKS", "200"))

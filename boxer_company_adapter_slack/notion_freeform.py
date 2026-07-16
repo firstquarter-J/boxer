@@ -664,7 +664,8 @@ def _sanitize_notion_references_for_llm(references: list[dict[str, Any]] | None)
 
 
 def _needs_notion_doc_security_refusal(text: str, route_name: str) -> bool:
-    if route_name != "notion playbook qa":
+    # 전사 Work Board 답변도 문서 기반 합성이므로 같은 출력 유출 가드를 적용한다.
+    if route_name not in {"notion playbook qa", "company_notion_qa"}:
         return False
     normalized = (text or "").strip().lower()
     if any(marker in normalized for marker in _NOTION_DOC_LEAK_MARKERS):

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import time
 import urllib.error
 import urllib.parse
@@ -11,8 +12,19 @@ _NOTION_CACHE_TTL_SEC = 300
 _NOTION_PAGE_CACHE: dict[str, dict[str, Any]] = {}
 
 
-def _is_notion_configured() -> bool:
-    return bool(s.NOTION_TOKEN and s.NOTION_API_BASE_URL and s.NOTION_API_VERSION)
+def _resolve_notion_token(token: str | None = None) -> str:
+    return (token or s.NOTION_TOKEN_PERSONAL or "").strip()
+
+
+def _notion_cache_key(page_id: str, token: str | None = None) -> str:
+    # 같은 page_id라도 integration이 다르면 접근 가능한 workspace가 달라질 수 있어서 캐시를 토큰별로 분리한다.
+    resolved_token = _resolve_notion_token(token)
+    token_scope = hashlib.sha256(resolved_token.encode("utf-8")).hexdigest()[:12] if resolved_token else "default"
+    return f"{token_scope}:{page_id}"
+
+
+def _is_notion_configured(token: str | None = None) -> bool:
+    return bool(_resolve_notion_token(token) and s.NOTION_API_BASE_URL and s.NOTION_API_VERSION)
 
 
 def _normalize_notion_id(raw_value: str) -> str:
@@ -30,11 +42,12 @@ def _normalize_notion_id(raw_value: str) -> str:
     return value
 
 
-def _build_notion_headers() -> dict[str, str]:
-    if not _is_notion_configured():
+def _build_notion_headers(token: str | None = None) -> dict[str, str]:
+    resolved_token = _resolve_notion_token(token)
+    if not _is_notion_configured(resolved_token):
         raise RuntimeError("Notion 설정이 없어")
     return {
-        "Authorization": f"Bearer {s.NOTION_TOKEN}",
+        "Authorization": f"Bearer {resolved_token}",
         "Notion-Version": s.NOTION_API_VERSION,
         "Content-Type": "application/json",
     }
@@ -45,6 +58,7 @@ def _notion_request(
     *,
     method: str = "GET",
     payload: dict[str, Any] | None = None,
+    token: str | None = None,
 ) -> dict[str, Any]:
     body = None
     if payload is not None:
@@ -52,7 +66,7 @@ def _notion_request(
     request = urllib.request.Request(
         f"{s.NOTION_API_BASE_URL}{path}",
         data=body,
-        headers=_build_notion_headers(),
+        headers=_build_notion_headers(token),
         method=method,
     )
     try:
@@ -65,8 +79,8 @@ def _notion_request(
         raise RuntimeError(f"Notion API 연결 실패: {exc.reason}") from exc
 
 
-def _fetch_notion_page(page_id: str) -> dict[str, Any]:
-    return _notion_request(f"/pages/{_normalize_notion_id(page_id)}")
+def _fetch_notion_page(page_id: str, *, token: str | None = None) -> dict[str, Any]:
+    return _notion_request(f"/pages/{_normalize_notion_id(page_id)}", token=token)
 
 
 def _fetch_notion_block_children(
@@ -74,12 +88,14 @@ def _fetch_notion_block_children(
     *,
     start_cursor: str | None = None,
     page_size: int = 100,
+    token: str | None = None,
 ) -> dict[str, Any]:
     query: dict[str, Any] = {"page_size": max(1, min(100, page_size))}
     if start_cursor:
         query["start_cursor"] = start_cursor
     return _notion_request(
-        f"/blocks/{_normalize_notion_id(block_id)}/children?{urllib.parse.urlencode(query)}"
+        f"/blocks/{_normalize_notion_id(block_id)}/children?{urllib.parse.urlencode(query)}",
+        token=token,
     )
 
 
@@ -138,7 +154,7 @@ def _flatten_notion_blocks(blocks: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _fetch_all_notion_blocks(page_id: str) -> list[dict[str, Any]]:
+def _fetch_all_notion_blocks(page_id: str, *, token: str | None = None) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
@@ -146,6 +162,7 @@ def _fetch_all_notion_blocks(page_id: str) -> list[dict[str, Any]]:
             page_id,
             start_cursor=cursor,
             page_size=min(100, max(1, s.NOTION_MAX_BLOCKS)),
+            token=token,
         )
         results = response.get("results", [])
         for result in results:
@@ -158,10 +175,10 @@ def _fetch_all_notion_blocks(page_id: str) -> list[dict[str, Any]]:
         cursor = response.get("next_cursor")
 
 
-def _load_notion_page_content(page_id: str) -> dict[str, Any]:
+def _load_notion_page_content(page_id: str, *, token: str | None = None) -> dict[str, Any]:
     normalized_page_id = _normalize_notion_id(page_id)
-    page_payload = _fetch_notion_page(normalized_page_id)
-    blocks = _fetch_all_notion_blocks(normalized_page_id)
+    page_payload = _fetch_notion_page(normalized_page_id, token=token)
+    blocks = _fetch_all_notion_blocks(normalized_page_id, token=token)
     lines = _flatten_notion_blocks(blocks)
     return {
         "pageId": normalized_page_id,
@@ -173,17 +190,18 @@ def _load_notion_page_content(page_id: str) -> dict[str, Any]:
     }
 
 
-def _load_notion_page_content_cached(page_id: str) -> dict[str, Any]:
+def _load_notion_page_content_cached(page_id: str, *, token: str | None = None) -> dict[str, Any]:
     normalized_page_id = _normalize_notion_id(page_id)
+    cache_key = _notion_cache_key(normalized_page_id, token)
     now = time.time()
-    cached = _NOTION_PAGE_CACHE.get(normalized_page_id)
+    cached = _NOTION_PAGE_CACHE.get(cache_key)
     if isinstance(cached, dict) and float(cached.get("expires_at") or 0) > now:
         payload = cached.get("payload")
         if isinstance(payload, dict):
             return payload
 
-    payload = _load_notion_page_content(normalized_page_id)
-    _NOTION_PAGE_CACHE[normalized_page_id] = {
+    payload = _load_notion_page_content(normalized_page_id, token=token)
+    _NOTION_PAGE_CACHE[cache_key] = {
         "expires_at": now + _NOTION_CACHE_TTL_SEC,
         "payload": payload,
     }

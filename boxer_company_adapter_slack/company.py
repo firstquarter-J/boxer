@@ -33,6 +33,11 @@ from boxer_company_adapter_slack.admin_routes import (
     AdminRoutesDeps,
     _handle_admin_routes,
 )
+from boxer_company_adapter_slack.company_notion_routes import (
+    CompanyNotionRoutesContext,
+    CompanyNotionRoutesDeps,
+    _handle_company_notion_routes,
+)
 from boxer_company_adapter_slack.device_activity import (
     _build_device_download_activity_input,
     _extract_latest_barcode_from_thread_context,
@@ -118,6 +123,7 @@ from boxer_company.prompt_security import (
 )
 from boxer_company.notion_links import select_company_notion_doc_links
 from boxer_company.notion_playbooks import _select_notion_references
+from boxer_company.notion_workspace_search import _build_company_notion_source_docs
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
@@ -467,7 +473,16 @@ def create_app() -> App:
             notion_playbooks = _attach_notion_playbooks_to_evidence(evidence_payload)
             evidence_route = str(evidence_payload.get("route") or "").strip().lower()
             company_notion_docs: list[dict[str, str]] = []
-            if evidence_route == "notion_playbook_qa":
+            if evidence_route == "company_notion_qa":
+                references = evidence_payload.get("companyNotionReferences")
+                company_notion_docs = _build_company_notion_source_docs(
+                    references if isinstance(references, list) else []
+                )
+                fallback_with_references = _append_company_notion_doc_section(
+                    fallback_text,
+                    company_notion_docs,
+                )
+            elif evidence_route == "notion_playbook_qa":
                 request_payload = evidence_payload.get("request") if isinstance(evidence_payload.get("request"), dict) else {}
                 notion_link_query = str(request_payload.get("contextualQuestion") or question).strip() or question
                 company_notion_docs = select_company_notion_doc_links(
@@ -500,7 +515,10 @@ def create_app() -> App:
                     fallback_text,
                     notion_playbooks,
                 )
-            prefer_fallback_on_timeout = evidence_route == "notion_playbook_qa"
+            prefer_fallback_on_timeout = evidence_route in {
+                "company_notion_qa",
+                "notion_playbook_qa",
+            }
 
             if route_name == "barcode log analysis":
                 chunks = _split_barcode_log_reply(fallback_with_references)
@@ -551,7 +569,12 @@ def create_app() -> App:
 
             try:
                 thread_context = ""
-                if evidence_route == "notion_playbook_qa" or s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
+                # 전사 Work Board 답변에는 기존 마미박스 스레드 문맥을 섞지 않고
+                # 조회한 문서 발췌문만 근거로 사용한다.
+                if evidence_route != "company_notion_qa" and (
+                    evidence_route == "notion_playbook_qa"
+                    or s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT
+                ):
                     thread_context = _load_slack_thread_context(
                         client,
                         logger,
@@ -567,7 +590,13 @@ def create_app() -> App:
                     evidence_payload=evidence_payload,
                     provider=provider,
                     claude_client=claude_client,
-                    system_prompt=cs.RETRIEVAL_SYSTEM_PROMPT or None,
+                    # 전사 문서는 마미박스용으로 커스터마이즈될 수 있는 회사 프롬프트 대신
+                    # 공개 코어의 일반 근거 합성 프롬프트를 사용한다.
+                    system_prompt=(
+                        None
+                        if evidence_route == "company_notion_qa"
+                        else cs.RETRIEVAL_SYSTEM_PROMPT or None
+                    ),
                     extra_rules=_build_company_retrieval_rules(evidence_payload),
                     evidence_transform=_transform_company_retrieval_payload,
                     max_tokens=max_tokens,
@@ -590,6 +619,8 @@ def create_app() -> App:
                     final_text = fallback_with_references
                 if _needs_notion_doc_security_refusal(final_text, route_name):
                     final_text = _build_notion_doc_security_refusal()
+                elif evidence_route == "company_notion_qa":
+                    final_text = _append_company_notion_doc_section(final_text, company_notion_docs)
                 elif evidence_route == "notion_playbook_qa":
                     final_text = _append_company_notion_doc_section(final_text, company_notion_docs)
                 elif evidence_route == "device_led_pattern_guide":
@@ -659,6 +690,21 @@ def create_app() -> App:
             ),
             AdminRoutesDeps(
                 get_s3_client=_get_s3_client,
+                reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
+            ),
+        ):
+            return
+
+        if _handle_company_notion_routes(
+            CompanyNotionRoutesContext(
+                question=question,
+                user_id=user_id,
+                payload=payload,
+                thread_ts=thread_ts,
+                reply=reply,
+                logger=logger,
+            ),
+            CompanyNotionRoutesDeps(
                 reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
             ),
         ):

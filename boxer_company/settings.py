@@ -61,6 +61,27 @@ if _raw_thread_playbook_learning_ids.strip():
 else:
     THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS = set(CLAUDE_ALLOWED_USER_IDS)
 THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID = os.getenv("THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID", "").strip()
+# 회사 플레이북은 개인 Notion integration과 분리해서 읽고 쓸 수 있게 별도 토큰을 둔다.
+NOTION_TOKEN_COMPANY = os.getenv("NOTION_TOKEN_COMPANY", "").strip()
+# 전사 문서 검색은 마미박스 플레이북과 root/권한을 분리해서
+# 작은 읽기 전용 기능으로 시작한다.
+COMPANY_NOTION_SEARCH_ROOT_PAGE_ID = os.getenv("COMPANY_NOTION_SEARCH_ROOT_PAGE_ID", "").strip()
+COMPANY_NOTION_SEARCH_MAX_RESULTS = int(os.getenv("COMPANY_NOTION_SEARCH_MAX_RESULTS", "5"))
+COMPANY_NOTION_SEARCH_MAX_CANDIDATES = int(os.getenv("COMPANY_NOTION_SEARCH_MAX_CANDIDATES", "10"))
+COMPANY_NOTION_SEARCH_PARENT_MAX_DEPTH = int(os.getenv("COMPANY_NOTION_SEARCH_PARENT_MAX_DEPTH", "12"))
+COMPANY_NOTION_ANSWER_MAX_PAGES = int(os.getenv("COMPANY_NOTION_ANSWER_MAX_PAGES", "3"))
+COMPANY_NOTION_CONTENT_MAX_DEPTH = int(os.getenv("COMPANY_NOTION_CONTENT_MAX_DEPTH", "4"))
+COMPANY_NOTION_CONTENT_MAX_BLOCKS = int(os.getenv("COMPANY_NOTION_CONTENT_MAX_BLOCKS", "120"))
+COMPANY_NOTION_EVIDENCE_MAX_CHARS = int(os.getenv("COMPANY_NOTION_EVIDENCE_MAX_CHARS", "4500"))
+_raw_company_notion_search_ids = os.getenv("COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS", "")
+if _raw_company_notion_search_ids.strip():
+    COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS = {
+        item.strip()
+        for item in _raw_company_notion_search_ids.split(",")
+        if item.strip()
+    }
+else:
+    COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS = {HYUN_USER_ID} if HYUN_USER_ID else set()
 THREAD_PLAYBOOK_NOTION_SECTION = os.getenv(
     "THREAD_PLAYBOOK_NOTION_SECTION",
     "마미박스 장애 대응",
