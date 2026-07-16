@@ -10,7 +10,9 @@ from zoneinfo import ZoneInfo
 from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as cs
+from boxer_company.device_health_sheet import _append_device_health_sheet_alerts
 from boxer_company_adapter_slack.daily_device_round_reporter import (
+    _collect_daily_device_round_abnormal_alert_items,
     _post_daily_device_round_abnormal_alert,
 )
 
@@ -103,6 +105,17 @@ def _format_device_notification_occurred_at(value: Any) -> str:
             actual = actual.replace(tzinfo=timezone.utc)
     return actual.astimezone(_DEVICE_NOTIFICATION_ALERT_TIMEZONE).strftime(
         "%Y-%m-%d %H:%M:%S KST"
+    )
+
+
+def _format_device_notification_issue_with_occurred_at(
+    issue: str,
+    occurred_at: Any,
+) -> str:
+    # 공통 Slack 카드가 감지 내용 전체를 code 스타일로 감싸므로 시각에는 backtick을 중첩하지 않는다.
+    return (
+        f"{issue} "
+        f"(발생 {_format_device_notification_occurred_at(occurred_at)})"
     )
 
 
@@ -402,10 +415,12 @@ def _build_captureboard_notification_alert_summary(
     hospital_name = str(event.get("hospitalName") or "").strip() or "병원 미확인"
     room_name = str(event.get("roomName") or "").strip() or "병실 미확인"
     device_name = str(event.get("deviceName") or "").strip() or "장비명 미확인"
-    occurred_at = _format_device_notification_occurred_at(event.get("occurredAt"))
     message = str(event.get("message") or "").strip()
     issue = message or "캡처보드 연결 장애가 발생했어"
-    issue = f"{issue} (발생 `{occurred_at}`)"
+    issue = _format_device_notification_issue_with_occurred_at(
+        issue,
+        event.get("occurredAt"),
+    )
 
     return {
         "hospitalSeq": hospital_seq,
@@ -471,8 +486,10 @@ def _build_segmented_recordings_merge_alert_summary(
         issue_parts.append(f"분할 파일 {segment_count}개")
     if error_detail:
         issue_parts.append(f"오류: {error_detail}")
-    occurred_at = _format_device_notification_occurred_at(event.get("occurredAt"))
-    issue = f"{' / '.join(issue_parts)} (발생 `{occurred_at}`)"
+    issue = _format_device_notification_issue_with_occurred_at(
+        " / ".join(issue_parts),
+        event.get("occurredAt"),
+    )
 
     return {
         "hospitalSeq": hospital_seq,
@@ -523,6 +540,43 @@ def _parse_device_notification_datetime(value: Any) -> datetime | None:
     if actual.tzinfo is None:
         actual = actual.replace(tzinfo=timezone.utc)
     return actual.astimezone(timezone.utc)
+
+
+def _record_device_notification_sheet_alert_best_effort(
+    alert_summary: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    fallback_detected_at: datetime,
+    slack_permalink: str,
+    logger: logging.Logger,
+) -> None:
+    detected_at = _parse_device_notification_datetime(event.get("occurredAt"))
+    if detected_at is None:
+        detected_at = _coerce_device_notification_alert_now(fallback_detected_at)
+    try:
+        # Slack 루트 알림이 발송된 이벤트만 공통 A:M 형식으로 기록해 스레드 진행 답변은 중복 행을 만들지 않는다.
+        row_count = _append_device_health_sheet_alerts(
+            _collect_daily_device_round_abnormal_alert_items(alert_summary),
+            detected_at=detected_at,
+            slack_permalink=str(slack_permalink or "").strip(),
+        )
+    except Exception:
+        # Sheets 일시 오류가 이미 성공한 Slack 알림과 이벤트 커서 처리를 되돌리지 않게 한다.
+        logger.warning(
+            "장비 이벤트 알림을 Google Sheets에 기록하지 못했어 "
+            "notification_id=%s code=%s",
+            event.get("notificationId"),
+            event.get("code"),
+            exc_info=True,
+        )
+        return
+    if row_count is not None:
+        logger.info(
+            "Recorded Boxer device notification alert rows=%s notification_id=%s code=%s",
+            row_count,
+            event.get("notificationId"),
+            event.get("code"),
+        )
 
 
 def _recording_stall_context(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -647,10 +701,10 @@ def _build_recording_stall_alert_summary(
         _coerce_int(context.get("durationSeconds"))
     )
     growth_rate = _format_recording_stall_growth_rate(context.get("growthRate"))
-    occurred_at = _format_device_notification_occurred_at(event.get("occurredAt"))
-    issue = (
+    issue = _format_device_notification_issue_with_occurred_at(
         f"녹화 파일 증가 정지가 {duration} 동안 지속됐어: "
-        f"{growth_rate} (발생 `{occurred_at}`)"
+        f"{growth_rate}",
+        event.get("occurredAt"),
     )
     return {
         "hospitalSeq": hospital_seq,
@@ -751,6 +805,7 @@ def _process_recording_stall_event(
     event: dict[str, Any],
     *,
     channel_id: str,
+    now: datetime,
 ) -> tuple[dict[str, Any], bool, dict[str, str]] | None:
     context = _recording_stall_context(event)
     if context is None or not _is_recording_stall_scope(context):
@@ -811,6 +866,7 @@ def _process_recording_stall_event(
                 channel_id=channel_id,
                 message_ts="",
                 logger=logger,
+                include_blocks=True,
                 include_actions=False,
             )
             message_ts = str((delivery or {}).get("messageTs") or "").strip()
@@ -821,6 +877,13 @@ def _process_recording_stall_event(
                     context.get("deviceName"),
                 )
                 return None
+            _record_device_notification_sheet_alert_best_effort(
+                alert_summary,
+                event,
+                fallback_detected_at=now,
+                slack_permalink=str(delivery.get("permalink") or "").strip(),
+                logger=logger,
+            )
             incidents[incident_key] = {
                 **incident,
                 "phase": "alerted",
@@ -870,6 +933,7 @@ def _deliver_pending_device_notification_alerts(
                 channel_id=channel_id,
                 message_ts="",
                 logger=logger,
+                include_blocks=True,
                 include_actions=False,
             )
             if posted is None:
@@ -879,6 +943,13 @@ def _deliver_pending_device_notification_alerts(
                     code,
                 )
                 break
+            _record_device_notification_sheet_alert_best_effort(
+                alert_summary,
+                event,
+                fallback_detected_at=now,
+                slack_permalink=str(posted.get("permalink") or "").strip(),
+                logger=logger,
+            )
             delivery = posted
             slack_sent = True
             device_name = str(event.get("deviceName") or "").strip()
@@ -900,6 +971,7 @@ def _deliver_pending_device_notification_alerts(
                 next_state,
                 event,
                 channel_id=channel_id,
+                now=now,
             )
             if processed is None:
                 break
@@ -913,6 +985,7 @@ def _deliver_pending_device_notification_alerts(
                 channel_id=channel_id,
                 message_ts="",
                 logger=logger,
+                include_blocks=True,
                 include_actions=False,
             )
             if posted is None:
@@ -923,6 +996,13 @@ def _deliver_pending_device_notification_alerts(
                     code,
                 )
                 break
+            _record_device_notification_sheet_alert_best_effort(
+                alert_summary,
+                event,
+                fallback_detected_at=now,
+                slack_permalink=str(posted.get("permalink") or "").strip(),
+                logger=logger,
+            )
             delivery = posted
             slack_sent = True
         else:

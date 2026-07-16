@@ -1,11 +1,12 @@
 import logging
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from boxer_company_adapter_slack import daily_device_round_reporter
 from boxer_company_adapter_slack import device_notification_alert_reporter as reporter
 from boxer_company_adapter_slack import (
     device_health_monitor_reporter as health_reporter,
@@ -115,6 +116,14 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.logger = logging.getLogger("test.device_notification_alert_reporter")
         self.now = datetime(2026, 7, 13, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        # 알림 테스트가 로컬 자격증명으로 실제 운영 시트를 건드리지 않게 기록 경계를 기본 차단해.
+        sheet_patcher = patch.object(
+            reporter,
+            "_append_device_health_sheet_alerts",
+            return_value=None,
+        )
+        self.append_sheet_mock = sheet_patcher.start()
+        self.addCleanup(sheet_patcher.stop)
 
     def _settings_patches(self):
         return (
@@ -217,8 +226,22 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(device_result["deviceName"], "MB2-C00992")
             self.assertEqual(device_result["componentLabels"]["captureboard"], "이상")
             self.assertIn("2026-07-09 12:34:31 KST", device_result["priorityReason"])
+            self.assertNotIn("`2026-07-09", device_result["priorityReason"])
             self.assertEqual(post_mock.call_args.kwargs["channel_id"], "C094UC05PQW")
+            self.assertTrue(post_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_mock.call_args.kwargs["include_actions"])
+            self.append_sheet_mock.assert_called_once()
+            sheet_items = self.append_sheet_mock.call_args.args[0]
+            self.assertEqual(sheet_items[0]["device"], "MB2-C00992")
+            self.assertEqual(sheet_items[0]["problemComponents"], ["캡처보드"])
+            self.assertEqual(
+                self.append_sheet_mock.call_args.kwargs["detected_at"],
+                datetime(2026, 7, 9, 3, 34, 31, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                self.append_sheet_mock.call_args.kwargs["slack_permalink"],
+                "https://example.com/alert",
+            )
 
     def test_slack_failure_keeps_pending_event_and_retries_before_new_query(
         self,
@@ -297,6 +320,50 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(retried_state["pendingEvents"], [])
             self.assertEqual(retried_state["lastSentNotificationId"], 12)
             batch_mock.assert_called_once_with(12)
+            # Slack 실패 시점에는 시트를 쓰지 않고, 재시도 성공 후 딱 한 번만 기록해.
+            self.append_sheet_mock.assert_called_once()
+            self.assertEqual(
+                self.append_sheet_mock.call_args.kwargs["slack_permalink"],
+                "https://example.com/retried-alert",
+            )
+
+    def test_sheet_failure_does_not_undo_successful_slack_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            event = _captureboard_event()
+            state = reporter._normalize_device_notification_alert_state(
+                {
+                    "initialized": True,
+                    "lastSeenId": event["notificationId"],
+                    "pendingEvents": [event],
+                }
+            )
+            self.append_sheet_mock.side_effect = RuntimeError("Sheets down")
+
+            with patch.object(
+                reporter,
+                "_post_daily_device_round_abnormal_alert",
+                return_value={
+                    "channelId": "C094UC05PQW",
+                    "messageTs": "1000.020",
+                    "permalink": "https://example.com/sheet-failure",
+                },
+            ) as post_mock:
+                result_state, sent_count = (
+                    reporter._deliver_pending_device_notification_alerts(
+                        Mock(),
+                        self.logger,
+                        state,
+                        channel_id="C094UC05PQW",
+                        now=self.now,
+                        state_path=state_path,
+                    )
+                )
+
+            self.assertEqual(sent_count, 1)
+            self.assertEqual(result_state["pendingEvents"], [])
+            post_mock.assert_called_once()
+            self.append_sheet_mock.assert_called_once()
 
     def test_supported_device_notification_codes_are_accepted(self) -> None:
         stalled_event = _recording_stall_event(
@@ -367,12 +434,22 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 "2026-07-09 12:34:31 KST",
                 device_result["priorityReason"],
             )
+            self.assertNotIn("`2026-07-09", device_result["priorityReason"])
             self.assertEqual(
                 device_result["componentLabels"]["captureboard"],
                 "정상",
             )
             self.assertEqual(post_mock.call_args.kwargs["channel_id"], "C094UC05PQW")
+            self.assertTrue(post_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_mock.call_args.kwargs["include_actions"])
+            self.append_sheet_mock.assert_called_once()
+            merge_sheet_items = self.append_sheet_mock.call_args.args[0]
+            self.assertEqual(merge_sheet_items[0]["device"], "MB2-C00992")
+            self.assertEqual(merge_sheet_items[0]["problemComponents"], [])
+            self.assertEqual(
+                self.append_sheet_mock.call_args.kwargs["slack_permalink"],
+                "https://example.com/merge-error",
+            )
 
     def test_confirmed_recording_stall_posts_root_then_repeats_as_thread_replies(
         self,
@@ -441,6 +518,47 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(sent_count, 3)
             self.assertEqual(result_state["pendingEvents"], [])
             post_root_mock.assert_called_once()
+            self.assertTrue(post_root_mock.call_args.kwargs["include_blocks"])
+            self.assertFalse(post_root_mock.call_args.kwargs["include_actions"])
+            root_summary = post_root_mock.call_args.args[1]
+            root_issue = root_summary["deviceResults"][0]["priorityReason"]
+            self.assertEqual(
+                root_issue,
+                "녹화 파일 증가 정지가 240초 (4분) 동안 지속됐어: "
+                "0.00 KB/sec (발생 2026-07-09 12:36:31 KST)",
+            )
+            # 장비 이벤트는 공통 2열 카드를 쓰면서 모니터 조치 버튼만 제외해.
+            root_blocks = (
+                daily_device_round_reporter._build_daily_device_round_abnormal_alert_blocks(
+                    root_summary,
+                    permalink=None,
+                    include_actions=False,
+                )
+            )
+            self.assertEqual(
+                [block["type"] for block in root_blocks],
+                ["header", "section", "section", "section"],
+            )
+            self.assertTrue(
+                root_blocks[1]["fields"][0]["text"].startswith("⚙️ *장비*\n")
+            )
+            self.assertEqual(
+                root_blocks[2]["fields"],
+                [{"type": "mrkdwn", "text": f"🔎 *감지 내용*\n`{root_issue}`"}],
+            )
+            # 240초 루트 알림만 행으로 남기고 360·480초 스레드 답변은 추가하지 않아.
+            self.append_sheet_mock.assert_called_once()
+            recording_sheet_items = self.append_sheet_mock.call_args.args[0]
+            self.assertEqual(recording_sheet_items[0]["device"], "MB2-C00992")
+            self.assertEqual(recording_sheet_items[0]["problemComponents"], [])
+            self.assertEqual(
+                self.append_sheet_mock.call_args.kwargs["detected_at"],
+                datetime(2026, 7, 9, 3, 36, 31, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                self.append_sheet_mock.call_args.kwargs["slack_permalink"],
+                "https://example.com/recording-stall",
+            )
             self.assertEqual(client.chat_postMessage.call_count, 2)
             for call in client.chat_postMessage.call_args_list:
                 self.assertEqual(call.kwargs["thread_ts"], "1000.001")

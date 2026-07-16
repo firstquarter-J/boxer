@@ -794,7 +794,7 @@ def _build_device_health_alert_item_text_lines(item: dict[str, Any]) -> list[str
     # 식별 정보, 장애 내용, 연락처, 행동 순으로 묶어 Slack에서 빠르게 훑을 수 있게 해.
     lines = [
         f"*{item['hospital']}*",
-        f"🖥️ *장비*  {_format_device_health_alert_device_name(item)}  ·  🚪 *병실*  `{item['room']}`",
+        f"⚙️ *장비*  {_format_device_health_alert_device_name(item)}  ·  🚪 *병실*  `{item['room']}`",
         "",
     ]
     problem_components = _format_device_health_alert_problem_components(
@@ -871,7 +871,11 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:1900]
 
 
-def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_device_health_alert_item_blocks(
+    item: dict[str, Any],
+    *,
+    include_actions: bool = True,
+) -> list[dict[str, Any]]:
     problem_components = _format_device_health_alert_problem_components(
         item.get("problemComponents")
     )
@@ -896,9 +900,33 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
         },
     ]
 
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"⚙️ *장비*\n{_format_device_health_alert_device_name(item)}",
+                },
+                {"type": "mrkdwn", "text": f"🚪 *병실*\n`{item['room']}`"},
+            ],
+        },
+        {
+            "type": "section",
+            "fields": issue_fields,
+        },
+        {
+            "type": "section",
+            "fields": contact_fields,
+        },
+    ]
+    if not include_actions:
+        # 장비 이벤트 알림도 같은 카드 레이아웃을 쓰되 모니터 전용 조치 버튼은 노출하지 않는다.
+        return blocks
+
     sms_status_text = _display_value(item.get("smsStatusText"), default="")
     sms_status_button_enabled = _is_device_health_alert_auto_sms_status_button_enabled(item)
-
     action_value = _build_device_health_alert_action_value(item)
     action_elements: list[dict[str, Any]] = []
     if sms_status_button_enabled:
@@ -934,36 +962,15 @@ def _build_device_health_alert_item_blocks(item: dict[str, Any]) -> list[dict[st
             "value": action_value,
         }
     )
-    return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"🖥️ *장비*\n{_format_device_health_alert_device_name(item)}",
-                },
-                {"type": "mrkdwn", "text": f"🚪 *병실*\n`{item['room']}`"},
-            ],
-        },
-        {
-            "type": "section",
-            "fields": issue_fields,
-        },
-        {
-            "type": "section",
-            "fields": contact_fields,
-        },
-        {
-            "type": "actions",
-            "elements": action_elements,
-        },
-    ]
+    blocks.append({"type": "actions", "elements": action_elements})
+    return blocks
 
 
 def _build_daily_device_round_abnormal_alert_blocks(
     report_summary: dict[str, Any],
     permalink: str | None,
+    *,
+    include_actions: bool = True,
 ) -> list[dict[str, Any]]:
     alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
     blocks: list[dict[str, Any]] = [
@@ -973,9 +980,14 @@ def _build_daily_device_round_abnormal_alert_blocks(
         }
     ]
 
-    # 버튼은 장비별로 붙이되, Slack block 제한을 넘지 않게 상위 일부만 노출해.
+    # 장비별 카드는 Slack block 제한을 넘지 않게 상위 일부만 노출해.
     for item in alert_items[:_DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT]:
-        blocks.extend(_build_device_health_alert_item_blocks(item))
+        blocks.extend(
+            _build_device_health_alert_item_blocks(
+                item,
+                include_actions=include_actions,
+            )
+        )
 
     omitted_count = max(0, len(alert_items) - _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT)
     context_parts: list[dict[str, str]] = []
@@ -983,7 +995,7 @@ def _build_daily_device_round_abnormal_alert_blocks(
         context_parts.append(
             {
                 "type": "mrkdwn",
-                "text": f"버튼은 상위 {_DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT}건만 표시했어. 나머지 {omitted_count}건은 본문에서 확인해.",
+                "text": f"알림 카드는 상위 {_DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT}건만 표시했어. 나머지 {omitted_count}건은 본문에서 확인해.",
             }
         )
     if permalink:
@@ -1000,6 +1012,7 @@ def _post_daily_device_round_abnormal_alert(
     channel_id: str,
     message_ts: str,
     logger: logging.Logger,
+    include_blocks: bool = False,
     include_actions: bool = False,
 ) -> dict[str, str] | None:
     if not _daily_device_round_has_abnormal_result(report_summary):
@@ -1019,10 +1032,12 @@ def _post_daily_device_round_abnormal_alert(
             "unfurl_links": False,
             "unfurl_media": False,
         }
-        if include_actions:
+        # Block Kit 레이아웃과 조치 버튼을 독립적으로 켜 장비 이벤트도 공통 카드 형식을 재사용한다.
+        if include_blocks or include_actions:
             message_kwargs["blocks"] = _build_daily_device_round_abnormal_alert_blocks(
                 report_summary,
                 permalink,
+                include_actions=include_actions,
             )
         response = client.chat_postMessage(**message_kwargs)
         posted_message_ts = _extract_daily_device_round_thread_ts(response)

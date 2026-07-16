@@ -336,7 +336,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 [
                     ":alert: *장비 이상 감지*",
                     "*#69 수지미래산부인과의원(용인)*",
-                    "🖥️ *장비*  *<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*  ·  🚪 *병실*  `1진료실`",
+                    "⚙️ *장비*  *<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*  ·  🚪 *병실*  `1진료실`",
                     "",
                     ":rotating_light: *문제 장치*\n`LED`",
                     "🔎 *감지 내용*\n`LED USB 장치를 찾지 못했어`",
@@ -356,7 +356,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(
             [field["text"] for field in item_summary_block["fields"]],
             [
-                "🖥️ *장비*\n*<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*",
+                "⚙️ *장비*\n*<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*",
                 "🚪 *병실*\n`1진료실`",
             ],
         )
