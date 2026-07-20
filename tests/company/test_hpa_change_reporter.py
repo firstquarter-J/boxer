@@ -201,8 +201,9 @@ class HpaChangeReporterTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["channel"], "CHPA")
         self.assertEqual(client.calls[0]["thread_ts"], "1720580000.000001")
-        # 진행 상태도 원 요청자에게 직접 알림이 가야 한다.
-        self.assertTrue(client.calls[0]["text"].startswith("<@UJUSTIN> "))
+        # 같은 요청 thread에 쌓이는 자동 상태는 추가 멘션 없이도 문맥이 유지된다.
+        self.assertTrue(client.calls[0]["text"].startswith("*HPA 코드 변경 작업 진행 중*"))
+        self.assertNotIn("<@UJUSTIN>", client.calls[0]["text"])
         self.assertEqual(
             self.store.get_job(self.task_id).notified_status,
             HpaChangePollState.RUNNING.value,
@@ -309,9 +310,13 @@ class HpaChangeReporterTests(unittest.TestCase):
         self.assertIn("설명: 첨부 코드는 CR Web 환경에 맞춰 작성된 구현 예시야", message)
         self.assertNotIn("*HPA 실제 구조*", message)
         self.assertIn("*CR Web 코드를 그대로 못 쓰는 이유*", message)
-        self.assertIn("*HPA에서 사용할 변환 구현안*", message)
+        self.assertIn("*HPA 구현 방식*", message)
         self.assertIn("*1. 사전 크롭과 손 품질 검사를 추가*", message)
         self.assertIn("*2. Basic/Bonus 발송 버튼 분리*", message)
+        self.assertIn("• 처리 방향: HPA 방식으로 변환 반영", message)
+        self.assertIn("• 구현 방식: 요청 동작을 HPA 처리 흐름", message)
+        self.assertIn("필요한 화면·서버·상태 저장 범위", message)
+        self.assertNotIn("<@UJUSTIN>", message)
         self.assertNotIn("src/app/crystal-reveal", message)
         self.assertEqual(self.workflow.implementation_dispatches, [self.task_id])
         self.assertEqual(event_log, ["slack_post", "implementation_dispatch"])
@@ -476,7 +481,7 @@ class HpaChangeReporterTests(unittest.TestCase):
         review_message = client.calls[0]["text"]
         question_message = client.calls[1]["text"]
         self.assertIn("*CR Web 코드를 그대로 못 쓰는 이유*", review_message)
-        self.assertIn("\n\n*HPA에서 사용할 변환 구현안*", review_message)
+        self.assertIn("\n\n*HPA 구현 방식*", review_message)
         self.assertIn("\n\n*질문 1*", question_message)
         self.assertIn("• 전제: CR Web의 Vercel 설정을 그대로 옮기면 돼", review_message)
         self.assertIn("같은 값을 복사하는 것만으로는 동일한 동작을 보장할 수 없어", review_message)
@@ -500,6 +505,7 @@ class HpaChangeReporterTests(unittest.TestCase):
         self.assertNotIn("*질문 3*", question_message)
         self.assertNotIn("UOTHER", question_message)
         self.assertIn("결정 대상: Basic/Bonus 발송 버튼 분리", question_message)
+        self.assertNotIn("<@UJUSTIN>", review_message + question_message)
         self.assertNotIn("github_pat_", review_message + question_message)
         self.assertNotIn("ORIGINAL REQUEST", review_message + question_message)
         self.assertNotIn("원문을 그대로", review_message + question_message)
@@ -562,11 +568,16 @@ class HpaChangeReporterTests(unittest.TestCase):
         run_hpa_change_reporter_once(self.runtime, client)
 
         message = client.calls[0]["text"]
-        self.assertIn("*요청별 반영 결과*", message)
+        self.assertIn("• 상태: 구현·검증 완료 · PR 준비", message)
+        self.assertIn("• 운영 반영: 미머지 · 미배포", message)
+        self.assertIn("*최종 구현 결과*", message)
         self.assertIn("*1. Bonus 프롬프트와 생성 설정 변경*", message)
-        self.assertIn("• 처리: 반영 완료", message)
-        self.assertIn("• 처리: 기존 기능으로 충족", message)
+        self.assertIn("• 구현 상태: 반영 완료", message)
+        self.assertIn("• 구현 상태: 기존 기능으로 충족", message)
+        self.assertIn("• 최종 구현: 요청 동작을 HPA 처리 흐름", message)
+        self.assertIn("필요한 화면·서버·상태 저장 범위", message)
         self.assertIn("mmb-hospital-admin-server/pull/123", message)
+        self.assertNotIn("<@UJUSTIN>", message)
         self.assertNotIn("src/internal", message)
         self.assertNotIn("HPA 기준 정정", message)
         self.assertIn("자동 빌드·테스트와 독립 리뷰를 통과했어", message)
@@ -673,11 +684,13 @@ class HpaChangeReporterTests(unittest.TestCase):
         self.assertEqual(second_count, 0)
         self.assertEqual(len(client.calls), 1)
         message = client.calls[0]["text"]
-        self.assertIn("*요청별 확인 결과*", message)
-        self.assertIn("• 처리: 기존 기능으로 충족", message)
-        self.assertIn("• 처리: 이번 HPA 변경 대상 아님", message)
+        self.assertIn("*최종 확인 결과*", message)
+        self.assertIn("• 구현 상태: 기존 기능으로 충족", message)
+        self.assertIn("• 구현 상태: 이번 HPA 변경 대상 아님", message)
+        self.assertIn("• 최종 구현: 새 중복 구현 없이 기존 HPA 기능", message)
         self.assertIn("코드 변경 불필요 · PR 없음", message)
         self.assertIn("코드 변경과 PR을 만들지 않았어", message)
+        self.assertNotIn("<@UJUSTIN>", message)
         self.assertNotIn("*PR*", message)
         self.assertNotIn("현 승인 후", message)
         self.assertEqual(
@@ -827,6 +840,7 @@ class HpaChangeReporterTests(unittest.TestCase):
         message = client.calls[0]["text"]
         self.assertEqual(job.status, HpaChangeStatus.FAILED)
         self.assertEqual(job.notified_status, HpaChangePollState.FAILED.value)
+        self.assertNotIn("<@UJUSTIN>", message)
         self.assertNotIn(job.error_message, message)
         self.assertNotIn("ORIGINAL REQUEST", message)
 

@@ -177,6 +177,10 @@ class InvalidHpaChangeTransition(HpaChangeWorkflowError):
     pass
 
 
+class InvalidHpaChangeContinuation(HpaChangeWorkflowError):
+    """최신 추가 확인 작업이 이미 다른 event에 의해 이어졌을 때 발생한다."""
+
+
 class GitHubApiError(HpaChangeWorkflowError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         self.status_code = status_code
@@ -558,6 +562,98 @@ class HpaChangeJobStore:
 
         raise HpaChangeWorkflowError("고유한 HPA 변경 task id를 만들지 못했어")
 
+    def register_continuation_job(
+        self,
+        *,
+        parent_task_id: str,
+        workspace_id: str,
+        event_ts: str,
+        channel_id: str,
+        thread_ts: str,
+        requested_by: str,
+        request_text: str,
+        thread_url: str,
+        attachments: Sequence[HpaChangeAttachment | Mapping[str, Any]] = (),
+        metadata: Mapping[str, Any] | None = None,
+    ) -> HpaChangeJobRegistration:
+        """부모 최신 상태 확인과 자식 등록을 SQLite write transaction 하나로 처리한다."""
+
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        normalized_workspace_id = str(workspace_id or "").strip()
+        normalized_channel_id = str(channel_id or "").strip()
+        normalized_thread_ts = str(thread_ts or "").strip()
+        normalized_event_ts = str(event_ts or "").strip()
+        if (
+            not normalized_parent_task_id
+            or str((metadata or {}).get("continuation_of_request_id") or "").strip()
+            != normalized_parent_task_id
+        ):
+            raise InvalidHpaChangeContinuation(
+                "후속 작업 metadata와 clarification 부모가 일치하지 않아"
+            )
+
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                # 동일 event retry는 부모가 이미 소비된 뒤에도 기존 자식을 그대로 사용한다.
+                existing_row = self._connection.execute(
+                    "SELECT * FROM hpa_change_jobs WHERE workspace_id = ? AND event_ts = ?",
+                    (normalized_workspace_id, normalized_event_ts),
+                ).fetchone()
+                if existing_row is not None:
+                    registration = HpaChangeJobRegistration(
+                        job=self._row_to_job(existing_row),
+                        created=False,
+                    )
+                else:
+                    parent_row = self._connection.execute(
+                        "SELECT * FROM hpa_change_jobs WHERE task_id = ?",
+                        (normalized_parent_task_id,),
+                    ).fetchone()
+                    latest_row = self._connection.execute(
+                        """
+                        SELECT * FROM hpa_change_jobs
+                        WHERE workspace_id = ? AND channel_id = ? AND thread_ts = ?
+                        ORDER BY CAST(event_ts AS REAL) DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (
+                            normalized_workspace_id,
+                            normalized_channel_id,
+                            normalized_thread_ts,
+                        ),
+                    ).fetchone()
+                    if (
+                        parent_row is None
+                        or latest_row is None
+                        or str(latest_row["task_id"]) != normalized_parent_task_id
+                        or str(parent_row["workspace_id"]) != normalized_workspace_id
+                        or str(parent_row["channel_id"]) != normalized_channel_id
+                        or str(parent_row["thread_ts"]) != normalized_thread_ts
+                        or str(parent_row["status"])
+                        != HpaChangeStatus.NEEDS_CLARIFICATION.value
+                    ):
+                        raise InvalidHpaChangeContinuation(
+                            "최신 HPA 작업이 추가 답변을 기다리는 부모가 아니야"
+                        )
+                    # register_job은 같은 reentrant lock과 현재 transaction을 그대로 사용한다.
+                    registration = self.register_job(
+                        workspace_id=workspace_id,
+                        event_ts=event_ts,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        requested_by=requested_by,
+                        request_text=request_text,
+                        thread_url=thread_url,
+                        attachments=attachments,
+                        metadata=metadata,
+                    )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return registration
+
     def get_job(self, task_id: str) -> HpaChangeJob:
         with self._lock:
             row = self._connection.execute(
@@ -573,6 +669,31 @@ class HpaChangeJobStore:
             row = self._connection.execute(
                 "SELECT * FROM hpa_change_jobs WHERE workspace_id = ? AND event_ts = ?",
                 (str(workspace_id or "").strip(), str(event_ts or "").strip()),
+            ).fetchone()
+        return self._row_to_job(row) if row is not None else None
+
+    def get_latest_job_by_thread(
+        self,
+        workspace_id: str,
+        channel_id: str,
+        thread_ts: str,
+    ) -> HpaChangeJob | None:
+        """같은 응답 thread에서 Slack event 시간이 가장 최신인 작업을 돌려준다."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT *
+                FROM hpa_change_jobs
+                WHERE workspace_id = ? AND channel_id = ? AND thread_ts = ?
+                ORDER BY CAST(event_ts AS REAL) DESC, rowid DESC
+                LIMIT 1
+                """,
+                (
+                    str(workspace_id or "").strip(),
+                    str(channel_id or "").strip(),
+                    str(thread_ts or "").strip(),
+                ),
             ).fetchone()
         return self._row_to_job(row) if row is not None else None
 
@@ -1731,6 +1852,43 @@ class HpaChangeWorkflowService:
             self.dispatch(registration.job.task_id),
             True,
         )
+
+    def submit_continuation(
+        self,
+        request: HpaChangeRequest,
+        *,
+        parent_task_id: str,
+    ) -> tuple[HpaChangeJob, bool]:
+        """clarification 부모를 원자적으로 한 번만 이어받아 새 review 작업을 만든다."""
+
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        registration = self.store.register_continuation_job(
+            parent_task_id=normalized_parent_task_id,
+            workspace_id=request.workspace_id,
+            event_ts=request.event_ts,
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            requested_by=request.requested_by,
+            request_text=request.request_text,
+            thread_url=request.thread_url,
+            attachments=request.attachments,
+            metadata=request.metadata,
+        )
+        job = registration.job
+        if not registration.created:
+            existing_parent = str(
+                job.metadata.get("continuation_of_request_id") or ""
+            ).strip()
+            if (
+                existing_parent != normalized_parent_task_id
+                or job.channel_id != request.channel_id
+                or job.thread_ts != request.thread_ts
+            ):
+                raise InvalidHpaChangeContinuation(
+                    "같은 Slack event가 다른 HPA 작업에 이미 사용됐어"
+                )
+            return job, False
+        return self.dispatch(job.task_id), True
 
     def dispatch(
         self,

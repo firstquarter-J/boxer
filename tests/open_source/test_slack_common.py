@@ -21,6 +21,41 @@ class _FakeApp:
 
 
 class SlackCommonTests(unittest.TestCase):
+    def test_app_mention_reply_forwards_optional_client_msg_id(self) -> None:
+        say_calls: list[dict[str, Any]] = []
+
+        def mention_handler(payload, reply, client, logger: logging.Logger) -> None:
+            reply(
+                "멱등 응답",
+                mention_user=False,
+                client_msg_id="8e3fa7a5-20f2-5f3b-a2a4-1e109ea900d1",
+            )
+
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(mention_handler)
+            app.handlers["app_mention"](
+                {
+                    "text": "<@U_BOT> 멱등 응답",
+                    "user": "U_TEST",
+                    "channel": "C_TEST",
+                    "ts": "123.456",
+                    "team": "T_TEST",
+                },
+                lambda **kwargs: say_calls.append(kwargs),
+                object(),
+            )
+
+        self.assertEqual(
+            say_calls[0]["client_msg_id"],
+            "8e3fa7a5-20f2-5f3b-a2a4-1e109ea900d1",
+        )
+
     def test_app_mention_reply_supports_blocks(self) -> None:
         say_calls: list[dict[str, Any]] = []
 

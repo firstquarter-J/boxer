@@ -5,6 +5,7 @@ import logging
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,11 +19,17 @@ from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRequest,
     HpaChangeRoutesConfig,
     HpaChangeSubmissionStatus,
+    HpaChangeThreadLookupState,
 )
 from boxer_company_adapter_slack.hpa_change_runtime import (
     HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS,
     HPA_CHANGE_POLICY_ALLOWED_USER_IDS,
     create_hpa_change_runtime,
+)
+from boxer_company.hpa_change_workflow import (
+    GitHubArtifactArchive,
+    GitHubWorkflowRun,
+    HpaChangePollState,
 )
 from boxer_company_adapter_slack import company
 
@@ -108,6 +115,38 @@ def _route_request(
             "p1720580000000001"
         ),
     )
+
+
+def _mark_needs_clarification(runtime: Any, task_id: str) -> None:
+    run = GitHubWorkflowRun(
+        run_id=501,
+        status="completed",
+        conclusion="success",
+        html_url="https://github.com/mmtalk-app/mmb-hospital-admin-server/actions/runs/501",
+        display_title=f"Boxer HPA Review - {task_id}",
+        run_attempt=1,
+        created_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+    )
+    runtime.store.mark_running(task_id, run)
+    runtime.store.mark_workflow_succeeded(task_id, run)
+    runtime.store.mark_result_ready(
+        task_id,
+        GitHubArtifactArchive(
+            artifact_id=700,
+            workflow_run_id=run.run_id,
+            name=f"boxer-hpa-result-{task_id}",
+            size_in_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            content=b"{}",
+        ),
+    )
+    runtime.store.mark_needs_clarification(
+        task_id,
+        "발송 범위를 결정해줘",
+        result={"status": "needs_clarification"},
+    )
+    runtime.store.mark_notified(task_id, HpaChangePollState.NEEDS_CLARIFICATION)
 
 
 class HpaChangeRuntimeTests(unittest.TestCase):
@@ -278,6 +317,158 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             "Boxer HPA Implementation",
         )
 
+    def test_clarification_followup_creates_new_task_with_parent_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = _FakeSession()
+            runtime = create_hpa_change_runtime(
+                settings=_settings(str(Path(temp_dir) / "jobs.sqlite3")),
+                session=session,
+            )
+            self.addCleanup(runtime.close)
+
+            parent_result = runtime.submit_request(_route_request())
+            _mark_needs_clarification(runtime, parent_result.request_id)
+            pending = runtime.lookup_thread_job(
+                "TWORK",
+                "C02C08K7YEN",
+                "1720580000.000001",
+                "1720580500.000200",
+            )
+            self.assertEqual(
+                pending.state,
+                HpaChangeThreadLookupState.NEEDS_CLARIFICATION,
+            )
+            self.assertEqual(pending.request_id, parent_result.request_id)
+            self.assertEqual(pending.event_ts, "1720580400.000100")
+            self.assertEqual(
+                runtime.lookup_thread_job(
+                    "TOTHER",
+                    "C02C08K7YEN",
+                    "1720580000.000001",
+                    "1720580500.000200",
+                ).state,
+                HpaChangeThreadLookupState.NONE,
+            )
+            self.assertEqual(
+                runtime.lookup_thread_job(
+                    "TWORK",
+                    "C068FVD5V7Y",
+                    "1720580000.000001",
+                    "1720580500.000200",
+                ).state,
+                HpaChangeThreadLookupState.NONE,
+            )
+
+            followup = replace(
+                _route_request(requester_user_id="U0629HDSJHG"),
+                request_key="slack:TWORK:C02C08K7YEN:1720580500.000200",
+                event_ts="1720580500.000200",
+                question="진행해",
+                thread_text=(
+                    "[1720580000.000001] U07A5FM5XPD\nHPA 요청사항 검토\n\n"
+                    "[1720580490.000100] U0629HDSJHG\n"
+                    "질문1 답변: Basic과 Bonus 각각 독립 버튼\n"
+                    "질문2 답변: 최종 검증 실패 시 해당 결과 생성 실패 처리"
+                ),
+                attachments=(
+                    HpaChangeAttachment(
+                        file_id="FANSWER",
+                        name="decision.md",
+                        mimetype="text/markdown",
+                        size_bytes=16,
+                        content="confirmed decisions",
+                        message_ts="1720580490.000100",
+                    ),
+                ),
+                initiator_user_id="U0629HDSJHG",
+                source_channel_id="C02C08K7YEN",
+                source_message_ts="1720580000.000001",
+                selection_mode="clarification_followup",
+                continuation_of_request_id=parent_result.request_id,
+            )
+
+            child_result = runtime.submit_request(followup)
+            duplicate = runtime.submit_request(followup)
+
+            self.assertEqual(child_result.status, HpaChangeSubmissionStatus.ACCEPTED)
+            self.assertEqual(duplicate.status, HpaChangeSubmissionStatus.DUPLICATE)
+            self.assertEqual(duplicate.request_id, child_result.request_id)
+            self.assertNotEqual(child_result.request_id, parent_result.request_id)
+            # 최초 요청과 후속 요청은 서로 다른 task_id로 각각 한 번만 review dispatch한다.
+            self.assertEqual(len(session.calls), 2)
+
+            child = runtime.store.get_job(child_result.request_id)
+            self.assertEqual(child.requested_by, "U07A5FM5XPD")
+            self.assertEqual(child.channel_id, "C02C08K7YEN")
+            self.assertEqual(child.thread_ts, "1720580000.000001")
+            self.assertEqual(child.thread_url, _route_request().thread_url)
+            self.assertIn("Bonus 프롬프트 변경", child.request_text)
+            self.assertIn("Basic과 Bonus 각각 독립 버튼", child.request_text)
+            self.assertEqual(
+                {item.name for item in child.attachments},
+                {"handoff.txt", "decision.md"},
+            )
+            self.assertEqual(
+                child.metadata["continuation_of_request_id"],
+                parent_result.request_id,
+            )
+            self.assertEqual(child.metadata["source_channel_id"], "C068FVD5V7Y")
+            self.assertEqual(child.metadata["selection_mode"], "linked_message")
+            self.assertEqual(child.metadata["initiator_user_id"], "U0629HDSJHG")
+
+            worker_request = session.calls[1]["json"]["client_payload"]["request"]
+            self.assertEqual(worker_request["requester_slack_user_id"], "U07A5FM5XPD")
+            self.assertIn("최종 검증 실패", worker_request["text"])
+            self.assertEqual(
+                {item["name"] for item in worker_request["attachments"]},
+                {"handoff.txt", "decision.md"},
+            )
+            # Slack retry는 이미 등록한 자식의 실제 상태를 반환하고 grandchild를 만들지 않는다.
+            retry_lookup = runtime.lookup_thread_job(
+                "TWORK",
+                "C02C08K7YEN",
+                "1720580000.000001",
+                "1720580500.000200",
+            )
+            self.assertEqual(retry_lookup.state, HpaChangeThreadLookupState.ACTIVE)
+            self.assertEqual(retry_lookup.request_id, child_result.request_id)
+            self.assertTrue(retry_lookup.current_event)
+            # 다른 event도 최신 자식의 실제 active 상태를 사용한다.
+            latest_lookup = runtime.lookup_thread_job(
+                "TWORK",
+                "C02C08K7YEN",
+                "1720580000.000001",
+                "1720580600.000300",
+            )
+            self.assertEqual(latest_lookup.state, HpaChangeThreadLookupState.ACTIVE)
+            self.assertEqual(latest_lookup.request_id, child_result.request_id)
+
+            runtime.store.mark_failed(child_result.request_id, "worker failed")
+            terminal_lookup = runtime.lookup_thread_job(
+                "TWORK",
+                "C02C08K7YEN",
+                "1720580000.000001",
+                "1720580700.000400",
+            )
+            self.assertEqual(
+                terminal_lookup.state,
+                HpaChangeThreadLookupState.TERMINAL,
+            )
+            self.assertEqual(terminal_lookup.job_status, "failed")
+
+            with patch.object(
+                runtime.store,
+                "get_job_by_event_ts",
+                side_effect=RuntimeError("db unavailable"),
+            ):
+                error_lookup = runtime.lookup_thread_job(
+                    "TWORK",
+                    "C02C08K7YEN",
+                    "1720580000.000001",
+                    "1720580800.000500",
+                )
+            self.assertEqual(error_lookup.state, HpaChangeThreadLookupState.ERROR)
+
     def test_submit_rejects_request_outside_company_policy_before_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session = _FakeSession()
@@ -364,6 +555,7 @@ class HpaChangeRuntimeTests(unittest.TestCase):
         fake_runtime = SimpleNamespace(
             routes_config=HpaChangeRoutesConfig(enabled=True),
             submit_request=Mock(),
+            lookup_thread_job=Mock(),
         )
 
         def fake_create_slack_app(mention_handler: Any, message_handler: Any) -> Any:
@@ -414,6 +606,10 @@ class HpaChangeRuntimeTests(unittest.TestCase):
 
         self.assertIs(app, fake_app)
         handle_hpa.assert_called_once()
+        self.assertIs(
+            handle_hpa.call_args.args[2].lookup_thread_job,
+            fake_runtime.lookup_thread_job,
+        )
         check_ping.assert_not_called()
         attach_reporter.assert_called_once()
         self.assertIs(attach_reporter.call_args.args[1], fake_runtime)

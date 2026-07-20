@@ -61,7 +61,6 @@ _SAFE_PR_URL_RE = re.compile(
     r"^https://github\.com/mmtalk-app/"
     r"(?:mmb-hospital-admin-server|mmb-hospital-admin-client)/pull/[0-9]+/?$"
 )
-_SAFE_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{5,20}$")
 _PUBLIC_URL_RE = re.compile(r"https?://|files\.slack\.com", re.IGNORECASE)
 _REQUEST_ITEM_ID_RE = re.compile(r"^REQ-[0-9]{2}$")
 _INTERNAL_IDENTIFIER_TOKEN_RE = re.compile(
@@ -160,20 +159,40 @@ _REQUEST_REASON_TEXTS = {
     "not_applicable": "요청 목적과 현재 HPA 제품 범위가 직접 연결되지 않아 이번 변경 대상이 아니야.",
 }
 _REQUEST_APPLICATION_TEXTS = {
-    "implement_hpa_equivalent": "요청한 사용자 효과를 유지하고 HPA 제품 흐름에 맞는 방식으로 구현해.",
-    "update_existing_behavior": "기존 HPA 기능을 유지하면서 요청한 동작만 제품 수준으로 조정해.",
-    "reuse_existing_capability": "기존 HPA 기능을 사용하고 같은 기능을 중복으로 추가하지 않아.",
-    "add_end_to_end_capability": "사용자가 실제로 이용하는 전체 흐름이 함께 동작하도록 반영해.",
-    "no_change_needed": "이미 충족된 동작은 변경하지 않고 현재 제품 동작을 유지해.",
-    "await_product_decision": "제품 동작이 결정되기 전에는 구현하지 않고 결정된 범위만 반영해.",
+    "implement_hpa_equivalent": (
+        "요청 동작을 HPA 처리 흐름에 맞춰 다시 구성하고, 필요한 화면·서버·상태 저장 범위를 "
+        "함께 연결해 구현해."
+    ),
+    "update_existing_behavior": (
+        "기존 HPA 흐름은 유지하고 요청 동작에 필요한 화면·서버·상태 저장 범위만 조정해."
+    ),
+    "reuse_existing_capability": (
+        "기존 HPA 기능을 재사용하고 같은 처리 흐름을 중복으로 추가하지 않아."
+    ),
+    "add_end_to_end_capability": (
+        "사용자 동작부터 서버 처리와 결과 상태 반영까지 필요한 전체 흐름을 함께 구현해."
+    ),
+    "no_change_needed": "현재 HPA 흐름이 이미 요청을 충족하므로 변경하지 않아.",
+    "await_product_decision": (
+        "제품 동작이 결정되기 전에는 변경하지 않고 결정된 범위만 구현해."
+    ),
 }
 _APPLIED_RESULT_TEXTS = {
-    "implemented_hpa_equivalent": "요청 목적을 유지한 HPA 제품용 구현으로 반영했어.",
-    "updated_existing_behavior": "기존 제품 흐름을 유지하면서 요청한 동작을 반영했어.",
-    "existing_capability_reused": "새 중복 구현 없이 HPA의 기존 기능으로 충족했어.",
-    "no_change_needed": "현재 제품 동작이 요청을 이미 충족해 추가 변경하지 않았어.",
-    "not_in_scope": "이번 HPA 변경 범위에는 포함하지 않았어.",
-    "deferred_for_decision": "제품 동작 결정이 필요해 이번 PR에는 반영하지 않았어.",
+    "implemented_hpa_equivalent": (
+        "요청 동작을 HPA 처리 흐름에 맞춰 다시 구성하고, 필요한 화면·서버·상태 저장 범위를 "
+        "함께 연결해 구현했어."
+    ),
+    "updated_existing_behavior": (
+        "기존 HPA 흐름을 유지하면서 요청 동작에 필요한 화면·서버·상태 저장 범위를 구현했어."
+    ),
+    "existing_capability_reused": (
+        "새 중복 구현 없이 기존 HPA 기능으로 요청을 충족하는 걸 확인했어."
+    ),
+    "no_change_needed": "현재 HPA 흐름이 요청을 이미 충족해 추가 변경하지 않았어.",
+    "not_in_scope": "요청 범위를 확인했고 이번 HPA 변경에는 포함하지 않았어.",
+    "deferred_for_decision": (
+        "제품 동작 결정 전이라 관련 변경을 이번 PR에 포함하지 않았어."
+    ),
 }
 _QUESTION_TEXTS = {
     "failure_behavior": "요청한 기능이 최종 검증을 통과하지 못했을 때 기존 결과를 유지할지, 해당 결과 생성을 실패 처리할지 결정해줘.",
@@ -727,15 +746,6 @@ def _safe_pr_urls(values: Sequence[Any]) -> list[str]:
     return urls
 
 
-def _requester_mention(job: HpaChangeJob) -> str:
-    """결과·정정·추가 질문을 원 요청자에게 직접 전달하되 Slack ID를 검증한다."""
-
-    requester_id = str(job.requested_by or "").strip()
-    if not _SAFE_SLACK_USER_ID_RE.fullmatch(requester_id):
-        return ""
-    return f"<@{requester_id}>"
-
-
 def _append_message_section(
     lines: list[str],
     title: str,
@@ -792,12 +802,16 @@ def _append_request_items(
         lines.extend(
             [
                 f"*{index}. {item['request']}*",
-                f"• 처리: {item['handling']}",
+                (
+                    f"• 구현 상태: {item['handling']}"
+                    if completed
+                    else f"• 처리 방향: {item['handling']}"
+                ),
                 f"• 판단 이유: {item['reason']}",
                 (
-                    f"• 반영 결과: {item['applied_as']}"
+                    f"• 최종 구현: {item['applied_as']}"
                     if completed
-                    else f"• 적용 방식: {item['applied_as']}"
+                    else f"• 구현 방식: {item['applied_as']}"
                 ),
             ]
         )
@@ -827,7 +841,7 @@ def _append_public_review(
     )
     _append_request_items(
         lines,
-        title="HPA에서 사용할 변환 구현안",
+        title="HPA 구현 방식",
         items=_public_request_items(
             result,
             corrections,
@@ -907,33 +921,44 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
         return ["\n".join(review_lines), "\n".join(question_lines)]
 
     if poll.state is HpaChangePollState.PR_OPENED:
-        lines = ["*HPA 코드 변경 PR 준비 완료*", "", *base_lines]
         applied_results = _public_applied_results(
             result,
             request_source=request_source,
         )
-        if applied_results:
-            _append_request_items(
-                lines,
-                title="요청별 반영 결과",
-                items=applied_results,
-                completed=True,
-            )
-        else:
-            _append_message_section(
-                lines,
-                "요청별 반영 결과",
-                ["• 자동화 결과에 공개 가능한 항목별 요약이 없어 PR에서 확인이 필요해"],
-            )
         quality_gates = result.get("qualityGates") or result.get("quality_gates")
-        if (
+        verification_complete = (
             isinstance(quality_gates, Mapping)
             and quality_gates.get("verificationPassed") is True
             and quality_gates.get("independentReviewPassed") is True
             and quality_gates.get("requestCoveragePassed") is True
             and quality_gates.get("initialRequestCoveragePassed") is True
             and bool(applied_results)
-        ):
+        )
+        lines = [
+            "*HPA 코드 변경 PR 준비 완료*",
+            "",
+            (
+                "• 상태: 구현·검증 완료 · PR 준비"
+                if verification_complete
+                else "• 상태: 구현 완료 · 검증 정보 확인 필요 · PR 준비"
+            ),
+            "• 운영 반영: 미머지 · 미배포",
+            *base_lines,
+        ]
+        if applied_results:
+            _append_request_items(
+                lines,
+                title="최종 구현 결과",
+                items=applied_results,
+                completed=True,
+            )
+        else:
+            _append_message_section(
+                lines,
+                "최종 구현 결과",
+                ["• 자동화 결과에 공개 가능한 항목별 요약이 없어 PR에서 확인이 필요해"],
+            )
+        if verification_complete:
             verification_lines = ["• 자동 빌드·테스트와 독립 리뷰를 통과했어"]
         else:
             verification_lines = ["• 이 결과에는 자동 검증 통과 정보가 없어 PR에서 확인이 필요해"]
@@ -962,14 +987,14 @@ def _format_hpa_change_poll_messages(poll: HpaChangePollResult) -> list[str]:
         if applied_results:
             _append_request_items(
                 lines,
-                title="요청별 확인 결과",
+                title="최종 확인 결과",
                 items=applied_results,
                 completed=True,
             )
         else:
             _append_message_section(
                 lines,
-                "요청별 확인 결과",
+                "최종 확인 결과",
                 ["• 공개 가능한 항목별 확인 결과가 없어 운영 확인이 필요해"],
             )
         quality_gates = result.get("qualityGates") or result.get("quality_gates")
@@ -1049,9 +1074,7 @@ def _post_hpa_change_message(
     *,
     message_key: str,
 ) -> None:
-    # 자동 결과가 thread에서 묻히지 않도록 요청자를 먼저 멘션한다.
-    mention = _requester_mention(job)
-    message = f"{mention} {text}" if mention else text
+    # 자동화 상태는 이미 같은 요청 thread에 이어지므로 별도 사용자 멘션 없이 게시한다.
     # Slack 재시도나 응답 유실에도 같은 logical 댓글이 중복 생성되지 않도록
     # task와 댓글 위치에서 결정적인 UUID를 만든다.
     client_msg_id = str(
@@ -1066,7 +1089,7 @@ def _post_hpa_change_message(
     client.chat_postMessage(
         channel=job.channel_id,
         thread_ts=job.thread_ts,
-        text=message,
+        text=text,
         client_msg_id=client_msg_id,
         unfurl_links=False,
         unfurl_media=False,

@@ -69,6 +69,7 @@ class SlackReplyFn(Protocol):
         *,
         mention_user: bool = True,
         blocks: list[dict[str, Any]] | None = None,
+        client_msg_id: str | None = None,
     ) -> None: ...
 
 
@@ -406,6 +407,7 @@ def create_slack_app(
             *,
             mention_user: bool = True,
             blocks: list[dict[str, Any]] | None = None,
+            client_msg_id: str | None = None,
         ) -> None:
             clean_text = (reply_text or "").strip()
             if not clean_text:
@@ -420,6 +422,10 @@ def create_slack_app(
             }
             if blocks:
                 say_kwargs["blocks"] = blocks
+            normalized_client_msg_id = str(client_msg_id or "").strip()
+            if normalized_client_msg_id:
+                # Slack retry에도 같은 logical 댓글을 재사용할 수 있게 adapter가 키를 지정한다.
+                say_kwargs["client_msg_id"] = normalized_client_msg_id
             say(**say_kwargs)
             _mark_request_log_reply(payload)
 

@@ -1,5 +1,6 @@
 import logging
 import unittest
+import uuid
 from typing import Any
 from unittest.mock import patch
 
@@ -10,9 +11,13 @@ from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRoutesDeps,
     HpaChangeSubmissionResult,
     HpaChangeSubmissionStatus,
+    HpaChangeThreadLookupResult,
+    HpaChangeThreadLookupState,
     _handle_hpa_change_request,
+    _looks_like_hpa_clarification_followup,
     _looks_like_hpa_change_request,
     _download_slack_file,
+    _select_clarification_followup_messages,
     _validate_slack_file_url,
 )
 
@@ -174,6 +179,26 @@ class HpaChangeRoutesTests(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertEqual(_looks_like_hpa_change_request(question), expected)
 
+    def test_clarification_followup_trigger_is_narrow(self) -> None:
+        cases = {
+            "진행해": True,
+            "HPA 진행해": True,
+            "구현 진행해주세요": True,
+            "질문1 답변: Basic과 Bonus를 분리": True,
+            "질문 2 답변: 생성 실패 처리": True,
+            "진행 상황 알려줘": False,
+            "이 작업 진행해도 돼?": False,
+            "회의 진행해": False,
+            "답변을 확인해줘": False,
+        }
+
+        for question, expected in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(
+                    _looks_like_hpa_clarification_followup(question),
+                    expected,
+                )
+
     def test_unrelated_question_returns_false_without_side_effect(self) -> None:
         client = _FakeSlackClient()
         replies: list[tuple[str, dict[str, Any]]] = []
@@ -191,6 +216,195 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertEqual(client.reply_calls, [])
         self.assertEqual(replies, [])
         self.assertEqual(submitted, [])
+
+    def test_plain_continue_does_not_capture_thread_without_pending_clarification(self) -> None:
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        handled = _handle_hpa_change_request(
+            _context(client, replies, question="진행해"),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request),  # type: ignore[func-returns-value]
+                lookup_thread_job=lambda *_args: HpaChangeThreadLookupResult(
+                    HpaChangeThreadLookupState.NONE
+                ),
+            ),
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(replies, [])
+        self.assertEqual(submitted, [])
+
+    def test_active_thread_consumes_explicit_continue_without_new_submission(self) -> None:
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        handled = _handle_hpa_change_request(
+            _context(client, replies, question="HPA 구현 진행해"),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request),  # type: ignore[func-returns-value]
+                lookup_thread_job=lambda *_args: HpaChangeThreadLookupResult(
+                    HpaChangeThreadLookupState.ACTIVE,
+                    request_id="TASK-ACTIVE",
+                    job_status="running",
+                    event_ts="1.5",
+                ),
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
+        self.assertIn("TASK-ACTIVE", replies[0][0])
+        self.assertIn("running", replies[0][0])
+        self.assertIn("새 작업은 만들지 않았어", replies[0][0])
+
+    def test_thread_lookup_error_fails_closed_without_fresh_hpa_request(self) -> None:
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        handled = _handle_hpa_change_request(
+            _context(client, replies, question="HPA 구현 진행해"),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request),  # type: ignore[func-returns-value]
+                lookup_thread_job=lambda *_args: (_ for _ in ()).throw(
+                    RuntimeError("db unavailable")
+                ),
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
+        self.assertIn("조회 오류", replies[0][0])
+        self.assertIn("새 작업으로 우회하지 않았어", replies[0][0])
+
+    def test_same_event_retry_reports_pending_job_without_grandchild(self) -> None:
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        handled = _handle_hpa_change_request(
+            _context(client, replies, question="진행해"),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request),  # type: ignore[func-returns-value]
+                lookup_thread_job=lambda *_args: HpaChangeThreadLookupResult(
+                    HpaChangeThreadLookupState.NEEDS_CLARIFICATION,
+                    request_id="TASK-RETRY",
+                    job_status="needs_clarification",
+                    event_ts="2.0",
+                    current_event=True,
+                ),
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
+        self.assertIn("TASK-RETRY", replies[0][0])
+        self.assertIn("다시 만들지 않았어", replies[0][0])
+
+    def test_pending_clarification_followup_collects_current_thread_for_new_task(self) -> None:
+        pages = {
+            "": {
+                "messages": [
+                    {
+                        "ts": "1.0",
+                        "user": "UJUSTIN",
+                        "text": "HPA 요청사항 검토",
+                    },
+                    {
+                        "ts": "1.1",
+                        "bot_id": "BBOXER",
+                        "text": "질문 1: 발송 범위를 결정해줘",
+                    },
+                    {
+                        "ts": "1.2",
+                        "user": "UJUSTIN",
+                        "text": "질문1 답변: Basic과 Bonus 각각 독립 버튼",
+                    },
+                    {
+                        "ts": "1.3",
+                        "user": "UJUSTIN",
+                        "text": "<@UBOXER> 진행해",
+                    },
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        }
+        client = _FakeSlackClient(pages)
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+        finder_calls: list[tuple[str, str, str, str]] = []
+
+        def lookup_thread_job(*args: str) -> HpaChangeThreadLookupResult:
+            finder_calls.append(args)
+            return HpaChangeThreadLookupResult(
+                HpaChangeThreadLookupState.NEEDS_CLARIFICATION,
+                request_id="TASK-PARENT",
+                job_status="needs_clarification",
+                event_ts="1.0",
+            )
+
+        def submit_request(request: HpaChangeRequest) -> HpaChangeSubmissionResult:
+            submitted.append(request)
+            return HpaChangeSubmissionResult(
+                HpaChangeSubmissionStatus.ACCEPTED,
+                request_id="TASK-CHILD",
+            )
+
+        handled = _handle_hpa_change_request(
+            _context(
+                client,
+                replies,
+                question="진행해",
+                current_ts="1.3",
+                thread_ts="1.0",
+            ),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=submit_request,
+                lookup_thread_job=lookup_thread_job,
+            ),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(finder_calls, [("TWORK", "CHPA", "1.0", "1.3")])
+        self.assertEqual(len(submitted), 1)
+        request = submitted[0]
+        self.assertEqual(request.continuation_of_request_id, "TASK-PARENT")
+        self.assertEqual(request.selection_mode, "clarification_followup")
+        self.assertIn("Basic과 Bonus 각각 독립 버튼", request.thread_text)
+        self.assertIn("<@UBOXER> 진행해", request.thread_text)
+        self.assertNotIn("발송 범위를 결정해줘", request.thread_text)
+        self.assertNotIn("HPA 요청사항 검토", request.thread_text)
+        self.assertIn("TASK-PARENT", replies[0][0])
+        self.assertIn("TASK-CHILD", replies[0][0])
+        self.assertIn("추가 답변 재접수", replies[0][0])
+
+    def test_followup_message_selection_keeps_only_delta_after_parent_event(self) -> None:
+        selected = _select_clarification_followup_messages(
+            [
+                {"ts": "1.0", "user": "UJUSTIN", "text": "thread root"},
+                {"ts": "1.2", "user": "UJUSTIN", "text": "이전 답변"},
+                {"ts": "1.4", "bot_id": "BBOXER", "text": "추가 질문"},
+                {"ts": "1.5", "user": "UJUSTIN", "text": "새 답변"},
+                {"ts": "1.6", "user": "UOTHER", "text": "허용되지 않은 답변"},
+            ],
+            thread_ts="1.0",
+            allowed_user_ids={"UJUSTIN"},
+            after_event_ts="1.3",
+        )
+
+        self.assertEqual([item["text"] for item in selected], ["새 답변"])
 
     def test_direct_requirements_review_collects_current_message_without_link(self) -> None:
         requirement = "Basic과 Bonus 발송 버튼을 분리하고 Basic만 발송할 수 있게 해줘"
@@ -988,6 +1202,9 @@ class HpaChangeRoutesTests(unittest.TestCase):
         ])
         self.assertIn("요청 접수", replies[0][0])
         self.assertIn("이미 접수된", replies[1][0])
+        first_client_msg_id = replies[0][1]["client_msg_id"]
+        self.assertEqual(replies[1][1]["client_msg_id"], first_client_msg_id)
+        self.assertEqual(str(uuid.UUID(first_client_msg_id)), first_client_msg_id)
 
     def test_rejected_submission_uses_safe_callback_result(self) -> None:
         client = _FakeSlackClient()

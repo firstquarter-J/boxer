@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import tempfile
+import threading
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,7 @@ from boxer_company.hpa_change_workflow import (
     HpaChangeRequest,
     HpaChangeStatus,
     HpaChangeWorkflowService,
+    InvalidHpaChangeContinuation,
     InvalidHpaChangeTransition,
     StaticGitHubTokenProvider,
     generate_hpa_change_task_id,
@@ -134,6 +136,34 @@ def _workflow_run(
     )
 
 
+def _mark_store_needs_clarification(
+    store: HpaChangeJobStore,
+    task_id: str,
+) -> None:
+    """continuation 저장소 테스트가 실제 허용 전이를 따라 부모 상태를 만든다."""
+
+    run = _workflow_run()
+    store.begin_dispatch(task_id)
+    store.mark_dispatched(task_id)
+    store.mark_running(task_id, run)
+    store.mark_workflow_succeeded(
+        task_id,
+        _workflow_run(status="completed", conclusion="success"),
+    )
+    store.mark_result_ready(
+        task_id,
+        GitHubArtifactArchive(
+            artifact_id=10,
+            workflow_run_id=run.run_id,
+            name=f"boxer-hpa-result-{task_id}",
+            size_in_bytes=20,
+            sha256="a" * 64,
+            content=b"zip",
+        ),
+    )
+    store.mark_needs_clarification(task_id, "결정이 필요해")
+
+
 def _zip_result(payload: dict[str, Any], member_name: str = "result.json") -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
@@ -198,6 +228,96 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         self.assertTrue(another_workspace.created)
         self.assertNotEqual(another_workspace.job.task_id, first.job.task_id)
         self.assertEqual(len(self.store.list_jobs()), 2)
+
+    def test_latest_job_by_thread_does_not_return_stale_clarification(self) -> None:
+        first = _register(self.store).job
+        second = _register(
+            self.store,
+            event_ts="1720580400.000101",
+            request_text="추가 답변을 반영한 새 요청",
+        ).job
+
+        latest = self.store.get_latest_job_by_thread(
+            "T_WORKSPACE",
+            "C_REQUESTS",
+            "1720580000.000001",
+        )
+        other_thread = self.store.get_latest_job_by_thread(
+            "T_WORKSPACE",
+            "C_REQUESTS",
+            "1720580000.999999",
+        )
+
+        # 같은 clock 시각이어도 Slack event 순서로 최신 등록을 선택한다.
+        self.assertEqual(latest.task_id, second.task_id)
+        self.assertNotEqual(latest.task_id, first.task_id)
+        self.assertIsNone(other_thread)
+
+    def test_continuation_parent_is_consumed_atomically_across_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "continuation-race.db"
+            first_store = HpaChangeJobStore(
+                db_path,
+                clock=self.clock,
+                task_id_factory=_TaskIdFactory(),
+            )
+            second_store = HpaChangeJobStore(
+                db_path,
+                clock=self.clock,
+                task_id_factory=_TaskIdFactory(),
+            )
+            try:
+                parent = _register(first_store).job
+                _mark_store_needs_clarification(first_store, parent.task_id)
+                barrier = threading.Barrier(2)
+                created: list[str] = []
+                rejected: list[Exception] = []
+
+                def register_child(store: HpaChangeJobStore, event_ts: str) -> None:
+                    barrier.wait()
+                    try:
+                        registration = store.register_continuation_job(
+                            parent_task_id=parent.task_id,
+                            workspace_id=parent.workspace_id,
+                            event_ts=event_ts,
+                            channel_id=parent.channel_id,
+                            thread_ts=parent.thread_ts,
+                            requested_by=parent.requested_by,
+                            request_text="추가 답변",
+                            thread_url=parent.thread_url,
+                            metadata={
+                                "source": "slack",
+                                "continuation_of_request_id": parent.task_id,
+                            },
+                        )
+                        if registration.created:
+                            created.append(registration.job.task_id)
+                    except Exception as exc:
+                        rejected.append(exc)
+
+                threads = [
+                    threading.Thread(
+                        target=register_child,
+                        args=(first_store, "1720580500.000200"),
+                    ),
+                    threading.Thread(
+                        target=register_child,
+                        args=(second_store, "1720580501.000201"),
+                    ),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual(len(created), 1)
+                self.assertEqual(len(rejected), 1)
+                self.assertIsInstance(rejected[0], InvalidHpaChangeContinuation)
+                self.assertEqual(len(first_store.list_jobs()), 2)
+            finally:
+                second_store.close()
+                first_store.close()
 
     def test_persists_job_and_notified_status_across_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

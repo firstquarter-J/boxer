@@ -19,7 +19,9 @@ from boxer_company.hpa_change_workflow import (
     HpaChangeAttachment,
     HpaChangeJobStore,
     HpaChangeRequest as WorkflowHpaChangeRequest,
+    HpaChangeStatus,
     HpaChangeWorkflowService,
+    InvalidHpaChangeContinuation,
     StaticGitHubTokenProvider,
 )
 from boxer_company_adapter_slack.hpa_change_routes import (
@@ -27,6 +29,8 @@ from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRoutesConfig,
     HpaChangeSubmissionResult,
     HpaChangeSubmissionStatus,
+    HpaChangeThreadLookupResult,
+    HpaChangeThreadLookupState,
 )
 
 
@@ -61,6 +65,244 @@ class HpaChangeRuntime:
     auth_mode: str = "disabled"
     logger: logging.Logger | None = None
 
+    def lookup_thread_job(
+        self,
+        workspace_id: str,
+        channel_id: str,
+        thread_ts: str,
+        event_ts: str,
+    ) -> HpaChangeThreadLookupResult:
+        """후속 명령을 실제 thread 작업 상태에 연결하고 조회 오류는 닫힌 상태로 돌려준다."""
+
+        if not self.enabled or self.store is None:
+            return HpaChangeThreadLookupResult(HpaChangeThreadLookupState.NONE)
+        normalized_workspace_id = str(workspace_id or "").strip()
+        normalized_channel_id = str(channel_id or "").strip()
+        normalized_thread_ts = str(thread_ts or "").strip()
+        normalized_event_ts = str(event_ts or "").strip()
+
+        try:
+            # 동일 event가 이미 등록됐다면 최신 thread 작업보다 먼저 찾아 Slack retry를 복원한다.
+            existing = self.store.get_job_by_event_ts(
+                normalized_workspace_id,
+                normalized_event_ts,
+            )
+            if existing is not None and (
+                existing.channel_id != normalized_channel_id
+                or existing.thread_ts != normalized_thread_ts
+            ):
+                return HpaChangeThreadLookupResult(HpaChangeThreadLookupState.ERROR)
+            job = existing or self.store.get_latest_job_by_thread(
+                normalized_workspace_id,
+                normalized_channel_id,
+                normalized_thread_ts,
+            )
+        except Exception as exc:
+            actual_logger = self.logger or logging.getLogger(__name__)
+            actual_logger.warning(
+                "Failed to look up HPA thread job error_type=%s",
+                type(exc).__name__,
+            )
+            return HpaChangeThreadLookupResult(HpaChangeThreadLookupState.ERROR)
+
+        if job is None:
+            return HpaChangeThreadLookupResult(HpaChangeThreadLookupState.NONE)
+        if job.status is HpaChangeStatus.NEEDS_CLARIFICATION:
+            state = HpaChangeThreadLookupState.NEEDS_CLARIFICATION
+        elif job.status in {
+            HpaChangeStatus.RECEIVED,
+            HpaChangeStatus.DISPATCHING,
+            HpaChangeStatus.DISPATCHED,
+            HpaChangeStatus.RUNNING,
+            HpaChangeStatus.WORKFLOW_SUCCEEDED,
+            HpaChangeStatus.RESULT_READY,
+            HpaChangeStatus.REVIEW_READY,
+            HpaChangeStatus.REVIEW_POSTED,
+        }:
+            state = HpaChangeThreadLookupState.ACTIVE
+        else:
+            state = HpaChangeThreadLookupState.TERMINAL
+        return HpaChangeThreadLookupResult(
+            state=state,
+            request_id=job.task_id,
+            job_status=job.status.value,
+            event_ts=job.event_ts,
+            current_event=existing is not None,
+        )
+
+    @staticmethod
+    def _route_attachments(
+        request: RouteHpaChangeRequest,
+    ) -> tuple[HpaChangeAttachment, ...]:
+        return tuple(
+            HpaChangeAttachment(
+                name=item.name,
+                content=item.content,
+                sha256=hashlib.sha256(item.content.encode("utf-8")).hexdigest(),
+            )
+            for item in request.attachments
+        )
+
+    def _build_workflow_request(
+        self,
+        request: RouteHpaChangeRequest,
+    ) -> WorkflowHpaChangeRequest | HpaChangeSubmissionResult:
+        if self.store is None:
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="HPA 코드 변경 작업 큐가 활성화되지 않았어",
+            )
+
+        continuation_of = str(request.continuation_of_request_id or "").strip()
+        current_attachments = self._route_attachments(request)
+        if not continuation_of:
+            return WorkflowHpaChangeRequest(
+                workspace_id=request.workspace_id,
+                event_ts=request.event_ts,
+                channel_id=request.channel_id,
+                thread_ts=request.thread_ts,
+                requested_by=request.requester_user_id,
+                request_text=request.thread_text,
+                thread_url=request.thread_url,
+                attachments=current_attachments,
+                metadata={
+                    "source": "slack",
+                    "request_key": request.request_key,
+                    "initiator_user_id": request.initiator_user_id
+                    or request.requester_user_id,
+                    "source_channel_id": request.source_channel_id or request.channel_id,
+                    "source_message_ts": request.source_message_ts or request.thread_ts,
+                    "selection_mode": request.selection_mode,
+                    "response_thread_url": request.response_thread_url,
+                },
+            )
+
+        existing = self.store.get_job_by_event_ts(
+            request.workspace_id,
+            request.event_ts,
+        )
+        if existing is not None:
+            existing_parent = str(
+                existing.metadata.get("continuation_of_request_id") or ""
+            ).strip()
+            if (
+                existing_parent == continuation_of
+                and existing.channel_id == request.channel_id
+                and existing.thread_ts == request.thread_ts
+            ):
+                return HpaChangeSubmissionResult(
+                    status=HpaChangeSubmissionStatus.DUPLICATE,
+                    request_id=existing.task_id,
+                    user_message="기존 추가 답변 작업의 진행 상황을 계속 확인할게",
+                )
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                request_id=existing.task_id,
+                user_message="같은 Slack 이벤트가 다른 HPA 작업에 이미 사용됐어",
+            )
+
+        try:
+            parent = self.store.get_job(continuation_of)
+        except KeyError:
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="이어갈 HPA 추가 확인 작업을 찾지 못했어",
+            )
+        if (
+            parent.status is not HpaChangeStatus.NEEDS_CLARIFICATION
+            or parent.workspace_id != request.workspace_id
+            or parent.channel_id != request.channel_id
+            or parent.thread_ts != request.thread_ts
+        ):
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="이 스레드의 최신 HPA 작업은 추가 답변을 기다리는 상태가 아니야",
+            )
+
+        parent_source_channel_id = str(
+            parent.metadata.get("source_channel_id") or parent.channel_id
+        ).strip()
+        if (
+            parent.requested_by not in HPA_CHANGE_POLICY_ALLOWED_USER_IDS
+            or parent.channel_id not in HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
+            or parent_source_channel_id not in HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
+        ):
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="이전 HPA 요청의 사용자·채널 정책을 확인하지 못했어",
+            )
+
+        combined_text = "\n\n".join(
+            (
+                "[기존 HPA 변경 요청]\n" + parent.request_text,
+                "[이전 작업 접수 이후 추가 답변과 진행 명령]\n" + request.thread_text,
+            )
+        )
+        if len(combined_text) > max(0, self.routes_config.max_thread_chars):
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="기존 요청과 추가 답변을 합친 내용이 허용 길이를 초과했어",
+            )
+
+        # 부모 첨부를 먼저 보존하고, 같은 이름·같은 내용은 한 번만 전달한다.
+        merged_attachments: list[HpaChangeAttachment] = list(parent.attachments)
+        attachment_by_name = {item.name: item for item in parent.attachments}
+        for attachment in current_attachments:
+            previous = attachment_by_name.get(attachment.name)
+            if previous is not None:
+                if previous.sha256 == attachment.sha256:
+                    continue
+                return HpaChangeSubmissionResult(
+                    status=HpaChangeSubmissionStatus.REJECTED,
+                    user_message=f"같은 이름의 첨부 내용이 달라 확인이 필요해: {attachment.name}",
+                )
+            attachment_by_name[attachment.name] = attachment
+            merged_attachments.append(attachment)
+        if len(merged_attachments) > max(0, self.routes_config.max_attachment_count):
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="기존 요청과 추가 답변의 첨부 개수 합계가 제한을 초과했어",
+            )
+        total_attachment_bytes = sum(
+            len(item.content.encode("utf-8")) for item in merged_attachments
+        )
+        if total_attachment_bytes > max(
+            0,
+            self.routes_config.max_total_attachment_bytes,
+        ):
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                user_message="기존 요청과 추가 답변의 첨부 크기 합계가 제한을 초과했어",
+            )
+
+        # 원 요청자와 선택한 원문 소스는 그대로 두고, 실행자와 응답 thread만 이번 event로 갱신한다.
+        metadata = dict(parent.metadata)
+        metadata.update(
+            {
+                "source": "slack",
+                "request_key": request.request_key,
+                "initiator_user_id": request.initiator_user_id
+                or request.requester_user_id,
+                "response_thread_url": request.response_thread_url
+                or parent.metadata.get("response_thread_url")
+                or "",
+                "continuation_of_request_id": parent.task_id,
+                "continuation_event_ts": request.event_ts,
+                "continuation_selection_mode": request.selection_mode,
+            }
+        )
+        return WorkflowHpaChangeRequest(
+            workspace_id=request.workspace_id,
+            event_ts=request.event_ts,
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            requested_by=parent.requested_by,
+            request_text=combined_text,
+            thread_url=parent.thread_url,
+            attachments=tuple(merged_attachments),
+            metadata=metadata,
+        )
+
     def submit_request(self, request: RouteHpaChangeRequest) -> HpaChangeSubmissionResult:
         if not self.enabled or self.store is None or self.workflow is None:
             return HpaChangeSubmissionResult(
@@ -86,42 +328,31 @@ class HpaChangeRuntime:
                 ),
             )
 
-        # worker에는 정규화한 스레드 요구사항과 텍스트 첨부만 전달한다.
-        # Slack file id, channel id 같은 내부 intake 정보는
-        # dispatch payload에 넣지 않는다.
-        attachments = tuple(
-            HpaChangeAttachment(
-                name=item.name,
-                content=item.content,
-                sha256=hashlib.sha256(item.content.encode("utf-8")).hexdigest(),
-            )
-            for item in request.attachments
-        )
-        workflow_request = WorkflowHpaChangeRequest(
-            workspace_id=request.workspace_id,
-            event_ts=request.event_ts,
-            channel_id=request.channel_id,
-            thread_ts=request.thread_ts,
-            requested_by=request.requester_user_id,
-            request_text=request.thread_text,
-            thread_url=request.thread_url,
-            attachments=attachments,
-            metadata={
-                "source": "slack",
-                "request_key": request.request_key,
-                "initiator_user_id": request.initiator_user_id
-                or request.requester_user_id,
-                "source_channel_id": request.source_channel_id or request.channel_id,
-                "source_message_ts": request.source_message_ts or request.thread_ts,
-                "selection_mode": request.selection_mode,
-                "response_thread_url": request.response_thread_url,
-            },
-        )
+        workflow_request = self._build_workflow_request(request)
+        if isinstance(workflow_request, HpaChangeSubmissionResult):
+            return workflow_request
         try:
-            job, created = self.workflow.submit(workflow_request)
+            if request.continuation_of_request_id:
+                job, created = self.workflow.submit_continuation(
+                    workflow_request,
+                    parent_task_id=request.continuation_of_request_id,
+                )
+            else:
+                job, created = self.workflow.submit(workflow_request)
+        except InvalidHpaChangeContinuation:
+            # 다른 process가 같은 부모를 먼저 이어받은 경우 새 작업을 중복 생성하지 않는다.
+            latest = self.store.get_latest_job_by_thread(
+                request.workspace_id,
+                request.channel_id,
+                request.thread_ts,
+            )
+            return HpaChangeSubmissionResult(
+                status=HpaChangeSubmissionStatus.REJECTED,
+                request_id=latest.task_id if latest is not None else "",
+                user_message="이 스레드의 추가 답변은 다른 HPA 작업이 먼저 이어받았어",
+            )
         except Exception as exc:
-            # GitHub 오류 원문에는 응답이나 credential이 포함될 수 있어
-            # type만 기록한다.
+            # GitHub 오류 원문에는 응답이나 credential이 포함될 수 있어 type만 기록한다.
             actual_logger = self.logger or logging.getLogger(__name__)
             actual_logger.warning(
                 "Failed to submit HPA change workflow error_type=%s",
@@ -141,12 +372,17 @@ class HpaChangeRuntime:
             )
 
         if created:
+            continuation_message = (
+                "추가 답변을 기존 요청과 합쳐 새 격리 worker에 전달했어. "
+                if request.continuation_of_request_id
+                else "격리 worker에 전달했어. "
+            )
             return HpaChangeSubmissionResult(
                 status=HpaChangeSubmissionStatus.ACCEPTED,
                 request_id=job.task_id,
                 user_message=(
-                    "격리 worker에 전달했어. "
-                    "진행 상황과 PR은 이 스레드에 알릴게"
+                    continuation_message
+                    + "진행 상황과 PR은 이 스레드에 알릴게"
                 ),
             )
         return HpaChangeSubmissionResult(

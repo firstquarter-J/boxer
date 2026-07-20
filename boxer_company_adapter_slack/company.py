@@ -267,7 +267,10 @@ def create_app() -> App:
                 logger=logger,
             ),
             hpa_change_runtime.routes_config,
-            HpaChangeRoutesDeps(submit_request=hpa_change_runtime.submit_request),
+            HpaChangeRoutesDeps(
+                submit_request=hpa_change_runtime.submit_request,
+                lookup_thread_job=hpa_change_runtime.lookup_thread_job,
+            ),
         ):
             return
 
