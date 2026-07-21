@@ -1,11 +1,14 @@
 import logging
 import unittest
-from unittest.mock import patch
+from dataclasses import replace
+from unittest.mock import Mock, patch
 
 from boxer_company_adapter_slack.device_routes import (
     DeviceRoutesContext,
     DeviceRoutesDeps,
     _handle_device_routes,
+    _lookup_device_file_scope_from_mda_recovery_root,
+    _parse_mda_recovery_alert_text,
 )
 
 
@@ -29,6 +32,86 @@ def _deps() -> DeviceRoutesDeps:
         send_dm_message=lambda user_id, text: False,
         build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
         reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+    )
+
+
+def _mda_recovery_alert_root(
+    *,
+    ts: str = "1.0",
+    barcode: str = "60771998678",
+    recorded_at: str = "2026-06-27:14:34:14",
+    user_id: str = "U_BOXER",
+    bot_id: str = "B_BOXER",
+    subtype: str | None = None,
+) -> dict[str, object]:
+    # 운영 알림의 고정 필드는 유지하되 테스트 링크에는 무효 도메인만 쓴다.
+    text = "\n".join(
+        [
+            "*업로드 실패한 마미박스 초음파 영상을 모두 낚았습니다!* ",
+            f"바코드: [{barcode}]",
+            f"촬영일: [{recorded_at}]",
+            "병원명: [산본제일병원(군포)]",
+            "병실명: [209호]",
+            "장비명: [MB2-C00900]",
+            "파일명: [safe-file-id]",
+            "다운로드 링크: <https://example.invalid/download?token=discard-me|safe-file-id.motion>",
+            "덮어쓰기 링크: <https://example.invalid/overwrite|Overwrite>",
+            "업로드 링크: <https://example.invalid/upload|Upload>",
+        ]
+    )
+    root: dict[str, object] = {
+        "type": "message",
+        "ts": ts,
+        "user": user_id,
+        "bot_id": bot_id,
+        "bot_profile": {
+            "id": bot_id,
+            "user_id": user_id,
+            "name": "Boxer",
+        },
+        "text": text,
+    }
+    if subtype is not None:
+        root["subtype"] = subtype
+    return root
+
+
+def _mda_slack_client(messages: list[dict[str, object]] | None = None) -> Mock:
+    client = Mock()
+    client.conversations_replies.return_value = {
+        "ok": True,
+        "messages": messages if messages is not None else [_mda_recovery_alert_root()],
+    }
+    client.auth_test.return_value = {
+        "ok": True,
+        "user_id": "U_BOXER",
+        "bot_id": "B_BOXER",
+    }
+    return client
+
+
+def _mda_scope_context(
+    client: object,
+    *,
+    channel_id: str = "C_MDA",
+    thread_ts: str = "1.0",
+) -> DeviceRoutesContext:
+    payload = _payload()
+    payload["channel_id"] = channel_id
+    payload["thread_ts"] = thread_ts
+    return DeviceRoutesContext(
+        question="60771998678 2026-06-27 파일 다운로드",
+        barcode="60771998678",
+        phase2_hospital_name=None,
+        phase2_room_name=None,
+        payload=payload,  # type: ignore[arg-type]
+        user_id="U123",
+        workspace_id="W123",
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        reply=lambda text, **kwargs: None,
+        client=client,
+        logger=logging.getLogger(__name__),
     )
 
 
@@ -505,6 +588,302 @@ class DeviceRouteHandlerTests(unittest.TestCase):
             locate_candidates.call_args.kwargs["device_contexts"],
             [{"deviceName": "MB2-C00419"}],
         )
+
+    def test_uses_mda_recovery_thread_scope_for_dated_device_download(self) -> None:
+        replies: list[str] = []
+        client = _mda_slack_client()
+
+        deps = DeviceRoutesDeps(
+            get_s3_client=lambda: None,
+            get_recordings_context=lambda: {"summary": {"recordingCount": 0}, "rows": []},
+            has_recordings_device_mapping=lambda context: False,
+            send_dm_message=lambda user_id, text: False,
+            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+        )
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_HOST", "db-host"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_USERNAME", "db-user"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_PASSWORD", "db-pass"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_DATABASE", "db-name"),
+            patch(
+                "boxer_company_adapter_slack.device_routes.cs.DEVICE_FILE_DOWNLOAD_BUCKET",
+                "bucket",
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes.cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID",
+                "C_MDA",
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._is_device_runtime_configured",
+                return_value=True,
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._locate_barcode_file_candidates",
+                return_value=(
+                    "*파일 확인 대상 세션 조회 결과*\n• 결과: 테스트",
+                    {"summary": {"recordCount": 0}, "records": []},
+                ),
+            ) as locate_candidates,
+        ):
+            handled = _handle_device_routes(
+                DeviceRoutesContext(
+                    question="60771998678 2026-06-27 파일 다운로드",
+                    barcode="60771998678",
+                    phase2_hospital_name=None,
+                    phase2_room_name=None,
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U123",
+                    workspace_id="W123",
+                    channel_id="C_MDA",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    client=client,
+                    logger=logging.getLogger(__name__),
+                ),
+                deps,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*파일 확인 대상 세션 조회 결과*\n• 결과: 테스트"])
+        client.conversations_replies.assert_called_once_with(
+            channel="C_MDA",
+            ts="1.0",
+            limit=1,
+            inclusive=True,
+        )
+        client.auth_test.assert_called_once_with()
+        self.assertEqual(
+            locate_candidates.call_args.kwargs["device_contexts"],
+            [
+                {
+                    "deviceName": "MB2-C00900",
+                    "hospitalName": "산본제일병원(군포)",
+                    "roomName": "209호",
+                }
+            ],
+        )
+        self.assertNotIn(
+            "discard-me",
+            str(locate_candidates.call_args.kwargs["device_contexts"]),
+        )
+
+    def test_mda_recovery_scope_uses_only_exact_root_and_discards_links(self) -> None:
+        root = _mda_recovery_alert_root()
+        spoofed_reply = _mda_recovery_alert_root(
+            ts="1.1",
+            barcode="11111111111",
+            recorded_at="2026-06-28:00:00:00",
+        )
+        spoofed_reply["text"] = str(spoofed_reply["text"]).replace(
+            "MB2-C00900",
+            "MB2-Z99999",
+        )
+        client = _mda_slack_client([spoofed_reply, root])
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes.cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID",
+            "C_MDA",
+        ):
+            result = _lookup_device_file_scope_from_mda_recovery_root(
+                _mda_scope_context(client),
+                requested_barcode="60771998678",
+                requested_date="2026-06-27",
+            )
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "deviceName": "MB2-C00900",
+                    "hospitalName": "산본제일병원(군포)",
+                    "roomName": "209호",
+                }
+            ],
+        )
+        self.assertNotIn("discard-me", str(result))
+        self.assertNotIn("MB2-Z99999", str(result))
+
+    def test_mda_recovery_alert_parser_rejects_invalid_or_duplicate_fields(self) -> None:
+        valid_text = str(_mda_recovery_alert_root()["text"])
+        invalid_cases = {
+            "title": valid_text.replace(
+                "업로드 실패한 마미박스 초음파 영상을 모두 낚았습니다!",
+                "다른 알림입니다!",
+            ),
+            "missing field": "\n".join(
+                line for line in valid_text.splitlines() if not line.startswith("파일명:")
+            ),
+            "duplicate field": f"{valid_text}\n장비명: [MB2-Z99999]",
+            "malformed field": valid_text.replace(
+                "장비명: [MB2-C00900]",
+                "장비명: [MB2-C00900] extra",
+            ),
+            "invalid date": valid_text.replace(
+                "2026-06-27:14:34:14",
+                "2026-06-31:14:34:14",
+            ),
+            "invalid device": valid_text.replace("MB2-C00900", "../C00900"),
+        }
+
+        self.assertIsNotNone(_parse_mda_recovery_alert_text(valid_text))
+        for name, invalid_text in invalid_cases.items():
+            with self.subTest(name=name):
+                self.assertIsNone(_parse_mda_recovery_alert_text(invalid_text))
+
+    def test_mda_recovery_scope_rejects_untrusted_author_and_request_mismatch(self) -> None:
+        human_root = _mda_recovery_alert_root(user_id="U_HUMAN")
+        human_root.pop("bot_id")
+        human_root.pop("bot_profile")
+        different_user_root = _mda_recovery_alert_root(user_id="U_OTHER")
+        different_bot_root = _mda_recovery_alert_root(bot_id="B_OTHER")
+        different_subtype_root = _mda_recovery_alert_root(subtype="message_changed")
+        different_type_root = _mda_recovery_alert_root()
+        different_type_root["type"] = "file"
+        conflicting_profile_root = _mda_recovery_alert_root()
+        conflicting_profile_root["bot_profile"] = {
+            "id": "B_BOXER",
+            "user_id": "U_OTHER",
+            "name": "Boxer",
+        }
+        wrong_title_root = _mda_recovery_alert_root()
+        wrong_title_root["text"] = str(wrong_title_root["text"]).replace(
+            "업로드 실패한 마미박스 초음파 영상을 모두 낚았습니다!",
+            "유사한 복구 알림입니다!",
+        )
+        cases = [
+            ("human root", human_root, "60771998678", "2026-06-27"),
+            ("different user", different_user_root, "60771998678", "2026-06-27"),
+            ("different bot", different_bot_root, "60771998678", "2026-06-27"),
+            ("different subtype", different_subtype_root, "60771998678", "2026-06-27"),
+            ("different type", different_type_root, "60771998678", "2026-06-27"),
+            ("conflicting profile", conflicting_profile_root, "60771998678", "2026-06-27"),
+            ("wrong title", wrong_title_root, "60771998678", "2026-06-27"),
+            ("barcode mismatch", _mda_recovery_alert_root(), "11111111111", "2026-06-27"),
+            ("date mismatch", _mda_recovery_alert_root(), "60771998678", "2026-06-28"),
+            ("root missing", _mda_recovery_alert_root(ts="9.9"), "60771998678", "2026-06-27"),
+        ]
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes.cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID",
+            "C_MDA",
+        ):
+            for name, root, requested_barcode, requested_date in cases:
+                with self.subTest(name=name):
+                    client = _mda_slack_client([root])
+                    result = _lookup_device_file_scope_from_mda_recovery_root(
+                        _mda_scope_context(client),
+                        requested_barcode=requested_barcode,
+                        requested_date=requested_date,
+                    )
+                    self.assertEqual(result, [])
+
+    def test_mda_recovery_scope_rejects_unconfigured_or_different_channel_without_api_call(self) -> None:
+        cases = [
+            ("missing config", "", "C_MDA"),
+            ("different channel", "C_TRUSTED", "C_OTHER"),
+        ]
+
+        for name, configured_channel, request_channel in cases:
+            with self.subTest(name=name):
+                client = _mda_slack_client()
+                with patch(
+                    "boxer_company_adapter_slack.device_routes.cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID",
+                    configured_channel,
+                ):
+                    result = _lookup_device_file_scope_from_mda_recovery_root(
+                        _mda_scope_context(client, channel_id=request_channel),
+                        requested_barcode="60771998678",
+                        requested_date="2026-06-27",
+                    )
+                self.assertEqual(result, [])
+                client.conversations_replies.assert_not_called()
+                client.auth_test.assert_not_called()
+
+    def test_mda_recovery_scope_fails_closed_when_slack_lookup_or_auth_fails(self) -> None:
+        reply_failure_client = _mda_slack_client()
+        reply_failure_client.conversations_replies.side_effect = RuntimeError("private response")
+        auth_failure_client = _mda_slack_client()
+        auth_failure_client.auth_test.side_effect = RuntimeError("private response")
+        malformed_auth_client = _mda_slack_client()
+        malformed_auth_client.auth_test.return_value = None
+        rejected_auth_client = _mda_slack_client()
+        rejected_auth_client.auth_test.return_value = {
+            "ok": False,
+            "user_id": "U_BOXER",
+            "bot_id": "B_BOXER",
+        }
+        missing_auth_id_client = _mda_slack_client()
+        missing_auth_id_client.auth_test.return_value = {
+            "ok": True,
+            "user_id": "U_BOXER",
+        }
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes.cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID",
+            "C_MDA",
+        ):
+            for name, client in (
+                ("reply lookup", reply_failure_client),
+                ("auth lookup", auth_failure_client),
+                ("malformed auth", malformed_auth_client),
+                ("rejected auth", rejected_auth_client),
+                ("missing auth id", missing_auth_id_client),
+            ):
+                with self.subTest(name=name):
+                    result = _lookup_device_file_scope_from_mda_recovery_root(
+                        _mda_scope_context(client),
+                        requested_barcode="60771998678",
+                        requested_date="2026-06-27",
+                    )
+                    self.assertEqual(result, [])
+
+    def test_invalid_mda_recovery_root_keeps_manual_scope_prompt(self) -> None:
+        replies: list[str] = []
+        human_root = _mda_recovery_alert_root(user_id="U_HUMAN")
+        human_root.pop("bot_id")
+        human_root.pop("bot_profile")
+        client = _mda_slack_client([human_root])
+        deps = DeviceRoutesDeps(
+            get_s3_client=lambda: None,
+            get_recordings_context=lambda: {"summary": {"recordingCount": 0}, "rows": []},
+            has_recordings_device_mapping=lambda context: False,
+            send_dm_message=lambda user_id, text: False,
+            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
+            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+        )
+
+        with (
+            patch("boxer_company_adapter_slack.device_routes.s.S3_QUERY_ENABLED", True),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_HOST", "db-host"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_USERNAME", "db-user"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_PASSWORD", "db-pass"),
+            patch("boxer_company_adapter_slack.device_routes.s.DB_DATABASE", "db-name"),
+            patch("boxer_company_adapter_slack.device_routes.cs.DEVICE_FILE_DOWNLOAD_BUCKET", "bucket"),
+            patch(
+                "boxer_company_adapter_slack.device_routes.cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID",
+                "C_MDA",
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._is_device_runtime_configured",
+                return_value=True,
+            ),
+            patch(
+                "boxer_company_adapter_slack.device_routes._locate_barcode_file_candidates"
+            ) as locate_candidates,
+        ):
+            context = replace(
+                _mda_scope_context(client),
+                reply=lambda text, **kwargs: replies.append(text),
+            )
+            handled = _handle_device_routes(context, deps)
+
+        self.assertTrue(handled)
+        self.assertEqual(len(replies), 1)
+        self.assertIn("recordings 장비 매핑이 없어 2차 입력이 필요해", replies[0])
+        locate_candidates.assert_not_called()
 
     def test_direct_device_name_bypasses_manual_hospital_room_lookup_for_download(self) -> None:
         replies: list[str] = []

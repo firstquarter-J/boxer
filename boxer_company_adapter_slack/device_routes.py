@@ -1,5 +1,7 @@
 import logging
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 import pymysql
@@ -11,7 +13,10 @@ from boxer.core import settings as s
 from boxer.core.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.notion_playbooks import _select_notion_references
-from boxer_company.routers.barcode_log import _extract_device_name_scope, _extract_log_date_with_presence
+from boxer_company.routers.barcode_log import (
+    _extract_device_name_scope,
+    _extract_log_date_with_presence,
+)
 from boxer_company.routers.box_db import (
     _lookup_device_contexts_by_barcode_on_date,
     _lookup_device_contexts_by_hospital_room,
@@ -182,6 +187,175 @@ def _build_device_download_date_required_message() -> str:
         "11자리 바코드랑 날짜를 같이 보내줘. "
         "예: `12345678910 2026-04-28 영상 다운로드`"
     )
+
+
+_MDA_RECOVERY_ALERT_TITLE = "업로드 실패한 마미박스 초음파 영상을 모두 낚았습니다!"
+_MDA_RECOVERY_ALERT_FIELDS = frozenset(
+    {"바코드", "촬영일", "병원명", "병실명", "장비명", "파일명"}
+)
+_MDA_RECOVERY_ALERT_FIELD_LINE_PATTERN = re.compile(
+    r"^[ \t]*(바코드|촬영일|병원명|병실명|장비명|파일명)[ \t]*:[ \t]*\[([^\]\r\n]+)\][ \t]*$"
+)
+_MDA_RECOVERY_ALERT_FIELD_PREFIX_PATTERN = re.compile(
+    r"^[ \t]*(바코드|촬영일|병원명|병실명|장비명|파일명)[ \t]*:"
+)
+_MDA_RECOVERY_ALERT_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+
+
+def _parse_mda_recovery_alert_text(text: str) -> dict[str, str] | None:
+    lines = str(text or "").strip().splitlines()
+    if not lines:
+        return None
+
+    # 링크와 emoji는 보지 않고, MDA가 고정 포맷으로 쓰는 제목과 필드만 검증한다.
+    normalized_title = lines[0].strip().strip("*").strip()
+    if normalized_title != _MDA_RECOVERY_ALERT_TITLE:
+        return None
+
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        prefix_match = _MDA_RECOVERY_ALERT_FIELD_PREFIX_PATTERN.match(line)
+        if not prefix_match:
+            continue
+        field_match = _MDA_RECOVERY_ALERT_FIELD_LINE_PATTERN.fullmatch(line)
+        if not field_match:
+            return None
+        field_name = field_match.group(1)
+        if field_name in fields:
+            return None
+        fields[field_name] = field_match.group(2).strip()
+
+    if frozenset(fields) != _MDA_RECOVERY_ALERT_FIELDS:
+        return None
+    if not re.fullmatch(r"\d{11}", fields["바코드"]):
+        return None
+    try:
+        datetime.strptime(fields["촬영일"], "%Y-%m-%d:%H:%M:%S")
+    except ValueError:
+        return None
+    if not (
+        1 <= len(fields["병원명"]) <= 200
+        and 1 <= len(fields["병실명"]) <= 200
+        and fields["병원명"].isprintable()
+        and fields["병실명"].isprintable()
+    ):
+        return None
+    if not (
+        len(fields["장비명"]) <= 64
+        and cs.S3_DEVICE_NAME_PATTERN.fullmatch(fields["장비명"])
+    ):
+        return None
+    if not _MDA_RECOVERY_ALERT_FILE_NAME_PATTERN.fullmatch(fields["파일명"]):
+        return None
+    return fields
+
+
+def _is_mda_recovery_alert_from_current_bot(
+    client: Any,
+    root_message: dict[str, Any],
+    logger: logging.Logger,
+) -> bool:
+    if root_message.get("type") != "message":
+        return False
+    # 최신 Slack bot message에는 subtype이 없을 수 있다. 값이 있다면 bot_message만 허용한다.
+    subtype = str(root_message.get("subtype") or "").strip()
+    if subtype and subtype != "bot_message":
+        return False
+
+    try:
+        auth = client.auth_test()
+    except Exception as exc:
+        # Slack 오류 메시지에 응답 원문이 섞일 수 있어 오류 종류만 남긴다.
+        logger.warning(
+            "Failed to validate MDA recovery alert author error_type=%s",
+            type(exc).__name__,
+        )
+        return False
+    if not hasattr(auth, "get"):
+        return False
+
+    current_user_id = str(auth.get("user_id") or "").strip()
+    current_bot_id = str(auth.get("bot_id") or "").strip()
+    if not current_user_id or not current_bot_id or auth.get("ok") is False:
+        return False
+
+    bot_profile = root_message.get("bot_profile")
+    if not isinstance(bot_profile, dict):
+        bot_profile = {}
+    root_user_ids = {
+        str(value).strip()
+        for value in (root_message.get("user"), bot_profile.get("user_id"))
+        if str(value or "").strip()
+    }
+    root_bot_ids = {
+        str(value).strip()
+        for value in (root_message.get("bot_id"), bot_profile.get("id"))
+        if str(value or "").strip()
+    }
+    return root_user_ids == {current_user_id} and root_bot_ids == {current_bot_id}
+
+
+def _lookup_device_file_scope_from_mda_recovery_root(
+    context: DeviceRoutesContext,
+    *,
+    requested_barcode: str,
+    requested_date: str,
+) -> list[dict[str, Any]]:
+    trusted_channel_id = str(cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID or "").strip()
+    if (
+        not context.client
+        or not trusted_channel_id
+        or context.channel_id != trusted_channel_id
+        or not context.thread_ts
+    ):
+        return []
+
+    try:
+        response = context.client.conversations_replies(
+            channel=context.channel_id,
+            ts=context.thread_ts,
+            limit=1,
+            inclusive=True,
+        )
+        messages = response.get("messages") or []
+    except Exception as exc:
+        # 실패 시 일반 2차 입력으로 되돌리고 Slack 응답 본문은 로그에 남기지 않는다.
+        context.logger.warning(
+            "Failed to load MDA recovery alert root error_type=%s",
+            type(exc).__name__,
+        )
+        return []
+
+    # 답글에 같은 필드를 써도 신뢰하지 않고, thread_ts와 정확히 같은 root만 고른다.
+    root_message = next(
+        (
+            message
+            for message in messages
+            if isinstance(message, dict)
+            and str(message.get("ts") or "") == str(context.thread_ts)
+        ),
+        None,
+    )
+    if not root_message or not _is_mda_recovery_alert_from_current_bot(
+        context.client,
+        root_message,
+        context.logger,
+    ):
+        return []
+
+    fields = _parse_mda_recovery_alert_text(str(root_message.get("text") or ""))
+    if not fields:
+        return []
+    if fields["바코드"] != requested_barcode or fields["촬영일"][:10] != requested_date:
+        return []
+
+    return [
+        {
+            "deviceName": fields["장비명"],
+            "hospitalName": fields["병원명"],
+            "roomName": fields["병실명"],
+        }
+    ]
 
 
 def _normalize_daily_device_round_control_question(question: str) -> str:
@@ -653,6 +827,12 @@ def _handle_device_routes(
                     if recording_count > 0
                     else []
                 )
+                if not resolved_device_contexts:
+                    resolved_device_contexts = _lookup_device_file_scope_from_mda_recovery_root(
+                        context,
+                        requested_barcode=barcode or "",
+                        requested_date=log_date,
+                    )
                 if not resolved_device_contexts:
                     context.reply(
                         _build_device_file_scope_request_message(
