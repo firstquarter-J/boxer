@@ -444,6 +444,8 @@ def _build_captureboard_notification_alert_summary(
                 "deviceName": device_name,
                 "overallLabel": "이상",
                 "priorityReason": issue,
+                # 이벤트 코드를 사용자 영향 중심의 공통 Slack 제목 범주로 전달한다.
+                "alertCategory": "video_signal",
                 "componentLabels": {
                     "audio": "정상",
                     "pm2": "정상",
@@ -513,6 +515,8 @@ def _build_segmented_recordings_merge_alert_summary(
                 "deviceName": device_name,
                 "overallLabel": "이상",
                 "priorityReason": issue,
+                # 병합 구현명보다 사용자가 이해하기 쉬운 녹화 파일 처리 범주로 표시한다.
+                "alertCategory": "recording_processing",
                 # 병합 실패만으로 캡처보드나 저장장치 원인을 단정하지 않는다.
                 "componentLabels": {
                     "audio": "정상",
@@ -728,6 +732,8 @@ def _build_recording_stall_alert_summary(
                 "deviceName": context["deviceName"],
                 "overallLabel": "이상",
                 "priorityReason": issue,
+                # 파일 증가 정지는 원인이 확정되지 않았으므로 녹화 상태 확인으로 안내한다.
+                "alertCategory": "recording",
                 # 원인은 아직 특정하지 않았으므로 캡처보드나 저장장치 이상으로 표시하지 않는다.
                 "componentLabels": {
                     "audio": "정상",

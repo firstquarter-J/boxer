@@ -224,6 +224,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             alert_summary = post_mock.call_args.args[1]
             device_result = alert_summary["deviceResults"][0]
             self.assertEqual(device_result["deviceName"], "MB2-C00992")
+            self.assertEqual(device_result["alertCategory"], "video_signal")
             self.assertEqual(device_result["componentLabels"]["captureboard"], "이상")
             self.assertIn("2026-07-09 12:34:31 KST", device_result["priorityReason"])
             self.assertNotIn("`2026-07-09", device_result["priorityReason"])
@@ -439,6 +440,18 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 device_result["componentLabels"]["captureboard"],
                 "정상",
             )
+            self.assertEqual(device_result["alertCategory"], "recording_processing")
+            merge_blocks = (
+                daily_device_round_reporter._build_daily_device_round_abnormal_alert_blocks(
+                    alert_summary,
+                    permalink=None,
+                    include_actions=False,
+                )
+            )
+            self.assertEqual(
+                merge_blocks[0]["text"]["text"],
+                ":alert: 녹화 파일 처리 확인 필요",
+            )
             self.assertEqual(post_mock.call_args.kwargs["channel_id"], "C094UC05PQW")
             self.assertTrue(post_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_mock.call_args.kwargs["include_actions"])
@@ -521,6 +534,10 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertTrue(post_root_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_root_mock.call_args.kwargs["include_actions"])
             root_summary = post_root_mock.call_args.args[1]
+            self.assertEqual(
+                root_summary["deviceResults"][0]["alertCategory"],
+                "recording",
+            )
             root_issue = root_summary["deviceResults"][0]["priorityReason"]
             self.assertEqual(
                 root_issue,
@@ -538,6 +555,10 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(
                 [block["type"] for block in root_blocks],
                 ["header", "section", "section", "section"],
+            )
+            self.assertEqual(
+                root_blocks[0]["text"]["text"],
+                ":alert: 녹화 상태 확인 필요",
             )
             self.assertTrue(
                 root_blocks[1]["fields"][0]["text"].startswith("⚙️ *장비*\n")

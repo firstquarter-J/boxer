@@ -44,7 +44,25 @@ _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
 _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
 _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
-_DEVICE_HEALTH_ALERT_HEADER_TEXT = ":alert: *장비 이상 감지*"
+_DEVICE_HEALTH_ALERT_DEFAULT_TITLE = "장비 상태 확인 필요"
+_DEVICE_HEALTH_ALERT_CATEGORY_TITLES = {
+    "recording": "녹화 상태 확인 필요",
+    "recording_processing": "녹화 파일 처리 확인 필요",
+    "video_signal": "영상 신호 확인 필요",
+    "led": "LED 연결 확인 필요",
+    "audio": "음성 출력 확인 필요",
+    "application": "장비 앱 실행 확인 필요",
+    "storage": "장비 저장 공간 부족",
+    "device_connection": "장비 연결 확인 필요",
+    "upload": "영상 업로드 확인 필요",
+}
+_DEVICE_HEALTH_ALERT_COMPONENT_CATEGORIES = {
+    "audio": "audio",
+    "pm2": "application",
+    "storage": "storage",
+    "captureboard": "video_signal",
+    "led": "led",
+}
 _DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
 _DEVICE_HEALTH_ALERT_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
@@ -649,6 +667,11 @@ def _collect_daily_device_round_abnormal_alert_items(
             device_result,
             issue=issue,
         )
+        alert_category = _resolve_device_health_alert_category(
+            device_result,
+            problem_components=problem_components,
+            issue=issue,
+        )
         device_name = _display_value(device_result.get("deviceName"), default="장비명 미확인")
         items.append(
             {
@@ -662,6 +685,7 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "smsPhoneNumber": _display_value(device_result.get("smsPhoneNumber"), default=""),
                 "smsMessage": _display_value(device_result.get("smsMessage"), default=""),
                 "smsTemplateId": _display_value(device_result.get("smsTemplateId"), default=""),
+                "alertCategory": alert_category,
                 "problemComponents": problem_components,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
@@ -677,6 +701,94 @@ def _collect_daily_device_round_abnormal_alert_items(
         )
 
     return items
+
+
+def _resolve_device_health_alert_category(
+    device_result: dict[str, Any],
+    *,
+    problem_components: list[str],
+    issue: str,
+) -> str:
+    explicit_category = _display_value(device_result.get("alertCategory"), default="")
+    if explicit_category in _DEVICE_HEALTH_ALERT_CATEGORY_TITLES:
+        return explicit_category
+
+    component_labels = (
+        device_result.get("componentLabels")
+        if isinstance(device_result.get("componentLabels"), dict)
+        else {}
+    )
+    # 확정 이상인 구성 요소를 우선하고, 레거시 payload만 문제 장치와 문구로 보강해.
+    abnormal_categories = {
+        category
+        for component, category in _DEVICE_HEALTH_ALERT_COMPONENT_CATEGORIES.items()
+        if _display_value(component_labels.get(component), default="") == "이상"
+    }
+    if len(abnormal_categories) == 1:
+        return next(iter(abnormal_categories))
+    if len(abnormal_categories) > 1:
+        return "mixed"
+
+    component_category_by_label = {
+        "캡처보드": "video_signal",
+        "LED": "led",
+        "스피커": "audio",
+        "PM2": "application",
+    }
+    legacy_categories = {
+        component_category_by_label[component]
+        for component in problem_components
+        if component in component_category_by_label
+    }
+    if len(legacy_categories) == 1:
+        return next(iter(legacy_categories))
+    if len(legacy_categories) > 1:
+        return "mixed"
+
+    issue_text = _display_value(issue, default="")
+    lowered_issue = issue_text.lower()
+    # 명시적 코드나 구성 요소가 없는 과거 결과도 사용자 영향 기준 제목으로 분류해.
+    keyword_categories = (
+        ("recording_processing", ("병합", "ffmpeg")),
+        ("upload", ("업로드", "upload")),
+        ("recording", ("녹화", "recording")),
+        ("storage", ("저장 공간", "디스크", "용량", "storage", "disk")),
+        ("device_connection", ("오프라인", "연결 끊", "연결이 끊", "offline", "disconnect")),
+        ("video_signal", ("캡처보드", "비디오 장치", "영상 신호", "captureboard")),
+        ("led", ("led", "엘이디")),
+        ("audio", ("스피커", "오디오", "소리", "audio", "speaker")),
+        ("application", ("pm2", "프로세스")),
+    )
+    for category, keywords in keyword_categories:
+        if any(keyword in lowered_issue for keyword in keywords):
+            return category
+    return ""
+
+
+def _build_device_health_alert_title(alert_items: list[dict[str, Any]]) -> str:
+    categories = [
+        _display_value(item.get("alertCategory"), default="")
+        for item in alert_items
+    ]
+    # 미분류 항목이나 여러 장애 유형이 섞이면 일부만 대표하지 않도록 공통 제목으로 낮춰.
+    if not categories or any(not category for category in categories):
+        return _DEVICE_HEALTH_ALERT_DEFAULT_TITLE
+    unique_categories = set(categories)
+    if len(unique_categories) != 1:
+        return _DEVICE_HEALTH_ALERT_DEFAULT_TITLE
+    return _DEVICE_HEALTH_ALERT_CATEGORY_TITLES.get(
+        next(iter(unique_categories)),
+        _DEVICE_HEALTH_ALERT_DEFAULT_TITLE,
+    )
+
+
+def _format_device_health_alert_header(
+    alert_items: list[dict[str, Any]],
+    *,
+    mrkdwn: bool,
+) -> str:
+    title = _build_device_health_alert_title(alert_items)
+    return f":alert: *{title}*" if mrkdwn else f":alert: {title}"
 
 
 def _build_device_health_alert_problem_components(
@@ -829,8 +941,8 @@ def _build_daily_device_round_abnormal_alert_text(
     permalink: str | None,
 ) -> str:
     alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
-    # Slack 커스텀 경고 이모지로 루트 이상 알림을 통일해 채널에서 바로 눈에 띄게 한다.
-    lines = [_DEVICE_HEALTH_ALERT_HEADER_TEXT]
+    # Slack 커스텀 경고 이모지는 유지하고, 제목은 감지 유형의 사용자 영향에 맞춰 보여줘.
+    lines = [_format_device_health_alert_header(alert_items, mrkdwn=True)]
     if alert_items:
         # 실제 block과 fallback text가 같은 정보 구조를 유지하게 공통 formatter를 사용해.
         for item in alert_items:
@@ -976,7 +1088,11 @@ def _build_daily_device_round_abnormal_alert_blocks(
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": ":alert: 장비 이상 감지", "emoji": True},
+            "text": {
+                "type": "plain_text",
+                "text": _format_device_health_alert_header(alert_items, mrkdwn=False),
+                "emoji": True,
+            },
         }
     ]
 

@@ -334,7 +334,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             client.messages[0]["text"],
             "\n".join(
                 [
-                    ":alert: *장비 이상 감지*",
+                    ":alert: *LED 연결 확인 필요*",
                     "*#69 수지미래산부인과의원(용인)*",
                     "⚙️ *장비*  *<https://mda.kr.mmtalkbox.com/monitoring?focusDevice=MB2-C00043&hospitalSeq=69|MB2-C00043>*  ·  🚪 *병실*  `1진료실`",
                     "",
@@ -350,7 +350,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertFalse(client.messages[0]["unfurl_media"])
         blocks = client.messages[0]["blocks"]
         self.assertEqual(blocks[0]["type"], "header")
-        self.assertEqual(blocks[0]["text"]["text"], ":alert: 장비 이상 감지")
+        self.assertEqual(blocks[0]["text"]["text"], ":alert: LED 연결 확인 필요")
         item_summary_block = blocks[1]
         self.assertEqual(item_summary_block["text"]["text"], "*#69 수지미래산부인과의원(용인)*")
         self.assertEqual(
@@ -414,10 +414,72 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             permalink=None,
         )
 
+        # 여러 장애 유형이 한 카드에 섞이면 일부 구성 요소만 대표 제목으로 쓰지 않아야 해.
+        self.assertTrue(text.startswith(":alert: *장비 상태 확인 필요*"))
         self.assertIn(":rotating_light: *문제 장치*\n`캡처보드` `LED`", text)
         self.assertIn(
             "🔎 *감지 내용*\n`캡처보드 USB나 비디오 장치를 찾지 못했어 / LED USB 장치를 찾지 못했어`",
             text,
+        )
+
+    def test_abnormal_alert_header_matches_single_component_type(self) -> None:
+        expected_titles = {
+            "audio": "음성 출력 확인 필요",
+            "pm2": "장비 앱 실행 확인 필요",
+            "storage": "장비 저장 공간 부족",
+            "captureboard": "영상 신호 확인 필요",
+            "led": "LED 연결 확인 필요",
+        }
+
+        for component, expected_title in expected_titles.items():
+            with self.subTest(component=component):
+                summary = _abnormal_summary()
+                summary["deviceResults"][0]["componentLabels"] = {
+                    key: "이상" if key == component else "정상"
+                    for key in expected_titles
+                }
+
+                text = daily_device_round_reporter._build_daily_device_round_abnormal_alert_text(
+                    summary,
+                    permalink=None,
+                )
+                blocks = daily_device_round_reporter._build_daily_device_round_abnormal_alert_blocks(
+                    summary,
+                    permalink=None,
+                    include_actions=False,
+                )
+
+                # Slack fallback과 Block Kit가 같은 사용자용 제목을 유지하는지 함께 검증해.
+                self.assertTrue(text.startswith(f":alert: *{expected_title}*"))
+                self.assertEqual(
+                    blocks[0]["text"]["text"],
+                    f":alert: {expected_title}",
+                )
+
+    def test_abnormal_alert_header_falls_back_when_known_and_unknown_types_mix(self) -> None:
+        summary = _abnormal_summary()
+        known_result = summary["deviceResults"][0]
+        summary["deviceResults"] = [
+            known_result,
+            {
+                **known_result,
+                "deviceName": "MB2-C00044",
+                "roomName": "2진료실",
+                "priorityReason": "분류되지 않은 장비 상태 코드가 발생했어",
+            },
+        ]
+        summary["statusCounts"]["이상"] = 2
+
+        blocks = daily_device_round_reporter._build_daily_device_round_abnormal_alert_blocks(
+            summary,
+            permalink=None,
+            include_actions=False,
+        )
+
+        # 한 항목이라도 미분류면 알려진 LED 유형만 전체 알림의 제목으로 대표하면 안 돼.
+        self.assertEqual(
+            blocks[0]["text"]["text"],
+            ":alert: 장비 상태 확인 필요",
         )
 
     def test_storage_capacity_is_not_classified_as_problem_device(self) -> None:
