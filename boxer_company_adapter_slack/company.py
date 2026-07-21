@@ -657,6 +657,7 @@ def create_app() -> App:
                 question=question,
                 payload=payload,
                 user_id=user_id,
+                workspace_id=str(payload.get("workspace_id") or "").strip(),
                 channel_id=channel_id,
                 current_ts=current_ts,
                 thread_ts=thread_ts,

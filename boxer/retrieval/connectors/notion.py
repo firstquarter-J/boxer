@@ -1,5 +1,6 @@
-import json
 import hashlib
+import http.client
+import json
 import time
 import urllib.error
 import urllib.parse
@@ -16,11 +17,43 @@ def _resolve_notion_token(token: str | None = None) -> str:
     return (token or s.NOTION_TOKEN_PERSONAL or "").strip()
 
 
+def _notion_token_scope(token: str | None = None) -> str:
+    # 원문 토큰을 캐시 키에 노출하지 않으면서 integration별 캐시를 격리한다.
+    resolved_token = _resolve_notion_token(token)
+    return hashlib.sha256(resolved_token.encode("utf-8")).hexdigest()[:12] if resolved_token else "default"
+
+
 def _notion_cache_key(page_id: str, token: str | None = None) -> str:
     # 같은 page_id라도 integration이 다르면 접근 가능한 workspace가 달라질 수 있어서 캐시를 토큰별로 분리한다.
-    resolved_token = _resolve_notion_token(token)
-    token_scope = hashlib.sha256(resolved_token.encode("utf-8")).hexdigest()[:12] if resolved_token else "default"
-    return f"{token_scope}:{page_id}"
+    return f"{_notion_token_scope(token)}:{page_id}"
+
+
+def _invalidate_notion_page_cache(
+    page_id: str | None = None,
+    *,
+    token: str | None = None,
+    all_tokens: bool = False,
+) -> None:
+    # 특정 integration의 page만 지워 다른 workspace의 동일 page id 캐시는 보존한다.
+    if page_id:
+        normalized_page_id = _normalize_notion_id(page_id)
+        if all_tokens:
+            page_suffix = f":{normalized_page_id}"
+            for cache_key in tuple(_NOTION_PAGE_CACHE):
+                if cache_key.endswith(page_suffix):
+                    _NOTION_PAGE_CACHE.pop(cache_key, None)
+            return
+        _NOTION_PAGE_CACHE.pop(_notion_cache_key(normalized_page_id, token), None)
+        return
+
+    if token is None:
+        _NOTION_PAGE_CACHE.clear()
+        return
+
+    token_prefix = f"{_notion_token_scope(token)}:"
+    for cache_key in tuple(_NOTION_PAGE_CACHE):
+        if cache_key.startswith(token_prefix):
+            _NOTION_PAGE_CACHE.pop(cache_key, None)
 
 
 def _is_notion_configured(token: str | None = None) -> bool:
@@ -69,14 +102,33 @@ def _notion_request(
         headers=_build_notion_headers(token),
         method=method,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=max(1, s.NOTION_API_TIMEOUT_SEC)) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Notion API 오류: {exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Notion API 연결 실패: {exc.reason}") from exc
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=max(1, s.NOTION_API_TIMEOUT_SEC)) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            response_headers = exc.headers
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
+            if exc.code == 429 and attempt < 2:
+                # Notion의 Retry-After를 따라 일회성 rate limit 때문에 전체 조회가 실패하지 않게 한다.
+                raw_retry_after = str((response_headers or {}).get("Retry-After") or "1").strip()
+                try:
+                    retry_after = float(raw_retry_after)
+                except ValueError:
+                    retry_after = 1.0
+                time.sleep(max(0.1, min(10.0, retry_after)))
+                continue
+            raise RuntimeError(f"Notion API 오류: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Notion API 연결 실패: {exc.reason}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # socket reset이나 불완전 응답도 상위 retrieval fallback이 처리할 수 있는 오류로 통일한다.
+            raise RuntimeError(f"Notion API 연결 실패: {exc}") from exc
+
+    raise RuntimeError("Notion API 재시도 횟수를 초과했어")
 
 
 def _fetch_notion_page(page_id: str, *, token: str | None = None) -> dict[str, Any]:
@@ -154,25 +206,45 @@ def _flatten_notion_blocks(blocks: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _fetch_all_notion_blocks(page_id: str, *, token: str | None = None) -> list[dict[str, Any]]:
+def _fetch_all_notion_blocks(
+    page_id: str,
+    *,
+    token: str | None = None,
+    max_blocks: int | None = None,
+) -> list[dict[str, Any]]:
+    # 생략 시 기존 설정 의미(최소 1개)를 유지하고, 명시적인 0만 무제한 조회로 쓴다.
+    if max_blocks is not None and max_blocks < 0:
+        raise ValueError("Notion block limit은 0 이상이어야 해")
+    block_limit = max(1, s.NOTION_MAX_BLOCKS) if max_blocks is None else max_blocks
     blocks: list[dict[str, Any]] = []
     cursor: str | None = None
+    seen_cursors: set[str] = set()
     while True:
         response = _fetch_notion_block_children(
             page_id,
             start_cursor=cursor,
-            page_size=min(100, max(1, s.NOTION_MAX_BLOCKS)),
+            page_size=(
+                100
+                if block_limit <= 0
+                else min(100, max(1, block_limit - len(blocks)))
+            ),
             token=token,
         )
         results = response.get("results", [])
         for result in results:
             if isinstance(result, dict):
                 blocks.append(result)
-                if len(blocks) >= max(1, s.NOTION_MAX_BLOCKS):
+                if block_limit > 0 and len(blocks) >= max(1, block_limit):
                     return blocks
-        if not response.get("has_more") or not response.get("next_cursor"):
+        next_cursor = str(response.get("next_cursor") or "").strip()
+        if not response.get("has_more"):
             return blocks
-        cursor = response.get("next_cursor")
+        if not next_cursor:
+            raise RuntimeError("Notion block pagination cursor가 비어있어")
+        if next_cursor in seen_cursors:
+            raise RuntimeError("Notion block pagination cursor가 반복됐어")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
 
 
 def _load_notion_page_content(page_id: str, *, token: str | None = None) -> dict[str, Any]:

@@ -1,3 +1,4 @@
+import logging
 import re
 import time
 from typing import Any
@@ -6,10 +7,15 @@ from boxer.core import settings as s
 from boxer.retrieval.connectors.notion import (
     _extract_block_text,
     _fetch_all_notion_blocks,
+    _invalidate_notion_page_cache,
     _is_notion_configured,
     _load_notion_page_content_cached,
     _normalize_notion_id,
+    _notion_token_scope,
 )
+from boxer_company import settings as cs
+
+logger = logging.getLogger(__name__)
 
 _RAG_INDEX_HEADING = "RAG 인덱스"
 _RAG_INDEX_LINE_PATTERN = re.compile(
@@ -18,14 +24,10 @@ _RAG_INDEX_LINE_PATTERN = re.compile(
     r"kind=(?P<kind>[^|]+?)\s*\|\s*"
     r"priority=(?P<priority>[^|]+?)\s*\|\s*"
     r"title=(?P<title>[^|]+?)\s*\|\s*"
-    r"keywords=(?P<keywords>.+)$"
+    r"keywords=(?P<keywords>.*)$"
 )
 _NOTION_CACHE_TTL_SEC = 300
-_NOTION_INDEX_CACHE: dict[str, Any] = {
-    "root_page_id": "",
-    "expires_at": 0.0,
-    "entries": [],
-}
+_NOTION_INDEX_CACHE: dict[str, dict[str, Any]] = {}
 _NOTION_OVERVIEW_QUERY_TOKENS = ("설명", "소개", "뭐야", "무엇", "개요", "알려줘")
 _NOTION_OVERVIEW_SECTION_TITLES = (
     "마미박스 장애 대응",
@@ -456,6 +458,42 @@ _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
         ),
     },
 )
+
+
+def _company_notion_token() -> str:
+    # 회사 레이어는 개인 Notion 토큰으로 절대 fallback하지 않는다.
+    return str(cs.NOTION_TOKEN_COMPANY or "").strip()
+
+
+def _resolve_company_notion_token(token: str | None = None) -> str:
+    resolved_token = str(token or "").strip() or _company_notion_token()
+    if not resolved_token:
+        raise RuntimeError("NOTION_TOKEN_COMPANY가 필요해")
+    return resolved_token
+
+
+def _resolve_notion_root_page_id(root_page_id: str | None = None) -> str:
+    # 테스트용 공개 설정과 회사 운영 문서 root를 명확히 분리한다.
+    return str(root_page_id or cs.THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID or "").strip()
+
+
+def _is_company_notion_configured(root_page_id: str | None = None) -> bool:
+    notion_token = _company_notion_token()
+    return bool(
+        notion_token
+        and _resolve_notion_root_page_id(root_page_id)
+        and _is_notion_configured(token=notion_token)
+    )
+
+
+def _notion_index_token_scope(token: str | None = None) -> str:
+    return _notion_token_scope(token)
+
+
+def _notion_index_cache_key(root_page_id: str, token: str | None = None) -> str:
+    return f"{_notion_index_token_scope(token)}:{_normalize_notion_id(root_page_id)}"
+
+
 _NOTION_QUERY_EXPANSIONS = (
     {
         "tokens": (
@@ -843,11 +881,19 @@ def _parse_notion_rag_index_line(text: str) -> dict[str, Any] | None:
     }
 
 
-def _build_fallback_notion_rag_index(root_page_id: str) -> list[dict[str, Any]]:
-    blocks = _fetch_all_notion_blocks(root_page_id)
+def _build_fallback_notion_rag_index(
+    root_page_id: str,
+    *,
+    token: str | None = None,
+    blocks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    notion_token = _resolve_company_notion_token(token)
+    root_blocks = blocks
+    if root_blocks is None:
+        root_blocks = _fetch_all_notion_blocks(root_page_id, token=notion_token, max_blocks=0)
     current_section = ""
     entries: list[dict[str, Any]] = []
-    for block in blocks:
+    for block in root_blocks:
         if not isinstance(block, dict):
             continue
         block_type = block.get("type")
@@ -873,18 +919,19 @@ def _build_fallback_notion_rag_index(root_page_id: str) -> list[dict[str, Any]]:
     return entries
 
 
-def _load_notion_rag_index(root_page_id: str) -> list[dict[str, Any]]:
+def _load_notion_rag_index(root_page_id: str, *, token: str | None = None) -> list[dict[str, Any]]:
+    notion_token = _resolve_company_notion_token(token)
     normalized_root_id = _normalize_notion_id(root_page_id)
+    cache_key = _notion_index_cache_key(normalized_root_id, notion_token)
     now = time.time()
-    if (
-        _NOTION_INDEX_CACHE.get("root_page_id") == normalized_root_id
-        and float(_NOTION_INDEX_CACHE.get("expires_at") or 0) > now
-    ):
-        cached_entries = _NOTION_INDEX_CACHE.get("entries")
+    cached = _NOTION_INDEX_CACHE.get(cache_key)
+    if isinstance(cached, dict) and float(cached.get("expires_at") or 0) > now:
+        cached_entries = cached.get("entries")
         if isinstance(cached_entries, list):
             return cached_entries
 
-    blocks = _fetch_all_notion_blocks(normalized_root_id)
+    # 운영 root의 인덱스는 기본 preview 제한을 넘어갈 수 있으므로 끝까지 읽는다.
+    blocks = _fetch_all_notion_blocks(normalized_root_id, token=notion_token, max_blocks=0)
     entries: list[dict[str, Any]] = []
     in_index = False
     for block in blocks:
@@ -897,7 +944,7 @@ def _load_notion_rag_index(root_page_id: str) -> list[dict[str, Any]]:
             continue
         if not in_index:
             continue
-        if block_type == "heading_1":
+        if block_type in {"heading_1", "heading_2", "heading_3"}:
             break
         if block_type != "bulleted_list_item":
             continue
@@ -905,7 +952,11 @@ def _load_notion_rag_index(root_page_id: str) -> list[dict[str, Any]]:
         if entry is not None:
             entries.append(entry)
 
-    fallback_entries = _build_fallback_notion_rag_index(normalized_root_id)
+    fallback_entries = _build_fallback_notion_rag_index(
+        normalized_root_id,
+        token=notion_token,
+        blocks=blocks,
+    )
     seen_page_ids = {
         _normalize_notion_id(str(entry.get("pageId") or ""))
         for entry in entries
@@ -920,13 +971,10 @@ def _load_notion_rag_index(root_page_id: str) -> list[dict[str, Any]]:
         seen_page_ids.add(page_id)
         entries.append(entry)
 
-    _NOTION_INDEX_CACHE.update(
-        {
-            "root_page_id": normalized_root_id,
-            "expires_at": now + _NOTION_CACHE_TTL_SEC,
-            "entries": entries,
-        }
-    )
+    _NOTION_INDEX_CACHE[cache_key] = {
+        "expires_at": now + _NOTION_CACHE_TTL_SEC,
+        "entries": entries,
+    }
     return entries
 
 
@@ -1062,8 +1110,11 @@ def _is_notion_overview_query(question: str) -> bool:
     return any(token in text for token in _NOTION_OVERVIEW_QUERY_TOKENS)
 
 
-def _build_notion_overview_reference(root_page_id: str) -> dict[str, Any]:
-    payload = _load_notion_page_content_cached(root_page_id)
+def _build_notion_overview_reference(root_page_id: str, *, token: str | None = None) -> dict[str, Any]:
+    payload = _load_notion_page_content_cached(
+        root_page_id,
+        token=_resolve_company_notion_token(token),
+    )
     lines = [str(line or "").strip() for line in (payload.get("lines") or [])]
     preview_lines = [str(payload.get("title") or "").strip() or "마미박스 운영 문서"]
     seen_sections: set[str] = set()
@@ -1112,11 +1163,9 @@ def _select_notion_playbooks(
     root_page_id: str | None = None,
     max_results: int = 3,
 ) -> list[dict[str, Any]]:
-    if not _is_notion_configured():
-        return []
-
-    target_root_page_id = root_page_id or s.NOTION_TEST_PAGE_ID
-    if not target_root_page_id:
+    notion_token = _company_notion_token()
+    target_root_page_id = _resolve_notion_root_page_id(root_page_id)
+    if not _is_company_notion_configured(target_root_page_id):
         return []
 
     route = ""
@@ -1128,7 +1177,7 @@ def _select_notion_playbooks(
         return []
 
     scored_entries: list[tuple[int, dict[str, Any], list[str]]] = []
-    for entry in _load_notion_rag_index(target_root_page_id):
+    for entry in _load_notion_rag_index(target_root_page_id, token=notion_token):
         if not isinstance(entry, dict):
             continue
         score, matched_terms = _score_notion_playbook_entry(entry, query_text, route)
@@ -1152,7 +1201,7 @@ def _select_notion_playbooks(
         if page_id in seen_page_ids:
             continue
         seen_page_ids.add(page_id)
-        page_content = _load_notion_page_content_cached(page_id)
+        page_content = _load_notion_page_content_cached(page_id, token=notion_token)
         preview_lines = _build_notion_preview_lines(
             page_content.get("lines") or [],
             query_text,
@@ -1263,17 +1312,26 @@ def _select_notion_references(
     root_page_id: str | None = None,
     max_results: int = 3,
 ) -> list[dict[str, Any]]:
-    target_root_page_id = root_page_id or s.NOTION_TEST_PAGE_ID
+    notion_token = _company_notion_token()
+    target_root_page_id = _resolve_notion_root_page_id(root_page_id)
     limit = max(1, max_results)
 
     selected: list[dict[str, Any]] = []
     seen_page_ids: set[str] = set()
+    remote_failed = False
 
-    if _is_notion_configured() and target_root_page_id and _is_notion_overview_query(question):
-        overview_reference = _build_notion_overview_reference(target_root_page_id)
-        overview_page_id = _resolve_playbook_page_id(overview_reference.get("pageId"))
-        seen_page_ids.add(overview_page_id)
-        selected.append(overview_reference)
+    notion_configured = _is_company_notion_configured(target_root_page_id)
+    if notion_configured and _is_notion_overview_query(question):
+        try:
+            overview_reference = _build_notion_overview_reference(target_root_page_id, token=notion_token)
+        except (RuntimeError, TimeoutError, ValueError):
+            # 원격 문서 장애가 로컬 운영 플레이북 답변까지 막지 않게 격리한다.
+            logger.warning("Failed to load company Notion overview", exc_info=True)
+            remote_failed = True
+        else:
+            overview_page_id = _resolve_playbook_page_id(overview_reference.get("pageId"))
+            seen_page_ids.add(overview_page_id)
+            selected.append(overview_reference)
 
     local_playbooks = _select_local_playbooks(
         question,
@@ -1291,13 +1349,17 @@ def _select_notion_references(
         if len(selected) >= limit:
             return selected[:limit]
 
-    if _is_notion_configured() and target_root_page_id:
-        playbooks = _select_notion_playbooks(
-            question,
-            evidence_payload=evidence_payload,
-            root_page_id=target_root_page_id,
-            max_results=limit,
-        )
+    if notion_configured and not remote_failed:
+        try:
+            playbooks = _select_notion_playbooks(
+                question,
+                evidence_payload=evidence_payload,
+                root_page_id=target_root_page_id,
+                max_results=limit,
+            )
+        except (RuntimeError, TimeoutError, ValueError):
+            logger.warning("Failed to load company Notion playbooks", exc_info=True)
+            playbooks = []
     else:
         playbooks = []
 
@@ -1315,7 +1377,11 @@ def _select_notion_references(
     return selected[:limit]
 
 
-def _invalidate_notion_playbook_cache(root_page_id: str | None = None) -> None:
+def _invalidate_notion_playbook_cache(
+    root_page_id: str | None = None,
+    *,
+    token: str | None = None,
+) -> None:
     normalized_root_id = ""
     if root_page_id:
         try:
@@ -1323,11 +1389,29 @@ def _invalidate_notion_playbook_cache(root_page_id: str | None = None) -> None:
         except ValueError:
             normalized_root_id = ""
 
-    if not normalized_root_id or _NOTION_INDEX_CACHE.get("root_page_id") == normalized_root_id:
-        _NOTION_INDEX_CACHE.update(
-            {
-                "root_page_id": "",
-                "expires_at": 0.0,
-                "entries": [],
-            }
+    if normalized_root_id and token is not None:
+        _NOTION_INDEX_CACHE.pop(_notion_index_cache_key(normalized_root_id, token), None)
+    elif normalized_root_id:
+        root_suffix = f":{normalized_root_id}"
+        for cache_key in tuple(_NOTION_INDEX_CACHE):
+            if cache_key.endswith(root_suffix):
+                _NOTION_INDEX_CACHE.pop(cache_key, None)
+    elif token is not None:
+        token_prefix = f"{_notion_index_token_scope(token)}:"
+        for cache_key in tuple(_NOTION_INDEX_CACHE):
+            if cache_key.startswith(token_prefix):
+                _NOTION_INDEX_CACHE.pop(cache_key, None)
+    else:
+        _NOTION_INDEX_CACHE.clear()
+
+    # root의 child/page/index 변경은 connector의 page snapshot도 함께 무효화해야 한다.
+    if normalized_root_id:
+        _invalidate_notion_page_cache(
+            normalized_root_id,
+            token=token,
+            all_tokens=token is None,
         )
+    elif token is not None:
+        _invalidate_notion_page_cache(token=token)
+    else:
+        _invalidate_notion_page_cache()

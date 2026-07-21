@@ -23,6 +23,7 @@ class ThreadLearningRoutesContext:
     question: str
     payload: MentionPayload
     user_id: str | None
+    workspace_id: str
     channel_id: str
     current_ts: str
     thread_ts: str
@@ -132,9 +133,11 @@ def _format_thread_learning_success(
     title: str,
     url: str,
     keywords: list[str],
+    created: bool = True,
 ) -> str:
+    # 같은 Slack thread가 이미 저장된 경우에는 새로 만든 것처럼 보이지 않게 명시한다.
     lines = [
-        "*스레드 학습 완료*",
+        "*스레드 학습 완료*" if created else "*이미 학습된 스레드야*",
         f"• 제목: {title}",
     ]
     if keywords:
@@ -184,6 +187,9 @@ def _handle_thread_learning_routes(context: ThreadLearningRoutesContext) -> bool
     try:
         result = _learn_slack_thread_playbook(
             thread_context,
+            workspace_id=context.workspace_id,
+            channel_id=context.channel_id,
+            thread_ts=context.thread_ts,
             thread_permalink=thread_permalink,
             learned_by_user_id=context.user_id,
             claude_client=context.claude_client,
@@ -198,12 +204,14 @@ def _handle_thread_learning_routes(context: ThreadLearningRoutesContext) -> bool
             title=result.title,
             url=result.url,
             keywords=result.keywords,
+            created=bool(getattr(result, "created", True)),
         ),
         mention_user=False,
     )
     context.logger.info(
-        "Learned Slack thread into Notion playbook thread_ts=%s page_id=%s",
+        "Handled Slack thread playbook learning thread_ts=%s page_id=%s created=%s",
         context.thread_ts,
         result.page_id,
+        bool(getattr(result, "created", True)),
     )
     return True

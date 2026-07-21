@@ -9,13 +9,12 @@ from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.context.builder import _build_model_input
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
-from boxer.retrieval.connectors.notion import _is_notion_configured
 from boxer.retrieval.synthesis import _synthesize_retrieval_answer
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
 )
-from boxer_company.notion_playbooks import _select_notion_references
+from boxer_company.notion_playbooks import _is_company_notion_configured, _select_notion_references
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
@@ -216,7 +215,7 @@ def _handle_knowledge_routes(
                     len(notion_references),
                 )
                 return True
-            if not _is_notion_configured():
+            if not _is_company_notion_configured():
                 context.logger.warning("Notion doc query had no local match and notion is not configured in runtime")
             context.reply("관련 운영 문서를 찾지 못했어. 증상이나 키워드를 조금 더 구체적으로 말해줘")
             context.logger.info("No notion references matched in thread_ts=%s question=%s", context.thread_ts, question)
