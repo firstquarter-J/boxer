@@ -9,6 +9,57 @@ from boxer_company_adapter_slack.notion_freeform import _needs_notion_doc_securi
 
 
 class CompanyNotionRetrievalRulesTests(unittest.TestCase):
+    def test_transform_compacts_device_diagnostic_snapshot(self) -> None:
+        payload = {
+            "route": "device_diagnostic_snapshot",
+            "source": "device.ssh",
+            "request": {"question": "왜 재시작됐어?"},
+            "device": {"deviceName": "MB2-C00419"},
+            "ping": {"online": True},
+            "ssh": {"ready": True},
+            "summary": {"status": "warning"},
+            "checks": {
+                "memory": {
+                    "summary": "메모리 확인",
+                    "ok": False,
+                    "exitStatus": 0,
+                    "output": "x" * 2000,
+                    "reason": "oom suspected",
+                    "rawSecret": "제외돼야 하는 값",
+                },
+                "unsafe_extra": {"output": "LLM에 전달하면 안 되는 검사"},
+            },
+            "rawResponse": "LLM에 전달하면 안 되는 전체 응답",
+        }
+
+        transformed = _transform_company_retrieval_payload(payload)
+
+        self.assertEqual(
+            set(transformed),
+            {"route", "source", "request", "device", "ping", "ssh", "summary", "checks"},
+        )
+        self.assertEqual(set(transformed["checks"]), {"memory"})
+        self.assertEqual(
+            set(transformed["checks"]["memory"]),
+            {"summary", "ok", "exitStatus", "output", "reason"},
+        )
+        self.assertEqual(len(transformed["checks"]["memory"]["output"]), 1600)
+        self.assertNotIn("rawSecret", json.dumps(transformed, ensure_ascii=False))
+
+    def test_device_diagnostic_rules_require_evidence_bounded_answer(self) -> None:
+        rules = _build_company_retrieval_rules(
+            {
+                "route": "device_diagnostic_snapshot",
+                "ssh": {"ready": False},
+                "checks": {},
+            }
+        )
+
+        self.assertIn("*장비 진단 답변*", rules)
+        self.assertIn("스냅샷에 없는 원인은 단정하지 마", rules)
+        self.assertIn("ssh.ready=false", rules)
+        self.assertIn("위험하거나 상태 변경하는 명령은 제안하지 마", rules)
+
     def test_transform_keeps_only_bounded_excerpts_and_removes_reference_urls(self) -> None:
         references = [
             {

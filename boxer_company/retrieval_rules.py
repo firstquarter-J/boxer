@@ -149,6 +149,41 @@ def _transform_company_retrieval_payload(payload: Any) -> Any:
             "companyNotionReferences": compact_references,
         }
 
+    if route == "device_diagnostic_snapshot":
+        summary = masked_payload.get("summary") if isinstance(masked_payload.get("summary"), dict) else {}
+        checks = masked_payload.get("checks") if isinstance(masked_payload.get("checks"), dict) else {}
+        compact_checks: dict[str, Any] = {}
+        for key in (
+            "uptime",
+            "memory",
+            "disk",
+            "pm2_describe_box",
+            "pm2_describe_agent",
+            "reboot_history",
+            "kernel_oom",
+        ):
+            item = checks.get(key) if isinstance(checks.get(key), dict) else {}
+            if not item:
+                continue
+            compact_checks[key] = {
+                "summary": item.get("summary"),
+                "ok": item.get("ok"),
+                "exitStatus": item.get("exitStatus"),
+                "output": str(item.get("output") or "")[:1600],
+                "reason": item.get("reason"),
+            }
+
+        return {
+            "route": masked_payload.get("route"),
+            "source": masked_payload.get("source"),
+            "request": masked_payload.get("request"),
+            "device": masked_payload.get("device"),
+            "ping": masked_payload.get("ping"),
+            "ssh": masked_payload.get("ssh"),
+            "summary": summary,
+            "checks": compact_checks,
+        }
+
     if route != "barcode_log_error_summary":
         return masked_payload
 
@@ -440,6 +475,26 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "13) `참고 상태`는 질문과 관련 큰 상태 2~3개만 `state=command` 형식으로 짧게 적어.\n"
             "14) 현장 표현만으로 하드웨어 고장까지 단정하지 말고, 재부팅 후 미기동 같은 별도 증상은 전원/하드웨어 점검을 분리해서 안내해.\n"
             "15) 6줄 안팎으로 끝내."
+        )
+    if route == "device_diagnostic_snapshot":
+        return (
+            "\n"
+            "7) 이 작업은 장비 진단 스냅샷 기반 follow-up 답변이다.\n"
+            "8) 아래 형식 그대로만 답해:\n"
+            "   *장비 진단 답변*\n"
+            "   • 결론:\n"
+            "   • 근거:\n"
+            "   • 조치:\n"
+            "   • 한계:\n"
+            "9) 반드시 한국어만 사용해. 영어 설명, 자기 사고 과정, 중간 추론, 검토 문장은 절대 쓰지 마.\n"
+            "10) evidence의 device/ping/ssh/summary/checks만 사용해. 스냅샷에 없는 원인은 단정하지 마.\n"
+            "11) capturedAt 기준 스냅샷이라는 점을 한계에 짧게 적어.\n"
+            "12) ssh.ready=false면 앱 내부 원인을 단정하지 말고 원격 접속/온라인 상태부터 확인하라고 적어.\n"
+            "13) PM2 restartCount가 높거나 로그에 restart/exit/error/OOM 단서가 있으면 그 관찰값을 근거로 써.\n"
+            "14) OOM/out of memory/killed process/heap 계열 단서가 있으면 메모리 문제를 우선 의심하되 추정이라고 적어.\n"
+            "15) PM2 상태가 online이어도 restartCount나 최근 로그 단서가 있으면 현재 online과 반복 재시작 가능성을 분리해서 설명해.\n"
+            "16) 조치는 최대 3개만 `/`로 이어서 적어. 위험하거나 상태 변경하는 명령은 제안하지 마.\n"
+            "17) 5줄 안팎으로 짧게 끝내."
         )
 
     if route != "barcode_log_analysis":
