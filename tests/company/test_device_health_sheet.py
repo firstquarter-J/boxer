@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 from boxer_company import device_health_sheet
@@ -111,6 +112,289 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertTrue(call["json"]["values"][0][8].startswith("=IF("))
         self.assertTrue(call["json"]["values"][0][9].startswith("=IF("))
         self.assertEqual(call["timeout"], 7)
+
+    def test_loads_bottommost_captureboard_incident_for_each_device(self) -> None:
+        session = _FakeAuthorizedSession(
+            get_payload={
+                "values": [
+                    [],
+                    ["MB2-C00043", "병원", "진료실", "LED", "LED를 찾지 못했어"],
+                    [
+                        "MB2-C00172",
+                        "삼성미래산부인과(부천)",
+                        "최정금 원장",
+                        "",
+                        "녹화 파일 증가 정지가 240초 동안 지속됐어",
+                        "Leon",
+                        "대기",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "https://slack.example/recording-stall",
+                    ],
+                    [
+                        "MB2-C00172",
+                        "삼성미래산부인과(부천)",
+                        "최정금 원장",
+                        "캡처보드",
+                        "분할 녹화 파일 병합 실패",
+                        "Leon",
+                        "대기",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "https://slack.example/merge-error",
+                    ],
+                    [
+                        "MB2-C00999",
+                        "테스트병원",
+                        "진료실",
+                        "캡처보드",
+                        "녹화 파일 업로드 실패",
+                        "Leon",
+                        "대기",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "https://slack.example/upload-error",
+                    ],
+                    [
+                        "MB2-C01263",
+                        "웰하이여성아동병원(부산)",
+                        "정밀초음파실",
+                        "",
+                        "비디오 장치를 찾지 못했어",
+                        "Leon",
+                        "대기",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "https://slack.example/video-device",
+                    ],
+                    [
+                        "MB2-C00172",
+                        "삼성미래산부인과(부천)",
+                        "최정금 원장",
+                        "캡처보드",
+                        "캡처보드 USB를 찾지 못했어",
+                        "Leon",
+                        "완료",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "https://slack.example/captureboard-latest",
+                    ],
+                ]
+            }
+        )
+
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                device_health_sheet.cs,
+                "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+                "spreadsheet/id",
+            ),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "TA's 현황"),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TIMEOUT_SEC", 7),
+        ):
+            incidents = device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                authorized_session=session
+            )
+
+        self.assertEqual(
+            incidents,
+            {
+                "MB2-C00172": {
+                    "deviceName": "MB2-C00172",
+                    "status": "완료",
+                    "slackPermalink": "https://slack.example/captureboard-latest",
+                    "rowNumber": 8,
+                },
+                "MB2-C01263": {
+                    "deviceName": "MB2-C01263",
+                    "status": "대기",
+                    "slackPermalink": "https://slack.example/video-device",
+                    "rowNumber": 7,
+                },
+            },
+        )
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(call["method"], "GET")
+        self.assertTrue(
+            unquote(call["url"]).endswith("/spreadsheet/id/values/'TA''s 현황'!B2:M")
+        )
+        self.assertEqual(
+            call["params"],
+            {"majorDimension": "ROWS", "valueRenderOption": "FORMATTED_VALUE"},
+        )
+        self.assertEqual(call["timeout"], 7)
+
+    def test_loads_short_captureboard_row_with_empty_status_and_permalink(self) -> None:
+        session = _FakeAuthorizedSession(
+            get_payload={
+                "values": [
+                    [""],
+                    ["MB2-C00043", "병원", "진료실", "캡처보드"],
+                ]
+            }
+        )
+
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                device_health_sheet.cs,
+                "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+                "spreadsheet-id",
+            ),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "현황"),
+        ):
+            incidents = device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                authorized_session=session
+            )
+
+        self.assertEqual(
+            incidents,
+            {
+                "MB2-C00043": {
+                    "deviceName": "MB2-C00043",
+                    "status": "",
+                    "slackPermalink": "",
+                    "rowNumber": 3,
+                }
+            },
+        )
+
+    def test_captureboard_incident_loader_includes_stall_and_excludes_processing_errors(
+        self,
+    ) -> None:
+        session = _FakeAuthorizedSession(
+            get_payload={
+                "values": [
+                    [
+                        "MB2-STALL",
+                        "병원",
+                        "진료실",
+                        "",
+                        "녹화 파일 증가 정지가 240초 동안 지속됐어",
+                        "Leon",
+                        "대기",
+                    ],
+                    [
+                        "MB2-MERGE",
+                        "병원",
+                        "진료실",
+                        "캡처보드",
+                        "분할 녹화 파일 병합 실패",
+                        "Leon",
+                        "대기",
+                    ],
+                    [
+                        "MB2-UPLOAD",
+                        "병원",
+                        "진료실",
+                        "캡처보드",
+                        "녹화 파일 upload 실패",
+                        "Leon",
+                        "대기",
+                    ],
+                    [
+                        "MB2-FFMPEG",
+                        "병원",
+                        "진료실",
+                        "캡처보드",
+                        "FFmpeg exited with code 1",
+                        "Leon",
+                        "대기",
+                    ],
+                ]
+            }
+        )
+
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                device_health_sheet.cs,
+                "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+                "spreadsheet-id",
+            ),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "현황"),
+        ):
+            incidents = device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                authorized_session=session
+            )
+
+        self.assertEqual(set(incidents or {}), {"MB2-STALL"})
+
+    def test_captureboard_incident_loader_skips_sheet_when_feature_is_disabled(self) -> None:
+        session = _FakeAuthorizedSession()
+
+        with patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", False):
+            result = device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                authorized_session=session
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(session.calls, [])
+
+    def test_captureboard_incident_loader_requires_sheet_configuration(self) -> None:
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_SPREADSHEET_ID", ""),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "현황"),
+        ):
+            with self.assertRaises(ValueError):
+                device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                    authorized_session=_FakeAuthorizedSession()
+                )
+
+    def test_captureboard_incident_loader_propagates_http_error(self) -> None:
+        response = Mock()
+        response.raise_for_status.side_effect = RuntimeError("Sheets HTTP error")
+        session = Mock()
+        session.get.return_value = response
+
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                device_health_sheet.cs,
+                "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+                "spreadsheet-id",
+            ),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "현황"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Sheets HTTP error"):
+                device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                    authorized_session=session
+                )
+
+        response.json.assert_not_called()
+
+    def test_captureboard_incident_loader_propagates_json_error(self) -> None:
+        response = Mock()
+        response.json.side_effect = ValueError("invalid JSON")
+        session = Mock()
+        session.get.return_value = response
+
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                device_health_sheet.cs,
+                "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+                "spreadsheet-id",
+            ),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "현황"),
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                device_health_sheet._load_device_health_sheet_captureboard_incidents(
+                    authorized_session=session
+                )
 
     def test_skips_sheet_when_feature_is_disabled(self) -> None:
         session = _FakeAuthorizedSession()

@@ -11,6 +11,18 @@ _GOOGLE_SHEETS_API_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 _GOOGLE_SHEETS_SERIAL_EPOCH = datetime(1899, 12, 30)
 _KST = ZoneInfo("Asia/Seoul")
 _NON_DEVICE_PROBLEM_COMPONENTS = {"용량", "storage", "디스크", "저장공간", "trashcan"}
+_CAPTUREBOARD_INCIDENT_ISSUE_MARKERS = (
+    "녹화 파일 증가 정지",
+    "캡처보드",
+    "비디오 장치",
+)
+_CAPTUREBOARD_INCIDENT_EXCLUDED_MARKERS = (
+    "병합",
+    "업로드",
+    "merge",
+    "upload",
+    "ffmpeg",
+)
 # 시트 반복 계산(최대 1회)과 함께 사용해 완료 선택 순간을 셀 자체에 고정한다.
 _COMPLETED_AT_FORMULA = (
     '=IF(INDIRECT("H"&ROW())="완료",'
@@ -24,6 +36,8 @@ _WORK_DURATION_FORMULA = (
     'TRIM(IF(hours>0,hours&"시간 ","")&IF(minutes>0,minutes&"분 ","")&'
     'IF(OR(seconds>0,AND(hours=0,minutes=0)),seconds&"초",""))))'
 )
+
+
 def _build_device_health_sheet_authorized_session() -> Any:
     # ADC를 사용해 배포 환경이 제공하는 서비스 계정 키 또는 WIF 자격증명을 공통으로 읽는다.
     import google.auth
@@ -82,6 +96,79 @@ def _build_device_health_sheet_rows(
             ]
         )
     return rows
+
+
+def _load_device_health_sheet_captureboard_incidents(
+    *,
+    authorized_session: Any | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    if not cs.DEVICE_HEALTH_SHEET_ENABLED:
+        return None
+    spreadsheet_id = str(cs.DEVICE_HEALTH_SHEET_SPREADSHEET_ID or "").strip()
+    tab_name = str(cs.DEVICE_HEALTH_SHEET_TAB_NAME or "").strip()
+    if not spreadsheet_id or not tab_name:
+        raise ValueError("장비 장애 시트 ID 또는 탭 이름이 비어 있어")
+
+    # 장비·문제장치·감지내용·상태·permalink가 포함된 기존 B:M을 한 번에 읽어
+    # TA가 갱신한 현재 상태와 원본 Slack 알림을 같은 물리 행 기준으로 판단한다.
+    quoted_tab_name = tab_name.replace("'", "''")
+    read_range = quote(f"'{quoted_tab_name}'!B2:M", safe="")
+    url = (
+        f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
+        f"/values/{read_range}"
+    )
+    session = authorized_session or _build_device_health_sheet_authorized_session()
+    response = session.get(
+        url,
+        params={
+            "majorDimension": "ROWS",
+            "valueRenderOption": "FORMATTED_VALUE",
+        },
+        timeout=max(1, int(cs.DEVICE_HEALTH_SHEET_TIMEOUT_SEC)),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("장비 장애 시트 조회 응답이 객체가 아니야")
+    rows = payload.get("values", [])
+    if not isinstance(rows, list):
+        raise ValueError("장비 장애 시트 조회 행 목록이 올바르지 않아")
+
+    incidents: dict[str, dict[str, Any]] = {}
+    for row_number, row in enumerate(rows, start=2):
+        if not isinstance(row, list):
+            raise ValueError("장비 장애 시트 조회 행 형식이 올바르지 않아")
+        device_name = _display_value(row[0] if row else None, default="")
+        if not device_name:
+            continue
+        problem_device = _display_value(row[3] if len(row) > 3 else None, default="")
+        issue = _display_value(row[4] if len(row) > 4 else None, default="")
+        normalized_details = f"{problem_device}\n{issue}".lower()
+
+        # 녹화 증가 정지와 캡처보드 미감지만 같은 장애로 묶고,
+        # 병합·업로드 같은 후처리 장애가 알림을 가리지 않도록 제외한다.
+        if any(
+            marker in normalized_details
+            for marker in _CAPTUREBOARD_INCIDENT_EXCLUDED_MARKERS
+        ):
+            continue
+        is_captureboard_incident = "캡처보드" in problem_device or any(
+            marker in issue for marker in _CAPTUREBOARD_INCIDENT_ISSUE_MARKERS
+        )
+        if not is_captureboard_incident:
+            continue
+
+        # 응답은 시트의 물리 행 순서이므로 같은 장비를 덮어써 가장 아래 행을 최신으로 남긴다.
+        incidents[device_name] = {
+            "deviceName": device_name,
+            "status": _display_value(row[6] if len(row) > 6 else None, default=""),
+            "slackPermalink": _display_value(
+                row[11] if len(row) > 11 else None,
+                default="",
+            ),
+            "rowNumber": row_number,
+        }
+    return incidents
 
 
 def _append_device_health_sheet_alerts(

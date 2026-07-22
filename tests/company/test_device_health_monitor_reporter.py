@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from boxer_company.redis_device_state import DeviceStateRedisClient
@@ -196,6 +196,21 @@ def _captureboard_led_abnormal_summary() -> dict:
     }
 
 
+def _captureboard_and_led_devices_abnormal_summary() -> dict:
+    captureboard_result = _captureboard_abnormal_summary()["deviceResults"][0]
+    led_result = {
+        **_abnormal_summary()["deviceResults"][0],
+        "deviceName": "MB2-C00044",
+        "roomName": "2진료실",
+    }
+    return {
+        **_abnormal_summary(),
+        "deviceCount": 2,
+        "statusCounts": {"정상": 0, "확인 필요": 0, "이상": 2, "점검 불가": 0},
+        "deviceResults": [captureboard_result, led_result],
+    }
+
+
 _LED_ALERT_FINGERPRINT = (
     "#69 수지미래산부인과의원(용인)|1진료실|"
     "MB2-C00043|LED USB 장치를 찾지 못했어"
@@ -203,6 +218,10 @@ _LED_ALERT_FINGERPRINT = (
 _CAPTUREBOARD_ALERT_FINGERPRINT = (
     "#69 수지미래산부인과의원(용인)|1진료실|"
     "MB2-C00043|캡처보드 USB나 비디오 장치를 찾지 못했어"
+)
+_SECOND_LED_ALERT_FINGERPRINT = (
+    "#69 수지미래산부인과의원(용인)|2진료실|"
+    "MB2-C00044|LED USB 장치를 찾지 못했어"
 )
 
 
@@ -224,6 +243,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
     def setUp(self) -> None:
         with reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK:
             reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE.clear()
+        with reporter._DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS_LOCK:
+            reporter._DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS.clear()
         # 로컬 .env의 실제 테스트 수신번호가 병원번호 기반 시나리오를 덮어쓰지 않게 격리해.
         self._sms_test_phone_patcher = patch.object(
             reporter.cs,
@@ -232,6 +253,76 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         )
         self._sms_test_phone_patcher.start()
         self.addCleanup(self._sms_test_phone_patcher.stop)
+
+    def _run_captureboard_alert_candidate(
+        self,
+        *,
+        sheet_incidents: dict[str, dict[str, object]] | None = None,
+        sheet_error: Exception | None = None,
+        summary: dict | None = None,
+        state: dict | None = None,
+    ) -> dict[str, object]:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.captureboard_sheet")
+        local_now = datetime(2026, 7, 21, 14, 38, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+        monitor_summary = summary or _captureboard_abnormal_summary()
+        monitor_state = state or _pending_alert_state(
+            _CAPTUREBOARD_ALERT_FINGERPRINT,
+            local_now - timedelta(minutes=1),
+        )
+        loader_kwargs = (
+            {"side_effect": sheet_error}
+            if sheet_error is not None
+            else {"return_value": sheet_incidents}
+        )
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
+            patch.object(reporter.cs, "MDA_GRAPHQL_ORIGIN", "https://mda.kr.mmtalkbox.com"),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", 6),
+            patch.object(
+                reporter,
+                "_load_device_health_monitor_state",
+                return_value=monitor_state,
+            ),
+            patch.object(
+                reporter,
+                "_build_device_health_monitor_summary",
+                return_value=monitor_summary,
+            ),
+            patch.object(
+                reporter,
+                "_load_recent_captureboard_notification_alerts",
+                return_value={},
+            ),
+            patch.object(
+                reporter,
+                "_load_device_health_sheet_captureboard_incidents",
+                **loader_kwargs,
+            ) as load_sheet_mock,
+            patch.object(reporter, "_save_device_health_monitor_state") as save_state_mock,
+            patch.object(reporter, "_append_device_health_monitor_event") as append_event_mock,
+            patch.object(
+                reporter,
+                "_append_device_health_sheet_alerts",
+                return_value=1,
+            ) as append_sheet_mock,
+        ):
+            sent = reporter._run_device_health_monitor_once(client, logger, now=local_now)
+
+        return {
+            "sent": sent,
+            "client": client,
+            "now": local_now,
+            "savedState": save_state_mock.call_args.args[0],
+            "loadSheetMock": load_sheet_mock,
+            "appendSheetMock": append_sheet_mock,
+            "eventTypes": [call.args[0] for call in append_event_mock.call_args_list],
+        }
 
     def test_sets_alert_delivery_override_in_monitor_state(self) -> None:
         logger = logging.getLogger("test.device_health_monitor.control")
@@ -518,6 +609,236 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(append_event_mock.call_args.args[0], "sheet_alert_write_failed")
         self.assertEqual(append_event_mock.call_args.args[1]["errorType"], "RuntimeError")
 
+    def test_suppresses_captureboard_alert_while_sheet_incident_is_open(self) -> None:
+        for status in ("대기", "처리중", "진행중", "처리 중"):
+            with self.subTest(status=status):
+                result = self._run_captureboard_alert_candidate(
+                    sheet_incidents={
+                        "MB2-C00043": {
+                            "status": status,
+                            "rowNumber": 27,
+                        }
+                    }
+                )
+
+                self.assertFalse(result["sent"])
+                self.assertEqual(result["client"].messages, [])
+                result["appendSheetMock"].assert_not_called()
+                result["loadSheetMock"].assert_called_once_with()
+                saved_state = result["savedState"]
+                # 억제는 실제 발송 완료가 아니므로 lastAlertedAt을 만들지 않고
+                # 확인 횟수만 유지한다.
+                self.assertNotIn(
+                    _CAPTUREBOARD_ALERT_FINGERPRINT,
+                    saved_state["alertFingerprints"],
+                )
+                self.assertEqual(
+                    saved_state["pendingAlertFingerprints"][_CAPTUREBOARD_ALERT_FINGERPRINT]["count"],
+                    2,
+                )
+                self.assertIn(
+                    "captureboard_sheet_alert_suppressed",
+                    result["eventTypes"],
+                )
+
+    def test_allows_captureboard_alert_when_sheet_incident_is_not_open(self) -> None:
+        sheet_cases = {
+            "완료": {"MB2-C00043": {"status": "완료", "rowNumber": 27}},
+            "이상없음": {"MB2-C00043": {"status": "이상없음", "rowNumber": 27}},
+            "unknown": {"MB2-C00043": {"status": "확인필요", "rowNumber": 27}},
+            "행 없음": {},
+        }
+        for case_name, sheet_incidents in sheet_cases.items():
+            with self.subTest(case=case_name):
+                result = self._run_captureboard_alert_candidate(
+                    sheet_incidents=sheet_incidents,
+                )
+
+                self.assertTrue(result["sent"])
+                self.assertEqual(len(result["client"].messages), 1)
+                result["appendSheetMock"].assert_called_once()
+                self.assertIn(
+                    _CAPTUREBOARD_ALERT_FINGERPRINT,
+                    result["savedState"]["alertFingerprints"],
+                )
+                self.assertNotIn(
+                    "captureboard_sheet_alert_suppressed",
+                    result["eventTypes"],
+                )
+
+    def test_alerts_on_next_poll_after_sheet_incident_is_completed(self) -> None:
+        open_result = self._run_captureboard_alert_candidate(
+            sheet_incidents={"MB2-C00043": {"status": "대기", "rowNumber": 27}},
+        )
+
+        completed_result = self._run_captureboard_alert_candidate(
+            sheet_incidents={"MB2-C00043": {"status": "완료", "rowNumber": 27}},
+            state=open_result["savedState"],
+        )
+
+        self.assertFalse(open_result["sent"])
+        self.assertTrue(completed_result["sent"])
+        self.assertEqual(len(completed_result["client"].messages), 1)
+        completed_result["appendSheetMock"].assert_called_once()
+        self.assertIn(
+            _CAPTUREBOARD_ALERT_FINGERPRINT,
+            completed_result["savedState"]["alertFingerprints"],
+        )
+
+    def test_open_sheet_does_not_advance_existing_alert_reminder_time(self) -> None:
+        previous_alert_at = datetime(
+            2026,
+            7,
+            21,
+            7,
+            38,
+            3,
+            tzinfo=ZoneInfo("Asia/Seoul"),
+        ).isoformat()
+        state = {
+            "alertFingerprints": {
+                _CAPTUREBOARD_ALERT_FINGERPRINT: {
+                    "firstAlertedAt": previous_alert_at,
+                    "lastAlertedAt": previous_alert_at,
+                    "lastSeenAt": previous_alert_at,
+                    "count": 1,
+                }
+            }
+        }
+
+        result = self._run_captureboard_alert_candidate(
+            sheet_incidents={"MB2-C00043": {"status": "진행중", "rowNumber": 27}},
+            state=state,
+        )
+
+        self.assertFalse(result["sent"])
+        saved_alert = result["savedState"]["alertFingerprints"][
+            _CAPTUREBOARD_ALERT_FINGERPRINT
+        ]
+        self.assertEqual(saved_alert["lastAlertedAt"], previous_alert_at)
+        result["appendSheetMock"].assert_not_called()
+
+    def test_sheet_disabled_or_read_failure_keeps_captureboard_alert_fail_open(self) -> None:
+        for case_name, sheet_incidents, sheet_error in (
+            ("disabled", None, None),
+            ("read failure", None, RuntimeError("sheets unavailable")),
+        ):
+            with self.subTest(case=case_name):
+                result = self._run_captureboard_alert_candidate(
+                    sheet_incidents=sheet_incidents,
+                    sheet_error=sheet_error,
+                )
+
+                self.assertTrue(result["sent"])
+                self.assertEqual(len(result["client"].messages), 1)
+                result["appendSheetMock"].assert_called_once()
+                if sheet_error is not None:
+                    self.assertIn(
+                        "captureboard_sheet_status_read_failed",
+                        result["eventTypes"],
+                    )
+
+    def test_sheet_gate_filters_only_captureboard_from_mixed_alerts(self) -> None:
+        local_now = datetime(2026, 7, 21, 14, 38, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+        state = {
+            "pendingAlertFingerprints": {
+                **_pending_alert_state(
+                    _CAPTUREBOARD_ALERT_FINGERPRINT,
+                    local_now - timedelta(minutes=1),
+                )["pendingAlertFingerprints"],
+                **_pending_alert_state(
+                    _SECOND_LED_ALERT_FINGERPRINT,
+                    local_now - timedelta(minutes=1),
+                )["pendingAlertFingerprints"],
+            }
+        }
+
+        result = self._run_captureboard_alert_candidate(
+            sheet_incidents={
+                "MB2-C00043": {
+                    "status": "대기",
+                    "rowNumber": 27,
+                }
+            },
+            summary=_captureboard_and_led_devices_abnormal_summary(),
+            state=state,
+        )
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(len(result["client"].messages), 1)
+        self.assertIn("MB2-C00044", result["client"].messages[0]["text"])
+        self.assertNotIn("MB2-C00043", result["client"].messages[0]["text"])
+        sheet_items = result["appendSheetMock"].call_args.args[0]
+        self.assertEqual([item["device"] for item in sheet_items], ["MB2-C00044"])
+        saved_state = result["savedState"]
+        self.assertNotIn(_CAPTUREBOARD_ALERT_FINGERPRINT, saved_state["alertFingerprints"])
+        self.assertEqual(
+            saved_state["pendingAlertFingerprints"][_CAPTUREBOARD_ALERT_FINGERPRINT]["count"],
+            2,
+        )
+        self.assertIn(_SECOND_LED_ALERT_FINGERPRINT, saved_state["alertFingerprints"])
+
+    def test_sheet_gate_keeps_other_component_on_same_device_alertable(self) -> None:
+        local_now = datetime(2026, 7, 21, 14, 38, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+        summary = _captureboard_led_abnormal_summary()
+        mixed_item = reporter._collect_daily_device_round_abnormal_alert_items(summary)[0]
+        mixed_fingerprint = reporter._build_device_health_monitor_alert_fingerprint(
+            mixed_item
+        )
+
+        result = self._run_captureboard_alert_candidate(
+            sheet_incidents={"MB2-C00043": {"status": "대기", "rowNumber": 27}},
+            summary=summary,
+            state=_pending_alert_state(
+                mixed_fingerprint,
+                local_now - timedelta(minutes=1),
+            ),
+        )
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(len(result["client"].messages), 1)
+        self.assertIn("LED", result["client"].messages[0]["text"])
+        result["appendSheetMock"].assert_called_once()
+        result["loadSheetMock"].assert_not_called()
+
+    def test_does_not_read_sheet_before_captureboard_candidate_becomes_alertable(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.captureboard_sheet")
+        local_now = datetime(2026, 7, 21, 14, 37, 3, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+            patch.object(
+                reporter,
+                "_load_device_health_monitor_state",
+                return_value={},
+            ),
+            patch.object(
+                reporter,
+                "_build_device_health_monitor_summary",
+                return_value=_captureboard_abnormal_summary(),
+            ),
+            patch.object(
+                reporter,
+                "_load_recent_captureboard_notification_alerts",
+                return_value={},
+            ),
+            patch.object(
+                reporter,
+                "_load_device_health_sheet_captureboard_incidents",
+            ) as load_sheet_mock,
+            patch.object(reporter, "_save_device_health_monitor_state"),
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            sent = reporter._run_device_health_monitor_once(client, logger, now=local_now)
+
+        self.assertFalse(sent)
+        self.assertEqual(client.messages, [])
+        load_sheet_mock.assert_not_called()
+
     def test_auto_sends_sms_when_device_alert_phone_is_mobile(self) -> None:
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor")
@@ -626,6 +947,185 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             [call.args[0] for call in append_event_mock.call_args_list],
             ["run_summary", "alert_sms_auto_sent", "slack_alert_sent"],
         )
+
+    def test_realtime_event_sms_guides_use_safe_fixed_messages(self) -> None:
+        scenarios = (
+            (
+                "captureboard",
+                {
+                    "alertCategory": "video_signal",
+                    "issue": "모션 감지 중 캡쳐보드 연결에 문제가 발생했습니다.",
+                },
+                "captureboard_disconnected",
+            ),
+            (
+                "recording_stall",
+                {
+                    "alertCategory": "recording",
+                    "issue": "녹화 파일 증가 정지가 240초 동안 지속됐어: 0.00 KB/sec",
+                },
+                "recording_stalled",
+            ),
+            (
+                "recording_merge",
+                {
+                    "alertCategory": "recording_processing",
+                    "issue": "분할 파일 3개 / 오류: ffmpeg exited with code 1 / /tmp/list.txt",
+                },
+                "recording_merge_failed",
+            ),
+        )
+
+        for scenario, issue_fields, template_id in scenarios:
+            with self.subTest(scenario=scenario):
+                guide = reporter._build_device_health_monitor_sms_guide(
+                    {
+                        **issue_fields,
+                        "room": "1진료실",
+                        "device": "MB2-C01259",
+                        "problemComponents": [],
+                    }
+                )
+
+                self.assertTrue(guide["supported"])
+                self.assertEqual(guide["templateId"], template_id)
+                self.assertTrue(guide["message"].startswith("안녕하세요 마미톡입니다. 🌷"))
+                self.assertNotIn("240초", guide["message"])
+                self.assertNotIn("0.00 KB/sec", guide["message"])
+                self.assertNotIn("ffmpeg", guide["message"])
+                self.assertNotIn("/tmp/", guide["message"])
+
+        captureboard_message = reporter._build_device_health_monitor_sms_guide(
+            {
+                "alertCategory": "video_signal",
+                "issue": "캡쳐보드 연결 오류",
+                "room": "1진료실",
+                "device": "MB2-C01259",
+            }
+        )["message"]
+        self.assertIn("영상 케이블", captureboard_message)
+        self.assertIn("USB 케이블", captureboard_message)
+        self.assertNotIn("두 HDMI", captureboard_message)
+
+    def test_auto_sms_skips_missing_or_non_mobile_alert_phone(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.auto_sms_phone")
+        local_now = datetime(2026, 7, 22, 14, 2, 2, tzinfo=ZoneInfo("Asia/Seoul"))
+        base_item = {
+            "hospitalSeq": "566",
+            "hospitalName": "웰하이여성아동병원(부산)",
+            "hospital": "#566 웰하이여성아동병원(부산)",
+            "telephone": "051-201-8854",
+            "room": "1진료실",
+            "device": "MB2-C01259",
+            "issue": "모션 감지 중 캡쳐보드 연결에 문제가 발생했습니다.",
+            "alertCategory": "video_signal",
+            "mdaUrl": "https://mda.example/device",
+        }
+
+        with patch.object(
+            reporter,
+            "_post_device_health_monitor_sms_payload",
+        ) as post_sms_mock:
+            for phone_number in ("", "051-201-8854"):
+                with self.subTest(phone_number=phone_number):
+                    result = reporter._send_device_health_monitor_auto_sms_for_item(
+                        {**base_item, "deviceAlertPhone": phone_number},
+                        channel_id="C_HEALTH",
+                        now=local_now,
+                        logger=logger,
+                    )
+
+                    self.assertEqual(result["status"], "manual_required")
+                    self.assertTrue(result["smsContactActionEnabled"])
+
+        post_sms_mock.assert_not_called()
+
+    def test_auto_sms_deduplicates_captureboard_and_recording_race(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.auto_sms_dedupe")
+        local_now = datetime(2026, 7, 22, 14, 2, 2, tzinfo=ZoneInfo("Asia/Seoul"))
+        base_item = {
+            "hospitalSeq": "566",
+            "hospitalName": "웰하이여성아동병원(부산)",
+            "hospital": "#566 웰하이여성아동병원(부산)",
+            "telephone": "051-201-8854",
+            "deviceAlertPhone": "010-1234-5678",
+            "room": "1진료실",
+            "device": "MB2-C01259",
+            "mdaUrl": "https://mda.example/device",
+        }
+        captureboard_item = {
+            **base_item,
+            "alertCategory": "video_signal",
+            "problemComponents": ["캡처보드"],
+            "issue": "모션 감지 중 캡쳐보드 연결에 문제가 발생했습니다.",
+        }
+        recording_item = {
+            **base_item,
+            "alertCategory": "recording",
+            "problemComponents": [],
+            "issue": "녹화 파일 증가 정지가 240초 동안 지속됐어: 0.00 KB/sec",
+        }
+
+        with (
+            patch.object(
+                reporter,
+                "_lookup_device_health_monitor_hospital_contact",
+                return_value={
+                    "status": "ok",
+                    "hospitalSeq": "566",
+                    "hospitalName": "웰하이여성아동병원(부산)",
+                    "telephone": "051-201-8854",
+                    "deviceAlertPhone": "010-1234-5678",
+                    "phoneNumber": "01012345678",
+                },
+            ),
+            patch.object(
+                reporter,
+                "_post_device_health_monitor_sms_payload",
+                return_value={"status": "sent", "ok": True, "provider": "fake"},
+            ) as post_sms_mock,
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            first_result = reporter._send_device_health_monitor_auto_sms_for_item(
+                captureboard_item,
+                channel_id="C_HEALTH",
+                now=local_now,
+                logger=logger,
+            )
+            second_result = reporter._send_device_health_monitor_auto_sms_for_item(
+                recording_item,
+                channel_id="C_HEALTH",
+                now=local_now,
+                logger=logger,
+            )
+
+        self.assertEqual(first_result["status"], "sent")
+        self.assertEqual(second_result["status"], "sent")
+        self.assertTrue(second_result["deduplicated"])
+        self.assertEqual(first_result["smsMessage"], second_result["smsMessage"])
+        post_sms_mock.assert_called_once()
+        self.assertEqual(
+            reporter._device_health_monitor_auto_sms_claim_key(captureboard_item),
+            reporter._device_health_monitor_auto_sms_claim_key(recording_item),
+        )
+
+    def test_realtime_event_only_mode_still_attaches_sms_actions(self) -> None:
+        app = Mock()
+        app.client = object()
+        logger = logging.getLogger("test.device_health_monitor.event_actions")
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
+            patch.object(reporter.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(
+                reporter,
+                "_attach_device_health_monitor_alert_actions",
+            ) as attach_actions_mock,
+        ):
+            reporter.attach_device_health_monitor_reporter(app, logger=logger)
+
+        attach_actions_mock.assert_called_once_with(app, logger)
 
     def test_suppresses_alert_delivery_when_alerts_are_disabled(self) -> None:
         client = _FakeSlackClient()
@@ -797,7 +1297,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             message_block["element"]["initial_value"].startswith("안녕하세요 마미톡입니다. 🌷")
         )
         self.assertIn("초음파 진단기와 캡처보드", message_block["element"]["initial_value"])
-        self.assertIn("두 HDMI 케이블을 분리했다가 다시", message_block["element"]["initial_value"])
+        self.assertIn(
+            "캡처보드와 마미박스를 연결한 USB 케이블",
+            message_block["element"]["initial_value"],
+        )
         self.assertIn("\n\n", message_block["element"]["initial_value"])
 
     def test_auto_sms_status_action_opens_confirmation_modal_without_resending(self) -> None:
@@ -1129,7 +1632,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(payload["sms"]["templateId"], "captureboard_disconnected")
         self.assertTrue(payload["sms"]["message"].startswith("안녕하세요 마미톡입니다. 🌷"))
         self.assertIn("초음파 진단기와 캡처보드", payload["sms"]["message"])
-        self.assertIn("두 HDMI 케이블을 분리했다가 다시", payload["sms"]["message"])
+        self.assertIn(
+            "캡처보드와 마미박스를 연결한 USB 케이블",
+            payload["sms"]["message"],
+        )
         self.assertEqual(len(client.messages), 1)
         self.assertEqual(client.messages[0]["thread_ts"], "3000.001")
         self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
@@ -1352,7 +1858,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(solapi_payload["messages"][0]["from"], "0212345678")
         self.assertTrue(solapi_payload["messages"][0]["text"].startswith("안녕하세요 마미톡입니다. 🌷"))
         self.assertIn("초음파 진단기와 캡처보드", solapi_payload["messages"][0]["text"])
-        self.assertIn("두 HDMI 케이블을 분리했다가 다시", solapi_payload["messages"][0]["text"])
+        self.assertIn(
+            "캡처보드와 마미박스를 연결한 USB 케이블",
+            solapi_payload["messages"][0]["text"],
+        )
         self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
 
     def test_voice_action_is_marked_not_implemented(self) -> None:

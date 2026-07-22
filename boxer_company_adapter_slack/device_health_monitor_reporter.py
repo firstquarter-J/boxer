@@ -48,6 +48,7 @@ from boxer_company.routers.mda_graphql import (
 )
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
+    _load_device_health_sheet_captureboard_incidents,
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
@@ -65,6 +66,9 @@ _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
 _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
 _DEVICE_HEALTH_MONITOR_RUNTIME_STATE: dict[str, Any] = {}
 _DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK = threading.Lock()
+_DEVICE_HEALTH_MONITOR_AUTO_SMS_DEDUPE_WINDOW_SEC = 60.0
+_DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS: dict[str, dict[str, Any]] = {}
+_DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS_LOCK = threading.Lock()
 _DEVICE_HEALTH_MONITOR_ACTION_IDS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
@@ -94,6 +98,11 @@ _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
 _DEVICE_HEALTH_MONITOR_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
 _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
 _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
+_DEVICE_HEALTH_MONITOR_OPEN_CAPTUREBOARD_SHEET_STATUSES = {
+    "대기",
+    "처리중",
+    "진행중",
+}
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -480,7 +489,7 @@ def _device_health_monitor_required_confirmation_polls(item: dict[str, Any]) -> 
     return 1
 
 
-def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, str]:
+def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, Any]:
     raw_item = value
     if isinstance(value, str):
         try:
@@ -499,6 +508,18 @@ def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, 
         "smsMessage": _display_value(item.get("smsMessage"), default=""),
         "smsTemplateId": _display_value(item.get("smsTemplateId"), default=""),
         "smsModalMode": _display_value(item.get("smsModalMode"), default=""),
+        # 수동 문자 모달에서도 실시간 이벤트용 고정 템플릿을 그대로 찾을 수 있게
+        # 사용자용 장애 범주와 문제 장치를 action payload에 보존한다.
+        "alertCategory": _display_value(item.get("alertCategory"), default=""),
+        "problemComponents": (
+            [
+                _display_value(component, default="")
+                for component in item.get("problemComponents", [])
+                if _display_value(component, default="")
+            ]
+            if isinstance(item.get("problemComponents"), list)
+            else []
+        ),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
@@ -632,18 +653,73 @@ def _lookup_device_health_monitor_hospital_contact(
     }
 
 
-def _build_device_health_monitor_sms_guide(item: dict[str, str]) -> dict[str, Any]:
+def _build_device_health_monitor_sms_guide(item: dict[str, Any]) -> dict[str, Any]:
     issue = _display_value(item.get("issue"), default="")
     room = _display_value(item.get("room"), default="진료실")
     device = _display_value(item.get("device"), default="마미박스 장비")
+    alert_category = _display_value(item.get("alertCategory"), default="")
     lowered = issue.lower()
+    problem_components = {
+        _display_value(component, default="").replace(" ", "")
+        for component in (
+            item.get("problemComponents")
+            if isinstance(item.get("problemComponents"), list)
+            else []
+        )
+        if _display_value(component, default="")
+    }
 
-    if "캡처보드" in issue or "비디오 장치" in issue or "영상" in issue:
+    # 병합 실패는 병원에서 케이블을 다시 꽂아 해결할 수 있는 장애가 아니므로
+    # 내부 오류를 노출하지 않고 담당자 확인 안내만 보낸다.
+    if alert_category == "recording_processing" or any(
+        marker in lowered for marker in ("병합", "ffmpeg", "merge")
+    ):
+        message = (
+            f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
+            f"{room} {device}에서 녹화 파일 저장 처리 문제를 감지했습니다.\n\n"
+            "마미톡 담당자가 확인할 예정이며 병원에서 별도로 조치하실 내용은 없습니다.\n"
+            "추가 확인이 필요하면 담당자가 다시 연락드리겠습니다."
+        )
+        return {
+            "supported": True,
+            "templateId": "recording_merge_failed",
+            "title": "녹화 파일 처리 확인 문자",
+            "message": message,
+        }
+
+    # 파일 증가 정지는 실시간 이벤트의 확정 알림에서만 호출된다. 병원에는
+    # 증가율·지속시간 대신 영상 입력 연결을 확인하는 안전한 조치만 안내한다.
+    if alert_category == "recording" or any(
+        marker in lowered
+        for marker in ("녹화 파일 증가 정지", "파일 증가 속도", "recording stalled")
+    ):
+        message = (
+            f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
+            f"{room} {device}에서 녹화 영상 입력이 정상적으로 이어지지 않아 연결 확인이 필요합니다.\n\n"
+            "초음파 진단기와 캡처보드를 연결한 영상 케이블과 "
+            "캡처보드와 마미박스를 연결한 USB 케이블을 각각 분리했다가 다시 단단히 연결해 주세요.\n"
+            "연결 후에도 같은 문제가 반복되면 마미톡 담당자에게 알려 주세요."
+        )
+        return {
+            "supported": True,
+            "templateId": "recording_stalled",
+            "title": "녹화 영상 입력 확인 문자",
+            "message": message,
+        }
+
+    if (
+        alert_category == "video_signal"
+        or "캡처보드" in issue
+        or "캡쳐보드" in issue
+        or "비디오 장치" in issue
+        or "영상" in issue
+        or "캡처보드" in problem_components
+    ):
         message = (
             f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
             f"{room} {device}에서 초음파 영상 입력 장치 연결 확인이 필요합니다.\n\n"
-            "초음파 진단기와 캡처보드, 캡처보드와 마미박스가 각각 HDMI 케이블로 연결되어 있습니다.\n"
-            "먼저 두 HDMI 케이블을 분리했다가 다시 단단히 연결해 주세요.\n"
+            "초음파 진단기와 캡처보드를 연결한 영상 케이블과 "
+            "캡처보드와 마미박스를 연결한 USB 케이블을 각각 분리했다가 다시 단단히 연결해 주세요.\n"
             "케이블이 빠져 있거나 헐거우면 영상이 정상적으로 들어오지 않을 수 있습니다."
         )
         return {
@@ -1089,7 +1165,7 @@ def _post_device_health_monitor_action_webhook(
         }
 
 
-def _device_health_monitor_auto_sms_phone_number(item: dict[str, str]) -> str:
+def _device_health_monitor_auto_sms_phone_number(item: dict[str, Any]) -> str:
     # 자동발송은 이상 알림 전용 휴대전화번호만 사용하고 대표번호나 테스트 번호 fallback은 쓰지 않는다.
     phone_number = _device_health_monitor_korean_national_phone_number(item.get("deviceAlertPhone"))
     if not _is_device_health_monitor_mobile_phone_number(phone_number):
@@ -1097,8 +1173,8 @@ def _device_health_monitor_auto_sms_phone_number(item: dict[str, str]) -> str:
     return phone_number
 
 
-def _send_device_health_monitor_auto_sms_for_item(
-    item: dict[str, str],
+def _send_device_health_monitor_auto_sms_for_item_uncached(
+    item: dict[str, Any],
     *,
     channel_id: str,
     now: datetime,
@@ -1169,6 +1245,188 @@ def _send_device_health_monitor_auto_sms_for_item(
         "smsMessage": _display_value(payload.get("sms", {}).get("message"), default=""),
         "smsTemplateId": _display_value(payload.get("sms", {}).get("templateId"), default=""),
     }
+
+
+def _device_health_monitor_auto_sms_incident_family(item: dict[str, Any]) -> str:
+    alert_category = _display_value(item.get("alertCategory"), default="")
+    issue = _display_value(item.get("issue"), default="").lower()
+    problem_components = {
+        _display_value(component, default="").replace(" ", "")
+        for component in (
+            item.get("problemComponents")
+            if isinstance(item.get("problemComponents"), list)
+            else []
+        )
+        if _display_value(component, default="")
+    }
+    if alert_category == "recording_processing" or any(
+        marker in issue for marker in ("병합", "ffmpeg", "merge")
+    ):
+        return "recording_processing"
+    if (
+        alert_category in {"video_signal", "recording"}
+        or "캡처보드" in problem_components
+        or any(
+            marker in issue
+            for marker in (
+                "캡처보드",
+                "캡쳐보드",
+                "비디오 장치",
+                "영상 입력",
+                "녹화 파일 증가 정지",
+            )
+        )
+    ):
+        # 실시간 녹화 정지와 상태 모니터의 캡처보드 이상을 같은 장애군으로 묶는다.
+        return "captureboard_recording"
+    if alert_category:
+        return alert_category
+    if problem_components:
+        return "+".join(sorted(problem_components))
+    return issue[:120]
+
+
+def _device_health_monitor_auto_sms_claim_key(item: dict[str, Any]) -> str:
+    device_name = _display_value(item.get("device"), default="")
+    incident_family = _device_health_monitor_auto_sms_incident_family(item)
+    if not device_name or not incident_family:
+        return ""
+    hospital_key = _display_value(
+        item.get("hospitalSeq"),
+        default=_display_value(
+            item.get("hospitalName"),
+            default=_display_value(item.get("hospital"), default=""),
+        ),
+    )
+    return "|".join((hospital_key, device_name, incident_family))
+
+
+def _acquire_device_health_monitor_auto_sms_claim(
+    claim_key: str,
+) -> tuple[bool, dict[str, Any]]:
+    claimed_at = time.monotonic()
+    with _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS_LOCK:
+        expired_keys = [
+            key
+            for key, claim in _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS.items()
+            if claimed_at - float(claim.get("claimedAt") or 0.0)
+            >= _DEVICE_HEALTH_MONITOR_AUTO_SMS_DEDUPE_WINDOW_SEC
+        ]
+        for key in expired_keys:
+            _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS.pop(key, None)
+
+        existing = _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS.get(claim_key)
+        if existing is not None:
+            return False, existing
+
+        claim = {
+            "claimedAt": claimed_at,
+            "done": threading.Event(),
+            "result": None,
+        }
+        _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS[claim_key] = claim
+        return True, claim
+
+
+def _publish_device_health_monitor_auto_sms_claim_result(
+    claim: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    with _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS_LOCK:
+        claim["result"] = dict(result)
+        done = claim.get("done")
+        if isinstance(done, threading.Event):
+            done.set()
+
+
+def _reuse_device_health_monitor_auto_sms_claim_result(
+    claim_key: str,
+    claim: dict[str, Any],
+    *,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    done = claim.get("done")
+    if isinstance(done, threading.Event):
+        done.wait(
+            timeout=min(
+                _DEVICE_HEALTH_MONITOR_AUTO_SMS_DEDUPE_WINDOW_SEC,
+                max(
+                    3,
+                    int(cs.DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC) + 2,
+                ),
+            )
+        )
+    with _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS_LOCK:
+        result = claim.get("result")
+        if isinstance(result, dict):
+            logger.info("Reused device alert auto SMS result claim=%s", claim_key)
+            return {**result, "deduplicated": True}
+    # 첫 호출의 결과를 확정하지 못했어도 중복 가능성이 있으므로 자동 재발송은 하지 않는다.
+    return {
+        "status": "duplicate_suppressed",
+        "ok": False,
+        "smsStatusText": "동일 장애 문자 발송 여부 확인 필요",
+        "smsContactActionEnabled": False,
+        "deduplicated": True,
+    }
+
+
+def _send_device_health_monitor_auto_sms_for_item(
+    item: dict[str, Any],
+    *,
+    channel_id: str,
+    now: datetime,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    # 실제 발송 가능 항목만 공통 claim을 잡아 번호 없음·미지원 항목은 기존 수동 흐름을 유지한다.
+    if not _device_health_monitor_auto_sms_phone_number(item):
+        return {"status": "manual_required", "smsContactActionEnabled": True}
+    sms_guide = _build_device_health_monitor_sms_guide(item)
+    if not sms_guide.get("supported") or not _display_value(
+        sms_guide.get("message"),
+        default="",
+    ):
+        return {"status": "unsupported_issue", "smsContactActionEnabled": True}
+
+    claim_key = _device_health_monitor_auto_sms_claim_key(item)
+    if not claim_key:
+        return _send_device_health_monitor_auto_sms_for_item_uncached(
+            item,
+            channel_id=channel_id,
+            now=now,
+            logger=logger,
+        )
+
+    is_owner, claim = _acquire_device_health_monitor_auto_sms_claim(claim_key)
+    if not is_owner:
+        return _reuse_device_health_monitor_auto_sms_claim_result(
+            claim_key,
+            claim,
+            logger=logger,
+        )
+
+    try:
+        result = _send_device_health_monitor_auto_sms_for_item_uncached(
+            item,
+            channel_id=channel_id,
+            now=now,
+            logger=logger,
+        )
+    except Exception as exc:
+        _publish_device_health_monitor_auto_sms_claim_result(
+            claim,
+            {
+                "status": "error",
+                "ok": False,
+                "error": type(exc).__name__,
+                "smsStatusText": _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT,
+                "smsContactActionEnabled": True,
+            },
+        )
+        raise
+
+    _publish_device_health_monitor_auto_sms_claim_result(claim, result)
+    return result
 
 
 def _apply_device_health_monitor_auto_sms(
@@ -3450,6 +3708,159 @@ def _record_device_health_sheet_alerts_best_effort(
         logger.warning("장비 이상 알림을 Google Sheets에 기록하지 못했어", exc_info=True)
 
 
+def _is_device_health_monitor_captureboard_alert_item(item: dict[str, Any]) -> bool:
+    problem_components = (
+        item.get("problemComponents")
+        if isinstance(item.get("problemComponents"), list)
+        else []
+    )
+    normalized_components = {
+        _display_value(component, default="").replace(" ", "")
+        for component in problem_components
+        if _display_value(component, default="")
+    }
+    if normalized_components:
+        # 같은 장비에서 LED 등 독립 장애가 함께 확인되면 카드 전체를 숨기지 않는다.
+        return normalized_components == {"캡처보드"}
+
+    issue = _display_value(item.get("issue"), default="").lower()
+    return any(
+        marker in issue
+        for marker in ("캡처보드", "비디오 장치", "녹화 파일 증가 정지")
+    )
+
+
+def _filter_open_captureboard_sheet_alerts(
+    report_summary: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    alertable_fingerprints: set[str],
+    updated_alerts: dict[str, dict[str, Any]],
+    updated_pending_alerts: dict[str, dict[str, Any]],
+    now: datetime,
+    logger: logging.Logger,
+) -> tuple[
+    set[str],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    alert_items_by_fingerprint = {
+        _build_device_health_monitor_alert_fingerprint(item): item
+        for item in _collect_daily_device_round_abnormal_alert_items(report_summary)
+    }
+    captureboard_candidates = {
+        fingerprint: item
+        for fingerprint, item in alert_items_by_fingerprint.items()
+        if fingerprint in alertable_fingerprints
+        and _is_device_health_monitor_captureboard_alert_item(item)
+    }
+    if not captureboard_candidates:
+        # 빈 poll이나 다른 부품 장애만 있는 poll에서는 B:M 전체를 읽지 않는다.
+        return (
+            alertable_fingerprints,
+            updated_alerts,
+            updated_pending_alerts,
+            [],
+        )
+
+    try:
+        sheet_incidents = _load_device_health_sheet_captureboard_incidents()
+    except Exception as exc:
+        # Sheets가 잠시 불안정해도 실제 장비 장애를 놓치지 않도록
+        # 조회 실패는 fail-open 한다.
+        _append_device_health_monitor_event(
+            "captureboard_sheet_status_read_failed",
+            {
+                "candidateCount": len(captureboard_candidates),
+                "errorType": type(exc).__name__,
+            },
+            now=now,
+            logger=logger,
+        )
+        logger.warning("캡처보드 진행 상태를 Google Sheets에서 읽지 못했어", exc_info=True)
+        return (
+            alertable_fingerprints,
+            updated_alerts,
+            updated_pending_alerts,
+            [],
+        )
+
+    # 시트 연동 자체가 꺼진 경우도 기존 운영 흐름을 유지하는 fail-open으로 처리한다.
+    if sheet_incidents is None:
+        return (
+            alertable_fingerprints,
+            updated_alerts,
+            updated_pending_alerts,
+            [],
+        )
+
+    suppressed: dict[str, dict[str, Any]] = {}
+    for fingerprint, item in captureboard_candidates.items():
+        device_name = _display_value(item.get("device"), default="")
+        incident = sheet_incidents.get(device_name)
+        if not isinstance(incident, dict):
+            continue
+        status = _display_value(incident.get("status"), default="").replace(" ", "")
+        if status not in _DEVICE_HEALTH_MONITOR_OPEN_CAPTUREBOARD_SHEET_STATUSES:
+            # 완료/이상없음/알 수 없는 값은 모두 다시 알릴 수 있게 둔다.
+            continue
+        suppressed[fingerprint] = {
+            "fingerprint": fingerprint,
+            "deviceName": device_name,
+            "sheetStatus": status,
+            "sheetRowNumber": max(0, int(incident.get("rowNumber") or 0)),
+        }
+
+    if not suppressed:
+        return (
+            alertable_fingerprints,
+            updated_alerts,
+            updated_pending_alerts,
+            [],
+        )
+
+    filtered_alertable = alertable_fingerprints - set(suppressed)
+    restored_alerts = dict(updated_alerts)
+    restored_pending_alerts = dict(updated_pending_alerts)
+    previous_alerts = _normalize_device_health_monitor_alerts(state.get("alertFingerprints"))
+    previous_pending_alerts = _normalize_device_health_monitor_pending_alerts(
+        state.get("pendingAlertFingerprints")
+    )
+    now_text = now.isoformat()
+
+    for fingerprint in suppressed:
+        previous_alert = previous_alerts.get(fingerprint, {})
+        if _parse_device_health_monitor_datetime(previous_alert.get("lastAlertedAt")) is not None:
+            # reminder 후보도 실제 발송 시각을 앞으로 당기지 않아,
+            # 시트가 닫히면 다음 poll에 바로 재알림한다.
+            restored_alerts[fingerprint] = {
+                "firstAlertedAt": str(previous_alert.get("firstAlertedAt") or ""),
+                "lastAlertedAt": str(previous_alert.get("lastAlertedAt") or ""),
+                "lastSeenAt": now_text,
+                "count": max(0, int(previous_alert.get("count") or 0)) + 1,
+            }
+            restored_pending_alerts.pop(fingerprint, None)
+            continue
+
+        # 신규 후보는 발송 완료로 승격하지 않고 확인 횟수를 pending에 유지한다.
+        # TA가 상태를 완료로 바꾸면 다음 poll에서 재확인 대기 없이 즉시 발송된다.
+        previous_pending = previous_pending_alerts.get(fingerprint, {})
+        restored_alerts.pop(fingerprint, None)
+        restored_pending_alerts[fingerprint] = {
+            "firstSeenAt": str(previous_pending.get("firstSeenAt") or now_text),
+            "lastSeenAt": now_text,
+            "count": max(0, int(previous_pending.get("count") or 0)) + 1,
+        }
+
+    return (
+        filtered_alertable,
+        restored_alerts,
+        restored_pending_alerts,
+        list(suppressed.values()),
+    )
+
+
 def _run_device_health_monitor_once(
     client: Any,
     logger: logging.Logger,
@@ -3566,6 +3977,20 @@ def _run_device_health_monitor_once(
         state,
         now=local_now,
     )
+    (
+        alertable_fingerprints,
+        updated_alerts,
+        updated_pending_alerts,
+        sheet_suppressed_alerts,
+    ) = _filter_open_captureboard_sheet_alerts(
+        report_summary,
+        state,
+        alertable_fingerprints=alertable_fingerprints,
+        updated_alerts=updated_alerts,
+        updated_pending_alerts=updated_pending_alerts,
+        now=local_now,
+        logger=logger,
+    )
     next_state = _build_device_health_monitor_next_state(
         state,
         report_summary,
@@ -3581,6 +4006,16 @@ def _run_device_health_monitor_once(
         channel_id=channel_id,
         alertable_fingerprints=alertable_fingerprints,
     )
+    if sheet_suppressed_alerts:
+        _append_device_health_monitor_event(
+            "captureboard_sheet_alert_suppressed",
+            {
+                "suppressedCount": len(sheet_suppressed_alerts),
+                "incidents": sheet_suppressed_alerts,
+            },
+            now=local_now,
+            logger=logger,
+        )
 
     if not alertable_fingerprints:
         logger.info(
@@ -3678,7 +4113,9 @@ def _attach_device_health_monitor_alert_actions(app: Any, logger: logging.Logger
 
 
 def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | None = None) -> None:
-    if not cs.DEVICE_HEALTH_MONITOR_ENABLED:
+    health_monitor_enabled = bool(cs.DEVICE_HEALTH_MONITOR_ENABLED)
+    notification_alert_enabled = bool(cs.DEVICE_NOTIFICATION_ALERT_ENABLED)
+    if not health_monitor_enabled and not notification_alert_enabled:
         return
 
     actual_logger = logger or logging.getLogger(__name__)
@@ -3694,6 +4131,10 @@ def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | 
         return
 
     _attach_device_health_monitor_alert_actions(app, actual_logger)
+
+    # 상태 모니터가 꺼져 있어도 실시간 이벤트 카드의 문자 확인·수동 발송 버튼은 동작해야 한다.
+    if not health_monitor_enabled:
+        return
 
     global _DEVICE_HEALTH_MONITOR_THREAD
     with _DEVICE_HEALTH_MONITOR_THREAD_LOCK:

@@ -106,7 +106,10 @@ from boxer_company_adapter_slack.thread_learning_routes import (
     _handle_thread_learning_routes,
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import attach_daily_device_round_reporter
-from boxer_company_adapter_slack.device_health_monitor_reporter import attach_device_health_monitor_reporter
+from boxer_company_adapter_slack.device_health_monitor_reporter import (
+    _send_device_health_monitor_auto_sms_for_item,
+    attach_device_health_monitor_reporter,
+)
 from boxer_company_adapter_slack.device_notification_alert_reporter import (
     attach_device_notification_alert_reporter,
 )
@@ -1016,6 +1019,11 @@ def create_app() -> App:
     attach_hpa_change_reporter(app, hpa_change_runtime, logger=app_logger)
     attach_weekly_recordings_reporter(app, logger=app_logger)
     attach_device_health_monitor_reporter(app, logger=app_logger)
-    attach_device_notification_alert_reporter(app, logger=app_logger)
+    # 실시간 장비 이벤트도 상태 모니터와 같은 번호 판정·공급자·감사 로그 경로를 사용한다.
+    attach_device_notification_alert_reporter(
+        app,
+        logger=app_logger,
+        auto_sms_sender=_send_device_health_monitor_auto_sms_for_item,
+    )
     attach_daily_device_round_reporter(app, logger=app_logger)
     return app

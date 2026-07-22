@@ -580,6 +580,10 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             patch.object(company, "attach_hpa_change_reporter") as attach_reporter,
             patch.object(company, "attach_weekly_recordings_reporter"),
             patch.object(company, "attach_device_health_monitor_reporter"),
+            patch.object(
+                company,
+                "attach_device_notification_alert_reporter",
+            ) as attach_notification_reporter,
             patch.object(company, "attach_daily_device_round_reporter"),
             patch.object(
                 company,
@@ -613,6 +617,11 @@ class HpaChangeRuntimeTests(unittest.TestCase):
         check_ping.assert_not_called()
         attach_reporter.assert_called_once()
         self.assertIs(attach_reporter.call_args.args[1], fake_runtime)
+        attach_notification_reporter.assert_called_once()
+        self.assertIs(
+            attach_notification_reporter.call_args.kwargs["auto_sms_sender"],
+            company._send_device_health_monitor_auto_sms_for_item,
+        )
 
 
 if __name__ == "__main__":

@@ -968,6 +968,13 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
         "smsMessage": _display_value(item.get("smsMessage"), default=""),
         "smsTemplateId": _display_value(item.get("smsTemplateId"), default=""),
         "smsModalMode": _display_value(item.get("smsModalMode"), default=""),
+        # 자동문자와 수동 모달이 같은 장애별 템플릿을 선택하도록 구조화된 범주를 보존해.
+        "alertCategory": _display_value(item.get("alertCategory"), default=""),
+        "problemComponents": (
+            item.get("problemComponents")
+            if isinstance(item.get("problemComponents"), list)
+            else []
+        ),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
@@ -987,6 +994,7 @@ def _build_device_health_alert_item_blocks(
     item: dict[str, Any],
     *,
     include_actions: bool = True,
+    include_device_voice_action: bool = True,
 ) -> list[dict[str, Any]]:
     problem_components = _format_device_health_alert_problem_components(
         item.get("problemComponents")
@@ -1066,15 +1074,18 @@ def _build_device_health_alert_item_blocks(
                 "style": "primary",
             }
         )
-    action_elements.append(
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
-            "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-            "value": action_value,
-        }
-    )
-    blocks.append({"type": "actions", "elements": action_elements})
+    if include_device_voice_action:
+        action_elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
+                "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                "value": action_value,
+            }
+        )
+    if action_elements:
+        # 실시간 이벤트 카드는 문자 조치만, 상태 모니터 카드는 기존 전체 조치를 노출한다.
+        blocks.append({"type": "actions", "elements": action_elements})
     return blocks
 
 
@@ -1083,6 +1094,7 @@ def _build_daily_device_round_abnormal_alert_blocks(
     permalink: str | None,
     *,
     include_actions: bool = True,
+    include_device_voice_action: bool = True,
 ) -> list[dict[str, Any]]:
     alert_items = _collect_daily_device_round_abnormal_alert_items(report_summary)
     blocks: list[dict[str, Any]] = [
@@ -1102,6 +1114,7 @@ def _build_daily_device_round_abnormal_alert_blocks(
             _build_device_health_alert_item_blocks(
                 item,
                 include_actions=include_actions,
+                include_device_voice_action=include_device_voice_action,
             )
         )
 
@@ -1130,6 +1143,7 @@ def _post_daily_device_round_abnormal_alert(
     logger: logging.Logger,
     include_blocks: bool = False,
     include_actions: bool = False,
+    include_device_voice_action: bool = True,
 ) -> dict[str, str] | None:
     if not _daily_device_round_has_abnormal_result(report_summary):
         return
@@ -1154,6 +1168,7 @@ def _post_daily_device_round_abnormal_alert(
                 report_summary,
                 permalink,
                 include_actions=include_actions,
+                include_device_voice_action=include_device_voice_action,
             )
         response = client.chat_postMessage(**message_kwargs)
         posted_message_ts = _extract_daily_device_round_thread_ts(response)
