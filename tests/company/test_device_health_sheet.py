@@ -33,7 +33,7 @@ class _FakeAuthorizedSession:
 
 
 class DeviceHealthSheetTests(unittest.TestCase):
-    def test_builds_thirteen_column_row_with_pending_status(self) -> None:
+    def test_builds_fifteen_column_row_with_pending_status(self) -> None:
         detected_at = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
 
         rows = device_health_sheet._build_device_health_sheet_rows(
@@ -51,7 +51,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(len(rows[0]), 13)
+        self.assertEqual(len(rows[0]), 15)
         self.assertIsInstance(rows[0][0], float)
         self.assertEqual(rows[0][1], "MB2-C00043")
         self.assertEqual(rows[0][2], "수지미래산부인과의원(용인)")
@@ -59,11 +59,16 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(rows[0][4], "캡처보드 LED")
         self.assertEqual(rows[0][5], "캡처보드와 LED를 찾지 못했어")
         self.assertEqual(rows[0][6], "")
-        self.assertEqual(rows[0][7], "대기")
-        self.assertIn('INDIRECT("H"&ROW())="완료"', rows[0][8])
-        self.assertIn('INDIRECT("I"&ROW())=0', rows[0][8])
-        self.assertIn("LET(total", rows[0][9])
-        self.assertEqual(rows[0][12], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
+        self.assertEqual(rows[0][7], "")
+        self.assertEqual(rows[0][8], "대기")
+        self.assertEqual(rows[0][9], "")
+        self.assertIn('INDIRECT("I"&ROW())="완료"', rows[0][10])
+        self.assertIn('INDIRECT("K"&ROW())=0', rows[0][10])
+        self.assertIn("LET(total", rows[0][11])
+        self.assertIn('INDIRECT("K"&ROW())-INDIRECT("A"&ROW())', rows[0][11])
+        self.assertEqual(rows[0][12], "")
+        self.assertEqual(rows[0][13], "")
+        self.assertEqual(rows[0][14], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
 
     def test_appends_rows_with_adc_authorized_session(self) -> None:
         session = _FakeAuthorizedSession()
@@ -109,8 +114,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
         )
         self.assertEqual(call["json"]["majorDimension"], "ROWS")
         self.assertEqual(call["json"]["values"][0][1], "MB2-C00043")
-        self.assertTrue(call["json"]["values"][0][8].startswith("=IF("))
-        self.assertTrue(call["json"]["values"][0][9].startswith("=IF("))
+        self.assertTrue(unquote(call["url"]).endswith("'Boxer 장애 감지 처리 현황'!A:O:append"))
+        self.assertTrue(call["json"]["values"][0][10].startswith("=IF("))
+        self.assertTrue(call["json"]["values"][0][11].startswith("=IF("))
         self.assertEqual(call["timeout"], 7)
 
     def test_loads_bottommost_captureboard_incident_for_each_device(self) -> None:
@@ -126,7 +132,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "",
                         "녹화 파일 증가 정지가 240초 동안 지속됐어",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
+                        "",
                         "",
                         "",
                         "",
@@ -140,7 +148,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "캡처보드",
                         "분할 녹화 파일 병합 실패",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
+                        "",
                         "",
                         "",
                         "",
@@ -154,7 +164,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "캡처보드",
                         "녹화 파일 업로드 실패",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
+                        "",
                         "",
                         "",
                         "",
@@ -168,7 +180,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "",
                         "비디오 장치를 찾지 못했어",
                         "Leon",
+                        "CS 인입",
                         "대기",
+                        "",
                         "",
                         "",
                         "",
@@ -182,7 +196,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "캡처보드",
                         "캡처보드 USB를 찾지 못했어",
                         "Leon",
+                        "선제연락",
                         "완료",
+                        "",
                         "",
                         "",
                         "",
@@ -228,7 +244,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         call = session.calls[0]
         self.assertEqual(call["method"], "GET")
         self.assertTrue(
-            unquote(call["url"]).endswith("/spreadsheet/id/values/'TA''s 현황'!B2:M")
+            unquote(call["url"]).endswith("/spreadsheet/id/values/'TA''s 현황'!B2:O")
         )
         self.assertEqual(
             call["params"],
@@ -284,6 +300,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "",
                         "녹화 파일 증가 정지가 240초 동안 지속됐어",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
                     ],
                     [
@@ -293,6 +310,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "캡처보드",
                         "분할 녹화 파일 병합 실패",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
                     ],
                     [
@@ -302,6 +320,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "캡처보드",
                         "녹화 파일 upload 실패",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
                     ],
                     [
@@ -311,6 +330,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
                         "캡처보드",
                         "FFmpeg exited with code 1",
                         "Leon",
+                        "MDA 모니터링",
                         "대기",
                     ],
                 ]

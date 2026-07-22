@@ -25,13 +25,13 @@ _CAPTUREBOARD_INCIDENT_EXCLUDED_MARKERS = (
 )
 # 시트 반복 계산(최대 1회)과 함께 사용해 완료 선택 순간을 셀 자체에 고정한다.
 _COMPLETED_AT_FORMULA = (
-    '=IF(INDIRECT("H"&ROW())="완료",'
-    'IF(OR(INDIRECT("I"&ROW())="",INDIRECT("I"&ROW())=0),'
-    'NOW()+9/24,INDIRECT("I"&ROW())),"")'
+    '=IF(INDIRECT("I"&ROW())="완료",'
+    'IF(OR(INDIRECT("K"&ROW())="",INDIRECT("K"&ROW())=0),'
+    'NOW()+9/24,INDIRECT("K"&ROW())),"")'
 )
 _WORK_DURATION_FORMULA = (
-    '=IF(OR(INDIRECT("A"&ROW())="",INDIRECT("I"&ROW())=""),"",'
-    'LET(total,ROUND((INDIRECT("I"&ROW())-INDIRECT("A"&ROW()))*86400),'
+    '=IF(OR(INDIRECT("A"&ROW())="",INDIRECT("K"&ROW())=""),"",'
+    'LET(total,ROUND((INDIRECT("K"&ROW())-INDIRECT("A"&ROW()))*86400),'
     'hours,INT(total/3600),minutes,INT(MOD(total,3600)/60),seconds,MOD(total,60),'
     'TRIM(IF(hours>0,hours&"시간 ","")&IF(minutes>0,minutes&"분 ","")&'
     'IF(OR(seconds>0,AND(hours=0,minutes=0)),seconds&"초",""))))'
@@ -77,7 +77,7 @@ def _build_device_health_sheet_rows(
             if isinstance(problem_components, list)
             else ""
         )
-        # G~M은 TA 처리 영역이며 신규 장애는 대기로 시작하고 완료 계산은 시트가 즉시 수행한다.
+        # G~N은 TA 처리 영역이다. 신규 장애는 I열 대기로 시작하고 K/L열은 시트가 계산한다.
         rows.append(
             [
                 detected_at_serial,
@@ -87,7 +87,9 @@ def _build_device_health_sheet_rows(
                 problem_device,
                 _display_value(item.get("issue"), default="상세 확인 필요"),
                 "",
+                "",
                 "대기",
+                "",
                 _COMPLETED_AT_FORMULA,
                 _WORK_DURATION_FORMULA,
                 "",
@@ -109,10 +111,10 @@ def _load_device_health_sheet_captureboard_incidents(
     if not spreadsheet_id or not tab_name:
         raise ValueError("장비 장애 시트 ID 또는 탭 이름이 비어 있어")
 
-    # 장비·문제장치·감지내용·상태·permalink가 포함된 기존 B:M을 한 번에 읽어
+    # 장비·문제장치·감지내용·상태·permalink가 포함된 B:O를 한 번에 읽어
     # TA가 갱신한 현재 상태와 원본 Slack 알림을 같은 물리 행 기준으로 판단한다.
     quoted_tab_name = tab_name.replace("'", "''")
-    read_range = quote(f"'{quoted_tab_name}'!B2:M", safe="")
+    read_range = quote(f"'{quoted_tab_name}'!B2:O", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{read_range}"
@@ -161,9 +163,9 @@ def _load_device_health_sheet_captureboard_incidents(
         # 응답은 시트의 물리 행 순서이므로 같은 장비를 덮어써 가장 아래 행을 최신으로 남긴다.
         incidents[device_name] = {
             "deviceName": device_name,
-            "status": _display_value(row[6] if len(row) > 6 else None, default=""),
+            "status": _display_value(row[7] if len(row) > 7 else None, default=""),
             "slackPermalink": _display_value(
-                row[11] if len(row) > 11 else None,
+                row[13] if len(row) > 13 else None,
                 default="",
             ),
             "rowNumber": row_number,
@@ -195,7 +197,7 @@ def _append_device_health_sheet_alerts(
 
     # 탭 이름의 작은따옴표를 Sheets A1 규칙에 맞게 이스케이프하고 URL path도 별도로 인코딩한다.
     quoted_tab_name = tab_name.replace("'", "''")
-    append_range = quote(f"'{quoted_tab_name}'!A:M", safe="")
+    append_range = quote(f"'{quoted_tab_name}'!A:O", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{append_range}:append"
