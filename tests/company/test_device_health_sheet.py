@@ -60,6 +60,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(rows[0][6], "")
         self.assertEqual(rows[0][7], "대기")
         self.assertIn('INDIRECT("H"&ROW())="완료"', rows[0][8])
+        self.assertIn('INDIRECT("I"&ROW())=0', rows[0][8])
         self.assertIn("LET(total", rows[0][9])
         self.assertEqual(rows[0][12], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
 
