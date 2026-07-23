@@ -15,9 +15,16 @@ from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
     _load_device_health_sheet_captureboard_incidents,
 )
+from boxer_company.sms_delivery import (
+    _SMS_DELIVERY_CONFIRM_REQUIRED,
+    _SMS_DELIVERY_REQUEST_FAILED,
+)
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _collect_daily_device_round_abnormal_alert_items,
     _post_daily_device_round_abnormal_alert,
+)
+from boxer_company_adapter_slack.sms_delivery_reporter import (
+    remember_sms_delivery_sheet_record,
 )
 
 _CAPTUREBOARD_CONNECTION_ERROR = "captureboard_connection_error"
@@ -36,11 +43,10 @@ _SUPPORTED_DEVICE_NOTIFICATION_CODES = (
 _DEVICE_NOTIFICATION_ALERT_BATCH_SIZE = 200
 _DEVICE_NOTIFICATION_ALERT_TIMEZONE = ZoneInfo("Asia/Seoul")
 _RECORDING_STALL_MIN_DURATION_SECONDS = 120
-_RECORDING_STALL_CONFIRM_DURATION_SECONDS = 240
 _RECORDING_STALL_MAX_EVENT_GAP_SECONDS = 300
 _DEVICE_NOTIFICATION_ALERT_THREAD: threading.Thread | None = None
 _DEVICE_NOTIFICATION_ALERT_THREAD_LOCK = threading.Lock()
-_DEVICE_NOTIFICATION_AUTO_SMS_SENT_TEXT = "문자 자동발송 완료"
+_DEVICE_NOTIFICATION_AUTO_SMS_SENT_TEXT = "문자 발송 접수"
 _DEVICE_NOTIFICATION_AUTO_SMS_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 _DeviceNotificationAutoSmsSender = Callable[..., dict[str, Any]]
 
@@ -191,6 +197,12 @@ def _normalize_device_notification_auto_sms_result(value: Any) -> dict[str, Any]
         "smsPhoneNumber": str(value.get("smsPhoneNumber") or "").strip(),
         "smsMessage": str(value.get("smsMessage") or "").strip(),
         "smsTemplateId": str(value.get("smsTemplateId") or "").strip(),
+        "smsProvider": str(value.get("smsProvider") or "").strip(),
+        "smsGroupId": str(value.get("smsGroupId") or "").strip(),
+        "smsMessageId": str(value.get("smsMessageId") or "").strip(),
+        "smsDeliveryStatus": str(value.get("smsDeliveryStatus") or "").strip(),
+        # Slack 재시도 상태에서도 최초 공급자 접수 시각을 잃지 않게 보존한다.
+        "smsAcceptedAt": str(value.get("smsAcceptedAt") or "").strip(),
     }
 
 
@@ -638,8 +650,9 @@ def _refresh_captureboard_incidents_from_sheet(
             }
             # Sheet에 열린 행이 있으면 기존 녹화 후보·스레드는 같은 장애에 속하므로 폐기한다.
             reset_device_names.add(device_name)
-        elif device_name in current_incidents or device_name in legacy_alerted_device_names:
-            # 완료·이상없음·알 수 없는 상태·행 없음은 새 장애를 받을 수 있도록 모두 닫힌 것으로 본다.
+        elif device_name in current_incidents:
+            # Sheet에 실제로 연결했던 장애만 완료·이상없음·행 없음일 때 닫는다.
+            # Sheet 기록에 실패한 녹화 알림 상태까지 지우면 후속 이벤트가 새 루트·문자로 중복된다.
             reset_device_names.add(device_name)
 
     next_state = _clear_recording_stall_incidents_for_devices(
@@ -891,10 +904,28 @@ def _record_device_notification_sheet_alert_best_effort(
     detected_at = _parse_device_notification_datetime(event.get("occurredAt"))
     if detected_at is None:
         detected_at = _coerce_device_notification_alert_now(fallback_detected_at)
+    alert_items = _collect_daily_device_round_abnormal_alert_items(alert_summary)
+    if cs.DEVICE_HEALTH_SHEET_ENABLED:
+        for alert_item in alert_items:
+            try:
+                # Sheet append보다 먼저 접수 결과를 보존해 일시적인 Sheets 장애 뒤에도 재기록한다.
+                remember_sms_delivery_sheet_record(
+                    alert_item,
+                    detected_at=detected_at,
+                    permalink=str(slack_permalink or "").strip(),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "장비 이벤트 문자 발송 추적값을 outbox에 저장하지 못했어 "
+                    "notification_id=%s device=%s error_type=%s",
+                    event.get("notificationId"),
+                    str(alert_item.get("device") or "").strip(),
+                    type(exc).__name__,
+                )
     try:
-        # Slack 루트 알림이 발송된 이벤트만 공통 A:M 형식으로 기록해 스레드 진행 답변은 중복 행을 만들지 않는다.
+        # Slack 루트 알림이 발송된 이벤트만 공통 A:R 형식으로 기록해 스레드 진행 답변은 중복 행을 만들지 않는다.
         row_count = _append_device_health_sheet_alerts(
-            _collect_daily_device_round_abnormal_alert_items(alert_summary),
+            alert_items,
             detected_at=detected_at,
             slack_permalink=str(slack_permalink or "").strip(),
         )
@@ -1171,6 +1202,11 @@ def _apply_device_notification_auto_sms_result(
             "smsPhoneNumber",
             "smsMessage",
             "smsTemplateId",
+            "smsProvider",
+            "smsGroupId",
+            "smsMessageId",
+            "smsDeliveryStatus",
+            "smsAcceptedAt",
         ):
             value = str(auto_sms_result.get(key) or "").strip()
             if value:
@@ -1204,15 +1240,17 @@ def _prepare_device_notification_auto_sms(
             return alert_summary
 
         # provider 응답 뒤에만 결과를 쓰면 발송 직후 프로세스 종료 시 같은 문자를
-        # 재시도할 수 있다. 시도 claim을 먼저 원자 저장해 복구 시 자동 재발송하지 않는다.
+        # 재시도할 수 있다. 시도 claim을 먼저 원자 저장하되 실제 결과를 알 수 없는
+        # crash window를 발송 실패로 단정하지 않는다.
         event["autoSms"] = _normalize_device_notification_auto_sms_result(
             {
                 "attempted": True,
                 "attemptedAt": now.isoformat(),
                 "status": "attempting",
                 "ok": False,
-                "smsStatusText": _DEVICE_NOTIFICATION_AUTO_SMS_FAILED_TEXT,
-                "smsContactActionEnabled": True,
+                "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                "smsStatusText": "문자 발송 여부 확인 필요",
+                "smsContactActionEnabled": False,
             }
         )
         _save_device_notification_alert_state(state, state_path)
@@ -1237,6 +1275,7 @@ def _prepare_device_notification_auto_sms(
             raw_result = {
                 "status": "error",
                 "ok": False,
+                "smsDeliveryStatus": _SMS_DELIVERY_REQUEST_FAILED,
                 "smsStatusText": _DEVICE_NOTIFICATION_AUTO_SMS_FAILED_TEXT,
                 "smsContactActionEnabled": True,
             }
@@ -1325,87 +1364,79 @@ def _process_recording_stall_event(
             }
             return {**state, "recordingStallIncidents": incidents}, True, delivery
 
-        # 지속 시간이 다시 시작했거나 이벤트 간격이 끊기면 새 장애 후보로 분리한다.
+        # 지속 시간이 다시 시작했거나 이벤트 간격이 끊기면 현재 이벤트를 새 장애로 판단한다.
         incidents.pop(incident_key, None)
-        if is_zero_growth_candidate:
-            incidents[incident_key] = _new_recording_stall_candidate(event, context)
+    elif isinstance(incident, dict) and incident.get("phase") == "candidate":
+        # 배포 전 저장된 2분 후보도 다음 poll에서 현재 기준으로 바로 알릴 수 있게 이어받는다.
+        incidents.pop(incident_key, None)
+
+    if not is_zero_growth_candidate:
         return {**state, "recordingStallIncidents": incidents}, False, {}
 
-    if isinstance(incident, dict) and incident.get("phase") == "candidate":
-        can_confirm = (
-            is_zero_growth_candidate
-            and _coerce_int(context.get("durationSeconds"))
-            >= _RECORDING_STALL_CONFIRM_DURATION_SECONDS
-            and context.get("currentSize") == incident.get("lastCurrentSize")
-            and _is_recording_stall_continuation(incident, context)
+    # 장비의 critical 이벤트가 이미 2분 연속 무증가를 검증하므로 Boxer에서
+    # 같은 크기의 두 번째 이벤트를 기다리지 않고 첫 120초 이벤트를 즉시 알린다.
+    alert_summary = _build_recording_stall_alert_summary(event, context)
+    alert_summary = _prepare_device_notification_auto_sms(
+        state,
+        event,
+        alert_summary,
+        channel_id=channel_id,
+        now=now,
+        state_path=state_path,
+        logger=logger,
+        auto_sms_sender=auto_sms_sender,
+    )
+    delivery = _post_daily_device_round_abnormal_alert(
+        client,
+        alert_summary,
+        channel_id=channel_id,
+        message_ts="",
+        logger=logger,
+        include_blocks=True,
+        include_actions=auto_sms_sender is not None,
+        include_device_voice_action=False,
+    )
+    message_ts = str((delivery or {}).get("messageTs") or "").strip()
+    if delivery is None or not message_ts:
+        logger.warning(
+            "녹화 정지 루트 알림을 보내지 못했어 notification_id=%s device=%s",
+            event.get("notificationId"),
+            context.get("deviceName"),
         )
-        if can_confirm:
-            alert_summary = _build_recording_stall_alert_summary(event, context)
-            alert_summary = _prepare_device_notification_auto_sms(
-                state,
-                event,
-                alert_summary,
-                channel_id=channel_id,
-                now=now,
-                state_path=state_path,
-                logger=logger,
-                auto_sms_sender=auto_sms_sender,
-            )
-            delivery = _post_daily_device_round_abnormal_alert(
-                client,
-                alert_summary,
-                channel_id=channel_id,
-                message_ts="",
-                logger=logger,
-                include_blocks=True,
-                include_actions=auto_sms_sender is not None,
-                include_device_voice_action=False,
-            )
-            message_ts = str((delivery or {}).get("messageTs") or "").strip()
-            if delivery is None or not message_ts:
-                logger.warning(
-                    "녹화 정지 루트 알림을 보내지 못했어 notification_id=%s device=%s",
-                    event.get("notificationId"),
-                    context.get("deviceName"),
-                )
-                return None
-            sheet_recorded = _record_device_notification_sheet_alert_best_effort(
-                alert_summary,
-                event,
-                fallback_detected_at=now,
-                slack_permalink=str(delivery.get("permalink") or "").strip(),
-                logger=logger,
-            )
-            incidents[incident_key] = {
-                **incident,
-                "phase": "alerted",
-                "lastNotificationId": _coerce_int(event.get("notificationId")),
-                "lastOccurredAt": context["occurredAt"],
-                "lastDurationSeconds": _coerce_int(context.get("durationSeconds")),
-                "lastCurrentSize": context.get("currentSize"),
-                "slackMessageTs": message_ts,
-                "slackPermalink": str(delivery.get("permalink") or "").strip(),
-            }
-            next_state = {**state, "recordingStallIncidents": incidents}
-            if sheet_recorded:
-                # Sheet의 대기 행이 생성된 순간부터 같은 장비의 두 이벤트를 한 장애로 묶는다.
-                next_state = _mark_captureboard_incident_open(
-                    next_state,
-                    event,
-                    delivery,
-                    now=now,
-                )
-            return next_state, True, delivery
+        return None
 
-        # 크기가 조금이라도 변했으면 기존 후보를 폐기하고 현재 0 증가 이벤트부터 다시 확인한다.
-        incidents.pop(incident_key, None)
-        if is_zero_growth_candidate:
-            incidents[incident_key] = _new_recording_stall_candidate(event, context)
-        return {**state, "recordingStallIncidents": incidents}, False, {}
-
-    if is_zero_growth_candidate:
-        incidents[incident_key] = _new_recording_stall_candidate(event, context)
-    return {**state, "recordingStallIncidents": incidents}, False, {}
+    sheet_recorded = _record_device_notification_sheet_alert_best_effort(
+        alert_summary,
+        event,
+        fallback_detected_at=now,
+        slack_permalink=str(delivery.get("permalink") or "").strip(),
+        logger=logger,
+    )
+    opened_incident = (
+        incident
+        if isinstance(incident, dict) and incident.get("phase") == "candidate"
+        else _new_recording_stall_candidate(event, context)
+    )
+    incidents[incident_key] = {
+        **opened_incident,
+        "phase": "alerted",
+        "lastNotificationId": _coerce_int(event.get("notificationId")),
+        "lastOccurredAt": context["occurredAt"],
+        "lastDurationSeconds": _coerce_int(context.get("durationSeconds")),
+        "lastCurrentSize": context.get("currentSize"),
+        "slackMessageTs": message_ts,
+        "slackPermalink": str(delivery.get("permalink") or "").strip(),
+    }
+    next_state = {**state, "recordingStallIncidents": incidents}
+    if sheet_recorded:
+        # Sheet의 대기 행이 생성된 순간부터 같은 장비의 후속 이벤트를 한 장애로 묶는다.
+        next_state = _mark_captureboard_incident_open(
+            next_state,
+            event,
+            delivery,
+            now=now,
+        )
+    return next_state, True, delivery
 
 
 def _deliver_pending_device_notification_alerts(

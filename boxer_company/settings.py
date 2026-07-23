@@ -406,6 +406,19 @@ SOLAPI_API_KEY = os.getenv("SOLAPI_API_KEY", "").strip()
 SOLAPI_API_SECRET = os.getenv("SOLAPI_API_SECRET", "").strip()
 SOLAPI_FROM_NUMBER = os.getenv("SOLAPI_FROM_NUMBER", "").strip()
 SOLAPI_BASE_URL = os.getenv("SOLAPI_BASE_URL", "https://api.solapi.com").strip()
+SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC = int(
+    os.getenv("SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC", "30")
+)
+SOLAPI_DELIVERY_REPORT_MAX_AGE_HOURS = int(
+    os.getenv("SOLAPI_DELIVERY_REPORT_MAX_AGE_HOURS", "48")
+)
+SMS_DELIVERY_OUTBOX_PATH = (
+    os.getenv("SMS_DELIVERY_OUTBOX_PATH", "").strip()
+    or str(core_settings.PROJECT_ROOT / "data" / "sms_delivery_outbox.json")
+)
+SMS_DELIVERY_OUTBOX_REPAIR_GRACE_SEC = int(
+    os.getenv("SMS_DELIVERY_OUTBOX_REPAIR_GRACE_SEC", "60")
+)
 DEVICE_STATE_REDIS_HOST = os.getenv("DEVICE_STATE_REDIS_HOST", "").strip()
 DEVICE_STATE_REDIS_PORT = int(os.getenv("DEVICE_STATE_REDIS_PORT", "6379"))
 DEVICE_STATE_REDIS_PASSWORD = os.getenv("DEVICE_STATE_REDIS_PASSWORD", "").strip()

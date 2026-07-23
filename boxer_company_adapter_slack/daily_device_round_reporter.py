@@ -63,7 +63,8 @@ _DEVICE_HEALTH_ALERT_COMPONENT_CATEGORIES = {
     "captureboard": "video_signal",
     "led": "led",
 }
-_DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
+_DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT = "문자 발송 접수"
+_DEVICE_HEALTH_ALERT_SMS_AUTO_LEGACY_SENT_TEXT = "문자 자동발송 완료"
 _DEVICE_HEALTH_ALERT_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
 _DEVICE_HEALTH_ALERT_COMPONENT_ORDER = ("captureboard", "led", "audio", "pm2")
@@ -685,6 +686,17 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "smsPhoneNumber": _display_value(device_result.get("smsPhoneNumber"), default=""),
                 "smsMessage": _display_value(device_result.get("smsMessage"), default=""),
                 "smsTemplateId": _display_value(device_result.get("smsTemplateId"), default=""),
+                "smsProvider": _display_value(device_result.get("smsProvider"), default=""),
+                "smsGroupId": _display_value(device_result.get("smsGroupId"), default=""),
+                "smsMessageId": _display_value(device_result.get("smsMessageId"), default=""),
+                "smsDeliveryStatus": _display_value(
+                    device_result.get("smsDeliveryStatus"),
+                    default="",
+                ),
+                "smsAcceptedAt": _display_value(
+                    device_result.get("smsAcceptedAt"),
+                    default="",
+                ),
                 "alertCategory": alert_category,
                 "problemComponents": problem_components,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
@@ -933,7 +945,11 @@ def _build_device_health_alert_item_text_lines(item: dict[str, Any]) -> list[str
 
 
 def _is_device_health_alert_auto_sms_status_button_enabled(item: dict[str, Any]) -> bool:
-    return _display_value(item.get("smsStatusText"), default="") == _DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT
+    # 배포 전 Slack action payload의 완료 문구도 조회 버튼으로 계속 동작하게 유지한다.
+    return _display_value(item.get("smsStatusText"), default="") in {
+        _DEVICE_HEALTH_ALERT_SMS_AUTO_SENT_TEXT,
+        _DEVICE_HEALTH_ALERT_SMS_AUTO_LEGACY_SENT_TEXT,
+    }
 
 
 def _build_daily_device_round_abnormal_alert_text(
@@ -1050,7 +1066,7 @@ def _build_device_health_alert_item_blocks(
     action_value = _build_device_health_alert_action_value(item)
     action_elements: list[dict[str, Any]] = []
     if sms_status_button_enabled:
-        # 자동발송 완료는 재발송 버튼 대신 확인 버튼으로 노출해 실제 발송 번호와 문구를 다시 볼 수 있게 한다.
+        # 발송 접수는 재발송 버튼 대신 확인 버튼으로 노출해 실제 발송 번호와 문구를 다시 볼 수 있게 한다.
         sms_status_action_value = _build_device_health_alert_action_value(
             {**item, "smsModalMode": _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT}
         )

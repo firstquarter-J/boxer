@@ -1,11 +1,9 @@
 import gzip
 import hashlib
-import hmac
 import json
 import logging
 import os
 import re
-import secrets
 import stat
 import tempfile
 import threading
@@ -30,6 +28,15 @@ from boxer_company.daily_device_round import (
     _daily_device_round_status_label,
 )
 from boxer_company.redis_device_state import DeviceStateRedisClient, DeviceStateRedisUnavailable
+from boxer_company.sms_delivery import (
+    _SMS_DELIVERY_ACCEPTED,
+    _SMS_DELIVERY_CONFIRM_REQUIRED,
+    _SMS_DELIVERY_DELIVERED,
+    _SMS_DELIVERY_FAILED,
+    _SMS_DELIVERY_NOT_SENT,
+    _SMS_DELIVERY_REQUEST_FAILED,
+    _build_solapi_authorization_header,
+)
 from boxer_company.routers.device_file_probe import (
     _connect_device_ssh_client,
     _get_active_device_ssh_client_count,
@@ -66,6 +73,10 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
 from boxer_company_adapter_slack.device_notification_alert_reporter import (
     _load_recent_captureboard_notification_alerts,
 )
+from boxer_company_adapter_slack.sms_delivery_reporter import (
+    attach_sms_delivery_reporter,
+    remember_sms_delivery_sheet_record,
+)
 
 _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
 _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
@@ -84,7 +95,7 @@ _DEVICE_HEALTH_MONITOR_ACTION_LABELS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "병원 문자 보내기",
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE: "장비 음성 안내(미구현)",
     _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE: "확인 완료",
-    _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS: "문자 자동발송 완료",
+    _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS: "문자 발송 접수",
 }
 _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
@@ -101,7 +112,9 @@ _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND = "send"
 _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT = "view_auto_sent"
 # 병원 관계자가 첫 줄에서 발신 주체를 바로 알 수 있게 모든 기본 문자에 같은 인사를 쓴다.
 _DEVICE_HEALTH_MONITOR_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
-_DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT = "문자 자동발송 완료"
+_DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT = "문자 발송 접수"
+_DEVICE_HEALTH_MONITOR_SMS_AUTO_LEGACY_SENT_TEXT = "문자 자동발송 완료"
+_DEVICE_HEALTH_MONITOR_SMS_CONFIRM_REQUIRED_TEXT = "문자 발송 여부 확인 필요"
 _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT = "문자 자동발송 실패 - 수동 발송 가능"
 _DEVICE_HEALTH_MONITOR_OPEN_CAPTUREBOARD_SHEET_STATUSES = {
     "대기",
@@ -827,12 +840,15 @@ def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, 
 
 
 def _is_device_health_monitor_auto_sent_action_item(item: dict[str, str]) -> bool:
-    # 이전 알림 payload에 smsModalMode가 없어도 자동발송 완료 버튼은 재발송 모달로 열지 않는다.
+    # 이전 알림 payload의 완료 문구도 접수 확인 버튼으로 인정해 재발송 모달로 열지 않는다.
     return (
         _display_value(item.get("smsModalMode"), default="")
         == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
         or _display_value(item.get("smsStatusText"), default="")
-        == _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT
+        in {
+            _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT,
+            _DEVICE_HEALTH_MONITOR_SMS_AUTO_LEGACY_SENT_TEXT,
+        }
     )
 
 
@@ -1136,17 +1152,6 @@ def _device_health_monitor_action_webhook_url(action_id: str) -> str:
     return str(getattr(cs, setting_name, "") or "").strip()
 
 
-def _build_solapi_authorization_header() -> str:
-    date_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    salt = secrets.token_hex(16)
-    signature = hmac.new(
-        cs.SOLAPI_API_SECRET.encode("utf-8"),
-        f"{date_time}{salt}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"HMAC-SHA256 apiKey={cs.SOLAPI_API_KEY}, date={date_time}, salt={salt}, signature={signature}"
-
-
 def _device_health_monitor_sms_type(message: str) -> str:
     return "SMS" if len(str(message or "").encode("euc-kr", errors="replace")) <= 90 else "LMS"
 
@@ -1179,7 +1184,9 @@ def _post_device_health_monitor_solapi_sms(
                 "type": _device_health_monitor_sms_type(message),
                 "country": "82",
             }
-        ]
+        ],
+        # 최종 수신 결과를 추적할 messageId와 최초 provider 상태를 응답에 포함시킨다.
+        "showMessageList": True,
     }
     url = f"{cs.SOLAPI_BASE_URL.rstrip('/')}/messages/v4/send-many/detail"
     try:
@@ -1194,7 +1201,14 @@ def _post_device_health_monitor_solapi_sms(
         )
     except Exception as exc:
         logger.warning("Solapi SMS 발송 요청 실패", exc_info=True)
-        return {"status": "error", "ok": False, "provider": "solapi", "error": type(exc).__name__}
+        # 연결 종료·timeout은 공급자가 요청을 접수했을 가능성이 있어 자동 재발송하지 않는다.
+        return {
+            "status": "error",
+            "ok": False,
+            "provider": "solapi",
+            "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+            "error": type(exc).__name__,
+        }
 
     response_text = _display_value(response.text, default="")
     try:
@@ -1203,18 +1217,114 @@ def _post_device_health_monitor_solapi_sms(
         response_payload = {}
 
     if 200 <= int(response.status_code) < 300:
+        group_info = (
+            response_payload.get("groupInfo")
+            if isinstance(response_payload.get("groupInfo"), dict)
+            else {}
+        )
+        message_list = (
+            response_payload.get("messageList")
+            if isinstance(response_payload.get("messageList"), list)
+            else []
+        )
+        failed_message_list = (
+            response_payload.get("failedMessageList")
+            if isinstance(response_payload.get("failedMessageList"), list)
+            else []
+        )
+        first_message = message_list[0] if message_list and isinstance(message_list[0], dict) else {}
+        first_failed_message = (
+            failed_message_list[0]
+            if failed_message_list and isinstance(failed_message_list[0], dict)
+            else {}
+        )
+        group_id = _display_value(
+            group_info.get("groupId"),
+            default=_display_value(response_payload.get("groupId"), default=""),
+        )
+        message_id = _display_value(first_message.get("messageId"), default="")
+        provider_status_code = _display_value(
+            first_message.get("statusCode"),
+            default="",
+        )
+
+        if failed_message_list:
+            return {
+                "status": "error",
+                "ok": False,
+                "provider": "solapi",
+                "statusCode": int(response.status_code),
+                "httpStatusCode": int(response.status_code),
+                "providerStatusCode": _display_value(
+                    first_failed_message.get("statusCode"),
+                    default="",
+                ),
+                "groupId": group_id,
+                "messageId": _display_value(
+                    first_failed_message.get("messageId"),
+                    default="",
+                ),
+                "smsDeliveryStatus": _SMS_DELIVERY_REQUEST_FAILED,
+                "error": _display_value(
+                    first_failed_message.get("statusMessage"),
+                    default="Solapi 메시지 등록 실패",
+                )[:300],
+            }
+
+        if provider_status_code and provider_status_code not in {
+            "2000",
+            "3000",
+            "4000",
+        }:
+            # HTTP 2xx여도 개별 메시지가 즉시 실패로 확정되면 접수 성공으로 취급하지 않는다.
+            return {
+                "status": "error",
+                "ok": False,
+                "provider": "solapi",
+                "statusCode": int(response.status_code),
+                "httpStatusCode": int(response.status_code),
+                "providerStatusCode": provider_status_code,
+                "groupId": group_id,
+                "messageId": message_id,
+                "smsDeliveryStatus": _SMS_DELIVERY_FAILED,
+                "error": _display_value(
+                    first_message.get("statusMessage"),
+                    default="Solapi 메시지 발송 실패",
+                )[:300],
+            }
+
+        if provider_status_code == "4000":
+            delivery_status = _SMS_DELIVERY_DELIVERED
+        elif group_id:
+            delivery_status = _SMS_DELIVERY_ACCEPTED
+        else:
+            # HTTP 성공이어도 추적 ID가 없으면 실제 수신 여부를 확인할 수 없다.
+            delivery_status = _SMS_DELIVERY_CONFIRM_REQUIRED
         return {
             "status": "sent",
             "ok": True,
             "provider": "solapi",
             "statusCode": int(response.status_code),
-            "groupId": _display_value(response_payload.get("groupId"), default=""),
+            "httpStatusCode": int(response.status_code),
+            "providerStatusCode": provider_status_code,
+            "groupId": group_id,
+            "messageId": message_id,
+            "smsDeliveryStatus": delivery_status,
         }
+    http_status_code = int(response.status_code)
+    delivery_status = (
+        _SMS_DELIVERY_REQUEST_FAILED
+        if 400 <= http_status_code < 500 and http_status_code != 408
+        else _SMS_DELIVERY_CONFIRM_REQUIRED
+    )
     return {
         "status": "error",
         "ok": False,
         "provider": "solapi",
-        "statusCode": int(response.status_code),
+        "statusCode": http_status_code,
+        "httpStatusCode": http_status_code,
+        # timeout·서버 오류는 요청 수신 여부가 불명확하고, 그 외 명확한 4xx만 재시도 가능 실패다.
+        "smsDeliveryStatus": delivery_status,
         "error": response_text[:300],
     }
 
@@ -1481,11 +1591,19 @@ def _send_device_health_monitor_auto_sms_for_item_uncached(
 ) -> dict[str, Any]:
     phone_number = _device_health_monitor_auto_sms_phone_number(item)
     if not phone_number:
-        return {"status": "manual_required", "smsContactActionEnabled": True}
+        return {
+            "status": "manual_required",
+            "smsDeliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            "smsContactActionEnabled": True,
+        }
 
     sms_guide = _build_device_health_monitor_sms_guide(item)
     if not sms_guide.get("supported") or not _display_value(sms_guide.get("message"), default=""):
-        return {"status": "unsupported_issue", "smsContactActionEnabled": True}
+        return {
+            "status": "unsupported_issue",
+            "smsDeliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            "smsContactActionEnabled": True,
+        }
 
     try:
         payload, prepared_result = _build_device_health_monitor_contact_webhook_payload(
@@ -1503,23 +1621,53 @@ def _send_device_health_monitor_auto_sms_for_item_uncached(
             "status": "error",
             "ok": False,
             "error": type(exc).__name__,
+            "smsDeliveryStatus": _SMS_DELIVERY_REQUEST_FAILED,
             "smsStatusText": _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT,
             "smsContactActionEnabled": True,
         }
 
     if payload is None:
-        return {**prepared_result, "smsContactActionEnabled": True}
+        return {
+            **prepared_result,
+            "smsDeliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            "smsContactActionEnabled": True,
+        }
 
     send_result = _post_device_health_monitor_sms_payload(payload, logger=logger)
     result = {**prepared_result, **send_result}
-    sent = bool(result.get("ok")) and _display_value(result.get("status"), default="") == "sent"
-    status_text = (
-        _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT
-        if sent
-        else _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT
+    request_accepted = (
+        bool(result.get("ok"))
+        and _display_value(result.get("status"), default="") == "sent"
     )
+    delivery_status = _display_value(result.get("smsDeliveryStatus"), default="")
+    if not delivery_status:
+        # Solapi 외 provider는 최종 수신 조회 수단이 연결되지 않아 접수 성공만으로 완료를 단정하지 않는다.
+        delivery_status = (
+            _SMS_DELIVERY_CONFIRM_REQUIRED
+            if request_accepted
+            else _SMS_DELIVERY_REQUEST_FAILED
+        )
+    confirm_required = delivery_status == _SMS_DELIVERY_CONFIRM_REQUIRED
+    status_text = (
+        _DEVICE_HEALTH_MONITOR_SMS_CONFIRM_REQUIRED_TEXT
+        if confirm_required
+        else (
+            _DEVICE_HEALTH_MONITOR_SMS_AUTO_SENT_TEXT
+            if request_accepted
+            else _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT
+        )
+    )
+    sms_accepted_at = now.isoformat() if request_accepted else ""
     _append_device_health_monitor_event(
-        "alert_sms_auto_sent" if sent else "alert_sms_auto_failed",
+        (
+            "alert_sms_auto_confirm_required"
+            if confirm_required
+            else (
+                "alert_sms_auto_accepted"
+                if request_accepted
+                else "alert_sms_auto_failed"
+            )
+        ),
         {
             "actionId": _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
             "channelId": channel_id,
@@ -1530,6 +1678,15 @@ def _send_device_health_monitor_auto_sms_for_item_uncached(
             "templateId": _display_value(result.get("templateId"), default=""),
             "provider": _display_value(result.get("provider"), default=""),
             "status": _display_value(result.get("status"), default=""),
+            # 공급자 조회와 Sheets 최종 상태 복구에 쓰는 비민감 추적값을 감사 로그에도 남긴다.
+            "smsGroupId": _display_value(result.get("groupId"), default=""),
+            "smsMessageId": _display_value(result.get("messageId"), default=""),
+            "providerStatusCode": _display_value(
+                result.get("providerStatusCode"),
+                default="",
+            ),
+            "smsDeliveryStatus": delivery_status,
+            "smsAcceptedAt": sms_accepted_at,
             "phoneLast4": _display_value(result.get("phoneLast4"), default=""),
         },
         now=now,
@@ -1537,9 +1694,15 @@ def _send_device_health_monitor_auto_sms_for_item_uncached(
     )
     return {
         **result,
+        "smsProvider": _display_value(result.get("provider"), default=""),
+        "smsGroupId": _display_value(result.get("groupId"), default=""),
+        "smsMessageId": _display_value(result.get("messageId"), default=""),
+        "smsDeliveryStatus": delivery_status,
+        **({"smsAcceptedAt": sms_accepted_at} if sms_accepted_at else {}),
         "smsStatusText": status_text,
-        "smsContactActionEnabled": not sent,
-        # 자동발송 완료 버튼에서 실제 발송 대상과 본문을 확인할 수 있게 Slack action payload로 넘긴다.
+        # 발송 여부가 불확실할 때는 중복 발송을 막고 공급자 조회 결과를 기다린다.
+        "smsContactActionEnabled": not request_accepted and not confirm_required,
+        # 발송 접수 버튼에서 실제 발송 대상과 본문을 확인할 수 있게 Slack action payload로 넘긴다.
         "smsPhoneNumber": _display_value(payload.get("sms", {}).get("to"), default=""),
         "smsMessage": _display_value(payload.get("sms", {}).get("message"), default=""),
         "smsTemplateId": _display_value(payload.get("sms", {}).get("templateId"), default=""),
@@ -1659,12 +1822,12 @@ def _reuse_device_health_monitor_auto_sms_claim_result(
         result = claim.get("result")
         if isinstance(result, dict):
             logger.info("Reused device alert auto SMS result claim=%s", claim_key)
-            return {**result, "deduplicated": True}
-    # 첫 호출의 결과를 확정하지 못했어도 중복 가능성이 있으므로 자동 재발송은 하지 않는다.
+    # 중복 알림에는 최초 발송의 추적 ID를 복제하지 않아 한 groupId가 여러 Sheet 행에 연결되지 않게 한다.
     return {
         "status": "duplicate_suppressed",
         "ok": False,
-        "smsStatusText": "동일 장애 문자 발송 여부 확인 필요",
+        "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+        "smsStatusText": "동일 장애 문자 중복 발송 생략 - 기존 알림에서 발송 여부 확인 필요",
         "smsContactActionEnabled": False,
         "deduplicated": True,
     }
@@ -1679,13 +1842,21 @@ def _send_device_health_monitor_auto_sms_for_item(
 ) -> dict[str, Any]:
     # 실제 발송 가능 항목만 공통 claim을 잡아 번호 없음·미지원 항목은 기존 수동 흐름을 유지한다.
     if not _device_health_monitor_auto_sms_phone_number(item):
-        return {"status": "manual_required", "smsContactActionEnabled": True}
+        return {
+            "status": "manual_required",
+            "smsDeliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            "smsContactActionEnabled": True,
+        }
     sms_guide = _build_device_health_monitor_sms_guide(item)
     if not sms_guide.get("supported") or not _display_value(
         sms_guide.get("message"),
         default="",
     ):
-        return {"status": "unsupported_issue", "smsContactActionEnabled": True}
+        return {
+            "status": "unsupported_issue",
+            "smsDeliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            "smsContactActionEnabled": True,
+        }
 
     claim_key = _device_health_monitor_auto_sms_claim_key(item)
     if not claim_key:
@@ -1718,6 +1889,7 @@ def _send_device_health_monitor_auto_sms_for_item(
                 "status": "error",
                 "ok": False,
                 "error": type(exc).__name__,
+                "smsDeliveryStatus": _SMS_DELIVERY_REQUEST_FAILED,
                 "smsStatusText": _DEVICE_HEALTH_MONITOR_SMS_AUTO_FAILED_TEXT,
                 "smsContactActionEnabled": True,
             },
@@ -1759,13 +1931,22 @@ def _apply_device_health_monitor_auto_sms(
                 sms_status_text = _display_value(auto_result.get("smsStatusText"), default="")
                 if sms_status_text:
                     next_device_result["smsStatusText"] = sms_status_text
-                    next_device_result["smsContactActionEnabled"] = (
-                        "true" if auto_result.get("smsContactActionEnabled", True) else "false"
-                    )
-                    for key in ("smsPhoneNumber", "smsMessage", "smsTemplateId"):
-                        value = _display_value(auto_result.get(key), default="")
-                        if value:
-                            next_device_result[key] = value
+                next_device_result["smsContactActionEnabled"] = (
+                    "true" if auto_result.get("smsContactActionEnabled", True) else "false"
+                )
+                for key in (
+                    "smsPhoneNumber",
+                    "smsMessage",
+                    "smsTemplateId",
+                    "smsProvider",
+                    "smsGroupId",
+                    "smsMessageId",
+                    "smsDeliveryStatus",
+                    "smsAcceptedAt",
+                ):
+                    value = _display_value(auto_result.get(key), default="")
+                    if value:
+                        next_device_result[key] = value
         next_device_results.append(next_device_result)
     return {**alert_summary, "deviceResults": next_device_results}
 
@@ -4129,6 +4310,34 @@ def _build_device_health_monitor_next_state(
     }
 
 
+def _remember_device_health_sms_sheet_records_best_effort(
+    alert_items: list[dict[str, Any]],
+    *,
+    detected_at: datetime,
+    slack_permalink: str,
+    logger: logging.Logger,
+) -> None:
+    if not cs.DEVICE_HEALTH_SHEET_ENABLED:
+        return
+    for alert_item in alert_items:
+        if not _display_value(alert_item.get("smsGroupId"), default=""):
+            continue
+        try:
+            # Slack·Sheet보다 먼저 추적 ID를 보존해 어느 후속 단계가 실패해도 공급자 조회가 가능하게 한다.
+            remember_sms_delivery_sheet_record(
+                alert_item,
+                detected_at=detected_at,
+                permalink=slack_permalink,
+            )
+        except Exception as exc:
+            logger.warning(
+                "문자 발송 추적값을 outbox에 저장하지 못했어 "
+                "device=%s error_type=%s",
+                _display_value(alert_item.get("device"), default=""),
+                type(exc).__name__,
+            )
+
+
 def _record_device_health_sheet_alerts_best_effort(
     alert_summary: dict[str, Any],
     *,
@@ -4136,10 +4345,17 @@ def _record_device_health_sheet_alerts_best_effort(
     slack_permalink: str,
     logger: logging.Logger,
 ) -> None:
+    alert_items = _collect_daily_device_round_abnormal_alert_items(alert_summary)
+    _remember_device_health_sms_sheet_records_best_effort(
+        alert_items,
+        detected_at=detected_at,
+        slack_permalink=slack_permalink,
+        logger=logger,
+    )
     try:
         # Slack 발송 성공 후에만 기록하고, Sheets 장애는 이미 전달된 운영 알림을 실패로 바꾸지 않는다.
         sheet_row_count = _append_device_health_sheet_alerts(
-            _collect_daily_device_round_abnormal_alert_items(alert_summary),
+            alert_items,
             detected_at=detected_at,
             slack_permalink=slack_permalink,
         )
@@ -4506,6 +4722,13 @@ def _run_device_health_monitor_once(
         now=local_now,
         logger=logger,
     )
+    # Slack 호출이 실패해도 이미 접수된 문자의 groupId를 잃지 않도록 먼저 outbox에 기록한다.
+    _remember_device_health_sms_sheet_records_best_effort(
+        _collect_daily_device_round_abnormal_alert_items(alert_summary),
+        detected_at=local_now,
+        slack_permalink="",
+        logger=logger,
+    )
     slack_delivery = _post_daily_device_round_abnormal_alert(
         client,
         alert_summary,
@@ -4637,6 +4860,8 @@ def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | 
         return
 
     _attach_device_health_monitor_alert_actions(app, actual_logger)
+    # 시트 H/R을 정본으로 삼아 프로세스 재시작 뒤에도 접수된 문자의 최종 수신 결과를 이어서 확인한다.
+    attach_sms_delivery_reporter(logger=actual_logger)
 
     # 상태 모니터가 꺼져 있어도 실시간 이벤트 카드의 문자 확인·수동 발송 버튼은 동작해야 한다.
     if not health_monitor_enabled:

@@ -15,6 +15,10 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 data/*.jsonl
+data/sms_delivery_outbox.json
+data/sms_delivery_outbox.json.lock
+data/sms_delivery_outbox.json.reconcile.lock
+data/.sms_delivery_outbox.json.*.tmp
 data/*-wal
 data/*-shm
 widget/node_modules/

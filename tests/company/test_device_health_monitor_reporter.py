@@ -253,6 +253,13 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         )
         self._sms_test_phone_patcher.start()
         self.addCleanup(self._sms_test_phone_patcher.stop)
+        self._sms_outbox_patcher = patch.object(
+            reporter,
+            "remember_sms_delivery_sheet_record",
+            return_value=False,
+        )
+        self.remember_sms_delivery_mock = self._sms_outbox_patcher.start()
+        self.addCleanup(self._sms_outbox_patcher.stop)
 
     def _run_captureboard_alert_candidate(
         self,
@@ -609,6 +616,210 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(append_event_mock.call_args.args[0], "sheet_alert_write_failed")
         self.assertEqual(append_event_mock.call_args.args[1]["errorType"], "RuntimeError")
 
+    def test_remembers_accepted_sms_before_sheet_append(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.sms_outbox")
+        local_now = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+        summary = _abnormal_summary()
+        summary["deviceResults"][0].update(
+            {
+                "smsDeliveryStatus": "accepted",
+                "smsGroupId": "G123",
+                "smsMessageId": "M123",
+                "smsAcceptedAt": local_now.isoformat(),
+            }
+        )
+        operations: list[str] = []
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                reporter,
+                "remember_sms_delivery_sheet_record",
+                side_effect=lambda *args, **kwargs: operations.append("remember"),
+            ) as remember_mock,
+            patch.object(
+                reporter,
+                "_append_device_health_sheet_alerts",
+                side_effect=lambda *args, **kwargs: operations.append("append") or 1,
+            ),
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            reporter._record_device_health_sheet_alerts_best_effort(
+                summary,
+                detected_at=local_now,
+                slack_permalink="https://lifexio.slack.com/archives/C_HEALTH/p3000001",
+                logger=logger,
+            )
+
+        self.assertEqual(operations, ["remember", "append"])
+        remembered_item = remember_mock.call_args.args[0]
+        self.assertEqual(remembered_item["smsGroupId"], "G123")
+        self.assertEqual(remembered_item["smsAcceptedAt"], local_now.isoformat())
+        self.assertEqual(remember_mock.call_args.kwargs["detected_at"], local_now)
+        self.assertEqual(
+            remember_mock.call_args.kwargs["permalink"],
+            "https://lifexio.slack.com/archives/C_HEALTH/p3000001",
+        )
+
+    def test_health_monitor_remembers_sms_before_slack_and_merges_permalink(
+        self,
+    ) -> None:
+        logger = logging.getLogger("test.device_health_monitor.sms_outbox_order")
+        local_now = datetime(2026, 7, 23, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+        pending_state = _pending_alert_state(
+            _LED_ALERT_FINGERPRINT,
+            local_now - timedelta(minutes=1),
+        )
+        sms_summary = _abnormal_summary()
+        sms_summary["deviceResults"][0].update(
+            {
+                "smsDeliveryStatus": "accepted",
+                "smsGroupId": "G-BEFORE-SLACK",
+                "smsMessageId": "M-BEFORE-SLACK",
+                "smsAcceptedAt": local_now.isoformat(),
+            }
+        )
+        operations: list[tuple[str, str]] = []
+
+        def _remember(*_args, **kwargs):
+            operations.append(("remember", kwargs["permalink"]))
+            return True
+
+        def _post_slack(*_args, **_kwargs):
+            operations.append(("slack", ""))
+            return {
+                "channelId": "C_HEALTH",
+                "messageTs": "3000.001",
+                "permalink": "https://example.com/health-alert",
+            }
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+            patch.object(
+                reporter,
+                "_load_device_health_monitor_state",
+                return_value=pending_state,
+            ),
+            patch.object(
+                reporter,
+                "_build_device_health_monitor_summary",
+                return_value=_abnormal_summary(),
+            ),
+            patch.object(reporter, "_save_device_health_monitor_state"),
+            patch.object(
+                reporter,
+                "_apply_device_health_monitor_auto_sms",
+                return_value=sms_summary,
+            ),
+            patch.object(
+                reporter,
+                "remember_sms_delivery_sheet_record",
+                side_effect=_remember,
+            ),
+            patch.object(
+                reporter,
+                "_post_daily_device_round_abnormal_alert",
+                side_effect=_post_slack,
+            ),
+            patch.object(
+                reporter,
+                "_append_device_health_sheet_alerts",
+                side_effect=lambda *_args, **_kwargs: (
+                    operations.append(("append", "")) or 1
+                ),
+            ),
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            sent = reporter._run_device_health_monitor_once(
+                object(),
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(
+            operations,
+            [
+                ("remember", ""),
+                ("slack", ""),
+                ("remember", "https://example.com/health-alert"),
+                ("append", ""),
+            ],
+        )
+
+    def test_health_monitor_outbox_failure_does_not_block_slack(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.sms_outbox_failure")
+        local_now = datetime(2026, 7, 23, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+        pending_state = _pending_alert_state(
+            _LED_ALERT_FINGERPRINT,
+            local_now - timedelta(minutes=1),
+        )
+        sms_summary = _abnormal_summary()
+        sms_summary["deviceResults"][0].update(
+            {
+                "smsDeliveryStatus": "accepted",
+                "smsGroupId": "G-OUTBOX-FAILURE",
+                "smsAcceptedAt": local_now.isoformat(),
+            }
+        )
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+            patch.object(
+                reporter,
+                "_load_device_health_monitor_state",
+                return_value=pending_state,
+            ),
+            patch.object(
+                reporter,
+                "_build_device_health_monitor_summary",
+                return_value=_abnormal_summary(),
+            ),
+            patch.object(reporter, "_save_device_health_monitor_state"),
+            patch.object(
+                reporter,
+                "_apply_device_health_monitor_auto_sms",
+                return_value=sms_summary,
+            ),
+            patch.object(
+                reporter,
+                "remember_sms_delivery_sheet_record",
+                side_effect=OSError("outbox unavailable"),
+            ) as remember_mock,
+            patch.object(
+                reporter,
+                "_post_daily_device_round_abnormal_alert",
+                return_value={
+                    "channelId": "C_HEALTH",
+                    "messageTs": "3000.001",
+                    "permalink": "https://example.com/health-alert",
+                },
+            ) as post_slack_mock,
+            patch.object(
+                reporter,
+                "_append_device_health_sheet_alerts",
+                return_value=1,
+            ),
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            sent = reporter._run_device_health_monitor_once(
+                object(),
+                logger,
+                now=local_now,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(remember_mock.call_count, 2)
+        post_slack_mock.assert_called_once()
+
     def test_suppresses_captureboard_alert_while_sheet_incident_is_open(self) -> None:
         for status in ("대기", "처리중", "진행중", "처리 중"):
             with self.subTest(status=status):
@@ -883,7 +1094,15 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             ),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._post_device_health_monitor_sms_payload",
-                return_value={"status": "sent", "ok": True, "provider": "fake"},
+                return_value={
+                    "status": "sent",
+                    "ok": True,
+                    "provider": "fake",
+                    "groupId": "G4V-AUDIT",
+                    "messageId": "M4V-AUDIT",
+                    "providerStatusCode": "2000",
+                    "smsDeliveryStatus": "accepted",
+                },
             ) as post_sms_mock,
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
@@ -936,7 +1155,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
             ],
         )
-        self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "문자 자동발송 완료")
+        self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "문자 발송 접수")
         self.assertIn('"smsPhoneNumber":"01012344567"', action_blocks[0]["elements"][0]["value"])
         self.assertIn(
             f'"smsModalMode":"{reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT}"',
@@ -945,8 +1164,12 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertIn("LED USB 케이블을 분리했다가 다시", action_blocks[0]["elements"][0]["value"])
         self.assertEqual(
             [call.args[0] for call in append_event_mock.call_args_list],
-            ["run_summary", "alert_sms_auto_sent", "slack_alert_sent"],
+            ["run_summary", "alert_sms_auto_accepted", "slack_alert_sent"],
         )
+        sms_audit_payload = append_event_mock.call_args_list[1].args[1]
+        self.assertEqual(sms_audit_payload["smsGroupId"], "G4V-AUDIT")
+        self.assertEqual(sms_audit_payload["smsMessageId"], "M4V-AUDIT")
+        self.assertEqual(sms_audit_payload["providerStatusCode"], "2000")
 
     def test_realtime_event_sms_guides_use_safe_fixed_messages(self) -> None:
         scenarios = (
@@ -1082,7 +1305,14 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             patch.object(
                 reporter,
                 "_post_device_health_monitor_sms_payload",
-                return_value={"status": "sent", "ok": True, "provider": "fake"},
+                return_value={
+                    "status": "sent",
+                    "ok": True,
+                    "provider": "fake",
+                    "groupId": "G-DEDUPE-OWNER",
+                    "messageId": "M-DEDUPE-OWNER",
+                    "smsDeliveryStatus": "accepted",
+                },
             ) as post_sms_mock,
             patch.object(reporter, "_append_device_health_monitor_event"),
         ):
@@ -1100,13 +1330,78 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             )
 
         self.assertEqual(first_result["status"], "sent")
-        self.assertEqual(second_result["status"], "sent")
+        self.assertEqual(first_result["smsAcceptedAt"], local_now.isoformat())
+        self.assertEqual(second_result["status"], "duplicate_suppressed")
+        self.assertEqual(second_result["smsDeliveryStatus"], "confirm_required")
+        self.assertFalse(second_result["smsContactActionEnabled"])
         self.assertTrue(second_result["deduplicated"])
-        self.assertEqual(first_result["smsMessage"], second_result["smsMessage"])
+        self.assertIn("중복 발송 생략", second_result["smsStatusText"])
+        self.assertNotIn("smsGroupId", second_result)
+        self.assertNotIn("smsMessageId", second_result)
+        self.assertNotIn("smsAcceptedAt", second_result)
         post_sms_mock.assert_called_once()
         self.assertEqual(
             reporter._device_health_monitor_auto_sms_claim_key(captureboard_item),
             reporter._device_health_monitor_auto_sms_claim_key(recording_item),
+        )
+
+    def test_auto_sms_confirm_required_disables_manual_resend(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.auto_sms_uncertain")
+        local_now = datetime(2026, 7, 23, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = {
+            "hospitalSeq": "566",
+            "hospitalName": "웰하이여성아동병원(부산)",
+            "hospital": "#566 웰하이여성아동병원(부산)",
+            "telephone": "051-201-8854",
+            "deviceAlertPhone": "010-1234-5678",
+            "room": "1진료실",
+            "device": "MB2-C01259",
+            "alertCategory": "video_signal",
+            "problemComponents": ["캡처보드"],
+            "issue": "모션 감지 중 캡쳐보드 연결에 문제가 발생했습니다.",
+            "mdaUrl": "https://mda.example/device",
+        }
+
+        with (
+            patch.object(
+                reporter,
+                "_lookup_device_health_monitor_hospital_contact",
+                return_value={
+                    "status": "ok",
+                    "hospitalSeq": "566",
+                    "hospitalName": "웰하이여성아동병원(부산)",
+                    "telephone": "051-201-8854",
+                    "deviceAlertPhone": "010-1234-5678",
+                    "phoneNumber": "01012345678",
+                },
+            ),
+            patch.object(
+                reporter,
+                "_post_device_health_monitor_sms_payload",
+                return_value={
+                    "status": "error",
+                    "ok": False,
+                    "provider": "solapi",
+                    "smsDeliveryStatus": "confirm_required",
+                    "error": "Timeout",
+                },
+            ),
+            patch.object(reporter, "_append_device_health_monitor_event") as append_event_mock,
+        ):
+            result = reporter._send_device_health_monitor_auto_sms_for_item(
+                item,
+                channel_id="C_HEALTH",
+                now=local_now,
+                logger=logger,
+            )
+
+        self.assertEqual(result["smsDeliveryStatus"], "confirm_required")
+        self.assertEqual(result["smsStatusText"], "문자 발송 여부 확인 필요")
+        self.assertFalse(result["smsContactActionEnabled"])
+        self.assertNotIn("smsAcceptedAt", result)
+        self.assertEqual(
+            append_event_mock.call_args.args[0],
+            "alert_sms_auto_confirm_required",
         )
 
     def test_realtime_event_only_mode_still_attaches_sms_actions(self) -> None:
@@ -1789,6 +2084,235 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(result["result"]["status"], "non_mobile_telephone")
         post_mock.assert_not_called()
         self.assertIn("휴대전화번호가 아니라", client.messages[0]["text"])
+
+    def test_solapi_send_response_keeps_tracking_ids_as_accepted(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.solapi")
+        response_payload = {
+            "groupInfo": {
+                "groupId": "G4V-TRACK",
+                "status": "SENDING",
+            },
+            "failedMessageList": [],
+            "messageList": [
+                {
+                    "messageId": "M4V-TRACK",
+                    "statusCode": "2000",
+                    "statusMessage": "정상 접수",
+                }
+            ],
+        }
+
+        with (
+            patch.object(reporter.cs, "SOLAPI_API_KEY", "api-key"),
+            patch.object(reporter.cs, "SOLAPI_API_SECRET", "api-secret"),
+            patch.object(reporter.cs, "SOLAPI_FROM_NUMBER", "0212345678"),
+            patch.object(reporter.cs, "SOLAPI_BASE_URL", "https://api.solapi.com"),
+            patch.object(
+                reporter.requests,
+                "post",
+                return_value=_FakeWebhookResponse(
+                    status_code=200,
+                    text=json.dumps(response_payload),
+                ),
+            ) as post_mock,
+        ):
+            result = reporter._post_device_health_monitor_solapi_sms(
+                {
+                    "sms": {
+                        "to": "01012345678",
+                        "message": "테스트 문자",
+                    }
+                },
+                logger=logger,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["smsDeliveryStatus"], "accepted")
+        self.assertEqual(result["groupId"], "G4V-TRACK")
+        self.assertEqual(result["messageId"], "M4V-TRACK")
+        self.assertEqual(result["providerStatusCode"], "2000")
+        self.assertTrue(post_mock.call_args.kwargs["json"]["showMessageList"])
+
+    def test_solapi_transport_failure_requires_confirmation(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.solapi")
+
+        with (
+            patch.object(reporter.cs, "SOLAPI_API_KEY", "api-key"),
+            patch.object(reporter.cs, "SOLAPI_API_SECRET", "api-secret"),
+            patch.object(reporter.cs, "SOLAPI_FROM_NUMBER", "0212345678"),
+            patch.object(
+                reporter.requests,
+                "post",
+                side_effect=TimeoutError("response timeout"),
+            ),
+        ):
+            result = reporter._post_device_health_monitor_solapi_sms(
+                {
+                    "sms": {
+                        "to": "01012345678",
+                        "message": "테스트 문자",
+                    }
+                },
+                logger=logger,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["smsDeliveryStatus"], "confirm_required")
+
+    def test_solapi_uncertain_http_status_requires_confirmation(
+        self,
+    ) -> None:
+        logger = logging.getLogger("test.device_health_monitor.solapi")
+
+        for status_code in (302, 408, 500, 503):
+            with (
+                self.subTest(status_code=status_code),
+                patch.object(reporter.cs, "SOLAPI_API_KEY", "api-key"),
+                patch.object(reporter.cs, "SOLAPI_API_SECRET", "api-secret"),
+                patch.object(reporter.cs, "SOLAPI_FROM_NUMBER", "0212345678"),
+                patch.object(
+                    reporter.requests,
+                    "post",
+                    return_value=_FakeWebhookResponse(
+                        status_code=status_code,
+                        text='{"message":"temporarily unavailable"}',
+                    ),
+                ),
+            ):
+                result = reporter._post_device_health_monitor_solapi_sms(
+                    {
+                        "sms": {
+                            "to": "01012345678",
+                            "message": "테스트 문자",
+                        }
+                    },
+                    logger=logger,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["httpStatusCode"], status_code)
+            self.assertEqual(result["smsDeliveryStatus"], "confirm_required")
+
+    def test_solapi_clear_http_client_error_is_request_failure(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.solapi")
+
+        for status_code in (400, 401, 403):
+            with (
+                self.subTest(status_code=status_code),
+                patch.object(reporter.cs, "SOLAPI_API_KEY", "api-key"),
+                patch.object(reporter.cs, "SOLAPI_API_SECRET", "api-secret"),
+                patch.object(reporter.cs, "SOLAPI_FROM_NUMBER", "0212345678"),
+                patch.object(
+                    reporter.requests,
+                    "post",
+                    return_value=_FakeWebhookResponse(
+                        status_code=status_code,
+                        text='{"message":"invalid request"}',
+                    ),
+                ),
+            ):
+                result = reporter._post_device_health_monitor_solapi_sms(
+                    {
+                        "sms": {
+                            "to": "01012345678",
+                            "message": "테스트 문자",
+                        }
+                    },
+                    logger=logger,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["httpStatusCode"], status_code)
+            self.assertEqual(result["smsDeliveryStatus"], "request_failed")
+
+    def test_solapi_http_success_with_failed_message_is_request_failure(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.solapi")
+        response_payload = {
+            "groupInfo": {"groupId": "G4V-FAILED", "status": "SENDING"},
+            "failedMessageList": [
+                {
+                    "messageId": "M4V-FAILED",
+                    "statusCode": "3040",
+                    "statusMessage": "등록되지 않은 발신번호입니다.",
+                }
+            ],
+            "messageList": [],
+        }
+
+        with (
+            patch.object(reporter.cs, "SOLAPI_API_KEY", "api-key"),
+            patch.object(reporter.cs, "SOLAPI_API_SECRET", "api-secret"),
+            patch.object(reporter.cs, "SOLAPI_FROM_NUMBER", "0212345678"),
+            patch.object(
+                reporter.requests,
+                "post",
+                return_value=_FakeWebhookResponse(
+                    status_code=200,
+                    text=json.dumps(response_payload),
+                ),
+            ),
+        ):
+            result = reporter._post_device_health_monitor_solapi_sms(
+                {
+                    "sms": {
+                        "to": "01012345678",
+                        "message": "테스트 문자",
+                    }
+                },
+                logger=logger,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["smsDeliveryStatus"], "request_failed")
+        self.assertEqual(result["providerStatusCode"], "3040")
+
+    def test_solapi_http_success_with_immediate_delivery_failure_is_not_accepted(
+        self,
+    ) -> None:
+        logger = logging.getLogger("test.device_health_monitor.solapi")
+        response_payload = {
+            "groupInfo": {"groupId": "G4V-DELIVERY-FAILED", "status": "COMPLETE"},
+            "failedMessageList": [],
+            "messageList": [
+                {
+                    "messageId": "M4V-DELIVERY-FAILED",
+                    "statusCode": "5000",
+                    "statusMessage": "수신 실패",
+                }
+            ],
+        }
+
+        with (
+            patch.object(reporter.cs, "SOLAPI_API_KEY", "api-key"),
+            patch.object(reporter.cs, "SOLAPI_API_SECRET", "api-secret"),
+            patch.object(reporter.cs, "SOLAPI_FROM_NUMBER", "0212345678"),
+            patch.object(reporter.cs, "SOLAPI_BASE_URL", "https://api.solapi.com"),
+            patch.object(
+                reporter.requests,
+                "post",
+                return_value=_FakeWebhookResponse(
+                    status_code=200,
+                    text=json.dumps(response_payload),
+                ),
+            ),
+        ):
+            result = reporter._post_device_health_monitor_solapi_sms(
+                {
+                    "sms": {
+                        "to": "01012345678",
+                        "message": "테스트 문자",
+                    }
+                },
+                logger=logger,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["smsDeliveryStatus"], "delivery_failed")
+        self.assertEqual(result["providerStatusCode"], "5000")
 
     def test_contact_action_can_send_sms_via_solapi_provider(self) -> None:
         client = _FakeSlackClient()
