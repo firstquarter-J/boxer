@@ -1,9 +1,13 @@
+import gzip
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
+import stat
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +19,7 @@ import requests
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
+from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_priority,
@@ -103,6 +108,9 @@ _DEVICE_HEALTH_MONITOR_OPEN_CAPTUREBOARD_SHEET_STATUSES = {
     "처리중",
     "진행중",
 }
+_DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN = re.compile(
+    r"^device_health_monitor_events-(\d{4}-\d{2}-\d{2})\.jsonl$"
+)
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -120,13 +128,276 @@ def _device_health_monitor_event_log_path(now: datetime) -> Path:
     )
 
 
+def _device_health_monitor_event_archive_key(source_path: Path) -> str:
+    match = _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN.fullmatch(source_path.name)
+    if match is None:
+        raise ValueError(f"장비 상태 이벤트 로그 파일명이 아니야: {source_path.name}")
+    source_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    prefix = str(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_PREFIX or "").strip().strip("/")
+    relative_key = f"{source_date:%Y/%m}/{source_path.name}.gz"
+    return f"{prefix}/{relative_key}" if prefix else relative_key
+
+
+def _device_health_monitor_event_archive_metadata(
+    source_path: Path,
+    *,
+    source_size: int,
+    source_sha256: str,
+    compressed_size: int,
+    compressed_sha256: str,
+) -> dict[str, str]:
+    match = _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN.fullmatch(source_path.name)
+    source_date = match.group(1) if match is not None else ""
+    return {
+        "source-date": source_date,
+        "source-filename": source_path.name,
+        "source-sha256": source_sha256,
+        "source-size": str(source_size),
+        "compressed-size": str(compressed_size),
+        "compressed-sha256": compressed_sha256,
+    }
+
+
+def _device_health_monitor_archive_matches(
+    head_response: dict[str, Any],
+    *,
+    metadata: dict[str, str],
+    compressed_size: int,
+) -> bool:
+    remote_metadata = (
+        head_response.get("Metadata")
+        if isinstance(head_response.get("Metadata"), dict)
+        else {}
+    )
+    return (
+        max(0, int(head_response.get("ContentLength") or 0)) == compressed_size
+        and all(str(remote_metadata.get(key) or "") == value for key, value in metadata.items())
+    )
+
+
+def _load_device_health_monitor_archive_head(
+    s3_client: Any,
+    *,
+    bucket: str,
+    key: str,
+) -> dict[str, Any] | None:
+    try:
+        response = s3_client.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        error_payload = getattr(exc, "response", {})
+        error = error_payload.get("Error") if isinstance(error_payload, dict) else {}
+        error_code = str(error.get("Code") or "") if isinstance(error, dict) else ""
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+    return response if isinstance(response, dict) else {}
+
+
+def _device_health_monitor_event_source_identity(source_path: Path) -> tuple[int, int, int, int]:
+    source_stat = source_path.lstat()
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ValueError("일반 파일이 아닌 장비 상태 이벤트 로그는 보관하지 않아")
+    return (
+        source_stat.st_dev,
+        source_stat.st_ino,
+        source_stat.st_size,
+        source_stat.st_mtime_ns,
+    )
+
+
+def _device_health_monitor_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+    )
+
+
+def _compress_device_health_monitor_event_log(
+    source_path: Path,
+) -> tuple[Any, str, int, str, tuple[int, int, int, int]]:
+    source_identity = _device_health_monitor_event_source_identity(source_path)
+    source_digest = hashlib.sha256()
+    compressed_file = tempfile.SpooledTemporaryFile(
+        mode="w+b",
+        max_size=8 * 1024 * 1024,
+    )
+    try:
+        with source_path.open("rb") as source_file:
+            if _device_health_monitor_file_identity(os.fstat(source_file.fileno())) != source_identity:
+                raise RuntimeError("압축 직전에 장비 상태 이벤트 로그가 변경됐어")
+            # mtime과 원본 경로를 gzip header에서 제거해 같은 원본은 항상 같은 결과가 되게 한다.
+            with gzip.GzipFile(filename="", mode="wb", fileobj=compressed_file, mtime=0) as gzip_file:
+                while chunk := source_file.read(1024 * 1024):
+                    source_digest.update(chunk)
+                    gzip_file.write(chunk)
+            if _device_health_monitor_file_identity(os.fstat(source_file.fileno())) != source_identity:
+                raise RuntimeError("압축하는 동안 장비 상태 이벤트 로그가 변경됐어")
+
+        if _device_health_monitor_event_source_identity(source_path) != source_identity:
+            raise RuntimeError("압축한 뒤 장비 상태 이벤트 로그가 변경됐어")
+
+        compressed_size = compressed_file.tell()
+        compressed_digest = hashlib.sha256()
+        compressed_file.seek(0)
+        while chunk := compressed_file.read(1024 * 1024):
+            compressed_digest.update(chunk)
+        compressed_file.seek(0)
+    except Exception:
+        compressed_file.close()
+        raise
+    return (
+        compressed_file,
+        source_digest.hexdigest(),
+        compressed_size,
+        compressed_digest.hexdigest(),
+        source_identity,
+    )
+
+
+def _archive_device_health_monitor_event_logs(
+    *,
+    now: datetime | None = None,
+    log_dir: Path | None = None,
+    s3_client: Any | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    local_now = _coerce_daily_device_round_now(now)
+    actual_log_dir = log_dir or _device_health_monitor_event_log_dir()
+    retention_days = max(1, int(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_RETENTION_DAYS))
+    first_kept_date = local_now.date() - timedelta(days=retention_days - 1)
+    bucket = str(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_BUCKET or "").strip()
+    result: dict[str, Any] = {
+        "enabled": bool(bucket),
+        "bucket": bucket,
+        "firstKeptDate": first_kept_date.isoformat(),
+        "archivedCount": 0,
+        "archivedSourceBytes": 0,
+        "archivedCompressedBytes": 0,
+        "keptCount": 0,
+        "failedCount": 0,
+        "failures": [],
+    }
+    if not bucket or not actual_log_dir.exists():
+        return result
+
+    archive_candidates: list[Path] = []
+    for source_path in sorted(actual_log_dir.glob("device_health_monitor_events-*.jsonl")):
+        match = _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN.fullmatch(source_path.name)
+        if match is None or source_path.is_symlink():
+            continue
+        try:
+            source_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if source_date >= first_kept_date:
+            result["keptCount"] += 1
+            continue
+        archive_candidates.append(source_path)
+
+    if not archive_candidates:
+        return result
+
+    try:
+        client = s3_client or _build_s3_client()
+    except Exception as exc:
+        result["failedCount"] = len(archive_candidates)
+        result["failures"] = [
+            {"file": source_path.name, "errorType": type(exc).__name__}
+            for source_path in archive_candidates
+        ]
+        if logger is not None:
+            logger.warning("장비 상태 이벤트 로그 S3 client를 만들지 못했어", exc_info=True)
+        return result
+
+    for source_path in archive_candidates:
+        compressed_file: Any | None = None
+        try:
+            (
+                compressed_file,
+                source_sha256,
+                compressed_size,
+                compressed_sha256,
+                source_identity,
+            ) = _compress_device_health_monitor_event_log(source_path)
+            source_size = source_identity[2]
+            metadata = _device_health_monitor_event_archive_metadata(
+                source_path,
+                source_size=source_size,
+                source_sha256=source_sha256,
+                compressed_size=compressed_size,
+                compressed_sha256=compressed_sha256,
+            )
+            key = _device_health_monitor_event_archive_key(source_path)
+            existing_head = _load_device_health_monitor_archive_head(
+                client,
+                bucket=bucket,
+                key=key,
+            )
+            if existing_head is not None:
+                if not _device_health_monitor_archive_matches(
+                    existing_head,
+                    metadata=metadata,
+                    compressed_size=compressed_size,
+                ):
+                    raise RuntimeError("같은 S3 key에 다른 장비 상태 이벤트 로그가 이미 있어")
+            else:
+                # 45MB 안팎의 일별 파일은 gzip 후 단일 PutObject로 보내 멀티파트 권한 없이 보관한다.
+                compressed_file.seek(0)
+                client.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=compressed_file,
+                    ContentLength=compressed_size,
+                    ContentType="application/x-ndjson",
+                    ContentEncoding="gzip",
+                    ServerSideEncryption="AES256",
+                    Metadata=metadata,
+                )
+                uploaded_head = _load_device_health_monitor_archive_head(
+                    client,
+                    bucket=bucket,
+                    key=key,
+                )
+                if uploaded_head is None or not _device_health_monitor_archive_matches(
+                    uploaded_head,
+                    metadata=metadata,
+                    compressed_size=compressed_size,
+                ):
+                    raise RuntimeError("S3에 보관한 장비 상태 이벤트 로그 검증에 실패했어")
+
+            # S3 객체를 확인한 뒤에도 원본이 그대로일 때만 로컬 파일을 제거한다.
+            if _device_health_monitor_event_source_identity(source_path) != source_identity:
+                raise RuntimeError("S3 보관 후 장비 상태 이벤트 로그가 변경돼 원본을 유지해")
+            source_path.unlink()
+            result["archivedCount"] += 1
+            result["archivedSourceBytes"] += source_size
+            result["archivedCompressedBytes"] += compressed_size
+        except Exception as exc:
+            result["failedCount"] += 1
+            result["failures"].append(
+                {"file": source_path.name, "errorType": type(exc).__name__}
+            )
+            if logger is not None:
+                logger.warning(
+                    "장비 상태 이벤트 로그를 S3에 보관하지 못했어: %s",
+                    source_path,
+                    exc_info=True,
+                )
+        finally:
+            if compressed_file is not None:
+                compressed_file.close()
+    return result
+
+
 def _append_device_health_monitor_event(
     event_type: str,
     payload: dict[str, Any],
     *,
     now: datetime | None = None,
     logger: logging.Logger | None = None,
-) -> None:
+) -> bool:
     local_now = _coerce_daily_device_round_now(now)
     event_payload = {
         "eventType": _display_value(event_type, default="unknown"),
@@ -141,9 +412,11 @@ def _append_device_health_monitor_event(
                 json.dumps(event_payload, ensure_ascii=True, sort_keys=True, default=str)
                 + "\n"
             )
+        return True
     except Exception:
         if logger is not None:
             logger.warning("장비 상태 모니터 이벤트 로그를 저장하지 못했어: %s", path, exc_info=True)
+        return False
 
 
 def _load_device_health_monitor_runtime_state() -> dict[str, Any]:
@@ -338,6 +611,21 @@ def _normalize_device_health_monitor_alert_delivery_override(value: Any) -> dict
     }
 
 
+def _normalize_device_health_monitor_unavailable_event_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "signatureVersion": 1,
+        "signature": str(value.get("signature") or "").strip(),
+        "lastLoggedAt": str(value.get("lastLoggedAt") or "").strip(),
+        "changedAt": str(value.get("changedAt") or "").strip(),
+        "unavailableCount": max(
+            0,
+            int(_coerce_int(value.get("unavailableCount", value.get("count"))) or 0),
+        ),
+    }
+
+
 def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, Any]:
     state_payload = state if isinstance(state, dict) else {}
     normalized_state = dict(state_payload)
@@ -370,6 +658,17 @@ def _normalize_device_health_monitor_state(state: dict[str, Any]) -> dict[str, A
         normalized_state.pop("alertDeliveryOverride", None)
     else:
         normalized_state["alertDeliveryOverride"] = alert_delivery_override
+    unavailable_event_state = state_payload.get(
+        "deviceUnavailableEventState",
+        state_payload.get("unavailableEventLog"),
+    )
+    normalized_state.pop("unavailableEventLog", None)
+    if isinstance(unavailable_event_state, dict):
+        normalized_state["deviceUnavailableEventState"] = (
+            _normalize_device_health_monitor_unavailable_event_state(
+                unavailable_event_state
+            )
+        )
     return normalized_state
 
 
@@ -2321,10 +2620,141 @@ def _iter_device_health_monitor_device_events(
                     "sampleLimit": sample_limit,
                     "omittedCount": max(0, len(unavailable_payloads) - sample_limit),
                     "sampleDevices": unavailable_payloads[:sample_limit],
+                    "stateSignature": _device_health_monitor_unavailable_event_signature(
+                        unavailable_payloads
+                    ),
                 },
             ),
         )
     return events
+
+
+def _device_health_monitor_unavailable_event_signature(value: Any) -> str:
+    if isinstance(value, dict) and isinstance(value.get("deviceResults"), list):
+        unavailable_devices = [
+            _build_device_health_monitor_device_event_payload(device_result)
+            for device_result in value["deviceResults"]
+            if isinstance(device_result, dict)
+            and _display_value(device_result.get("overallLabel"), default="") == "점검 불가"
+        ]
+    elif isinstance(value, dict) and isinstance(value.get("sampleDevices"), list):
+        unavailable_devices = value["sampleDevices"]
+    elif isinstance(value, list):
+        unavailable_devices = value
+    else:
+        unavailable_devices = []
+
+    stable_devices: list[dict[str, Any]] = []
+    for raw_device in unavailable_devices:
+        if not isinstance(raw_device, dict):
+            continue
+        redis_payload = raw_device.get("redis") if isinstance(raw_device.get("redis"), dict) else {}
+        ssh_payload = raw_device.get("ssh") if isinstance(raw_device.get("ssh"), dict) else {}
+        availability_reasons = (
+            redis_payload.get("availabilityReasons")
+            if isinstance(redis_payload.get("availabilityReasons"), list)
+            else []
+        )
+        stable_devices.append(
+            {
+                "hospitalSeq": _coerce_int(raw_device.get("hospitalSeq")),
+                "deviceName": _display_value(raw_device.get("deviceName"), default=""),
+                "source": _display_value(raw_device.get("source"), default=""),
+                "availabilityReasons": sorted(
+                    {
+                        _display_value(reason, default="")
+                        for reason in availability_reasons
+                        if _display_value(reason, default="")
+                    }
+                ),
+                "sshReason": _display_value(ssh_payload.get("reason"), default=""),
+            }
+        )
+    stable_payload = sorted(
+        stable_devices,
+        key=lambda item: (
+            item["hospitalSeq"] if item["hospitalSeq"] is not None else -1,
+            item["deviceName"],
+            item["source"],
+            item["availabilityReasons"],
+            item["sshReason"],
+        ),
+    )
+    encoded = json.dumps(
+        stable_payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_device_health_monitor_unavailable_event_log(
+    payload: dict[str, Any] | None,
+    *,
+    state: dict[str, Any] | None,
+    now: datetime,
+) -> tuple[bool, dict[str, Any]]:
+    previous = _normalize_device_health_monitor_unavailable_event_state(
+        (state or {}).get(
+            "deviceUnavailableEventState",
+            (state or {}).get("unavailableEventLog"),
+        )
+    )
+    unavailable_count = (
+        max(0, int(_coerce_int(payload.get("count")) or 0))
+        if isinstance(payload, dict)
+        else 0
+    )
+    previous_count = max(0, int(previous.get("unavailableCount") or 0))
+    if unavailable_count == 0:
+        return False, {
+            "signatureVersion": 1,
+            "signature": "",
+            "lastLoggedAt": "",
+            "changedAt": (
+                now.isoformat()
+                if previous_count > 0
+                else str(previous.get("changedAt") or "")
+            ),
+            "unavailableCount": 0,
+            "emissionReason": "",
+        }
+
+    signature = str(payload.get("stateSignature") or "").strip()
+    if not signature:
+        signature = _device_health_monitor_unavailable_event_signature(payload)
+    signature_changed = signature != str(previous.get("signature") or "")
+    last_logged_at = _parse_device_health_monitor_datetime(previous.get("lastLoggedAt"))
+    if last_logged_at is not None and last_logged_at > now:
+        last_logged_at = None
+    summary_delta = timedelta(
+        hours=max(1, int(cs.DEVICE_HEALTH_MONITOR_UNAVAILABLE_EVENT_SUMMARY_HOURS))
+    )
+    initial_snapshot = previous_count == 0 or last_logged_at is None
+    periodic_summary = (
+        last_logged_at is not None
+        and now - last_logged_at >= summary_delta
+    )
+    should_log = initial_snapshot or periodic_summary
+    return should_log, {
+        "signatureVersion": 1,
+        "signature": signature,
+        "lastLoggedAt": now.isoformat() if should_log else str(previous.get("lastLoggedAt") or ""),
+        "changedAt": (
+            now.isoformat()
+            if signature_changed
+            else str(previous.get("changedAt") or "")
+        ),
+        "unavailableCount": unavailable_count,
+        "emissionReason": (
+            "initial_snapshot"
+            if initial_snapshot
+            else "periodic_summary"
+            if periodic_summary
+            else ""
+        ),
+    }
 
 
 def _log_device_health_monitor_run_events(
@@ -2335,7 +2765,14 @@ def _log_device_health_monitor_run_events(
     channel_id: str = "",
     alertable_fingerprints: set[str] | None = None,
     channel_missing: bool = False,
-) -> None:
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    previous_unavailable_state = _normalize_device_health_monitor_unavailable_event_state(
+        (state or {}).get(
+            "deviceUnavailableEventState",
+            (state or {}).get("unavailableEventLog"),
+        )
+    )
     _append_device_health_monitor_event(
         "run_summary",
         _build_device_health_monitor_run_event_payload(
@@ -2347,13 +2784,43 @@ def _log_device_health_monitor_run_events(
         now=now,
         logger=logger,
     )
-    for event_type, payload in _iter_device_health_monitor_device_events(report_summary):
-        _append_device_health_monitor_event(
+    device_events = _iter_device_health_monitor_device_events(report_summary)
+    unavailable_payload = next(
+        (
+            payload
+            for event_type, payload in device_events
+            if event_type == "device_unavailable"
+        ),
+        None,
+    )
+    should_log_unavailable, unavailable_event_log = (
+        _resolve_device_health_monitor_unavailable_event_log(
+            unavailable_payload,
+            state=state,
+            now=now,
+        )
+    )
+    emission_reason = str(unavailable_event_log.pop("emissionReason", "") or "")
+    for event_type, payload in device_events:
+        if event_type == "device_unavailable" and not should_log_unavailable:
+            continue
+        actual_payload = (
+            {
+                **payload,
+                "emissionReason": emission_reason,
+            }
+            if event_type == "device_unavailable"
+            else payload
+        )
+        appended = _append_device_health_monitor_event(
             event_type,
-            payload,
+            actual_payload,
             now=now,
             logger=logger,
         )
+        if event_type == "device_unavailable" and not appended:
+            return previous_unavailable_state
+    return unavailable_event_log
 
 
 def _build_device_health_monitor_redis_client() -> DeviceStateRedisClient:
@@ -3907,6 +4374,13 @@ def _run_device_health_monitor_once(
     alert_delivery_status = _resolve_device_health_monitor_alert_delivery_status(state)
     alert_delivery_enabled = bool(alert_delivery_status.get("enabled"))
     if alert_delivery_enabled and not channel_id:
+        unavailable_event_state = _log_device_health_monitor_run_events(
+            report_summary,
+            now=local_now,
+            logger=logger,
+            channel_missing=True,
+            state=state,
+        )
         next_state = _build_device_health_monitor_next_state(
             state,
             report_summary,
@@ -3916,13 +4390,8 @@ def _run_device_health_monitor_once(
                 state.get("pendingAlertFingerprints")
             ),
         )
+        next_state["deviceUnavailableEventState"] = unavailable_event_state
         _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
-        _log_device_health_monitor_run_events(
-            report_summary,
-            now=local_now,
-            logger=logger,
-            channel_missing=True,
-        )
         logger.warning("장비 상태 모니터 채널 ID가 없어. DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘")
         return False
 
@@ -3936,6 +4405,14 @@ def _run_device_health_monitor_once(
             state,
             now=local_now,
         )
+        unavailable_event_state = _log_device_health_monitor_run_events(
+            report_summary,
+            now=local_now,
+            logger=logger,
+            channel_id=channel_id,
+            alertable_fingerprints=suppressed_alertable_fingerprints,
+            state=state,
+        )
         next_state = _build_device_health_monitor_next_state(
             state,
             report_summary,
@@ -3943,14 +4420,8 @@ def _run_device_health_monitor_once(
             alert_fingerprints=updated_alerts,
             pending_alert_fingerprints=updated_pending_alerts,
         )
+        next_state["deviceUnavailableEventState"] = unavailable_event_state
         _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
-        _log_device_health_monitor_run_events(
-            report_summary,
-            now=local_now,
-            logger=logger,
-            channel_id=channel_id,
-            alertable_fingerprints=suppressed_alertable_fingerprints,
-        )
         if suppressed_alertable_fingerprints:
             _append_device_health_monitor_event(
                 "alert_delivery_suppressed",
@@ -3991,6 +4462,14 @@ def _run_device_health_monitor_once(
         now=local_now,
         logger=logger,
     )
+    unavailable_event_state = _log_device_health_monitor_run_events(
+        report_summary,
+        now=local_now,
+        logger=logger,
+        channel_id=channel_id,
+        alertable_fingerprints=alertable_fingerprints,
+        state=state,
+    )
     next_state = _build_device_health_monitor_next_state(
         state,
         report_summary,
@@ -3998,14 +4477,8 @@ def _run_device_health_monitor_once(
         alert_fingerprints=updated_alerts,
         pending_alert_fingerprints=updated_pending_alerts,
     )
+    next_state["deviceUnavailableEventState"] = unavailable_event_state
     _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
-    _log_device_health_monitor_run_events(
-        report_summary,
-        now=local_now,
-        logger=logger,
-        channel_id=channel_id,
-        alertable_fingerprints=alertable_fingerprints,
-    )
     if sheet_suppressed_alerts:
         _append_device_health_monitor_event(
             "captureboard_sheet_alert_suppressed",
@@ -4077,9 +4550,42 @@ def _run_device_health_monitor_once(
     return True
 
 
+def _archive_device_health_monitor_event_logs_best_effort(logger: logging.Logger) -> None:
+    try:
+        archive_result = _archive_device_health_monitor_event_logs(logger=logger)
+        logger.info(
+            "Device health event archive completed bucket=%s kept=%s archived=%s "
+            "failed=%s sourceBytes=%s compressedBytes=%s",
+            archive_result.get("bucket"),
+            archive_result.get("keptCount"),
+            archive_result.get("archivedCount"),
+            archive_result.get("failedCount"),
+            archive_result.get("archivedSourceBytes"),
+            archive_result.get("archivedCompressedBytes"),
+        )
+    except Exception:
+        # 보관 실패가 장비 상태 점검 자체를 중단시키지는 않는다.
+        logger.exception("장비 상태 이벤트 로그 보관 중 오류가 발생했어")
+
+
 def _device_health_monitor_loop(client: Any, logger: logging.Logger) -> None:
     poll_interval_sec = max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC))
+    archive_attempt_date = None
+    archive_thread: threading.Thread | None = None
     while True:
+        local_date = _coerce_daily_device_round_now().date()
+        if (
+            archive_attempt_date != local_date
+            and (archive_thread is None or not archive_thread.is_alive())
+        ):
+            archive_attempt_date = local_date
+            archive_thread = threading.Thread(
+                target=_archive_device_health_monitor_event_logs_best_effort,
+                args=(logger,),
+                name="boxer-device-health-event-archive",
+                daemon=True,
+            )
+            archive_thread.start()
         try:
             _run_device_health_monitor_once(client, logger)
         except Exception:
