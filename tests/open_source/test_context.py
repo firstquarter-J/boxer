@@ -2,8 +2,17 @@ import logging
 import unittest
 
 from boxer.context.builder import _build_model_input
-from boxer.context.windowing import _limit_context_entries, _render_context_text
-from boxer_adapter_slack.context import _load_slack_thread_context, _normalize_slack_context_entries
+from boxer.context.windowing import (
+    _limit_context_entries,
+    _render_context_text,
+    window_context_entries,
+)
+import boxer_adapter_slack
+from boxer_adapter_slack.context import (
+    _load_slack_thread_context,
+    _normalize_slack_context_entries,
+    load_slack_thread_context_entries,
+)
 
 
 class ContextBuilderTests(unittest.TestCase):
@@ -60,8 +69,31 @@ class ContextWindowingTests(unittest.TestCase):
 
         self.assertEqual(rendered, "team_profile/profile: 차분하고 짧게 답함")
 
+    def test_char_window_drops_stale_entries_when_latest_is_too_large(
+        self,
+    ) -> None:
+        entries = [
+            {"author_id": "U1", "text": "세션 1로 봐줘"},
+            {"author_id": "U1", "text": "x" * 100},
+        ]
+
+        self.assertEqual(
+            window_context_entries(entries, max_chars=50),
+            [],
+        )
+        self.assertEqual(
+            _render_context_text(entries, max_chars=50),
+            "",
+        )
+
 
 class SlackContextTests(unittest.TestCase):
+    def test_package_exports_channel_neutral_thread_entries_loader(self) -> None:
+        self.assertIs(
+            boxer_adapter_slack.load_slack_thread_context_entries,
+            load_slack_thread_context_entries,
+        )
+
     def test_normalize_slack_context_entries_filters_current_and_empty_text(self) -> None:
         messages = [
             {"user": "U1", "text": "older", "ts": "1.0"},
@@ -113,6 +145,37 @@ class SlackContextTests(unittest.TestCase):
         self.assertEqual(result, "U1: hello\nU2: world")
         self.assertEqual(client.called["channel"], "C123")
         self.assertEqual(client.called["ts"], "1.0")
+
+    def test_load_slack_thread_context_entries_keeps_normalized_order(self) -> None:
+        class FakeClient:
+            def conversations_replies(self, **kwargs) -> dict:
+                return {
+                    "messages": [
+                        {"user": "U1", "text": "older", "ts": "1.0"},
+                        {"user": "U2", "text": "current", "ts": "2.0"},
+                    ]
+                }
+
+        result = load_slack_thread_context_entries(
+            FakeClient(),
+            logging.getLogger("test"),
+            "C123",
+            "1.0",
+            "2.0",
+        )
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "kind": "message",
+                    "source": "slack",
+                    "author_id": "U1",
+                    "text": "older",
+                    "created_at": "1.0",
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

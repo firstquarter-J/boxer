@@ -43,8 +43,29 @@ def _load_slack_thread_context(
     thread_ts: str | None,
     current_ts: str | None,
 ) -> str:
+    normalized_entries = load_slack_thread_context_entries(
+        client,
+        logger,
+        channel_id,
+        thread_ts,
+        current_ts,
+    )
+    return _render_context_text(
+        normalized_entries,
+        max_chars=max(1, s.THREAD_CONTEXT_MAX_CHARS),
+    )
+
+
+def load_slack_thread_context_entries(
+    client: Any,
+    logger: logging.Logger,
+    channel_id: str,
+    thread_ts: str | None,
+    current_ts: str | None,
+) -> list[ContextEntry]:
+    """Slack 원문 대신 공통 service에 전달할 정규화된 entry 목록을 반환한다."""
     if not channel_id or not thread_ts:
-        return ""
+        return []
 
     try:
         replies = client.conversations_replies(
@@ -55,21 +76,20 @@ def _load_slack_thread_context(
         )
     except Exception:
         logger.exception("Failed to fetch Slack thread context")
-        return ""
+        return []
 
     messages = replies.get("messages") or []
     if not isinstance(messages, list):
-        return ""
+        return []
 
     normalized_entries = _normalize_slack_context_entries(
         messages,
         current_ts=current_ts,
     )
-    trimmed_entries = _limit_context_entries(
+    return _limit_context_entries(
         normalized_entries,
         max(1, s.THREAD_CONTEXT_MAX_MESSAGES),
     )
-    return _render_context_text(
-        trimmed_entries,
-        max_chars=max(1, s.THREAD_CONTEXT_MAX_CHARS),
-    )
+
+
+__all__ = ["load_slack_thread_context_entries"]

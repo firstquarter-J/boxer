@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any
 
 import pymysql
@@ -13,7 +14,10 @@ from boxer_adapter_slack.common import (
     _set_request_log_route,
     create_slack_app,
 )
-from boxer_adapter_slack.context import _load_slack_thread_context
+from boxer_adapter_slack.context import (
+    _load_slack_thread_context,
+    load_slack_thread_context_entries,
+)
 from boxer_company_adapter_slack.barcode_logs import (
     _needs_barcode_log_fallback,
     _split_barcode_log_reply,
@@ -22,6 +26,9 @@ from boxer_company_adapter_slack.barcode_query_routes import (
     BarcodeQueryRoutesContext,
     BarcodeQueryRoutesDeps,
     _handle_barcode_query_routes,
+)
+from boxer_company_adapter_slack.assistant_bridge import (
+    build_company_assistant_request,
 )
 from boxer_company_adapter_slack.barcode_routes import (
     BarcodeLogRouteContext,
@@ -40,7 +47,6 @@ from boxer_company_adapter_slack.company_notion_routes import (
 )
 from boxer_company_adapter_slack.device_activity import (
     _build_device_download_activity_input,
-    _extract_latest_barcode_from_thread_context,
 )
 from boxer_company_adapter_slack.device_routes import (
     DeviceRoutesContext,
@@ -126,14 +132,33 @@ from boxer_company.prompt_security import (
 )
 from boxer_company.notion_links import select_company_notion_doc_links
 from boxer_company.notion_playbooks import _select_notion_references
-from boxer_company.notion_workspace_search import _build_company_notion_source_docs
+from boxer_company.notion_workspace_search import (
+    _build_company_notion_source_docs,
+    _extract_company_notion_search_query,
+    _is_company_notion_search_allowed,
+    _is_company_notion_search_configured,
+    _load_company_notion_references,
+    _looks_like_company_notion_search,
+    _search_company_notion,
+)
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
 )
+from boxer_company.assistant import (
+    CompanyAssistantRuntime,
+    CompanyAssistantRuntimeDeps,
+    CompanyAssistantRequest,
+    CompanyNotionAssistantRouteDeps,
+    CompanyReadOnlyKnowledgeRouteDeps,
+    build_company_read_only_knowledge_routes,
+)
 from boxer_company import settings as cs
+# 기존 characterization test와 외부 patch 지점만 유지하고 실제 추출은 runtime이 맡는다.
 from boxer_company.utils import _extract_barcode
+from boxer import AnswerEngine, synthesize_retrieval_answer
 from boxer.context.builder import _build_model_input
+from boxer.context.entries import ContextEntry
 from boxer.core import settings as s
 from boxer.core.llm import (
     _ask_claude,
@@ -145,7 +170,6 @@ from boxer.core.llm import (
 from boxer.core.utils import _validate_tokens
 from boxer.retrieval.connectors.notion import _is_notion_configured
 from boxer.retrieval.connectors.s3 import _build_s3_client
-from boxer.retrieval.synthesis import _synthesize_retrieval_answer
 from boxer_company.routers.app_user import _lookup_app_user_by_barcode, _should_lookup_barcode
 from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_scan_events,
@@ -157,7 +181,9 @@ from boxer_company.routers.barcode_log import (
     _extract_hospital_room_scope,
     _extract_leading_hospital_scope,
     _extract_log_date,
-    _extract_log_date_with_presence,
+    _is_barcode_log_analysis_request,
+    _is_barcode_last_recorded_at_request,
+    _is_barcode_video_recorded_on_date_request,
 )
 from boxer_company.routers.device_file_probe import (
     _build_device_file_download_config_message,
@@ -173,6 +199,12 @@ from boxer_company.routers.device_file_probe import (
     _should_render_compact_device_download_result,
     _should_render_compact_device_file_list,
     _should_render_compact_device_recovery_result,
+)
+from boxer_company.routers.device_diagnostics import (
+    _extract_device_name_for_diagnostic_freeform,
+    _is_device_diagnostic_freeform_request,
+    _load_device_diagnostic_snapshot,
+    _select_device_diagnostic_followup_command_keys,
 )
 from boxer_company.routers.device_audio_probe import (
     _build_device_audio_probe_config_message,
@@ -196,6 +228,7 @@ from boxer_company.routers.device_status_probe import (
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
     _is_device_led_probe_request,
+    _is_device_led_pattern_help_request,
     _is_device_memory_patch_request,
     _is_device_pm2_probe_request,
     _is_device_status_probe_request,
@@ -207,7 +240,7 @@ from boxer_company.routers.request_log_query import (
     _extract_request_log_query,
 )
 from boxer_company.routers.recording_failure_analysis import (
-    _has_recording_failure_analysis_hints,
+    _is_recording_failure_analysis_request,
 )
 from boxer_company.routers.box_db import (
     _load_recordings_context_by_barcode,
@@ -220,6 +253,44 @@ from boxer_company.routers.usage_help import (
     _build_usage_help_response,
     _is_usage_help_request,
 )
+
+# 기존 테스트·외부 patch 지점을 유지하되 실제 구현은 공개 facade를 통한다.
+def _synthesize_retrieval_answer(
+    question: str,
+    thread_context: str,
+    evidence_payload: Any,
+    *,
+    provider: str,
+    provider_client: Any | None = None,
+    timeout_sec: int | None = None,
+    claude_client: Any | None = None,
+    system_prompt: str | None = None,
+    extra_rules: str = "",
+    evidence_transform: Any | None = None,
+    max_tokens: int | None = None,
+    ollama_timeout_sec: int | None = None,
+) -> str:
+    """기존 Slack 호출 규격을 공개 provider 중립 facade로 연결한다."""
+    return synthesize_retrieval_answer(
+        question,
+        thread_context,
+        evidence_payload,
+        provider=provider,
+        provider_client=(
+            provider_client
+            if provider_client is not None
+            else claude_client
+        ),
+        system_prompt=system_prompt,
+        extra_rules=extra_rules,
+        evidence_transform=evidence_transform,
+        max_tokens=max_tokens,
+        timeout_sec=(
+            timeout_sec
+            if timeout_sec is not None
+            else ollama_timeout_sec
+        ),
+    )
 
 
 def create_app() -> App:
@@ -240,6 +311,176 @@ def create_app() -> App:
         if s3_client is None:
             s3_client = _build_s3_client()
         return s3_client
+
+    def _is_claude_allowed_user(target_user_id: str | None) -> bool:
+        if not cs.CLAUDE_ALLOWED_USER_IDS:
+            return True
+        return bool(target_user_id) and target_user_id in cs.CLAUDE_ALLOWED_USER_IDS
+
+    ollama_health_cache: tuple[float, dict[str, Any]] | None = None
+
+    def _get_ollama_health() -> dict[str, Any]:
+        nonlocal ollama_health_cache
+        now = time.monotonic()
+        if ollama_health_cache is not None:
+            cached_at, cached_health = ollama_health_cache
+            ttl = 30.0 if cached_health.get("ok") else 2.0
+            if now - cached_at < ttl:
+                return cached_health
+        health = _check_ollama_health()
+        # 같은 요청이 core 위임 뒤 legacy 안내로 내려가도
+        # health timeout을 다시 기다리지 않도록 전체 결과를 공유한다.
+        ollama_health_cache = (now, health)
+        return health
+
+    def _is_answer_provider_ready() -> bool:
+        provider = (s.LLM_PROVIDER or "").lower().strip()
+        if provider == "claude":
+            return claude_client is not None
+        if provider == "ollama":
+            return bool(_get_ollama_health()["ok"])
+        return False
+
+    def _answer_timeout_reply_text() -> str:
+        provider = (s.LLM_PROVIDER or "").lower().strip()
+        if provider == "claude":
+            timeout_sec = max(1, s.ANTHROPIC_TIMEOUT_SEC)
+            return f"AI API가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
+        timeout_sec = max(1, s.OLLAMA_TIMEOUT_SEC)
+        return f"LLM 서버가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
+
+    company_answer_engine = AnswerEngine(
+        provider=s.LLM_PROVIDER,
+        provider_client=claude_client,
+        synthesize=_synthesize_retrieval_answer,
+        logger=app_logger,
+    )
+
+    def _load_diagnostic_snapshot(
+        request: CompanyAssistantRequest,
+    ) -> dict[str, Any] | None:
+        metadata_channel_id = request.metadata.get("channel_id")
+        channel_key = (
+            str(metadata_channel_id).strip()
+            if isinstance(metadata_channel_id, str)
+            else request.channel
+        )
+        return _load_device_diagnostic_snapshot(
+            workspace_id=request.tenant_id,
+            channel_id=channel_key,
+            thread_ts=request.conversation_id,
+        )
+
+    def _load_read_only_diagnostic_snapshot(
+        request: CompanyAssistantRequest,
+    ) -> dict[str, Any] | None:
+        # live 진단은 sshOrder를 보낼 수 있으므로 공통 read-only route가
+        # 저장 snapshot만 답할 수 있는 질문에서만 기존 저장소를 연다.
+        if _select_device_diagnostic_followup_command_keys(
+            request.question
+        ):
+            return None
+        return _load_diagnostic_snapshot(request)
+
+    def _should_handle_barcode_evidence(
+        request: CompanyAssistantRequest,
+    ) -> bool:
+        # live 장비 진단과 provider 장애 안내는 기존 Slack 전용 경로가
+        # 먼저 처리하도록 공통 read-only 자유질문에서 제외한다.
+        command_keys = _select_device_diagnostic_followup_command_keys(
+            request.question
+        )
+        if command_keys and _load_diagnostic_snapshot(request) is not None:
+            return False
+        device_name = _extract_device_name_for_diagnostic_freeform(
+            request.question
+        )
+        if _is_device_diagnostic_freeform_request(
+            request.question,
+            device_name=device_name,
+        ):
+            return False
+        provider = (s.LLM_PROVIDER or "").lower().strip()
+        if (
+            not s.LLM_SYNTHESIS_ENABLED
+            or provider not in {"claude", "ollama"}
+        ):
+            return False
+        return _is_answer_provider_ready()
+
+    def _build_read_only_knowledge_routes(
+        recordings,
+        composer,
+    ):
+        provider = (s.LLM_PROVIDER or "").lower().strip()
+        return build_company_read_only_knowledge_routes(
+            recordings,
+            composer,
+            CompanyReadOnlyKnowledgeRouteDeps(
+                load_diagnostic_snapshot=(
+                    _load_read_only_diagnostic_snapshot
+                ),
+                # 기존 Slack mention은 내부 채널 정책을 통과한 요청이다.
+                notion_is_allowed=lambda request: True,
+                barcode_is_allowed=lambda request: (
+                    provider != "claude"
+                    or _is_claude_allowed_user(request.actor_id)
+                ),
+                barcode_should_handle=_should_handle_barcode_evidence,
+                db_configured=lambda: bool(
+                    s.DB_HOST
+                    and s.DB_USERNAME
+                    and s.DB_PASSWORD
+                    and s.DB_DATABASE
+                ),
+                build_barcode_system_prompt=(
+                    lambda request, context_text: (
+                        _get_freeform_system_prompt(
+                            request.question,
+                            context_text,
+                        )
+                    )
+                ),
+                timeout_message=_answer_timeout_reply_text(),
+                # provider가 없으면 기존 일반 사용법 fallback까지 내려간다.
+                include_barcode_evidence=provider in {"claude", "ollama"},
+            ),
+            logger=app_logger,
+        )
+
+    company_assistant_runtime = CompanyAssistantRuntime(
+        CompanyAssistantRuntimeDeps(
+            answer_engine=company_answer_engine,
+            synthesis_enabled=s.LLM_SYNTHESIS_ENABLED,
+            provider_ready=_is_answer_provider_ready,
+            actor_allowed_for_llm=_is_claude_allowed_user,
+            get_s3_client=_get_s3_client,
+            recordings_loader=_load_recordings_context_by_barcode,
+            notion_reference_loader=_select_notion_references,
+            s3_query_enabled=lambda: s.S3_QUERY_ENABLED,
+            db_configured=lambda: bool(
+                s.DB_HOST
+                and s.DB_USERNAME
+                and s.DB_PASSWORD
+                and s.DB_DATABASE
+            ),
+            timeout_message=_answer_timeout_reply_text(),
+            notion_route_deps=CompanyNotionAssistantRouteDeps(
+                answer_engine=company_answer_engine,
+                synthesis_enabled=s.LLM_SYNTHESIS_ENABLED,
+                provider_ready=_is_answer_provider_ready,
+                actor_allowed_for_llm=_is_claude_allowed_user,
+                looks_like_search=_looks_like_company_notion_search,
+                is_search_allowed=_is_company_notion_search_allowed,
+                is_search_configured=_is_company_notion_search_configured,
+                extract_query=_extract_company_notion_search_query,
+                search=_search_company_notion,
+                load_references=_load_company_notion_references,
+            ),
+        ),
+        knowledge_route_factory=_build_read_only_knowledge_routes,
+        logger=app_logger,
+    )
 
     def _handle_company_mention(
         payload: MentionPayload,
@@ -281,7 +522,7 @@ def create_app() -> App:
             _set_request_log_route(payload, "ping")
             provider = (s.LLM_PROVIDER or "").lower().strip()
             if provider == "ollama":
-                health = _check_ollama_health()
+                health = _get_ollama_health()
                 reply(f"🏓 pong\n• llm: {_format_ping_llm_status(bool(health['ok']))}")
                 logger.info(
                     "Responded with ping health in thread_ts=%s provider=ollama ok=%s",
@@ -310,18 +551,8 @@ def create_app() -> App:
             logger.info("Responded with usage help in thread_ts=%s", thread_ts)
             return
 
-        def _is_claude_allowed_user(target_user_id: str | None) -> bool:
-            if not cs.CLAUDE_ALLOWED_USER_IDS:
-                return True
-            return bool(target_user_id) and target_user_id in cs.CLAUDE_ALLOWED_USER_IDS
-
         def _timeout_reply_text() -> str:
-            provider = (s.LLM_PROVIDER or "").lower().strip()
-            if provider == "claude":
-                timeout_sec = max(1, s.ANTHROPIC_TIMEOUT_SEC)
-                return f"AI API가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
-            timeout_sec = max(1, s.OLLAMA_TIMEOUT_SEC)
-            return f"LLM 서버가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
+            return _answer_timeout_reply_text()
 
         def _llm_unavailable_reply_text(summary: str | None = None) -> str:
             provider = (s.LLM_PROVIDER or "").lower().strip()
@@ -356,6 +587,36 @@ def create_app() -> App:
             except Exception:
                 logger.exception("Failed to send DM to user=%s", target_user_id)
                 return False
+
+        assistant_context_entries: tuple[ContextEntry, ...] = ()
+        assistant_context_loaded = False
+
+        def _get_assistant_context_entries() -> tuple[ContextEntry, ...]:
+            nonlocal assistant_context_entries, assistant_context_loaded
+            if assistant_context_loaded:
+                return assistant_context_entries
+            assistant_context_loaded = True
+            assistant_context_entries = tuple(
+                load_slack_thread_context_entries(
+                    client,
+                    logger,
+                    channel_id,
+                    thread_ts,
+                    current_ts,
+                )
+            )
+            return assistant_context_entries
+
+        def _should_load_llm_context() -> bool:
+            if (
+                not s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT
+                or not s.LLM_SYNTHESIS_ENABLED
+            ):
+                return False
+            provider = (s.LLM_PROVIDER or "").lower().strip()
+            if provider == "claude" and not _is_claude_allowed_user(user_id):
+                return False
+            return _is_answer_provider_ready()
 
         def _needs_recording_failure_analysis_fallback(
             synthesized: str,
@@ -550,7 +811,7 @@ def create_app() -> App:
                 logger.info("Responded with %s (direct, unsupported provider=%s)", route_name, provider)
                 return
             if provider == "ollama":
-                health = _check_ollama_health()
+                health = _get_ollama_health()
                 if not health["ok"]:
                     reply(fallback_with_references)
                     logger.warning(
@@ -702,6 +963,9 @@ def create_app() -> App:
         ):
             return
 
+        notion_turn = company_assistant_runtime.start_turn(
+            build_company_assistant_request(payload)
+        )
         if _handle_company_notion_routes(
             CompanyNotionRoutesContext(
                 question=question,
@@ -710,141 +974,53 @@ def create_app() -> App:
                 thread_ts=thread_ts,
                 reply=reply,
                 logger=logger,
+                client=client,
             ),
             CompanyNotionRoutesDeps(
-                reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
+                assistant_service=notion_turn.service_for_stage(
+                    "notion"
+                ),
             ),
         ):
             return
 
-        barcode = _extract_barcode(question)
-        phase2_hospital_name, phase2_room_name = _extract_hospital_room_scope(question)
-        has_phase2_scope = bool(phase2_hospital_name and phase2_room_name)
-        phase2_has_requested_date = False
-        thread_context_for_scope = ""
-
-        if has_phase2_scope:
-            try:
-                _, phase2_has_requested_date = _extract_log_date_with_presence(question)
-            except ValueError:
-                phase2_has_requested_date = True
-
-        if has_phase2_scope and phase2_has_requested_date:
-            thread_context_for_scope = _load_slack_thread_context(
-                client,
-                logger,
-                channel_id,
-                thread_ts,
-                current_ts,
+        scope_context_entries = (
+            _get_assistant_context_entries()
+            if company_assistant_runtime.needs_scope_context(question)
+            else ()
+        )
+        assistant_turn = company_assistant_runtime.start_turn(
+            build_company_assistant_request(
+                payload,
+                context_entries=scope_context_entries,
             )
-
-        if not barcode and has_phase2_scope and phase2_has_requested_date:
-            recovered_barcode = _extract_latest_barcode_from_thread_context(thread_context_for_scope)
-            if recovered_barcode:
-                barcode = recovered_barcode
-                logger.info(
-                    "Recovered barcode from thread context for phase2 scope follow-up in thread_ts=%s barcode=%s",
-                    thread_ts,
-                    barcode,
-                )
-        recordings_context: dict[str, Any] | None = None
-        recordings_context_prefetch_error: Exception | None = None
-
-        if barcode:
-            try:
-                recordings_context = _load_recordings_context_by_barcode(barcode)
-                prefetch_summary = recordings_context.get("summary") or {}
-                logger.info(
-                    "Prefetched recordings context in thread_ts=%s barcode=%s count=%s",
-                    thread_ts,
-                    barcode,
-                    int(prefetch_summary.get("recordingCount") or 0),
-                )
-            except Exception as exc:
-                recordings_context_prefetch_error = exc
-                logger.warning(
-                    "Failed to prefetch recordings context in thread_ts=%s barcode=%s error=%s",
-                    thread_ts,
-                    barcode,
-                    type(exc).__name__,
-                )
+        )
+        barcode = assistant_turn.barcode
+        phase2_hospital_name = assistant_turn.hospital_name
+        phase2_room_name = assistant_turn.room_name
+        thread_context_for_scope = assistant_turn.thread_context
+        is_phase2_scope_followup = assistant_turn.is_scope_followup
+        is_failure_phase2_scope_followup = bool(
+            assistant_turn.is_scope_followup
+            and assistant_turn.has_failure_context_hint
+        )
+        recordings_scope = assistant_turn.recordings
 
         def _get_recordings_context() -> dict[str, Any]:
-            nonlocal recordings_context, recordings_context_prefetch_error
-            if recordings_context is not None:
-                return recordings_context
-            if recordings_context_prefetch_error is not None:
-                raise recordings_context_prefetch_error
-            if not barcode:
-                raise ValueError("바코드가 필요해")
-            recordings_context = _load_recordings_context_by_barcode(barcode)
-            return recordings_context
-
-        def _build_recordings_rows_evidence(context: dict[str, Any]) -> list[dict[str, Any]]:
-            rows = context.get("rows") or []
-            return [
-                {
-                    "seq": row.get("seq"),
-                    "hospitalSeq": row.get("hospitalSeq"),
-                    "hospitalRoomSeq": row.get("hospitalRoomSeq"),
-                    "hospitalName": row.get("hospitalName"),
-                    "roomName": row.get("roomName"),
-                    "deviceSeq": row.get("deviceSeq"),
-                    "videoLength": row.get("videoLength"),
-                    "streamingStatus": row.get("streamingStatus"),
-                    "recordedAt": row.get("recordedAt"),
-                    "createdAt": row.get("createdAt"),
-                }
-                for row in rows
-            ]
+            return recordings_scope.get()
 
         def _attach_recordings_context_to_evidence(
             evidence: dict[str, Any],
             context: dict[str, Any],
         ) -> None:
-            evidence["recordingsSummary"] = context.get("summary")
-            evidence["recordingsContextLimit"] = context.get("limit")
-            evidence["recordingsHasMore"] = context.get("has_more")
-            evidence["recordingsRows"] = _build_recordings_rows_evidence(context)
+            recordings_scope.attach_to_evidence(evidence, context)
 
         def _has_recordings_device_mapping(context: dict[str, Any]) -> bool:
-            rows = context.get("rows") or []
-            return any(row.get("deviceSeq") is not None for row in rows)
+            return recordings_scope.has_device_mapping(context)
 
-        def _build_barcode_fallback_evidence() -> dict[str, Any] | None:
-            if not barcode:
-                return None
-
-            evidence: dict[str, Any] = {
-                "route": "llm_barcode_fallback",
-                "source": "box_db.recordings",
-                "request": {
-                    "barcode": barcode,
-                    "question": question,
-                },
-            }
-
-            if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
-                evidence["warning"] = "DB 접속 정보(DB_*)가 없어 recordings 컨텍스트를 넣지 못했어"
-                return evidence
-
-            try:
-                context = _get_recordings_context()
-            except Exception as exc:
-                logger.exception("Failed to load recordings context for llm fallback barcode=%s", barcode)
-                evidence["warning"] = f"recordings 컨텍스트 조회 실패: {type(exc).__name__}"
-                return evidence
-
-            _attach_recordings_context_to_evidence(evidence, context)
-            return evidence
-
-        is_phase2_scope_followup = bool(barcode and has_phase2_scope and phase2_has_requested_date)
-        is_failure_phase2_scope_followup = bool(
-            barcode
-            and has_phase2_scope
-            and phase2_has_requested_date
-            and _has_recording_failure_analysis_hints(thread_context_for_scope)
-        )
+        # 바코드 자유질문의 evidence 조립도 runtime knowledge route가 소유한다.
+        def _build_barcode_fallback_evidence() -> None:
+            return None
 
         if _handle_device_routes(
             DeviceRoutesContext(
@@ -860,6 +1036,17 @@ def create_app() -> App:
                 reply=reply,
                 client=client,
                 logger=logger,
+                assistant_service=assistant_turn.service_for_stage(
+                    "device"
+                ),
+                context_entries=(
+                    _get_assistant_context_entries()
+                    if (
+                        _is_device_led_pattern_help_request(question)
+                        and _should_load_llm_context()
+                    )
+                    else ()
+                ),
             ),
             DeviceRoutesDeps(
                 get_s3_client=_get_s3_client,
@@ -887,6 +1074,21 @@ def create_app() -> App:
                 reply=reply,
                 logger=logger,
                 client=client,
+                payload=payload,
+                assistant_service=assistant_turn.service_for_stage(
+                    "failure"
+                ),
+                context_entries=(
+                    _get_assistant_context_entries()
+                    if (
+                        _is_recording_failure_analysis_request(
+                            question,
+                            barcode,
+                        )
+                        or is_failure_phase2_scope_followup
+                    )
+                    else ()
+                ),
             ),
             RecordingFailureRouteDeps(
                 get_s3_client=_get_s3_client,
@@ -914,6 +1116,24 @@ def create_app() -> App:
                 logger=logger,
                 claude_client=claude_client,
                 client=client,
+                payload=payload,
+                assistant_service=assistant_turn.service_for_stage(
+                    "log"
+                ),
+                context_entries=(
+                    _get_assistant_context_entries()
+                    if (
+                        is_phase2_scope_followup
+                        or (
+                            _is_barcode_log_analysis_request(
+                                question,
+                                barcode,
+                            )
+                            and _should_load_llm_context()
+                        )
+                    )
+                    else ()
+                ),
             ),
             BarcodeLogRouteDeps(
                 get_s3_client=_get_s3_client,
@@ -937,6 +1157,10 @@ def create_app() -> App:
                 thread_ts=thread_ts,
                 reply=reply,
                 logger=logger,
+                assistant_service=assistant_turn.service_for_stage(
+                    "structured"
+                ),
+                client=client,
             )
         ):
             return
@@ -949,6 +1173,28 @@ def create_app() -> App:
                 thread_ts=thread_ts,
                 reply=reply,
                 logger=logger,
+                payload=payload,
+                assistant_service=assistant_turn.service_for_stage(
+                    "barcode"
+                ),
+                client=client,
+                context_entries=(
+                    _get_assistant_context_entries()
+                    if (
+                        (
+                            _is_barcode_last_recorded_at_request(
+                                question,
+                                barcode,
+                            )
+                            or _is_barcode_video_recorded_on_date_request(
+                                question,
+                                barcode,
+                            )
+                        )
+                        and _should_load_llm_context()
+                    )
+                    else ()
+                ),
             ),
             BarcodeQueryRoutesDeps(
                 get_recordings_context=_get_recordings_context,
@@ -964,10 +1210,17 @@ def create_app() -> App:
         ):
             return
 
+        knowledge_context_entries = _get_assistant_context_entries()
+        knowledge_turn = company_assistant_runtime.start_turn(
+            build_company_assistant_request(
+                payload,
+                context_entries=knowledge_context_entries,
+            )
+        )
         if _handle_knowledge_routes(
             KnowledgeRoutesContext(
                 question=question,
-                barcode=barcode,
+                barcode=knowledge_turn.barcode,
                 user_id=user_id,
                 payload=payload,
                 thread_ts=thread_ts,
@@ -977,6 +1230,10 @@ def create_app() -> App:
                 logger=logger,
                 client=client,
                 claude_client=claude_client,
+                assistant_service=knowledge_turn.service_for_stage(
+                    "knowledge"
+                ),
+                context_entries=knowledge_context_entries,
             ),
             KnowledgeRoutesDeps(
                 reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
@@ -985,6 +1242,7 @@ def create_app() -> App:
                 is_timeout_error=_is_timeout_error,
                 is_claude_allowed_user=_is_claude_allowed_user,
                 build_barcode_fallback_evidence=_build_barcode_fallback_evidence,
+                check_ollama_health=_get_ollama_health,
             ),
         ):
             return

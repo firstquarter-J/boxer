@@ -13,12 +13,14 @@ from boxer_adapter_slack.common import (
     set_request_log_skip_persist,
     set_request_log_status,
 )
+from boxer_adapter_slack.context import load_slack_thread_context_entries
 
 __all__ = [
     "MentionPayload",
     "SlackReplyFn",
     "create_slack_app",
     "merge_request_log_metadata",
+    "load_slack_thread_context_entries",
     "set_request_log_route",
     "set_request_log_skip_persist",
     "set_request_log_status",

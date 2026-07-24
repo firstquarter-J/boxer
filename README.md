@@ -41,6 +41,7 @@ Boxer는 오픈소스로 재사용 가능한 `Retrieval-Grounded Assistant (RGA)
 boxer/
   pyproject.toml
   boxer/
+    answering.py
     core/
     context/
     observability/
@@ -68,6 +69,7 @@ boxer/
 
 open core 내부 구조:
 
+- `boxer/answering.py`: 공개 `AnswerEngine`, `AnswerRequest`, `AnswerResult` facade
 - `boxer/core`: 설정, LLM, 공통 utils
 - `boxer/context`: entries / builder / windowing
 - `boxer/observability`: request log / audit / sqlite snapshot helper

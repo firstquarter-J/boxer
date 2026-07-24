@@ -2,6 +2,7 @@ import logging
 import unittest
 from unittest.mock import patch
 
+from boxer_company.assistant import AssistantMessage, CompanyAssistantResult
 from boxer_company_adapter_slack.barcode_routes import (
     BarcodeLogRouteContext,
     BarcodeLogRouteDeps,
@@ -24,6 +25,207 @@ def _build_deps() -> BarcodeLogRouteDeps:
 
 
 class BarcodeRouteHandlerTests(unittest.TestCase):
+    def test_channel_neutral_service_preserves_slack_chunking_and_mentions(self) -> None:
+        replies: list[tuple[str, bool]] = []
+        captured_requests: list[object] = []
+
+        class Service:
+            def answer(self, request):
+                captured_requests.append(request)
+                long_body = "\n".join(
+                    f"• 로그 줄 {index}: {'x' * 40}"
+                    for index in range(100)
+                )
+                return CompanyAssistantResult(
+                    route="barcode_log_analysis",
+                    outcome="answered",
+                    messages=(
+                        AssistantMessage(body=f"**로그 분석**\n{long_body}"),
+                        AssistantMessage(
+                            body="**세션별 에러 분석**\n• 조치: 확인",
+                            mention_actor=False,
+                        ),
+                    ),
+                )
+
+        payload = {
+            "text": "12345678901 로그 분석",
+            "question": "12345678901 로그 분석",
+            "user_id": "U123",
+            "workspace_id": "W123",
+            "channel_id": "C123",
+            "current_ts": "1.1",
+            "thread_ts": "1",
+        }
+        handled = _handle_barcode_log_analysis_request(
+            BarcodeLogRouteContext(
+                question="12345678901 로그 분석",
+                barcode="12345678901",
+                is_phase2_scope_followup=False,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                thread_ts="1",
+                user_id="U123",
+                channel_id="C123",
+                current_ts="1.1",
+                reply=lambda text, mention_user=True: replies.append(
+                    (text, mention_user)
+                ),
+                logger=logging.getLogger(__name__),
+                claude_client=None,
+                client=None,
+                payload=payload,  # type: ignore[arg-type]
+                assistant_service=Service(),  # type: ignore[arg-type]
+                context_entries=(
+                    {
+                        "kind": "message",
+                        "source": "slack",
+                        "author_id": "U123",
+                        "text": "이전 로그 질문",
+                    },
+                ),
+            ),
+            _build_deps(),
+        )
+
+        self.assertTrue(handled)
+        self.assertGreaterEqual(len(replies), 3)
+        self.assertTrue(replies[0][1])
+        self.assertTrue(all(not mention for _, mention in replies[1:]))
+        self.assertTrue(all(len(text) <= 3000 for text, _ in replies))
+        self.assertEqual(
+            captured_requests[0].context_entries[0]["text"],
+            "이전 로그 질문",
+        )
+        self.assertEqual(
+            payload["request_log"]["route_name"],
+            "barcode log analysis",
+        )
+
+    def test_progress_renders_main_then_summary_without_duplicate_mention(
+        self,
+    ) -> None:
+        replies: list[tuple[str, bool]] = []
+
+        class ProgressiveService:
+            def answer_with_progress(self, request, on_partial_result):
+                on_partial_result(
+                    CompanyAssistantResult(
+                        route="barcode_log_analysis",
+                        outcome="answered",
+                        messages=(
+                            AssistantMessage(body="**확정 본문**"),
+                        ),
+                    )
+                )
+                return CompanyAssistantResult(
+                    route="barcode_log_analysis",
+                    outcome="answered",
+                    messages=(
+                        AssistantMessage(
+                            body="**세션별 요약**",
+                            mention_actor=False,
+                        ),
+                    ),
+                    used_llm=True,
+                )
+
+        payload = {
+            "question": "12345678901 로그 분석",
+            "user_id": "U123",
+            "workspace_id": "W123",
+            "channel_id": "C123",
+            "current_ts": "1.1",
+            "thread_ts": "1",
+        }
+        handled = _handle_barcode_log_analysis_request(
+            BarcodeLogRouteContext(
+                question="12345678901 로그 분석",
+                barcode="12345678901",
+                is_phase2_scope_followup=False,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                thread_ts="1",
+                user_id="U123",
+                channel_id="C123",
+                current_ts="1.1",
+                reply=lambda text, mention_user=True: replies.append(
+                    (text, mention_user)
+                ),
+                logger=logging.getLogger(__name__),
+                claude_client=None,
+                client=None,
+                payload=payload,  # type: ignore[arg-type]
+                assistant_service=ProgressiveService(),  # type: ignore[arg-type]
+            ),
+            _build_deps(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            replies,
+            [("*확정 본문*", True), ("*세션별 요약*", False)],
+        )
+        self.assertEqual(
+            payload["request_log"]["route_name"],
+            "barcode log analysis",
+        )
+        self.assertTrue(
+            payload["request_log"]["metadata"]["assistantUsedLlm"]
+        )
+
+    def test_progress_empty_terminal_result_is_still_handled_once(self) -> None:
+        replies: list[tuple[str, bool]] = []
+
+        class ProgressiveService:
+            def answer_with_progress(self, request, on_partial_result):
+                on_partial_result(
+                    CompanyAssistantResult(
+                        route="barcode_log_analysis",
+                        outcome="answered",
+                        messages=(AssistantMessage(body="확정 본문"),),
+                    )
+                )
+                return CompanyAssistantResult(
+                    route="barcode_log_analysis",
+                    outcome="answered",
+                    messages=(),
+                )
+
+        payload = {
+            "question": "12345678901 로그 분석",
+            "user_id": "U123",
+            "workspace_id": "W123",
+            "channel_id": "C123",
+            "current_ts": "1.1",
+            "thread_ts": "1",
+        }
+        handled = _handle_barcode_log_analysis_request(
+            BarcodeLogRouteContext(
+                question="12345678901 로그 분석",
+                barcode="12345678901",
+                is_phase2_scope_followup=False,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                thread_ts="1",
+                user_id="U123",
+                channel_id="C123",
+                current_ts="1.1",
+                reply=lambda text, mention_user=True: replies.append(
+                    (text, mention_user)
+                ),
+                logger=logging.getLogger(__name__),
+                claude_client=None,
+                client=None,
+                payload=payload,  # type: ignore[arg-type]
+                assistant_service=ProgressiveService(),  # type: ignore[arg-type]
+            ),
+            _build_deps(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, [("확정 본문", True)])
+
     def test_returns_false_when_question_is_not_barcode_log_route(self) -> None:
         replies: list[tuple[str, bool]] = []
 

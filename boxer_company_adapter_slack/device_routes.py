@@ -2,12 +2,19 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import pymysql
 from botocore.exceptions import BotoCoreError, ClientError
 
-from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _load_slack_user_name, _set_request_log_route
+from boxer.context.entries import ContextEntry
+from boxer_adapter_slack.common import (
+    MentionPayload,
+    SlackReplyFn,
+    _load_slack_user_name,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+)
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
@@ -102,6 +109,12 @@ from boxer_company.routers.recording_streaming_restore import (
     _extract_recording_streaming_restore_month,
     _is_recording_streaming_restore_request,
 )
+from boxer_company.assistant import CompanyAssistantService
+from boxer_company_adapter_slack.assistant_bridge import (
+    assistant_slack_route_name,
+    build_company_assistant_request,
+    render_company_assistant_result,
+)
 from boxer_company_adapter_slack.device_activity import (
     _collect_device_download_records,
     _log_device_download_activity,
@@ -136,6 +149,8 @@ class DeviceRoutesContext:
     reply: SlackReplyFn
     client: Any
     logger: logging.Logger
+    assistant_service: CompanyAssistantService | None = None
+    context_entries: Sequence[ContextEntry] = ()
 
 
 @dataclass(frozen=True)
@@ -557,6 +572,58 @@ def _handle_device_routes(
         # 다운로드는 세션 단위 작업이라 병원/병실/날짜만으로 확정하지 않는다.
         context.reply(_build_device_download_barcode_required_message())
         return True
+
+    if context.assistant_service is not None:
+        result = context.assistant_service.answer(
+            build_company_assistant_request(
+                context.payload,
+                context_entries=context.context_entries,
+                metadata={
+                    "barcode": barcode,
+                    "device_name": structured_device_name,
+                },
+            )
+        )
+        if result is not None:
+            route_fields: dict[str, Any] = {}
+            if result.route == "device_led_log_analysis":
+                try:
+                    requested_date, _ = _extract_log_date_with_presence(
+                        question
+                    )
+                except ValueError:
+                    requested_date = None
+                route_fields = {
+                    "subject_type": "device",
+                    "subject_key": structured_device_name or "",
+                    "requested_date": requested_date,
+                }
+            _set_request_log_route(
+                context.payload,
+                assistant_slack_route_name(result.route),
+                handler_type="router",
+                **route_fields,
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                assistantOutcome=result.outcome,
+                assistantFallbackReason=result.fallback_reason,
+                assistantUsedLlm=result.used_llm,
+            )
+            render_company_assistant_result(
+                result,
+                reply=context.reply,
+                actor_id=context.user_id,
+                client=context.client,
+                logger=context.logger,
+            )
+            context.logger.info(
+                "Responded with device assistant route=%s outcome=%s thread_ts=%s",
+                result.route,
+                result.outcome,
+                context.thread_ts,
+            )
+            return True
 
     if _is_device_led_log_analysis_request(question, device_name=structured_device_name):
         if not s.S3_QUERY_ENABLED:

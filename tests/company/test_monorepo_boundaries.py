@@ -20,7 +20,14 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
 
         self.assertEqual(project.get("name"), "boxer-company")
         self.assertIn("boxer[db,s3]>=0.1.0", dependencies)
-        self.assertEqual(packages, ["boxer_company", "boxer_company.routers"])
+        self.assertEqual(
+            packages,
+            [
+                "boxer_company",
+                "boxer_company.assistant",
+                "boxer_company.routers",
+            ],
+        )
         self.assertNotIn("boxer", packages)
         self.assertNotIn("boxer_adapter_slack", packages)
 
@@ -46,6 +53,16 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
             "boxer_company_adapter_slack/requirements.txt",
         ):
             self.assertFalse((PROJECT_ROOT / relative_path).exists(), relative_path)
+
+    def test_company_assistant_package_has_no_slack_runtime_imports(self) -> None:
+        assistant_root = PROJECT_ROOT / "boxer_company" / "assistant"
+        forbidden_imports = ("boxer_adapter_slack", "slack_bolt")
+
+        # 공통 API가 이 패키지를 그대로 조립할 수 있도록 Slack 의존 역류를 막는다.
+        for path in assistant_root.glob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            for forbidden_import in forbidden_imports:
+                self.assertNotIn(forbidden_import, source, path)
 
 
 if __name__ == "__main__":

@@ -21,8 +21,13 @@ dependencies = [
 Repository = "https://github.com/firstquarter-J/boxer"
 
 [tool.setuptools]
-packages = ["boxer_company", "boxer_company.routers"]
+packages = [
+  "boxer_company",
+  "boxer_company.assistant",
+  "boxer_company.routers",
+]
 
 [tool.setuptools.package-dir]
 boxer_company = "."
+"boxer_company.assistant" = "assistant"
 "boxer_company.routers" = "routers"

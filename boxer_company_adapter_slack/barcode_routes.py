@@ -1,11 +1,17 @@
 import logging
-from dataclasses import dataclass
-from typing import Any, Callable
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Sequence
 
 import pymysql
 from botocore.exceptions import BotoCoreError, ClientError
 
-from boxer_adapter_slack.common import SlackReplyFn
+from boxer.context.entries import ContextEntry
+from boxer_adapter_slack.common import (
+    MentionPayload,
+    SlackReplyFn,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+)
 from boxer.core import settings as s
 from boxer_company import settings as cs
 from boxer_company.routers.barcode_log import (
@@ -23,7 +29,17 @@ from boxer_company.routers.box_db import (
     _lookup_device_contexts_by_barcode_on_date,
     _lookup_device_contexts_by_hospital_room,
 )
-from boxer_company_adapter_slack.barcode_logs import _reply_with_barcode_log_error_summary
+from boxer_company.assistant import CompanyAssistantService
+from boxer_company.assistant.contracts import AssistantMessage
+from boxer_company_adapter_slack.assistant_bridge import (
+    assistant_slack_route_name,
+    build_company_assistant_request,
+    render_company_assistant_result,
+)
+from boxer_company_adapter_slack.barcode_logs import (
+    _reply_with_barcode_log_error_summary,
+    _split_barcode_log_reply,
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +57,9 @@ class BarcodeLogRouteContext:
     logger: logging.Logger
     claude_client: Any
     client: Any
+    payload: MentionPayload | None = None
+    assistant_service: CompanyAssistantService | None = None
+    context_entries: Sequence[ContextEntry] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +81,87 @@ def _handle_barcode_log_analysis_request(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if context.assistant_service is not None and context.payload is not None:
+        assistant_request = build_company_assistant_request(
+            context.payload,
+            context_entries=context.context_entries,
+            metadata={
+                "barcode": barcode,
+                "phase2_hospital_name": context.phase2_hospital_name,
+                "phase2_room_name": context.phase2_room_name,
+            },
+        )
+
+        def render_result_messages(result) -> int:
+            split_messages: list[AssistantMessage] = []
+            for message in result.messages:
+                chunks = _split_barcode_log_reply(message.body)
+                for index, chunk in enumerate(chunks or [message.body]):
+                    split_messages.append(
+                        replace(
+                            message,
+                            body=chunk,
+                            mention_actor=(
+                                message.mention_actor and index == 0
+                            ),
+                        )
+                    )
+            render_company_assistant_result(
+                replace(result, messages=tuple(split_messages)),
+                reply=context.reply,
+                actor_id=context.user_id,
+                client=context.client,
+                logger=context.logger,
+            )
+            return len(split_messages)
+
+        sent_messages = 0
+
+        def render_partial_result(partial_result) -> None:
+            nonlocal sent_messages
+            _set_request_log_route(
+                context.payload,
+                assistant_slack_route_name(partial_result.route),
+                handler_type="router",
+            )
+            sent_messages += render_result_messages(partial_result)
+
+        progress_answer = getattr(
+            context.assistant_service,
+            "answer_with_progress",
+            None,
+        )
+        if callable(progress_answer):
+            result = progress_answer(
+                assistant_request,
+                render_partial_result,
+            )
+        else:
+            result = context.assistant_service.answer(assistant_request)
+
+        if result is not None:
+            _set_request_log_route(
+                context.payload,
+                assistant_slack_route_name(result.route),
+                handler_type="router",
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                assistantOutcome=result.outcome,
+                assistantFallbackReason=result.fallback_reason,
+                assistantUsedLlm=result.used_llm,
+            )
+            sent_messages += render_result_messages(result)
+            context.logger.info(
+                "Responded with barcode log assistant route=%s outcome=%s thread_ts=%s messages=%s",
+                result.route,
+                result.outcome,
+                context.thread_ts,
+                sent_messages,
+            )
+            return True
+
     direct_device_name = _extract_device_name_scope(question)
 
     if not (_is_barcode_log_analysis_request(question, barcode) or context.is_phase2_scope_followup):

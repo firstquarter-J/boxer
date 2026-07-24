@@ -2,6 +2,10 @@ import re
 from typing import Any
 
 from boxer_company import settings as cs
+from boxer_company.assistant.notion_answer_safety import (
+    build_notion_document_security_refusal as _build_notion_doc_security_refusal,
+    needs_notion_document_security_refusal as _needs_notion_doc_security_refusal,
+)
 from boxer_company.retrieval_rules import _is_notion_doc_general_overview_question
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES, build_team_freeform_context
 
@@ -257,19 +261,6 @@ _NOTION_DOC_EXFILTRATION_PATTERNS = (
         r"((i\s*am|i'?m|im)\s+(super\s+admin|admin|owner|developer|maintainer)|super\s+admin|admin\s+mode|override|ignore\s+(previous|all)\s+(rules|instructions)|bypass)",
         re.IGNORECASE,
     ),
-)
-_NOTION_DOC_LEAK_MARKERS = (
-    "system prompt",
-    "developer prompt",
-    "internal prompt",
-    "thread context",
-    "evidence(json)",
-    "page_id=",
-    "authorization:",
-    "bearer ",
-    "notion_token",
-    "<think>",
-    "</think>",
 )
 _FREEFORM_COMPARISON_HINTS = (
     " vs ",
@@ -545,10 +536,6 @@ def _is_notion_doc_exfiltration_attempt(question: str, thread_context: str = "")
     return any(pattern.search(text) for pattern in _NOTION_DOC_EXFILTRATION_PATTERNS)
 
 
-def _build_notion_doc_security_refusal() -> str:
-    return "보안 위반 시도로 판단해 요청을 즉시 차단해. 문서 원문, 시스템 정보, 내부 지시문은 공개하지 않아. 같은 시도가 반복되면 관리자 검토 및 접근 제한 대상으로 처리해."
-
-
 def _is_notion_doc_general_overview_answer(text: str) -> bool:
     normalized = (text or "").strip()
     if not normalized.startswith("*문서 기반 답변*"):
@@ -661,23 +648,6 @@ def _sanitize_notion_references_for_llm(references: list[dict[str, Any]] | None)
             }
         )
     return sanitized
-
-
-def _needs_notion_doc_security_refusal(text: str, route_name: str) -> bool:
-    # 전사 Work Board 답변도 문서 기반 합성이므로 같은 출력 유출 가드를 적용한다.
-    if route_name not in {"notion playbook qa", "company_notion_qa"}:
-        return False
-    normalized = (text or "").strip().lower()
-    if any(marker in normalized for marker in _NOTION_DOC_LEAK_MARKERS):
-        return True
-    meaningful_lines = [line for line in (text or "").splitlines() if line.strip()]
-    if "```" in (text or ""):
-        return True
-    if len(meaningful_lines) > 16:
-        return True
-    if len(text or "") > 1400:
-        return True
-    return False
 
 
 def _build_notion_doc_general_overview_fallback(

@@ -3,7 +3,17 @@ from dataclasses import dataclass
 
 import pymysql
 
-from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _set_request_log_route
+from boxer_adapter_slack.common import (
+    MentionPayload,
+    SlackReplyFn,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+)
+from boxer_company.assistant import CompanyAssistantService
+from boxer_company_adapter_slack.assistant_bridge import (
+    build_company_assistant_request,
+    render_company_assistant_result,
+)
 from boxer_company_adapter_slack.notion_freeform import _is_generic_count_or_existence_request
 from boxer_company_adapter_slack.weekly_reports import (
     _build_weekly_recordings_report_reply_payload,
@@ -45,11 +55,47 @@ class StructuredRoutesContext:
     thread_ts: str
     reply: SlackReplyFn
     logger: logging.Logger
+    assistant_service: CompanyAssistantService | None = None
+    client: object | None = None
 
 
 def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if context.assistant_service is not None:
+        result = context.assistant_service.answer(
+            build_company_assistant_request(
+                context.payload,
+                metadata={"barcode": barcode},
+            )
+        )
+        if result is not None:
+            _set_request_log_route(
+                context.payload,
+                result.route,
+                handler_type="router",
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                assistantOutcome=result.outcome,
+                assistantFallbackReason=result.fallback_reason,
+                assistantUsedLlm=result.used_llm,
+            )
+            render_company_assistant_result(
+                result,
+                reply=context.reply,
+                actor_id=context.payload.get("user_id"),
+                client=context.client,
+                logger=context.logger,
+            )
+            context.logger.info(
+                "Responded with structured assistant route=%s outcome=%s thread_ts=%s",
+                result.route,
+                result.outcome,
+                context.thread_ts,
+            )
+            return True
 
     if _is_recording_streaming_restore_request(question, barcode):
         # 복원 요청은 "영상 + 연월" 형태라 구조화 영상 조회가 먼저 잡기 쉬워서

@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
+from boxer_company.assistant import AssistantMessage, CompanyAssistantResult
 from boxer_company_adapter_slack.device_routes import (
     DeviceRoutesContext,
     DeviceRoutesDeps,
@@ -116,6 +117,57 @@ def _mda_scope_context(
 
 
 class DeviceRouteHandlerTests(unittest.TestCase):
+    def test_channel_neutral_led_service_runs_at_existing_route_position(self) -> None:
+        replies: list[str] = []
+        captured_requests: list[object] = []
+
+        class Service:
+            def answer(self, request):
+                captured_requests.append(request)
+                return CompanyAssistantResult(
+                    route="device_led_log_analysis",
+                    outcome="answered",
+                    messages=(
+                        AssistantMessage(body="**장비 LED 로그 확인**"),
+                    ),
+                )
+
+        payload = _payload()
+        payload["question"] = "MB2-C00570 2026-07-04 LED 로그 확인"
+        handled = _handle_device_routes(
+            DeviceRoutesContext(
+                question="MB2-C00570 2026-07-04 LED 로그 확인",
+                barcode=None,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                payload=payload,  # type: ignore[arg-type]
+                user_id="U123",
+                workspace_id="W123",
+                channel_id="C123",
+                thread_ts="1.0",
+                reply=lambda text, **kwargs: replies.append(text),
+                client=None,
+                logger=logging.getLogger(__name__),
+                assistant_service=Service(),  # type: ignore[arg-type]
+            ),
+            _deps(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*장비 LED 로그 확인*"])
+        self.assertEqual(
+            captured_requests[0].metadata["device_name"],
+            "MB2-C00570",
+        )
+        self.assertEqual(
+            payload["request_log"]["route_name"],
+            "device led log analysis",
+        )
+        self.assertEqual(
+            payload["request_log"]["requested_date"],
+            "2026-07-04",
+        )
+
     def test_device_health_alert_delivery_enable_command_updates_runtime_setting(self) -> None:
         replies: list[str] = []
         logger = logging.getLogger(__name__)

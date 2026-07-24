@@ -1,18 +1,30 @@
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import anthropic
 
-from boxer_adapter_slack.common import MentionPayload, SlackReplyFn, _set_request_log_route
+from boxer_adapter_slack.common import (
+    MentionPayload,
+    SlackReplyFn,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+)
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.context.builder import _build_model_input
+from boxer.context.entries import ContextEntry
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat, _check_ollama_health
 from boxer.retrieval.synthesis import _synthesize_retrieval_answer
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
+)
+from boxer_company.assistant import CompanyAssistantService
+from boxer_company_adapter_slack.assistant_bridge import (
+    assistant_slack_route_name,
+    build_company_assistant_request,
+    render_company_assistant_result,
 )
 from boxer_company.notion_playbooks import _is_company_notion_configured, _select_notion_references
 from boxer_company.retrieval_rules import (
@@ -56,6 +68,8 @@ class KnowledgeRoutesContext:
     logger: logging.Logger
     client: Any
     claude_client: Any
+    assistant_service: CompanyAssistantService | None = None
+    context_entries: Sequence[ContextEntry] = ()
 
 
 @dataclass(frozen=True)
@@ -66,6 +80,9 @@ class KnowledgeRoutesDeps:
     is_timeout_error: Callable[[Exception], bool]
     is_claude_allowed_user: Callable[[str | None], bool]
     build_barcode_fallback_evidence: Callable[[], dict[str, Any] | None]
+    check_ollama_health: Callable[[], dict[str, Any]] = (
+        _check_ollama_health
+    )
 
 
 def _build_claude_api_key_missing_reply() -> str:
@@ -131,6 +148,49 @@ def _handle_knowledge_routes(
 ) -> bool:
     question = context.question
     provider = (s.LLM_PROVIDER or "").lower().strip()
+
+    if context.assistant_service is not None:
+        result = context.assistant_service.answer(
+            build_company_assistant_request(
+                context.payload,
+                context_entries=context.context_entries,
+                metadata={"barcode": context.barcode},
+            )
+        )
+        if result is not None:
+            route_name = assistant_slack_route_name(result.route)
+            route_kwargs: dict[str, Any] = {}
+            handler_type = "router"
+            if result.route == "barcode_evidence_freeform":
+                # 기존 request-log dashboard가 쓰는 provider mode도 유지한다.
+                route_kwargs["route_mode"] = provider
+                handler_type = "llm_freeform"
+            _set_request_log_route(
+                context.payload,
+                route_name,
+                handler_type=handler_type,
+                **route_kwargs,
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                assistantOutcome=result.outcome,
+                assistantFallbackReason=result.fallback_reason,
+                assistantUsedLlm=result.used_llm,
+            )
+            render_company_assistant_result(
+                result,
+                reply=context.reply,
+                actor_id=context.user_id,
+                client=context.client,
+                logger=context.logger,
+            )
+            context.logger.info(
+                "Responded with knowledge assistant route=%s outcome=%s thread_ts=%s",
+                result.route,
+                result.outcome,
+                context.thread_ts,
+            )
+            return True
 
     # 장비 진단 thread에서는 자유질문도 방금 수집한 read-only 스냅샷을 우선 근거로 답한다.
     diagnostic_snapshot = _load_device_diagnostic_snapshot(
@@ -410,7 +470,7 @@ def _handle_knowledge_routes(
                 )
                 context.reply(build_prompt_security_refusal())
                 return True
-            health = _check_ollama_health()
+            health = deps.check_ollama_health()
             if not health["ok"]:
                 context.logger.warning("Ollama unavailable before answer generation: %s", health["summary"])
                 context.reply(deps.llm_unavailable_reply_text(str(health["summary"])))

@@ -1,11 +1,22 @@
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import pymysql
 
-from boxer_adapter_slack.common import SlackReplyFn
+from boxer.context.entries import ContextEntry
+from boxer_adapter_slack.common import (
+    MentionPayload,
+    SlackReplyFn,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+)
 from boxer_company import settings as cs
+from boxer_company.assistant import CompanyAssistantService
+from boxer_company_adapter_slack.assistant_bridge import (
+    build_company_assistant_request,
+    render_company_assistant_result,
+)
 from boxer_company.routers.app_user import _lookup_app_user_by_barcode, _should_lookup_barcode
 from boxer_company.routers.barcode_validation import (
     _is_barcode_pink_classification_reason_request,
@@ -51,6 +62,10 @@ class BarcodeQueryRoutesContext:
     thread_ts: str
     reply: SlackReplyFn
     logger: logging.Logger
+    payload: MentionPayload | None = None
+    assistant_service: CompanyAssistantService | None = None
+    client: Any | None = None
+    context_entries: Sequence[ContextEntry] = ()
 
 
 @dataclass(frozen=True)
@@ -67,6 +82,41 @@ def _handle_barcode_query_routes(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if context.assistant_service is not None and context.payload is not None:
+        result = context.assistant_service.answer(
+            build_company_assistant_request(
+                context.payload,
+                context_entries=context.context_entries,
+                metadata={"barcode": barcode},
+            )
+        )
+        if result is not None:
+            _set_request_log_route(
+                context.payload,
+                result.route,
+                handler_type="router",
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                assistantOutcome=result.outcome,
+                assistantFallbackReason=result.fallback_reason,
+                assistantUsedLlm=result.used_llm,
+            )
+            render_company_assistant_result(
+                result,
+                reply=context.reply,
+                actor_id=context.user_id,
+                client=context.client,
+                logger=context.logger,
+            )
+            context.logger.info(
+                "Responded with barcode assistant route=%s outcome=%s thread_ts=%s",
+                result.route,
+                result.outcome,
+                context.thread_ts,
+            )
+            return True
 
     if _is_barcode_pink_classification_reason_request(question, barcode):
         try:

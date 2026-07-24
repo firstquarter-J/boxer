@@ -5,6 +5,7 @@ from unittest.mock import patch
 import anthropic
 import httpx
 
+from boxer_company.assistant import AssistantMessage, CompanyAssistantResult
 from boxer_company_adapter_slack.admin_routes import (
     AdminRoutesContext,
     AdminRoutesDeps,
@@ -611,6 +612,69 @@ class RouteModulesSmokeTests(unittest.TestCase):
             )
 
         self.assertFalse(handled)
+
+    def test_knowledge_routes_prefers_channel_neutral_service_and_keeps_audit_contract(
+        self,
+    ) -> None:
+        replies: list[str] = []
+        requests = []
+        payload = _payload()
+
+        class Service:
+            def answer(self, request):  # type: ignore[no-untyped-def]
+                requests.append(request)
+                return CompanyAssistantResult(
+                    route="barcode_evidence_freeform",
+                    outcome="answered",
+                    messages=(AssistantMessage(body="**근거 답변**"),),
+                    used_llm=True,
+                )
+
+        # 공통 route가 답했으면 live 진단을 포함한 legacy fallback은
+        # 다시 실행하지 않아야 한다.
+        with (
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes.s.LLM_PROVIDER",
+                "claude",
+            ),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes._load_device_diagnostic_snapshot"
+            ) as legacy_snapshot,
+        ):
+            handled = _handle_knowledge_routes(
+                KnowledgeRoutesContext(
+                    question="바코드 상태를 설명해줘",
+                    barcode="12345678910",
+                    user_id="U123",
+                    payload=payload,  # type: ignore[arg-type]
+                    thread_ts="1.0",
+                    channel_id="C123",
+                    current_ts="1.1",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                    client=None,
+                    claude_client=object(),
+                    assistant_service=Service(),  # type: ignore[arg-type]
+                ),
+                KnowledgeRoutesDeps(
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                    timeout_reply_text=lambda: "timeout",
+                    llm_unavailable_reply_text=lambda summary=None: "down",
+                    is_timeout_error=lambda exc: False,
+                    is_claude_allowed_user=lambda user_id: True,
+                    build_barcode_fallback_evidence=lambda: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*근거 답변*"])
+        self.assertEqual(requests[0].metadata["barcode"], "12345678910")
+        request_log = payload["request_log"]
+        self.assertEqual(request_log["route_name"], "llm_freeform")  # type: ignore[index]
+        self.assertEqual(request_log["route_mode"], "claude")  # type: ignore[index]
+        self.assertEqual(request_log["handler_type"], "llm_freeform")  # type: ignore[index]
+        self.assertTrue(request_log["metadata"]["assistantUsedLlm"])  # type: ignore[index]
+        legacy_snapshot.assert_not_called()
 
     def test_knowledge_routes_reports_missing_claude_api_key_when_client_unavailable(self) -> None:
         replies: list[str] = []

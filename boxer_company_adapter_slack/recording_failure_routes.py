@@ -1,11 +1,17 @@
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import pymysql
 from botocore.exceptions import BotoCoreError, ClientError
 
-from boxer_adapter_slack.common import SlackReplyFn
+from boxer.context.entries import ContextEntry
+from boxer_adapter_slack.common import (
+    MentionPayload,
+    SlackReplyFn,
+    _merge_request_log_metadata,
+    _set_request_log_route,
+)
 from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer.core import settings as s
 from boxer_company import settings as cs
@@ -26,6 +32,12 @@ from boxer_company.routers.recording_failure_analysis import (
     _narrow_recording_failure_analysis_evidence,
     _render_recording_failure_analysis_fallback,
 )
+from boxer_company.assistant import CompanyAssistantService
+from boxer_company_adapter_slack.assistant_bridge import (
+    assistant_slack_route_name,
+    build_company_assistant_request,
+    render_company_assistant_result,
+)
 from boxer_company_adapter_slack.device_activity import _extract_user_only_thread_text
 from boxer_company_adapter_slack.weekly_reports import _rewrite_phase2_scope_request_message
 
@@ -45,6 +57,9 @@ class RecordingFailureRouteContext:
     reply: SlackReplyFn
     logger: logging.Logger
     client: Any
+    payload: MentionPayload | None = None
+    assistant_service: CompanyAssistantService | None = None
+    context_entries: Sequence[ContextEntry] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +78,49 @@ def _handle_recording_failure_analysis_request(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+
+    if context.assistant_service is not None and context.payload is not None:
+        result = context.assistant_service.answer(
+            build_company_assistant_request(
+                context.payload,
+                context_entries=context.context_entries,
+                metadata={
+                    "barcode": barcode,
+                    "phase2_hospital_name": context.phase2_hospital_name,
+                    "phase2_room_name": context.phase2_room_name,
+                    "is_failure_phase2_scope_followup": (
+                        context.is_failure_phase2_scope_followup
+                    ),
+                },
+            )
+        )
+        if result is not None:
+            _set_request_log_route(
+                context.payload,
+                assistant_slack_route_name(result.route),
+                handler_type="router",
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                assistantOutcome=result.outcome,
+                assistantFallbackReason=result.fallback_reason,
+                assistantUsedLlm=result.used_llm,
+            )
+            render_company_assistant_result(
+                result,
+                reply=context.reply,
+                actor_id=context.user_id,
+                client=context.client,
+                logger=context.logger,
+            )
+            context.logger.info(
+                "Responded with recording failure assistant route=%s outcome=%s thread_ts=%s",
+                result.route,
+                result.outcome,
+                context.thread_ts,
+            )
+            return True
+
     direct_device_name = _extract_device_name_scope(question)
 
     if not (_is_recording_failure_analysis_request(question, barcode) or context.is_failure_phase2_scope_followup):

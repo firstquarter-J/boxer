@@ -2,6 +2,7 @@ import logging
 import unittest
 from unittest.mock import patch
 
+from boxer_company.assistant import AssistantMessage, CompanyAssistantResult
 from boxer_company_adapter_slack.recording_failure_routes import (
     RecordingFailureRouteContext,
     RecordingFailureRouteDeps,
@@ -21,6 +22,76 @@ def _build_deps() -> RecordingFailureRouteDeps:
 
 
 class RecordingFailureRouteHandlerTests(unittest.TestCase):
+    def test_channel_neutral_service_short_circuits_legacy_handler(self) -> None:
+        replies: list[tuple[str, bool]] = []
+        captured_requests: list[object] = []
+
+        class Service:
+            def answer(self, request):
+                captured_requests.append(request)
+                return CompanyAssistantResult(
+                    route="recording_failure_analysis",
+                    outcome="answered",
+                    messages=(
+                        AssistantMessage(body="**공통 실패 분석**"),
+                    ),
+                    used_llm=True,
+                )
+
+        payload = {
+            "text": "12345678901 녹화 실패",
+            "question": "12345678901 녹화 실패",
+            "user_id": "U123",
+            "workspace_id": "W123",
+            "channel_id": "C123",
+            "current_ts": "1.1",
+            "thread_ts": "1",
+        }
+        handled = _handle_recording_failure_analysis_request(
+            RecordingFailureRouteContext(
+                question="12345678901 녹화 실패",
+                barcode="12345678901",
+                is_failure_phase2_scope_followup=False,
+                phase2_hospital_name=None,
+                phase2_room_name=None,
+                thread_context_for_scope="",
+                thread_ts="1",
+                user_id="U123",
+                channel_id="C123",
+                current_ts="1.1",
+                reply=lambda text, mention_user=True: replies.append(
+                    (text, mention_user)
+                ),
+                logger=logging.getLogger(__name__),
+                client=None,
+                payload=payload,  # type: ignore[arg-type]
+                assistant_service=Service(),  # type: ignore[arg-type]
+                context_entries=(
+                    {
+                        "kind": "message",
+                        "source": "slack",
+                        "author_id": "U123",
+                        "text": "이전 실패 질문",
+                    },
+                ),
+            ),
+            _build_deps(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, [("*공통 실패 분석*", True)])
+        self.assertEqual(
+            captured_requests[0].context_entries[0]["text"],
+            "이전 실패 질문",
+        )
+        self.assertEqual(
+            payload["request_log"]["route_name"],
+            "recording failure analysis",
+        )
+        self.assertTrue(
+            payload["request_log"]["metadata"]["assistantUsedLlm"]
+        )
+
     def test_returns_false_when_question_is_not_recording_failure_route(self) -> None:
         replies: list[tuple[str, bool]] = []
 

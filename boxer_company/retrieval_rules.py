@@ -322,8 +322,8 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
         return (
             "\n"
             "7) 이 작업은 녹화 실패 원인 분석이다. 원문 로그를 길게 반복하지 마.\n"
-            "8) 아래 형식 그대로만 답해:\n"
-            "   *녹화 실패 원인 분석*\n"
+            "8) 아래 CommonMark 형식 그대로만 답해:\n"
+            "   **녹화 실패 원인 분석**\n"
             "   • 핵심 원인:\n"
             "   • 운영 근거:\n"
             "   • 영향:\n"
