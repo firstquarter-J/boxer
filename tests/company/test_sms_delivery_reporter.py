@@ -380,8 +380,15 @@ class SmsDeliveryReporterTests(unittest.TestCase):
 
     def test_reconciles_after_temporary_append_failure_without_duplicate(self) -> None:
         logger = logging.getLogger("test.sms_delivery_reporter")
-        now = datetime(2026, 7, 23, 10, 0, tzinfo=timezone.utc)
-        self._remember_accepted(detected_at=now - timedelta(hours=1))
+        detected_at = datetime(2026, 7, 23, 9, 0, tzinfo=timezone.utc)
+        self._remember_accepted(detected_at=detected_at)
+        # outbox 저장 시각은 실제 현재시각이므로 그 값 이후를 reconcile 시계로 사용한다.
+        stored_at = datetime.fromisoformat(
+            sms_delivery_reporter._load_sms_delivery_outbox_items()[0][
+                "storedAt"
+            ].replace("Z", "+00:00")
+        )
+        now = stored_at + timedelta(seconds=1)
 
         with (
             patch.object(

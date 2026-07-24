@@ -99,6 +99,8 @@ export interface WidgetConfig {
   starterOptions?: string[];
   starterEntries?: StarterEntry[];
   workflowOptions?: WidgetWorkflowOptions;
+  // 서버 계약 버전을 보존해 이후 BFF 전환 시 config 호환성을 판별한다.
+  workflowConfigVersion?: string;
   welcomeTimeZones?: WidgetTimeZoneMap;
 }
 

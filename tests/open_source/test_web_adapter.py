@@ -17,6 +17,44 @@ from boxer_adapter_web.storage import WebChatStore
 from boxer_adapter_web.workflows import WorkflowCatalog
 
 
+# Node BFF 전환 때도 그대로 유지해야 하는 외부 transport 필드 집합을 명시한다.
+_SOURCE_REFERENCE_CONTRACT_FIELDS = {
+    "documentId",
+    "title",
+    "score",
+    "sourceUri",
+}
+_MESSAGE_CONTRACT_FIELDS = {
+    "id",
+    "senderType",
+    "senderName",
+    "body",
+    "sourceRefs",
+    "createdAt",
+}
+_CONVERSATION_CONTRACT_FIELDS = {
+    "id",
+    "sessionId",
+    "customerId",
+    "customerName",
+    "customerEmail",
+    "context",
+    "status",
+    "workflowKey",
+    "workflowState",
+    "assignedAdminUserId",
+    "assignedAdminUserName",
+    "handoffRequestedAt",
+    "handoffStartedAt",
+    "closedAt",
+    "lastMessagePreview",
+    "createdAt",
+    "updatedAt",
+    "messages",
+}
+_ADMIN_USER_CONTRACT_FIELDS = {"id", "email", "name"}
+
+
 class BoxerWebAdapterTests(unittest.TestCase):
     def test_public_package_exports_create_web_app(self) -> None:
         self.assertIs(boxer_adapter_web.create_web_app, create_web_app)
@@ -33,19 +71,93 @@ class BoxerWebAdapterTests(unittest.TestCase):
                 )
 
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json()["adminUser"]["email"], "admin@example.com")
-                self.assertTrue(response.json()["csrfToken"])
+                login_payload = response.json()
+                self.assertEqual(set(login_payload), {"adminUser", "csrfToken"})
+                self.assertEqual(
+                    set(login_payload["adminUser"]),
+                    _ADMIN_USER_CONTRACT_FIELDS,
+                )
+                self.assertEqual(login_payload["adminUser"]["email"], "admin@example.com")
+                self.assertTrue(login_payload["csrfToken"])
                 self.assertTrue(client.cookies.get("boxer_web_admin_csrf"))
 
                 # 공개 alpha의 관리 화면은 원문 편집 대신 sync/preview를 제공해야 한다.
                 status_response = client.get("/api/admin/knowledge/status")
                 self.assertEqual(status_response.status_code, 200)
-                self.assertEqual(status_response.json()["activeSource"], "markdown")
-                self.assertGreaterEqual(status_response.json()["documentCount"], 1)
+                status_payload = status_response.json()
+                self.assertEqual(
+                    set(status_payload),
+                    {"activeSource", "documentCount", "lastSync"},
+                )
+                self.assertEqual(status_payload["activeSource"], "markdown")
+                self.assertGreaterEqual(status_payload["documentCount"], 1)
+                self.assertEqual(
+                    set(status_payload["lastSync"]),
+                    {
+                        "id",
+                        "sourceType",
+                        "status",
+                        "documentCount",
+                        "errorMessage",
+                        "startedAt",
+                        "finishedAt",
+                    },
+                )
 
                 documents_response = client.get("/api/admin/knowledge/documents")
                 self.assertEqual(documents_response.status_code, 200)
-                self.assertGreaterEqual(len(documents_response.json()["documents"]), 1)
+                documents_payload = documents_response.json()
+                self.assertEqual(set(documents_payload), {"documents"})
+                self.assertGreaterEqual(len(documents_payload["documents"]), 1)
+                document_summary = documents_payload["documents"][0]
+                self.assertEqual(
+                    set(document_summary),
+                    {
+                        "id",
+                        "title",
+                        "sourceType",
+                        "sourceUri",
+                        "excerpt",
+                        "syncedAt",
+                    },
+                )
+
+                detail_response = client.get(
+                    f"/api/admin/knowledge/documents/{document_summary['id']}"
+                )
+                self.assertEqual(detail_response.status_code, 200)
+                self.assertEqual(set(detail_response.json()), {"document"})
+                self.assertEqual(
+                    set(detail_response.json()["document"]),
+                    {
+                        "id",
+                        "title",
+                        "sourceType",
+                        "sourceUri",
+                        "excerpt",
+                        "syncedAt",
+                        "content",
+                        "metadata",
+                    },
+                )
+
+                sync_response = client.post(
+                    "/api/admin/knowledge/sync",
+                    headers=self._admin_csrf_headers(client),
+                )
+                self.assertEqual(sync_response.status_code, 200)
+                self.assertEqual(
+                    set(sync_response.json()),
+                    {
+                        "id",
+                        "sourceType",
+                        "status",
+                        "documentCount",
+                        "errorMessage",
+                        "startedAt",
+                        "finishedAt",
+                    },
+                )
 
     def test_web_adapter_serves_only_admin_frontend(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -108,25 +220,75 @@ class BoxerWebAdapterTests(unittest.TestCase):
                 response = client.get("/api/widget/config")
 
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json()["welcomeTitle"], "Support desk")
-                self.assertEqual(response.json()["welcomeMessage"], "Welcome to the help center")
                 self.assertEqual(
-                    response.json()["starterOptions"],
-                    ["Account access", "Refund request"],
+                    response.json(),
+                    {
+                        "welcomeTitle": "Support desk",
+                        "welcomeMessage": "Welcome to the help center",
+                        "starterOptions": ["Account access", "Refund request"],
+                        "starterEntries": [
+                            {"key": "account_access", "label": "Account access"},
+                            {"key": "refund_request", "label": "Refund request"},
+                        ],
+                        "workflowOptions": {
+                            "account_access": [
+                                {
+                                    "field": "email",
+                                    "inputType": "text",
+                                    "skipAllowed": False,
+                                    "choices": [],
+                                },
+                                {
+                                    "field": "summary",
+                                    "inputType": "text",
+                                    "skipAllowed": False,
+                                    "choices": [],
+                                },
+                            ]
+                        },
+                        "workflowConfigVersion": "1",
+                        "welcomeTimeZones": {
+                            "ko": "Asia/Seoul",
+                            "en": "America/Los_Angeles",
+                        },
+                    },
                 )
-                self.assertEqual(
-                    response.json()["starterEntries"],
-                    [
-                        {"key": "account_access", "label": "Account access"},
-                        {"key": "refund_request", "label": "Refund request"},
-                    ],
-                )
-                self.assertEqual(response.json()["workflowConfigVersion"], "1")
-                self.assertEqual(response.json()["workflowOptions"]["account_access"][0]["field"], "email")
-                self.assertEqual(
-                    response.json()["welcomeTimeZones"],
-                    {"ko": "Asia/Seoul", "en": "America/Los_Angeles"},
-                )
+
+    def test_http_endpoint_inventory_is_stable_for_widget_and_admin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._create_client(temp_dir) as client:
+                openapi_paths = client.get("/openapi.json").json()["paths"]
+
+        # WebSocket은 OpenAPI 밖에서 별도 검증하고 HTTP 공개 표면만 exact match로 잠근다.
+        http_methods = {"get", "post", "put", "patch", "delete"}
+        actual_inventory = {
+            path: {
+                method
+                for method in operations
+                if method in http_methods
+            }
+            for path, operations in openapi_paths.items()
+            if path == "/api/widget/config" or path.startswith("/api/admin/")
+        }
+        self.assertEqual(
+            actual_inventory,
+            {
+                "/api/widget/config": {"get"},
+                "/api/admin/auth/login": {"post"},
+                "/api/admin/auth/logout": {"post"},
+                "/api/admin/auth/me": {"get"},
+                "/api/admin/knowledge/status": {"get"},
+                "/api/admin/knowledge/sync": {"post"},
+                "/api/admin/knowledge/documents": {"get"},
+                "/api/admin/knowledge/documents/{document_id}": {"get"},
+                "/api/admin/conversations": {"get"},
+                "/api/admin/conversations/{conversation_id}": {"get"},
+                "/api/admin/conversations/{conversation_id}/claim": {"post"},
+                "/api/admin/conversations/{conversation_id}/release": {"post"},
+                "/api/admin/conversations/{conversation_id}/close": {"post"},
+                "/api/admin/conversations/{conversation_id}/reply": {"post"},
+            },
+        )
 
     def test_workflow_catalog_exposes_widget_choice_metadata(self) -> None:
         catalog = WorkflowCatalog.from_config(
@@ -213,12 +375,33 @@ class BoxerWebAdapterTests(unittest.TestCase):
                     assistant_event = websocket.receive_json()
                     updated_event = websocket.receive_json()
 
+                    self.assertEqual(set(user_event), {"type", "payload"})
                     self.assertEqual(user_event["type"], "message.created")
+                    self.assertEqual(
+                        set(user_event["payload"]),
+                        _MESSAGE_CONTRACT_FIELDS,
+                    )
                     self.assertEqual(user_event["payload"]["senderType"], "user")
+                    self.assertEqual(set(assistant_event), {"type", "payload"})
                     self.assertEqual(assistant_event["type"], "message.created")
+                    self.assertEqual(
+                        set(assistant_event["payload"]),
+                        _MESSAGE_CONTRACT_FIELDS,
+                    )
                     self.assertEqual(assistant_event["payload"]["senderType"], "assistant")
+                    self.assertGreaterEqual(
+                        len(assistant_event["payload"]["sourceRefs"]),
+                        1,
+                    )
+                    for source_ref in assistant_event["payload"]["sourceRefs"]:
+                        self.assertEqual(
+                            set(source_ref),
+                            _SOURCE_REFERENCE_CONTRACT_FIELDS,
+                        )
                     self.assertIn("3 business days", assistant_event["payload"]["body"])
+                    self.assertEqual(set(updated_event), {"type", "payload"})
                     self.assertEqual(updated_event["type"], "conversation.updated")
+                    self._assert_conversation_contract(updated_event["payload"])
                     self.assertEqual(updated_event["payload"]["status"], "ai_active")
                     self.assertEqual(len(updated_event["payload"]["messages"]), 2)
 
@@ -386,7 +569,12 @@ class BoxerWebAdapterTests(unittest.TestCase):
                     self.assertEqual(system_event["payload"]["body"], "상담이 종료됐어. 새 문의는 다시 시작해 줘.")
                     self.assertEqual(updated_event["payload"]["status"], "closed")
                     self.assertIsNotNone(updated_event["payload"]["closedAt"])
+                    self.assertEqual(set(ended_event), {"type", "payload"})
                     self.assertEqual(ended_event["type"], "session.ended")
+                    self.assertEqual(
+                        set(ended_event["payload"]),
+                        _CONVERSATION_CONTRACT_FIELDS,
+                    )
                     self.assertEqual(ended_event["payload"]["sessionId"], original_session_id)
 
                     websocket.send_json(
@@ -530,6 +718,71 @@ class BoxerWebAdapterTests(unittest.TestCase):
                     self.assertEqual(error_event["type"], "error")
                     self.assertEqual(error_event["payload"]["code"], "rate_limited")
 
+    def test_widget_websocket_contract_keeps_exact_event_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._create_client(temp_dir) as client:
+                with client.websocket_connect("/ws/widget") as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "session.init",
+                            "payload": {
+                                "identity": {
+                                    "id": "contract-customer",
+                                    "name": "Contract Customer",
+                                },
+                                "context": {
+                                    "language": "ko",
+                                    "tags": ["contract"],
+                                    "metadata": {"source": "test"},
+                                },
+                            },
+                        }
+                    )
+                    ready_event = websocket.receive_json()
+
+                    self.assertEqual(set(ready_event), {"type", "payload"})
+                    self.assertEqual(ready_event["type"], "session.ready")
+                    self.assertEqual(
+                        set(ready_event["payload"]),
+                        _CONVERSATION_CONTRACT_FIELDS,
+                    )
+                    self.assertEqual(ready_event["payload"]["messages"], [])
+
+                    websocket.send_json(
+                        {
+                            "type": "contract.unknown",
+                            "payload": {},
+                        }
+                    )
+                    self.assertEqual(
+                        websocket.receive_json(),
+                        {
+                            "type": "error",
+                            "payload": {
+                                "code": "unknown_event",
+                                "message": (
+                                    "Unsupported event type: contract.unknown"
+                                ),
+                            },
+                        },
+                    )
+
+                    # unknown event 뒤에도 연결이 유지되는 현재 복구 계약을 고정한다.
+                    websocket.send_json(
+                        {
+                            "type": "session.init",
+                            "payload": {
+                                "sessionId": ready_event["payload"]["sessionId"],
+                            },
+                        }
+                    )
+                    resumed_event = websocket.receive_json()
+                    self.assertEqual(resumed_event["type"], "session.ready")
+                    self.assertEqual(
+                        set(resumed_event["payload"]),
+                        _CONVERSATION_CONTRACT_FIELDS,
+                    )
+
     def test_admin_post_requires_csrf_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._create_client(temp_dir) as client:
@@ -544,6 +797,197 @@ class BoxerWebAdapterTests(unittest.TestCase):
 
                 missing_csrf_response = client.post("/api/admin/knowledge/sync", json={})
                 self.assertEqual(missing_csrf_response.status_code, 403)
+
+    def test_admin_auth_and_websocket_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._create_client(temp_dir) as client:
+                # 관리자 WebSocket은 세션 cookie가 생기기 전에는 accept되지 않아야 한다.
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect("/ws/admin"):
+                        pass
+
+                login_response = client.post(
+                    "/api/admin/auth/login",
+                    json={
+                        "email": "admin@example.com",
+                        "password": "admin1234",
+                    },
+                )
+                self.assertEqual(login_response.status_code, 200)
+                login_payload = login_response.json()
+                self.assertEqual(set(login_payload), {"adminUser", "csrfToken"})
+                self.assertEqual(
+                    set(login_payload["adminUser"]),
+                    _ADMIN_USER_CONTRACT_FIELDS,
+                )
+
+                me_response = client.get("/api/admin/auth/me")
+                self.assertEqual(me_response.status_code, 200)
+                self.assertEqual(set(me_response.json()), {"adminUser", "csrfToken"})
+                self.assertEqual(
+                    set(me_response.json()["adminUser"]),
+                    _ADMIN_USER_CONTRACT_FIELDS,
+                )
+
+                with client.websocket_connect("/ws/admin") as websocket:
+                    self.assertEqual(
+                        websocket.receive_json(),
+                        {
+                            "type": "admin.ready",
+                            "payload": {
+                                "adminUser": login_payload["adminUser"],
+                            },
+                        },
+                    )
+
+                logout_response = client.post(
+                    "/api/admin/auth/logout",
+                    headers=self._admin_csrf_headers(client),
+                )
+                self.assertEqual(logout_response.status_code, 200)
+                self.assertEqual(logout_response.json(), {"ok": True})
+                self.assertEqual(client.get("/api/admin/auth/me").status_code, 401)
+
+    def test_admin_conversation_http_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._create_client(temp_dir) as client:
+                with client.websocket_connect("/ws/widget") as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "session.init",
+                            "payload": {
+                                "identity": {
+                                    "id": "contract-customer",
+                                    "name": "Contract Customer",
+                                }
+                            },
+                        }
+                    )
+                    session_id = websocket.receive_json()["payload"]["sessionId"]
+                    websocket.send_json(
+                        {
+                            "type": "handoff.request",
+                            "payload": {
+                                "sessionId": session_id,
+                                "reason": "Contract handoff",
+                            },
+                        }
+                    )
+                    websocket.receive_json()
+                    websocket.receive_json()
+                    handoff_event = websocket.receive_json()
+                    conversation_id = handoff_event["payload"]["id"]
+
+                client.post(
+                    "/api/admin/auth/login",
+                    json={
+                        "email": "admin@example.com",
+                        "password": "admin1234",
+                    },
+                )
+                csrf_headers = self._admin_csrf_headers(client)
+
+                list_response = client.get("/api/admin/conversations")
+                self.assertEqual(list_response.status_code, 200)
+                list_payload = list_response.json()
+                self.assertEqual(
+                    set(list_payload),
+                    {"conversations", "pagination"},
+                )
+                self.assertEqual(
+                    set(list_payload["pagination"]),
+                    {"limit", "offset", "total"},
+                )
+                summary = next(
+                    conversation
+                    for conversation in list_payload["conversations"]
+                    if conversation["id"] == conversation_id
+                )
+                self.assertEqual(
+                    set(summary),
+                    _CONVERSATION_CONTRACT_FIELDS,
+                )
+                self.assertEqual(summary["messages"], [])
+
+                detail_response = client.get(
+                    f"/api/admin/conversations/{conversation_id}"
+                )
+                self.assertEqual(detail_response.status_code, 200)
+                self.assertEqual(set(detail_response.json()), {"conversation"})
+                detail = detail_response.json()["conversation"]
+                self.assertEqual(
+                    set(detail),
+                    _CONVERSATION_CONTRACT_FIELDS,
+                )
+                self.assertGreaterEqual(len(detail["messages"]), 2)
+                for message in detail["messages"]:
+                    self.assertEqual(
+                        set(message),
+                        _MESSAGE_CONTRACT_FIELDS,
+                    )
+
+                claim_response = client.post(
+                    f"/api/admin/conversations/{conversation_id}/claim",
+                    headers=csrf_headers,
+                )
+                self.assertEqual(claim_response.status_code, 200)
+                self.assertEqual(set(claim_response.json()), {"conversation"})
+                self.assertEqual(
+                    set(claim_response.json()["conversation"]),
+                    _CONVERSATION_CONTRACT_FIELDS,
+                )
+
+                reply_response = client.post(
+                    f"/api/admin/conversations/{conversation_id}/reply",
+                    json={"text": "Contract reply"},
+                    headers=csrf_headers,
+                )
+                self.assertEqual(reply_response.status_code, 200)
+                self.assertEqual(
+                    set(reply_response.json()),
+                    {"message", "conversation"},
+                )
+                self.assertEqual(
+                    set(reply_response.json()["message"]),
+                    _MESSAGE_CONTRACT_FIELDS,
+                )
+                self.assertEqual(
+                    set(reply_response.json()["conversation"]),
+                    _CONVERSATION_CONTRACT_FIELDS,
+                )
+
+                release_response = client.post(
+                    f"/api/admin/conversations/{conversation_id}/release",
+                    headers=csrf_headers,
+                )
+                self.assertEqual(release_response.status_code, 200)
+                self.assertEqual(
+                    set(release_response.json()["conversation"]),
+                    _CONVERSATION_CONTRACT_FIELDS,
+                )
+                self.assertEqual(
+                    release_response.json()["conversation"]["status"],
+                    "handoff_pending",
+                )
+
+                reclaim_response = client.post(
+                    f"/api/admin/conversations/{conversation_id}/claim",
+                    headers=csrf_headers,
+                )
+                self.assertEqual(reclaim_response.status_code, 200)
+                close_response = client.post(
+                    f"/api/admin/conversations/{conversation_id}/close",
+                    headers=csrf_headers,
+                )
+                self.assertEqual(close_response.status_code, 200)
+                self.assertEqual(
+                    set(close_response.json()["conversation"]),
+                    _CONVERSATION_CONTRACT_FIELDS,
+                )
+                self.assertEqual(
+                    close_response.json()["conversation"]["status"],
+                    "closed",
+                )
 
     def test_web_store_search_matches_korean_question(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -661,8 +1105,25 @@ class BoxerWebAdapterTests(unittest.TestCase):
                     admin_notice_event = admin_websocket.receive_json()
                     admin_update_event = admin_websocket.receive_json()
                     self.assertEqual(admin_message_event["type"], "message.created")
+                    self.assertEqual(
+                        set(admin_message_event["payload"]),
+                        {"conversationId", "message"},
+                    )
+                    self.assertEqual(
+                        set(admin_message_event["payload"]["message"]),
+                        _MESSAGE_CONTRACT_FIELDS,
+                    )
                     self.assertEqual(admin_notice_event["type"], "message.created")
+                    self.assertEqual(
+                        set(admin_notice_event["payload"]),
+                        {"conversationId", "message"},
+                    )
+                    self.assertEqual(
+                        set(admin_notice_event["payload"]["message"]),
+                        _MESSAGE_CONTRACT_FIELDS,
+                    )
                     self.assertEqual(admin_update_event["type"], "conversation.updated")
+                    self._assert_conversation_contract(admin_update_event["payload"])
                     self.assertEqual(admin_update_event["payload"]["status"], "handoff_pending")
 
     def test_live_handoff_requests_keep_assigned_status(self) -> None:
@@ -897,6 +1358,20 @@ class BoxerWebAdapterTests(unittest.TestCase):
     def _admin_csrf_headers(self, client: TestClient) -> dict[str, str]:
         csrf_token = client.cookies.get("boxer_web_admin_csrf") or ""
         return {"X-Boxer-Csrf-Token": csrf_token}
+
+    def _assert_message_contract(self, message: dict[str, object]) -> None:
+        self.assertEqual(set(message), _MESSAGE_CONTRACT_FIELDS)
+        for source_ref in message["sourceRefs"]:
+            self.assertEqual(
+                set(source_ref),
+                _SOURCE_REFERENCE_CONTRACT_FIELDS,
+            )
+
+    def _assert_conversation_contract(self, conversation: dict[str, object]) -> None:
+        # 대화 이벤트의 중첩 메시지와 출처까지 함께 고정해야 BFF 전환 시 드리프트를 잡는다.
+        self.assertEqual(set(conversation), _CONVERSATION_CONTRACT_FIELDS)
+        for message in conversation["messages"]:
+            self._assert_message_contract(message)
 
 
 if __name__ == "__main__":
