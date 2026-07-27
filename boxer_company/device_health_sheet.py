@@ -39,12 +39,17 @@ _COMPLETED_AT_FORMULA = (
     'IF(OR(INDIRECT("L"&ROW())="",INDIRECT("L"&ROW())=0),'
     'NOW()+9/24,INDIRECT("L"&ROW())),"")'
 )
+# 기존 운영 행처럼 완료시간이 고정 문자열로 바뀌어도 감지시간과의 차이를 다시 계산한다.
+# 완료 상태가 아닌 행은 L에 과거 값이 남아 있어도 조치시간을 표시하지 않는다.
 _WORK_DURATION_FORMULA = (
-    '=IF(OR(INDIRECT("A"&ROW())="",INDIRECT("L"&ROW())=""),"",'
-    'LET(total,ROUND((INDIRECT("L"&ROW())-INDIRECT("A"&ROW()))*86400),'
-    'hours,INT(total/3600),minutes,INT(MOD(total,3600)/60),seconds,MOD(total,60),'
-    'TRIM(IF(hours>0,hours&"시간 ","")&IF(minutes>0,minutes&"분 ","")&'
-    'IF(OR(seconds>0,AND(hours=0,minutes=0)),seconds&"초",""))))'
+    '=IF(OR(INDIRECT("J"&ROW())<>"완료",INDIRECT("A"&ROW())="",'
+    'INDIRECT("L"&ROW())=""),"",'
+    'LET(done,IF(ISNUMBER(INDIRECT("L"&ROW())),INDIRECT("L"&ROW()),'
+    'IFERROR(DATEVALUE(LEFT(INDIRECT("L"&ROW()),10))+'
+    'TIMEVALUE(RIGHT(INDIRECT("L"&ROW()),8)),"")),'
+    'IF(done="","",LET(totalSeconds,MAX(0,ROUND((done-INDIRECT("A"&ROW()))*86400)),'
+    'INT(totalSeconds/3600)&"시간 "&'
+    'TEXT(INT(MOD(totalSeconds,3600)/60),"00")&"분"))))'
 )
 _AUTO_SMS_ACCEPTED_TEXT = "문자 발송 접수"
 _AUTO_SMS_LEGACY_SENT_TEXT = "문자 자동발송 완료"
