@@ -52,17 +52,22 @@ def _mention_payload(raw_text: str = "<@UBOXER> <@UBUDDY> 보안성 검토해") 
     }
 
 
-def _bot_payload(text: str, *, bot_user_id: str = "UBUDDY") -> dict[str, Any]:
+def _bot_payload(
+    text: str,
+    *,
+    bot_user_id: str = "UBUDDY",
+    subtype: str = "bot_message",
+) -> dict[str, Any]:
     return {
         "raw_text": text,
         "text": text.lower(),
-        "user_id": None,
-        "bot_user_id": bot_user_id,
+        "user_id": bot_user_id if not subtype else None,
+        "bot_user_id": bot_user_id if subtype else "",
         "workspace_id": "T_TEST",
         "channel_id": "C_TEST",
         "current_ts": "2.1",
         "thread_ts": "1.0",
-        "subtype": "bot_message",
+        "subtype": subtype,
         "bot_id": "B_BUDDY" if bot_user_id == "UBUDDY" else "B_OTHER",
         "bot_name": "buddy" if bot_user_id == "UBUDDY" else "other",
         "app_id": "A_BUDDY" if bot_user_id == "UBUDDY" else "A_OTHER",
@@ -145,6 +150,39 @@ class SecurityReviewRoutesTests(unittest.TestCase):
             message_replies[0][0],
         )
         self.assertEqual(_SECURITY_REVIEW_SESSIONS, {})
+
+    def test_security_review_accepts_bot_reply_without_subtype(self) -> None:
+        client = _FakeSlackClient()
+
+        _handle_security_review_request(
+            SecurityReviewRoutesContext(
+                question="보안성 검토해",
+                payload=_mention_payload(),  # type: ignore[arg-type]
+                user_id="UHYUN",
+                channel_id="C_TEST",
+                thread_ts="1.0",
+                reply=lambda *args, **kwargs: None,
+                client=client,
+                logger=self.logger,
+            )
+        )
+
+        # 최신 Slack 앱 메시지처럼 subtype 없이 bot_id와 user만 있는 응답도 다음 질문으로 이어간다.
+        handled = _handle_security_review_bot_message(
+            SecurityReviewMessageContext(
+                payload=_bot_payload(
+                    "정책 문서 기준으로만 답합니다.",
+                    subtype="",
+                ),  # type: ignore[arg-type]
+                reply=lambda *args, **kwargs: None,
+                client=client,
+                logger=self.logger,
+            )
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(client.posts), 2)
+        self.assertIn("2/11", client.posts[1]["text"])
 
     def test_security_review_request_requires_target_mention(self) -> None:
         client = _FakeSlackClient()

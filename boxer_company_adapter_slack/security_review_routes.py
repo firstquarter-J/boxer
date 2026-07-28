@@ -361,8 +361,19 @@ def _post_current_probe(
     )
 
 
+def _is_bot_message(payload: MessagePayload) -> bool:
+    subtype = str(payload.get("subtype") or "").strip()
+    if subtype:
+        return subtype == "bot_message"
+    # 최신 Slack 앱 메시지는 subtype 없이 bot_id/app_id만 전달될 수 있다.
+    return bool(
+        str(payload.get("bot_id") or "").strip()
+        or str(payload.get("app_id") or "").strip()
+    )
+
+
 def _message_matches_target(payload: MessagePayload, session: SecurityReviewSession) -> bool:
-    if payload.get("subtype") != "bot_message":
+    if not _is_bot_message(payload):
         return False
     bot_user_id = str(payload.get("bot_user_id") or payload.get("user_id") or "").strip()
     bot_id = str(payload.get("bot_id") or "").strip()
@@ -530,7 +541,7 @@ def _handle_security_review_request(context: SecurityReviewRoutesContext) -> boo
 
 def _handle_security_review_bot_message(context: SecurityReviewMessageContext) -> bool:
     payload = context.payload
-    if payload.get("subtype") != "bot_message":
+    if not _is_bot_message(payload):
         return False
 
     _cleanup_stale_security_review_sessions()
