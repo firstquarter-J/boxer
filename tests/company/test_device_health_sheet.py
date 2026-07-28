@@ -144,17 +144,8 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(rows[0][8], "")
         self.assertEqual(rows[0][9], "대기")
         self.assertEqual(rows[0][10], "")
-        self.assertIn('INDIRECT("J"&ROW())="완료"', rows[0][11])
-        self.assertIn('INDIRECT("L"&ROW())=0', rows[0][11])
-        self.assertIn('INDIRECT("J"&ROW())<>"완료"', rows[0][12])
-        self.assertIn('ISNUMBER(INDIRECT("L"&ROW()))', rows[0][12])
-        self.assertIn('DATEVALUE(LEFT(INDIRECT("L"&ROW()),10))', rows[0][12])
-        self.assertIn("LET(totalSeconds", rows[0][12])
-        self.assertIn('done-INDIRECT("A"&ROW())', rows[0][12])
-        self.assertIn(
-            'TEXT(INT(MOD(totalSeconds,3600)/60),"00")&"분"',
-            rows[0][12],
-        )
+        self.assertEqual(rows[0][11], "")
+        self.assertEqual(rows[0][12], "")
         self.assertEqual(rows[0][13], "")
         self.assertEqual(rows[0][14], "")
         self.assertEqual(rows[0][15], "")
@@ -272,8 +263,8 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(call["json"]["majorDimension"], "ROWS")
         self.assertEqual(call["json"]["values"][0][1], "MB2-C00043")
         self.assertTrue(unquote(call["url"]).endswith("'Boxer 장애 감지 처리 현황'!A:R:append"))
-        self.assertTrue(call["json"]["values"][0][11].startswith("=IF("))
-        self.assertTrue(call["json"]["values"][0][12].startswith("=IF("))
+        self.assertEqual(call["json"]["values"][0][11], "")
+        self.assertEqual(call["json"]["values"][0][12], "")
         self.assertEqual(call["timeout"], 7)
 
     def test_loads_only_pending_sms_deliveries_with_group_id(self) -> None:
