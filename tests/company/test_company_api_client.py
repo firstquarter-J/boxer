@@ -1,0 +1,715 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import logging
+import threading
+from typing import Any
+import unittest
+from unittest.mock import patch
+
+import requests
+
+from boxer_company.assistant import CompanyAssistantRequest
+from boxer_company_adapter_slack.company_api_client import (
+    CompanyApiAmbiguousTimeoutError,
+    CompanyApiAvailabilityError,
+    CompanyApiClientSettings,
+    CompanyApiContractError,
+    CompanyApiPolicyError,
+    CompanyAssistantApiClient,
+    load_company_api_client_settings,
+)
+
+
+_TOKEN = "service-token-" + ("x" * 40)
+_TRACEPARENT = (
+    "00-0123456789abcdef0123456789abcdef-"
+    "0123456789abcdef-01"
+)
+_QUESTION = "회사 노션에서 커머스 운영 기준 찾아줘"
+_SILENT_LOGGER = logging.getLogger(f"{__name__}.silent")
+_SILENT_LOGGER.disabled = True
+
+
+@dataclass
+class _FakeResponse:
+    status_code: int
+    payload: Any
+    content_type: str
+    raw_content: bytes = b"{}"
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"content-type": self.content_type}
+
+    @property
+    def content(self) -> bytes:
+        return self.raw_content
+
+    def json(self) -> Any:
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        return self.payload
+
+
+class _FakeSession:
+    def __init__(self, *results: Any) -> None:
+        self.results = list(results)
+        self.calls: list[dict[str, Any]] = []
+
+    def post(self, url: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append({"url": url, **kwargs})
+        if not self.results:
+            raise AssertionError("unexpected HTTP request")
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class _CollectingHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def _settings(
+    *,
+    max_retries: int = 0,
+) -> CompanyApiClientSettings:
+    return CompanyApiClientSettings(
+        base_url="http://127.0.0.1:8010",
+        token=_TOKEN,
+        connect_timeout_sec=2.0,
+        read_timeout_sec=90.0,
+        max_retries=max_retries,
+        notion_mode="remote",
+        notion_fallback_enabled=True,
+    )
+
+
+def _request(
+    *,
+    request_id: str = "slack:T1:C1:1785312000.000001",
+    context_entries: tuple[dict[str, Any], ...] = (),
+    metadata: dict[str, Any] | None = None,
+) -> CompanyAssistantRequest:
+    return CompanyAssistantRequest(
+        request_id=request_id,
+        tenant_id="T1",
+        actor_id="U1",
+        channel="slack",
+        conversation_id="1785312000.000001",
+        question=_QUESTION,
+        locale="ko",
+        context_entries=context_entries,
+        metadata=metadata or {"channel_id": "C1"},
+    )
+
+
+def _success_payload(
+    request_id: str,
+    *,
+    outcome: str = "answered",
+) -> dict[str, Any]:
+    return {
+        "requestId": request_id,
+        "route": "company_notion_qa",
+        "outcome": outcome,
+        "messages": [
+            {
+                "body": "**회사 Notion 문서 답변**",
+                "deliveryScope": "conversation",
+                "mentionActor": True,
+                "format": "commonmark",
+            }
+        ],
+        "sources": [
+            {
+                "sourceId": "notion-source",
+                "title": "운영 기준",
+                "uri": "https://app.notion.com/p/operations",
+                "score": 0.9,
+            }
+        ],
+        "usedLlm": True,
+        "fallbackReason": None,
+        "suggestedAction": None,
+        "asyncJob": None,
+    }
+
+
+def _success_response(
+    request_id: str,
+    *,
+    outcome: str = "answered",
+) -> _FakeResponse:
+    return _FakeResponse(
+        status_code=200,
+        payload=_success_payload(request_id, outcome=outcome),
+        content_type="application/json",
+    )
+
+
+def _problem_response(
+    request_id: str,
+    *,
+    status: int,
+    code: str,
+    retryable: bool,
+) -> _FakeResponse:
+    return _FakeResponse(
+        status_code=status,
+        payload={
+            "type": f"urn:boxer-company-api:problem:{code}",
+            "title": "Safe problem",
+            "status": status,
+            "code": code,
+            "requestId": request_id,
+            "retryable": retryable,
+        },
+        content_type="application/problem+json",
+    )
+
+
+def _client(
+    session: _FakeSession,
+    *,
+    settings: CompanyApiClientSettings | None = None,
+    sleep: Any = lambda _seconds: None,
+    logger: logging.Logger | None = None,
+    traceparent: str = _TRACEPARENT,
+) -> CompanyAssistantApiClient:
+    return CompanyAssistantApiClient(
+        settings or _settings(),
+        session=session,
+        sleep=sleep,
+        traceparent_factory=lambda: traceparent,
+        logger=logger or _SILENT_LOGGER,
+    )
+
+
+class CompanyApiClientSettingsTests(unittest.TestCase):
+    def test_local_is_the_credential_free_rollback_default(self) -> None:
+        settings = load_company_api_client_settings({})
+
+        self.assertEqual(settings.notion_mode, "local")
+        self.assertFalse(settings.enabled)
+        self.assertEqual(settings.base_url, "")
+        self.assertEqual(settings.token, "")
+        self.assertFalse(settings.notion_fallback_enabled)
+
+    def test_local_rollback_ignores_stale_remote_credentials(self) -> None:
+        settings = load_company_api_client_settings(
+            {
+                "BOXER_COMPANY_API_NOTION_MODE": "local",
+                "BOXER_COMPANY_API_BASE_URL": "http://public.example.com",
+                "BOXER_COMPANY_API_SERVICE_TOKEN": "stale-invalid-token",
+                "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "invalid",
+                "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "-1",
+                "BOXER_COMPANY_API_MAX_RETRIES": "999",
+                "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "invalid",
+            }
+        )
+
+        self.assertEqual(settings.notion_mode, "local")
+        self.assertEqual(settings.base_url, "")
+        self.assertEqual(settings.token, "")
+
+    def test_manual_remote_settings_cannot_bypass_transport_validation(
+        self,
+    ) -> None:
+        invalid_settings = (
+            replace(
+                _settings(),
+                base_url="http://public.example.com",
+            ),
+            replace(_settings(), token="short"),
+            replace(_settings(), read_timeout_sec=float("nan")),
+            replace(_settings(), max_retries=3),
+        )
+
+        for settings in invalid_settings:
+            with self.subTest(base_url=settings.base_url):
+                with self.assertRaises(CompanyApiContractError):
+                    CompanyAssistantApiClient(
+                        settings,
+                        session=_FakeSession(),
+                    )
+
+    def test_remote_settings_validate_internal_transport_and_hide_token(self) -> None:
+        settings = load_company_api_client_settings(
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010/"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_NOTION_MODE": "shadow",
+                "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "1.5",
+                "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "75",
+                "BOXER_COMPANY_API_MAX_RETRIES": "2",
+                "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "false",
+            }
+        )
+
+        self.assertEqual(
+            settings.base_url,
+            "http://10.40.102.50:8010",
+        )
+        self.assertEqual(settings.notion_mode, "shadow")
+        self.assertEqual(settings.connect_timeout_sec, 1.5)
+        self.assertEqual(settings.read_timeout_sec, 75)
+        self.assertEqual(settings.max_retries, 2)
+        self.assertFalse(settings.notion_fallback_enabled)
+        self.assertNotIn(_TOKEN, repr(settings))
+
+    def test_remote_configuration_rejects_unsafe_or_missing_values(self) -> None:
+        cases = (
+            {
+                "BOXER_COMPANY_API_NOTION_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_NOTION_MODE": "remote",
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://public.example.com:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+            },
+            {
+                "BOXER_COMPANY_API_NOTION_MODE": "remote",
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "https://user:password@api.example.com"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+            },
+            {
+                "BOXER_COMPANY_API_NOTION_MODE": "remote",
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "https://api.example.com/path"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+            },
+        )
+        for env in cases:
+            with self.subTest(env_keys=sorted(env)):
+                with self.assertRaises(CompanyApiContractError):
+                    load_company_api_client_settings(env)
+
+
+class CompanyApiClientContractTests(unittest.TestCase):
+    def test_serializes_headers_scope_and_success_result(self) -> None:
+        request = _request(
+            metadata={
+                "barcode": "12345678901",
+                "hospital_name": "테스트 병원",
+                "room_name": "검사실",
+                "device_name": "MB2-C00419",
+                "channel_id": "C1",
+                "role": "must-not-cross",
+            }
+        )
+        session = _FakeSession(
+            _success_response(request.request_id)
+        )
+
+        result = _client(session).answer(request)
+
+        self.assertEqual(result.route, "company_notion_qa")
+        self.assertEqual(result.outcome, "answered")
+        self.assertEqual(len(result.messages), 1)
+        self.assertEqual(len(result.sources), 1)
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(
+            call["url"],
+            (
+                "http://127.0.0.1:8010"
+                "/internal/v1/assistant/turns"
+            ),
+        )
+        self.assertEqual(
+            call["headers"]["Authorization"],
+            f"Bearer {_TOKEN}",
+        )
+        self.assertEqual(
+            call["headers"]["X-Request-ID"],
+            request.request_id,
+        )
+        self.assertEqual(
+            call["headers"]["traceparent"],
+            _TRACEPARENT,
+        )
+        self.assertFalse(call["allow_redirects"])
+        self.assertEqual(call["timeout"], (2.0, 90.0))
+        self.assertEqual(
+            call["json"]["scope"],
+            {
+                "barcode": "12345678901",
+                "hospitalName": "테스트 병원",
+                "roomName": "검사실",
+                "deviceName": "MB2-C00419",
+                "channelContextId": "C1",
+            },
+        )
+        self.assertNotIn("role", call["json"]["scope"])
+
+    def test_context_uses_the_newest_entries_within_both_budgets(self) -> None:
+        entries = tuple(
+            {
+                "kind": "message",
+                "source": "slack",
+                "author_id": "U1",
+                "text": f"{index:02d}-" + ("x" * 597),
+                "created_at": f"17853120{index:02d}.000001",
+            }
+            for index in range(14)
+        )
+        request = _request(context_entries=entries)
+        session = _FakeSession(
+            _success_response(request.request_id)
+        )
+
+        _client(session).answer(request)
+
+        serialized = session.calls[0]["json"]["contextEntries"]
+        self.assertEqual(len(serialized), 9)
+        self.assertEqual(
+            sum(len(entry["text"]) for entry in serialized),
+            5_000,
+        )
+        self.assertTrue(serialized[0]["text"].startswith("05-"))
+        self.assertEqual(len(serialized[0]["text"]), 200)
+        self.assertTrue(serialized[-1]["text"].startswith("13-"))
+
+    def test_invalid_request_or_trace_context_never_calls_http(self) -> None:
+        invalid_requests = (
+            replace(_request(), channel="web"),
+            replace(_request(), actor_id=None),
+        )
+        for request in invalid_requests:
+            with self.subTest(channel=request.channel):
+                session = _FakeSession()
+                with self.assertRaises(CompanyApiContractError):
+                    _client(session).answer(request)
+                self.assertEqual(session.calls, [])
+
+        session = _FakeSession()
+        with self.assertRaises(CompanyApiContractError):
+            _client(
+                session,
+                traceparent=(
+                    "00-00000000000000000000000000000000-"
+                    "0000000000000000-01"
+                ),
+            ).answer(_request())
+        self.assertEqual(session.calls, [])
+
+    def test_connect_retry_preserves_request_and_trace_ids(self) -> None:
+        request = _request()
+        sleeps: list[float] = []
+        session = _FakeSession(
+            requests.exceptions.ConnectTimeout(),
+            _success_response(request.request_id),
+        )
+
+        result = _client(
+            session,
+            settings=_settings(max_retries=1),
+            sleep=sleeps.append,
+        ).answer(request)
+
+        self.assertEqual(result.outcome, "answered")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(sleeps, [0.1])
+        self.assertEqual(
+            {
+                call["headers"]["X-Request-ID"]
+                for call in session.calls
+            },
+            {request.request_id},
+        )
+        self.assertEqual(
+            {
+                call["headers"]["traceparent"]
+                for call in session.calls
+            },
+            {_TRACEPARENT},
+        )
+
+    def test_connection_reset_is_not_retried(self) -> None:
+        session = _FakeSession(
+            requests.exceptions.ConnectionError("reset-after-send"),
+            _success_response(_request().request_id),
+        )
+
+        with self.assertRaises(CompanyApiAvailabilityError):
+            _client(
+                session,
+                settings=_settings(max_retries=2),
+            ).answer(_request())
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_default_sessions_are_isolated_per_caller_thread(self) -> None:
+        sessions: list[_FakeSession] = []
+        errors: list[Exception] = []
+
+        def build_session() -> _FakeSession:
+            session = _FakeSession(
+                _success_response(_request().request_id)
+            )
+            sessions.append(session)
+            return session
+
+        with patch(
+            "boxer_company_adapter_slack.company_api_client."
+            "requests.Session",
+            side_effect=build_session,
+        ):
+            client = CompanyAssistantApiClient(
+                _settings(),
+                traceparent_factory=lambda: _TRACEPARENT,
+            )
+            client.answer(_request())
+
+            def call_from_worker() -> None:
+                try:
+                    client.answer(_request())
+                except Exception as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=call_from_worker)
+            worker.start()
+            worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(sessions), 2)
+        self.assertTrue(all(session.trust_env is False for session in sessions))
+
+    def test_service_not_ready_is_the_only_http_retry(self) -> None:
+        request = _request()
+        session = _FakeSession(
+            _problem_response(
+                request.request_id,
+                status=503,
+                code="service_not_ready",
+                retryable=True,
+            ),
+            _success_response(request.request_id),
+        )
+
+        result = _client(
+            session,
+            settings=_settings(max_retries=1),
+        ).answer(request)
+
+        self.assertEqual(result.outcome, "answered")
+        self.assertEqual(len(session.calls), 2)
+
+    def test_read_timeout_is_ambiguous_and_is_not_retried(self) -> None:
+        session = _FakeSession(
+            requests.exceptions.ReadTimeout()
+        )
+
+        with self.assertRaises(
+            CompanyApiAmbiguousTimeoutError
+        ):
+            _client(
+                session,
+                settings=_settings(max_retries=2),
+            ).answer(_request())
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_auth_and_validation_problems_do_not_retry_or_fallback(self) -> None:
+        cases = (
+            (401, "authentication_failed", CompanyApiPolicyError),
+            (403, "caller_not_allowed", CompanyApiPolicyError),
+            (400, "invalid_request_id", CompanyApiContractError),
+            (422, "validation_failed", CompanyApiContractError),
+        )
+        for status, code, error_type in cases:
+            with self.subTest(status=status):
+                request = _request()
+                session = _FakeSession(
+                    _problem_response(
+                        request.request_id,
+                        status=status,
+                        code=code,
+                        retryable=False,
+                    ),
+                    _success_response(request.request_id),
+                )
+                with self.assertRaises(error_type):
+                    _client(
+                        session,
+                        settings=_settings(max_retries=2),
+                    ).answer(request)
+                self.assertEqual(len(session.calls), 1)
+
+    def test_domain_denial_is_a_successful_result(self) -> None:
+        request = _request()
+        response = _success_response(
+            request.request_id,
+            outcome="denied",
+        )
+
+        result = _client(_FakeSession(response)).answer(request)
+
+        self.assertEqual(result.outcome, "denied")
+
+    def test_gateway_error_without_problem_body_is_availability(self) -> None:
+        response = _FakeResponse(
+            status_code=502,
+            payload=ValueError("gateway-secret-body"),
+            content_type="text/html",
+            raw_content=b"gateway-secret-body",
+        )
+
+        with self.assertRaises(CompanyApiAvailabilityError) as raised:
+            _client(_FakeSession(response)).answer(_request())
+
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(
+            raised.exception.code,
+            "server_response_invalid",
+        )
+        self.assertNotIn(
+            "gateway-secret-body",
+            str(raised.exception),
+        )
+
+    def test_response_contract_rejects_mismatch_actions_and_unsafe_sources(
+        self,
+    ) -> None:
+        request = _request()
+        cases: list[dict[str, Any]] = []
+
+        mismatched = _success_payload("OTHER-REQUEST")
+        cases.append(mismatched)
+        action = _success_payload(request.request_id)
+        action["suggestedAction"] = {"action": "unsafe"}
+        cases.append(action)
+        extra = _success_payload(request.request_id)
+        extra["unexpected"] = "field"
+        cases.append(extra)
+        bad_outcome = _success_payload(request.request_id)
+        bad_outcome["outcome"] = "unknown"
+        cases.append(bad_outcome)
+        signed_source = _success_payload(request.request_id)
+        signed_source["sources"][0]["uri"] = (
+            "https://storage.example/file?sig=must-not-leak"
+        )
+        cases.append(signed_source)
+        requester_format = _success_payload(request.request_id)
+        requester_format["messages"][0]["format"] = "slack"
+        cases.append(requester_format)
+        too_many_messages = _success_payload(request.request_id)
+        too_many_messages["messages"] *= 9
+        cases.append(too_many_messages)
+        too_many_sources = _success_payload(request.request_id)
+        too_many_sources["sources"] *= 21
+        cases.append(too_many_sources)
+        oversized_message = _success_payload(request.request_id)
+        oversized_message["messages"][0]["body"] = "x" * 30_001
+        cases.append(oversized_message)
+
+        for payload in cases:
+            with self.subTest(keys=sorted(payload)):
+                session = _FakeSession(
+                    _FakeResponse(
+                        status_code=200,
+                        payload=payload,
+                        content_type="application/json",
+                    )
+                )
+                with self.assertRaises(CompanyApiContractError):
+                    _client(session).answer(request)
+
+    def test_redirect_and_invalid_media_type_are_never_followed(self) -> None:
+        request = _request()
+        for response in (
+            _FakeResponse(
+                status_code=307,
+                payload={},
+                content_type="text/html",
+            ),
+            _FakeResponse(
+                status_code=200,
+                payload=_success_payload(request.request_id),
+                content_type="text/plain",
+            ),
+        ):
+            with self.subTest(status=response.status_code):
+                session = _FakeSession(response)
+                with self.assertRaises(CompanyApiContractError):
+                    _client(session).answer(request)
+                self.assertFalse(
+                    session.calls[0]["allow_redirects"]
+                )
+
+    def test_problem_code_cannot_inject_log_content(self) -> None:
+        request = _request()
+        forged_code = "validation_failed\nFORGED-LOG-LINE"
+        response = _problem_response(
+            request.request_id,
+            status=400,
+            code=forged_code,
+            retryable=False,
+        )
+
+        with self.assertRaises(CompanyApiContractError) as raised:
+            _client(_FakeSession(response)).answer(request)
+
+        self.assertNotIn(
+            "FORGED-LOG-LINE",
+            str(raised.exception),
+        )
+
+    def test_error_and_logs_never_include_sensitive_transport_content(
+        self,
+    ) -> None:
+        logger = logging.getLogger(
+            f"{__name__}.safe-log"
+        )
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = _CollectingHandler()
+        logger.addHandler(handler)
+        request = _request()
+        secret_answer = "secret-answer-body"
+        response = _problem_response(
+            request.request_id,
+            status=500,
+            code="internal_error",
+            retryable=True,
+        )
+        response.raw_content = (
+            f"{_TOKEN}|{_QUESTION}|{secret_answer}".encode()
+        )
+
+        try:
+            with self.assertRaises(
+                CompanyApiAvailabilityError
+            ) as raised:
+                _client(
+                    _FakeSession(response),
+                    logger=logger,
+                ).answer(request)
+        finally:
+            logger.removeHandler(handler)
+
+        diagnostics = "\n".join(
+            [str(raised.exception), *handler.messages]
+        )
+        self.assertNotIn(_TOKEN, diagnostics)
+        self.assertNotIn(_QUESTION, diagnostics)
+        self.assertNotIn(secret_answer, diagnostics)
+
+
+if __name__ == "__main__":
+    unittest.main()

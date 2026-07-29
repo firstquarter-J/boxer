@@ -74,6 +74,7 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
             [
                 "boxer-adapter-slack>=0.1.0",
                 "boxer-company>=0.1.0",
+                "requests==2.32.3",
             ],
         )
 

@@ -6,7 +6,15 @@ import unittest
 from unittest.mock import Mock, patch
 
 from boxer import AnswerEngine, AnswerRequest
+from boxer_company.assistant import (
+    AssistantMessage,
+    CompanyAssistantResult,
+    SourceReference,
+)
 from boxer_company_adapter_slack import company
+from boxer_company_adapter_slack.company_api_client import (
+    CompanyApiClientSettings,
+)
 
 
 _ROUTE_HANDLER_ORDER = (
@@ -244,7 +252,7 @@ class CompanyRouteContractTests(unittest.TestCase):
         )
 
     def test_route_handlers_keep_golden_order_and_short_circuit(self) -> None:
-        # 각 라우터가 매칭되는 지점마다 이후 라우터가 실행되지 않는지 함께 고정한다.
+        # 각 매칭 지점에서 이후 라우터가 실행되지 않는지도 함께 고정한다.
         for index, matched_handler in enumerate(_ROUTE_HANDLER_ORDER):
             with self.subTest(matched_handler=matched_handler):
                 result = self._invoke_mention(
@@ -255,6 +263,73 @@ class CompanyRouteContractTests(unittest.TestCase):
                     result.route_calls,
                     list(_ROUTE_HANDLER_ORDER[: index + 1]),
                 )
+
+    def test_company_notion_remote_mode_uses_api_and_renders_once(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            notion_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="company_notion_qa",
+            outcome="answered",
+            messages=(
+                AssistantMessage(body="**공통 API 답변**"),
+            ),
+            sources=(
+                SourceReference(
+                    source_id="notion:remote-contract",
+                    title="운영 기준",
+                    uri=(
+                        "https://app.notion.com/p/"
+                        "remote-contract"
+                    ),
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ) as client_factory,
+        ):
+            result = self._invoke_mention(
+                text="회사 노션에서 운영 기준 찾아줘",
+                question="회사 노션에서 운영 기준 찾아줘",
+                real_handlers={"_handle_company_notion_routes"},
+            )
+
+        client_factory.assert_called_once_with(settings)
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            result.route_calls,
+            list(
+                _ROUTE_HANDLER_ORDER[
+                    : _ROUTE_HANDLER_ORDER.index(
+                        "_handle_company_notion_routes"
+                    )
+                    + 1
+                ]
+            ),
+        )
+        self.assertEqual(len(result.reply_calls), 1)
+        self.assertIn("*공통 API 답변*", result.reply_calls[0][0])
+        self.assertIn(
+            "<https://app.notion.com/p/remote-contract|운영 기준>",
+            result.reply_calls[0][0],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "company_notion_qa",
+        )
 
     def test_unmatched_barcode_question_does_not_eagerly_prefetch_recordings(
         self,

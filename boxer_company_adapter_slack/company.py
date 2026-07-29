@@ -30,6 +30,14 @@ from boxer_company_adapter_slack.barcode_query_routes import (
 from boxer_company_adapter_slack.assistant_bridge import (
     build_company_assistant_request,
 )
+from boxer_company_adapter_slack.company_api_client import (
+    CompanyAssistantApiClient,
+    load_company_api_client_settings,
+)
+from boxer_company_adapter_slack.company_api_rollout import (
+    BoundedShadowRunner,
+    wrap_company_notion_service,
+)
 from boxer_company_adapter_slack.barcode_routes import (
     BarcodeLogRouteContext,
     BarcodeLogRouteDeps,
@@ -297,6 +305,22 @@ def create_app() -> App:
     _validate_ec2_runtime_aws_env()
     _validate_tokens(include_llm=True, include_data_sources=True)
     app_logger = logging.getLogger(__name__)
+    company_api_settings = load_company_api_client_settings()
+    company_api_client = (
+        CompanyAssistantApiClient(company_api_settings)
+        if company_api_settings.notion_mode != "local"
+        else None
+    )
+    company_api_shadow_runner = (
+        BoundedShadowRunner(logger=app_logger)
+        if company_api_settings.notion_mode == "shadow"
+        else None
+    )
+    app_logger.info(
+        "Company API Notion rollout configured mode=%s local_fallback=%s",
+        company_api_settings.notion_mode,
+        company_api_settings.notion_fallback_enabled,
+    )
     claude_client = None
     if s.LLM_PROVIDER == "claude":
         try:
@@ -966,6 +990,15 @@ def create_app() -> App:
         notion_turn = company_assistant_runtime.start_turn(
             build_company_assistant_request(payload)
         )
+        # 첫 HTTP 전환은 순수 read-only 회사 Notion matcher로만 제한한다.
+        # 나머지 stage와 Slack 전용 mutation 경로는 기존 순서를 그대로 탄다.
+        notion_assistant_service = wrap_company_notion_service(
+            notion_turn.service_for_stage("notion"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
         if _handle_company_notion_routes(
             CompanyNotionRoutesContext(
                 question=question,
@@ -977,9 +1010,7 @@ def create_app() -> App:
                 client=client,
             ),
             CompanyNotionRoutesDeps(
-                assistant_service=notion_turn.service_for_stage(
-                    "notion"
-                ),
+                assistant_service=notion_assistant_service,
             ),
         ):
             return
