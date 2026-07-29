@@ -923,7 +923,7 @@ def _record_device_notification_sheet_alert_best_effort(
                     type(exc).__name__,
                 )
     try:
-        # Slack 루트 알림이 발송된 이벤트만 공통 A:R 형식으로 기록해 스레드 진행 답변은 중복 행을 만들지 않는다.
+        # Slack 루트 알림이 발송된 이벤트만 공통 A:T 형식으로 기록해 스레드 진행 답변은 중복 행을 만들지 않는다.
         row_count = _append_device_health_sheet_alerts(
             alert_items,
             detected_at=detected_at,

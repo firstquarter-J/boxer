@@ -165,7 +165,7 @@ def _build_device_health_sheet_sms_tracking_metadata(
     message_id = _display_value(item.get("smsMessageId"), default="")
     if message_id:
         metadata["m"] = message_id
-    # 숨김 R열에는 원문 식별값 대신 버전이 있는 compact JSON만 남긴다.
+    # 숨김 T열에는 원문 식별값 대신 버전이 있는 compact JSON만 남긴다.
     return json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -233,8 +233,8 @@ def _build_device_health_sheet_rows(
         )
         device_name = _display_value(item.get("device"), default="장비명 미확인")
         issue = _display_value(item.get("issue"), default="상세 확인 필요")
-        # 문자 상태를 Action 왼쪽 H에 두고 신규 장애는 J 대기로 시작한다.
-        # 완료시간과 조치시간은 시트의 설치형 onEdit 자동화가 J 상태 변경 시 기록한다.
+        # Boxer는 A:F 원본 정보, H 문자 상태, S 원문 링크만 표시 영역에 기록한다.
+        # G와 I:R은 TA Apps Script가 전담하며, 문자 추적용 compact JSON만 숨김 T에 둔다.
         rows.append(
             [
                 detected_at_serial,
@@ -246,7 +246,9 @@ def _build_device_health_sheet_rows(
                 "",
                 _device_health_sheet_sms_status(item),
                 "",
-                "대기",
+                "",
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -277,10 +279,10 @@ def _load_device_health_sheet_captureboard_incidents(
     if not spreadsheet_id or not tab_name:
         raise ValueError("장비 장애 시트 ID 또는 탭 이름이 비어 있어")
 
-    # 장비·문제장치·감지내용·상태·permalink가 포함된 B:Q를 한 번에 읽어
+    # 장비·문제장치·감지내용·상태·permalink가 포함된 B:S를 한 번에 읽어
     # TA가 갱신한 현재 상태와 원본 Slack 알림을 같은 물리 행 기준으로 판단한다.
     quoted_tab_name = tab_name.replace("'", "''")
-    read_range = quote(f"'{quoted_tab_name}'!B2:Q", safe="")
+    read_range = quote(f"'{quoted_tab_name}'!B2:S", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{read_range}"
@@ -331,7 +333,7 @@ def _load_device_health_sheet_captureboard_incidents(
             "deviceName": device_name,
             "status": _display_value(row[8] if len(row) > 8 else None, default=""),
             "slackPermalink": _display_value(
-                row[15] if len(row) > 15 else None,
+                row[17] if len(row) > 17 else None,
                 default="",
             ),
             "rowNumber": row_number,
@@ -346,7 +348,7 @@ def _load_device_health_sheet_sms_tracking_rows(
     authorized_session: Any,
 ) -> list[list[Any]]:
     quoted_tab_name = tab_name.replace("'", "''")
-    read_range = quote(f"'{quoted_tab_name}'!B2:R", safe="")
+    read_range = quote(f"'{quoted_tab_name}'!B2:T", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{read_range}"
@@ -381,11 +383,11 @@ def _resolve_device_health_sheet_sms_tracking_rows(
         if not isinstance(row, list):
             raise ValueError("장비 장애 시트 조회 행 형식이 올바르지 않아")
 
-        # B/F/Q는 사용자가 보는 대상 식별자이고 R은 정렬 범위에서 빠질 수 있으므로 독립 수집한다.
+        # B/F/S는 사용자가 보는 대상 식별자이고 T는 정렬 범위에서 빠질 수 있으므로 독립 수집한다.
         device_name = _display_value(row[0] if row else None, default="")
         issue = _display_value(row[4] if len(row) > 4 else None, default="")
         slack_permalink = _display_value(
-            row[15] if len(row) > 15 else None,
+            row[17] if len(row) > 17 else None,
             default="",
         )
         if device_name and issue:
@@ -405,7 +407,7 @@ def _resolve_device_health_sheet_sms_tracking_rows(
             )
 
         tracking_metadata = _parse_device_health_sheet_sms_tracking_metadata(
-            row[16] if len(row) > 16 else None
+            row[18] if len(row) > 18 else None
         )
         if tracking_metadata is not None:
             tracking_records_by_key.setdefault(
@@ -496,10 +498,10 @@ def _has_device_health_sheet_sms_tracking_group_id(
         tab_name=tab_name,
         authorized_session=session,
     )
-    # outbox 중복 방지는 B/F/Q 결합 성공 여부와 무관하게 R의 버전된 메타데이터만 본다.
+    # outbox 중복 방지는 B/F/S 결합 성공 여부와 무관하게 T의 버전된 메타데이터만 본다.
     for row in rows:
         tracking_metadata = _parse_device_health_sheet_sms_tracking_metadata(
-            row[16] if len(row) > 16 else None
+            row[18] if len(row) > 18 else None
         )
         if (
             tracking_metadata is not None
@@ -578,7 +580,7 @@ def _update_device_health_sheet_sms_status_by_group_id(
     if not spreadsheet_id or not tab_name:
         raise ValueError("장비 장애 시트 ID 또는 탭 이름이 비어 있어")
 
-    # 기존 호출 API의 행 번호는 힌트로만 받고, 실제 대상은 매번 R 메타데이터와 B/F/Q 해시로 다시 찾는다.
+    # 기존 호출 API의 행 번호는 힌트로만 받고, 실제 대상은 매번 T 메타데이터와 B/F/S 해시로 다시 찾는다.
     # 호환용 행 번호 인자를 검증하되 실제 대상은 아래 identity 조회로 결정한다.
     normalized_row_number = int(row_number)
     if normalized_row_number < 2:
@@ -608,7 +610,7 @@ def _update_device_health_sheet_sms_status_by_group_id(
     if initial_match["smsStatus"] != _SMS_SHEET_ACCEPTED:
         return False
 
-    # 실제 쓰기 직전 전체 R 레코드를 다시 스캔해 행 이동과 식별 셀 수정을 확인한다.
+    # 실제 쓰기 직전 전체 T 레코드를 다시 스캔해 행 이동과 식별 셀 수정을 확인한다.
     preflight_rows = _load_device_health_sheet_sms_tracking_rows(
         spreadsheet_id=spreadsheet_id,
         tab_name=tab_name,
@@ -684,7 +686,7 @@ def _append_device_health_sheet_alerts(
 
     # 탭 이름의 작은따옴표를 Sheets A1 규칙에 맞게 이스케이프하고 URL path도 별도로 인코딩한다.
     quoted_tab_name = tab_name.replace("'", "''")
-    append_range = quote(f"'{quoted_tab_name}'!A:R", safe="")
+    append_range = quote(f"'{quoted_tab_name}'!A:T", safe="")
     url = (
         f"{_GOOGLE_SHEETS_API_BASE_URL}/{quote(spreadsheet_id, safe='')}"
         f"/values/{append_range}:append"

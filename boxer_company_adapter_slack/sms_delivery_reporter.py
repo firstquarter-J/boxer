@@ -484,7 +484,7 @@ def _load_device_health_sheet_sms_delivery_rows(
         group_id = _display_value(row.get("groupId"), default="")
         if not group_id:
             continue
-        # Sheet 모듈이 R metadata와 B/F/Q identity hash로 고유성을 검증한 결과만 사용한다.
+        # Sheet 모듈이 T metadata와 B/F/S identity hash로 고유성을 검증한 결과만 사용한다.
         rows_by_group_id[group_id] = dict(row)
     return rows_by_group_id
 
@@ -681,7 +681,7 @@ def _reconcile_sms_delivery_outbox_once(
                         _has_device_health_sheet_sms_tracking_group_id(group_id)
                     )
                 except Exception as exc:
-                    # R 존재 확인이 실패하면 중복 위험이 있으므로 재append하지 않는다.
+                    # T 존재 확인이 실패하면 중복 위험이 있으므로 재append하지 않는다.
                     logger.warning(
                         "문자 발송 추적 groupId를 Google Sheets에서 확인하지 못했어 "
                         "group_id=%s error_type=%s",
@@ -711,7 +711,7 @@ def _reconcile_sms_delivery_outbox_once(
                 if not appended:
                     continue
                 changed_count += 1
-                # 최종 상태로 직접 append한 경우에도 실제 H/R 반영 확인 뒤에만 outbox를 제거한다.
+                # 최종 상태로 직접 append한 경우에도 실제 H/T 반영 확인 뒤에만 outbox를 제거한다.
                 try:
                     refreshed_rows = _load_device_health_sheet_sms_delivery_rows()
                 except Exception as exc:

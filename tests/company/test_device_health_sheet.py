@@ -77,13 +77,13 @@ def _sms_sheet_row(
     sms_status: str = "",
     tracking_metadata: str = "",
 ) -> list[str]:
-    # B:R 응답의 실제 열 위치를 유지해 R이 대상 행과 분리된 경우도 표현한다.
-    row = [""] * 17
+    # B:T 응답의 실제 열 위치를 유지해 T가 대상 행과 분리된 경우도 표현한다.
+    row = [""] * 19
     row[0] = device_name
     row[4] = issue
     row[6] = sms_status
-    row[15] = permalink
-    row[16] = tracking_metadata
+    row[17] = permalink
+    row[18] = tracking_metadata
     return row
 
 
@@ -99,8 +99,8 @@ def _captureboard_sheet_row(
     status: str,
     permalink: str,
 ) -> list[str]:
-    # B:Q 조회에서 H는 문자 상태, I는 Action, J는 처리 상태로 배치한다.
-    row = [""] * 16
+    # B:S 조회에서 H는 문자 상태, I는 Action, J는 처리 상태, S는 원문링크다.
+    row = [""] * 18
     row[0] = device_name
     row[1] = hospital_name
     row[2] = room_name
@@ -109,12 +109,12 @@ def _captureboard_sheet_row(
     row[5] = assignee
     row[7] = action
     row[8] = status
-    row[15] = permalink
+    row[17] = permalink
     return row
 
 
 class DeviceHealthSheetTests(unittest.TestCase):
-    def test_builds_eighteen_column_row_with_pending_status(self) -> None:
+    def test_builds_twenty_column_row_without_ta_managed_values(self) -> None:
         detected_at = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
 
         rows = device_health_sheet._build_device_health_sheet_rows(
@@ -132,7 +132,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(len(rows[0]), 18)
+        self.assertEqual(len(rows[0]), 20)
         self.assertIsInstance(rows[0][0], float)
         self.assertEqual(rows[0][1], "MB2-C00043")
         self.assertEqual(rows[0][2], "수지미래산부인과의원(용인)")
@@ -142,15 +142,17 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(rows[0][6], "")
         self.assertEqual(rows[0][7], "미발송")
         self.assertEqual(rows[0][8], "")
-        self.assertEqual(rows[0][9], "대기")
+        self.assertEqual(rows[0][9], "")
         self.assertEqual(rows[0][10], "")
         self.assertEqual(rows[0][11], "")
         self.assertEqual(rows[0][12], "")
         self.assertEqual(rows[0][13], "")
         self.assertEqual(rows[0][14], "")
         self.assertEqual(rows[0][15], "")
-        self.assertEqual(rows[0][16], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
+        self.assertEqual(rows[0][16], "")
         self.assertEqual(rows[0][17], "")
+        self.assertEqual(rows[0][18], "https://lifexio.slack.com/archives/C_HEALTH/p3000001")
+        self.assertEqual(rows[0][19], "")
 
     def test_maps_actual_auto_sms_result_to_sheet_status(self) -> None:
         detected_at = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -199,7 +201,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
 
                 self.assertEqual(rows[0][7], expected_status)
                 if expected_group_id:
-                    tracking_metadata = json.loads(rows[0][17])
+                    tracking_metadata = json.loads(rows[0][19])
                     self.assertEqual(
                         tracking_metadata,
                         {
@@ -214,9 +216,9 @@ class DeviceHealthSheetTests(unittest.TestCase):
                             "m": "M123",
                         },
                     )
-                    self.assertNotEqual(rows[0][17], expected_group_id)
+                    self.assertNotEqual(rows[0][19], expected_group_id)
                 else:
-                    self.assertEqual(rows[0][17], "")
+                    self.assertEqual(rows[0][19], "")
 
     def test_appends_rows_with_adc_authorized_session(self) -> None:
         session = _FakeAuthorizedSession()
@@ -262,7 +264,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         )
         self.assertEqual(call["json"]["majorDimension"], "ROWS")
         self.assertEqual(call["json"]["values"][0][1], "MB2-C00043")
-        self.assertTrue(unquote(call["url"]).endswith("'Boxer 장애 감지 처리 현황'!A:R:append"))
+        self.assertTrue(unquote(call["url"]).endswith("'Boxer 장애 감지 처리 현황'!A:T:append"))
         self.assertEqual(call["json"]["values"][0][11], "")
         self.assertEqual(call["json"]["values"][0][12], "")
         self.assertEqual(call["timeout"], 7)
@@ -355,7 +357,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
                 },
             ],
         )
-        self.assertTrue(unquote(session.calls[0]["url"]).endswith("'현황'!B2:R"))
+        self.assertTrue(unquote(session.calls[0]["url"]).endswith("'현황'!B2:T"))
 
     def test_loads_all_exact_sms_delivery_matches_for_outbox(self) -> None:
         accepted_target = {
@@ -528,11 +530,11 @@ class DeviceHealthSheetTests(unittest.TestCase):
             [call["method"] for call in session.calls],
             ["GET", "GET", "PUT", "GET"],
         )
-        self.assertTrue(unquote(session.calls[0]["url"]).endswith("'현황'!B2:R"))
-        self.assertTrue(unquote(session.calls[1]["url"]).endswith("'현황'!B2:R"))
+        self.assertTrue(unquote(session.calls[0]["url"]).endswith("'현황'!B2:T"))
+        self.assertTrue(unquote(session.calls[1]["url"]).endswith("'현황'!B2:T"))
         self.assertTrue(unquote(session.calls[2]["url"]).endswith("'현황'!H2"))
         self.assertEqual(session.calls[2]["json"]["values"], [["수신 완료"]])
-        self.assertTrue(unquote(session.calls[3]["url"]).endswith("'현황'!B2:R"))
+        self.assertTrue(unquote(session.calls[3]["url"]).endswith("'현황'!B2:T"))
 
     def test_finds_target_again_when_r_and_target_rows_move_after_scan(self) -> None:
         device_name = "MB2-C00043"
@@ -925,7 +927,7 @@ class DeviceHealthSheetTests(unittest.TestCase):
         call = session.calls[0]
         self.assertEqual(call["method"], "GET")
         self.assertTrue(
-            unquote(call["url"]).endswith("/spreadsheet/id/values/'TA''s 현황'!B2:Q")
+            unquote(call["url"]).endswith("/spreadsheet/id/values/'TA''s 현황'!B2:S")
         )
         self.assertEqual(
             call["params"],
