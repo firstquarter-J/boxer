@@ -44,6 +44,16 @@ def _payload() -> dict[str, object]:
     }
 
 
+_APP_USER_BABY_SELECTION_REPLY = (
+    "Lambda 조회 결과 태아 상태 아이가 두 명이야.\n"
+    "• 똑딱: 2027-05-04\n"
+    "• 쑥쑥이: 2026-10-22\n"
+    "\n"
+    "두 아이가 다태아로 설정되지 않아, 출산예정일이 더 먼 "
+    "똑딱이 선택되고 쑥쑥이는 제외된 거야."
+)
+
+
 def _anthropic_auth_error() -> anthropic.AuthenticationError:
     response = httpx.Response(
         401,
@@ -167,10 +177,7 @@ class RouteModulesSmokeTests(unittest.TestCase):
     ) -> None:
         replies: list[str] = []
         payload = _payload()
-        expected = (
-            "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
-            "태아 상태 아이가 두 명이라 출산예정일이 가장 먼 아이가 선택된거야."
-        )
+        expected = _APP_USER_BABY_SELECTION_REPLY
 
         class UnexpectedAssistantService:
             def answer(self, request):
@@ -227,10 +234,7 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self,
     ) -> None:
         replies: list[str] = []
-        expected = (
-            "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
-            "태아 상태 아이가 두 명이라 출산예정일이 가장 먼 아이가 선택된거야."
-        )
+        expected = _APP_USER_BABY_SELECTION_REPLY
 
         with (
             patch(

@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from urllib import error, parse, request
 
@@ -29,12 +29,6 @@ _BABY_SELECTION_ANALYSIS_KEYWORDS = (
     "왜",
     "분석",
 )
-_BABY_SELECTION_EXPLANATION = (
-    "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
-    "태아 상태 아이가 두 명이라 출산예정일이 가장 먼 아이가 선택된거야."
-)
-
-
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
 
@@ -110,18 +104,85 @@ def _request_app_users_by_barcode(barcode: str) -> list[dict[str, Any]]:
     return users
 
 
-def _parse_birth_date(value: object) -> datetime | None:
+def _parse_birth_date(value: object) -> date | None:
     normalized = str(value or "").strip()
     if not normalized:
         return None
     try:
-        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        return datetime.fromisoformat(
+            normalized.replace("Z", "+00:00")
+        ).date()
     except ValueError:
         return None
 
 
 def _format_embryo_count(count: int) -> str:
     return "두 명" if count == 2 else f"{count}명"
+
+
+def _has_hangul_final_consonant(text: str) -> bool:
+    if not text:
+        return False
+    code_point = ord(text[-1])
+    return (
+        0xAC00 <= code_point <= 0xD7A3
+        and (code_point - 0xAC00) % 28 != 0
+    )
+
+
+def _with_subject_particle(text: str) -> str:
+    return f"{text}{'이' if _has_hangul_final_consonant(text) else '가'}"
+
+
+def _with_topic_particle(text: str) -> str:
+    return f"{text}{'은' if _has_hangul_final_consonant(text) else '는'}"
+
+
+def _format_baby_selection_explanation(
+    babies: list[dict[str, Any]],
+    birth_dates: list[date],
+) -> str:
+    # 예정일 내림차순으로 근거와 실제 선택 결과를 같은 순서로 보여준다.
+    ordered = sorted(
+        zip(babies, birth_dates, strict=True),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    details = [
+        (
+            str(
+                _display_value(
+                    baby.get("babyNickname"),
+                    default="이름 없음",
+                )
+            ),
+            birth_date,
+        )
+        for baby, birth_date in ordered
+    ]
+    count_label = _format_embryo_count(len(details))
+    lines = [
+        f"Lambda 조회 결과 태아 상태 아이가 {count_label}이야.",
+        *[
+            f"• {nickname}: {birth_date.isoformat()}"
+            for nickname, birth_date in details
+        ],
+        "",
+    ]
+    selected_name = details[0][0]
+    if len(details) == 2:
+        excluded_name = details[1][0]
+        lines.append(
+            "두 아이가 다태아로 설정되지 않아, 출산예정일이 더 먼 "
+            f"{_with_subject_particle(selected_name)} 선택되고 "
+            f"{_with_topic_particle(excluded_name)} 제외된 거야."
+        )
+    else:
+        lines.append(
+            "아이들이 다태아로 설정되지 않아, 출산예정일이 가장 먼 "
+            f"{_with_subject_particle(selected_name)} 선택되고 나머지는 제외된 거야."
+        )
+    return "\n".join(lines)
 
 
 def _analyze_app_user_baby_selection_by_barcode(barcode: str) -> str:
@@ -175,13 +236,13 @@ def _analyze_app_user_baby_selection_by_barcode(barcode: str) -> str:
             "가장 먼 예정일 선택 로직이 원인인지 확정할 수 없어."
         )
 
-    count_label = _format_embryo_count(len(babies))
-    if len(babies) == 2:
-        return _BABY_SELECTION_EXPLANATION
-    return (
-        "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
-        f"태아 상태 아이가 {count_label}이라 "
-        "출산예정일이 가장 먼 아이가 선택된거야."
+    return _format_baby_selection_explanation(
+        babies,
+        [
+            birth_date
+            for birth_date in birth_dates
+            if birth_date is not None
+        ],
     )
 
 

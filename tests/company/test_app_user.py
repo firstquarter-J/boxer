@@ -2,7 +2,6 @@ import unittest
 from unittest.mock import patch
 
 from boxer_company.routers.app_user import (
-    _BABY_SELECTION_EXPLANATION,
     _analyze_app_user_baby_selection_by_barcode,
     _lookup_app_user_by_barcode,
     _should_analyze_app_user_baby_selection,
@@ -13,6 +12,14 @@ _BARCODE = "16326662589"
 _QUESTION = (
     "16326662589 바코드로 유저조회 람다 호출시 결과가 똑딱이만 나온대. "
     "쑥쑥이는 왜 안나오는지 원인분석해"
+)
+_DETAILED_EXPLANATION = (
+    "Lambda 조회 결과 태아 상태 아이가 두 명이야.\n"
+    "• 똑딱: 2027-05-04\n"
+    "• 쑥쑥이: 2026-10-22\n"
+    "\n"
+    "두 아이가 다태아로 설정되지 않아, 출산예정일이 더 먼 "
+    "똑딱이 선택되고 쑥쑥이는 제외된 거야."
 )
 
 
@@ -53,7 +60,7 @@ class AppUserBabySelectionAnalysisTests(unittest.TestCase):
             )
         )
 
-    def test_explains_two_non_twin_embryos_with_requested_sentence(
+    def test_explains_two_non_twin_embryos_with_names_and_dates(
         self,
     ) -> None:
         babies = [
@@ -75,7 +82,7 @@ class AppUserBabySelectionAnalysisTests(unittest.TestCase):
                         )
                     )
 
-                self.assertEqual(result, _BABY_SELECTION_EXPLANATION)
+                self.assertEqual(result, _DETAILED_EXPLANATION)
 
     def test_does_not_claim_single_selection_for_twins(self) -> None:
         with patch(
@@ -104,7 +111,7 @@ class AppUserBabySelectionAnalysisTests(unittest.TestCase):
             )
 
         self.assertIn("다태아로 식별", result)
-        self.assertNotEqual(result, _BABY_SELECTION_EXPLANATION)
+        self.assertNotEqual(result, _DETAILED_EXPLANATION)
 
     def test_does_not_claim_cause_for_one_embryo(self) -> None:
         with patch(
@@ -118,7 +125,7 @@ class AppUserBabySelectionAnalysisTests(unittest.TestCase):
             )
 
         self.assertIn("태아 상태 아이가 한 명", result)
-        self.assertNotEqual(result, _BABY_SELECTION_EXPLANATION)
+        self.assertNotEqual(result, _DETAILED_EXPLANATION)
 
     def test_does_not_claim_cause_when_birth_date_is_missing_or_tied(
         self,
@@ -148,7 +155,7 @@ class AppUserBabySelectionAnalysisTests(unittest.TestCase):
                     )
 
                 self.assertIn("확정할 수 없어", result)
-                self.assertNotEqual(result, _BABY_SELECTION_EXPLANATION)
+                self.assertNotEqual(result, _DETAILED_EXPLANATION)
 
     def test_existing_app_user_lookup_format_is_preserved(self) -> None:
         with patch(
