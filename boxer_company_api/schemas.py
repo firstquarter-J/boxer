@@ -23,6 +23,22 @@ _LOCALE_PATTERN = r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"
 _MAX_CONTEXT_ENTRIES = 12
 _MAX_CONTEXT_CHARS = 5_000
 _MAX_QUESTION_CHARS = 4_000
+_SENSITIVE_SOURCE_PARAMETER_EXACT_NAMES = frozenset(
+    {
+        "auth",
+        "key",
+        "sig",
+    }
+)
+_SENSITIVE_SOURCE_PARAMETER_MARKERS = (
+    "accesskey",
+    "apikey",
+    "authorization",
+    "credential",
+    "secret",
+    "signature",
+    "token",
+)
 
 
 class _StrictInputModel(BaseModel):
@@ -325,33 +341,45 @@ def _safe_source_uri(uri: str) -> str | None:
     ):
         return None
     parsed = urlsplit(normalized)
-    query_keys = {
-        key.strip().lower()
-        for key, _value in parse_qsl(
-            parsed.query,
-            keep_blank_values=True,
-        )
-    }
     if not (
         parsed.scheme.lower() == "https"
         and parsed.hostname
         and parsed.username is None
         and parsed.password is None
-        and not any(
-            marker in key
-            for key in query_keys
-            for marker in (
-                "api_key",
-                "apikey",
-                "credential",
-                "secret",
-                "signature",
-                "token",
-            )
-        )
+        and not _contains_sensitive_source_parameter(parsed.query)
+        and not _contains_sensitive_source_parameter(parsed.fragment)
     ):
         return None
     return normalized
+
+
+def _contains_sensitive_source_parameter(raw_parameters: str) -> bool:
+    """서명 URL과 OAuth fragment가 근거 링크로 되돌아가지 않게 막는다."""
+
+    candidates = [raw_parameters]
+    if "?" in raw_parameters:
+        # 일반 anchor 뒤에 query 형식의 OAuth fragment가 붙는 경우도 검사한다.
+        candidates.append(raw_parameters.split("?", 1)[1])
+
+    for candidate in candidates:
+        for key, _value in parse_qsl(
+            candidate,
+            keep_blank_values=True,
+        ):
+            normalized_key = re.sub(
+                r"[^a-z0-9]",
+                "",
+                key.strip().lower(),
+            )
+            if (
+                normalized_key in _SENSITIVE_SOURCE_PARAMETER_EXACT_NAMES
+                or any(
+                    marker in normalized_key
+                    for marker in _SENSITIVE_SOURCE_PARAMETER_MARKERS
+                )
+            ):
+                return True
+    return False
 
 
 def _safe_score(value: object) -> float | None:

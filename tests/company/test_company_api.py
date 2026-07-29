@@ -536,6 +536,27 @@ class CompanyApiContractTests(unittest.TestCase):
                             "X-Amz-Signature=must-not-leak"
                         ),
                     ),
+                    SourceReference(
+                        source_id="azure-signed",
+                        title="azure-signed",
+                        uri=(
+                            "https://storage.example/file?"
+                            "sig=must-not-leak"
+                        ),
+                    ),
+                    SourceReference(
+                        source_id="fragment-token",
+                        title="fragment-token",
+                        uri=(
+                            "https://identity.example/callback"
+                            "#access_token=must-not-leak"
+                        ),
+                    ),
+                    SourceReference(
+                        source_id="safe-anchor",
+                        title="safe-anchor",
+                        uri="https://www.notion.so/source#safe-heading",
+                    ),
                 ),
                 suggested_action=SuggestedAction(
                     action="dangerous_internal_action",
@@ -559,7 +580,17 @@ class CompanyApiContractTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["sources"], [])
+        self.assertEqual(
+            response.json()["sources"],
+            [
+                {
+                    "sourceId": "safe-anchor",
+                    "title": "safe-anchor",
+                    "uri": "https://www.notion.so/source#safe-heading",
+                    "score": None,
+                }
+            ],
+        )
         self.assertIsNone(response.json()["suggestedAction"])
         self.assertIsNone(response.json()["asyncJob"])
         self.assertNotIn("must-not-leak", response.text)
