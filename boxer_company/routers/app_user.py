@@ -164,7 +164,7 @@ def _format_baby_selection_explanation(
     lines = [
         f"Lambda 조회 결과 태아 상태 아이가 {count_label}이야.",
         *[
-            f"• {nickname}: {birth_date.isoformat()}"
+            f"• {nickname} 출산예정일: {birth_date.isoformat()}"
             for nickname, birth_date in details
         ],
         "",
