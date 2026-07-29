@@ -65,7 +65,11 @@ jobs:
           python - <<'PY'
           import importlib.util
 
-          for package_name in ("boxer_company", "boxer_company_adapter_slack"):
+          for package_name in (
+              "boxer_company",
+              "boxer_company_adapter_slack",
+              "boxer_company_api",
+          ):
               if importlib.util.find_spec(package_name) is not None:
                   raise SystemExit(f"{package_name} must not be importable in open-source CI")
           PY
@@ -120,6 +124,57 @@ jobs:
           python -m pip install -e ./boxer_adapter_slack
           python -m pip install -e ./boxer_company
           python -m pip install -e ./boxer_company_adapter_slack
+          python -m pip install -e ./boxer_company_api
+
+      - name: Verify company API isolated wheel
+        run: |
+          wheel_root="$(mktemp -d)"
+          api_venv_root="$(mktemp -d)"
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" .
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" ./boxer_company
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" ./boxer_company_api
+          python -m venv "${api_venv_root}/venv"
+          "${api_venv_root}/venv/bin/python" -m pip install \
+            "${wheel_root}"/boxer-*.whl \
+            "${wheel_root}"/boxer_company-*.whl \
+            "${wheel_root}"/boxer_company_api-*.whl
+          cd "${api_venv_root}"
+          "${api_venv_root}/venv/bin/python" - <<'PY'
+          import importlib.metadata
+          import importlib.util
+
+          import boxer_company_api
+          from boxer_company_api.runtime import main
+
+          if not callable(main):
+              raise SystemExit("boxer-company-api entrypoint must be callable")
+
+          for package_name in (
+              "boxer_adapter_slack",
+              "boxer_company_adapter_slack",
+              "boxer_adapter_web",
+              "slack_bolt",
+          ):
+              if importlib.util.find_spec(package_name) is not None:
+                  raise SystemExit(
+                      f"{package_name} must not be installed with boxer-company-api"
+                  )
+
+          distribution = importlib.metadata.distribution(
+              "boxer-company-api"
+          )
+          forbidden_paths = (
+              "boxer_adapter_slack/",
+              "boxer_company_adapter_slack/",
+              "boxer_adapter_web/",
+          )
+          for file_path in distribution.files or ():
+              normalized = str(file_path).replace("\\", "/")
+              if normalized.startswith(forbidden_paths):
+                  raise SystemExit(
+                      f"adapter source leaked into API wheel: {normalized}"
+                  )
+          PY
 
       - name: Run company tests
         env:

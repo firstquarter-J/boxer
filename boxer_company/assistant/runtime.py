@@ -23,6 +23,7 @@ from boxer_company.assistant.barcode_query_route import (
     BarcodeQueryAssistantRoute,
 )
 from boxer_company.assistant.contracts import (
+    AssistantMessage,
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
@@ -75,6 +76,10 @@ CompanyAssistantStage = Literal[
 RecordingsLoader = Callable[[str], dict[str, Any]]
 ConfigFlag = Callable[[], bool]
 PartialResultHandler = Callable[[CompanyAssistantResult], None]
+RequestGuard = Callable[
+    [CompanyAssistantRequest],
+    CompanyAssistantResult | None,
+]
 KnowledgeRouteFactory = Callable[
     [
         RequestScopedRecordingsContext,
@@ -143,6 +148,7 @@ class CompanyAssistantRuntimeDeps:
     )
     context_max_chars: int = core_settings.THREAD_CONTEXT_MAX_CHARS
     notion_route_deps: CompanyNotionAssistantRouteDeps | None = None
+    request_guard: RequestGuard | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +203,11 @@ class CompanyAssistantRuntime:
             request,
             context_max_chars=self._deps.context_max_chars,
         )
+        request_guard_result = _run_request_guard(
+            normalized_request,
+            self._deps.request_guard,
+            logger=self._logger,
+        )
         scope_mismatch_result = _resolve_scope_mismatch_result(
             normalized_request
         )
@@ -231,8 +242,11 @@ class CompanyAssistantRuntime:
             recordings=recordings,
             route_groups=route_groups,
             prefetch_enabled=(
-                db_configured and scope_mismatch_result is None
+                db_configured
+                and request_guard_result is None
+                and scope_mismatch_result is None
             ),
+            request_guard_result=request_guard_result,
             scope_mismatch_result=scope_mismatch_result,
             logger=self._logger,
         )
@@ -362,6 +376,7 @@ class CompanyAssistantTurn:
             Sequence[CompanyAssistantRoute],
         ],
         prefetch_enabled: bool,
+        request_guard_result: CompanyAssistantResult | None,
         scope_mismatch_result: CompanyAssistantResult | None,
         logger: logging.Logger,
     ) -> None:
@@ -377,6 +392,7 @@ class CompanyAssistantTurn:
             for stage, routes in self._route_groups.items()
         }
         self._prefetch_enabled = prefetch_enabled
+        self._request_guard_result = request_guard_result
         self._scope_mismatch_result = scope_mismatch_result
         self._logger = logger
         self._prefetch_attempted = False
@@ -474,6 +490,9 @@ class CompanyAssistantTurn:
     ) -> CompanyAssistantResult | None:
         """Slack adapter가 기존 중간 legacy route 위치에서 호출하는 진입점이다."""
         _validate_stage(stage)
+        if self._request_guard_result is not None:
+            # 프로세스 공통 read-only 경계는 route matcher나 조회보다 먼저 적용한다.
+            return self._request_guard_result
         if stage != "notion" and self._scope_mismatch_result is not None:
             # 질문과 adapter scope가 다르면 DB/S3 선조회 전에 막는다.
             return self._scope_mismatch_result
@@ -673,7 +692,40 @@ def _read_config_flag(
             name,
             type(exc).__name__,
         )
-        return False
+    return False
+
+
+def _run_request_guard(
+    request: CompanyAssistantRequest,
+    guard: RequestGuard | None,
+    *,
+    logger: logging.Logger,
+) -> CompanyAssistantResult | None:
+    if guard is None:
+        return None
+    try:
+        return guard(request)
+    except Exception as exc:
+        # 정책 구현 오류가 조회 허용으로 이어지지 않도록 fail closed한다.
+        logger.warning(
+            "Company assistant request guard failed request_id=%s "
+            "error_type=%s",
+            request.request_id,
+            type(exc).__name__,
+        )
+        return CompanyAssistantResult(
+            route="request_guard",
+            outcome="denied",
+            messages=(
+                AssistantMessage(
+                    body=(
+                        "요청의 읽기 전용 정책을 확인하지 못했어. "
+                        "잠시 후 다시 시도해줘"
+                    )
+                ),
+            ),
+            fallback_reason="request_guard_error",
+        )
 
 
 def _validate_stage(stage: str) -> None:
@@ -719,5 +771,6 @@ __all__ = [
     "CompanyAssistantTurn",
     "CompanyAssistantTurnScope",
     "KnowledgeRouteFactory",
+    "RequestGuard",
     "needs_assistant_scope_context",
 ]

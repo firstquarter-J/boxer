@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxer-company-api"
+version = "0.1.0"
+description = "Private company assistant API for Boxer."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boxer-company>=0.1.0",
+  "fastapi==0.116.1",
+  "pydantic>=2.11,<3",
+  "uvicorn==0.35.0",
+]
+
+[project.urls]
+Repository = "https://github.com/firstquarter-J/boxer"
+
+[project.scripts]
+boxer-company-api = "boxer_company_api.runtime:main"
+
+[tool.setuptools]
+packages = ["boxer_company_api"]
+
+[tool.setuptools.package-dir]
+boxer_company_api = "."

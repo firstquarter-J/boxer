@@ -68,6 +68,10 @@ _LAZY_EXPORTS = {
         "boxer_company.assistant.runtime",
         "CompanyAssistantRuntimeDeps",
     ),
+    "CompanyAssistantRuntimePolicy": (
+        "boxer_company.assistant.factory",
+        "CompanyAssistantRuntimePolicy",
+    ),
     "CompanyAssistantTurn": (
         "boxer_company.assistant.runtime",
         "CompanyAssistantTurn",
@@ -112,6 +116,14 @@ _LAZY_EXPORTS = {
         "boxer_company.assistant.knowledge_routes",
         "build_company_read_only_knowledge_routes",
     ),
+    "build_company_freeform_system_prompt": (
+        "boxer_company.assistant.freeform_prompt",
+        "build_company_freeform_system_prompt",
+    ),
+    "create_company_assistant_runtime": (
+        "boxer_company.assistant.factory",
+        "create_company_assistant_runtime",
+    ),
 }
 
 
@@ -137,6 +149,7 @@ __all__ = [
     "CompanyAssistantRoute",
     "CompanyAssistantRuntime",
     "CompanyAssistantRuntimeDeps",
+    "CompanyAssistantRuntimePolicy",
     "CompanyAssistantService",
     "CompanyAssistantTurn",
     "CompanyEvidenceAnswerComposer",
@@ -156,5 +169,7 @@ __all__ = [
     "SourceReference",
     "StructuredAssistantRoute",
     "SuggestedAction",
+    "build_company_freeform_system_prompt",
     "build_company_read_only_knowledge_routes",
+    "create_company_assistant_runtime",
 ]

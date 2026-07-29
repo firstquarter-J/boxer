@@ -20,6 +20,9 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
     SourceReference,
 )
+from boxer_company.assistant.freeform_prompt import (
+    build_company_freeform_system_prompt,
+)
 from boxer_company.assistant.notion_answer_safety import (
     build_notion_document_security_refusal,
     needs_notion_document_security_refusal,
@@ -546,13 +549,10 @@ def _default_freeform_system_prompt(
     request: CompanyAssistantRequest,
     context_text: str,
 ) -> str | None:
-    del request, context_text
-    sections = (
-        str(cs.FREEFORM_CORE_IDENTITY_PROMPT or "").strip(),
-        str(cs.FREEFORM_RESPONSE_RULES_PROMPT or "").strip(),
+    return build_company_freeform_system_prompt(
+        request.question,
+        context_text,
     )
-    prompt = "\n\n".join(section for section in sections if section).strip()
-    return prompt or None
 
 
 def _deny_request_by_default(request: CompanyAssistantRequest) -> bool:
