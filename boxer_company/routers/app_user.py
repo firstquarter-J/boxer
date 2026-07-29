@@ -172,15 +172,26 @@ def _format_baby_selection_explanation(
     selected_name = details[0][0]
     if len(details) == 2:
         excluded_name = details[1][0]
-        lines.append(
-            "두 아이가 다태아로 설정되지 않아, 출산예정일이 더 먼 "
-            f"{_with_subject_particle(selected_name)} 선택되고 "
-            f"{_with_topic_particle(excluded_name)} 제외된 거야."
+        lines.extend(
+            (
+                "문제는 두 아이가 하나의 다태아 묶음으로 설정된 게 아니라, "
+                "각각 독립적인 태아로 설정돼 있다는 점이야.",
+                "HPA는 다태아가 아닌 경우 임신 중인 태아는 한 명만 "
+                "존재한다고 보고 출산예정일이 더 먼 아이를 선택해. "
+                f"이 경우 {_with_subject_particle(selected_name)} 선택되고 "
+                f"{_with_topic_particle(excluded_name)} 제외된 거야.",
+            )
         )
     else:
-        lines.append(
-            "아이들이 다태아로 설정되지 않아, 출산예정일이 가장 먼 "
-            f"{_with_subject_particle(selected_name)} 선택되고 나머지는 제외된 거야."
+        lines.extend(
+            (
+                "문제는 아이들이 하나의 다태아 묶음으로 설정된 게 아니라, "
+                "각각 독립적인 태아로 설정돼 있다는 점이야.",
+                "HPA는 다태아가 아닌 경우 임신 중인 태아는 한 명만 "
+                "존재한다고 보고 출산예정일이 가장 먼 아이를 선택해. "
+                f"이 경우 {_with_subject_particle(selected_name)} 선택되고 "
+                "나머지는 제외된 거야.",
+            )
         )
     return "\n".join(lines)
 
