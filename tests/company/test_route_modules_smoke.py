@@ -162,6 +162,211 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertFalse(handled)
 
+    def test_barcode_query_routes_handles_app_user_baby_selection_analysis(
+        self,
+    ) -> None:
+        replies: list[str] = []
+        payload = _payload()
+        expected = (
+            "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
+            "태아 상태 아이가 두 명이라 출산예정일이 가장 먼 아이가 선택된거야."
+        )
+
+        class UnexpectedAssistantService:
+            def answer(self, request):
+                raise AssertionError(
+                    "app-user 원인분석보다 먼저 호출되면 안 돼"
+                )
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
+                {"U123"},
+            ),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "_analyze_app_user_baby_selection_by_barcode",
+                return_value=expected,
+            ) as analysis_mock,
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question=(
+                        "16326662589 바코드로 유저조회 람다 호출시 결과가 "
+                        "똑딱이만 나온대. 쑥쑥이는 왜 안나오는지 원인분석해"
+                    ),
+                    barcode="16326662589",
+                    user_id="U123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                    payload=payload,  # type: ignore[arg-type]
+                    assistant_service=UnexpectedAssistantService(),  # type: ignore[arg-type]
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=(
+                        lambda evidence, context: None
+                    ),
+                    reply_with_retrieval_synthesis=(
+                        lambda *args, **kwargs: None
+                    ),
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, [expected])
+        analysis_mock.assert_called_once_with("16326662589")
+        self.assertEqual(
+            payload["request_log"]["route_name"],  # type: ignore[index]
+            "app_user_baby_selection_analysis",
+        )
+
+    def test_barcode_query_routes_allows_baby_analysis_without_lookup_permission(
+        self,
+    ) -> None:
+        replies: list[str] = []
+        expected = (
+            "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
+            "태아 상태 아이가 두 명이라 출산예정일이 가장 먼 아이가 선택된거야."
+        )
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
+                set(),
+            ),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "_analyze_app_user_baby_selection_by_barcode",
+                return_value=expected,
+            ) as analysis_mock,
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question=(
+                        "16326662589 유저조회 결과가 한 명만 나오는 "
+                        "원인 분석해줘"
+                    ),
+                    barcode="16326662589",
+                    user_id="U_ANY",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=(
+                        lambda evidence, context: None
+                    ),
+                    reply_with_retrieval_synthesis=(
+                        lambda *args, **kwargs: None
+                    ),
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, [expected])
+        analysis_mock.assert_called_once_with("16326662589")
+
+    def test_barcode_query_routes_keeps_permission_for_detailed_app_user_lookup(
+        self,
+    ) -> None:
+        replies: list[tuple[str, bool]] = []
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
+                set(),
+            ),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "cs.DD_USER_ID",
+                "U_DD",
+            ),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "_lookup_app_user_by_barcode",
+            ) as lookup_mock,
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question="16326662589 유저조회",
+                    barcode="16326662589",
+                    user_id="U_ANY",
+                    thread_ts="1.0",
+                    reply=lambda text, mention_user=True, **kwargs: (
+                        replies.append((text, mention_user))
+                    ),
+                    logger=logging.getLogger(__name__),
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=(
+                        lambda evidence, context: None
+                    ),
+                    reply_with_retrieval_synthesis=(
+                        lambda *args, **kwargs: None
+                    ),
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            replies,
+            [("보안 책임자 <@U_DD> 의 승인이 필요합니다.", False)],
+        )
+        lookup_mock.assert_not_called()
+
+    def test_barcode_query_routes_safely_handles_baby_analysis_failure(
+        self,
+    ) -> None:
+        replies: list[str] = []
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
+                {"U123"},
+            ),
+            patch(
+                "boxer_company_adapter_slack.barcode_query_routes."
+                "_analyze_app_user_baby_selection_by_barcode",
+                side_effect=RuntimeError("secret detail"),
+            ),
+        ):
+            handled = _handle_barcode_query_routes(
+                BarcodeQueryRoutesContext(
+                    question=(
+                        "16326662589 람다 유저조회에서 아이가 "
+                        "왜 하나만 나오는지 원인분석해"
+                    ),
+                    barcode="16326662589",
+                    user_id="U123",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=_silent_logger(),
+                ),
+                BarcodeQueryRoutesDeps(
+                    get_recordings_context=lambda: {},
+                    attach_recordings_context_to_evidence=(
+                        lambda evidence, context: None
+                    ),
+                    reply_with_retrieval_synthesis=(
+                        lambda *args, **kwargs: None
+                    ),
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            replies,
+            ["유저 조회 원인분석 중 오류가 발생했어. 잠시 후 다시 시도해줘"],
+        )
+
     def test_barcode_query_routes_handles_validation_status_question(self) -> None:
         replies: list[str] = []
 

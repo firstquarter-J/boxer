@@ -17,7 +17,12 @@ from boxer_company_adapter_slack.assistant_bridge import (
     build_company_assistant_request,
     render_company_assistant_result,
 )
-from boxer_company.routers.app_user import _lookup_app_user_by_barcode, _should_lookup_barcode
+from boxer_company.routers.app_user import (
+    _analyze_app_user_baby_selection_by_barcode,
+    _lookup_app_user_by_barcode,
+    _should_analyze_app_user_baby_selection,
+    _should_lookup_barcode,
+)
 from boxer_company.routers.barcode_validation import (
     _is_barcode_pink_classification_reason_request,
     _is_barcode_validation_status_request,
@@ -82,6 +87,74 @@ def _handle_barcode_query_routes(
 ) -> bool:
     question = context.question
     barcode = context.barcode
+
+    # 원인분석은 PII를 출력하지 않으므로 모든 멘션 사용자에게 열고,
+    # 전화번호·실명이 포함되는 기존 상세 유저 조회만 권한을 확인한다.
+    app_user_query: Callable[[], str] | None = None
+    app_user_route = ""
+    app_user_requires_permission = True
+    if barcode and _should_analyze_app_user_baby_selection(
+        question,
+        barcode,
+    ):
+        app_user_query = lambda: _analyze_app_user_baby_selection_by_barcode(
+            barcode
+        )
+        app_user_route = "app_user_baby_selection_analysis"
+        app_user_requires_permission = False
+    elif barcode and _should_lookup_barcode(question, barcode):
+        app_user_query = lambda: _lookup_app_user_by_barcode(barcode)
+        app_user_route = "app_user_lookup"
+
+    if app_user_query is not None:
+        if (
+            not app_user_requires_permission
+            or context.user_id in cs.APP_USER_LOOKUP_ALLOWED_USER_IDS
+        ):
+            try:
+                lookup_result = app_user_query()
+                context.reply(lookup_result)
+                if context.payload is not None:
+                    _set_request_log_route(
+                        context.payload,
+                        app_user_route,
+                        handler_type="router",
+                    )
+                context.logger.info(
+                    "Responded with app-user route=%s in thread_ts=%s barcode=%s",
+                    app_user_route,
+                    context.thread_ts,
+                    barcode,
+                )
+            except Exception:
+                context.logger.exception(
+                    "App-user query failed route=%s",
+                    app_user_route,
+                )
+                context.reply(
+                    "유저 조회 원인분석 중 오류가 발생했어. 잠시 후 다시 시도해줘"
+                    if app_user_route
+                    == "app_user_baby_selection_analysis"
+                    else "바코드 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘"
+                )
+            return True
+
+        approval_text = "보안 책임자의 승인이 필요합니다."
+        if cs.DD_USER_ID:
+            approval_text = (
+                f"보안 책임자 <@{cs.DD_USER_ID}> 의 승인이 필요합니다."
+            )
+        context.reply(
+            approval_text,
+            mention_user=False,
+        )
+        context.logger.info(
+            "Rejected app-user route=%s for unauthorized user=%s barcode=%s",
+            app_user_route,
+            context.user_id,
+            barcode,
+        )
+        return True
 
     if context.assistant_service is not None and context.payload is not None:
         result = context.assistant_service.answer(
@@ -427,34 +500,6 @@ def _handle_barcode_query_routes(
         except Exception:
             context.logger.exception("Barcode recordedAt-on-date query failed")
             context.reply("날짜별 녹화 여부 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
-        return True
-
-    if barcode and _should_lookup_barcode(question, barcode):
-        if context.user_id in cs.APP_USER_LOOKUP_ALLOWED_USER_IDS:
-            try:
-                lookup_result = _lookup_app_user_by_barcode(barcode)
-                context.reply(lookup_result)
-                context.logger.info(
-                    "Responded with barcode lookup in thread_ts=%s barcode=%s",
-                    context.thread_ts,
-                    barcode,
-                )
-            except Exception:
-                context.logger.exception("Barcode lookup failed")
-                context.reply("바코드 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘")
-            return True
-        approval_text = "보안 책임자의 승인이 필요합니다."
-        if cs.DD_USER_ID:
-            approval_text = f"보안 책임자 <@{cs.DD_USER_ID}> 의 승인이 필요합니다."
-        context.reply(
-            approval_text,
-            mention_user=False,
-        )
-        context.logger.info(
-            "Rejected app-user barcode lookup for unauthorized user=%s barcode=%s",
-            context.user_id,
-            barcode,
-        )
         return True
 
     return False

@@ -1,12 +1,61 @@
 import json
+from datetime import datetime
+from typing import Any
 from urllib import error, parse, request
 
 from boxer_company import settings as cs
 from boxer.core.utils import _display_value
 
 
+_BABY_SELECTION_CONTEXT_KEYWORDS = (
+    "유저 조회",
+    "유저조회",
+    "산모 조회",
+    "산모조회",
+    "람다",
+    "lambda",
+)
+_BABY_SELECTION_ISSUE_KEYWORDS = (
+    "안 나",
+    "안나",
+    "누락",
+    "한 명만",
+    "한명만",
+    "하나만",
+    "선택",
+)
+_BABY_SELECTION_ANALYSIS_KEYWORDS = (
+    "원인",
+    "왜",
+    "분석",
+)
+_BABY_SELECTION_EXPLANATION = (
+    "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
+    "태아 상태 아이가 두 명이라 출산예정일이 가장 먼 아이가 선택된거야."
+)
+
+
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
+
+
+def _should_analyze_app_user_baby_selection(
+    question: str,
+    barcode: str,
+) -> bool:
+    normalized = (question or "").strip().lower()
+    if not normalized or barcode not in normalized:
+        return False
+    return _contains_any(
+        normalized,
+        _BABY_SELECTION_CONTEXT_KEYWORDS,
+    ) and _contains_any(
+        normalized,
+        _BABY_SELECTION_ISSUE_KEYWORDS,
+    ) and _contains_any(
+        normalized,
+        _BABY_SELECTION_ANALYSIS_KEYWORDS,
+    )
 
 
 def _should_lookup_barcode(question: str, barcode: str) -> bool:
@@ -26,7 +75,7 @@ def _should_lookup_barcode(question: str, barcode: str) -> bool:
     return has_lookup_keyword
 
 
-def _lookup_app_user_by_barcode(barcode: str) -> str:
+def _request_app_users_by_barcode(barcode: str) -> list[dict[str, Any]]:
     if not cs.APP_USER_API_URL:
         raise RuntimeError("APP_USER_API_URL is empty")
 
@@ -49,8 +98,96 @@ def _lookup_app_user_by_barcode(barcode: str) -> str:
     except json.JSONDecodeError as exc:
         raise RuntimeError("app-user API returned invalid JSON") from exc
 
+    if not isinstance(payload, dict):
+        raise RuntimeError("app-user API returned invalid payload")
     users = payload.get("data")
-    if not isinstance(users, list) or not users:
+    if users is None:
+        return []
+    if not isinstance(users, list) or not all(
+        isinstance(user, dict) for user in users
+    ):
+        raise RuntimeError("app-user API returned invalid users")
+    return users
+
+
+def _parse_birth_date(value: object) -> datetime | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    try:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_embryo_count(count: int) -> str:
+    return "두 명" if count == 2 else f"{count}명"
+
+
+def _analyze_app_user_baby_selection_by_barcode(barcode: str) -> str:
+    users = _request_app_users_by_barcode(barcode)
+    if not users:
+        return f"바코드 {barcode}로 조회된 유저가 없어"
+
+    babies = users[0].get("babies")
+    if not isinstance(babies, list) or not all(
+        isinstance(baby, dict) for baby in babies
+    ):
+        raise RuntimeError("app-user API returned invalid babies")
+    if len(babies) <= 1:
+        return (
+            "Lambda 조회 결과에서 태아 상태 아이가 한 명이라 "
+            "출산예정일로 한 명을 선택하는 로직이 원인이라고 볼 수 없어."
+        )
+
+    # Lambda는 babyStatus=EMBRYO만 반환한다. HPA와 동일하게 유효한
+    # 다태아 묶음이 있으면 그 묶음을 유지하고, 없을 때만 예정일을 비교한다.
+    twin_baby = next(
+        (baby for baby in babies if baby.get("twinFlag") == 1),
+        None,
+    )
+    twin_key = twin_baby.get("twinKey") if twin_baby else None
+    twin_babies = (
+        [
+            baby
+            for baby in babies
+            if baby.get("twinFlag") == 1
+            and baby.get("twinKey") == twin_key
+        ]
+        if twin_key
+        else []
+    )
+    if twin_babies:
+        return (
+            "Lambda 조회 결과에서 다태아로 식별된 아이들이라 "
+            "출산예정일이 가장 먼 한 명만 선택하는 경우가 아니야."
+        )
+
+    birth_dates = [_parse_birth_date(baby.get("birthDate")) for baby in babies]
+    if any(birth_date is None for birth_date in birth_dates):
+        return (
+            "태아 상태 아이가 여러 명이지만 출산예정일이 없는 아이가 있어서 "
+            "가장 먼 예정일 선택 로직이 원인인지 확정할 수 없어."
+        )
+    if len(set(birth_dates)) != len(birth_dates):
+        return (
+            "태아 상태 아이가 여러 명이지만 출산예정일이 같아서 "
+            "가장 먼 예정일 선택 로직이 원인인지 확정할 수 없어."
+        )
+
+    count_label = _format_embryo_count(len(babies))
+    if len(babies) == 2:
+        return _BABY_SELECTION_EXPLANATION
+    return (
+        "임신 중인 태아는 한 명만(다태아가 아닌 이상) 존재해야 하는데, "
+        f"태아 상태 아이가 {count_label}이라 "
+        "출산예정일이 가장 먼 아이가 선택된거야."
+    )
+
+
+def _lookup_app_user_by_barcode(barcode: str) -> str:
+    users = _request_app_users_by_barcode(barcode)
+    if not users:
         return f"바코드 {barcode}로 조회된 유저가 없어"
 
     lines = [
