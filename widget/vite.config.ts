@@ -10,7 +10,7 @@ export default defineConfig(({ mode }) => {
   const entryName = isAdminBuild ? "admin" : "widget";
 
   return {
-    // widget과 admin은 배포 주체가 다르므로 서로 독립된 정적 artifact로 만든다.
+    // widget과 admin은 제공 주체가 다르므로 서로 독립된 정적 build output으로 만든다.
     base: "./",
     root: resolve(projectRoot, "src/entries", entryName),
     plugins: [react()],
