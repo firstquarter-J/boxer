@@ -37,6 +37,7 @@ from boxer_company_adapter_slack.company_api_client import (
 from boxer_company_adapter_slack.company_api_rollout import (
     BoundedShadowRunner,
     wrap_company_notion_service,
+    wrap_company_structured_service,
 )
 from boxer_company_adapter_slack.barcode_routes import (
     BarcodeLogRouteContext,
@@ -308,18 +309,22 @@ def create_app() -> App:
     company_api_settings = load_company_api_client_settings()
     company_api_client = (
         CompanyAssistantApiClient(company_api_settings)
-        if company_api_settings.notion_mode != "local"
+        if company_api_settings.enabled
         else None
     )
     company_api_shadow_runner = (
         BoundedShadowRunner(logger=app_logger)
-        if company_api_settings.notion_mode == "shadow"
+        if company_api_settings.shadow_enabled
         else None
     )
     app_logger.info(
-        "Company API Notion rollout configured mode=%s local_fallback=%s",
+        "Company API rollout configured "
+        "notion_mode=%s notion_local_fallback=%s "
+        "structured_mode=%s structured_local_fallback=%s",
         company_api_settings.notion_mode,
         company_api_settings.notion_fallback_enabled,
+        company_api_settings.structured_mode,
+        company_api_settings.structured_fallback_enabled,
     )
     claude_client = None
     if s.LLM_PROVIDER == "claude":
@@ -1180,6 +1185,15 @@ def create_app() -> App:
         ):
             return
 
+        # DB-only 구조화 route만 별도 스위치로 API 전환하고, SSH/MDA
+        # enrichment가 섞인 장비 조회는 기존 local 경로에 남긴다.
+        structured_assistant_service = wrap_company_structured_service(
+            assistant_turn.service_for_stage("structured"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
         if _handle_structured_routes(
             StructuredRoutesContext(
                 question=question,
@@ -1188,9 +1202,7 @@ def create_app() -> App:
                 thread_ts=thread_ts,
                 reply=reply,
                 logger=logger,
-                assistant_service=assistant_turn.service_for_stage(
-                    "structured"
-                ),
+                assistant_service=structured_assistant_service,
                 client=client,
             )
         ):

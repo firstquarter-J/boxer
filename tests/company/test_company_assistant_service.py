@@ -20,6 +20,9 @@ from boxer_company.assistant import (
     StructuredAssistantRoute,
 )
 from boxer_company.assistant.commonmark import slack_mrkdwn_to_commonmark
+from boxer_company.assistant.structured_route import (
+    match_structured_read_route,
+)
 from boxer_company.notion_workspace_search import CompanyNotionSearchResult
 
 
@@ -378,6 +381,61 @@ class CompanyNotionAssistantRouteTests(unittest.TestCase):
 
 
 class StructuredAssistantRouteTests(unittest.TestCase):
+    def test_pure_classifier_identifies_all_structured_read_routes_in_priority_order(
+        self,
+    ) -> None:
+        cases = (
+            ("2026년 병원 목록", "hospitals_filter"),
+            (
+                "병원명 서울병원 병실 목록",
+                "hospital_rooms_filter",
+            ),
+            ("MB2-C00419 장비 정보", "devices_filter"),
+            (
+                # 캡처와 영상 힌트가 함께 있어도 기존 순서상 캡처가 먼저다.
+                "12345678910 2026-07-01 초음파 캡처 영상 조회",
+                "ultrasound_captures_filter",
+            ),
+            (
+                "12345678910 2026-07-01 영상 조회",
+                "recordings_filter",
+            ),
+        )
+
+        for question, expected_route in cases:
+            with self.subTest(route=expected_route):
+                self.assertEqual(
+                    match_structured_read_route(_request(question)),
+                    expected_route,
+                )
+
+    def test_pure_classifier_excludes_adapter_only_mutation_and_invalid_scope(
+        self,
+    ) -> None:
+        # 주간 리포트와 복원은 Slack 전용이고 일반 질문은 공통 API 전환
+        # 후보가 아니므로 조회 실행 전 classifier에서 제외한다.
+        for question in (
+            "이번 주 영상 현황 리포트",
+            "35033165423 2024년 4월 영상 복원",
+            "오늘 점심 뭐 먹지?",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(
+                    match_structured_read_route(_request(question))
+                )
+
+        mismatched = CompanyAssistantRequest(
+            request_id="REQ-CLASSIFIER-SCOPE",
+            tenant_id="TENANT-1",
+            actor_id="ACTOR-1",
+            channel="test",
+            conversation_id="CONVERSATION-1",
+            question="10987654321 2026-07-01 영상 조회",
+            locale="ko",
+            metadata={"barcode": "12345678910"},
+        )
+        self.assertIsNone(match_structured_read_route(mismatched))
+
     def test_hospital_room_query_returns_channel_neutral_result(self) -> None:
         route = StructuredAssistantRoute(
             is_weekly_report_request=lambda *args, **kwargs: False,
@@ -400,6 +458,34 @@ class StructuredAssistantRouteTests(unittest.TestCase):
             room_name=None,
             hospital_seq=None,
             hospital_room_seq=None,
+            count_only=False,
+        )
+
+    def test_device_query_remains_enabled_for_local_runtime(
+        self,
+    ) -> None:
+        route = StructuredAssistantRoute(
+            is_weekly_report_request=lambda *args, **kwargs: False,
+        )
+        with patch(
+            "boxer_company.assistant.structured_route."
+            "_query_devices_by_filters",
+            return_value="*장비 조회 결과*\n• MB2-C00419",
+        ) as query:
+            result = route.handle(_request("MB2-C00419 장비 정보"))
+
+        self.assertEqual(result.route, "devices_filter")
+        self.assertEqual(result.outcome, "answered")
+        query.assert_called_once_with(
+            device_name="MB2-C00419",
+            device_seq=None,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status=None,
+            active_flag=None,
+            install_flag=None,
             count_only=False,
         )
 

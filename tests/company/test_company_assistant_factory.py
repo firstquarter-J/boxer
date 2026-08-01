@@ -186,6 +186,37 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                     )
         recordings_loader.assert_not_called()
 
+    def test_device_detail_query_is_denied_before_live_enrichment(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.LLM_PROVIDER",
+                "",
+            ),
+            patch(
+                "boxer_company.assistant.structured_route."
+                "_query_devices_by_filters",
+            ) as device_query,
+        ):
+            runtime = create_company_assistant_runtime()
+            result = runtime.answer(
+                _request("MB2-C00419 장비 정보")
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result.route,
+            "unsupported_device_enrichment",
+        )
+        self.assertEqual(result.outcome, "denied")
+        self.assertEqual(
+            result.fallback_reason,
+            "read_only_boundary",
+        )
+        device_query.assert_not_called()
+
     def test_ollama_health_result_is_cached_for_requests(self) -> None:
         with (
             patch(

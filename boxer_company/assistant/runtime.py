@@ -149,6 +149,7 @@ class CompanyAssistantRuntimeDeps:
     context_max_chars: int = core_settings.THREAD_CONTEXT_MAX_CHARS
     notion_route_deps: CompanyNotionAssistantRouteDeps | None = None
     request_guard: RequestGuard | None = None
+    structured_device_filter_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,7 +337,12 @@ class CompanyAssistantRuntime:
                 ),
             ),
             "structured": (
-                StructuredAssistantRoute(logger=self._logger),
+                StructuredAssistantRoute(
+                    device_filter_enabled=(
+                        self._deps.structured_device_filter_enabled
+                    ),
+                    logger=self._logger,
+                ),
             ),
             "barcode": (
                 BarcodeQueryAssistantRoute(

@@ -110,7 +110,7 @@ _SENSITIVE_SOURCE_PARAMETER_MARKERS = (
     "signature",
     "token",
 )
-_NotionMode = Literal["local", "shadow", "remote"]
+_RolloutMode = Literal["local", "shadow", "remote"]
 
 
 class CompanyApiClientError(RuntimeError):
@@ -153,12 +153,27 @@ class CompanyApiClientSettings:
     connect_timeout_sec: float = 2.0
     read_timeout_sec: float = 90.0
     max_retries: int = 1
-    notion_mode: _NotionMode = "local"
+    notion_mode: _RolloutMode = "local"
     notion_fallback_enabled: bool = False
+    structured_mode: _RolloutMode = "local"
+    structured_fallback_enabled: bool = False
 
     @property
     def enabled(self) -> bool:
-        return self.notion_mode in {"shadow", "remote"}
+        return any(
+            mode in {"shadow", "remote"}
+            for mode in (
+                self.notion_mode,
+                self.structured_mode,
+            )
+        )
+
+    @property
+    def shadow_enabled(self) -> bool:
+        return "shadow" in {
+            self.notion_mode,
+            self.structured_mode,
+        }
 
 
 def load_company_api_client_settings(
@@ -167,19 +182,23 @@ def load_company_api_client_settings(
     """Slack client 설정을 읽고 remote 계열 mode만 credential을 요구한다."""
 
     source = os.environ if env is None else env
-    mode = str(
-        source.get("BOXER_COMPANY_API_NOTION_MODE", "local")
-    ).strip().lower()
-    if mode not in {"local", "shadow", "remote"}:
-        raise CompanyApiContractError("company_api_mode_invalid")
+    notion_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_NOTION_MODE",
+    )
+    structured_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_STRUCTURED_MODE",
+    )
 
-    # local은 즉시 롤백 스위치다. 이전 remote transport 값이 환경에
-    # 잘못 남아 있어도 전부 폐기해 Slack 기동을 막지 않는다.
-    if mode == "local":
+    # 모든 route group이 local이면 즉시 롤백 상태다. 이전 remote
+    # transport 값이 잘못 남아 있어도 전부 폐기해 Slack 기동을 막지 않는다.
+    if notion_mode == "local" and structured_mode == "local":
         return CompanyApiClientSettings(
             base_url="",
             token="",
             notion_mode="local",
+            structured_mode="local",
         )
 
     raw_base_url = str(
@@ -217,10 +236,23 @@ def load_company_api_client_settings(
         minimum=0,
         maximum=2,
     )
-    fallback_enabled = _boolean_setting(
-        source,
-        "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED",
-        False,
+    notion_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED",
+            False,
+        )
+        if notion_mode != "local"
+        else False
+    )
+    structured_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED",
+            False,
+        )
+        if structured_mode != "local"
+        else False
     )
     return CompanyApiClientSettings(
         base_url=base_url,
@@ -228,8 +260,12 @@ def load_company_api_client_settings(
         connect_timeout_sec=connect_timeout_sec,
         read_timeout_sec=read_timeout_sec,
         max_retries=max_retries,
-        notion_mode=mode,  # type: ignore[arg-type]
-        notion_fallback_enabled=fallback_enabled,
+        notion_mode=notion_mode,
+        notion_fallback_enabled=notion_fallback_enabled,
+        structured_mode=structured_mode,
+        structured_fallback_enabled=(
+            structured_fallback_enabled
+        ),
     )
 
 
@@ -513,6 +549,9 @@ def _validate_client_settings(
     if (
         settings.notion_mode not in {"local", "shadow", "remote"}
         or type(settings.notion_fallback_enabled) is not bool
+        or settings.structured_mode
+        not in {"local", "shadow", "remote"}
+        or type(settings.structured_fallback_enabled) is not bool
     ):
         raise CompanyApiContractError("company_api_settings_invalid")
     if not settings.enabled:
@@ -543,6 +582,16 @@ def _validate_client_settings(
     ):
         raise CompanyApiContractError("company_api_retry_invalid")
     return base_url
+
+
+def _rollout_mode_setting(
+    env: Mapping[str, str],
+    key: str,
+) -> _RolloutMode:
+    mode = str(env.get(key, "local")).strip().lower()
+    if mode not in {"local", "shadow", "remote"}:
+        raise CompanyApiContractError("company_api_mode_invalid")
+    return mode  # type: ignore[return-value]
 
 
 def _is_internal_http_host(hostname: str) -> bool:

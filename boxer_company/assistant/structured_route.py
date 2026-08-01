@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 from typing import Callable
 
@@ -48,6 +49,28 @@ from boxer_company.weekly_recordings_report import (
     _is_weekly_recordings_report_request,
 )
 
+
+@dataclass(frozen=True, slots=True)
+class _StructuredQueryMatch:
+    """DB 호출 전에 확정한 구조화 조회 종류와 파싱 결과다."""
+
+    route: str
+    barcode: str | None
+    target_date: str | None
+    target_year: int | None
+    hospital_name: str | None
+    room_name: str | None
+    hospital_seq: int | None
+    hospital_room_seq: int | None
+    device_name: str | None
+    device_seq: int | None
+    device_status: str | None
+    active_flag: int | None
+    install_flag: int | None
+    count_only: bool
+    date_error: ValueError | None
+
+
 class StructuredAssistantRoute:
     name = "structured"
 
@@ -57,63 +80,58 @@ class StructuredAssistantRoute:
         is_weekly_report_request: Callable[..., bool] = (
             _is_weekly_recordings_report_request
         ),
+        device_filter_enabled: bool = True,
         logger: logging.Logger | None = None,
     ) -> None:
         self._is_weekly_report_request = is_weekly_report_request
+        self._device_filter_enabled = device_filter_enabled
         self._logger = logger or logging.getLogger(__name__)
 
     def handle(
         self,
         request: CompanyAssistantRequest,
     ) -> CompanyAssistantResult | None:
-        question = request.question
         try:
-            barcode = resolve_assistant_request_scope(request).barcode
+            matched = _build_structured_query_match(
+                request,
+                is_weekly_report_request=self._is_weekly_report_request,
+            )
         except AssistantRequestScopeMismatch as mismatch:
             return build_scope_mismatch_result(mismatch)
-        if _is_recording_streaming_restore_request(question, barcode):
-            # 복원은 상태 변경 작업이라 read-only assistant service 밖에 유지한다.
+        if matched is None:
             return None
 
-        try:
-            parsed_date, has_requested_date = _extract_log_date_with_presence(question)
-            target_date = parsed_date if has_requested_date else None
-        except ValueError as exc:
-            target_date = None
-            date_error: ValueError | None = exc
-        else:
-            date_error = None
-
-        target_year = _extract_year_filter(question)
-        if target_year is not None and target_date is None:
-            date_error = None
-        hospital_name, room_name = _extract_hospital_room_scope(question)
-        if not hospital_name:
-            hospital_name = _extract_leading_hospital_scope(question)
-        hospital_seq, hospital_room_seq = _extract_capture_seq_filters(question)
-        device_name = _extract_device_name_scope(question)
-        device_seq = _extract_device_seq_filter(question)
-        device_status = _extract_device_status_filter(question)
-        active_flag, install_flag = _extract_device_flag_filters(question)
-        count_only = _is_generic_count_or_existence_request(question)
-
-        if _is_hospitals_filter_query_request(
-            question,
-            target_date=target_date,
-            target_year=target_year,
-            hospital_name=hospital_name,
-            hospital_seq=hospital_seq,
+        if (
+            matched.route == "devices_filter"
+            and not self._device_filter_enabled
         ):
+            # 기존 장비 상세 보강은 MDA SSH open mutation과 실제 SSH 연결로
+            # 이어질 수 있어 순수 DB 경로로 분리되기 전에는 API runtime이 막는다.
+            return CompanyAssistantResult(
+                route="unsupported_device_enrichment",
+                outcome="denied",
+                messages=(
+                    AssistantMessage(
+                        body=(
+                            "장비 상세 조회는 읽기 전용 API에서 "
+                            "지원하지 않아"
+                        )
+                    ),
+                ),
+                fallback_reason="read_only_boundary",
+            )
+
+        if matched.route == "hospitals_filter":
             return self._run_query(
                 route="hospitals_filter",
                 query=lambda: _raise_or_call(
-                    date_error,
+                    matched.date_error,
                     lambda: _query_hospitals_by_filters(
-                        hospital_name=hospital_name,
-                        hospital_seq=hospital_seq,
-                        target_date=target_date,
-                        target_year=target_year,
-                        count_only=count_only,
+                        hospital_name=matched.hospital_name,
+                        hospital_seq=matched.hospital_seq,
+                        target_date=matched.target_date,
+                        target_year=matched.target_year,
+                        count_only=matched.count_only,
                     ),
                 ),
                 format_error_prefix="병원 조회 요청 형식 오류",
@@ -122,21 +140,15 @@ class StructuredAssistantRoute:
                 request_id=request.request_id,
             )
 
-        if _is_hospital_rooms_filter_query_request(
-            question,
-            hospital_name=hospital_name,
-            room_name=room_name,
-            hospital_seq=hospital_seq,
-            hospital_room_seq=hospital_room_seq,
-        ):
+        if matched.route == "hospital_rooms_filter":
             return self._run_query(
                 route="hospital_rooms_filter",
                 query=lambda: _query_hospital_rooms_by_filters(
-                    hospital_name=hospital_name,
-                    room_name=room_name,
-                    hospital_seq=hospital_seq,
-                    hospital_room_seq=hospital_room_seq,
-                    count_only=count_only,
+                    hospital_name=matched.hospital_name,
+                    room_name=matched.room_name,
+                    hospital_seq=matched.hospital_seq,
+                    hospital_room_seq=matched.hospital_room_seq,
+                    count_only=matched.count_only,
                 ),
                 format_error_prefix="병실 조회 요청 형식 오류",
                 dependency_error="병실 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
@@ -144,31 +156,20 @@ class StructuredAssistantRoute:
                 request_id=request.request_id,
             )
 
-        if _is_devices_filter_query_request(
-            question,
-            device_name=device_name,
-            device_seq=device_seq,
-            hospital_name=hospital_name,
-            room_name=room_name,
-            hospital_seq=hospital_seq,
-            hospital_room_seq=hospital_room_seq,
-            status=device_status,
-            active_flag=active_flag,
-            install_flag=install_flag,
-        ):
+        if matched.route == "devices_filter":
             return self._run_query(
                 route="devices_filter",
                 query=lambda: _query_devices_by_filters(
-                    device_name=device_name,
-                    device_seq=device_seq,
-                    hospital_name=hospital_name,
-                    room_name=room_name,
-                    hospital_seq=hospital_seq,
-                    hospital_room_seq=hospital_room_seq,
-                    status=device_status,
-                    active_flag=active_flag,
-                    install_flag=install_flag,
-                    count_only=count_only,
+                    device_name=matched.device_name,
+                    device_seq=matched.device_seq,
+                    hospital_name=matched.hospital_name,
+                    room_name=matched.room_name,
+                    hospital_seq=matched.hospital_seq,
+                    hospital_room_seq=matched.hospital_room_seq,
+                    status=matched.device_status,
+                    active_flag=matched.active_flag,
+                    install_flag=matched.install_flag,
+                    count_only=matched.count_only,
                 ),
                 format_error_prefix="장비 조회 요청 형식 오류",
                 dependency_error="장비 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
@@ -176,37 +177,20 @@ class StructuredAssistantRoute:
                 request_id=request.request_id,
             )
 
-        if self._is_weekly_report_request(
-            question,
-            barcode=barcode,
-            target_date=target_date,
-        ):
-            # Slack Block을 쓰는 주간 리포트는 adapter가 기존 형식으로 렌더링한다.
-            return None
-
-        if _is_ultrasound_capture_filter_query_request(
-            question,
-            barcode=barcode,
-            target_date=target_date,
-            target_year=target_year,
-            hospital_name=hospital_name,
-            room_name=room_name,
-            hospital_seq=hospital_seq,
-            hospital_room_seq=hospital_room_seq,
-        ):
+        if matched.route == "ultrasound_captures_filter":
             return self._run_query(
                 route="ultrasound_captures_filter",
                 query=lambda: _raise_or_call(
-                    date_error,
+                    matched.date_error,
                     lambda: _query_ultrasound_captures_by_filters(
-                        barcode=barcode,
-                        target_date=target_date,
-                        target_year=target_year,
-                        hospital_name=hospital_name,
-                        room_name=room_name,
-                        hospital_seq=hospital_seq,
-                        hospital_room_seq=hospital_room_seq,
-                        count_only=count_only,
+                        barcode=matched.barcode,
+                        target_date=matched.target_date,
+                        target_year=matched.target_year,
+                        hospital_name=matched.hospital_name,
+                        room_name=matched.room_name,
+                        hospital_seq=matched.hospital_seq,
+                        hospital_room_seq=matched.hospital_room_seq,
+                        count_only=matched.count_only,
                     ),
                 ),
                 format_error_prefix="캡처 조회 요청 형식 오류",
@@ -215,29 +199,20 @@ class StructuredAssistantRoute:
                 request_id=request.request_id,
             )
 
-        if _is_recordings_filter_query_request(
-            question,
-            barcode=barcode,
-            target_date=target_date,
-            target_year=target_year,
-            hospital_name=hospital_name,
-            room_name=room_name,
-            hospital_seq=hospital_seq,
-            hospital_room_seq=hospital_room_seq,
-        ):
+        if matched.route == "recordings_filter":
             return self._run_query(
                 route="recordings_filter",
                 query=lambda: _raise_or_call(
-                    date_error,
+                    matched.date_error,
                     lambda: _query_recordings_by_filters(
-                        barcode=barcode,
-                        target_date=target_date,
-                        target_year=target_year,
-                        hospital_name=hospital_name,
-                        room_name=room_name,
-                        hospital_seq=hospital_seq,
-                        hospital_room_seq=hospital_room_seq,
-                        count_only=count_only,
+                        barcode=matched.barcode,
+                        target_date=matched.target_date,
+                        target_year=matched.target_year,
+                        hospital_name=matched.hospital_name,
+                        room_name=matched.room_name,
+                        hospital_seq=matched.hospital_seq,
+                        hospital_room_seq=matched.hospital_room_seq,
+                        count_only=matched.count_only,
                     ),
                 ),
                 format_error_prefix="영상 조회 요청 형식 오류",
@@ -299,6 +274,144 @@ class StructuredAssistantRoute:
             )
 
 
+def match_structured_read_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """조회 없이 구조화 route만 분류해 adapter의 HTTP 전환 범위를 고정한다."""
+
+    try:
+        matched = _build_structured_query_match(
+            request,
+            is_weekly_report_request=(
+                _is_weekly_recordings_report_request
+            ),
+        )
+    except AssistantRequestScopeMismatch:
+        # scope 불일치는 기존 local guard가 값 노출 없이 처리하게 둔다.
+        return None
+    return matched.route if matched is not None else None
+
+
+def _build_structured_query_match(
+    request: CompanyAssistantRequest,
+    *,
+    is_weekly_report_request: Callable[..., bool],
+) -> _StructuredQueryMatch | None:
+    """기존 route 우선순위를 보존하며 파싱만 하고 외부 조회는 하지 않는다."""
+
+    question = request.question
+    barcode = resolve_assistant_request_scope(request).barcode
+    if _is_recording_streaming_restore_request(question, barcode):
+        # 복원은 상태 변경 작업이라 read-only assistant service 밖에 유지한다.
+        return None
+
+    try:
+        parsed_date, has_requested_date = (
+            _extract_log_date_with_presence(question)
+        )
+        target_date = parsed_date if has_requested_date else None
+    except ValueError as exc:
+        target_date = None
+        date_error: ValueError | None = exc
+    else:
+        date_error = None
+
+    target_year = _extract_year_filter(question)
+    if target_year is not None and target_date is None:
+        date_error = None
+    hospital_name, room_name = _extract_hospital_room_scope(question)
+    if not hospital_name:
+        hospital_name = _extract_leading_hospital_scope(question)
+    hospital_seq, hospital_room_seq = _extract_capture_seq_filters(
+        question
+    )
+    device_name = _extract_device_name_scope(question)
+    device_seq = _extract_device_seq_filter(question)
+    device_status = _extract_device_status_filter(question)
+    active_flag, install_flag = _extract_device_flag_filters(question)
+    count_only = _is_generic_count_or_existence_request(question)
+
+    route: str | None = None
+    if _is_hospitals_filter_query_request(
+        question,
+        target_date=target_date,
+        target_year=target_year,
+        hospital_name=hospital_name,
+        hospital_seq=hospital_seq,
+    ):
+        route = "hospitals_filter"
+    elif _is_hospital_rooms_filter_query_request(
+        question,
+        hospital_name=hospital_name,
+        room_name=room_name,
+        hospital_seq=hospital_seq,
+        hospital_room_seq=hospital_room_seq,
+    ):
+        route = "hospital_rooms_filter"
+    elif _is_devices_filter_query_request(
+        question,
+        device_name=device_name,
+        device_seq=device_seq,
+        hospital_name=hospital_name,
+        room_name=room_name,
+        hospital_seq=hospital_seq,
+        hospital_room_seq=hospital_room_seq,
+        status=device_status,
+        active_flag=active_flag,
+        install_flag=install_flag,
+    ):
+        route = "devices_filter"
+    elif is_weekly_report_request(
+        question,
+        barcode=barcode,
+        target_date=target_date,
+    ):
+        # Slack Block을 쓰는 주간 리포트는 adapter가 기존 형식으로 렌더링한다.
+        return None
+    elif _is_ultrasound_capture_filter_query_request(
+        question,
+        barcode=barcode,
+        target_date=target_date,
+        target_year=target_year,
+        hospital_name=hospital_name,
+        room_name=room_name,
+        hospital_seq=hospital_seq,
+        hospital_room_seq=hospital_room_seq,
+    ):
+        route = "ultrasound_captures_filter"
+    elif _is_recordings_filter_query_request(
+        question,
+        barcode=barcode,
+        target_date=target_date,
+        target_year=target_year,
+        hospital_name=hospital_name,
+        room_name=room_name,
+        hospital_seq=hospital_seq,
+        hospital_room_seq=hospital_room_seq,
+    ):
+        route = "recordings_filter"
+
+    if route is None:
+        return None
+    return _StructuredQueryMatch(
+        route=route,
+        barcode=barcode,
+        target_date=target_date,
+        target_year=target_year,
+        hospital_name=hospital_name,
+        room_name=room_name,
+        hospital_seq=hospital_seq,
+        hospital_room_seq=hospital_room_seq,
+        device_name=device_name,
+        device_seq=device_seq,
+        device_status=device_status,
+        active_flag=active_flag,
+        install_flag=install_flag,
+        count_only=count_only,
+        date_error=date_error,
+    )
+
+
 def _raise_or_call(
     error: ValueError | None,
     query: Callable[[], str],
@@ -336,4 +449,7 @@ def _result(
     )
 
 
-__all__ = ["StructuredAssistantRoute"]
+__all__ = [
+    "StructuredAssistantRoute",
+    "match_structured_read_route",
+]

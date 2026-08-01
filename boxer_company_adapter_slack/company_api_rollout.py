@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import logging
 import re
 import threading
@@ -14,6 +15,9 @@ from boxer_company.assistant import (
 )
 from boxer_company.notion_workspace_search import (
     _looks_like_company_notion_search,
+)
+from boxer_company.assistant.structured_route import (
+    match_structured_read_route,
 )
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiAmbiguousTimeoutError,
@@ -30,6 +34,14 @@ _ALLOWED_NOTION_ROUTES = frozenset(
     {
         "company_notion_search",
         "company_notion_qa",
+    }
+)
+_ALLOWED_STRUCTURED_ROUTES = frozenset(
+    {
+        "hospitals_filter",
+        "hospital_rooms_filter",
+        "ultrasound_captures_filter",
+        "recordings_filter",
     }
 )
 _SAFE_REQUEST_ID_PATTERN = re.compile(
@@ -110,20 +122,42 @@ class _RemoteResultValidation:
     reason: str | None = None
 
 
-class CompanyNotionApiRolloutService:
-    """회사 Notion 한 route만 local/shadow/remote로 점진 전환한다."""
+@dataclass(frozen=True, slots=True)
+class _RolloutProfile:
+    log_label: str
+    allowed_routes: frozenset[str]
+    matches_request: Callable[[CompanyAssistantRequest], bool]
+    validate_result: Callable[
+        [CompanyAssistantResult | None],
+        _RemoteResultValidation,
+    ]
+    failure_route: str
+    failure_body: str
+    expected_route: (
+        Callable[[CompanyAssistantRequest], str | None]
+        | None
+    ) = None
+    fallback_on_unexpected_route: bool = False
+
+
+class _CompanyApiRolloutService:
+    """허용된 read-only route 묶음만 공통 API로 점진 전환한다."""
 
     def __init__(
         self,
         local_service: _LocalAssistantService,
         *,
-        settings: CompanyApiClientSettings,
+        mode: str,
+        fallback_enabled: bool,
+        profile: _RolloutProfile,
         api_client: CompanyAssistantApiClient | None,
         logger: logging.Logger,
         shadow_runner: _ShadowRunner,
     ) -> None:
         self._local_service = local_service
-        self._settings = settings
+        self._mode = mode
+        self._fallback_enabled = fallback_enabled
+        self._profile = profile
         self._api_client = api_client
         self._logger = logger
         self._shadow_runner = shadow_runner
@@ -134,13 +168,12 @@ class CompanyNotionApiRolloutService:
     ) -> CompanyAssistantResult | None:
         # 순수 matcher를 먼저 적용해 다른 read-only route나 mutation 문장을
         # 전체-stage HTTP endpoint가 선점하지 못하게 한다.
-        if not _looks_like_company_notion_search(request.question):
+        if not self._profile.matches_request(request):
             return self._local_service.answer(request)
 
-        mode = self._settings.notion_mode
-        if mode == "shadow":
+        if self._mode == "shadow":
             return self._answer_shadow(request)
-        if mode == "remote":
+        if self._mode == "remote":
             return self._answer_remote(request)
         return self._local_service.answer(request)
 
@@ -149,7 +182,10 @@ class CompanyNotionApiRolloutService:
         request: CompanyAssistantRequest,
     ) -> CompanyAssistantResult | None:
         local_result = self._local_service.answer(request)
-        if not _is_shadow_eligible_notion_result(local_result):
+        if not _is_shadow_eligible_result(
+            local_result,
+            self._profile.allowed_routes,
+        ):
             return local_result
 
         def compare_remote() -> None:
@@ -159,8 +195,9 @@ class CompanyNotionApiRolloutService:
             accepted = self._shadow_runner.submit(compare_remote)
         except Exception as exc:
             self._logger.warning(
-                "Company Notion API shadow submission failed "
+                "%s shadow submission failed "
                 "request_id=%s error_type=%s",
+                self._profile.log_label,
                 _safe_request_id(request.request_id),
                 type(exc).__name__,
             )
@@ -169,7 +206,8 @@ class CompanyNotionApiRolloutService:
         # capacity 거부로 해석한다.
         if accepted is False:
             self._logger.warning(
-                "Company Notion API shadow skipped request_id=%s reason=capacity",
+                "%s shadow skipped request_id=%s reason=capacity",
+                self._profile.log_label,
                 _safe_request_id(request.request_id),
             )
         # shadow 결과는 renderer로 절대 반환하지 않아 Slack 중복 응답을 막는다.
@@ -201,11 +239,15 @@ class CompanyNotionApiRolloutService:
             self._log_shadow_error(request, "unexpected")
             return
 
-        validation = _validate_remote_notion_result(remote_result)
+        validation = self._validate_remote_result(
+            request,
+            remote_result,
+        )
         if not validation.accepted:
             self._logger.info(
-                "Company Notion API shadow comparison "
+                "%s shadow comparison "
                 "request_id=%s accepted=false reason=%s",
+                self._profile.log_label,
                 _safe_request_id(request.request_id),
                 validation.reason or "unknown",
             )
@@ -213,13 +255,14 @@ class CompanyNotionApiRolloutService:
 
         assert remote_result is not None
         self._logger.info(
-            "Company Notion API shadow comparison "
+            "%s shadow comparison "
             "request_id=%s accepted=true "
             "route_match=%s outcome_match=%s fallback_match=%s "
             "used_llm_match=%s source_set_match=%s "
-            "message_scope_match=%s "
+            "message_scope_match=%s message_body_match=%s "
             "local_source_count=%s remote_source_count=%s "
             "local_message_count=%s remote_message_count=%s",
+            self._profile.log_label,
             _safe_request_id(request.request_id),
             local_result.route == remote_result.route,
             local_result.outcome == remote_result.outcome,
@@ -229,6 +272,8 @@ class CompanyNotionApiRolloutService:
             _source_set(local_result) == _source_set(remote_result),
             _message_scopes(local_result)
             == _message_scopes(remote_result),
+            _message_body_digests(local_result)
+            == _message_body_digests(remote_result),
             len(local_result.sources),
             len(remote_result.sources),
             len(local_result.messages),
@@ -244,10 +289,11 @@ class CompanyNotionApiRolloutService:
         except CompanyApiAmbiguousTimeoutError:
             return self._fail_closed(request, "ambiguous_timeout")
         except CompanyApiAvailabilityError:
-            if self._settings.notion_fallback_enabled:
+            if self._fallback_enabled:
                 self._logger.warning(
-                    "Company Notion API local fallback "
+                    "%s local fallback "
                     "request_id=%s reason=availability",
+                    self._profile.log_label,
                     _safe_request_id(request.request_id),
                 )
                 return self._local_service.answer(request)
@@ -261,13 +307,20 @@ class CompanyNotionApiRolloutService:
         except Exception:
             return self._fail_closed(request, "unexpected")
 
-        validation = _validate_remote_notion_result(remote_result)
+        validation = self._validate_remote_result(
+            request,
+            remote_result,
+        )
         if validation.accepted:
             return remote_result
-        if validation.reason == "unexpected_route":
+        if (
+            validation.reason == "unexpected_route"
+            and self._profile.fallback_on_unexpected_route
+        ):
             self._logger.warning(
-                "Company Notion API local fallback "
+                "%s local fallback "
                 "request_id=%s reason=unexpected_route",
+                self._profile.log_label,
                 _safe_request_id(request.request_id),
             )
             return self._local_service.answer(request)
@@ -277,6 +330,29 @@ class CompanyNotionApiRolloutService:
             request,
             validation.reason or "contract",
         )
+
+    def _validate_remote_result(
+        self,
+        request: CompanyAssistantRequest,
+        result: CompanyAssistantResult | None,
+    ) -> _RemoteResultValidation:
+        validation = self._profile.validate_result(result)
+        if not validation.accepted:
+            return validation
+
+        expected_route = self._profile.expected_route
+        if (
+            expected_route is not None
+            and result is not None
+            and result.route != expected_route(request)
+        ):
+            # 같은 allowlist 안의 다른 DB route도 질문 분류 drift이므로
+            # 응답하거나 local로 우회하지 않고 계약 오류로 닫는다.
+            return _RemoteResultValidation(
+                accepted=False,
+                reason="route_mismatch",
+            )
+        return validation
 
     def _call_api(
         self,
@@ -292,7 +368,8 @@ class CompanyNotionApiRolloutService:
         reason: str,
     ) -> None:
         self._logger.warning(
-            "Company Notion API shadow failed request_id=%s reason=%s",
+            "%s shadow failed request_id=%s reason=%s",
+            self._profile.log_label,
             _safe_request_id(request.request_id),
             reason,
         )
@@ -303,22 +380,98 @@ class CompanyNotionApiRolloutService:
         reason: str,
     ) -> CompanyAssistantResult:
         self._logger.warning(
-            "Company Notion API failed closed request_id=%s reason=%s",
+            "%s failed closed request_id=%s reason=%s",
+            self._profile.log_label,
             _safe_request_id(request.request_id),
             reason,
         )
         return CompanyAssistantResult(
-            route="company_notion_search",
+            route=self._profile.failure_route,
             outcome="failed",
             messages=(
                 AssistantMessage(
-                    body=(
-                        "회사 Notion 답변 서비스 상태를 확인할 수 없어. "
-                        "잠시 후 다시 시도해줘"
-                    )
+                    body=self._profile.failure_body,
                 ),
             ),
             fallback_reason=f"company_api_{reason}",
+        )
+
+
+class CompanyNotionApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """회사 Notion route만 local/shadow/remote로 점진 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+    ) -> None:
+        super().__init__(
+            local_service,
+            mode=settings.notion_mode,
+            fallback_enabled=settings.notion_fallback_enabled,
+            profile=_RolloutProfile(
+                log_label="Company Notion API",
+                allowed_routes=_ALLOWED_NOTION_ROUTES,
+                matches_request=lambda request: (
+                    _looks_like_company_notion_search(
+                        request.question
+                    )
+                ),
+                validate_result=_validate_remote_notion_result,
+                failure_route="company_notion_search",
+                failure_body=(
+                    "회사 Notion 답변 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                fallback_on_unexpected_route=True,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+
+class CompanyStructuredApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """순수 DB 구조화 route만 공통 API로 점진 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+    ) -> None:
+        super().__init__(
+            local_service,
+            mode=settings.structured_mode,
+            fallback_enabled=(
+                settings.structured_fallback_enabled
+            ),
+            profile=_RolloutProfile(
+                log_label="Company Structured API",
+                allowed_routes=_ALLOWED_STRUCTURED_ROUTES,
+                matches_request=_matches_structured_api_request,
+                validate_result=_validate_remote_structured_result,
+                failure_route="structured_read",
+                failure_body=(
+                    "구조화 조회 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                expected_route=match_structured_read_route,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
         )
 
 
@@ -342,22 +495,44 @@ def wrap_company_notion_service(
     )
 
 
-def _is_allowed_notion_route(
-    result: CompanyAssistantResult | None,
-) -> bool:
-    return bool(
-        result is not None
-        and result.route in _ALLOWED_NOTION_ROUTES
+def wrap_company_structured_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+) -> _LocalAssistantService:
+    """장비 enrichment를 뺀 구조화 DB route만 decorator로 전환한다."""
+
+    if settings.structured_mode == "local":
+        return local_service
+    return CompanyStructuredApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
     )
 
 
-def _is_shadow_eligible_notion_result(
+def _is_allowed_route(
     result: CompanyAssistantResult | None,
+    allowed_routes: frozenset[str],
+) -> bool:
+    return bool(
+        result is not None
+        and result.route in allowed_routes
+    )
+
+
+def _is_shadow_eligible_result(
+    result: CompanyAssistantResult | None,
+    allowed_routes: frozenset[str],
 ) -> bool:
     # local actor 정책에서 거부한 질문은 API allowlist가 drift했더라도
     # shadow 조회나 LLM 실행을 시작하지 않는다.
     return bool(
-        _is_allowed_notion_route(result)
+        _is_allowed_route(result, allowed_routes)
         and result is not None
         and result.outcome != "denied"
     )
@@ -366,9 +541,65 @@ def _is_shadow_eligible_notion_result(
 def _validate_remote_notion_result(
     result: CompanyAssistantResult | None,
 ) -> _RemoteResultValidation:
-    if not _is_allowed_notion_route(result):
+    base_validation = _validate_remote_result_base(
+        result,
+        _ALLOWED_NOTION_ROUTES,
+    )
+    if not base_validation.accepted:
+        return base_validation
+    assert result is not None
+    if any(
+        not _is_notion_source_uri(source.uri)
+        for source in result.sources
+    ):
+        return _RemoteResultValidation(
+            accepted=False,
+            reason="unsafe_source_host",
+        )
+    return _RemoteResultValidation(accepted=True)
+
+
+def _matches_structured_api_request(
+    request: CompanyAssistantRequest,
+) -> bool:
+    # devices_filter는 단건 조회가 SSH open mutation으로 이어질 수 있어
+    # DB-only 전환 범위에서 명시적으로 제외한다.
+    return (
+        match_structured_read_route(request)
+        in _ALLOWED_STRUCTURED_ROUTES
+    )
+
+
+def _validate_remote_structured_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    base_validation = _validate_remote_result_base(
+        result,
+        _ALLOWED_STRUCTURED_ROUTES,
+    )
+    if not base_validation.accepted:
+        return base_validation
+    assert result is not None
+    if result.sources:
+        return _RemoteResultValidation(
+            accepted=False,
+            reason="unexpected_sources",
+        )
+    if result.used_llm:
+        return _RemoteResultValidation(
+            accepted=False,
+            reason="unexpected_llm",
+        )
+    return _RemoteResultValidation(accepted=True)
+
+
+def _validate_remote_result_base(
+    result: CompanyAssistantResult | None,
+    allowed_routes: frozenset[str],
+) -> _RemoteResultValidation:
+    if not _is_allowed_route(result, allowed_routes):
         # API가 다른 정책 route에서 명시적으로 거부한 결과는 local
-        # Notion으로 우회하지 않는다.
+        # route로 우회하지 않는다.
         if result is not None and result.outcome == "denied":
             return _RemoteResultValidation(
                 accepted=False,
@@ -387,13 +618,13 @@ def _validate_remote_notion_result(
             accepted=False,
             reason="unsafe_message_scope",
         )
-    if any(
-        not _is_notion_source_uri(source.uri)
-        for source in result.sources
+    if (
+        result.suggested_action is not None
+        or result.async_job is not None
     ):
         return _RemoteResultValidation(
             accepted=False,
-            reason="unsafe_source_host",
+            reason="unsafe_action",
         )
     return _RemoteResultValidation(accepted=True)
 
@@ -416,9 +647,19 @@ def _source_set(
 def _message_scopes(
     result: CompanyAssistantResult,
 ) -> tuple[str, ...]:
-    # 본문은 비교하거나 기록하지 않고 전달 범위와 메시지 개수만
-    # 비교한다.
+    # 본문 원문은 기록하지 않고 전달 범위만 비교한다.
     return tuple(message.delivery_scope for message in result.messages)
+
+
+def _message_body_digests(
+    result: CompanyAssistantResult,
+) -> tuple[str, ...]:
+    # deterministic DB 답변의 동일 여부만 남기고 실제 조회값은 로그에
+    # 노출하지 않는다.
+    return tuple(
+        hashlib.sha256(message.body.encode("utf-8")).hexdigest()
+        for message in result.messages
+    )
 
 
 def _is_notion_source_uri(value: object) -> bool:
@@ -446,5 +687,7 @@ def _safe_request_id(value: object) -> str:
 __all__ = [
     "BoundedShadowRunner",
     "CompanyNotionApiRolloutService",
+    "CompanyStructuredApiRolloutService",
     "wrap_company_notion_service",
+    "wrap_company_structured_service",
 ]

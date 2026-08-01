@@ -364,6 +364,9 @@ def create_company_assistant_runtime(
                 ),
             ),
             request_guard=_guard_read_only_request,
+            # 장비 상세는 MDA/SSH live enrichment와 분리되기 전까지
+            # read-only API의 structured stage에서 조회 전에 차단한다.
+            structured_device_filter_enabled=False,
         ),
         knowledge_route_factory=build_knowledge_routes,
         logger=app_logger,

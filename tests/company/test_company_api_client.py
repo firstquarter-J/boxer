@@ -197,25 +197,30 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         settings = load_company_api_client_settings({})
 
         self.assertEqual(settings.notion_mode, "local")
+        self.assertEqual(settings.structured_mode, "local")
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
         self.assertFalse(settings.notion_fallback_enabled)
+        self.assertFalse(settings.structured_fallback_enabled)
 
     def test_local_rollback_ignores_stale_remote_credentials(self) -> None:
         settings = load_company_api_client_settings(
             {
                 "BOXER_COMPANY_API_NOTION_MODE": "local",
+                "BOXER_COMPANY_API_STRUCTURED_MODE": "local",
                 "BOXER_COMPANY_API_BASE_URL": "http://public.example.com",
                 "BOXER_COMPANY_API_SERVICE_TOKEN": "stale-invalid-token",
                 "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "invalid",
                 "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "-1",
                 "BOXER_COMPANY_API_MAX_RETRIES": "999",
                 "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
             }
         )
 
         self.assertEqual(settings.notion_mode, "local")
+        self.assertEqual(settings.structured_mode, "local")
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
 
@@ -230,6 +235,8 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             replace(_settings(), token="short"),
             replace(_settings(), read_timeout_sec=float("nan")),
             replace(_settings(), max_retries=3),
+            replace(_settings(), structured_mode="invalid"),
+            replace(_settings(), structured_fallback_enabled="true"),
         )
 
         for settings in invalid_settings:
@@ -260,16 +267,91 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             "http://10.40.102.50:8010",
         )
         self.assertEqual(settings.notion_mode, "shadow")
+        self.assertEqual(settings.structured_mode, "local")
         self.assertEqual(settings.connect_timeout_sec, 1.5)
         self.assertEqual(settings.read_timeout_sec, 75)
         self.assertEqual(settings.max_retries, 2)
         self.assertFalse(settings.notion_fallback_enabled)
+        self.assertFalse(settings.structured_fallback_enabled)
         self.assertNotIn(_TOKEN, repr(settings))
+
+    def test_structured_mode_independently_enables_shared_transport(
+        self,
+    ) -> None:
+        settings = load_company_api_client_settings(
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_NOTION_MODE": "local",
+                "BOXER_COMPANY_API_STRUCTURED_MODE": "remote",
+                "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "false",
+                "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "true",
+            }
+        )
+
+        self.assertTrue(settings.enabled)
+        self.assertEqual(settings.notion_mode, "local")
+        self.assertEqual(settings.structured_mode, "remote")
+        self.assertFalse(settings.notion_fallback_enabled)
+        self.assertTrue(settings.structured_fallback_enabled)
+        self.assertEqual(
+            settings.base_url,
+            "http://10.40.102.50:8010",
+        )
+        self.assertNotIn(_TOKEN, repr(settings))
+
+    def test_notion_and_structured_modes_enable_transport_independently(
+        self,
+    ) -> None:
+        base = _settings()
+        cases = (
+            ("local", "local", False, False),
+            ("shadow", "local", True, True),
+            ("local", "shadow", True, True),
+            ("remote", "local", True, False),
+            ("local", "remote", True, False),
+        )
+        for (
+            notion_mode,
+            structured_mode,
+            expected_enabled,
+            expected_shadow_enabled,
+        ) in cases:
+            with self.subTest(
+                notion_mode=notion_mode,
+                structured_mode=structured_mode,
+            ):
+                settings = replace(
+                    base,
+                    notion_mode=notion_mode,
+                    structured_mode=structured_mode,
+                )
+                self.assertEqual(settings.enabled, expected_enabled)
+                self.assertEqual(
+                    settings.shadow_enabled,
+                    expected_shadow_enabled,
+                )
 
     def test_remote_configuration_rejects_unsafe_or_missing_values(self) -> None:
         cases = (
             {
                 "BOXER_COMPANY_API_NOTION_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_STRUCTURED_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_STRUCTURED_MODE": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_STRUCTURED_MODE": "shadow",
+                "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
             },
             {
                 "BOXER_COMPANY_API_NOTION_MODE": "remote",

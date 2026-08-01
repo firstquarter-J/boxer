@@ -11,7 +11,7 @@ from boxer_company.assistant import (
     CompanyAssistantResult,
     SourceReference,
 )
-from boxer_company_adapter_slack import company
+from boxer_company_adapter_slack import company, structured_routes
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiClientSettings,
 )
@@ -329,6 +329,91 @@ class CompanyRouteContractTests(unittest.TestCase):
         self.assertEqual(
             result.payload["request_log"]["route_name"],
             "company_notion_qa",
+        )
+
+    def test_structured_remote_mode_uses_api_without_local_db_query(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            structured_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="hospital_rooms_filter",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body="**공통 API 병실 조회**\n• 서울병원 병실 2개"
+                ),
+            ),
+        )
+        renderer_impl = structured_routes.render_company_assistant_result
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ) as client_factory,
+            patch.object(
+                structured_routes,
+                "render_company_assistant_result",
+                wraps=renderer_impl,
+            ) as renderer,
+            patch(
+                "boxer_company.assistant.structured_route."
+                "_query_hospital_rooms_by_filters"
+            ) as local_query,
+        ):
+            result = self._invoke_mention(
+                text="병원명 서울병원 병실 목록",
+                question="병원명 서울병원 병실 목록",
+                real_handlers={"_handle_structured_routes"},
+            )
+
+        client_factory.assert_called_once_with(settings)
+        api_client.answer.assert_called_once()
+        local_query.assert_not_called()
+        renderer.assert_called_once()
+        self.assertEqual(
+            result.route_calls,
+            list(
+                _ROUTE_HANDLER_ORDER[
+                    : _ROUTE_HANDLER_ORDER.index(
+                        "_handle_structured_routes"
+                    )
+                    + 1
+                ]
+            ),
+        )
+        self.assertEqual(
+            result.reply_calls,
+            [
+                (
+                    "*공통 API 병실 조회*\n• 서울병원 병실 2개",
+                    {},
+                )
+            ],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "hospital_rooms_filter",
+        )
+        self.assertEqual(
+            result.payload["request_log"]["handler_type"],
+            "router",
+        )
+        self.assertEqual(
+            result.payload["request_log"]["metadata"],
+            {
+                "assistantOutcome": "answered",
+                "assistantUsedLlm": False,
+            },
         )
 
     def test_unmatched_barcode_question_does_not_eagerly_prefetch_recordings(
