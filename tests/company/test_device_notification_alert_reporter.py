@@ -533,7 +533,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
         self.assertEqual(incident["slackPermalink"], "https://example.com/open")
         self.assertEqual(incident["suppressedCount"], 2)
 
-    def test_open_sheet_incident_suppresses_both_captureboard_event_codes(
+    def test_open_sheet_incident_suppresses_captureboard_but_keeps_recording_thread(
         self,
     ) -> None:
         for status in ("대기", "처리 중", "진행중"):
@@ -553,6 +553,20 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                         "initialized": True,
                         "lastSeenId": 52,
                         "pendingEvents": events,
+                        "recordingStallIncidents": {
+                            "MB2-C00992|-|-|recording": {
+                                "phase": "alerted",
+                                "deviceName": "MB2-C00992",
+                                "firstNotificationId": 50,
+                                "firstOccurredAt": "2026-07-09T03:34:31+00:00",
+                                "firstDurationSeconds": 120,
+                                "lastNotificationId": 50,
+                                "lastOccurredAt": "2026-07-09T03:34:31+00:00",
+                                "lastDurationSeconds": 120,
+                                "lastCurrentSize": 1000,
+                                "slackMessageTs": "1000.050",
+                            }
+                        },
                     }
                 )
                 self.load_sheet_incidents_mock.return_value = {
@@ -564,6 +578,8 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                     }
                 }
                 auto_sms_sender = Mock()
+                client = Mock()
+                client.chat_postMessage.return_value = {"ts": "1000.052"}
 
                 with patch.object(
                     reporter,
@@ -571,7 +587,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 ) as post_mock:
                     result_state, sent_count = (
                         reporter._deliver_pending_device_notification_alerts(
-                            Mock(),
+                            client,
                             self.logger,
                             state,
                             channel_id="C094UC05PQW",
@@ -581,27 +597,35 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                         )
                     )
 
-                self.assertEqual(sent_count, 0)
+                self.assertEqual(sent_count, 1)
                 self.assertEqual(result_state["pendingEvents"], [])
                 post_mock.assert_not_called()
                 auto_sms_sender.assert_not_called()
                 self.append_sheet_mock.assert_not_called()
+                client.chat_postMessage.assert_called_once()
+                self.assertEqual(
+                    client.chat_postMessage.call_args.kwargs["thread_ts"],
+                    "1000.050",
+                )
                 incident = result_state["captureboardIncidents"]["MB2-C00992"]
                 self.assertEqual(incident["status"], "".join(status.split()))
-                self.assertEqual(incident["suppressedCount"], 2)
-                self.assertEqual(incident["lastSuppressedNotificationId"], 52)
+                self.assertEqual(incident["suppressedCount"], 1)
+                self.assertEqual(incident["lastSuppressedNotificationId"], 51)
                 self.assertEqual(
                     incident["lastSuppressedCode"],
-                    "recording_critically_stalled",
+                    "captureboard_connection_error",
                 )
-                self.assertEqual(result_state["recordingStallIncidents"], {})
+                recording_incident = next(
+                    iter(result_state["recordingStallIncidents"].values())
+                )
+                self.assertEqual(recording_incident["lastDurationSeconds"], 240)
                 self.assertEqual(
                     result_state["captureboardIncidentsLastSheetCheckedAt"],
                     self.now.isoformat(),
                 )
                 self.append_sheet_mock.reset_mock()
 
-    def test_sheet_backed_first_alert_suppresses_later_code_in_same_batch(
+    def test_sheet_backed_captureboard_alert_does_not_suppress_recording_alert(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -652,16 +676,18 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                     )
                 )
 
-            self.assertEqual(sent_count, 1)
+            self.assertEqual(sent_count, 2)
             self.assertEqual(result_state["pendingEvents"], [])
-            post_mock.assert_called_once()
-            auto_sms_sender.assert_called_once()
-            self.append_sheet_mock.assert_called_once()
+            self.assertEqual(post_mock.call_count, 2)
+            self.assertEqual(auto_sms_sender.call_count, 2)
+            self.assertEqual(self.append_sheet_mock.call_count, 2)
             incident = result_state["captureboardIncidents"]["MB2-C00992"]
-            self.assertEqual(incident["openedNotificationId"], 61)
-            self.assertEqual(incident["suppressedCount"], 1)
-            self.assertEqual(incident["lastSuppressedNotificationId"], 62)
-            self.assertEqual(result_state["recordingStallIncidents"], {})
+            self.assertEqual(incident["openedNotificationId"], 62)
+            self.assertEqual(incident["suppressedCount"], 0)
+            recording_incident = next(
+                iter(result_state["recordingStallIncidents"].values())
+            )
+            self.assertEqual(recording_incident["lastDurationSeconds"], 240)
 
     def test_closed_or_unknown_sheet_incident_allows_new_captureboard_alert(
         self,
@@ -730,7 +756,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 self.assertEqual(result_state["captureboardIncidents"], {})
                 self.append_sheet_mock.reset_mock()
 
-    def test_sheet_lookup_failure_fails_open_and_clears_old_recording_state(
+    def test_sheet_lookup_failure_fails_open_and_preserves_recording_state(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -783,7 +809,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(sent_count, 1)
             post_mock.assert_called_once()
             self.assertEqual(result_state["captureboardIncidents"], {})
-            self.assertEqual(result_state["recordingStallIncidents"], {})
+            self.assertIn(incident_key, result_state["recordingStallIncidents"])
             self.load_sheet_incidents_mock.side_effect = None
 
     def test_supported_device_notification_codes_are_accepted(self) -> None:
@@ -1066,7 +1092,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             )
             self.load_sheet_incidents_mock.assert_not_called()
 
-    def test_two_minute_recording_stall_sheet_row_suppresses_same_batch_repeats(
+    def test_two_minute_recording_stall_posts_later_durations_in_root_thread(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1105,6 +1131,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 }
             )
             client = Mock()
+            client.chat_postMessage.return_value = {"ts": "1000.002"}
             self.append_sheet_mock.return_value = 1
 
             with patch.object(
@@ -1127,7 +1154,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                     )
                 )
 
-            self.assertEqual(sent_count, 1)
+            self.assertEqual(sent_count, 4)
             self.assertEqual(result_state["pendingEvents"], [])
             post_root_mock.assert_called_once()
             self.assertTrue(post_root_mock.call_args.kwargs["include_blocks"])
@@ -1166,7 +1193,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 root_blocks[2]["fields"],
                 [{"type": "mrkdwn", "text": f"🔎 *감지 내용*\n`{root_issue}`"}],
             )
-            # 120초 루트 행이 대기로 생성되면 240초 이후 이벤트는 같은 장애로 소비한다.
+            # Sheet 행은 최초 120초 루트만 기록하고 이후 지속 이벤트는 Slack 댓글로 잇는다.
             self.append_sheet_mock.assert_called_once()
             recording_sheet_items = self.append_sheet_mock.call_args.args[0]
             self.assertEqual(recording_sheet_items[0]["device"], "MB2-C00992")
@@ -1179,13 +1206,37 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 self.append_sheet_mock.call_args.kwargs["slack_permalink"],
                 "https://example.com/recording-stall",
             )
-            client.chat_postMessage.assert_not_called()
-            self.assertEqual(result_state["recordingStallIncidents"], {})
+            self.assertEqual(client.chat_postMessage.call_count, 3)
+            self.assertEqual(
+                [call.kwargs["thread_ts"] for call in client.chat_postMessage.call_args_list],
+                ["1000.001", "1000.001", "1000.001"],
+            )
+            self.assertEqual(
+                [call.kwargs["text"] for call in client.chat_postMessage.call_args_list],
+                [
+                    ":warning: *녹화 파일 증가 정지 지속*\n"
+                    "> *지속 시간*  `240초 (4분)`\n"
+                    "> *현재 증가율*  `0.00 KB/sec`\n"
+                    "> *발생 시각*  `2026-07-09 12:36:31 KST`",
+                    ":warning: *녹화 파일 증가 정지 지속*\n"
+                    "> *지속 시간*  `360초 (6분)`\n"
+                    "> *현재 증가율*  `0.00 KB/sec`\n"
+                    "> *발생 시각*  `2026-07-09 12:38:31 KST`",
+                    ":warning: *녹화 파일 증가 정지 지속*\n"
+                    "> *지속 시간*  `480초 (8분)`\n"
+                    "> *현재 증가율*  `0.00 KB/sec`\n"
+                    "> *발생 시각*  `2026-07-09 12:40:31 KST`",
+                ],
+            )
+            recording_incident = next(
+                iter(result_state["recordingStallIncidents"].values())
+            )
+            self.assertEqual(recording_incident["lastDurationSeconds"], 480)
+            self.assertEqual(recording_incident["lastCommentNotificationId"], 24)
             incident = result_state["captureboardIncidents"]["MB2-C00992"]
             self.assertEqual(incident["openedNotificationId"], 21)
             self.assertEqual(incident["openedCode"], "recording_critically_stalled")
-            self.assertEqual(incident["suppressedCount"], 3)
-            self.assertEqual(incident["lastSuppressedNotificationId"], 24)
+            self.assertEqual(incident["suppressedCount"], 0)
 
     def test_sheet_append_failure_keeps_followup_in_thread_without_resending_sms(
         self,
@@ -1269,6 +1320,82 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             incident = next(iter(second_state["recordingStallIncidents"].values()))
             self.assertEqual(incident["phase"], "alerted")
             self.assertEqual(incident["lastNotificationId"], 32)
+            self.assertEqual(incident["lastDurationSeconds"], 240)
+
+    def test_blank_sheet_status_keeps_next_poll_recording_event_in_thread(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state = reporter._normalize_device_notification_alert_state(
+                {
+                    "initialized": True,
+                    "lastSeenId": 31,
+                    "pendingEvents": [
+                        _recording_stall_event(
+                            31,
+                            duration_seconds=120,
+                            current_size=1000,
+                            occurred_at="2026-07-09T03:34:31+00:00",
+                        )
+                    ],
+                }
+            )
+            self.append_sheet_mock.return_value = 1
+            client = Mock()
+            client.chat_postMessage.return_value = {"ts": "1000.032"}
+
+            with patch.object(
+                reporter,
+                "_post_daily_device_round_abnormal_alert",
+                return_value={
+                    "channelId": "C094UC05PQW",
+                    "messageTs": "1000.031",
+                    "permalink": "https://example.com/two-minute-recording-stall",
+                },
+            ) as post_root_mock:
+                first_state, first_count = (
+                    reporter._deliver_pending_device_notification_alerts(
+                        client,
+                        self.logger,
+                        state,
+                        channel_id="C094UC05PQW",
+                        now=self.now,
+                        state_path=state_path,
+                    )
+                )
+                # TA 관리 상태가 아직 빈칸이어도 Slack incident의 thread_ts는 보존한다.
+                second_state, second_count = (
+                    reporter._deliver_pending_device_notification_alerts(
+                        client,
+                        self.logger,
+                        {
+                            **first_state,
+                            "lastSeenId": 32,
+                            "pendingEvents": [
+                                _recording_stall_event(
+                                    32,
+                                    duration_seconds=240,
+                                    current_size=1000,
+                                    occurred_at="2026-07-09T03:36:31+00:00",
+                                )
+                            ],
+                        },
+                        channel_id="C094UC05PQW",
+                        now=self.now,
+                        state_path=state_path,
+                    )
+                )
+
+            self.assertEqual((first_count, second_count), (1, 1))
+            post_root_mock.assert_called_once()
+            self.append_sheet_mock.assert_called_once()
+            client.chat_postMessage.assert_called_once()
+            self.assertEqual(
+                client.chat_postMessage.call_args.kwargs["thread_ts"],
+                "1000.031",
+            )
+            incident = next(iter(second_state["recordingStallIncidents"].values()))
             self.assertEqual(incident["lastDurationSeconds"], 240)
 
     def test_recording_stall_alerts_immediately_at_two_minutes(self) -> None:
@@ -1401,7 +1528,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(result_state["recordingStallIncidents"], {})
             post_root_mock.assert_not_called()
 
-    def test_completed_sheet_incident_restarts_recording_alert_immediately(
+    def test_completed_sheet_incident_keeps_recording_alert_in_original_thread(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1453,6 +1580,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             }
             self.append_sheet_mock.return_value = 1
             client = Mock()
+            client.chat_postMessage.return_value = {"ts": "1000.043"}
 
             with patch.object(
                 reporter,
@@ -1475,13 +1603,16 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 )
 
             self.assertEqual(sent_count, 1)
-            post_root_mock.assert_called_once()
-            client.chat_postMessage.assert_not_called()
-            self.append_sheet_mock.assert_called_once()
-            self.assertEqual(result_state["recordingStallIncidents"], {})
-            reopened = result_state["captureboardIncidents"]["MB2-C00992"]
-            self.assertEqual(reopened["openedNotificationId"], 43)
-            self.assertEqual(reopened["openedCode"], "recording_critically_stalled")
+            post_root_mock.assert_not_called()
+            client.chat_postMessage.assert_called_once()
+            self.assertEqual(
+                client.chat_postMessage.call_args.kwargs["thread_ts"],
+                "1000.001",
+            )
+            self.append_sheet_mock.assert_not_called()
+            incident = result_state["recordingStallIncidents"][incident_key]
+            self.assertEqual(incident["lastDurationSeconds"], 360)
+            self.assertEqual(result_state["captureboardIncidents"], {})
 
     def test_missing_sheet_row_preserves_non_sheet_recording_thread(
         self,

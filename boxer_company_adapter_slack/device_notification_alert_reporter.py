@@ -513,39 +513,6 @@ def _captureboard_incident_pending_device_names(
     }
 
 
-def _recording_stall_alerted_device_names(state: dict[str, Any]) -> set[str]:
-    return {
-        str(incident.get("deviceName") or "").strip()
-        for incident in (state.get("recordingStallIncidents") or {}).values()
-        if isinstance(incident, dict)
-        and incident.get("phase") == "alerted"
-        and str(incident.get("deviceName") or "").strip()
-    }
-
-
-def _clear_recording_stall_incidents_for_devices(
-    state: dict[str, Any],
-    device_names: set[str],
-) -> dict[str, Any]:
-    normalized_device_names = {
-        str(device_name or "").strip()
-        for device_name in device_names
-        if str(device_name or "").strip()
-    }
-    if not normalized_device_names:
-        return state
-    incidents = {
-        incident_key: incident
-        for incident_key, incident in (
-            state.get("recordingStallIncidents") or {}
-        ).items()
-        if not isinstance(incident, dict)
-        or str(incident.get("deviceName") or "").strip()
-        not in normalized_device_names
-    }
-    return {**state, "recordingStallIncidents": incidents}
-
-
 def _normalize_sheet_captureboard_incident(
     value: Any,
     *,
@@ -580,33 +547,22 @@ def _refresh_captureboard_incidents_from_sheet(
     if not pending_device_names:
         return state
 
-    legacy_alerted_device_names = _recording_stall_alerted_device_names(state)
     try:
         loaded = _load_device_health_sheet_captureboard_incidents()
     except Exception:
-        # Sheet 상태를 확인할 수 없을 때는 unified open 연결만 해제해 후속 이벤트를
-        # 숨기지 않는다. Sheet와 연결되지 않은 기존 녹화 스레드는 재시도 흐름을 유지한다.
+        # Sheet 조회 실패는 처리 현황만 초기화하고 Slack 녹화 스레드는 독립적으로 유지한다.
         reset_device_names = set(current_incidents)
-        next_state = _clear_recording_stall_incidents_for_devices(
-            state,
-            reset_device_names,
-        )
         logger.warning(
             "캡처보드 장애 처리 상태를 Google Sheets에서 읽지 못했어. "
             "후속 이벤트를 다시 알릴게 devices=%s",
             ",".join(sorted(reset_device_names)) or "없음",
             exc_info=True,
         )
-        return {**next_state, "captureboardIncidents": {}}
+        return {**state, "captureboardIncidents": {}}
 
     if loaded is None:
-        # 비활성 Sheet의 unified open 상태만 해제하고 기존 녹화 스레드 동작은 보존한다.
-        reset_device_names = set(current_incidents)
-        next_state = _clear_recording_stall_incidents_for_devices(
-            state,
-            reset_device_names,
-        )
-        return {**next_state, "captureboardIncidents": {}}
+        # 비활성 Sheet의 처리 현황만 해제하고 기존 녹화 스레드 동작은 보존한다.
+        return {**state, "captureboardIncidents": {}}
 
     sheet_incidents: dict[str, dict[str, Any]] = {}
     if isinstance(loaded, dict):
@@ -620,12 +576,7 @@ def _refresh_captureboard_incidents_from_sheet(
 
     checked_at = now.isoformat()
     next_incidents: dict[str, dict[str, Any]] = {}
-    reset_device_names: set[str] = set()
-    tracked_device_names = (
-        set(current_incidents)
-        | pending_device_names
-        | legacy_alerted_device_names
-    )
+    tracked_device_names = set(current_incidents) | pending_device_names
     for device_name in tracked_device_names:
         sheet_incident = sheet_incidents.get(device_name)
         sheet_status = (
@@ -648,19 +599,9 @@ def _refresh_captureboard_incidents_from_sheet(
                 "openedAt": str(previous.get("openedAt") or checked_at),
                 "lastSheetCheckedAt": checked_at,
             }
-            # Sheet에 열린 행이 있으면 기존 녹화 후보·스레드는 같은 장애에 속하므로 폐기한다.
-            reset_device_names.add(device_name)
-        elif device_name in current_incidents:
-            # Sheet에 실제로 연결했던 장애만 완료·이상없음·행 없음일 때 닫는다.
-            # Sheet 기록에 실패한 녹화 알림 상태까지 지우면 후속 이벤트가 새 루트·문자로 중복된다.
-            reset_device_names.add(device_name)
-
-    next_state = _clear_recording_stall_incidents_for_devices(
-        state,
-        reset_device_names,
-    )
+            # Sheet 처리 상태는 캡처보드 중복 억제에만 쓰고 녹화 Slack 스레드는 건드리지 않는다.
     return {
-        **next_state,
+        **state,
         "captureboardIncidents": next_incidents,
         "captureboardIncidentsLastSheetCheckedAt": checked_at,
     }
@@ -693,12 +634,8 @@ def _mark_captureboard_incident_open(
         "lastSuppressedCode": "",
         "suppressedCount": 0,
     }
-    next_state = {**state, "captureboardIncidents": incidents}
-    # 같은 batch의 다음 녹화 이벤트가 이전 후보나 스레드로 이어지지 않게 즉시 정리한다.
-    return _clear_recording_stall_incidents_for_devices(
-        next_state,
-        {device_name},
-    )
+    # Sheet 처리 상태와 Slack 녹화 스레드 상태를 함께 보존해 후속 정지 이벤트를 댓글로 잇는다.
+    return {**state, "captureboardIncidents": incidents}
 
 
 def _suppress_open_captureboard_incident_event(
@@ -709,6 +646,9 @@ def _suppress_open_captureboard_incident_event(
 ) -> dict[str, Any] | None:
     code = str(event.get("code") or "").strip()
     device_name = str(event.get("deviceName") or "").strip()
+    # 녹화 정지는 2분 루트 이후 지속 시간을 Slack 댓글로 계속 알려야 한다.
+    if code == _RECORDING_CRITICALLY_STALLED:
+        return None
     if code not in _CAPTUREBOARD_INCIDENT_CODES or not device_name:
         return None
     incidents = dict(state.get("captureboardIncidents") or {})
@@ -1429,7 +1369,7 @@ def _process_recording_stall_event(
     }
     next_state = {**state, "recordingStallIncidents": incidents}
     if sheet_recorded:
-        # Sheet의 대기 행이 생성된 순간부터 같은 장비의 후속 이벤트를 한 장애로 묶는다.
+        # Sheet 처리 행을 추적하되 후속 녹화 이벤트의 Slack thread_ts는 별도로 보존한다.
         next_state = _mark_captureboard_incident_open(
             next_state,
             event,
