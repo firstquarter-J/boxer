@@ -3150,22 +3150,28 @@ def _collect_device_health_monitor_redis_availability_reasons(
 ) -> list[str]:
     device_name = _display_value(device_context.get("deviceName"), default="장비명 미확인")
     reasons: list[str] = []
-    device_stale = _is_device_health_monitor_state_stale(device_state, now=now)
-    agent_stale = _is_device_health_monitor_state_stale(agent_state, now=now)
-    if device_stale and agent_stale:
-        return [f"{device_name} 상태 정보가 Redis에서 갱신되지 않고 있어"]
-    if device_stale:
+
+    # 장비 상태는 주기 status 갱신으로 freshness를 확인하되, agent updatedAt은 heartbeat가 아니라
+    # 마지막 접속/SSH 변경 시각이므로 freshness gate로 쓰지 않는다.
+    if not isinstance(device_state, dict):
+        reasons.append(f"{device_name} 장비 상태 정보가 Redis에 없어")
+    elif _is_device_health_monitor_state_stale(device_state, now=now):
         reasons.append(f"{device_name} 장비 상태 정보가 Redis에서 갱신되지 않고 있어")
-    if agent_stale:
-        reasons.append(f"{device_name} agent 상태 정보가 Redis에서 갱신되지 않고 있어")
+    else:
+        device_connected = device_state.get("isConnected")
+        if device_connected is False:
+            reasons.append("장비 socket 연결이 끊겼어")
+        elif device_connected is not True:
+            reasons.append("장비 socket 연결 상태를 확인할 수 없어")
 
-    device_connected = device_state.get("isConnected") if isinstance(device_state, dict) else None
-    if device_connected is False:
-        reasons.append("장비 socket 연결이 끊겼어")
-
-    agent_connected = agent_state.get("isConnected") if isinstance(agent_state, dict) else None
-    if agent_connected is False:
-        reasons.append("장비 agent 연결이 끊겼어")
+    if not isinstance(agent_state, dict):
+        reasons.append(f"{device_name} agent 상태 정보가 Redis에 없어")
+    else:
+        agent_connected = agent_state.get("isConnected")
+        if agent_connected is False:
+            reasons.append("장비 agent 연결이 끊겼어")
+        elif agent_connected is not True:
+            reasons.append("장비 agent 연결 상태를 확인할 수 없어")
 
     device_status = _display_value((device_state or {}).get("status"), default="").strip().upper()
     if any(token in device_status for token in ("EXIT", "DISCONNECT", "OFFLINE")):

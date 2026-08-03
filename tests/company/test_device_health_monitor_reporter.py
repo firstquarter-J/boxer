@@ -3053,7 +3053,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         alert_items = reporter._collect_daily_device_round_abnormal_alert_items(summary)
         self.assertEqual(alert_items, [])
 
-    def test_redis_stale_device_is_not_alert_candidate(self) -> None:
+    def test_redis_old_agent_updated_at_connected_device_is_still_evaluated(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
         stale_at = (local_now - timedelta(minutes=10)).isoformat()
         device_context = {
@@ -3070,7 +3070,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                         "deviceName": "MB2-C00043",
                         "isConnected": True,
                         "status": "CONNECTED",
-                        "updatedAt": stale_at,
+                        "updatedAt": local_now.isoformat(),
                     },
                     "agentState": {
                         "isConnected": True,
@@ -3081,7 +3081,6 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         )
 
         with (
-            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC", 180),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_device_candidates",
                 return_value=[device_context],
@@ -3098,9 +3097,94 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
         ssh_verify_mock.assert_not_called()
         self.assertEqual(summary["abnormalCandidateCount"], 0)
-        self.assertEqual(summary["statusCounts"]["점검 불가"], 1)
-        self.assertEqual(summary["deviceResults"][0]["overallLabel"], "점검 불가")
+        self.assertEqual(summary["statusCounts"]["정상"], 1)
+        self.assertEqual(summary["statusCounts"]["점검 불가"], 0)
+        self.assertEqual(summary["deviceResults"][0]["overallLabel"], "정상")
         self.assertEqual(reporter._collect_daily_device_round_abnormal_alert_items(summary), [])
+
+    def test_redis_stale_device_is_still_unavailable(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        stale_at = (local_now - timedelta(minutes=10)).isoformat()
+
+        reasons = reporter._collect_device_health_monitor_redis_availability_reasons(
+            device_context={"deviceName": "MB2-C00043"},
+            device_state={"isConnected": True, "updatedAt": stale_at},
+            agent_state={"isConnected": True, "updatedAt": stale_at},
+            now=local_now,
+        )
+
+        self.assertEqual(
+            reasons,
+            ["MB2-C00043 장비 상태 정보가 Redis에서 갱신되지 않고 있어"],
+        )
+
+    def test_redis_availability_requires_explicit_connected_states(self) -> None:
+        device_context = {"deviceName": "MB2-C00043"}
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        connected = {"isConnected": True, "updatedAt": local_now.isoformat()}
+        old_connected_agent = {
+            "isConnected": True,
+            "updatedAt": (local_now - timedelta(days=30)).isoformat(),
+        }
+
+        # Agent 시간은 무시하되, 양쪽 연결 상태는 명시적인 true만 허용한다.
+        cases = (
+            ("old connected agent", connected, old_connected_agent, []),
+            (
+                "device state missing",
+                None,
+                connected,
+                ["MB2-C00043 장비 상태 정보가 Redis에 없어"],
+            ),
+            (
+                "agent state missing",
+                connected,
+                None,
+                ["MB2-C00043 agent 상태 정보가 Redis에 없어"],
+            ),
+            (
+                "device disconnected",
+                {"isConnected": False, "updatedAt": local_now.isoformat()},
+                connected,
+                ["장비 socket 연결이 끊겼어"],
+            ),
+            (
+                "agent disconnected",
+                connected,
+                {"isConnected": False},
+                ["장비 agent 연결이 끊겼어"],
+            ),
+            (
+                "device connection unknown",
+                {"isConnected": None, "updatedAt": local_now.isoformat()},
+                connected,
+                ["장비 socket 연결 상태를 확인할 수 없어"],
+            ),
+            (
+                "agent connection missing",
+                connected,
+                {},
+                ["장비 agent 연결 상태를 확인할 수 없어"],
+            ),
+            (
+                "non boolean connection",
+                {"isConnected": 1, "updatedAt": local_now.isoformat()},
+                connected,
+                ["장비 socket 연결 상태를 확인할 수 없어"],
+            ),
+        )
+
+        for label, device_state, agent_state, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    reporter._collect_device_health_monitor_redis_availability_reasons(
+                        device_context=device_context,
+                        device_state=device_state,
+                        agent_state=agent_state,
+                        now=local_now,
+                    ),
+                    expected,
+                )
 
     def test_redis_captureboard_status_none_is_ignored_when_usb_list_confirms_captureboard(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -3180,7 +3264,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     },
                     "agentState": {
                         "isConnected": True,
-                        "updatedAt": local_now.isoformat(),
+                        # Agent 시간이 오래돼도 연결 상태가 true면 Redis 이상 후보를 SSH로 검증한다.
+                        "updatedAt": (local_now - timedelta(days=1)).isoformat(),
                     },
                 }
             }
