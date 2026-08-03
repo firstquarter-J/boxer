@@ -148,6 +148,47 @@ class BarcodeLogHelperTests(unittest.TestCase):
         self.assertEqual(hospital_name, "분당제일여성병원(성남)")
         self.assertEqual(room_name, "3층 C동 초음파실3")
 
+    def test_extract_hospital_room_scope_ignores_count_question_endings(self) -> None:
+        # 병원 라벨 뒤의 문장형 수량 표현과 연도는 병원명 후보가 아니다.
+        for question in (
+            "2099년 병원 몇 개야?",
+            "2099년 병원 몇 개인가요?",
+            "2099년 병원 몇 개예요?",
+            "2099년 병원 몇 개 있어?",
+            "2099년 병원 몇 개 있어요?",
+            "2099년 병원 몇 개 있나요?",
+            "2099년 병원 목록",
+            "2099년 병원 개수",
+            "2099년 병원 갯수",
+            "2099년 병원 개수야?",
+            "2099년 병원 총 몇 개야?",
+            "2099년 병원은 몇 개야?",
+            "병원 몇 개나 되나요?",
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(
+                    _extract_hospital_room_scope(question),
+                    (None, None),
+                )
+
+    def test_extract_hospital_room_scope_preserves_real_hospital_names_in_count_questions(
+        self,
+    ) -> None:
+        # 수량 질문 suffix만 제거하고 병원명 자체는 그대로 유지한다.
+        cases = (
+            ("개나리병원 몇 개야?", ("개나리병원", None)),
+            ("개나리병원 개수", ("개나리병원", None)),
+            ("개나리병원은 몇 개야?", ("개나리병원", None)),
+            ("서울병원 병실 몇 개야?", ("서울병원", None)),
+            ("서울병원 병실 갯수", ("서울병원", None)),
+        )
+        for question, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    _extract_hospital_room_scope(question),
+                    expected,
+                )
+
     def test_phase2_parser_keeps_hyphenated_room_and_later_date(self) -> None:
         question = "@Boxer 16971952215 나무정원여성병원(양주) 2층1-1진료실 MB2-A00313 2026-04-22 영상 다운"
 

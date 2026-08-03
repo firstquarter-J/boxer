@@ -461,6 +461,28 @@ class StructuredAssistantRouteTests(unittest.TestCase):
             count_only=False,
         )
 
+    def test_hospital_count_question_does_not_use_question_as_name(self) -> None:
+        route = StructuredAssistantRoute(
+            is_weekly_report_request=lambda *args, **kwargs: False,
+        )
+        with patch(
+            "boxer_company.assistant.structured_route."
+            "_query_hospitals_by_filters",
+            return_value="*병원 조회 결과*\n• hospitals row 수: *0개*",
+        ) as query:
+            result = route.handle(_request("2099년 병원 몇 개야?"))
+
+        self.assertEqual(result.route, "hospitals_filter")
+        self.assertEqual(result.outcome, "answered")
+        # 수량 질의 문구가 hospital_name으로 전달되지 않아야 한다.
+        query.assert_called_once_with(
+            hospital_name=None,
+            hospital_seq=None,
+            target_date=None,
+            target_year=2099,
+            count_only=True,
+        )
+
     def test_device_query_remains_enabled_for_local_runtime(
         self,
     ) -> None:

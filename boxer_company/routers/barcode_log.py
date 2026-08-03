@@ -60,11 +60,11 @@ _OS_LIFECYCLE_JOURNAL_GREP_PATTERN = (
 _OS_LIFECYCLE_PRE_WINDOW_SEC = 180
 _OS_LIFECYCLE_POST_WINDOW_SEC = 420
 _HOSPITAL_SCOPE_PATTERN = re.compile(
-    r"(?:^|\s)병원(?:명)?\s*[:=]?\s*(.+?)(?=\s*(?:병실(?:명)?|진료실명|장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)\s*[:=]?|$)",
+    r"(?:^|\s)병원(?:명)?\s*[:=]?\s*(.*?)(?=\s*(?:병실(?:명)?|진료실명|장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)\s*[:=]?|$)",
     re.IGNORECASE,
 )
 _ROOM_SCOPE_PATTERN = re.compile(
-    r"(?:^|[\s)])(?:병실(?:명)?|진료실명)\s*[:=]?\s*(.+?)(?=\s*(?:장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|파일|file|download|다운로드|다운)\s*[:=]?|$)",
+    r"(?:^|[\s)])(?:병실(?:명)?|진료실명)\s*[:=]?\s*(.*?)(?=\s*(?:장비명|devicename|날짜|로그|분석|(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|파일|file|download|다운로드|다운)\s*[:=]?|$)",
     re.IGNORECASE,
 )
 _ROOM_TOKEN_PATTERN = re.compile(
@@ -80,6 +80,14 @@ _LEADING_HOSPITAL_SCOPE_PATTERN = re.compile(
 )
 _LEADING_HOSPITAL_KEYWORD_SCOPE_PATTERN = re.compile(
     r"^\s*(.+?)\s+병원\s+(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운)(?:\s|$)",
+    re.IGNORECASE,
+)
+_SCOPE_COUNT_QUERY_SUFFIX_PATTERN = re.compile(
+    r"(?:^|\s)(?:총\s*)?(?:몇\s*개(?:나)?|개수|갯수|수)"
+    r"(?:\s*(?:야|냐|니|인가(?:요)?|예요|에요|입니까|인지|"
+    r"있어(?:요)?|있나(?:요)?|있는지|일까(?:요)?|죠|"
+    r"되나(?:요)?|되는지|될까(?:요)?))?"
+    r"\s*[?？.!~]*\s*$",
     re.IGNORECASE,
 )
 _LEADING_HOSPITAL_SCOPE_QUESTION_TOKENS = (
@@ -4392,6 +4400,13 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         normalized = re.sub(r"<@[^>]+>", " ", str(value or ""))
         normalized = re.sub(r"(?<!\S)@\S+", " ", normalized)
         normalized = " ".join(normalized.split()).strip().strip("`'\"[]")
+        # 이름 뒤의 자연어 수량 질문만 제거해 `개나리병원` 같은 실제 이름은 보존한다.
+        normalized = _SCOPE_COUNT_QUERY_SUFFIX_PATTERN.sub("", normalized).strip()
+        normalized = re.sub(
+            r"((?:병원|의원|클리닉|센터))(?:들)?(?:은|는|이|가)\s*$",
+            r"\1",
+            normalized,
+        )
         normalized = re.sub(r"(?<!\d)\d{11}(?!\d)", "", normalized)
         normalized = re.sub(r"\s+\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*$", "", normalized)
         normalized = re.sub(r"\s+\d{1,2}\s*월\s*\d{1,2}\s*일\s*$", "", normalized)
@@ -4429,11 +4444,13 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
 
     def _is_scope_noise(value: str) -> bool:
         cleaned = " ".join(str(value or "").split()).strip()
+        cleaned = _SCOPE_COUNT_QUERY_SUFFIX_PATTERN.sub("", cleaned).strip()
         if not cleaned:
             return True
+        cleaned = re.sub(r"[?!.~]+\s*$", "", cleaned).strip()
         return bool(
             re.fullmatch(
-                r"(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운|\d{2,4}\s*년(?:도)?)(?:\s+(?:개수|갯수|수|조회|목록))?",
+                r"(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운|총|은|는|이|가|들이?|들은|\d{2,4}\s*년(?:도)?|(?:\d{2,4}\s*년(?:도)?\s+)?(?:병원|병실|진료실))(?:\s+(?:개수|갯수|수|조회|목록))?",
                 cleaned,
                 flags=re.IGNORECASE,
             )
@@ -4503,6 +4520,13 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         cleaned_fallback = _clean(fallback_text)
         if any(token in cleaned_fallback for token in ("병원", "의원", "클리닉", "센터")):
             hospital_name = cleaned_fallback
+
+    # fallback에서 날짜나 질의어만 다시 scope로 유도될 수 있어 최종 후보에도
+    # 동일한 noise 판정을 적용한다.
+    if _is_scope_noise(hospital_name):
+        hospital_name = ""
+    if _is_scope_noise(room_name):
+        room_name = ""
 
     return (hospital_name or None, room_name or None)
 
