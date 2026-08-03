@@ -90,6 +90,9 @@ _SCOPE_COUNT_QUERY_SUFFIX_PATTERN = re.compile(
     r"\s*[?？.!~]*\s*$",
     re.IGNORECASE,
 )
+_SCOPE_COUNT_GRAMMAR_RESIDUES = frozenset(
+    {"총", "은", "는", "이", "가", "들", "들이", "들은"}
+)
 _LEADING_HOSPITAL_SCOPE_QUESTION_TOKENS = (
     "모션감지",
     "모션 감지",
@@ -4395,6 +4398,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
     text = (question or "").strip()
     hospital_match = _HOSPITAL_SCOPE_PATTERN.search(text)
     room_match = _ROOM_SCOPE_PATTERN.search(text)
+    has_count_query = bool(_SCOPE_COUNT_QUERY_SUFFIX_PATTERN.search(text))
 
     def _clean(value: str) -> str:
         normalized = re.sub(r"<@[^>]+>", " ", str(value or ""))
@@ -4450,7 +4454,7 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
         cleaned = re.sub(r"[?!.~]+\s*$", "", cleaned).strip()
         return bool(
             re.fullmatch(
-                r"(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운|총|은|는|이|가|들이?|들은|\d{2,4}\s*년(?:도)?|(?:\d{2,4}\s*년(?:도)?\s+)?(?:병원|병실|진료실))(?:\s+(?:개수|갯수|수|조회|목록))?",
+                r"(?:(?:초음파\s*)?영상|비디오|동영상|녹화|캡처|스냅샷|개수|갯수|수|몇\s*개|있나|있는지|있어|유무|존재|조회|목록|다운로드|다운|\d{2,4}\s*년(?:도)?|(?:\d{2,4}\s*년(?:도)?\s+)?(?:병원|병실|진료실))(?:\s+(?:개수|갯수|수|조회|목록))?",
                 cleaned,
                 flags=re.IGNORECASE,
             )
@@ -4458,6 +4462,11 @@ def _extract_hospital_room_scope(question: str) -> tuple[str | None, str | None]
 
     hospital_name = _clean(hospital_match.group(1)) if hospital_match else ""
     room_name = _clean(room_match.group(1)) if room_match else ""
+    # 조사·총계 표현은 수량 질문에서 캡처된 경우에만 버려 한 글자 실제 scope를 보존한다.
+    if has_count_query and hospital_name in _SCOPE_COUNT_GRAMMAR_RESIDUES:
+        hospital_name = ""
+    if has_count_query and room_name in _SCOPE_COUNT_GRAMMAR_RESIDUES:
+        room_name = ""
     if _is_scope_noise(hospital_name):
         hospital_name = ""
     if _is_scope_noise(room_name):

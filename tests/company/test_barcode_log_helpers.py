@@ -189,6 +189,13 @@ class BarcodeLogHelperTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_extract_hospital_room_scope_preserves_single_character_names(self) -> None:
+        # 수량 질문이 아니면 조사와 같은 한 글자도 명시된 scope 값으로 유지한다.
+        self.assertEqual(
+            _extract_hospital_room_scope("병원명 이 병실명 가 조회"),
+            ("이", "가"),
+        )
+
     def test_phase2_parser_keeps_hyphenated_room_and_later_date(self) -> None:
         question = "@Boxer 16971952215 나무정원여성병원(양주) 2층1-1진료실 MB2-A00313 2026-04-22 영상 다운"
 
