@@ -3104,19 +3104,110 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
     def test_redis_stale_device_is_still_unavailable(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-        stale_at = (local_now - timedelta(minutes=10)).isoformat()
+        stale_at = (local_now - timedelta(minutes=26)).isoformat()
 
-        reasons = reporter._collect_device_health_monitor_redis_availability_reasons(
-            device_context={"deviceName": "MB2-C00043"},
-            device_state={"isConnected": True, "updatedAt": stale_at},
-            agent_state={"isConnected": True, "updatedAt": stale_at},
-            now=local_now,
-        )
+        with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STANDBY_STALE_SEC", 1500):
+            reasons = reporter._collect_device_health_monitor_redis_availability_reasons(
+                device_context={"deviceName": "MB2-C00043"},
+                device_state={"isConnected": True, "status": "NOSESS", "updatedAt": stale_at},
+                agent_state={"isConnected": True, "updatedAt": stale_at},
+                now=local_now,
+            )
 
         self.assertEqual(
             reasons,
             ["MB2-C00043 장비 상태 정보가 Redis에서 갱신되지 않고 있어"],
         )
+
+    def test_redis_idle_device_remains_available_for_25_minutes(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        device_context = {"deviceName": "MB2-C00043"}
+        agent_state = {"isConnected": True}
+
+        # 20분 보고 주기에 여유를 둬 정확히 25분까지는 대기 장비 상태를 신뢰한다.
+        with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STANDBY_STALE_SEC", 1500):
+            for status in ("NOSESS", " standby "):
+                with self.subTest(status=status):
+                    reasons = reporter._collect_device_health_monitor_redis_availability_reasons(
+                        device_context=device_context,
+                        device_state={
+                            "isConnected": True,
+                            "status": status,
+                            "updatedAt": (local_now - timedelta(minutes=25)).isoformat(),
+                        },
+                        agent_state=agent_state,
+                        now=local_now,
+                    )
+                    self.assertEqual(reasons, [])
+
+    def test_redis_active_device_keeps_three_minute_threshold(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC", 180):
+            reasons = reporter._collect_device_health_monitor_redis_availability_reasons(
+                device_context={"deviceName": "MB2-C00043"},
+                device_state={
+                    "isConnected": True,
+                    "status": "RECORDING",
+                    "updatedAt": (local_now - timedelta(seconds=181)).isoformat(),
+                },
+                agent_state={"isConnected": True},
+                now=local_now,
+            )
+
+        self.assertEqual(
+            reasons,
+            ["MB2-C00043 장비 상태 정보가 Redis에서 갱신되지 않고 있어"],
+        )
+
+    def test_redis_unknown_status_keeps_conservative_three_minute_threshold(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC", 180),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STANDBY_STALE_SEC", 1500),
+        ):
+            reasons = reporter._collect_device_health_monitor_redis_availability_reasons(
+                device_context={"deviceName": "MB2-C00043"},
+                device_state={
+                    "isConnected": True,
+                    "status": "UNKNOWN",
+                    "updatedAt": (local_now - timedelta(seconds=181)).isoformat(),
+                },
+                agent_state={"isConnected": True},
+                now=local_now,
+            )
+
+        self.assertEqual(
+            reasons,
+            ["MB2-C00043 장비 상태 정보가 Redis에서 갱신되지 않고 있어"],
+        )
+
+    def test_redis_status_payload_exposes_selected_stale_threshold(self) -> None:
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        device_context = {"deviceName": "MB2-C00043"}
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC", 180),
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_REDIS_STANDBY_STALE_SEC", 1500),
+        ):
+            idle_payload = reporter._build_device_health_monitor_redis_status_payload(
+                device_context=device_context,
+                device_state={"status": "NOSESS"},
+                agent_state={},
+                issues=[],
+                now=local_now,
+            )
+            active_payload = reporter._build_device_health_monitor_redis_status_payload(
+                device_context=device_context,
+                device_state={"status": "SESSION"},
+                agent_state={},
+                issues=[],
+                now=local_now,
+            )
+
+        self.assertEqual(idle_payload["redis"]["staleThresholdSec"], 1500)
+        self.assertEqual(active_payload["redis"]["staleThresholdSec"], 180)
 
     def test_redis_availability_requires_explicit_connected_states(self) -> None:
         device_context = {"deviceName": "MB2-C00043"}

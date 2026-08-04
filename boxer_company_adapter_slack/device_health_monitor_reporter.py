@@ -124,6 +124,10 @@ _DEVICE_HEALTH_MONITOR_OPEN_CAPTUREBOARD_SHEET_STATUSES = {
 _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN = re.compile(
     r"^device_health_monitor_events-(\d{4}-\d{2}-\d{2})\.jsonl$"
 )
+_DEVICE_HEALTH_MONITOR_STANDBY_REDIS_STATUSES = {
+    "NOSESS",
+    "STANDBY",
+}
 
 
 def _device_health_monitor_state_path() -> Path:
@@ -3044,8 +3048,18 @@ def _is_device_health_monitor_state_stale(
     updated_at = _parse_device_health_monitor_state_datetime(state_payload.get("updatedAt"))
     if updated_at is None:
         return True
-    stale_sec = max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC))
+    stale_sec = _device_health_monitor_redis_stale_threshold_sec(state_payload)
     return now - updated_at > timedelta(seconds=stale_sec)
+
+
+def _device_health_monitor_redis_stale_threshold_sec(
+    state_payload: dict[str, Any] | None,
+) -> int:
+    status = _display_value((state_payload or {}).get("status"), default="").strip().upper()
+    # 실제 장비의 대기 상태만 20분 주기를 허용하고, 미확인 상태는 기존 3분 기준을 유지한다.
+    if status in _DEVICE_HEALTH_MONITOR_STANDBY_REDIS_STATUSES:
+        return max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STANDBY_STALE_SEC))
+    return max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC))
 
 
 def _build_device_health_monitor_pass_component(summary: str = "Redis 상태 정상") -> dict[str, str]:
@@ -3315,7 +3329,7 @@ def _build_device_health_monitor_redis_status_payload(
         },
         "redis": {
             "checkedAt": now.isoformat(),
-            "staleThresholdSec": max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC)),
+            "staleThresholdSec": _device_health_monitor_redis_stale_threshold_sec(device_state),
             "deviceState": _trim_device_health_monitor_redis_state(device_state),
             "agentState": _trim_device_health_monitor_redis_state(agent_state),
         },
@@ -3361,7 +3375,7 @@ def _build_device_health_monitor_redis_unavailable_status_payload(
         },
         "redis": {
             "checkedAt": now.isoformat(),
-            "staleThresholdSec": max(30, int(cs.DEVICE_HEALTH_MONITOR_REDIS_STALE_SEC)),
+            "staleThresholdSec": _device_health_monitor_redis_stale_threshold_sec(device_state),
             "availabilityReasons": reasons,
             "deviceState": _trim_device_health_monitor_redis_state(device_state),
             "agentState": _trim_device_health_monitor_redis_state(agent_state),
