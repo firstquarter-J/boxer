@@ -1,6 +1,7 @@
 import json
 import logging
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -370,6 +371,302 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(status["source"], "slack_override")
         self.assertTrue(status["monitorEnabled"])
         self.assertEqual(append_event_mock.call_args.args[0], "alert_delivery_control_changed")
+
+    def test_poll_does_not_restore_stale_alert_delivery_override_after_disable(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.control_race")
+        client = _FakeSlackClient()
+        poll_started = threading.Event()
+        resume_poll = threading.Event()
+        poll_results: list[bool] = []
+        poll_errors: list[BaseException] = []
+        old_now = datetime(2026, 7, 13, 11, 58, 21, tzinfo=ZoneInfo("Asia/Seoul"))
+        disabled_at = datetime(2026, 8, 4, 17, 26, 39, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "device-health-state.json"
+            initial_state = {
+                **_pending_alert_state(
+                    _LED_ALERT_FINGERPRINT,
+                    old_now - timedelta(minutes=1),
+                ),
+                "alertDeliveryOverride": {
+                    "enabled": True,
+                    "updatedAt": old_now.isoformat(),
+                    "updatedBy": "U_HYUN",
+                },
+            }
+            reporter._save_device_health_monitor_state(initial_state, state_path)
+
+            def _block_summary(*, now: datetime, state: dict) -> dict:
+                self.assertTrue(state["alertDeliveryOverride"]["enabled"])
+                poll_started.set()
+                if not resume_poll.wait(timeout=3):
+                    raise TimeoutError("poll resume timeout")
+                return _mobile_abnormal_summary()
+
+            def _run_poll() -> None:
+                try:
+                    poll_results.append(
+                        reporter._run_device_health_monitor_once(
+                            client,
+                            logger,
+                            now=disabled_at - timedelta(seconds=8),
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - assertion reports the captured error
+                    poll_errors.append(exc)
+
+            with (
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+                patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_STATE_PATH", str(state_path)),
+                patch.object(reporter, "_build_device_health_monitor_summary", side_effect=_block_summary),
+                patch.object(reporter, "_append_device_health_monitor_event"),
+                patch.object(reporter, "_post_device_health_monitor_sms_payload") as post_sms_mock,
+            ):
+                poll_thread = threading.Thread(target=_run_poll)
+                poll_thread.start()
+                try:
+                    self.assertTrue(poll_started.wait(timeout=3))
+                    disabled_status = reporter._set_device_health_monitor_alert_delivery_enabled(
+                        False,
+                        user_id="U_HYUN",
+                        now=disabled_at,
+                        logger=logger,
+                    )
+                finally:
+                    resume_poll.set()
+                    poll_thread.join(timeout=3)
+
+                self.assertFalse(poll_thread.is_alive())
+                self.assertEqual(poll_errors, [])
+                self.assertEqual(poll_results, [False])
+                self.assertFalse(disabled_status["enabled"])
+                final_state = reporter._load_device_health_monitor_state(state_path)
+                persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    final_state["alertDeliveryOverride"],
+                    {
+                        "enabled": False,
+                        "updatedAt": disabled_at.isoformat(),
+                        "updatedBy": "U_HYUN",
+                    },
+                )
+                self.assertEqual(
+                    persisted_state["alertDeliveryOverride"],
+                    final_state["alertDeliveryOverride"],
+                )
+                self.assertEqual(client.messages, [])
+                post_sms_mock.assert_not_called()
+
+    def test_disable_after_initial_check_still_suppresses_before_delivery(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.delivery_race")
+        client = _FakeSlackClient()
+        local_now = datetime(2026, 8, 4, 17, 30, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "device-health-state.json"
+            initial_state = {
+                **_pending_alert_state(
+                    _LED_ALERT_FINGERPRINT,
+                    local_now - timedelta(minutes=1),
+                ),
+                "alertDeliveryOverride": {
+                    "enabled": True,
+                    "updatedAt": (local_now - timedelta(days=1)).isoformat(),
+                    "updatedBy": "U_HYUN",
+                },
+            }
+            reporter._save_device_health_monitor_state(initial_state, state_path)
+
+            def _disable_before_delivery(
+                report_summary: dict,
+                state: dict,
+                **kwargs,
+            ) -> tuple[set[str], dict, dict, list]:
+                # 첫 상태 확인 뒤 실제 발송 경계에 도달하기 전에 끄는 순서를 재현한다.
+                reporter._set_device_health_monitor_alert_delivery_enabled(
+                    False,
+                    user_id="U_HYUN",
+                    now=local_now,
+                    logger=logger,
+                )
+                return (
+                    kwargs["alertable_fingerprints"],
+                    kwargs["updated_alerts"],
+                    kwargs["updated_pending_alerts"],
+                    [],
+                )
+
+            with (
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+                patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_STATE_PATH", str(state_path)),
+                patch.object(
+                    reporter,
+                    "_build_device_health_monitor_summary",
+                    return_value=_mobile_abnormal_summary(),
+                ),
+                patch.object(
+                    reporter,
+                    "_filter_open_captureboard_sheet_alerts",
+                    side_effect=_disable_before_delivery,
+                ),
+                patch.object(reporter, "_append_device_health_monitor_event"),
+                patch.object(reporter, "_post_device_health_monitor_sms_payload") as post_sms_mock,
+            ):
+                sent = reporter._run_device_health_monitor_once(
+                    client,
+                    logger,
+                    now=local_now - timedelta(seconds=8),
+                )
+
+            persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(sent)
+            self.assertFalse(persisted_state["alertDeliveryOverride"]["enabled"])
+            self.assertNotIn(_LED_ALERT_FINGERPRINT, persisted_state["alertFingerprints"])
+            self.assertIn(_LED_ALERT_FINGERPRINT, persisted_state["pendingAlertFingerprints"])
+            self.assertEqual(client.messages, [])
+            post_sms_mock.assert_not_called()
+
+    def test_disable_ack_waits_for_inflight_alert_delivery_to_finish(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.delivery_linearization")
+        client = _FakeSlackClient()
+        local_now = datetime(2026, 8, 4, 17, 31, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        delivery_started = threading.Event()
+        finish_delivery = threading.Event()
+        control_started = threading.Event()
+        control_finished = threading.Event()
+        operation_order: list[str] = []
+        poll_results: list[bool] = []
+        poll_errors: list[BaseException] = []
+        control_statuses: list[dict] = []
+        control_errors: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "device-health-state.json"
+            reporter._save_device_health_monitor_state(
+                {
+                    **_pending_alert_state(
+                        _LED_ALERT_FINGERPRINT,
+                        local_now - timedelta(minutes=1),
+                    ),
+                    "alertDeliveryOverride": {
+                        "enabled": True,
+                        "updatedAt": (local_now - timedelta(days=1)).isoformat(),
+                        "updatedBy": "U_HYUN",
+                    },
+                },
+                state_path,
+            )
+
+            def _block_slack_delivery(*args, **kwargs) -> dict[str, str]:
+                operation_order.append("delivery_started")
+                delivery_started.set()
+                if not finish_delivery.wait(timeout=3):
+                    raise TimeoutError("delivery finish timeout")
+                operation_order.append("delivery_finished")
+                return {
+                    "messageTs": "3000.001",
+                    "permalink": "https://example.invalid/alert",
+                }
+
+            def _run_poll() -> None:
+                try:
+                    poll_results.append(
+                        reporter._run_device_health_monitor_once(
+                            client,
+                            logger,
+                            now=local_now,
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - assertion reports the captured error
+                    poll_errors.append(exc)
+
+            def _disable_alerts() -> None:
+                control_started.set()
+                try:
+                    control_statuses.append(
+                        reporter._set_device_health_monitor_alert_delivery_enabled(
+                            False,
+                            user_id="U_HYUN",
+                            now=local_now + timedelta(seconds=1),
+                            logger=logger,
+                        )
+                    )
+                    operation_order.append("control_finished")
+                    control_finished.set()
+                except BaseException as exc:  # pragma: no cover - assertion reports the captured error
+                    control_errors.append(exc)
+
+            with (
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", True),
+                patch.object(reporter.s, "DB_QUERY_ENABLED", True),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_CHANNEL_ID", "C_HEALTH"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_STATE_PATH", str(state_path)),
+                patch.object(
+                    reporter,
+                    "_build_device_health_monitor_summary",
+                    return_value=_abnormal_summary(),
+                ),
+                patch.object(
+                    reporter,
+                    "_post_daily_device_round_abnormal_alert",
+                    side_effect=_block_slack_delivery,
+                ),
+                patch.object(reporter, "_append_device_health_monitor_event"),
+                patch.object(reporter, "_record_device_health_sheet_alerts_best_effort"),
+            ):
+                poll_thread = threading.Thread(target=_run_poll)
+                poll_thread.start()
+                self.assertTrue(delivery_started.wait(timeout=3))
+
+                control_thread = threading.Thread(target=_disable_alerts)
+                control_thread.start()
+                self.assertTrue(control_started.wait(timeout=3))
+                self.assertFalse(control_finished.wait(timeout=0.1))
+
+                finish_delivery.set()
+                poll_thread.join(timeout=3)
+                control_thread.join(timeout=3)
+
+            persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(poll_thread.is_alive())
+            self.assertFalse(control_thread.is_alive())
+            self.assertEqual(poll_errors, [])
+            self.assertEqual(control_errors, [])
+            self.assertEqual(poll_results, [True])
+            self.assertFalse(control_statuses[0]["enabled"])
+            self.assertEqual(
+                operation_order,
+                ["delivery_started", "delivery_finished", "control_finished"],
+            )
+            self.assertFalse(persisted_state["alertDeliveryOverride"]["enabled"])
+
+    def test_alert_delivery_control_does_not_report_success_when_state_save_fails(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.control_save_failure")
+        with (
+            patch.object(reporter, "_load_device_health_monitor_state", return_value={}),
+            patch.object(
+                reporter,
+                "_save_device_health_monitor_state",
+                side_effect=OSError("state is read-only"),
+            ),
+            patch.object(reporter, "_append_device_health_monitor_event") as append_event_mock,
+        ):
+            with self.assertRaisesRegex(OSError, "state is read-only"):
+                reporter._set_device_health_monitor_alert_delivery_enabled(
+                    False,
+                    user_id="U_HYUN",
+                    logger=logger,
+                )
+
+        append_event_mock.assert_not_called()
 
     def test_posts_abnormal_alert_without_running_maintenance_actions(self) -> None:
         client = _FakeSlackClient()

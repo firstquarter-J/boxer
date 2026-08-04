@@ -82,6 +82,10 @@ _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
 _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
 _DEVICE_HEALTH_MONITOR_RUNTIME_STATE: dict[str, Any] = {}
 _DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK = threading.Lock()
+# Slack 제어와 백그라운드 poll이 같은 상태 파일을 갱신하므로 state 변경을
+# 직렬화한다. 긴 Redis/SSH 점검 동안에는 놓고, 실제 알림 발송 구간에서는
+# 꺼짐 성공 응답 뒤 후발 알림이 나가지 않도록 SMS/Slack 완료까지 유지한다.
+_DEVICE_HEALTH_MONITOR_STATE_LOCK = threading.RLock()
 _DEVICE_HEALTH_MONITOR_AUTO_SMS_DEDUPE_WINDOW_SEC = 60.0
 _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS: dict[str, dict[str, Any]] = {}
 _DEVICE_HEALTH_MONITOR_AUTO_SMS_CLAIMS_LOCK = threading.Lock()
@@ -454,49 +458,122 @@ def _load_device_health_monitor_state(
     *,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    path = state_path or _device_health_monitor_state_path()
-    runtime_state = _load_device_health_monitor_runtime_state()
-    if not path.exists():
-        return runtime_state
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        if logger is not None:
-            logger.warning("장비 상태 모니터 상태 파일을 읽지 못했어: %s", path, exc_info=True)
-        return runtime_state
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        path = state_path or _device_health_monitor_state_path()
+        runtime_state = _load_device_health_monitor_runtime_state()
+        if not path.exists():
+            return runtime_state
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            if logger is not None:
+                logger.warning("장비 상태 모니터 상태 파일을 읽지 못했어: %s", path, exc_info=True)
+            return runtime_state
 
-    state = data if isinstance(data, dict) else {}
-    if runtime_state:
-        merged_state = dict(state)
-        merged_state.update(runtime_state)
-        return merged_state
-    return state
+        state = data if isinstance(data, dict) else {}
+        if runtime_state:
+            merged_state = dict(state)
+            merged_state.update(runtime_state)
+            return merged_state
+        return state
 
 
 def _save_device_health_monitor_state(
     state: dict[str, Any],
     state_path: Path | None = None,
 ) -> None:
-    path = state_path or _device_health_monitor_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        path = state_path or _device_health_monitor_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            # 독자가 반쯤 쓰인 JSON을 보지 않도록 같은 디렉터리의 임시 파일을
+            # 완전히 flush한 뒤 원자적으로 교체한다.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                json.dump(
+                    state,
+                    temp_file,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                )
+                temp_file.write("\n")
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+
+def _prepare_device_health_monitor_state_for_persistence(
+    state: dict[str, Any],
+    *,
+    preserve_latest_alert_delivery_override: bool,
+    logger: logging.Logger | None,
+) -> dict[str, Any]:
+    normalized_state = _normalize_device_health_monitor_state(state)
+    if not preserve_latest_alert_delivery_override:
+        return normalized_state
+
+    # poll은 오래된 전체 snapshot을 들고 있을 수 있으므로 Slack 명령이 가장
+    # 최근에 저장한 제어 필드는 현재 store에서 다시 읽어 덮어쓰지 않게 한다.
+    latest_state = _normalize_device_health_monitor_state(
+        _load_device_health_monitor_state(logger=logger)
     )
+    latest_override = _normalize_device_health_monitor_alert_delivery_override(
+        latest_state.get("alertDeliveryOverride")
+    )
+    if latest_override is None:
+        normalized_state.pop("alertDeliveryOverride", None)
+    else:
+        normalized_state["alertDeliveryOverride"] = latest_override
+    return normalized_state
+
+
+def _persist_device_health_monitor_state(
+    state: dict[str, Any],
+    *,
+    logger: logging.Logger | None = None,
+    preserve_latest_alert_delivery_override: bool = False,
+) -> dict[str, Any]:
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        normalized_state = _prepare_device_health_monitor_state_for_persistence(
+            state,
+            preserve_latest_alert_delivery_override=preserve_latest_alert_delivery_override,
+            logger=logger,
+        )
+        _save_device_health_monitor_state(normalized_state)
+        return _remember_device_health_monitor_runtime_state(normalized_state)
 
 
 def _persist_device_health_monitor_state_best_effort(
     state: dict[str, Any],
     *,
     logger: logging.Logger | None = None,
+    preserve_latest_alert_delivery_override: bool = False,
 ) -> dict[str, Any]:
-    normalized_state = _remember_device_health_monitor_runtime_state(state)
-    try:
-        _save_device_health_monitor_state(normalized_state)
-    except Exception:
-        if logger is not None:
-            logger.warning("장비 상태 모니터 상태를 저장하지 못했어", exc_info=True)
-    return normalized_state
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        normalized_state = _prepare_device_health_monitor_state_for_persistence(
+            state,
+            preserve_latest_alert_delivery_override=preserve_latest_alert_delivery_override,
+            logger=logger,
+        )
+        try:
+            _save_device_health_monitor_state(normalized_state)
+        except Exception:
+            if logger is not None:
+                logger.warning("장비 상태 모니터 상태를 저장하지 못했어", exc_info=True)
+        return _remember_device_health_monitor_runtime_state(normalized_state)
 
 
 def _normalize_device_health_monitor_alerts(value: Any) -> dict[str, dict[str, Any]]:
@@ -721,14 +798,16 @@ def _set_device_health_monitor_alert_delivery_enabled(
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
-    state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
-    state["alertDeliveryOverride"] = {
-        "enabled": bool(enabled),
-        "updatedAt": local_now.isoformat(),
-        "updatedBy": _display_value(user_id, default=""),
-    }
-    # Slack 명령으로 바꾼 발송 설정은 재시작 뒤에도 유지되게 상태 파일에 저장한다.
-    persisted_state = _persist_device_health_monitor_state_best_effort(state, logger=logger)
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
+        state["alertDeliveryOverride"] = {
+            "enabled": bool(enabled),
+            "updatedAt": local_now.isoformat(),
+            "updatedBy": _display_value(user_id, default=""),
+        }
+        # 제어 명령은 디스크 저장이 실패하면 성공으로 응답하지 않고 route까지
+        # 오류를 올린다. 성공한 설정만 재시작 뒤에도 동일하게 유지된다.
+        persisted_state = _persist_device_health_monitor_state(state, logger=logger)
     _append_device_health_monitor_event(
         "alert_delivery_control_changed",
         {
@@ -4564,6 +4643,68 @@ def _filter_open_captureboard_sheet_alerts(
     )
 
 
+def _persist_suppressed_device_health_monitor_run(
+    report_summary: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    alert_delivery_status: dict[str, Any],
+    channel_id: str,
+    now: datetime,
+    logger: logging.Logger,
+) -> None:
+    # 꺼짐으로 확인된 poll은 신규 이상을 발송 완료로 승격하지 않고 pending에
+    # 유지한다. 다시 켜졌을 때 같은 이상을 놓치지 않게 하는 공통 경로다.
+    (
+        suppressed_alertable_fingerprints,
+        updated_alerts,
+        updated_pending_alerts,
+    ) = _collect_device_health_monitor_suppressed_alert_updates(
+        report_summary,
+        state,
+        now=now,
+    )
+    unavailable_event_state = _log_device_health_monitor_run_events(
+        report_summary,
+        now=now,
+        logger=logger,
+        channel_id=channel_id,
+        alertable_fingerprints=suppressed_alertable_fingerprints,
+        state=state,
+    )
+    next_state = _build_device_health_monitor_next_state(
+        state,
+        report_summary,
+        now=now,
+        alert_fingerprints=updated_alerts,
+        pending_alert_fingerprints=updated_pending_alerts,
+    )
+    next_state["deviceUnavailableEventState"] = unavailable_event_state
+    _persist_device_health_monitor_state_best_effort(
+        next_state,
+        logger=logger,
+        preserve_latest_alert_delivery_override=True,
+    )
+    if suppressed_alertable_fingerprints:
+        _append_device_health_monitor_event(
+            "alert_delivery_suppressed",
+            {
+                "alertableCount": len(suppressed_alertable_fingerprints),
+                "alertFingerprints": sorted(suppressed_alertable_fingerprints),
+                "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+                "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+                "source": _display_value(alert_delivery_status.get("source"), default=""),
+            },
+            now=now,
+            logger=logger,
+        )
+    logger.info(
+        "Suppressed device health alert delivery checkedDevices=%s alertable=%s source=%s",
+        report_summary.get("checkedDeviceCount"),
+        len(suppressed_alertable_fingerprints),
+        alert_delivery_status.get("source"),
+    )
+
+
 def _run_device_health_monitor_once(
     client: Any,
     logger: logging.Logger,
@@ -4592,7 +4733,11 @@ def _run_device_health_monitor_once(
                 state.get("pendingAlertFingerprints")
             ),
         )
-        _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
+        _persist_device_health_monitor_state_best_effort(
+            next_state,
+            logger=logger,
+            preserve_latest_alert_delivery_override=True,
+        )
         _append_device_health_monitor_event(
             "monitor_unavailable",
             _build_device_health_monitor_run_event_payload(report_summary),
@@ -4607,7 +4752,14 @@ def _run_device_health_monitor_once(
         return False
 
     channel_id = _device_health_monitor_channel_id()
-    alert_delivery_status = _resolve_device_health_monitor_alert_delivery_status(state)
+    # Redis/SSH 점검 중 Slack 제어가 바뀔 수 있으므로 발송 판단은 시작 시점의
+    # snapshot이 아니라 점검 완료 뒤 최신 상태로 다시 확인한다.
+    alert_delivery_state = _normalize_device_health_monitor_state(
+        _load_device_health_monitor_state(logger=logger)
+    )
+    alert_delivery_status = _resolve_device_health_monitor_alert_delivery_status(
+        alert_delivery_state
+    )
     alert_delivery_enabled = bool(alert_delivery_status.get("enabled"))
     if alert_delivery_enabled and not channel_id:
         unavailable_event_state = _log_device_health_monitor_run_events(
@@ -4627,55 +4779,22 @@ def _run_device_health_monitor_once(
             ),
         )
         next_state["deviceUnavailableEventState"] = unavailable_event_state
-        _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
+        _persist_device_health_monitor_state_best_effort(
+            next_state,
+            logger=logger,
+            preserve_latest_alert_delivery_override=True,
+        )
         logger.warning("장비 상태 모니터 채널 ID가 없어. DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘")
         return False
 
     if not alert_delivery_enabled:
-        (
-            suppressed_alertable_fingerprints,
-            updated_alerts,
-            updated_pending_alerts,
-        ) = _collect_device_health_monitor_suppressed_alert_updates(
+        _persist_suppressed_device_health_monitor_run(
             report_summary,
-            state,
-            now=local_now,
-        )
-        unavailable_event_state = _log_device_health_monitor_run_events(
-            report_summary,
+            alert_delivery_state,
+            alert_delivery_status=alert_delivery_status,
+            channel_id=channel_id,
             now=local_now,
             logger=logger,
-            channel_id=channel_id,
-            alertable_fingerprints=suppressed_alertable_fingerprints,
-            state=state,
-        )
-        next_state = _build_device_health_monitor_next_state(
-            state,
-            report_summary,
-            now=local_now,
-            alert_fingerprints=updated_alerts,
-            pending_alert_fingerprints=updated_pending_alerts,
-        )
-        next_state["deviceUnavailableEventState"] = unavailable_event_state
-        _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
-        if suppressed_alertable_fingerprints:
-            _append_device_health_monitor_event(
-                "alert_delivery_suppressed",
-                {
-                    "alertableCount": len(suppressed_alertable_fingerprints),
-                    "alertFingerprints": sorted(suppressed_alertable_fingerprints),
-                    "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
-                    "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
-                    "source": _display_value(alert_delivery_status.get("source"), default=""),
-                },
-                now=local_now,
-                logger=logger,
-            )
-        logger.info(
-            "Suppressed device health alert delivery checkedDevices=%s alertable=%s source=%s",
-            report_summary.get("checkedDeviceCount"),
-            len(suppressed_alertable_fingerprints),
-            alert_delivery_status.get("source"),
         )
         return False
 
@@ -4698,35 +4817,38 @@ def _run_device_health_monitor_once(
         now=local_now,
         logger=logger,
     )
-    unavailable_event_state = _log_device_health_monitor_run_events(
-        report_summary,
-        now=local_now,
-        logger=logger,
-        channel_id=channel_id,
-        alertable_fingerprints=alertable_fingerprints,
-        state=state,
-    )
-    next_state = _build_device_health_monitor_next_state(
-        state,
-        report_summary,
-        now=local_now,
-        alert_fingerprints=updated_alerts,
-        pending_alert_fingerprints=updated_pending_alerts,
-    )
-    next_state["deviceUnavailableEventState"] = unavailable_event_state
-    _persist_device_health_monitor_state_best_effort(next_state, logger=logger)
-    if sheet_suppressed_alerts:
-        _append_device_health_monitor_event(
-            "captureboard_sheet_alert_suppressed",
-            {
-                "suppressedCount": len(sheet_suppressed_alerts),
-                "incidents": sheet_suppressed_alerts,
-            },
+    if not alertable_fingerprints:
+        unavailable_event_state = _log_device_health_monitor_run_events(
+            report_summary,
             now=local_now,
             logger=logger,
+            channel_id=channel_id,
+            alertable_fingerprints=alertable_fingerprints,
+            state=state,
         )
-
-    if not alertable_fingerprints:
+        next_state = _build_device_health_monitor_next_state(
+            state,
+            report_summary,
+            now=local_now,
+            alert_fingerprints=updated_alerts,
+            pending_alert_fingerprints=updated_pending_alerts,
+        )
+        next_state["deviceUnavailableEventState"] = unavailable_event_state
+        _persist_device_health_monitor_state_best_effort(
+            next_state,
+            logger=logger,
+            preserve_latest_alert_delivery_override=True,
+        )
+        if sheet_suppressed_alerts:
+            _append_device_health_monitor_event(
+                "captureboard_sheet_alert_suppressed",
+                {
+                    "suppressedCount": len(sheet_suppressed_alerts),
+                    "incidents": sheet_suppressed_alerts,
+                },
+                now=local_now,
+                logger=logger,
+            )
         logger.info(
             "Checked device health channel=%s checkedDevices=%s abnormalCandidates=%s alertable=0",
             channel_id,
@@ -4735,49 +4857,106 @@ def _run_device_health_monitor_once(
         )
         return False
 
-    alert_summary = _filter_device_health_monitor_alert_summary(report_summary, alertable_fingerprints)
-    alert_summary = _apply_device_health_monitor_auto_sms(
-        alert_summary,
-        channel_id=channel_id,
-        now=local_now,
-        logger=logger,
-    )
-    # Slack 호출이 실패해도 이미 접수된 문자의 groupId를 잃지 않도록 먼저 outbox에 기록한다.
-    _remember_device_health_sms_sheet_records_best_effort(
-        _collect_daily_device_round_abnormal_alert_items(alert_summary),
-        detected_at=local_now,
-        slack_permalink="",
-        logger=logger,
-    )
-    slack_delivery = _post_daily_device_round_abnormal_alert(
-        client,
-        alert_summary,
-        channel_id=channel_id,
-        message_ts="",
-        logger=logger,
-        include_actions=True,
-    )
-    if slack_delivery is None:
-        logger.warning(
-            "Device health Slack alert delivery failed channel=%s alertable=%s",
-            channel_id,
-            len(alertable_fingerprints),
+    # 발송 직전부터 Slack 호출 완료까지 제어 변경과 선형화한다. 꺼짐 명령이
+    # 먼저 저장되면 이 poll은 발송하지 않고, 발송이 먼저 시작됐으면 명령의
+    # 성공 응답은 발송 완료 뒤에만 나가므로 성공 응답 이후 알림이 새로 나가지 않는다.
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        final_delivery_state = _normalize_device_health_monitor_state(
+            _load_device_health_monitor_state(logger=logger)
         )
-        return False
-    _append_device_health_monitor_event(
-        "slack_alert_sent",
-        {
-            "channelId": channel_id,
-            "messageTs": _display_value(slack_delivery.get("messageTs"), default=""),
-            "permalink": _display_value(slack_delivery.get("permalink"), default=""),
-            "alertableCount": len(alertable_fingerprints),
-            "alertFingerprints": sorted(alertable_fingerprints),
-            "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
-            "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
-        },
-        now=local_now,
-        logger=logger,
-    )
+        final_delivery_status = _resolve_device_health_monitor_alert_delivery_status(
+            final_delivery_state
+        )
+        if not bool(final_delivery_status.get("enabled")):
+            _persist_suppressed_device_health_monitor_run(
+                report_summary,
+                final_delivery_state,
+                alert_delivery_status=final_delivery_status,
+                channel_id=channel_id,
+                now=local_now,
+                logger=logger,
+            )
+            return False
+
+        unavailable_event_state = _log_device_health_monitor_run_events(
+            report_summary,
+            now=local_now,
+            logger=logger,
+            channel_id=channel_id,
+            alertable_fingerprints=alertable_fingerprints,
+            state=state,
+        )
+        next_state = _build_device_health_monitor_next_state(
+            state,
+            report_summary,
+            now=local_now,
+            alert_fingerprints=updated_alerts,
+            pending_alert_fingerprints=updated_pending_alerts,
+        )
+        next_state["deviceUnavailableEventState"] = unavailable_event_state
+        _persist_device_health_monitor_state_best_effort(
+            next_state,
+            logger=logger,
+            preserve_latest_alert_delivery_override=True,
+        )
+        if sheet_suppressed_alerts:
+            _append_device_health_monitor_event(
+                "captureboard_sheet_alert_suppressed",
+                {
+                    "suppressedCount": len(sheet_suppressed_alerts),
+                    "incidents": sheet_suppressed_alerts,
+                },
+                now=local_now,
+                logger=logger,
+            )
+
+        alert_summary = _filter_device_health_monitor_alert_summary(
+            report_summary,
+            alertable_fingerprints,
+        )
+        alert_summary = _apply_device_health_monitor_auto_sms(
+            alert_summary,
+            channel_id=channel_id,
+            now=local_now,
+            logger=logger,
+        )
+        # Slack 호출이 실패해도 이미 접수된 문자의 groupId를 잃지 않도록 먼저 outbox에 기록한다.
+        _remember_device_health_sms_sheet_records_best_effort(
+            _collect_daily_device_round_abnormal_alert_items(alert_summary),
+            detected_at=local_now,
+            slack_permalink="",
+            logger=logger,
+        )
+        slack_delivery = _post_daily_device_round_abnormal_alert(
+            client,
+            alert_summary,
+            channel_id=channel_id,
+            message_ts="",
+            logger=logger,
+            include_actions=True,
+        )
+        if slack_delivery is None:
+            logger.warning(
+                "Device health Slack alert delivery failed channel=%s alertable=%s",
+                channel_id,
+                len(alertable_fingerprints),
+            )
+            return False
+        _append_device_health_monitor_event(
+            "slack_alert_sent",
+            {
+                "channelId": channel_id,
+                "messageTs": _display_value(slack_delivery.get("messageTs"), default=""),
+                "permalink": _display_value(slack_delivery.get("permalink"), default=""),
+                "alertableCount": len(alertable_fingerprints),
+                "alertFingerprints": sorted(alertable_fingerprints),
+                "checkedDeviceCount": max(0, int(report_summary.get("checkedDeviceCount") or 0)),
+                "abnormalCandidateCount": max(0, int(report_summary.get("abnormalCandidateCount") or 0)),
+            },
+            now=local_now,
+            logger=logger,
+        )
+
     _record_device_health_sheet_alerts_best_effort(
         alert_summary,
         detected_at=local_now,
