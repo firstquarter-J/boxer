@@ -11,6 +11,12 @@ _DEVICE_VOICE_COMMANDS = {
     "기존 귀여운 음성": "S_VOICE_LEGACY_1",
     "기존 진지한 음성": "S_VOICE_LEGACY_2",
 }
+_DEVICE_VOICE_TYPES = {
+    "귀여운 음성": "n",
+    "진지한 음성": "s",
+    "기존 귀여운 음성": "ln",
+    "기존 진지한 음성": "ls",
+}
 _DEVICE_VOICE_CHANGE_HINTS = (
     "바꿔",
     "바꾸",
@@ -22,6 +28,19 @@ _DEVICE_VOICE_CHANGE_HINTS = (
     "적용하",
     "전환해",
     "전환하",
+)
+_DEVICE_VOICE_CATALOG_HINTS = (
+    "음성 세트 목록",
+    "음성세트 목록",
+    "음성 목록",
+    "음성목록",
+    "음성 세트 종류",
+    "음성세트 종류",
+    "음성 종류",
+    "지원 음성",
+    "음성 선택지",
+    "음성 스캔 명령",
+    "음성 명령어",
 )
 
 
@@ -43,9 +62,34 @@ def _is_device_voice_change_request(question: str) -> bool:
     return "음성" in text and any(hint in text for hint in _DEVICE_VOICE_CHANGE_HINTS)
 
 
+def _is_device_voice_catalog_request(question: str) -> bool:
+    text = " ".join(str(question or "").split())
+    return any(hint in text for hint in _DEVICE_VOICE_CATALOG_HINTS)
+
+
+def _build_device_voice_catalog_message() -> str:
+    # 운영자가 MDA 입력과 장비 수신값을 바로 대조할 수 있게 내부 설정값까지 함께 보여준다.
+    lines = [
+        "*장비 음성 세트 목록*",
+        "• MDA 전송 형식: `command=scansim`, `acme=<스캔값>`",
+        "• 장비 수신 형식: `cmd=scansim`, `acme=<스캔값>`",
+    ]
+    for label in _device_voice_labels():
+        lines.append(
+            f"• *{label}*: 설정값 `{_DEVICE_VOICE_TYPES[label]}` | "
+            f"스캔값 `{_DEVICE_VOICE_COMMANDS[label]}`"
+        )
+    lines.extend(
+        (
+            "• 예: 귀여운 음성 적용 → `command=scansim`, `acme=S_VOICE1`",
+            "• Boxer 사용 예: `MB2-C00419 귀여운 음성으로 바꿔줘`",
+        )
+    )
+    return "\n".join(lines)
+
+
 def _build_device_voice_choices_message() -> str:
-    choices = " / ".join(f"`{label}`" for label in _device_voice_labels())
-    return f"바꿀 음성을 정확히 골라줘.\n• 음성 목록: {choices}"
+    return f"바꿀 음성을 정확히 골라줘.\n{_build_device_voice_catalog_message()}"
 
 
 def _build_device_voice_device_required_message(voice_label: str) -> str:

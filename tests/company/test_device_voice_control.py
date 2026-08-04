@@ -3,9 +3,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from boxer_company.routers.device_voice_control import (
+    _build_device_voice_catalog_message,
     _build_device_voice_choices_message,
     _change_device_voice,
     _extract_device_voice_label,
+    _is_device_voice_catalog_request,
     _is_device_voice_change_request,
 )
 from boxer_company_adapter_slack.device_routes import (
@@ -89,6 +91,32 @@ class DeviceVoiceControlTests(unittest.TestCase):
     def test_does_not_treat_voice_information_question_as_change(self) -> None:
         self.assertFalse(_is_device_voice_change_request("귀여운 음성이 뭐야?"))
 
+    def test_detects_voice_catalog_questions(self) -> None:
+        for question in (
+            "음성 세트 목록",
+            "지원 음성 종류 알려줘",
+            "음성 스캔 명령 알려줘",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(_is_device_voice_catalog_request(question))
+
+    def test_catalog_message_lists_config_and_scan_values(self) -> None:
+        message = _build_device_voice_catalog_message()
+        expected = {
+            "귀여운 음성": ("n", "S_VOICE1"),
+            "진지한 음성": ("s", "S_VOICE2"),
+            "기존 귀여운 음성": ("ln", "S_VOICE_LEGACY_1"),
+            "기존 진지한 음성": ("ls", "S_VOICE_LEGACY_2"),
+        }
+
+        self.assertIn("`command=scansim`, `acme=<스캔값>`", message)
+        self.assertIn("`cmd=scansim`, `acme=<스캔값>`", message)
+        for label, (voice_type, scan_value) in expected.items():
+            with self.subTest(label=label):
+                self.assertIn(f"*{label}*", message)
+                self.assertIn(f"설정값 `{voice_type}`", message)
+                self.assertIn(f"스캔값 `{scan_value}`", message)
+
     def test_choices_message_lists_exactly_four_supported_voices(self) -> None:
         message = _build_device_voice_choices_message()
         for label in (
@@ -97,7 +125,7 @@ class DeviceVoiceControlTests(unittest.TestCase):
             "기존 귀여운 음성",
             "기존 진지한 음성",
         ):
-            self.assertIn(f"`{label}`", message)
+            self.assertIn(f"*{label}*", message)
 
     def test_route_sends_voice_change_for_any_user(self) -> None:
         replies: list[str] = []
@@ -122,6 +150,25 @@ class DeviceVoiceControlTests(unittest.TestCase):
         )
         self.assertIn("기존 진지한 음성", replies[0])
         self.assertEqual(context.payload["request_log"]["route_name"], "device voice change")
+
+    def test_route_answers_voice_catalog_without_dispatching_command(self) -> None:
+        replies: list[str] = []
+
+        with patch(
+            "boxer_company_adapter_slack.device_routes._send_mda_device_command",
+        ) as send_command:
+            context = _context("음성 세트 목록", replies)
+            handled = _handle_device_routes(context, _deps())
+
+        self.assertTrue(handled)
+        send_command.assert_not_called()
+        self.assertIn("*장비 음성 세트 목록*", replies[0])
+        self.assertIn("`S_VOICE1`", replies[0])
+        self.assertIn("`S_VOICE_LEGACY_2`", replies[0])
+        self.assertEqual(
+            context.payload["request_log"]["route_name"],
+            "device voice catalog",
+        )
 
     def test_route_does_not_apply_user_allowlist(self) -> None:
         replies: list[str] = []

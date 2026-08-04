@@ -105,11 +105,13 @@ from boxer_company.routers.device_update import (
     _request_device_power_off,
 )
 from boxer_company.routers.device_voice_control import (
+    _build_device_voice_catalog_message,
     _build_device_voice_choices_message,
     _build_device_voice_config_message,
     _build_device_voice_device_required_message,
     _change_device_voice,
     _extract_device_voice_label,
+    _is_device_voice_catalog_request,
     _is_device_voice_change_request,
 )
 from boxer_company.routers.mda_graphql import _send_mda_device_command
@@ -499,6 +501,8 @@ def _handle_device_routes(
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
     diagnostic_device_name = _extract_device_name_for_diagnostic_start(question) or structured_device_name
     requested_voice_label = _extract_device_voice_label(question)
+    is_voice_change_request = _is_device_voice_change_request(question)
+    is_voice_catalog_request = _is_device_voice_catalog_request(question)
     alert_delivery_control = _extract_device_health_monitor_alert_delivery_control(question)
     auto_update_control = _extract_daily_device_round_auto_update_control(question)
 
@@ -582,7 +586,25 @@ def _handle_device_routes(
         context.reply(_build_device_download_barcode_required_message())
         return True
 
-    if _is_device_voice_change_request(question):
+    if is_voice_catalog_request and not is_voice_change_request:
+        # 목록 질문은 assistant로 넘기지 않고 코드에 고정된 실제 장비 값을 답한다.
+        _set_request_log_route(
+            context.payload,
+            "device voice catalog",
+            handler_type="router",
+            subject_type="device",
+        )
+        context.reply(
+            _build_device_voice_catalog_message(),
+            mention_user=False,
+        )
+        context.logger.info(
+            "Responded with device voice catalog in thread_ts=%s",
+            context.thread_ts,
+        )
+        return True
+
+    if is_voice_change_request:
         # 음성 변경은 LLM보다 먼저 결정적으로 처리하고, 장비명과 목표 음성이
         # 모두 확인된 경우에만 고정된 MDA 명령을 보낸다.
         if not requested_voice_label:
