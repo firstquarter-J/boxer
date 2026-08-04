@@ -337,11 +337,13 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
         return {
             "ok": False,
             "reason": "paramiko_missing",
+            "retryable": False,
         }
     if not cs.DEVICE_SSH_PASSWORD:
         return {
             "ok": False,
             "reason": "missing_password",
+            "retryable": False,
         }
 
     client = paramiko.SSHClient()
@@ -363,6 +365,7 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
         return {
             "ok": False,
             "reason": "ssh_auth_failed",
+            "retryable": False,
         }
     except (
         paramiko.SSHException,
@@ -375,12 +378,14 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
         return {
             "ok": False,
             "reason": type(exc).__name__.lower(),
+            "retryable": True,
         }
 
     active_key = _increment_active_device_ssh_client_count(host, int(port))
     return {
         "ok": True,
         "client": _TrackedDeviceSshClient(client, active_key),
+        "retryable": False,
     }
 
 

@@ -1,6 +1,9 @@
 import base64
+import hashlib
 import json
+import logging
 import re
+import threading
 from typing import Any
 
 from boxer.core.utils import _display_value, _format_size, _truncate_text
@@ -14,13 +17,31 @@ from boxer_company.routers.device_audio_probe import (
     _parse_tool_paths,
     _summarize_device_audio_probe,
 )
-from boxer_company.routers.device_file_probe import _connect_device_ssh_client
+from boxer_company.routers.device_file_probe import (
+    _connect_device_ssh_client,
+    _get_active_device_ssh_client_count,
+)
 from boxer_company.routers.mda_graphql import (
     _get_mda_device_detail,
     _send_mda_device_ping,
     _wait_for_mda_device_agent_ssh,
 )
 from boxer_company.routers.ssh_command import _close_ssh_streams, _wait_for_ssh_exit_status
+
+logger = logging.getLogger(__name__)
+
+# 동일 장비의 reverse SSH 재개방은 기존 터널을 끊으므로 프로세스 안에서 직렬화한다.
+_DEVICE_SSH_REFRESH_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def _device_ssh_refresh_lock(device_name: str) -> threading.Lock:
+    normalized_name = str(device_name or "").strip().upper()
+    lock_index = (
+        int(hashlib.sha256(normalized_name.encode("utf-8")).hexdigest(), 16)
+        % len(_DEVICE_SSH_REFRESH_LOCKS)
+    )
+    return _DEVICE_SSH_REFRESH_LOCKS[lock_index]
+
 
 _LEADING_DEVICE_PROBE_SCOPE_PATTERN = re.compile(
     r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
@@ -204,28 +225,28 @@ _LED_USB_SIGNATURES = {
 }
 _VOICE_SET_SPECS: dict[str, dict[str, Any]] = {
     "n": {
-        "label": "기본 1번(n)",
+        "label": "귀여운 음성",
         "baseArea": "기본 안내",
         "legacy": False,
         "invalidBarcodeVoice": True,
         "freeBarcodeVoice": True,
     },
     "s": {
-        "label": "기본 2번(s)",
+        "label": "진지한 음성",
         "baseArea": "기본 안내",
         "legacy": False,
         "invalidBarcodeVoice": True,
         "freeBarcodeVoice": True,
     },
     "ln": {
-        "label": "구형 1번(ln)",
+        "label": "기존 귀여운 음성",
         "baseArea": "구형 기본 안내",
         "legacy": True,
         "invalidBarcodeVoice": True,
         "freeBarcodeVoice": False,
     },
     "ls": {
-        "label": "구형 2번(ls)",
+        "label": "기존 진지한 음성",
         "baseArea": "구형 기본 안내",
         "legacy": True,
         "invalidBarcodeVoice": True,
@@ -233,10 +254,34 @@ _VOICE_SET_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 _VOICE_SET_ORDER = ("n", "s", "ln", "ls")
+_RETRYABLE_DEVICE_SSH_REASONS = frozenset(
+    {
+        "novalidconnectionserror",
+        "oserror",
+        "oerror",
+        "sshexception",
+        "timeout",
+        "timeouterror",
+    }
+)
 _VOICE_SUPPORT_CHECKS = (
     ("invalid_barcode", "유효성/만료 차단"),
     ("expired_barcode", "FREE/핑크 차단"),
 )
+
+
+def _is_retryable_device_ssh_reason(reason: str | None) -> bool:
+    normalized = str(reason or "").strip().lower()
+    return bool(
+        normalized in _RETRYABLE_DEVICE_SSH_REASONS
+        or (
+            normalized.startswith("connection")
+            and normalized.endswith("error")
+        )
+        or normalized in {"gaierror"}
+    )
+
+
 _PM2_TARGET_APP_ALIASES = {
     "mommybox-v2": "mommybox-v2",
     "mommybox-v2-agent": "mommybox-agent",
@@ -2655,6 +2700,14 @@ def _build_status_overview_ssh_unavailable_guidance(
             "summary": "boxer 런타임에 paramiko가 없어 SSH 점검을 이어갈 수 없어",
             "action": "앱 서버 의존성 설치 상태를 확인해",
         }
+    if _is_retryable_device_ssh_reason(normalized_reason):
+        return {
+            "summary": (
+                "MDA SSH 터널 정보는 보이지만 Boxer의 실제 SSH 연결이 "
+                f"`{normalized_reason}` 오류로 실패했어"
+            ),
+            "action": "잠시 후 다시 점검하고, 계속 실패하면 MDA 터널과 원격 접속 포트를 확인해",
+        }
     if ping_status is not None:
         return _build_remote_access_diagnosis(
             ping_status=ping_status,
@@ -3046,8 +3099,13 @@ def _build_runtime_probe_payload(
     *,
     device_name: str,
     component: str,
+    force_reopen: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    wait_result = _wait_for_mda_device_agent_ssh(device_name)
+    wait_result = (
+        _wait_for_mda_device_agent_ssh(device_name, force_reopen=True)
+        if force_reopen
+        else _wait_for_mda_device_agent_ssh(device_name)
+    )
     device_info = wait_result.get("device") if isinstance(wait_result.get("device"), dict) else {}
     agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
     host = _display_value(agent_ssh.get("host"), default="")
@@ -3083,9 +3141,43 @@ def _build_runtime_probe_payload(
             "port": port,
             "pollCount": wait_result.get("pollCount"),
             "reusedExisting": bool(wait_result.get("reusedExisting")),
+            "forceReopened": force_reopen,
         },
     }
     return evidence_payload, device_info
+
+
+def _runtime_ssh_endpoint(
+    evidence_payload: dict[str, Any],
+) -> tuple[dict[str, Any], str, int]:
+    # 재확인·재개방 경로가 동일한 host/port 정규화를 쓰게 한곳에서 꺼낸다.
+    agent_ssh = (
+        evidence_payload.get("ssh")
+        if isinstance(evidence_payload.get("ssh"), dict)
+        else {}
+    )
+    host = _display_value(agent_ssh.get("host"), default="")
+    try:
+        port = int(agent_ssh.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return agent_ssh, host, port
+
+
+def _connect_runtime_ssh_endpoint(
+    evidence_payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    agent_ssh, host, port = _runtime_ssh_endpoint(evidence_payload)
+    if not agent_ssh.get("ready"):
+        return agent_ssh, {
+            "ok": False,
+            "reason": _display_value(
+                agent_ssh.get("reason"),
+                default="agent_ssh_not_ready",
+            ),
+            "retryable": False,
+        }
+    return agent_ssh, _connect_device_ssh_client(host, port)
 
 
 def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
@@ -3093,20 +3185,155 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
     if not evidence_payload["ssh"]["ready"]:
         return evidence_payload, device_info, {}
 
-    agent_ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
-    host = _display_value(agent_ssh.get("host"), default="")
-    try:
-        port = int(agent_ssh.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    connection = _connect_device_ssh_client(host, port)
+    agent_ssh, connection = _connect_runtime_ssh_endpoint(evidence_payload)
+    retry_attempted = False
+    refresh_skipped_active_client = False
+    refresh_skipped_non_retryable = False
+    refresh_skipped_already_opened = False
+    refresh_error = ""
+    initial_reason = _display_value(
+        connection.get("reason"),
+        default="ssh_connect_failed",
+    )
+    if (
+        not connection.get("ok")
+        and bool(agent_ssh.get("reusedExisting"))
+        and bool(connection.get("retryable"))
+    ):
+        # 장비별 lock 안에서 최신 endpoint를 다시 확인한 뒤에만 강제 재개방한다.
+        # 다른 점검이 먼저 복구했거나 사용 중이면 기존 터널을 끊지 않는다.
+        retry_attempted = True
+        logger.info(
+            "Refreshing stale device SSH tunnel deviceName=%s reason=%s",
+            device_name,
+            initial_reason,
+        )
+        with _device_ssh_refresh_lock(device_name):
+            evidence_payload, rechecked_device_info = _build_runtime_probe_payload(
+                device_name=device_name,
+                component=component,
+            )
+            if rechecked_device_info:
+                device_info = rechecked_device_info
+            agent_ssh, connection = _connect_runtime_ssh_endpoint(evidence_payload)
+
+            if not connection.get("ok"):
+                active_client_count = 0
+                if not agent_ssh.get("reusedExisting"):
+                    # 일반 재확인 과정이 이미 open을 보냈으면 또 열어 새 터널을 끊지 않는다.
+                    refresh_skipped_already_opened = True
+                    logger.info(
+                        "Skipping duplicate device SSH tunnel refresh deviceName=%s",
+                        device_name,
+                    )
+                elif not connection.get("retryable"):
+                    refresh_skipped_non_retryable = True
+                    logger.info(
+                        "Skipping device SSH tunnel refresh for non-retryable failure "
+                        "deviceName=%s reason=%s",
+                        device_name,
+                        _display_value(
+                            connection.get("reason"),
+                            default="ssh_connect_failed",
+                        ),
+                    )
+                else:
+                    _, rechecked_host, rechecked_port = _runtime_ssh_endpoint(
+                        evidence_payload
+                    )
+                    active_client_count = (
+                        _get_active_device_ssh_client_count(
+                            rechecked_host,
+                            rechecked_port,
+                        )
+                        if rechecked_host and rechecked_port > 0
+                        else 0
+                    )
+
+                if (
+                    not refresh_skipped_already_opened
+                    and not refresh_skipped_non_retryable
+                    and active_client_count > 0
+                ):
+                    refresh_skipped_active_client = True
+                    logger.info(
+                        "Skipping device SSH tunnel refresh while endpoint is in use "
+                        "deviceName=%s activeClientCount=%s",
+                        device_name,
+                        active_client_count,
+                    )
+                elif (
+                    not refresh_skipped_already_opened
+                    and not refresh_skipped_non_retryable
+                    and active_client_count <= 0
+                ):
+                    try:
+                        refreshed_payload, refreshed_device_info = (
+                            _build_runtime_probe_payload(
+                                device_name=device_name,
+                                component=component,
+                                force_reopen=True,
+                            )
+                        )
+                    except Exception as exc:
+                        # MDA 일시 오류가 전체 상태 명령을 깨뜨리지 않게 최초 실패를 보존한다.
+                        refresh_error = type(exc).__name__.lower()
+                        logger.exception(
+                            "Device SSH tunnel refresh failed deviceName=%s",
+                            device_name,
+                        )
+                    else:
+                        evidence_payload = refreshed_payload
+                        if refreshed_device_info:
+                            device_info = refreshed_device_info
+                        agent_ssh, connection = _connect_runtime_ssh_endpoint(
+                            evidence_payload
+                        )
+
     if not connection.get("ok"):
+        final_reason = _display_value(
+            connection.get("reason"),
+            default="ssh_connect_failed",
+        )
         evidence_payload["ssh"] = {
             **agent_ssh,
             "ready": False,
-            "reason": _display_value(connection.get("reason"), default="ssh_connect_failed"),
+            "reason": final_reason,
+            "retryAttempted": retry_attempted,
+            "retrySucceeded": False,
+            "initialReason": initial_reason if retry_attempted else "",
         }
+        if refresh_skipped_active_client:
+            evidence_payload["ssh"]["refreshSkippedActiveClient"] = True
+        if refresh_skipped_non_retryable:
+            evidence_payload["ssh"]["refreshSkippedNonRetryable"] = True
+        if refresh_skipped_already_opened:
+            evidence_payload["ssh"]["refreshSkippedAlreadyOpened"] = True
+        if refresh_error:
+            evidence_payload["ssh"]["refreshError"] = refresh_error
+        logger.warning(
+            "Device SSH connection failed deviceName=%s reason=%s retryAttempted=%s",
+            device_name,
+            final_reason,
+            retry_attempted,
+        )
         return evidence_payload, device_info, {}
+
+    if retry_attempted:
+        evidence_payload["ssh"] = {
+            **agent_ssh,
+            "ready": True,
+            "reason": "ready",
+            "retryAttempted": True,
+            "retrySucceeded": True,
+            "initialReason": initial_reason,
+        }
+        logger.info(
+            "Device SSH connection recovered after tunnel retry deviceName=%s "
+            "forceReopened=%s",
+            device_name,
+            bool(agent_ssh.get("forceReopened")),
+        )
 
     client = connection["client"]
     keys = _PROBE_COMPONENT_COMMAND_KEYS[component]

@@ -6,6 +6,8 @@ from boxer_company.routers.mda_graphql import (
     _get_mda_stopped_recording_restore_candidates,
     _normalize_mda_device_detail,
     _restore_mda_stopped_recordings,
+    _send_mda_device_command,
+    _wait_for_mda_device_agent_ssh,
 )
 
 
@@ -68,6 +70,120 @@ class MdaDeviceDetailNormalizationTests(unittest.TestCase):
         self.assertFalse(result["checkInvalidBarcode"])
         self.assertEqual(result["checkExpiredBarcode"], 1)
         self.assertEqual(result["checkPinkBarcode"], -1)
+
+
+class MdaDeviceCommandTests(unittest.TestCase):
+    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql")
+    def test_sends_optional_acme_payload_for_scan_simulation(
+        self,
+        mock_execute_mda_graphql,
+    ) -> None:
+        # 음성 변경은 command와 payload를 분리해 MDA의 기존 mutation 계약으로 보낸다.
+        mock_execute_mda_graphql.return_value = {
+            "sendCommand": {"affected": 1, "status": True, "message": "sent"}
+        }
+
+        result = _send_mda_device_command(
+            "MB2-C00419",
+            command="scansim",
+            acme="S_VOICE1",
+        )
+
+        variables = mock_execute_mda_graphql.call_args.args[1]
+        self.assertEqual(
+            variables,
+            {
+                "deviceName": "MB2-C00419",
+                "command": "scansim",
+                "acme": "S_VOICE1",
+            },
+        )
+        self.assertEqual(result["acme"], "S_VOICE1")
+        self.assertTrue(result["status"])
+
+    @patch("boxer_company.routers.mda_graphql.time.sleep", return_value=None)
+    @patch("boxer_company.routers.mda_graphql._open_mda_device_ssh")
+    @patch("boxer_company.routers.mda_graphql._get_mda_device_agent_ssh")
+    def test_force_reopen_does_not_reuse_cached_ssh_endpoint(
+        self,
+        get_device_ssh,
+        open_device_ssh,
+        _sleep,
+    ) -> None:
+        cached = {
+            "deviceName": "MB2-C00419",
+            "agentUpdatedAt": "2026-08-04T06:40:00Z",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        refreshed = {
+            "deviceName": "MB2-C00419",
+            "agentUpdatedAt": "2026-08-04T06:40:02Z",
+            # 같은 포트가 재할당돼도 agent 갱신 시각으로 새 터널을 구분한다.
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        # 첫 poll의 기존 endpoint는 무시하고 실제 agent 갱신까지 기다린다.
+        get_device_ssh.side_effect = [cached, cached, refreshed]
+        open_device_ssh.return_value = {"status": True}
+
+        result = _wait_for_mda_device_agent_ssh(
+            "MB2-C00419",
+            poll_timeout_sec=2,
+            poll_interval_sec=1,
+            force_reopen=True,
+        )
+
+        open_device_ssh.assert_called_once_with(
+            "MB2-C00419",
+            host="remotes.example",
+        )
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["reusedExisting"])
+        self.assertEqual(result["device"]["agentSsh"]["port"], 61001)
+        self.assertEqual(
+            result["device"]["agentUpdatedAt"],
+            "2026-08-04T06:40:02Z",
+        )
+        self.assertEqual(get_device_ssh.call_count, 3)
+
+    def test_force_reopen_sends_open_once_across_multiple_polls(self) -> None:
+        cached = {
+            "deviceName": "MB2-C00419",
+            "agentUpdatedAt": "2026-08-04T06:40:00Z",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.mda_graphql.time.monotonic",
+                side_effect=[0, 0, 1, 2, 3, 4, 5],
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql.time.sleep",
+                return_value=None,
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql._open_mda_device_ssh",
+                return_value={"status": True},
+            ) as open_device_ssh,
+            patch(
+                "boxer_company.routers.mda_graphql._get_mda_device_agent_ssh",
+                return_value=cached,
+            ) as get_device_ssh,
+        ):
+            result = _wait_for_mda_device_agent_ssh(
+                "MB2-C00419",
+                poll_timeout_sec=5,
+                poll_interval_sec=1,
+                force_reopen=True,
+            )
+
+        open_device_ssh.assert_called_once_with(
+            "MB2-C00419",
+            host="remotes.example",
+        )
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["pollCount"], 5)
+        self.assertEqual(get_device_ssh.call_count, 6)
 
 
 class MdaStoppedRecordingRestoreTests(unittest.TestCase):

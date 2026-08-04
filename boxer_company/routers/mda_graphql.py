@@ -31,8 +31,8 @@ mutation SshOrder($deviceName: String!, $action: String!, $host: String!) {
 """
 
 _SEND_COMMAND_MUTATION = """
-mutation SendCommand($deviceName: String!, $command: String!) {
-  sendCommand(deviceName: $deviceName, command: $command) {
+mutation SendCommand($deviceName: String!, $command: String!, $acme: JSON) {
+  sendCommand(deviceName: $deviceName, command: $command, acme: $acme) {
     affected
     status
     message
@@ -437,12 +437,16 @@ def _send_mda_device_command(
     device_name: str,
     *,
     command: str,
+    acme: Any | None = None,
 ) -> dict[str, Any]:
+    # MDA의 범용 명령 mutation 형식을 그대로 사용하되, payload가 없는 기존
+    # ping/fdla 호출도 같은 함수에서 계속 처리한다.
     data = _execute_mda_graphql(
         _SEND_COMMAND_MUTATION,
         {
             "deviceName": device_name,
             "command": command,
+            "acme": acme,
         },
     )
     result = data.get("sendCommand")
@@ -453,6 +457,7 @@ def _send_mda_device_command(
         "status": _normalize_mda_boolean(result.get("status")),
         "message": _display_value(result.get("message"), default=""),
         "command": _display_value(command, default=""),
+        "acme": acme,
     }
 
 
@@ -803,6 +808,7 @@ def _wait_for_mda_device_agent_ssh(
     poll_timeout_sec: int | None = None,
     poll_interval_sec: int | None = None,
     resend_every: int | None = None,
+    force_reopen: bool = False,
 ) -> dict[str, Any]:
     actual_poll_timeout = max(
         1,
@@ -819,7 +825,21 @@ def _wait_for_mda_device_agent_ssh(
 
     current_state = _get_mda_device_agent_ssh(device_name)
     current_agent_ssh = ((current_state or {}).get("agentSsh") or {}) if isinstance(current_state, dict) else {}
-    if current_agent_ssh.get("host") and current_agent_ssh.get("port"):
+    current_endpoint = (
+        _display_value(current_agent_ssh.get("host"), default=""),
+        current_agent_ssh.get("port"),
+    )
+    current_agent_updated_at = _display_value(
+        (current_state or {}).get("agentUpdatedAt")
+        if isinstance(current_state, dict)
+        else "",
+        default="",
+    )
+    if (
+        not force_reopen
+        and current_agent_ssh.get("host")
+        and current_agent_ssh.get("port")
+    ):
         return {
             "opened": None,
             "device": current_state,
@@ -832,6 +852,8 @@ def _wait_for_mda_device_agent_ssh(
         _display_value(((current_state or {}).get("agentSsh") or {}).get("host"), default="")
         or (host or cs.MDA_SSH_OPEN_HOST).strip()
     )
+    # 캐시된 endpoint의 실제 handshake가 실패한 호출자는 강제 재개방을 요청한다.
+    # 이 경우 기존 host/port가 남아 있어도 sshOrder를 다시 보내고 poll 결과를 쓴다.
     open_result = _open_mda_device_ssh(device_name, host=host_to_use)
 
     deadline = time.monotonic() + actual_poll_timeout
@@ -842,7 +864,29 @@ def _wait_for_mda_device_agent_ssh(
         poll_count += 1
         last_state = _get_mda_device_agent_ssh(device_name)
         agent_ssh = ((last_state or {}).get("agentSsh") or {}) if isinstance(last_state, dict) else {}
-        if agent_ssh.get("host") and agent_ssh.get("port"):
+        polled_endpoint = (
+            _display_value(agent_ssh.get("host"), default=""),
+            agent_ssh.get("port"),
+        )
+        polled_agent_updated_at = _display_value(
+            last_state.get("agentUpdatedAt")
+            if isinstance(last_state, dict)
+            else "",
+            default="",
+        )
+        has_ready_endpoint = bool(agent_ssh.get("host")) and bool(
+            agent_ssh.get("port")
+        )
+        endpoint_refreshed = (
+            not force_reopen
+            or not all(current_endpoint)
+            or polled_endpoint != current_endpoint
+            or (
+                bool(polled_agent_updated_at)
+                and polled_agent_updated_at != current_agent_updated_at
+            )
+        )
+        if has_ready_endpoint and endpoint_refreshed:
             return {
                 "opened": open_result,
                 "device": last_state,
@@ -851,7 +895,9 @@ def _wait_for_mda_device_agent_ssh(
                 "reusedExisting": False,
             }
 
-        if poll_count % actual_resend_every == 0:
+        # 강제 재개방은 기존 reverse SSH를 끊을 수 있어 한 번만 보낸다.
+        # 일반 최초 개방에서만 기존 주기 재전송 동작을 유지한다.
+        if not force_reopen and poll_count % actual_resend_every == 0:
             open_result = _open_mda_device_ssh(device_name, host=host_to_use)
 
     return {

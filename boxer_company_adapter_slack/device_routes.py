@@ -104,6 +104,14 @@ from boxer_company.routers.device_update import (
     _request_device_box_update,
     _request_device_power_off,
 )
+from boxer_company.routers.device_voice_control import (
+    _build_device_voice_choices_message,
+    _build_device_voice_config_message,
+    _build_device_voice_device_required_message,
+    _change_device_voice,
+    _extract_device_voice_label,
+    _is_device_voice_change_request,
+)
 from boxer_company.routers.mda_graphql import _send_mda_device_command
 from boxer_company.routers.recording_streaming_restore import (
     _extract_recording_streaming_restore_month,
@@ -490,6 +498,7 @@ def _handle_device_routes(
     remote_access_device_name = _extract_device_name_for_remote_access_probe(question) or structured_device_name
     status_probe_device_name = _extract_device_name_for_status_probe(question) or structured_device_name
     diagnostic_device_name = _extract_device_name_for_diagnostic_start(question) or structured_device_name
+    requested_voice_label = _extract_device_voice_label(question)
     alert_delivery_control = _extract_device_health_monitor_alert_delivery_control(question)
     auto_update_control = _extract_daily_device_round_auto_update_control(question)
 
@@ -571,6 +580,55 @@ def _handle_device_routes(
     if _is_missing_barcode_device_download_request(question, barcode):
         # 다운로드는 세션 단위 작업이라 병원/병실/날짜만으로 확정하지 않는다.
         context.reply(_build_device_download_barcode_required_message())
+        return True
+
+    if _is_device_voice_change_request(question):
+        # 음성 변경은 LLM보다 먼저 결정적으로 처리하고, 장비명과 목표 음성이
+        # 모두 확인된 경우에만 고정된 MDA 명령을 보낸다.
+        if not requested_voice_label:
+            context.reply(_build_device_voice_choices_message())
+            return True
+        if not structured_device_name:
+            context.reply(
+                _build_device_voice_device_required_message(requested_voice_label)
+            )
+            return True
+        if not cs.MDA_GRAPHQL_URL or not cs.MDA_ADMIN_USER_PASSWORD:
+            context.reply(_build_device_voice_config_message())
+            return True
+        try:
+            _set_request_log_route(
+                context.payload,
+                "device voice change",
+                handler_type="router",
+                subject_type="device",
+                subject_key=structured_device_name,
+            )
+            _merge_request_log_metadata(
+                context.payload,
+                deviceVoiceLabel=requested_voice_label,
+            )
+            result_text, result_payload = _change_device_voice(
+                structured_device_name,
+                requested_voice_label,
+                command_dispatcher=_send_mda_device_command,
+            )
+            context.reply(result_text, mention_user=False)
+            context.logger.info(
+                "Responded with device voice change in thread_ts=%s deviceName=%s voice=%s status=%s",
+                context.thread_ts,
+                structured_device_name,
+                requested_voice_label,
+                bool((result_payload.get("dispatch") or {}).get("status")),
+            )
+        except ValueError as exc:
+            context.reply(f"장비 음성 변경 요청 형식 오류: {exc}")
+        except RuntimeError as exc:
+            context.logger.exception("Device voice change failed")
+            context.reply(deps.build_dependency_failure_reply("장비 음성 변경", exc))
+        except Exception:
+            context.logger.exception("Device voice change failed")
+            context.reply("장비 음성 변경 중 오류가 발생했어. 잠시 후 다시 시도해줘")
         return True
 
     if context.assistant_service is not None:

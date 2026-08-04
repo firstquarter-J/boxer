@@ -1,8 +1,11 @@
 import json
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from boxer_company.routers.device_status_probe import (
+    _collect_runtime_checks,
     _build_trashcan_storage_usage,
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
@@ -444,7 +447,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "warning")
         self.assertEqual(summary["voiceType"], "ln")
-        self.assertEqual(summary["voiceSetLabel"], "구형 1번(ln)")
+        self.assertEqual(summary["voiceSetLabel"], "기존 귀여운 음성")
         self.assertFalse(summary["freeBarcodeVoiceSupported"])
         self.assertTrue(summary["invalidBarcodeVoiceSupported"])
         self.assertFalse(summary["isLatestVoiceSet"])
@@ -507,7 +510,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
                 "status": "warning",
                 "summary": "현재 음성 세트는 FREE/핑크 바코드 차단 음성이 빠져 있어",
                 "voiceType": "ln",
-                "voiceSetLabel": "구형 1번(ln)",
+                "voiceSetLabel": "기존 귀여운 음성",
                 "locale": "ko_KR",
                 "freeBarcodeVoiceSupported": False,
                 "reason": "ok",
@@ -548,7 +551,7 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
         self.assertIn("*장비 상태 점검*", rendered)
         self.assertIn("*오디오*", rendered)
         self.assertIn("• 소리 출력: *정상* | 장치 `Generic Analog`, `Generic Digital` / 음량 `Master 87% on, PCM 100%`", rendered)
-        self.assertIn("• 음성 세트: *구형 1번(ln)* | 값 `ln` / locale `ko_KR` / FREE/핑크 차단 음성 `미지원`", rendered)
+        self.assertIn("• 음성 세트: *기존 귀여운 음성* | 값 `ln` / locale `ko_KR` / FREE/핑크 차단 음성 `미지원`", rendered)
         self.assertIn("• 미출력 음성: `FREE/핑크 차단`", rendered)
         self.assertNotIn("• 음성 세트별 지원:", rendered)
         self.assertIn("*런타임*", rendered)
@@ -642,6 +645,524 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
 
 
 class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
+    def test_refreshes_cached_ssh_tunnel_once_after_connection_failure(self) -> None:
+        client = _FakeSshClient(
+            [
+                {
+                    "exit_status": 0,
+                    "stdout": "APLAY=/usr/bin/aplay\nPM2=/usr/bin/pm2",
+                    "stderr": "",
+                },
+                {
+                    "exit_status": 0,
+                    "stdout": _PM2_JLIST_OUTPUT,
+                    "stderr": "",
+                },
+            ]
+        )
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        refreshed_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61002},
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 1,
+                        "reusedExisting": False,
+                        "device": refreshed_device,
+                    },
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "reason": "connectionrefusederror",
+                        "retryable": True,
+                    },
+                    {
+                        "ok": False,
+                        "reason": "connectionrefusederror",
+                        "retryable": True,
+                    },
+                    {"ok": True, "client": client},
+                ],
+            ) as connect_ssh,
+        ):
+            evidence, device_info, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 3)
+        wait_for_ssh.assert_any_call(
+            "MB2-C00419",
+            force_reopen=True,
+        )
+        self.assertEqual(
+            [call.args for call in connect_ssh.call_args_list],
+            [
+                ("remotes.example", 61001),
+                ("remotes.example", 61001),
+                ("remotes.example", 61002),
+            ],
+        )
+        self.assertEqual(device_info, refreshed_device)
+        self.assertTrue(evidence["ssh"]["ready"])
+        self.assertTrue(evidence["ssh"]["retryAttempted"])
+        self.assertTrue(evidence["ssh"]["retrySucceeded"])
+        self.assertEqual(
+            evidence["ssh"]["initialReason"],
+            "connectionrefusederror",
+        )
+        self.assertTrue(checks["pm2_jlist"]["ok"])
+        self.assertTrue(client.closed)
+
+    def test_rechecks_endpoint_under_lock_before_force_reopen(self) -> None:
+        client = _FakeSshClient(
+            [
+                {
+                    "exit_status": 0,
+                    "stdout": "APLAY=/usr/bin/aplay\nPM2=/usr/bin/pm2",
+                    "stderr": "",
+                },
+                {
+                    "exit_status": 0,
+                    "stdout": _PM2_JLIST_OUTPUT,
+                    "stderr": "",
+                },
+            ]
+        )
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "reason": "connectionrefusederror",
+                        "retryable": True,
+                    },
+                    {"ok": True, "client": client},
+                ],
+            ) as connect_ssh,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 2)
+        self.assertTrue(
+            all(not call.kwargs.get("force_reopen") for call in wait_for_ssh.call_args_list)
+        )
+        self.assertEqual(connect_ssh.call_count, 2)
+        self.assertTrue(evidence["ssh"]["ready"])
+        self.assertTrue(evidence["ssh"]["retryAttempted"])
+        self.assertTrue(evidence["ssh"]["retrySucceeded"])
+        self.assertFalse(evidence["ssh"]["forceReopened"])
+        self.assertTrue(checks["pm2_jlist"]["ok"])
+        self.assertTrue(client.closed)
+
+    def test_serializes_force_reopen_for_same_device(self) -> None:
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        refreshed_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61002},
+        }
+        initial_wait_barrier = threading.Barrier(2)
+        thread_state = threading.local()
+        state_lock = threading.Lock()
+        state = {"refreshed": False, "force_count": 0}
+        recovered_clients: list[_FakeSshClient] = []
+
+        def fake_wait_for_ssh(
+            device_name: str,
+            *,
+            force_reopen: bool = False,
+        ) -> dict[str, object]:
+            self.assertEqual(device_name, "MB2-C00419")
+            if force_reopen:
+                with state_lock:
+                    state["force_count"] += 1
+                    state["refreshed"] = True
+                return {
+                    "ready": True,
+                    "pollCount": 1,
+                    "reusedExisting": False,
+                    "device": refreshed_device,
+                }
+
+            normal_wait_count = int(getattr(thread_state, "normal_wait_count", 0))
+            thread_state.normal_wait_count = normal_wait_count + 1
+            if normal_wait_count == 0:
+                # 두 호출이 모두 stale endpoint를 받은 뒤 경쟁하도록 시작점을 맞춘다.
+                initial_wait_barrier.wait(timeout=5)
+                selected_device = cached_device
+            else:
+                with state_lock:
+                    selected_device = (
+                        refreshed_device if state["refreshed"] else cached_device
+                    )
+            return {
+                "ready": True,
+                "pollCount": 0,
+                "reusedExisting": True,
+                "device": selected_device,
+            }
+
+        def fake_connect_ssh(host: str, port: int) -> dict[str, object]:
+            self.assertEqual(host, "remotes.example")
+            if port == 61001:
+                return {
+                    "ok": False,
+                    "reason": "connectionrefusederror",
+                    "retryable": True,
+                }
+            client = _FakeSshClient(
+                [
+                    {
+                        "exit_status": 0,
+                        "stdout": "APLAY=/usr/bin/aplay\nPM2=/usr/bin/pm2",
+                        "stderr": "",
+                    },
+                    {
+                        "exit_status": 0,
+                        "stdout": _PM2_JLIST_OUTPUT,
+                        "stderr": "",
+                    },
+                ]
+            )
+            recovered_clients.append(client)
+            return {"ok": True, "client": client, "retryable": False}
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=fake_wait_for_ssh,
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=fake_connect_ssh,
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._get_active_device_ssh_client_count",
+                return_value=0,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            futures = [
+                executor.submit(
+                    _collect_runtime_checks,
+                    "MB2-C00419",
+                    "pm2",
+                )
+                for _ in range(2)
+            ]
+            results = [future.result(timeout=10) for future in futures]
+
+        self.assertEqual(state["force_count"], 1)
+        self.assertEqual(len(recovered_clients), 2)
+        self.assertTrue(all(result[0]["ssh"]["ready"] for result in results))
+        self.assertTrue(all(result[2]["pm2_jlist"]["ok"] for result in results))
+        self.assertTrue(all(client.closed for client in recovered_clients))
+
+    def test_does_not_reopen_tunnel_while_cached_endpoint_is_in_use(self) -> None:
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        failed_connection = {
+            "ok": False,
+            "reason": "connectionrefusederror",
+            "retryable": True,
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=[failed_connection, failed_connection],
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._get_active_device_ssh_client_count",
+                return_value=1,
+            ) as get_active_count,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 2)
+        self.assertTrue(
+            all(not call.kwargs.get("force_reopen") for call in wait_for_ssh.call_args_list)
+        )
+        get_active_count.assert_called_once_with("remotes.example", 61001)
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertTrue(evidence["ssh"]["retryAttempted"])
+        self.assertFalse(evidence["ssh"]["retrySucceeded"])
+        self.assertTrue(evidence["ssh"]["refreshSkippedActiveClient"])
+        self.assertEqual(evidence["ssh"]["reason"], "connectionrefusederror")
+        self.assertEqual(checks, {})
+
+    def test_does_not_force_reopen_after_recheck_becomes_non_retryable(self) -> None:
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "reason": "connectionrefusederror",
+                        "retryable": True,
+                    },
+                    {
+                        "ok": False,
+                        "reason": "ssh_auth_failed",
+                        "retryable": False,
+                    },
+                ],
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._get_active_device_ssh_client_count",
+            ) as get_active_count,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 2)
+        get_active_count.assert_not_called()
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertEqual(evidence["ssh"]["reason"], "ssh_auth_failed")
+        self.assertTrue(evidence["ssh"]["refreshSkippedNonRetryable"])
+        self.assertEqual(checks, {})
+
+    def test_does_not_force_reopen_when_recheck_already_sent_open(self) -> None:
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": False,
+                        "pollCount": 5,
+                        "reusedExisting": False,
+                        "device": {
+                            "deviceName": "MB2-C00419",
+                            "agentSsh": None,
+                        },
+                    },
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                return_value={
+                    "ok": False,
+                    "reason": "connectionrefusederror",
+                    "retryable": True,
+                },
+            ) as connect_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._get_active_device_ssh_client_count",
+            ) as get_active_count,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 2)
+        connect_ssh.assert_called_once_with("remotes.example", 61001)
+        get_active_count.assert_not_called()
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertEqual(evidence["ssh"]["reason"], "agent_ssh_not_ready")
+        self.assertTrue(evidence["ssh"]["refreshSkippedAlreadyOpened"])
+        self.assertEqual(checks, {})
+
+    def test_preserves_initial_failure_when_force_reopen_raises(self) -> None:
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        failed_connection = {
+            "ok": False,
+            "reason": "connectionrefusederror",
+            "retryable": True,
+        }
+
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    RuntimeError("temporary MDA failure"),
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=[failed_connection, failed_connection],
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._get_active_device_ssh_client_count",
+                return_value=0,
+            ),
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 3)
+        wait_for_ssh.assert_any_call("MB2-C00419", force_reopen=True)
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertEqual(evidence["ssh"]["reason"], "connectionrefusederror")
+        self.assertEqual(evidence["ssh"]["refreshError"], "runtimeerror")
+        self.assertEqual(checks, {})
+
+    def test_does_not_refresh_tunnel_after_ssh_auth_failure(self) -> None:
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                return_value={
+                    "ready": True,
+                    "pollCount": 0,
+                    "reusedExisting": True,
+                    "device": {
+                        "deviceName": "MB2-C00419",
+                        "agentSsh": {
+                            "host": "remotes.example",
+                            "port": 61001,
+                        },
+                    },
+                },
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                return_value={
+                    "ok": False,
+                    "reason": "ssh_auth_failed",
+                    "retryable": False,
+                },
+            ) as connect_ssh,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+            )
+
+        wait_for_ssh.assert_called_once_with("MB2-C00419")
+        connect_ssh.assert_called_once_with("remotes.example", 61001)
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertFalse(evidence["ssh"]["retryAttempted"])
+        self.assertEqual(evidence["ssh"]["reason"], "ssh_auth_failed")
+        self.assertEqual(checks, {})
+
     def test_status_overview_probe_includes_ping_result_when_ssh_not_ready(self) -> None:
         with (
             patch(
