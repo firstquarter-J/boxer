@@ -151,6 +151,94 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
         )
         query.assert_called_once()
 
+    def test_http_runtime_preserves_barcode_all_dates_precedence(
+        self,
+    ) -> None:
+        token = "a" * 48
+        settings = CompanyApiSettings(
+            host="127.0.0.1",
+            port=8010,
+            callers=(
+                CompanyApiCallerSettings(
+                    caller_id="barcode-dates-integration-test",
+                    token=token,
+                    tenant_ids=frozenset({"TENANT-1"}),
+                    channels=frozenset({"slack"}),
+                    actor_ids=frozenset({"ACTOR-1"}),
+                    allow_anonymous_actor=False,
+                    capabilities=frozenset({"assistant.turn.read"}),
+                ),
+            ),
+        )
+        recordings_context = {
+            "summary": {"recordingCount": 0},
+            "rows": [],
+            "limit": 30,
+            "has_more": False,
+        }
+        with (
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.LLM_PROVIDER",
+                "",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "_load_recordings_context_by_barcode",
+                return_value=recordings_context,
+            ),
+        ):
+            runtime = create_company_assistant_runtime()
+        app = create_company_api_app(
+            settings=settings,
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with (
+            patch(
+                "boxer_company.assistant.barcode_query_route."
+                "_query_all_recorded_dates_by_barcode",
+                return_value=(
+                    "*바코드 전체 녹화 날짜 조회 결과*\n"
+                    "• 조회 결과 없음"
+                ),
+            ) as query,
+            patch(
+                "boxer_company.assistant.structured_route."
+                "_query_recordings_by_filters"
+            ) as structured_query,
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Request-ID": "req-barcode-dates-001",
+                    },
+                    json={
+                        "tenantId": "TENANT-1",
+                        "actorId": "ACTOR-1",
+                        "channel": "slack",
+                        "conversationId": "THREAD-BARCODE-DATES-1",
+                        "question": "12345678910 전체 녹화 날짜",
+                        "locale": "ko",
+                        "contextEntries": [],
+                        "scope": {"barcode": "12345678910"},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["route"],
+            "barcode_all_recorded_dates",
+        )
+        query.assert_called_once_with(
+            "12345678910",
+            recordings_context=recordings_context,
+        )
+        structured_query.assert_not_called()
+
     def test_http_log_route_never_enables_device_ssh_enrichment(
         self,
     ) -> None:

@@ -29,6 +29,7 @@ from boxer_company.routers.barcode_log import (
     _extract_leading_hospital_scope,
     _extract_log_date_with_presence,
     _extract_year_filter,
+    _is_barcode_all_recorded_dates_request,
     _is_devices_filter_query_request,
     _is_hospitals_filter_query_request,
     _is_hospital_rooms_filter_query_request,
@@ -335,6 +336,10 @@ def _build_structured_query_match(
     barcode = resolve_assistant_request_scope(request).barcode
     if _is_recording_streaming_restore_request(question, barcode):
         # 복원은 상태 변경 작업이라 read-only assistant service 밖에 유지한다.
+        return None
+    if _is_barcode_all_recorded_dates_request(question, barcode):
+        # 더 구체적인 바코드 날짜 route가 뒤 stage에서 응답하도록
+        # 일반 recordings 필터가 같은 질문을 먼저 흡수하지 않는다.
         return None
 
     try:

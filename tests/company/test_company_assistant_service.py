@@ -417,6 +417,8 @@ class StructuredAssistantRouteTests(unittest.TestCase):
         for question in (
             "이번 주 영상 현황 리포트",
             "35033165423 2024년 4월 영상 복원",
+            # 전용 barcode stage가 정규화된 날짜 목록 형식으로 답한다.
+            "12345678910 전체 녹화 날짜",
             "오늘 점심 뭐 먹지?",
         ):
             with self.subTest(question=question):
