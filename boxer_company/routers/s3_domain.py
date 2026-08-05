@@ -27,13 +27,25 @@ def _fetch_s3_device_log_lines(
         head_response = s3_client.head_object(Bucket=s.S3_LOG_BUCKET, Key=key)
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in {"404", "NotFound", "NoSuchKey"}:
+        is_get_only_missing = bool(
+            code in {"403", "AccessDenied"}
+            and cs.BOXER_COMPANY_API_S3_HEAD_403_AS_MISSING
+        )
+        if code in {"404", "NotFound", "NoSuchKey"} or is_get_only_missing:
+            # GetObject-only API role은 없는 key의 HeadObject도 403을 받는다.
+            # 이 모드는 API에서만 명시적으로 켜고, 배포 smoke에서 실제
+            # 존재 key 접근을 먼저 확인해 권한 장애와 구분한다.
             return {
                 "found": False,
                 "device_name": device_name,
                 "key": key,
                 "content_length": 0,
                 "lines": [],
+                "lookup_status": (
+                    "not_found_or_forbidden"
+                    if is_get_only_missing
+                    else "not_found"
+                ),
             }
         raise
 

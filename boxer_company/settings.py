@@ -502,6 +502,12 @@ LOG_SCAN_MAX_EVENTS = int(os.getenv("LOG_SCAN_MAX_EVENTS", "50"))
 LOG_SESSION_SAFETY_LINES = int(os.getenv("LOG_SESSION_SAFETY_LINES", "20"))
 LOG_POST_STOP_MAX_LINES = int(os.getenv("LOG_POST_STOP_MAX_LINES", "50"))
 LOG_PHASE1_MAX_DAYS = int(os.getenv("LOG_PHASE1_MAX_DAYS", "30"))
+# API role이 ListBucket 없이 GetObject만 가질 때 없는 key의 HeadObject가
+# 403으로 보이는 S3 계약을 명시적으로 허용한다. Slack 기본값은 false다.
+BOXER_COMPANY_API_S3_HEAD_403_AS_MISSING = os.getenv(
+    "BOXER_COMPANY_API_S3_HEAD_403_AS_MISSING",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 RECORDINGS_CONTEXT_LIMIT = int(os.getenv("RECORDINGS_CONTEXT_LIMIT", "30"))
 BARCODE_LOG_ERROR_SUMMARY_MAX_TOKENS = int(
     os.getenv("BARCODE_LOG_ERROR_SUMMARY_MAX_TOKENS", "1200")
