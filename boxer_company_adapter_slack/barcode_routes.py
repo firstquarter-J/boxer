@@ -88,8 +88,14 @@ def _handle_barcode_log_analysis_request(
             context_entries=context.context_entries,
             metadata={
                 "barcode": barcode,
-                "phase2_hospital_name": context.phase2_hospital_name,
-                "phase2_room_name": context.phase2_room_name,
+                # HTTP schema가 허용하는 채널 중립 scope 이름으로 맞춘다.
+                "hospital_name": context.phase2_hospital_name,
+                "room_name": context.phase2_room_name,
+                "followup_kind": (
+                    "barcode_log"
+                    if context.is_phase2_scope_followup
+                    else None
+                ),
             },
         )
 
@@ -222,6 +228,7 @@ def _handle_barcode_log_analysis_request(
                         log_date,
                         recordings_context=recordings_context,
                         device_contexts=direct_device_contexts,
+                        include_live_enrichment=True,
                     )
                 else:
                     result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
@@ -230,6 +237,7 @@ def _handle_barcode_log_analysis_request(
                         log_date,
                         recordings_context=recordings_context,
                         device_contexts=direct_device_contexts,
+                        include_live_enrichment=True,
                     )
             elif recording_count <= 0 or not has_device_mapping:
                 if not context.phase2_hospital_name or not context.phase2_room_name:
@@ -243,6 +251,7 @@ def _handle_barcode_log_analysis_request(
                                 log_date,
                                 recordings_context=recordings_context,
                                 device_contexts=auto_device_contexts,
+                                include_live_enrichment=True,
                             )
                         else:
                             result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
@@ -251,6 +260,7 @@ def _handle_barcode_log_analysis_request(
                                 log_date,
                                 recordings_context=recordings_context,
                                 device_contexts=auto_device_contexts,
+                                include_live_enrichment=True,
                             )
                     else:
                         analysis_mode = "scope_required"
@@ -281,6 +291,7 @@ def _handle_barcode_log_analysis_request(
                                 log_date,
                                 recordings_context=recordings_context,
                                 device_contexts=manual_device_contexts,
+                                include_live_enrichment=True,
                             )
                         else:
                             result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
@@ -289,6 +300,7 @@ def _handle_barcode_log_analysis_request(
                                 log_date,
                                 recordings_context=recordings_context,
                                 device_contexts=manual_device_contexts,
+                                include_live_enrichment=True,
                             )
             else:
                 analysis_mode = base_mode
@@ -298,6 +310,7 @@ def _handle_barcode_log_analysis_request(
                         barcode or "",
                         log_date,
                         recordings_context=recordings_context,
+                        include_live_enrichment=True,
                     )
                 else:
                     result_text, log_analysis_payload = _analyze_barcode_log_scan_events(
@@ -305,6 +318,7 @@ def _handle_barcode_log_analysis_request(
                         barcode or "",
                         log_date,
                         recordings_context=recordings_context,
+                        include_live_enrichment=True,
                     )
         else:
             result_text, log_analysis_payload = _analyze_barcode_log_phase1_window(
@@ -312,6 +326,7 @@ def _handle_barcode_log_analysis_request(
                 barcode or "",
                 recordings_context=recordings_context,
                 max_days=cs.LOG_PHASE1_MAX_DAYS,
+                include_live_enrichment=True,
             )
 
         if analysis_mode in {"scope_required", "scope_not_found"}:

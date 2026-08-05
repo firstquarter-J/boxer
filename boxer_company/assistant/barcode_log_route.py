@@ -108,6 +108,8 @@ class BarcodeLogAssistantRoute:
         *,
         s3_query_enabled: ConfigCheck = _default_s3_query_enabled,
         db_configured: ConfigCheck = _default_db_configured,
+        live_enrichment_enabled: bool = False,
+        explicit_date_required: bool = False,
         logger: logging.Logger | None = None,
     ) -> None:
         self._recordings = recordings
@@ -115,6 +117,8 @@ class BarcodeLogAssistantRoute:
         self._composer = composer
         self._s3_query_enabled = s3_query_enabled
         self._db_configured = db_configured
+        self._live_enrichment_enabled = live_enrichment_enabled
+        self._explicit_date_required = explicit_date_required
         self._logger = logger or logging.getLogger(__name__)
 
     def handle(
@@ -151,7 +155,10 @@ class BarcodeLogAssistantRoute:
         barcode = scope.barcode or self._resolve_barcode(request)
         hospital_name = scope.hospital_name
         room_name = scope.room_name
-        has_context_log_request = _context_has_log_request(request)
+        has_context_log_request = bool(
+            _context_has_log_request(request)
+            or _metadata_followup_kind(request) == "barcode_log"
+        )
 
         # 병원/병실/날짜만 다시 입력한 2차 요청은 이전 정규화 문맥에
         # 로그 요청이 있을 때만 이어서 처리한다.
@@ -205,6 +212,15 @@ class BarcodeLogAssistantRoute:
 
         try:
             log_date, has_requested_date = _extract_log_date_with_presence(question)
+            if self._explicit_date_required and not has_requested_date:
+                return _result(
+                    outcome="needs_input",
+                    body=(
+                        "공통 API 로그 분석은 날짜를 YYYY-MM-DD로 "
+                        "지정해줘"
+                    ),
+                    fallback_reason="explicit_date_required",
+                )
             recordings_context = self._recordings.get(
                 requested_barcode=barcode,
             )
@@ -355,6 +371,9 @@ class BarcodeLogAssistantRoute:
                 barcode,
                 recordings_context=recordings_context,
                 max_days=cs.LOG_PHASE1_MAX_DAYS,
+                include_live_enrichment=(
+                    self._live_enrichment_enabled
+                ),
             )
         else:
             base_mode = (
@@ -491,6 +510,7 @@ class BarcodeLogAssistantRoute:
             log_date,
             recordings_context=recordings_context,
             device_contexts=device_contexts,
+            include_live_enrichment=self._live_enrichment_enabled,
         )
 
     def _compose_error_summary(
@@ -653,6 +673,55 @@ class BarcodeLogAssistantRoute:
         return hospital_name, room_name
 
 
+def match_barcode_log_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """DB/S3 조회 없이 직접 로그 요청과 동일 actor의 2차 범위 입력만 고른다."""
+
+    try:
+        scope = resolve_assistant_request_scope(request)
+    except AssistantRequestScopeMismatch:
+        return None
+    barcode = scope.barcode or BarcodeLogAssistantRoute._resolve_barcode(
+        request
+    )
+    hospital_name = scope.hospital_name
+    room_name = scope.room_name
+    if not (hospital_name and room_name):
+        hospital_name, room_name = (
+            BarcodeLogAssistantRoute._resolve_manual_scope(request)
+        )
+    if _is_barcode_log_analysis_request(request.question, barcode):
+        return "barcode_log_analysis"
+
+    has_context_log_request = bool(
+        _context_has_log_request(request)
+        or _metadata_followup_kind(request) == "barcode_log"
+    )
+    try:
+        _, has_scope_date = _extract_log_date_with_presence(
+            request.question
+        )
+    except ValueError:
+        has_scope_date = _looks_like_scope_followup(
+            barcode=barcode,
+            hospital_name=hospital_name,
+            room_name=room_name,
+            has_context_log_request=has_context_log_request,
+        )
+    if (
+        has_scope_date
+        and _looks_like_scope_followup(
+            barcode=barcode,
+            hospital_name=hospital_name,
+            room_name=room_name,
+            has_context_log_request=has_context_log_request,
+        )
+    ):
+        return "barcode_log_analysis"
+    return None
+
+
 def _context_has_log_request(request: CompanyAssistantRequest) -> bool:
     return any(
         (
@@ -671,6 +740,16 @@ def _context_has_log_request(request: CompanyAssistantRequest) -> bool:
             == request.actor_id
         )
     )
+
+
+def _metadata_followup_kind(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    value = request.metadata.get("followup_kind")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
 
 
 def _looks_like_scope_followup(
@@ -1478,4 +1557,7 @@ def _result(
     )
 
 
-__all__ = ["BarcodeLogAssistantRoute"]
+__all__ = [
+    "BarcodeLogAssistantRoute",
+    "match_barcode_log_route",
+]

@@ -11,6 +11,9 @@ from boxer_company.assistant.contracts import (
     SourceReference,
     SuggestedAction,
 )
+from boxer_company_adapter_slack.company_api_client import (
+    _deserialize_result,
+)
 from boxer_company_api.app import create_company_api_app
 from boxer_company_api.settings import (
     CompanyApiCallerSettings,
@@ -108,6 +111,100 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 
 class CompanyApiContractTests(unittest.TestCase):
+    def test_long_message_is_windowed_at_client_contract_boundary(
+        self,
+    ) -> None:
+        # 로그 분석 본문이 30,000자를 넘겨도 API가 계약 오류를 만들지 않고
+        # 의미를 보존한 여러 메시지로 직렬화해야 한다.
+        for body_size, expected_messages in (
+            (29_999, 1),
+            (30_000, 1),
+            (30_001, 2),
+        ):
+            with self.subTest(body_size=body_size):
+                body = "가" * body_size
+                runtime = _FakeRuntime(
+                    CompanyAssistantResult(
+                        route="barcode_log_analysis",
+                        outcome="answered",
+                        messages=(AssistantMessage(body=body),),
+                    )
+                )
+                app = create_company_api_app(
+                    settings=_settings(),
+                    assistant_runtime=runtime,
+                    readiness_probe=lambda: True,
+                )
+
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(),
+                        json=_payload(),
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                messages = response.json()["messages"]
+                self.assertEqual(len(messages), expected_messages)
+                self.assertTrue(
+                    all(len(item["body"]) <= 30_000 for item in messages)
+                )
+                self.assertEqual(
+                    "".join(item["body"] for item in messages),
+                    body,
+                )
+                self.assertTrue(messages[0]["mentionActor"])
+                if expected_messages > 1:
+                    self.assertFalse(messages[1]["mentionActor"])
+
+    def test_response_windowing_respects_utf8_byte_budget_and_source_contract(
+        self,
+    ) -> None:
+        # 문자 수가 같아도 4-byte emoji와 최대 source가 합쳐지면 client의
+        # 1MiB 상한을 넘을 수 있어 최종 JSON byte 크기까지 고정한다.
+        uri_prefix = "https://example.com/"
+        source_uri = uri_prefix + "a" * (2_048 - len(uri_prefix))
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="barcode_log_analysis",
+                outcome="answered",
+                messages=tuple(
+                    AssistantMessage(body="😀" * 30_000)
+                    for _ in range(8)
+                ),
+                sources=tuple(
+                    SourceReference(
+                        source_id="😀" * 512,
+                        title="😀" * 2_000,
+                        uri=source_uri,
+                    )
+                    for _ in range(21)
+                ),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLessEqual(len(response.content), 1_048_576)
+        payload = response.json()
+        self.assertLessEqual(len(payload["messages"]), 8)
+        self.assertEqual(len(payload["sources"]), 20)
+        self.assertTrue(payload["messages"][-1]["body"].endswith("...(truncated)"))
+        # 실제 Slack API client 역직렬화 계약도 같은 HTTP 응답을 수용한다.
+        deserialized = _deserialize_result(response, _REQUEST_ID)
+        self.assertEqual(deserialized.route, "barcode_log_analysis")
+
     def test_exposes_only_internal_turn_and_health_endpoints(self) -> None:
         runtime = _FakeRuntime()
         app = create_company_api_app(
@@ -410,6 +507,8 @@ class CompanyApiContractTests(unittest.TestCase):
         traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
         headers = _headers()
         headers["traceparent"] = traceparent
+        payload = _payload()
+        payload["scope"]["followupKind"] = "barcode_log"
 
         with self.assertLogs(
             "boxer.company_api",
@@ -419,7 +518,7 @@ class CompanyApiContractTests(unittest.TestCase):
                 response = client.post(
                     "/internal/v1/assistant/turns",
                     headers=headers,
-                    json=_payload(),
+                    json=payload,
                 )
 
         self.assertEqual(response.status_code, 200)
@@ -462,6 +561,10 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(request.channel, "slack")
         self.assertEqual(request.metadata["barcode"], "12345678910")
         self.assertEqual(request.metadata["channel_id"], "C01")
+        self.assertEqual(
+            request.metadata["followup_kind"],
+            "barcode_log",
+        )
         self.assertNotIn("role", request.metadata)
         self.assertNotIn("capabilities", request.metadata)
         self.assertEqual(request.context_entries[0]["source"], "slack")
@@ -488,6 +591,7 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["route"], "unhandled")
         self.assertEqual(response.json()["outcome"], "no_evidence")
+        self.assertEqual(len(response.json()["messages"]), 1)
         self.assertFalse(response.json()["usedLlm"])
         self.assertEqual(response.json()["fallbackReason"], "no_matching_route")
 

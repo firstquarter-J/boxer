@@ -157,6 +157,14 @@ class CompanyApiClientSettings:
     notion_fallback_enabled: bool = False
     structured_mode: _RolloutMode = "local"
     structured_fallback_enabled: bool = False
+    device_mode: _RolloutMode = "local"
+    device_fallback_enabled: bool = False
+    recording_failure_mode: _RolloutMode = "local"
+    recording_failure_fallback_enabled: bool = False
+    barcode_log_mode: _RolloutMode = "local"
+    barcode_log_fallback_enabled: bool = False
+    barcode_mode: _RolloutMode = "local"
+    barcode_fallback_enabled: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -165,6 +173,10 @@ class CompanyApiClientSettings:
             for mode in (
                 self.notion_mode,
                 self.structured_mode,
+                self.device_mode,
+                self.recording_failure_mode,
+                self.barcode_log_mode,
+                self.barcode_mode,
             )
         )
 
@@ -173,6 +185,10 @@ class CompanyApiClientSettings:
         return "shadow" in {
             self.notion_mode,
             self.structured_mode,
+            self.device_mode,
+            self.recording_failure_mode,
+            self.barcode_log_mode,
+            self.barcode_mode,
         }
 
 
@@ -190,10 +206,36 @@ def load_company_api_client_settings(
         source,
         "BOXER_COMPANY_API_STRUCTURED_MODE",
     )
+    device_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_DEVICE_MODE",
+    )
+    recording_failure_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
+    )
+    barcode_log_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_BARCODE_LOG_MODE",
+    )
+    barcode_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_BARCODE_MODE",
+    )
 
     # 모든 route group이 local이면 즉시 롤백 상태다. 이전 remote
     # transport 값이 잘못 남아 있어도 전부 폐기해 Slack 기동을 막지 않는다.
-    if notion_mode == "local" and structured_mode == "local":
+    if all(
+        mode == "local"
+        for mode in (
+            notion_mode,
+            structured_mode,
+            device_mode,
+            recording_failure_mode,
+            barcode_log_mode,
+            barcode_mode,
+        )
+    ):
         return CompanyApiClientSettings(
             base_url="",
             token="",
@@ -254,6 +296,42 @@ def load_company_api_client_settings(
         if structured_mode != "local"
         else False
     )
+    device_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_DEVICE_FALLBACK_ENABLED",
+            False,
+        )
+        if device_mode != "local"
+        else False
+    )
+    recording_failure_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_RECORDING_FAILURE_FALLBACK_ENABLED",
+            False,
+        )
+        if recording_failure_mode != "local"
+        else False
+    )
+    barcode_log_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_BARCODE_LOG_FALLBACK_ENABLED",
+            False,
+        )
+        if barcode_log_mode != "local"
+        else False
+    )
+    barcode_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_BARCODE_FALLBACK_ENABLED",
+            False,
+        )
+        if barcode_mode != "local"
+        else False
+    )
     return CompanyApiClientSettings(
         base_url=base_url,
         token=token,
@@ -266,6 +344,16 @@ def load_company_api_client_settings(
         structured_fallback_enabled=(
             structured_fallback_enabled
         ),
+        device_mode=device_mode,
+        device_fallback_enabled=device_fallback_enabled,
+        recording_failure_mode=recording_failure_mode,
+        recording_failure_fallback_enabled=(
+            recording_failure_fallback_enabled
+        ),
+        barcode_log_mode=barcode_log_mode,
+        barcode_log_fallback_enabled=barcode_log_fallback_enabled,
+        barcode_mode=barcode_mode,
+        barcode_fallback_enabled=barcode_fallback_enabled,
     )
 
 
@@ -546,12 +634,21 @@ def _validate_base_url(value: str) -> str:
 def _validate_client_settings(
     settings: CompanyApiClientSettings,
 ) -> str:
-    if (
-        settings.notion_mode not in {"local", "shadow", "remote"}
-        or type(settings.notion_fallback_enabled) is not bool
-        or settings.structured_mode
-        not in {"local", "shadow", "remote"}
-        or type(settings.structured_fallback_enabled) is not bool
+    rollout_settings = (
+        (settings.notion_mode, settings.notion_fallback_enabled),
+        (settings.structured_mode, settings.structured_fallback_enabled),
+        (settings.device_mode, settings.device_fallback_enabled),
+        (
+            settings.recording_failure_mode,
+            settings.recording_failure_fallback_enabled,
+        ),
+        (settings.barcode_log_mode, settings.barcode_log_fallback_enabled),
+        (settings.barcode_mode, settings.barcode_fallback_enabled),
+    )
+    if any(
+        mode not in {"local", "shadow", "remote"}
+        or type(fallback_enabled) is not bool
+        for mode, fallback_enabled in rollout_settings
     ):
         raise CompanyApiContractError("company_api_settings_invalid")
     if not settings.enabled:
@@ -777,6 +874,12 @@ def _serialize_scope(metadata: Mapping[str, Any]) -> dict[str, Any]:
     channel_id = str(metadata.get("channel_id") or "").strip()
     if channel_id and _IDENTIFIER_PATTERN.fullmatch(channel_id):
         scope["channelContextId"] = channel_id
+    followup_kind = str(
+        metadata.get("followup_kind") or ""
+    ).strip()
+    if followup_kind in {"recording_failure", "barcode_log"}:
+        # 임의 metadata는 버리고 API schema가 허용한 두 후속 유형만 전달한다.
+        scope["followupKind"] = followup_kind
     return scope
 
 

@@ -1736,6 +1736,7 @@ def _query_devices_by_filters(
     active_flag: int | None = None,
     install_flag: int | None = None,
     count_only: bool = False,
+    include_live_enrichment: bool = True,
 ) -> str:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
@@ -1861,7 +1862,9 @@ def _query_devices_by_filters(
     finally:
         connection.close()
 
-    if rows:
+    if rows and include_live_enrichment:
+        # Slack local 경로만 MDA/SSH 상태를 보강한다. 공통 read-only API는
+        # DB 결과만 사용해 sshOrder mutation과 장비 접속을 원천 차단한다.
         detail_by_name = _lookup_mda_device_details([row.get("deviceName") for row in rows])
         if detail_by_name:
             for row in rows:
@@ -1907,7 +1910,16 @@ def _query_devices_by_filters(
         return "\n".join(lines)
 
     if total_count == 1 and rows:
-        ssh_status = _lookup_device_ssh_status(_display_value(rows[0].get("deviceName"), default=""))
+        ssh_status = (
+            _lookup_device_ssh_status(
+                _display_value(
+                    rows[0].get("deviceName"),
+                    default="",
+                )
+            )
+            if include_live_enrichment
+            else None
+        )
         lines.extend(_build_device_detail_lines(rows[0], line_prefix="• ", ssh_status=ssh_status))
         return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
 

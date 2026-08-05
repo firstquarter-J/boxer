@@ -53,6 +53,24 @@ _LED_PATTERN_REQUIRED_BULLETS = (
 )
 
 
+def match_device_read_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """외부 조회 없이 API 전환 가능한 장비 read-only route만 고른다."""
+
+    question = request.question
+    device_name = _resolve_device_name(request)
+    # 실제 장비 접속이 필요한 진단·상태 probe는 이 matcher에 넣지 않는다.
+    if _is_device_led_log_analysis_request(
+        question,
+        device_name=device_name,
+    ):
+        return "device_led_log_analysis"
+    if _is_device_led_pattern_help_request(question):
+        return "device_led_pattern_guide"
+    return None
+
+
 class DeviceLedLogAssistantRoute:
     """S3 LED 로그 분석을 채널 중립 결과로 바꾼다."""
 
@@ -428,4 +446,5 @@ __all__ = [
     "DeviceLedPatternGuideAssistantRoute",
     "NotionReferenceLoader",
     "S3ClientProvider",
+    "match_device_read_route",
 ]

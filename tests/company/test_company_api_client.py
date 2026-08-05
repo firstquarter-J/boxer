@@ -198,17 +198,29 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.notion_mode, "local")
         self.assertEqual(settings.structured_mode, "local")
+        self.assertEqual(settings.device_mode, "local")
+        self.assertEqual(settings.recording_failure_mode, "local")
+        self.assertEqual(settings.barcode_log_mode, "local")
+        self.assertEqual(settings.barcode_mode, "local")
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
         self.assertFalse(settings.notion_fallback_enabled)
         self.assertFalse(settings.structured_fallback_enabled)
+        self.assertFalse(settings.device_fallback_enabled)
+        self.assertFalse(settings.recording_failure_fallback_enabled)
+        self.assertFalse(settings.barcode_log_fallback_enabled)
+        self.assertFalse(settings.barcode_fallback_enabled)
 
     def test_local_rollback_ignores_stale_remote_credentials(self) -> None:
         settings = load_company_api_client_settings(
             {
                 "BOXER_COMPANY_API_NOTION_MODE": "local",
                 "BOXER_COMPANY_API_STRUCTURED_MODE": "local",
+                "BOXER_COMPANY_API_DEVICE_MODE": "local",
+                "BOXER_COMPANY_API_RECORDING_FAILURE_MODE": "local",
+                "BOXER_COMPANY_API_BARCODE_LOG_MODE": "local",
+                "BOXER_COMPANY_API_BARCODE_MODE": "local",
                 "BOXER_COMPANY_API_BASE_URL": "http://public.example.com",
                 "BOXER_COMPANY_API_SERVICE_TOKEN": "stale-invalid-token",
                 "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "invalid",
@@ -216,11 +228,19 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_MAX_RETRIES": "999",
                 "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_DEVICE_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_RECORDING_FAILURE_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_BARCODE_LOG_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_BARCODE_FALLBACK_ENABLED": "invalid",
             }
         )
 
         self.assertEqual(settings.notion_mode, "local")
         self.assertEqual(settings.structured_mode, "local")
+        self.assertEqual(settings.device_mode, "local")
+        self.assertEqual(settings.recording_failure_mode, "local")
+        self.assertEqual(settings.barcode_log_mode, "local")
+        self.assertEqual(settings.barcode_mode, "local")
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
 
@@ -300,6 +320,46 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             settings.base_url,
             "http://10.40.102.50:8010",
         )
+
+    def test_remaining_route_mode_independently_enables_shared_transport(
+        self,
+    ) -> None:
+        mode_keys = (
+            (
+                "BOXER_COMPANY_API_DEVICE_MODE",
+                "device_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
+                "recording_failure_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_BARCODE_LOG_MODE",
+                "barcode_log_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_BARCODE_MODE",
+                "barcode_mode",
+            ),
+        )
+        for env_key, field_name in mode_keys:
+            with self.subTest(field_name=field_name):
+                settings = load_company_api_client_settings(
+                    {
+                        "BOXER_COMPANY_API_BASE_URL": (
+                            "http://10.40.102.50:8010"
+                        ),
+                        "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                        env_key: "shadow",
+                    }
+                )
+
+                self.assertTrue(settings.enabled)
+                self.assertTrue(settings.shadow_enabled)
+                self.assertEqual(
+                    getattr(settings, field_name),
+                    "shadow",
+                )
         self.assertNotIn(_TOKEN, repr(settings))
 
     def test_notion_and_structured_modes_enable_transport_independently(
@@ -390,6 +450,7 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 "room_name": "검사실",
                 "device_name": "MB2-C00419",
                 "channel_id": "C1",
+                "followup_kind": "barcode_log",
                 "role": "must-not-cross",
             }
         )
@@ -434,6 +495,7 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 "roomName": "검사실",
                 "deviceName": "MB2-C00419",
                 "channelContextId": "C1",
+                "followupKind": "barcode_log",
             },
         )
         self.assertNotIn("role", call["json"]["scope"])

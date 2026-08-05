@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import math
 import re
 from typing import Any, Literal
@@ -23,6 +24,11 @@ _LOCALE_PATTERN = r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"
 _MAX_CONTEXT_ENTRIES = 12
 _MAX_CONTEXT_CHARS = 5_000
 _MAX_QUESTION_CHARS = 4_000
+_MAX_RESPONSE_MESSAGES = 8
+_MAX_RESPONSE_SOURCES = 20
+_MAX_MESSAGE_CHARS = 30_000
+_MAX_RESPONSE_BYTES = 1_048_576
+_TRUNCATED_MARKER = "...(truncated)"
 _SENSITIVE_SOURCE_PARAMETER_EXACT_NAMES = frozenset(
     {
         "auth",
@@ -127,6 +133,10 @@ class AssistantTurnScopeInput(_StrictInputModel):
         max_length=256,
         pattern=_IDENTIFIER_PATTERN,
     )
+    followupKind: Literal[
+        "recording_failure",
+        "barcode_log",
+    ] | None = None
 
     @field_validator(
         "hospitalName",
@@ -163,6 +173,7 @@ class AssistantTurnScopeInput(_StrictInputModel):
             ("room_name", self.roomName),
             ("device_name", self.deviceName),
             ("channel_id", self.channelContextId),
+            ("followup_kind", self.followupKind),
         ):
             if value is not None:
                 metadata[key] = value
@@ -246,22 +257,22 @@ class AssistantTurnInput(_StrictInputModel):
 
 
 class AssistantMessageOutput(BaseModel):
-    body: str
+    body: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
     deliveryScope: Literal["conversation", "requester"]
     mentionActor: bool
     format: Literal["commonmark"]
 
 
 class SourceReferenceOutput(BaseModel):
-    sourceId: str
-    title: str
-    uri: str
+    sourceId: str = Field(min_length=1, max_length=512)
+    title: str = Field(min_length=1, max_length=2_000)
+    uri: str = Field(min_length=1, max_length=2_048)
     score: float | None
 
 
 class AssistantTurnOutput(BaseModel):
-    requestId: str
-    route: str
+    requestId: str = Field(min_length=1, max_length=128)
+    route: str = Field(min_length=1, max_length=256)
     outcome: Literal[
         "answered",
         "no_evidence",
@@ -269,10 +280,15 @@ class AssistantTurnOutput(BaseModel):
         "denied",
         "failed",
     ]
-    messages: list[AssistantMessageOutput]
-    sources: list[SourceReferenceOutput]
+    messages: list[AssistantMessageOutput] = Field(
+        min_length=1,
+        max_length=_MAX_RESPONSE_MESSAGES
+    )
+    sources: list[SourceReferenceOutput] = Field(
+        max_length=_MAX_RESPONSE_SOURCES
+    )
     usedLlm: bool
-    fallbackReason: str | None
+    fallbackReason: str | None = Field(default=None, max_length=256)
     suggestedAction: None = None
     asyncJob: None = None
 
@@ -288,7 +304,14 @@ def serialize_result(
             requestId=request_id,
             route="unhandled",
             outcome="no_evidence",
-            messages=[],
+            messages=[
+                AssistantMessageOutput(
+                    body="처리할 수 있는 read-only 경로를 찾지 못했어",
+                    deliveryScope="conversation",
+                    mentionActor=True,
+                    format="commonmark",
+                )
+            ],
             sources=[],
             usedLlm=False,
             fallbackReason="no_matching_route",
@@ -296,14 +319,26 @@ def serialize_result(
         return payload.model_dump(mode="json")
 
     sources: list[SourceReferenceOutput] = []
-    for source in result.sources:
+    for source in result.sources[:_MAX_RESPONSE_SOURCES]:
         safe_uri = _safe_source_uri(str(source.uri))
-        if safe_uri is None:
+        safe_source_id = _safe_source_text(
+            source.source_id,
+            maximum=512,
+        )
+        safe_title = _safe_source_text(
+            source.title,
+            maximum=2_000,
+        )
+        if (
+            safe_uri is None
+            or safe_source_id is None
+            or safe_title is None
+        ):
             continue
         sources.append(
             SourceReferenceOutput(
-                sourceId=str(source.source_id),
-                title=str(source.title),
+                sourceId=safe_source_id,
+                title=safe_title,
                 uri=safe_uri,
                 score=_safe_score(source.score),
             )
@@ -312,15 +347,9 @@ def serialize_result(
         requestId=request_id,
         route=result.route,
         outcome=result.outcome,
-        messages=[
-            AssistantMessageOutput(
-                body=message.body,
-                deliveryScope=message.delivery_scope,
-                mentionActor=message.mention_actor,
-                format=message.format,
-            )
-            for message in result.messages
-        ],
+        # 긴 로그 결과도 client의 30,000자/8개 계약 안에서만 내보낸다.
+        # 원문은 route 결과에 남기고 HTTP 표현에서만 안전하게 windowing한다.
+        messages=_serialize_messages(result.messages),
         sources=sources,
         usedLlm=result.used_llm,
         fallbackReason=result.fallback_reason,
@@ -328,7 +357,142 @@ def serialize_result(
         suggestedAction=None,
         asyncJob=None,
     )
-    return payload.model_dump(mode="json")
+    return _fit_response_byte_budget(payload).model_dump(mode="json")
+
+
+def _serialize_messages(
+    messages: tuple[Any, ...],
+) -> list[AssistantMessageOutput]:
+    chunks: list[AssistantMessageOutput] = []
+    was_truncated = False
+    for message_index, message in enumerate(messages):
+        body = str(message.body or "")
+        if not body.strip():
+            continue
+        for offset in range(0, len(body), _MAX_MESSAGE_CHARS):
+            if len(chunks) >= _MAX_RESPONSE_MESSAGES:
+                was_truncated = True
+                break
+            chunk = body[offset : offset + _MAX_MESSAGE_CHARS]
+            chunks.append(
+                AssistantMessageOutput(
+                    body=chunk,
+                    deliveryScope=message.delivery_scope,
+                    mentionActor=(
+                        message.mention_actor and offset == 0
+                    ),
+                    format=message.format,
+                )
+            )
+        if len(chunks) >= _MAX_RESPONSE_MESSAGES:
+            # 현재 본문의 잔여분이나 뒤 메시지가 있으면 마지막 조각에
+            # 잘림을 명시해 조용한 데이터 손실을 피한다.
+            was_truncated = was_truncated or (
+                offset + _MAX_MESSAGE_CHARS < len(body)
+            )
+            if message_index < len(messages) - 1:
+                was_truncated = True
+            break
+
+    if was_truncated and chunks:
+        last = chunks[-1]
+        marker_budget = _MAX_MESSAGE_CHARS - len(_TRUNCATED_MARKER)
+        chunks[-1] = last.model_copy(
+            update={
+                "body": last.body[:marker_budget] + _TRUNCATED_MARKER
+            }
+        )
+    return chunks
+
+
+def _fit_response_byte_budget(
+    payload: AssistantTurnOutput,
+) -> AssistantTurnOutput:
+    """UTF-8 JSON 본문이 client의 1MiB 상한을 넘지 않게 줄인다."""
+
+    messages = list(payload.messages)
+    fitted = payload
+    while (
+        _serialized_response_size(fitted) > _MAX_RESPONSE_BYTES
+        and len(messages) > 1
+    ):
+        # 뒤쪽 transport chunk부터 제거하고 마지막 보존 chunk에 잘림을
+        # 표시해 silent truncation을 피한다.
+        messages.pop()
+        messages[-1] = _with_truncated_marker(messages[-1])
+        fitted = payload.model_copy(update={"messages": messages})
+
+    if _serialized_response_size(fitted) <= _MAX_RESPONSE_BYTES:
+        return fitted
+
+    # source 최대 계약만으로도 1MiB보다 작으므로 마지막 한 메시지만
+    # binary search로 줄이면 항상 예산 안에 들어온다.
+    last = messages[-1]
+    raw_body = _without_truncated_marker(last.body)
+    low = 0
+    high = min(len(raw_body), _MAX_MESSAGE_CHARS - len(_TRUNCATED_MARKER))
+    best = _TRUNCATED_MARKER
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate_body = raw_body[:midpoint] + _TRUNCATED_MARKER
+        candidate_messages = [
+            *messages[:-1],
+            last.model_copy(update={"body": candidate_body}),
+        ]
+        candidate = payload.model_copy(
+            update={"messages": candidate_messages}
+        )
+        if _serialized_response_size(candidate) <= _MAX_RESPONSE_BYTES:
+            best = candidate_body
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    messages[-1] = last.model_copy(update={"body": best})
+    return payload.model_copy(update={"messages": messages})
+
+
+def _with_truncated_marker(
+    message: AssistantMessageOutput,
+) -> AssistantMessageOutput:
+    body = _without_truncated_marker(message.body)
+    marker_budget = _MAX_MESSAGE_CHARS - len(_TRUNCATED_MARKER)
+    return message.model_copy(
+        update={
+            "body": body[:marker_budget] + _TRUNCATED_MARKER
+        }
+    )
+
+
+def _without_truncated_marker(body: str) -> str:
+    if body.endswith(_TRUNCATED_MARKER):
+        return body[: -len(_TRUNCATED_MARKER)]
+    return body
+
+
+def _serialized_response_size(payload: AssistantTurnOutput) -> int:
+    return len(
+        json.dumps(
+            payload.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _safe_source_text(
+    value: object,
+    *,
+    maximum: int,
+) -> str | None:
+    normalized = str(value or "").strip()
+    if (
+        not normalized
+        or "\r" in normalized
+        or "\n" in normalized
+    ):
+        return None
+    return normalized[:maximum]
 
 
 def _safe_source_uri(uri: str) -> str | None:

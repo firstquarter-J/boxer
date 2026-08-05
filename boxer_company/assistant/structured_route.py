@@ -81,10 +81,14 @@ class StructuredAssistantRoute:
             _is_weekly_recordings_report_request
         ),
         device_filter_enabled: bool = True,
+        device_live_enrichment_enabled: bool = True,
         logger: logging.Logger | None = None,
     ) -> None:
         self._is_weekly_report_request = is_weekly_report_request
         self._device_filter_enabled = device_filter_enabled
+        self._device_live_enrichment_enabled = (
+            device_live_enrichment_enabled
+        )
         self._logger = logger or logging.getLogger(__name__)
 
     def handle(
@@ -170,6 +174,9 @@ class StructuredAssistantRoute:
                     active_flag=matched.active_flag,
                     install_flag=matched.install_flag,
                     count_only=matched.count_only,
+                    include_live_enrichment=(
+                        self._device_live_enrichment_enabled
+                    ),
                 ),
                 format_error_prefix="장비 조회 요청 형식 오류",
                 dependency_error="장비 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
@@ -290,6 +297,31 @@ def match_structured_read_route(
         # scope 불일치는 기존 local guard가 값 노출 없이 처리하게 둔다.
         return None
     return matched.route if matched is not None else None
+
+
+def match_structured_device_count_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """live enrichment가 필요 없는 장비 개수·존재 조회만 분류한다."""
+
+    try:
+        matched = _build_structured_query_match(
+            request,
+            is_weekly_report_request=(
+                _is_weekly_recordings_report_request
+            ),
+        )
+    except AssistantRequestScopeMismatch:
+        return None
+    if (
+        matched is not None
+        and matched.route == "devices_filter"
+        and matched.count_only
+    ):
+        # 개수 응답은 row 상세를 만들기 전에 반환하므로 MDA/SSH 보강과
+        # sshOrder mutation을 호출하지 않는다.
+        return matched.route
+    return None
 
 
 def _build_structured_query_match(
@@ -451,5 +483,6 @@ def _result(
 
 __all__ = [
     "StructuredAssistantRoute",
+    "match_structured_device_count_route",
     "match_structured_read_route",
 ]

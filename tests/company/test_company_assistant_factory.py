@@ -186,7 +186,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                     )
         recordings_loader.assert_not_called()
 
-    def test_device_detail_query_is_denied_before_live_enrichment(
+    def test_device_detail_query_uses_db_without_live_enrichment(
         self,
     ) -> None:
         with (
@@ -198,6 +198,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
             patch(
                 "boxer_company.assistant.structured_route."
                 "_query_devices_by_filters",
+                return_value="*장비 조회 결과*\n• MB2-C00419",
             ) as device_query,
         ):
             runtime = create_company_assistant_runtime()
@@ -206,16 +207,42 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(result)
-        self.assertEqual(
-            result.route,
-            "unsupported_device_enrichment",
+        self.assertEqual(result.route, "devices_filter")
+        self.assertEqual(result.outcome, "answered")
+        device_query.assert_called_once_with(
+            device_name="MB2-C00419",
+            device_seq=None,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status=None,
+            active_flag=None,
+            install_flag=None,
+            count_only=False,
+            include_live_enrichment=False,
         )
-        self.assertEqual(result.outcome, "denied")
-        self.assertEqual(
-            result.fallback_reason,
-            "read_only_boundary",
-        )
-        device_query.assert_not_called()
+
+    def test_api_factory_disables_live_enrichment_for_all_log_routes(
+        self,
+    ) -> None:
+        with patch(
+            "boxer_company.assistant.factory."
+            "core_settings.LLM_PROVIDER",
+            "",
+        ):
+            turn = create_company_assistant_runtime().start_turn(
+                _request(f"{_BARCODE} 2026-08-04 로그 분석")
+            )
+
+        # API factory의 두 로그 경로가 MDA sshOrder·장비 SSH를 열 수 없게
+        # 같은 fail-closed 설정을 공유하는지 조립 경계에서 고정한다.
+        failure_route = turn.routes_for_stage("failure")[0]
+        barcode_log_route = turn.routes_for_stage("log")[0]
+        self.assertFalse(failure_route._live_enrichment_enabled)
+        self.assertFalse(barcode_log_route._live_enrichment_enabled)
+        self.assertTrue(failure_route._explicit_date_required)
+        self.assertTrue(barcode_log_route._explicit_date_required)
 
     def test_ollama_health_result_is_cached_for_requests(self) -> None:
         with (

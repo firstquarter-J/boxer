@@ -21,7 +21,12 @@ from boxer_company_adapter_slack.company_api_client import (
 )
 from boxer_company_adapter_slack.company_api_rollout import (
     BoundedShadowRunner,
+    CompanyBarcodeApiRolloutService,
+    CompanyBarcodeLogApiRolloutService,
+    CompanyDeviceApiRolloutService,
+    CompanyDeviceFilterApiRolloutService,
     CompanyNotionApiRolloutService,
+    CompanyRecordingFailureApiRolloutService,
     CompanyStructuredApiRolloutService,
     wrap_company_notion_service,
     wrap_company_structured_service,
@@ -75,6 +80,14 @@ def _settings(
     fallback_enabled: bool = True,
     structured_mode: str = "local",
     structured_fallback_enabled: bool = False,
+    device_mode: str = "local",
+    device_fallback_enabled: bool = False,
+    recording_failure_mode: str = "local",
+    recording_failure_fallback_enabled: bool = False,
+    barcode_log_mode: str = "local",
+    barcode_log_fallback_enabled: bool = False,
+    barcode_mode: str = "local",
+    barcode_fallback_enabled: bool = False,
 ) -> SimpleNamespace:
     # rollout 단위 테스트는 transport 설정과 분리해 전환 필드만 고정한다.
     return SimpleNamespace(
@@ -82,6 +95,16 @@ def _settings(
         notion_fallback_enabled=fallback_enabled,
         structured_mode=structured_mode,
         structured_fallback_enabled=structured_fallback_enabled,
+        device_mode=device_mode,
+        device_fallback_enabled=device_fallback_enabled,
+        recording_failure_mode=recording_failure_mode,
+        recording_failure_fallback_enabled=(
+            recording_failure_fallback_enabled
+        ),
+        barcode_log_mode=barcode_log_mode,
+        barcode_log_fallback_enabled=barcode_log_fallback_enabled,
+        barcode_mode=barcode_mode,
+        barcode_fallback_enabled=barcode_fallback_enabled,
     )
 
 
@@ -132,6 +155,26 @@ class _FakeApiClient:
         self.requests.append(request)
         if self.error is not None:
             raise self.error
+        return self.result
+
+
+class _FakeProgressLocalService(_FakeLocalService):
+    def __init__(
+        self,
+        partial: CompanyAssistantResult,
+        final: CompanyAssistantResult,
+    ) -> None:
+        super().__init__(final)
+        self.partial = partial
+
+    def answer_with_progress(
+        self,
+        request: CompanyAssistantRequest,
+        on_partial_result: Callable[[CompanyAssistantResult], None],
+    ) -> CompanyAssistantResult:
+        self.requests.append(request)
+        on_partial_result(self.partial)
+        assert self.result is not None
         return self.result
 
 
@@ -236,7 +279,8 @@ class CompanyApiRolloutTests(unittest.TestCase):
         self.assertIn("fallback_match=False", logs)
         self.assertIn("used_llm_match=False", logs)
         self.assertIn("source_set_match=False", logs)
-        self.assertIn("message_scope_match=False", logs)
+        # 같은 conversation 메시지의 transport 분할 수는 scope 차이가 아니다.
+        self.assertIn("message_scope_match=True", logs)
         for secret in (
             "SECRET-QUESTION",
             "LOCAL-SECRET-BODY",
@@ -247,6 +291,35 @@ class CompanyApiRolloutTests(unittest.TestCase):
             "REMOTE-SECRET-TOKEN",
         ):
             self.assertNotIn(secret, logs)
+
+    def test_shadow_ignores_api_transport_chunk_boundaries(self) -> None:
+        body = "가" * 30_001
+        local_result = _result(body=body)
+        remote_result = _result(
+            body=body[:30_000],
+            extra_messages=(
+                AssistantMessage(
+                    body=body[30_000:],
+                    mention_actor=False,
+                ),
+            ),
+        )
+        runner = _CapturingShadowRunner()
+        wrapped = CompanyNotionApiRolloutService(
+            _FakeLocalService(local_result),  # type: ignore[arg-type]
+            settings=_settings("shadow"),  # type: ignore[arg-type]
+            api_client=_FakeApiClient(remote_result),  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=runner,
+        )
+
+        wrapped.answer(_request())
+        with self.assertLogs(self.logger, level="INFO") as captured:
+            runner.tasks[0]()
+
+        logs = "\n".join(captured.output)
+        self.assertIn("message_scope_match=True", logs)
+        self.assertIn("message_body_match=True", logs)
 
     def test_shadow_only_submits_after_local_notion_match(self) -> None:
         local = _FakeLocalService(
@@ -612,6 +685,229 @@ class CompanyApiRolloutTests(unittest.TestCase):
         else:
             self.fail("shadow runner did not release its bounded slot")
         self.assertEqual(daemon_values, [True])
+
+
+class CompanyRemainingReadApiRolloutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.logger = logging.getLogger(
+            f"{__name__}.{self._testMethodName}"
+        )
+        self.logger.handlers.clear()
+        self.logger.addHandler(logging.NullHandler())
+        self.logger.propagate = False
+        self.logger.setLevel(logging.DEBUG)
+
+    def test_device_rollout_moves_only_led_and_count_reads(self) -> None:
+        settings = _settings(
+            "local",
+            device_mode="remote",
+        )
+        for question, route, service_type in (
+            (
+                "MB2-B00045 2026-07-01 LED 로그 분석",
+                "device_led_log_analysis",
+                CompanyDeviceApiRolloutService,
+            ),
+            (
+                "빨간 LED가 깜빡이면 무슨 뜻이야?",
+                "device_led_pattern_guide",
+                CompanyDeviceApiRolloutService,
+            ),
+            (
+                "활성 장비 몇 개야?",
+                "devices_filter",
+                CompanyDeviceFilterApiRolloutService,
+            ),
+        ):
+            with self.subTest(route=route):
+                remote = _result(route=route, body="원격 조회")
+                local = _FakeLocalService(
+                    _result(route=route, body="로컬 조회")
+                )
+                api = _FakeApiClient(remote)
+                service = service_type(
+                    local,  # type: ignore[arg-type]
+                    settings=settings,  # type: ignore[arg-type]
+                    api_client=api,  # type: ignore[arg-type]
+                    logger=self.logger,
+                    shadow_runner=_CapturingShadowRunner(),
+                )
+                request = _request(question)
+
+                self.assertIs(service.answer(request), remote)
+                self.assertEqual(api.requests, [request])
+                self.assertEqual(local.requests, [])
+
+        # 개별 상태·상세는 MDA/SSH 의미를 보존하기 위해 local에 남긴다.
+        for question in (
+            "MB2-B00045 장비상태",
+            "MB2-B00045 장비정보",
+            "MB2-B00045 진단 시작",
+        ):
+            with self.subTest(question=question):
+                local_result = _result(route="devices_filter")
+                local = _FakeLocalService(local_result)
+                api = _FakeApiClient(_result(route="devices_filter"))
+                service = CompanyDeviceFilterApiRolloutService(
+                    local,  # type: ignore[arg-type]
+                    settings=settings,  # type: ignore[arg-type]
+                    api_client=api,  # type: ignore[arg-type]
+                    logger=self.logger,
+                    shadow_runner=_CapturingShadowRunner(),
+                )
+
+                self.assertIs(service.answer(_request(question)), local_result)
+                self.assertEqual(api.requests, [])
+
+    def test_barcode_rollout_accepts_only_five_deterministic_reads(
+        self,
+    ) -> None:
+        settings = _settings("local", barcode_mode="remote")
+        allowed = (
+            ("12345678910 영상 개수", "barcode_video_count"),
+            ("12345678910 영상 정보", "barcode_video_info"),
+            ("12345678910 영상 목록", "barcode_video_list"),
+            ("12345678910 영상 길이", "barcode_video_length"),
+            (
+                "12345678910 전체 녹화 날짜",
+                "barcode_all_recorded_dates",
+            ),
+        )
+        for question, route in allowed:
+            with self.subTest(route=route):
+                remote = _result(route=route, body="원격 DB 결과")
+                local = _FakeLocalService(_result(route=route))
+                api = _FakeApiClient(remote)
+                service = CompanyBarcodeApiRolloutService(
+                    local,  # type: ignore[arg-type]
+                    settings=settings,  # type: ignore[arg-type]
+                    api_client=api,  # type: ignore[arg-type]
+                    logger=self.logger,
+                    shadow_runner=_CapturingShadowRunner(),
+                )
+
+                self.assertIs(service.answer(_request(question)), remote)
+                self.assertEqual(len(api.requests), 1)
+                self.assertEqual(local.requests, [])
+
+        # MDA·복구·Baby AI·LLM 합성 경로는 첫 전환 allowlist 밖이다.
+        for question in (
+            "10255657857 이건 유효성 검사에 걸리는 바코드냐",
+            "58291583958 왜 핑크바코드로 분류되지 않았어?",
+            "12345678910 베이비매직 목록",
+            "12345678910 마지막 녹화 날짜",
+            "12345678910 2026-07-01 영상 있어?",
+            "12345678910 2026년 7월 영상 복원",
+        ):
+            with self.subTest(question=question):
+                local_result = _result(route="local_only")
+                local = _FakeLocalService(local_result)
+                api = _FakeApiClient(_result(route="barcode_video_count"))
+                service = CompanyBarcodeApiRolloutService(
+                    local,  # type: ignore[arg-type]
+                    settings=settings,  # type: ignore[arg-type]
+                    api_client=api,  # type: ignore[arg-type]
+                    logger=self.logger,
+                    shadow_runner=_CapturingShadowRunner(),
+                )
+
+                self.assertIs(service.answer(_request(question)), local_result)
+                self.assertEqual(api.requests, [])
+
+    def test_s3_rollout_requires_an_explicit_date(self) -> None:
+        cases = (
+            (
+                CompanyRecordingFailureApiRolloutService,
+                "recording_failure_mode",
+                "12345678910 녹화 실패 원인 분석",
+                "12345678910 2026-07-01 녹화 실패 원인 분석",
+                "recording_failure_analysis",
+            ),
+            (
+                CompanyBarcodeLogApiRolloutService,
+                "barcode_log_mode",
+                "12345678910 로그 분석",
+                "12345678910 2026-07-01 로그 분석",
+                "barcode_log_analysis",
+            ),
+        )
+        for service_type, mode_key, undated, dated, route in cases:
+            with self.subTest(route=route):
+                settings = _settings("local", **{mode_key: "remote"})
+                remote = _result(
+                    route=route,
+                    body="원격 S3 결과",
+                    used_llm=True,
+                )
+                local_result = _result(route=route, body="로컬 결과")
+                local = _FakeLocalService(local_result)
+                api = _FakeApiClient(remote)
+                service = service_type(
+                    local,  # type: ignore[arg-type]
+                    settings=settings,  # type: ignore[arg-type]
+                    api_client=api,  # type: ignore[arg-type]
+                    logger=self.logger,
+                    shadow_runner=_CapturingShadowRunner(),
+                )
+
+                self.assertIs(service.answer(_request(undated)), local_result)
+                self.assertEqual(api.requests, [])
+                self.assertIs(service.answer(_request(dated)), remote)
+                self.assertEqual(len(api.requests), 1)
+
+    def test_barcode_log_shadow_preserves_partial_delivery_once(
+        self,
+    ) -> None:
+        main = _result(
+            route="barcode_log_analysis",
+            body="확정 DB/S3 본문",
+        )
+        summary = _result(
+            route="barcode_log_analysis",
+            body="후속 LLM 요약",
+            used_llm=True,
+        )
+        remote = _result(
+            route="barcode_log_analysis",
+            body="확정 DB/S3 본문",
+            used_llm=True,
+            extra_messages=(
+                AssistantMessage(
+                    body="후속 LLM 요약",
+                    mention_actor=False,
+                ),
+            ),
+        )
+        local = _FakeProgressLocalService(main, summary)
+        api = _FakeApiClient(remote)
+        runner = _CapturingShadowRunner()
+        service = CompanyBarcodeLogApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=_settings(
+                "local",
+                barcode_log_mode="shadow",
+            ),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=runner,
+        )
+        partials: list[CompanyAssistantResult] = []
+        request = _request("12345678910 2026-07-01 로그 분석")
+
+        returned = service.answer_with_progress(
+            request,
+            partials.append,
+        )
+
+        self.assertIs(returned, summary)
+        self.assertEqual(partials, [main])
+        self.assertEqual(len(local.requests), 1)
+        self.assertEqual(api.requests, [])
+        self.assertEqual(len(runner.tasks), 1)
+        with self.assertLogs(self.logger, level="INFO") as captured:
+            runner.tasks[0]()
+        self.assertEqual(api.requests, [request])
+        self.assertIn("message_body_match=True", "\n".join(captured.output))
 
 
 class CompanyStructuredApiRolloutTests(unittest.TestCase):

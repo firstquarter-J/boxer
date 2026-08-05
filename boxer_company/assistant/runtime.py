@@ -150,6 +150,9 @@ class CompanyAssistantRuntimeDeps:
     notion_route_deps: CompanyNotionAssistantRouteDeps | None = None
     request_guard: RequestGuard | None = None
     structured_device_filter_enabled: bool = True
+    structured_device_live_enrichment_enabled: bool = True
+    log_analysis_live_enrichment_enabled: bool = False
+    log_analysis_explicit_date_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +325,12 @@ class CompanyAssistantRuntime:
                     composer,
                     s3_query_enabled=s3_query_enabled,
                     db_configured=db_configured,
+                    live_enrichment_enabled=(
+                        self._deps.log_analysis_live_enrichment_enabled
+                    ),
+                    explicit_date_required=(
+                        self._deps.log_analysis_explicit_date_required
+                    ),
                     timeout_message=self._deps.timeout_message,
                     logger=self._logger,
                 ),
@@ -333,6 +342,12 @@ class CompanyAssistantRuntime:
                     composer,
                     s3_query_enabled=lambda: s3_query_enabled,
                     db_configured=lambda: db_configured,
+                    live_enrichment_enabled=(
+                        self._deps.log_analysis_live_enrichment_enabled
+                    ),
+                    explicit_date_required=(
+                        self._deps.log_analysis_explicit_date_required
+                    ),
                     logger=self._logger,
                 ),
             ),
@@ -340,6 +355,9 @@ class CompanyAssistantRuntime:
                 StructuredAssistantRoute(
                     device_filter_enabled=(
                         self._deps.structured_device_filter_enabled
+                    ),
+                    device_live_enrichment_enabled=(
+                        self._deps.structured_device_live_enrichment_enabled
                     ),
                     logger=self._logger,
                 ),

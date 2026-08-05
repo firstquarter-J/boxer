@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from boxer_company.routers import box_db
 
@@ -100,6 +100,51 @@ class DeviceDetailRenderingTests(unittest.TestCase):
 
         self.assertIn("• SSH 연결 상태: 🔵 *연결 가능*", rendered)
         self.assertIn("• 초음파 영상 다운로드 가능 상태: 🔵 *가능*", rendered)
+
+
+class DeviceReadOnlyQueryTests(unittest.TestCase):
+    def test_db_only_device_detail_skips_mda_and_ssh_enrichment(self) -> None:
+        # 공통 API용 조회는 장비 기본 row만 읽고 MDA mutation이나 SSH를 열지 않는다.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"deviceCount": 1}
+        cursor.fetchall.return_value = [
+            {
+                "seq": 1079,
+                "deviceName": "MB2-C00419",
+                "hospitalName": "다온미래산부인과의원(아산)",
+                "roomName": "초음파실1",
+                "status": "NOSESS",
+                "activeFlag": 1,
+                "installFlag": 1,
+            }
+        ]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.object(box_db.s, "DB_HOST", "db-host"),
+            patch.object(box_db.s, "DB_USERNAME", "db-user"),
+            patch.object(box_db.s, "DB_PASSWORD", "db-pass"),
+            patch.object(box_db.s, "DB_DATABASE", "db-name"),
+            patch(
+                "boxer_company.routers.box_db._create_db_connection",
+                return_value=connection,
+            ),
+            patch(
+                "boxer_company.routers.box_db._lookup_mda_device_details"
+            ) as mda_lookup,
+            patch(
+                "boxer_company.routers.box_db._lookup_device_ssh_status"
+            ) as ssh_lookup,
+        ):
+            rendered = box_db._query_devices_by_filters(
+                device_name="MB2-C00419",
+                include_live_enrichment=False,
+            )
+
+        self.assertIn("MB2-C00419", rendered)
+        mda_lookup.assert_not_called()
+        ssh_lookup.assert_not_called()
 
 
 class LookupDeviceContextsByBarcodeOnDateTests(unittest.TestCase):

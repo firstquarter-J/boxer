@@ -364,9 +364,16 @@ def create_company_assistant_runtime(
                 ),
             ),
             request_guard=_guard_read_only_request,
-            # 장비 상세는 MDA/SSH live enrichment와 분리되기 전까지
-            # read-only API의 structured stage에서 조회 전에 차단한다.
-            structured_device_filter_enabled=False,
+            # 장비 기본 정보는 DB-only로 제공하고 MDA/SSH 보강과
+            # sshOrder mutation은 Slack의 live 진단 경계에 남긴다.
+            structured_device_filter_enabled=True,
+            structured_device_live_enrichment_enabled=False,
+            # 로그 분석은 S3/DB까지만 허용하고 MDA sshOrder와 실제
+            # 장비 SSH lifecycle 보강은 Slack local runtime에 남긴다.
+            log_analysis_live_enrichment_enabled=False,
+            # 초기 API 전환은 최대 30일 자동 탐색 없이 날짜 지정
+            # 요청만 허용해 S3 호출량과 timeout 범위를 제한한다.
+            log_analysis_explicit_date_required=True,
         ),
         knowledge_route_factory=build_knowledge_routes,
         logger=app_logger,

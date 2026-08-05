@@ -86,8 +86,15 @@ def _handle_recording_failure_analysis_request(
                 context_entries=context.context_entries,
                 metadata={
                     "barcode": barcode,
-                    "phase2_hospital_name": context.phase2_hospital_name,
-                    "phase2_room_name": context.phase2_room_name,
+                    # Slack 전용 alias가 HTTP에서 유실되지 않도록
+                    # 공통 scope key로 정규화한다.
+                    "hospital_name": context.phase2_hospital_name,
+                    "room_name": context.phase2_room_name,
+                    "followup_kind": (
+                        "recording_failure"
+                        if context.is_failure_phase2_scope_followup
+                        else None
+                    ),
                     "is_failure_phase2_scope_followup": (
                         context.is_failure_phase2_scope_followup
                     ),
@@ -168,6 +175,7 @@ def _handle_recording_failure_analysis_request(
                     log_date,
                     recordings_context=recordings_context,
                     device_contexts=direct_device_contexts,
+                    include_live_enrichment=True,
                 )
             elif recording_count <= 0 or not has_device_mapping:
                 if not context.phase2_hospital_name or not context.phase2_room_name:
@@ -185,6 +193,7 @@ def _handle_recording_failure_analysis_request(
                             log_date,
                             recordings_context=recordings_context,
                             device_contexts=auto_device_contexts,
+                            include_live_enrichment=True,
                         )
                     else:
                         context.reply(
@@ -231,6 +240,7 @@ def _handle_recording_failure_analysis_request(
                         log_date,
                         recordings_context=recordings_context,
                         device_contexts=manual_device_contexts,
+                        include_live_enrichment=True,
                     )
             else:
                 analysis_mode = "error"
@@ -239,6 +249,7 @@ def _handle_recording_failure_analysis_request(
                     barcode or "",
                     log_date,
                     recordings_context=recordings_context,
+                    include_live_enrichment=True,
                 )
         else:
             result_text, log_analysis_payload = _analyze_barcode_log_phase1_window(
@@ -246,6 +257,7 @@ def _handle_recording_failure_analysis_request(
                 barcode or "",
                 recordings_context=recordings_context,
                 max_days=cs.LOG_PHASE1_MAX_DAYS,
+                include_live_enrichment=True,
             )
             if "• 2차 조회를 위해 아래 3가지를 같이 입력해줘:" in result_text:
                 context.reply(

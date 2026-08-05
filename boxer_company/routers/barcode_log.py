@@ -4740,6 +4740,8 @@ def _analyze_barcode_log_phase1_window(
     barcode: str,
     recordings_context: dict[str, Any],
     max_days: int,
+    *,
+    include_live_enrichment: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     title = "*로그 분석 결과 (1차 자동 범위)*"
     summary = recordings_context.get("summary") or {}
@@ -4884,12 +4886,16 @@ def _analyze_barcode_log_phase1_window(
             if not sessions:
                 continue
 
-            extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
-                device_name=device_name,
-                log_date=date_label,
-                source_lines=source_lines,
-                sessions=sessions,
-                scan_events=events,
+            extra_lifecycle_events_by_session = (
+                _fetch_device_os_lifecycle_events_for_sessions(
+                    device_name=device_name,
+                    log_date=date_label,
+                    source_lines=source_lines,
+                    sessions=sessions,
+                    scan_events=events,
+                )
+                if include_live_enrichment
+                else {}
             )
             matched_scope_count += 1
             total_sessions += len(sessions)
@@ -5004,6 +5010,8 @@ def _analyze_barcode_log_scan_events(
     log_date: str,
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
+    *,
+    include_live_enrichment: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     mapped_device_contexts = device_contexts
     if mapped_device_contexts is None:
@@ -5138,12 +5146,16 @@ def _analyze_barcode_log_scan_events(
                     )
                 continue
 
-            extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
-                device_name=device_name,
-                log_date=log_date,
-                source_lines=source_lines,
-                sessions=sessions,
-                scan_events=events,
+            extra_lifecycle_events_by_session = (
+                _fetch_device_os_lifecycle_events_for_sessions(
+                    device_name=device_name,
+                    log_date=log_date,
+                    source_lines=source_lines,
+                    sessions=sessions,
+                    scan_events=events,
+                )
+                if include_live_enrichment
+                else {}
             )
             logs_with_session += 1
             devices_with_session += 1
@@ -5302,6 +5314,8 @@ def _analyze_barcode_log_errors(
     log_date: str,
     recordings_context: dict[str, Any] | None = None,
     device_contexts: list[dict[str, Any]] | None = None,
+    *,
+    include_live_enrichment: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     mapped_device_contexts = device_contexts
     if mapped_device_contexts is None:
@@ -5410,12 +5424,16 @@ def _analyze_barcode_log_errors(
             if session_count == 0:
                 continue
 
-            extra_lifecycle_events_by_session = _fetch_device_os_lifecycle_events_for_sessions(
-                device_name=device_name,
-                log_date=log_date,
-                source_lines=source_lines,
-                sessions=sessions,
-                scan_events=events,
+            extra_lifecycle_events_by_session = (
+                _fetch_device_os_lifecycle_events_for_sessions(
+                    device_name=device_name,
+                    log_date=log_date,
+                    source_lines=source_lines,
+                    sessions=sessions,
+                    scan_events=events,
+                )
+                if include_live_enrichment
+                else {}
             )
             logs_with_session += 1
             devices_with_session += 1

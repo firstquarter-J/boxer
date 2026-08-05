@@ -36,7 +36,12 @@ from boxer_company_adapter_slack.company_api_client import (
 )
 from boxer_company_adapter_slack.company_api_rollout import (
     BoundedShadowRunner,
+    wrap_company_barcode_log_service,
+    wrap_company_barcode_service,
+    wrap_company_device_filter_service,
+    wrap_company_device_service,
     wrap_company_notion_service,
+    wrap_company_recording_failure_service,
     wrap_company_structured_service,
 )
 from boxer_company_adapter_slack.barcode_routes import (
@@ -320,11 +325,23 @@ def create_app() -> App:
     app_logger.info(
         "Company API rollout configured "
         "notion_mode=%s notion_local_fallback=%s "
-        "structured_mode=%s structured_local_fallback=%s",
+        "structured_mode=%s structured_local_fallback=%s "
+        "device_mode=%s device_local_fallback=%s "
+        "recording_failure_mode=%s recording_failure_local_fallback=%s "
+        "barcode_log_mode=%s barcode_log_local_fallback=%s "
+        "barcode_mode=%s barcode_local_fallback=%s",
         company_api_settings.notion_mode,
         company_api_settings.notion_fallback_enabled,
         company_api_settings.structured_mode,
         company_api_settings.structured_fallback_enabled,
+        company_api_settings.device_mode,
+        company_api_settings.device_fallback_enabled,
+        company_api_settings.recording_failure_mode,
+        company_api_settings.recording_failure_fallback_enabled,
+        company_api_settings.barcode_log_mode,
+        company_api_settings.barcode_log_fallback_enabled,
+        company_api_settings.barcode_mode,
+        company_api_settings.barcode_fallback_enabled,
     )
     claude_client = None
     if s.LLM_PROVIDER == "claude":
@@ -493,6 +510,9 @@ def create_app() -> App:
                 and s.DB_PASSWORD
                 and s.DB_DATABASE
             ),
+            # Slack local runtime에서만 장비 SSH lifecycle 보강을 허용한다.
+            # 공통 API는 factory에서 항상 false로 고정한다.
+            log_analysis_live_enrichment_enabled=True,
             timeout_message=_answer_timeout_reply_text(),
             notion_route_deps=CompanyNotionAssistantRouteDeps(
                 answer_engine=company_answer_engine,
@@ -1058,6 +1078,15 @@ def create_app() -> App:
         def _build_barcode_fallback_evidence() -> None:
             return None
 
+        # 장비 stage에서는 S3 LED 조회·가이드만 API 대상이고 실제
+        # 상태 점검과 MDA/SSH 작업은 앞선 Slack 전용 handler가 처리한다.
+        device_assistant_service = wrap_company_device_service(
+            assistant_turn.service_for_stage("device"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
         if _handle_device_routes(
             DeviceRoutesContext(
                 question=question,
@@ -1072,9 +1101,7 @@ def create_app() -> App:
                 reply=reply,
                 client=client,
                 logger=logger,
-                assistant_service=assistant_turn.service_for_stage(
-                    "device"
-                ),
+                assistant_service=device_assistant_service,
                 context_entries=(
                     _get_assistant_context_entries()
                     if (
@@ -1095,6 +1122,15 @@ def create_app() -> App:
         ):
             return
 
+        recording_failure_assistant_service = (
+            wrap_company_recording_failure_service(
+                assistant_turn.service_for_stage("failure"),
+                company_api_settings,
+                company_api_client,
+                logger,
+                shadow_runner=company_api_shadow_runner,
+            )
+        )
         if _handle_recording_failure_analysis_request(
             RecordingFailureRouteContext(
                 question=question,
@@ -1111,8 +1147,8 @@ def create_app() -> App:
                 logger=logger,
                 client=client,
                 payload=payload,
-                assistant_service=assistant_turn.service_for_stage(
-                    "failure"
+                assistant_service=(
+                    recording_failure_assistant_service
                 ),
                 context_entries=(
                     _get_assistant_context_entries()
@@ -1137,6 +1173,13 @@ def create_app() -> App:
         ):
             return
 
+        barcode_log_assistant_service = wrap_company_barcode_log_service(
+            assistant_turn.service_for_stage("log"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
         if _handle_barcode_log_analysis_request(
             BarcodeLogRouteContext(
                 question=question,
@@ -1153,9 +1196,7 @@ def create_app() -> App:
                 claude_client=claude_client,
                 client=client,
                 payload=payload,
-                assistant_service=assistant_turn.service_for_stage(
-                    "log"
-                ),
+                assistant_service=barcode_log_assistant_service,
                 context_entries=(
                     _get_assistant_context_entries()
                     if (
@@ -1185,10 +1226,17 @@ def create_app() -> App:
         ):
             return
 
-        # DB-only 구조화 route만 별도 스위치로 API 전환하고, SSH/MDA
-        # enrichment가 섞인 장비 조회는 기존 local 경로에 남긴다.
+        # 기존 네 종류 DB route에 더해 장비는 개수·존재 조회만 API로
+        # 전환한다. 상세·상태 조회는 live enrichment 때문에 local이다.
         structured_assistant_service = wrap_company_structured_service(
             assistant_turn.service_for_stage("structured"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
+        structured_assistant_service = wrap_company_device_filter_service(
+            structured_assistant_service,
             company_api_settings,
             company_api_client,
             logger,
@@ -1208,6 +1256,13 @@ def create_app() -> App:
         ):
             return
 
+        barcode_assistant_service = wrap_company_barcode_service(
+            assistant_turn.service_for_stage("barcode"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
         if _handle_barcode_query_routes(
             BarcodeQueryRoutesContext(
                 question=question,
@@ -1217,9 +1272,7 @@ def create_app() -> App:
                 reply=reply,
                 logger=logger,
                 payload=payload,
-                assistant_service=assistant_turn.service_for_stage(
-                    "barcode"
-                ),
+                assistant_service=barcode_assistant_service,
                 client=client,
                 context_entries=(
                     _get_assistant_context_entries()

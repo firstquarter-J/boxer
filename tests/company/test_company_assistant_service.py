@@ -509,6 +509,7 @@ class StructuredAssistantRouteTests(unittest.TestCase):
             active_flag=None,
             install_flag=None,
             count_only=False,
+            include_live_enrichment=True,
         )
 
     def test_weekly_report_and_restore_stay_in_slack_adapter(self) -> None:

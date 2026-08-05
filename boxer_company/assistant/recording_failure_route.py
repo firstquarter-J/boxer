@@ -76,6 +76,8 @@ class RecordingFailureAssistantRoute:
         *,
         s3_query_enabled: bool | None = None,
         db_configured: bool | None = None,
+        live_enrichment_enabled: bool = False,
+        explicit_date_required: bool = False,
         timeout_message: str = (
             "AI 답변 생성 시간이 초과됐어. 잠시 후 다시 시도해줘"
         ),
@@ -94,6 +96,8 @@ class RecordingFailureAssistantRoute:
             if db_configured is None
             else bool(db_configured)
         )
+        self._live_enrichment_enabled = live_enrichment_enabled
+        self._explicit_date_required = explicit_date_required
         self._timeout_message = timeout_message
         self._logger = logger or logging.getLogger(__name__)
 
@@ -117,7 +121,7 @@ class RecordingFailureAssistantRoute:
             request,
             "is_failure_phase2_scope_followup",
             "isFailurePhase2ScopeFollowup",
-        )
+        ) or _metadata_followup_kind(request) == "recording_failure"
         contextual_followup = bool(
             barcode
             and hospital_name
@@ -154,6 +158,15 @@ class RecordingFailureAssistantRoute:
                 outcome="needs_input",
                 body=f"녹화 실패 원인 분석 요청 형식 오류: {exc}",
                 fallback_reason="invalid_request",
+            )
+        if self._explicit_date_required and not has_requested_date:
+            return _result(
+                outcome="needs_input",
+                body=(
+                    "공통 API 로그 분석은 날짜를 YYYY-MM-DD로 "
+                    "지정해줘"
+                ),
+                fallback_reason="explicit_date_required",
             )
 
         is_followup = _is_failure_scope_followup(
@@ -253,6 +266,9 @@ class RecordingFailureAssistantRoute:
                     log_date,
                     recordings_context=recordings_context,
                     device_contexts=direct_device_contexts,
+                    include_live_enrichment=(
+                        self._live_enrichment_enabled
+                    ),
                 )
             elif recording_count <= 0 or not has_device_mapping:
                 if not hospital_name or not room_name:
@@ -274,6 +290,9 @@ class RecordingFailureAssistantRoute:
                                 log_date,
                                 recordings_context=recordings_context,
                                 device_contexts=auto_device_contexts,
+                                include_live_enrichment=(
+                                    self._live_enrichment_enabled
+                                ),
                             )
                         )
                     else:
@@ -307,6 +326,9 @@ class RecordingFailureAssistantRoute:
                         log_date,
                         recordings_context=recordings_context,
                         device_contexts=manual_device_contexts,
+                        include_live_enrichment=(
+                            self._live_enrichment_enabled
+                        ),
                     )
             else:
                 analysis_mode = "error"
@@ -315,6 +337,9 @@ class RecordingFailureAssistantRoute:
                     barcode,
                     log_date,
                     recordings_context=recordings_context,
+                    include_live_enrichment=(
+                        self._live_enrichment_enabled
+                    ),
                 )
         else:
             result_text, log_analysis_payload = (
@@ -323,6 +348,9 @@ class RecordingFailureAssistantRoute:
                     barcode,
                     recordings_context=recordings_context,
                     max_days=cs.LOG_PHASE1_MAX_DAYS,
+                    include_live_enrichment=(
+                        self._live_enrichment_enabled
+                    ),
                 )
             )
             if "• 2차 조회를 위해 아래 3가지를 같이 입력해줘:" in result_text:
@@ -402,6 +430,54 @@ class RecordingFailureAssistantRoute:
         )
 
 
+def match_recording_failure_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """DB/S3 호출 전에 녹화 실패 분석 의도와 신뢰 가능한 후속 문맥만 확인한다."""
+
+    try:
+        resolve_assistant_request_scope(request)
+    except AssistantRequestScopeMismatch:
+        return None
+    barcode = _resolve_barcode(request)
+    hospital_name, room_name = _resolve_hospital_room(request)
+    context_text = _context_text(request)
+    direct_match = _is_recording_failure_analysis_request(
+        request.question,
+        barcode,
+    )
+    explicit_followup = _metadata_bool(
+        request,
+        "is_failure_phase2_scope_followup",
+        "isFailurePhase2ScopeFollowup",
+    ) or _metadata_followup_kind(request) == "recording_failure"
+    contextual_followup = bool(
+        barcode
+        and hospital_name
+        and room_name
+        and _has_recording_failure_analysis_hints(context_text)
+    )
+    if direct_match:
+        return "recording_failure_analysis"
+    if not (explicit_followup or contextual_followup):
+        return None
+    try:
+        _, has_requested_date = _resolve_log_date(request)
+    except ValueError:
+        # 잘못된 날짜도 route가 안전한 needs_input 결과로 바꿔야 한다.
+        return "recording_failure_analysis"
+    if _is_failure_scope_followup(
+        request,
+        barcode=barcode,
+        hospital_name=hospital_name,
+        room_name=room_name,
+        has_requested_date=has_requested_date,
+        context_text=context_text,
+    ):
+        return "recording_failure_analysis"
+    return None
+
+
 def _context_text(request: CompanyAssistantRequest) -> str:
     return "\n".join(
         str(entry.get("text") or "").strip()
@@ -434,6 +510,16 @@ def _metadata_bool(
     *keys: str,
 ) -> bool:
     return any(request.metadata.get(key) is True for key in keys)
+
+
+def _metadata_followup_kind(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    value = request.metadata.get("followup_kind")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
 
 
 def _resolve_barcode(
@@ -527,7 +613,7 @@ def _is_failure_scope_followup(
         request,
         "is_failure_phase2_scope_followup",
         "isFailurePhase2ScopeFollowup",
-    )
+    ) or _metadata_followup_kind(request) == "recording_failure"
     return bool(
         barcode
         and hospital_name
@@ -712,4 +798,5 @@ def _result(
 
 __all__ = [
     "RecordingFailureAssistantRoute",
+    "match_recording_failure_route",
 ]

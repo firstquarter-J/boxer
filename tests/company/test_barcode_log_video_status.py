@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import date, datetime
 import unittest
 
 from boxer_company.routers.barcode_log import (
+    _analyze_barcode_log_errors,
+    _analyze_barcode_log_phase1_window,
     _analyze_barcode_log_scan_events,
     _append_session_card,
     _build_log_analysis_record,
@@ -95,6 +97,8 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
                         "roomName": "입체초음파",
                     }
                 ],
+                # 장비 SSH lifecycle 보강은 이제 명시적으로만 연다.
+                include_live_enrichment=True,
             )
 
         self.assertIn("바코드 스캔은 확인됐지만 녹화 세션은 생성되지 않았어", result_text)
@@ -209,6 +213,7 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
                         "roomName": "3진료실",
                     }
                 ],
+                include_live_enrichment=True,
             )
 
         self.assertIn("전체 일자 로그 추가 검색", result_text)
@@ -559,12 +564,89 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
                         "roomName": "1진료실",
                     }
                 ],
+                # 기존 Slack 로컬 경로는 명시적으로 live enrichment를 유지한다.
+                include_live_enrichment=True,
             )
 
         fetch_os_events.assert_called_once()
         self.assertIn("• 종료 방식: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)", result_text)
         self.assertIn("12:27:58  종료 원인: 전원 버튼 종료(물리적 재부팅, 앱 크래시 아님)", result_text)
         self.assertNotIn("12:27:59  앱 종료 신호(SIGINT)", result_text)
+
+    def test_read_only_log_analyzers_never_fetch_device_lifecycle(
+        self,
+    ) -> None:
+        source_lines = [
+            "[12:20:29] Scanned : 33682817209",
+            "[12:24:22] Scanned : C_STOPSESS",
+            "[12:27:59] SIGINT received App Exiting. code : SIGINT",
+        ]
+        device_contexts = [
+            {
+                "deviceName": "MB2-C01040",
+                "hospitalName": "미즈맘의원(당진)",
+                "roomName": "1진료실",
+            }
+        ]
+        recordings_context = {
+            "summary": {"recordingCount": 1},
+            "rows": [],
+        }
+        with (
+            patch(
+                "boxer_company.routers.barcode_log._fetch_s3_device_log_lines",
+                return_value={
+                    "found": True,
+                    "lines": source_lines,
+                    "key": "MB2-C01040/log-2026-05-26.log",
+                    "content_length": 1234,
+                },
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._fetch_device_os_lifecycle_events_for_sessions"
+            ) as fetch_os_events,
+            patch(
+                "boxer_company.routers.barcode_log._extract_phase1_date_window",
+                return_value=(date(2026, 5, 26), date(2026, 5, 26)),
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._lookup_device_contexts_by_barcode",
+                return_value=device_contexts,
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._merge_device_contexts_with_recordings_hospital_scope",
+                return_value=(device_contexts, False),
+            ),
+            patch(
+                "boxer_company.routers.barcode_log._load_recordings_rows_on_date_by_barcode",
+                return_value=[],
+            ),
+        ):
+            _analyze_barcode_log_phase1_window(
+                None,
+                "33682817209",
+                recordings_context,
+                1,
+                include_live_enrichment=False,
+            )
+            _analyze_barcode_log_scan_events(
+                None,
+                "33682817209",
+                "2026-05-26",
+                recordings_context=recordings_context,
+                device_contexts=device_contexts,
+                include_live_enrichment=False,
+            )
+            _analyze_barcode_log_errors(
+                None,
+                "33682817209",
+                "2026-05-26",
+                recordings_context=recordings_context,
+                device_contexts=device_contexts,
+                include_live_enrichment=False,
+            )
+
+        fetch_os_events.assert_not_called()
 
     def test_app_crash_lifecycle_is_displayed_as_single_shutdown_cause(self) -> None:
         # 앱 비정상 종료 단서가 있으면 상세 로그 대신 크래시 여부만 한 줄로 남긴다.

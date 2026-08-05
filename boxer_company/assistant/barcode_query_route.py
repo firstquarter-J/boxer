@@ -63,6 +63,45 @@ from boxer_company.retrieval_rules import (
 from boxer_company.routers.recording_streaming_restore import (
     _is_recording_streaming_restore_request,
 )
+
+
+def match_barcode_query_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """DB/MDA 호출 없이 Slack에 남길 mutation·PII 경로를 제외해 분류한다."""
+
+    try:
+        barcode = resolve_assistant_request_scope(request).barcode
+    except AssistantRequestScopeMismatch:
+        return None
+    question = request.question
+    if _is_barcode_pink_classification_reason_request(question, barcode):
+        return "barcode_pink_classification_reason"
+    if _is_barcode_validation_status_request(question, barcode):
+        return "barcode_validation_status"
+    if _is_recording_streaming_restore_request(question, barcode):
+        return None
+    if _is_barcode_video_count_request(question, barcode):
+        return "barcode_video_count"
+    if _is_baby_ai_list_request_without_barcode(question, barcode):
+        return "baby_ai_list"
+    if _is_barcode_baby_ai_list_request(question, barcode):
+        return "barcode_baby_ai_list"
+    if _is_barcode_video_info_request(question, barcode):
+        return "barcode_video_info"
+    if _is_barcode_video_list_request(question, barcode):
+        return "barcode_video_list"
+    if _is_barcode_video_length_request(question, barcode):
+        return "barcode_video_length"
+    if _is_barcode_all_recorded_dates_request(question, barcode):
+        return "barcode_all_recorded_dates"
+    if _is_barcode_last_recorded_at_request(question, barcode):
+        return "barcode last recordedAt"
+    if _is_barcode_video_recorded_on_date_request(question, barcode):
+        return "barcode recordedAt-on-date"
+    return None
+
+
 class BarcodeQueryAssistantRoute:
     name = "barcode_query"
 
@@ -444,4 +483,7 @@ def _result(
     )
 
 
-__all__ = ["BarcodeQueryAssistantRoute"]
+__all__ = [
+    "BarcodeQueryAssistantRoute",
+    "match_barcode_query_route",
+]
