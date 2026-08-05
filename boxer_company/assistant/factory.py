@@ -14,10 +14,16 @@ from boxer.core.llm import (
 )
 from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company import settings as company_settings
+from boxer_company.assistant.barcode_log_route import (
+    match_barcode_log_route,
+)
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantRequest,
     CompanyAssistantResult,
+)
+from boxer_company.assistant.device_led_routes import (
+    match_device_read_route,
 )
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
@@ -28,6 +34,9 @@ from boxer_company.assistant.knowledge_routes import (
 )
 from boxer_company.assistant.notion_route import (
     CompanyNotionAssistantRouteDeps,
+)
+from boxer_company.assistant.recording_failure_route import (
+    match_recording_failure_route,
 )
 from boxer_company.assistant.runtime import (
     CompanyAssistantRuntime,
@@ -87,6 +96,21 @@ def _unavailable_diagnostic_snapshot(
 def _guard_read_only_request(
     request: CompanyAssistantRequest,
 ) -> CompanyAssistantResult | None:
+    has_live_start = _has_device_diagnostic_start_hint(
+        request.question
+    )
+    # 장비명이 포함된 DB/S3 조회도 진단 키워드와 겹칠 수 있으므로,
+    # 명시적인 진단 시작이 아닌 read-only 경로만 먼저 보존한다.
+    if not has_live_start and any(
+        matcher(request) is not None
+        for matcher in (
+            match_device_read_route,
+            match_recording_failure_route,
+            match_barcode_log_route,
+        )
+    ):
+        return None
+
     device_name = _extract_device_name_for_diagnostic_freeform(
         request.question
     )
@@ -95,7 +119,7 @@ def _guard_read_only_request(
         device_name=device_name,
     )
     if (
-        not _has_device_diagnostic_start_hint(request.question)
+        not has_live_start
         and not is_live_followup
     ):
         return None

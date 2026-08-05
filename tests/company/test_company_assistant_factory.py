@@ -6,6 +6,7 @@ from unittest.mock import patch
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.factory import (
     CompanyAssistantRuntimePolicy,
+    _guard_read_only_request,
     create_company_assistant_runtime,
 )
 from boxer_company.assistant.freeform_prompt import (
@@ -170,6 +171,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
             for question in (
                 "MB2-C00419 진단 시작",
                 f"{_BARCODE} MB2-C00419 PM2 상태 진단해줘",
+                "MB2-C00419 PM2 로그 확인해줘",
             ):
                 with self.subTest(question=question):
                     result = runtime.answer(_request(question))
@@ -185,6 +187,96 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                         "read_only_boundary",
                     )
         recordings_loader.assert_not_called()
+
+    def test_read_only_guard_preserves_supported_s3_log_routes(
+        self,
+    ) -> None:
+        # 장비명과 로그/실패 단어가 있어도 날짜 지정 DB/S3 조회는
+        # live 진단으로 오분류하지 않고 각 read-only route에 넘긴다.
+        for question in (
+            "MB2-C00570 2026-08-04 LED 로그 확인",
+            f"{_BARCODE} MB2-C00570 2026-08-04 로그 분석",
+            (
+                f"{_BARCODE} MB2-C00570 2026-08-04 "
+                "녹화 실패 원인 분석"
+            ),
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(
+                    _guard_read_only_request(_request(question))
+                )
+
+    def test_runtime_reaches_supported_s3_log_routes_after_guard(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.LLM_PROVIDER",
+                "",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.S3_QUERY_ENABLED",
+                False,
+            ),
+            patch(
+                "boxer_company.assistant.factory.core_settings.DB_HOST",
+                "",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.DB_USERNAME",
+                "",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.DB_PASSWORD",
+                "",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.DB_DATABASE",
+                "",
+            ),
+        ):
+            runtime = create_company_assistant_runtime()
+            for question, expected_route in (
+                (
+                    "MB2-C00570 2026-08-04 LED 로그 확인",
+                    "device_led_log_analysis",
+                ),
+                (
+                    f"{_BARCODE} MB2-C00570 2026-08-04 로그 분석",
+                    "barcode_log_analysis",
+                ),
+                (
+                    (
+                        f"{_BARCODE} MB2-C00570 2026-08-04 "
+                        "녹화 실패 원인 분석"
+                    ),
+                    "recording_failure_analysis",
+                ),
+            ):
+                with self.subTest(question=question):
+                    result = runtime.answer(_request(question))
+
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result.route, expected_route)
+                    self.assertEqual(result.outcome, "failed")
+
+    def test_read_only_guard_keeps_explicit_live_start_denied(
+        self,
+    ) -> None:
+        result = _guard_read_only_request(
+            _request(
+                "MB2-C00570 2026-08-04 LED 로그 확인 후 진단 시작"
+            )
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.route, "unsupported_live_diagnostic")
+        self.assertEqual(result.outcome, "denied")
 
     def test_device_detail_query_uses_db_without_live_enrichment(
         self,
