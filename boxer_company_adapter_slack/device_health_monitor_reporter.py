@@ -28,6 +28,7 @@ from boxer_company.daily_device_round import (
     _daily_device_round_status_label,
 )
 from boxer_company.redis_device_state import DeviceStateRedisClient, DeviceStateRedisUnavailable
+from boxer_company.routers.device_voice_control import _dispatch_device_voice_guide
 from boxer_company.sms_delivery import (
     _SMS_DELIVERY_ACCEPTED,
     _SMS_DELIVERY_CONFIRM_REQUIRED,
@@ -57,6 +58,7 @@ from boxer_company.routers.mda_graphql import (
     _close_mda_device_ssh,
     _get_mda_device_agent_ssh,
     _open_mda_device_ssh,
+    _send_mda_device_command,
 )
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
@@ -68,6 +70,7 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
     _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS,
     _collect_daily_device_round_abnormal_alert_items,
+    _is_device_health_alert_voice_guide_supported,
     _post_daily_device_round_abnormal_alert,
 )
 from boxer_company_adapter_slack.device_notification_alert_reporter import (
@@ -97,10 +100,12 @@ _DEVICE_HEALTH_MONITOR_ACTION_IDS = {
 }
 _DEVICE_HEALTH_MONITOR_ACTION_LABELS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "병원 문자 보내기",
-    _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE: "장비 음성 안내(미구현)",
+    _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE: "장비 음성 안내",
     _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE: "확인 완료",
     _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS: "문자 발송 접수",
 }
+_DEVICE_HEALTH_MONITOR_VOICE_GUIDE_MINIMUM_VERSION = (2, 11, 308)
+_DEVICE_HEALTH_MONITOR_VOICE_GUIDE_MINIMUM_VERSION_TEXT = "2.11.308"
 _DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_URL_SETTINGS = {
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL: "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
 }
@@ -537,6 +542,16 @@ def _prepare_device_health_monitor_state_for_persistence(
         normalized_state.pop("alertDeliveryOverride", None)
     else:
         normalized_state["alertDeliveryOverride"] = latest_override
+    # 음성 명령 쿨다운도 Slack 클릭이 갱신하는 제어 상태라 긴 poll의 과거
+    # snapshot으로 되돌아가지 않게 최신 값을 함께 보존한다.
+    if "alertActionCooldowns" in latest_state:
+        normalized_state["alertActionCooldowns"] = (
+            _normalize_device_health_monitor_action_cooldowns(
+                latest_state.get("alertActionCooldowns")
+            )
+        )
+    else:
+        normalized_state.pop("alertActionCooldowns", None)
     return normalized_state
 
 
@@ -1167,6 +1182,15 @@ def _build_device_health_monitor_sms_guide(item: dict[str, Any]) -> dict[str, An
 
 
 def _device_health_monitor_action_cooldown_key(action_id: str, item: dict[str, str]) -> str:
+    if action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
+        # 같은 장비의 캡처보드·녹화 알림 문구가 달라도 병원 현장에서는 같은
+        # 안내가 재생되므로, 음성 쿨다운은 장비 단위로 공유한다.
+        return "|".join(
+            [
+                _display_value(action_id, default="unknown"),
+                _display_value(item.get("device"), default=""),
+            ]
+        )
     return "|".join(
         [
             _display_value(action_id, default="unknown"),
@@ -1226,6 +1250,128 @@ def _remember_device_health_monitor_action_cooldown(
         "count": max(0, int(previous.get("count") or 0)) + 1,
     }
     return {**state, "alertActionCooldowns": cooldowns}
+
+
+def _parse_device_health_monitor_voice_guide_version(value: Any) -> tuple[int, int, int] | None:
+    matched = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(value or "").strip())
+    if not matched:
+        return None
+    return (
+        int(matched.group(1)),
+        int(matched.group(2)),
+        int(matched.group(3)),
+    )
+
+
+def _dispatch_device_health_monitor_voice_guide(
+    item: dict[str, Any],
+    *,
+    now: datetime,
+    logger: logging.Logger,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    state = _normalize_device_health_monitor_state(
+        _load_device_health_monitor_state(logger=logger)
+    )
+    if not _is_device_health_alert_voice_guide_supported(item):
+        return state, {"status": "unsupported_issue", "ok": False}
+
+    device_name = _display_value(item.get("device"), default="")
+    if not device_name or not cs.S3_DEVICE_NAME_PATTERN.fullmatch(device_name):
+        return state, {"status": "invalid_target", "ok": False}
+    if not cs.MDA_GRAPHQL_URL or not cs.MDA_ADMIN_USER_PASSWORD:
+        return state, {
+            "status": "not_configured",
+            "ok": False,
+            "missingSetting": "MDA_GRAPHQL_URL/MDA_ADMIN_USER_PASSWORD",
+        }
+
+    try:
+        # MDA의 현재 장비 버전과 box socket 연결 상태를 먼저 확인해, 명령을
+        # 이해하지 못하는 구버전이나 오프라인 장비에 성공처럼 안내하지 않는다.
+        device_detail = _get_mda_device_agent_ssh(device_name)
+    except Exception as exc:
+        logger.warning(
+            "장비 음성 안내 사전 확인에 실패했어 device=%s",
+            device_name,
+            exc_info=True,
+        )
+        return state, {
+            "status": "precheck_failed",
+            "ok": False,
+            "error": type(exc).__name__,
+        }
+    if not isinstance(device_detail, dict):
+        return state, {"status": "device_not_found", "ok": False}
+
+    current_version = _display_value(device_detail.get("version"), default="")
+    parsed_version = _parse_device_health_monitor_voice_guide_version(current_version)
+    if (
+        parsed_version is None
+        or parsed_version < _DEVICE_HEALTH_MONITOR_VOICE_GUIDE_MINIMUM_VERSION
+    ):
+        return state, {
+            "status": "unsupported_version",
+            "ok": False,
+            "currentVersion": current_version,
+            "minimumVersion": _DEVICE_HEALTH_MONITOR_VOICE_GUIDE_MINIMUM_VERSION_TEXT,
+        }
+    if not bool(device_detail.get("deviceIsConnected")):
+        return state, {"status": "device_offline", "ok": False}
+
+    # 전송 전에 쿨다운을 예약해 Slack 재전달·동시 클릭이 같은 음성을 여러 번
+    # 재생하지 않게 한다. 전송 결과가 불명확해도 자동 재시도하지 않는다.
+    with _DEVICE_HEALTH_MONITOR_STATE_LOCK:
+        state = _normalize_device_health_monitor_state(
+            _load_device_health_monitor_state(logger=logger)
+        )
+        cooldown = _check_device_health_monitor_action_cooldown(
+            state,
+            action_id=_DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+            item=item,
+            now=now,
+        )
+        if cooldown.get("active"):
+            return state, {"status": "cooldown", "ok": False, **cooldown}
+        state = _remember_device_health_monitor_action_cooldown(
+            state,
+            action_id=_DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+            item=item,
+            now=now,
+        )
+        state = _persist_device_health_monitor_state_best_effort(
+            state,
+            logger=logger,
+        )
+
+    try:
+        dispatch = _dispatch_device_voice_guide(
+            device_name,
+            command_dispatcher=_send_mda_device_command,
+        )
+    except Exception as exc:
+        logger.warning(
+            "장비 음성 안내 명령 결과를 확인하지 못했어 device=%s",
+            device_name,
+            exc_info=True,
+        )
+        return state, {
+            "status": "dispatch_uncertain",
+            "ok": False,
+            "error": type(exc).__name__,
+        }
+
+    if not isinstance(dispatch, dict) or not bool(dispatch.get("status")):
+        return state, {
+            "status": "dispatch_failed",
+            "ok": False,
+            "affected": dispatch.get("affected") if isinstance(dispatch, dict) else None,
+        }
+    return state, {
+        "status": "sent",
+        "ok": True,
+        "command": "voice_guide",
+        "affected": dispatch.get("affected"),
+    }
 
 
 def _device_health_monitor_action_webhook_url(action_id: str) -> str:
@@ -2050,17 +2196,41 @@ def _build_device_health_monitor_action_reply(
         return f":white_check_mark: {user} {action_label} 처리했어. `{target}`"
     if status == "cooldown":
         remaining_seconds = max(1, int(result.get("remainingSeconds") or 0))
+        # 짧은 음성 쿨다운은 분 단위로 올림하면 실제 대기 시간보다 길게
+        # 오해할 수 있어 1분 미만은 초 단위로 그대로 안내한다.
+        if remaining_seconds < 60:
+            return f":hourglass_flowing_sand: {user} 최근에 장비 음성 안내를 보냈어. `{target}`은 약 {remaining_seconds}초 뒤 다시 가능해."
         remaining_minutes = max(1, (remaining_seconds + 59) // 60)
         return f":hourglass_flowing_sand: {user} 최근에 장비 음성 안내를 보냈어. `{target}`은 약 {remaining_minutes}분 뒤 다시 가능해."
-    if status == "not_implemented":
-        return f":construction: {user} {action_label}은 아직 실행하지 않았어. 마미박스 장비 코드 추가 후 연결해야 해. `{target}`"
     if status == "sent":
         if action_id == _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL:
             template_id = _display_value(result.get("templateId"), default="")
             return f":white_check_mark: {user} 병원 문자 발송 요청을 보냈어. `{target}` `{template_id}`"
+        if action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
+            # MDA 응답은 장비 재생 완료 ACK가 아니므로 명령 전송까지만 확정해 안내한다.
+            return f":white_check_mark: {user} 장비 음성 안내 명령을 보냈어. `{target}`"
         return f":white_check_mark: {user} {action_label} 요청을 보냈어. `{target}`"
     if status == "unsupported_issue":
+        if action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
+            return f":no_entry: {user} 이 알림은 장비 음성 안내 대상이 아니야. `{target}`"
         return f":no_entry: {user} 이 이슈는 병원 문자 발송 대상이 아니야. 내부 확인으로 처리해줘. `{target}`"
+    if status == "invalid_target":
+        return f":warning: {user} 음성 안내를 보낼 장비명을 확인할 수 없어. `{target}`"
+    if status == "device_not_found":
+        return f":warning: {user} MDA에서 대상 장비를 찾지 못했어. `{target}`"
+    if status == "unsupported_version":
+        current_version = _display_value(result.get("currentVersion"), default="미확인")
+        minimum_version = _display_value(
+            result.get("minimumVersion"),
+            default=_DEVICE_HEALTH_MONITOR_VOICE_GUIDE_MINIMUM_VERSION_TEXT,
+        )
+        return f":warning: {user} 장비 음성 안내는 `{minimum_version}` 이상에서 가능해. 현재 버전은 `{current_version}`이야. `{target}`"
+    if status == "device_offline":
+        return f":warning: {user} 장비가 MDA에 연결되어 있지 않아 음성 안내를 보내지 않았어. `{target}`"
+    if status == "dispatch_uncertain":
+        return f":warning: {user} 음성 안내 명령의 처리 결과를 확인하지 못했어. 중복 재생 방지를 위해 자동 재시도하지 않았어. `{target}`"
+    if status == "dispatch_failed":
+        return f":warning: {user} MDA가 음성 안내 명령을 처리하지 못했어. `{target}`"
     if status == "missing_telephone":
         return f":warning: {user} 마미박스 이상 알림 전용 연락 번호가 없어 문자를 보낼 수 없어. hospitals.deviceAlertPhone을 확인해줘. `{target}`"
     if status == "non_mobile_telephone":
@@ -2418,13 +2588,18 @@ def _handle_device_health_monitor_alert_action(
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
     item = _normalize_device_health_monitor_alert_action_item(raw_item)
-    state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
     result: dict[str, Any]
 
     if action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
-        # 실제 재생은 마미박스 장비 agent 쪽 명령 수신/오디오 재생 코드가 들어간 뒤 활성화한다.
-        result = {"status": "not_implemented", "ok": False}
+        state, result = _dispatch_device_health_monitor_voice_guide(
+            item,
+            now=local_now,
+            logger=logger,
+        )
     else:
+        state = _normalize_device_health_monitor_state(
+            _load_device_health_monitor_state(logger=logger)
+        )
         cooldown = _check_device_health_monitor_action_cooldown(
             state,
             action_id=action_id,

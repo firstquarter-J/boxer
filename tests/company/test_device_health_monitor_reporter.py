@@ -372,6 +372,29 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertTrue(status["monitorEnabled"])
         self.assertEqual(append_event_mock.call_args.args[0], "alert_delivery_control_changed")
 
+    def test_poll_persistence_preserves_latest_voice_action_cooldown(self) -> None:
+        latest_cooldowns = {
+            "device_health_alert_device_voice_guide|MB2-C00043": {
+                "lastTriggeredAt": "2026-08-06T14:00:00+09:00",
+                "count": 1,
+            }
+        }
+
+        with patch.object(
+            reporter,
+            "_load_device_health_monitor_state",
+            return_value={"alertActionCooldowns": latest_cooldowns},
+        ):
+            prepared = reporter._prepare_device_health_monitor_state_for_persistence(
+                {"alertFingerprints": {}},
+                preserve_latest_alert_delivery_override=True,
+                logger=logging.getLogger("test.device_health_monitor.cooldown_race"),
+            )
+
+        # 오래 실행된 poll이 Slack 클릭 직전에 읽은 snapshot을 저장해도 최신
+        # 음성 명령 쿨다운은 지워지면 안 돼.
+        self.assertEqual(prepared["alertActionCooldowns"], latest_cooldowns)
+
     def test_poll_does_not_restore_stale_alert_delivery_override_after_disable(self) -> None:
         logger = logging.getLogger("test.device_health_monitor.control_race")
         client = _FakeSlackClient()
@@ -773,13 +796,9 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(len(action_blocks), 1)
         self.assertEqual(
             [element["action_id"] for element in action_blocks[0]["elements"]],
-            [
-                reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
-                reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-            ],
+            [reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL],
         )
         self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "병원 문자 보내기")
-        self.assertEqual(action_blocks[0]["elements"][1]["text"]["text"], "장비 음성 안내(미구현)")
         self.assertIn("MB2-C00043", action_blocks[0]["elements"][0]["value"])
         self.assertIn('"hospitalSeq":"69"', action_blocks[0]["elements"][0]["value"])
         self.assertIn('"telephone":"031-123-4567"', action_blocks[0]["elements"][0]["value"])
@@ -850,6 +869,53 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                     blocks[0]["text"]["text"],
                     f":alert: {expected_title}",
                 )
+
+    def test_voice_action_is_shown_for_captureboard_and_recording_alerts(self) -> None:
+        base_item = {
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "issue": "상태 확인이 필요해",
+        }
+        scenarios = (
+            ("video_signal", ["캡처보드"], True),
+            ("recording", [], True),
+            ("mixed", ["캡처보드", "LED"], True),
+            ("recording_processing", [], True),
+            ("led", ["LED"], False),
+            ("audio", ["스피커"], False),
+            ("storage", [], False),
+        )
+
+        for category, problem_components, expected in scenarios:
+            with self.subTest(category=category):
+                blocks = daily_device_round_reporter._build_device_health_alert_item_blocks(
+                    {
+                        **base_item,
+                        "alertCategory": category,
+                        "problemComponents": problem_components,
+                    },
+                    include_actions=False,
+                    include_device_voice_action=True,
+                )
+                action_elements = [
+                    element
+                    for block in blocks
+                    if block.get("type") == "actions"
+                    for element in block.get("elements", [])
+                ]
+
+                self.assertEqual(bool(action_elements), expected)
+                if expected:
+                    self.assertEqual(
+                        action_elements[0]["action_id"],
+                        reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                    )
+                    self.assertEqual(
+                        action_elements[0]["text"]["text"],
+                        "장비 음성 안내",
+                    )
+                    self.assertIn('"device":"MB2-C00043"', action_elements[0]["value"])
 
     def test_abnormal_alert_header_falls_back_when_known_and_unknown_types_mix(self) -> None:
         summary = _abnormal_summary()
@@ -1447,10 +1513,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(len(action_blocks), 1)
         self.assertEqual(
             [element["action_id"] for element in action_blocks[0]["elements"]],
-            [
-                reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
-                reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-            ],
+            [reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL],
         )
         self.assertEqual(action_blocks[0]["elements"][0]["text"]["text"], "문자 발송 접수")
         self.assertIn('"smsPhoneNumber":"01012344567"', action_blocks[0]["elements"][0]["value"])
@@ -2685,7 +2748,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         )
         self.assertIn("병원 문자 발송 요청을 보냈어", client.messages[0]["text"])
 
-    def test_voice_action_is_marked_not_implemented(self) -> None:
+    def test_voice_action_dispatches_fixed_command_and_blocks_duplicate_click(self) -> None:
         client = _FakeSlackClient()
         logger = logging.getLogger("test.device_health_monitor.action")
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -2693,20 +2756,184 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "hospital": "#69 수지미래산부인과의원(용인)",
             "room": "1진료실",
             "device": "MB2-C00043",
-            "issue": "LED USB 장치를 찾지 못했어",
+            "alertCategory": "video_signal",
+            "problemComponents": ["캡처보드"],
+            "issue": "캡처보드 USB나 비디오 장치를 찾지 못했어",
             "mdaUrl": "",
         }
 
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+                patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_VOICE_GUIDE_COOLDOWN_SEC", 10),
+                patch.object(
+                    reporter.cs,
+                    "DEVICE_HEALTH_MONITOR_STATE_PATH",
+                    str(Path(temp_dir) / "health-state.json"),
+                ),
+                patch.object(
+                    reporter,
+                    "_get_mda_device_agent_ssh",
+                    return_value={
+                        "deviceName": "MB2-C00043",
+                        "version": "2.11.308",
+                        "deviceIsConnected": True,
+                    },
+                ),
+                patch.object(
+                    reporter,
+                    "_send_mda_device_command",
+                    return_value={"status": True, "affected": 1},
+                ) as send_command_mock,
+                patch.object(
+                    reporter,
+                    "_append_device_health_monitor_event",
+                ) as append_event_mock,
+            ):
+                first_result = reporter._handle_device_health_monitor_alert_action(
+                    action_id=reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                    raw_item=item,
+                    actor_user_id="U123",
+                    channel_id="C_HEALTH",
+                    message_ts="3000.001",
+                    thread_ts="3000.001",
+                    client=client,
+                    logger=logger,
+                    now=local_now,
+                )
+                second_result = reporter._handle_device_health_monitor_alert_action(
+                    action_id=reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                    raw_item={
+                        **item,
+                        "alertCategory": "recording",
+                        "problemComponents": [],
+                        "issue": "녹화 파일 증가 정지가 120초 동안 지속됐어",
+                    },
+                    actor_user_id="U123",
+                    channel_id="C_HEALTH",
+                    message_ts="3000.001",
+                    thread_ts="3000.001",
+                    client=client,
+                    logger=logger,
+                    now=local_now + timedelta(seconds=1),
+                )
+
+        self.assertEqual(first_result["result"]["status"], "sent")
+        self.assertEqual(second_result["result"]["status"], "cooldown")
+        send_command_mock.assert_called_once_with(
+            "MB2-C00043",
+            command="voice_guide",
+        )
+        self.assertEqual(len(client.messages), 2)
+        self.assertIn("장비 음성 안내 명령을 보냈어", client.messages[0]["text"])
+        self.assertNotIn("재생 완료", client.messages[0]["text"])
+        self.assertIn("약 9초 뒤 다시 가능해", client.messages[1]["text"])
+        self.assertEqual(
+            [call.args[0] for call in append_event_mock.call_args_list],
+            ["alert_action_requested", "alert_action_requested"],
+        )
+
+    def test_voice_action_concurrent_clicks_dispatch_once(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.action_concurrent")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = reporter._normalize_device_health_monitor_alert_action_item(
+            {
+                "hospital": "#69 수지미래산부인과의원(용인)",
+                "room": "1진료실",
+                "device": "MB2-C00043",
+                "alertCategory": "video_signal",
+                "problemComponents": ["캡처보드"],
+                "issue": "캡처보드 연결 오류",
+            }
+        )
+        dispatch_started = threading.Event()
+        finish_dispatch = threading.Event()
+        first_results: list[dict[str, object]] = []
+        thread_errors: list[BaseException] = []
+
+        def _block_dispatch(*args, **kwargs) -> dict[str, object]:
+            dispatch_started.set()
+            if not finish_dispatch.wait(timeout=3):
+                raise TimeoutError("dispatch resume timeout")
+            return {"status": True, "affected": 1}
+
+        def _run_first_click() -> None:
+            try:
+                _, result = reporter._dispatch_device_health_monitor_voice_guide(
+                    item,
+                    now=local_now,
+                    logger=logger,
+                )
+                first_results.append(result)
+            except BaseException as exc:  # pragma: no cover - assertion reports the captured error
+                thread_errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+                patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_VOICE_GUIDE_COOLDOWN_SEC", 10),
+                patch.object(
+                    reporter.cs,
+                    "DEVICE_HEALTH_MONITOR_STATE_PATH",
+                    str(Path(temp_dir) / "health-state.json"),
+                ),
+                patch.object(
+                    reporter,
+                    "_get_mda_device_agent_ssh",
+                    return_value={
+                        "deviceName": "MB2-C00043",
+                        "version": "2.11.308",
+                        "deviceIsConnected": True,
+                    },
+                ),
+                patch.object(
+                    reporter,
+                    "_send_mda_device_command",
+                    side_effect=_block_dispatch,
+                ) as send_command_mock,
+            ):
+                first_thread = threading.Thread(target=_run_first_click)
+                first_thread.start()
+                self.assertTrue(dispatch_started.wait(timeout=3))
+                try:
+                    _, second_result = (
+                        reporter._dispatch_device_health_monitor_voice_guide(
+                            item,
+                            now=local_now,
+                            logger=logger,
+                        )
+                    )
+                finally:
+                    finish_dispatch.set()
+                    first_thread.join(timeout=3)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertEqual(first_results[0]["status"], "sent")
+        self.assertEqual(second_result["status"], "cooldown")
+        send_command_mock.assert_called_once_with(
+            "MB2-C00043",
+            command="voice_guide",
+        )
+
+    def test_voice_action_rejects_unsupported_issue_before_mda_lookup(self) -> None:
+        client = _FakeSlackClient()
+        item = {
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "alertCategory": "led",
+            "problemComponents": ["LED"],
+            "issue": "LED USB 장치를 찾지 못했어",
+        }
+
         with (
-            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_VOICE_GUIDE_WEBHOOK_URL", "https://hook.example/voice"),
-            patch(
-                "boxer_company_adapter_slack.device_health_monitor_reporter._load_device_health_monitor_state",
-                return_value={},
-            ),
-            patch(
-                "boxer_company_adapter_slack.device_health_monitor_reporter._append_device_health_monitor_event"
-            ) as append_event_mock,
-            patch("boxer_company_adapter_slack.device_health_monitor_reporter.requests.post") as post_mock,
+            patch.object(reporter, "_load_device_health_monitor_state", return_value={}),
+            patch.object(reporter, "_get_mda_device_agent_ssh") as detail_mock,
+            patch.object(reporter, "_send_mda_device_command") as send_command_mock,
+            patch.object(reporter, "_append_device_health_monitor_event"),
         ):
             result = reporter._handle_device_health_monitor_alert_action(
                 action_id=reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
@@ -2716,15 +2943,176 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 message_ts="3000.001",
                 thread_ts="3000.001",
                 client=client,
-                logger=logger,
-                now=local_now,
+                logger=logging.getLogger("test.device_health_monitor.action"),
             )
 
-        self.assertEqual(result["result"]["status"], "not_implemented")
-        post_mock.assert_not_called()
-        self.assertEqual(len(client.messages), 1)
-        self.assertIn("장비 코드 추가 후 연결해야 해", client.messages[0]["text"])
-        self.assertEqual(append_event_mock.call_args.args[0], "alert_action_requested")
+        self.assertEqual(result["result"]["status"], "unsupported_issue")
+        detail_mock.assert_not_called()
+        send_command_mock.assert_not_called()
+        self.assertIn("장비 음성 안내 대상이 아니야", client.messages[0]["text"])
+
+    def test_voice_action_does_not_retry_when_dispatch_result_is_uncertain(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.action_uncertain")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = reporter._normalize_device_health_monitor_alert_action_item(
+            {
+                "hospital": "#69 수지미래산부인과의원(용인)",
+                "room": "1진료실",
+                "device": "MB2-C00043",
+                "alertCategory": "recording",
+                "issue": "녹화 파일 증가 정지가 120초 동안 지속됐어",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+                patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_VOICE_GUIDE_COOLDOWN_SEC", 10),
+                patch.object(
+                    reporter.cs,
+                    "DEVICE_HEALTH_MONITOR_STATE_PATH",
+                    str(Path(temp_dir) / "health-state.json"),
+                ),
+                patch.object(
+                    reporter,
+                    "_get_mda_device_agent_ssh",
+                    return_value={
+                        "deviceName": "MB2-C00043",
+                        "version": "2.11.308",
+                        "deviceIsConnected": True,
+                    },
+                ),
+                patch.object(
+                    reporter,
+                    "_send_mda_device_command",
+                    side_effect=TimeoutError("MDA response timeout"),
+                ) as send_command_mock,
+            ):
+                _, first_result = reporter._dispatch_device_health_monitor_voice_guide(
+                    item,
+                    now=local_now,
+                    logger=logger,
+                )
+                _, second_result = reporter._dispatch_device_health_monitor_voice_guide(
+                    item,
+                    now=local_now + timedelta(seconds=1),
+                    logger=logger,
+                )
+
+        self.assertEqual(first_result["status"], "dispatch_uncertain")
+        self.assertEqual(second_result["status"], "cooldown")
+        send_command_mock.assert_called_once_with(
+            "MB2-C00043",
+            command="voice_guide",
+        )
+        reply = reporter._build_device_health_monitor_action_reply(
+            action_id=reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+            item=item,
+            actor_user_id="U123",
+            result=first_result,
+        )
+        self.assertIn("자동 재시도하지 않았어", reply)
+
+    def test_voice_action_reports_mda_rejection_without_retrying(self) -> None:
+        logger = logging.getLogger("test.device_health_monitor.action_rejected")
+        local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = reporter._normalize_device_health_monitor_alert_action_item(
+            {
+                "hospital": "#69 수지미래산부인과의원(용인)",
+                "room": "1진료실",
+                "device": "MB2-C00043",
+                "alertCategory": "video_signal",
+                "problemComponents": ["캡처보드"],
+                "issue": "캡처보드 연결 오류",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+                patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+                patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_VOICE_GUIDE_COOLDOWN_SEC", 10),
+                patch.object(
+                    reporter.cs,
+                    "DEVICE_HEALTH_MONITOR_STATE_PATH",
+                    str(Path(temp_dir) / "health-state.json"),
+                ),
+                patch.object(
+                    reporter,
+                    "_get_mda_device_agent_ssh",
+                    return_value={
+                        "deviceName": "MB2-C00043",
+                        "version": "2.11.309",
+                        "deviceIsConnected": True,
+                    },
+                ),
+                patch.object(
+                    reporter,
+                    "_send_mda_device_command",
+                    return_value={"status": False, "affected": 0},
+                ) as send_command_mock,
+            ):
+                _, first_result = reporter._dispatch_device_health_monitor_voice_guide(
+                    item,
+                    now=local_now,
+                    logger=logger,
+                )
+                _, second_result = reporter._dispatch_device_health_monitor_voice_guide(
+                    item,
+                    now=local_now + timedelta(seconds=1),
+                    logger=logger,
+                )
+
+        self.assertEqual(first_result["status"], "dispatch_failed")
+        self.assertEqual(second_result["status"], "cooldown")
+        send_command_mock.assert_called_once_with(
+            "MB2-C00043",
+            command="voice_guide",
+        )
+
+    def test_voice_action_requires_box_version_2_11_308_or_newer(self) -> None:
+        client = _FakeSlackClient()
+        item = {
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "alertCategory": "recording",
+            "problemComponents": [],
+            "issue": "녹화 파일 증가 정지가 120초 동안 지속됐어",
+        }
+
+        with (
+            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://mda.example/graphql"),
+            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
+            patch.object(reporter, "_load_device_health_monitor_state", return_value={}),
+            patch.object(
+                reporter,
+                "_get_mda_device_agent_ssh",
+                return_value={
+                    "deviceName": "MB2-C00043",
+                    "version": "2.11.307",
+                    "deviceIsConnected": True,
+                },
+            ),
+            patch.object(reporter, "_send_mda_device_command") as send_command_mock,
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            result = reporter._handle_device_health_monitor_alert_action(
+                action_id=reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                raw_item=item,
+                actor_user_id="U123",
+                channel_id="C_HEALTH",
+                message_ts="3000.001",
+                thread_ts="3000.001",
+                client=client,
+                logger=logging.getLogger("test.device_health_monitor.action"),
+            )
+
+        self.assertEqual(result["result"]["status"], "unsupported_version")
+        send_command_mock.assert_not_called()
+        self.assertIn("`2.11.308` 이상", client.messages[0]["text"])
+        self.assertIn("`2.11.307`", client.messages[0]["text"])
 
     def test_retains_recent_alert_when_issue_temporarily_disappears(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))

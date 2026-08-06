@@ -6,6 +6,7 @@ from boxer_company.routers.device_voice_control import (
     _build_device_voice_catalog_message,
     _build_device_voice_choices_message,
     _change_device_voice,
+    _dispatch_device_voice_guide,
     _extract_device_voice_label,
     _is_device_voice_catalog_request,
     _is_device_voice_change_request,
@@ -55,6 +56,57 @@ def _context(question: str, replies: list[str], *, user_id: str = "UHYUN") -> De
 
 
 class DeviceVoiceControlTests(unittest.TestCase):
+    def test_dispatches_voice_guide_with_fixed_command_only(self) -> None:
+        dispatcher = Mock(
+            return_value={"affected": 1, "status": True, "message": "sent"}
+        )
+
+        result = _dispatch_device_voice_guide(
+            "  MB2-C00419  ",
+            command_dispatcher=dispatcher,
+        )
+
+        dispatcher.assert_called_once_with(
+            "MB2-C00419",
+            command="voice_guide",
+        )
+        self.assertTrue(result["status"])
+
+    def test_rejects_arbitrary_command_or_acme_arguments(self) -> None:
+        # Slack payload가 command/acme를 조작해도 helper 인터페이스에 들어올 수 없어야 한다.
+        for field, value in (("command", "reboot"), ("acme", "INJECTED")):
+            with self.subTest(field=field):
+                dispatcher = Mock()
+
+                with self.assertRaises(TypeError):
+                    _dispatch_device_voice_guide(
+                        "MB2-C00419",
+                        command_dispatcher=dispatcher,
+                        **{field: value},  # type: ignore[arg-type]
+                    )
+
+                dispatcher.assert_not_called()
+
+    def test_rejects_invalid_device_names_before_dispatch(self) -> None:
+        for device_name in (
+            "",
+            "  ",
+            "MB",
+            "MB2-C00419;reboot",
+            "MB2/C00419",
+            "MB2 C00419",
+        ):
+            with self.subTest(device_name=device_name):
+                dispatcher = Mock()
+
+                with self.assertRaisesRegex(ValueError, "장비명이 올바르지 않아"):
+                    _dispatch_device_voice_guide(
+                        device_name,
+                        command_dispatcher=dispatcher,
+                    )
+
+                dispatcher.assert_not_called()
+
     def test_maps_all_allowed_voice_labels_to_fixed_commands(self) -> None:
         expected = {
             "귀여운 음성": "S_VOICE1",

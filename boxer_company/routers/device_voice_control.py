@@ -1,6 +1,7 @@
 from typing import Any, Callable
 
 from boxer.core.utils import _display_value
+from boxer_company import settings as cs
 
 
 # 장비에 전달할 수 있는 값은 이 네 개로 고정한다. Slack 문구나 LLM 출력으로
@@ -143,3 +144,23 @@ def _change_device_voice(
         "deviceCommand": command_value,
         "dispatch": dispatch,
     }
+
+
+def _dispatch_device_voice_guide(
+    device_name: str,
+    *,
+    command_dispatcher: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    normalized_device_name = str(device_name or "").strip()
+    if (
+        not normalized_device_name
+        or not cs.S3_DEVICE_NAME_PATTERN.fullmatch(normalized_device_name)
+    ):
+        raise ValueError("장비명이 올바르지 않아")
+
+    # Slack action payload에서 임의 command/acme를 주입할 수 없도록 현장 안내
+    # 명령을 회사 도메인 경계에서 고정한다.
+    return command_dispatcher(
+        normalized_device_name,
+        command="voice_guide",
+    )

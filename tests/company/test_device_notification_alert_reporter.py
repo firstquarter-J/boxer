@@ -246,6 +246,29 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(post_mock.call_args.kwargs["channel_id"], "C094UC05PQW")
             self.assertTrue(post_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_mock.call_args.kwargs["include_actions"])
+            self.assertTrue(
+                post_mock.call_args.kwargs["include_device_voice_action"]
+            )
+            # 자동 문자 발송이 없어도 캡처보드 장애에는 독립적인 음성 안내 버튼을 제공해.
+            captureboard_blocks = (
+                daily_device_round_reporter._build_daily_device_round_abnormal_alert_blocks(
+                    alert_summary,
+                    permalink=None,
+                    include_actions=False,
+                    include_device_voice_action=True,
+                )
+            )
+            captureboard_action_blocks = [
+                block for block in captureboard_blocks if block["type"] == "actions"
+            ]
+            self.assertEqual(len(captureboard_action_blocks), 1)
+            self.assertEqual(
+                [
+                    element["text"]["text"]
+                    for element in captureboard_action_blocks[0]["elements"]
+                ],
+                ["장비 음성 안내"],
+            )
             self.append_sheet_mock.assert_called_once()
             sheet_items = self.append_sheet_mock.call_args.args[0]
             self.assertEqual(sheet_items[0]["device"], "MB2-C00992")
@@ -839,6 +862,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 [_captureboard_event(101)],
                 "video_signal",
                 "captureboard_disconnected",
+                True,
             ),
             (
                 "recording_stall",
@@ -852,16 +876,24 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 ],
                 "recording",
                 "recording_stalled",
+                True,
             ),
             (
                 "recording_merge",
                 [_segmented_recordings_merge_error_event(104)],
                 "recording_processing",
                 "recording_merge_failed",
+                True,
             ),
         )
 
-        for scenario, events, expected_category, template_id in scenarios:
+        for (
+            scenario,
+            events,
+            expected_category,
+            template_id,
+            expected_voice_action,
+        ) in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp_dir:
                 state_path = Path(temp_dir) / "state.json"
                 state = reporter._normalize_device_notification_alert_state(
@@ -912,8 +944,9 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 self.assertEqual(sms_item["alertCategory"], expected_category)
                 post_mock.assert_called_once()
                 self.assertTrue(post_mock.call_args.kwargs["include_actions"])
-                self.assertFalse(
-                    post_mock.call_args.kwargs["include_device_voice_action"]
+                self.assertEqual(
+                    post_mock.call_args.kwargs["include_device_voice_action"],
+                    expected_voice_action,
                 )
                 posted_result = post_mock.call_args.args[1]["deviceResults"][0]
                 self.assertEqual(posted_result["smsStatusText"], "문자 자동발송 완료")
@@ -925,15 +958,21 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                         post_mock.call_args.args[1],
                         permalink=None,
                         include_actions=True,
-                        include_device_voice_action=False,
+                        include_device_voice_action=expected_voice_action,
                     )
                 )
                 action_blocks = [block for block in blocks if block["type"] == "actions"]
                 self.assertEqual(len(action_blocks), 1)
-                self.assertEqual(len(action_blocks[0]["elements"]), 1)
+                expected_action_labels = ["문자 자동발송 완료"]
+                if expected_voice_action:
+                    # 캡처보드가 직접 이상이거나 원인 후보인 녹화 장애에 음성 버튼을 함께 둬.
+                    expected_action_labels.append("장비 음성 안내")
                 self.assertEqual(
-                    action_blocks[0]["elements"][0]["text"]["text"],
-                    "문자 자동발송 완료",
+                    [
+                        element["text"]["text"]
+                        for element in action_blocks[0]["elements"]
+                    ],
+                    expected_action_labels,
                 )
                 self.append_sheet_mock.reset_mock()
 
@@ -1073,6 +1112,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                     alert_summary,
                     permalink=None,
                     include_actions=False,
+                    include_device_voice_action=True,
                 )
             )
             self.assertEqual(
@@ -1082,6 +1122,15 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(post_mock.call_args.kwargs["channel_id"], "C094UC05PQW")
             self.assertTrue(post_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_mock.call_args.kwargs["include_actions"])
+            # 병합 오류도 캡처보드가 원인일 수 있어 문자 설정과 무관하게 음성 버튼을 노출해.
+            self.assertTrue(
+                post_mock.call_args.kwargs["include_device_voice_action"]
+            )
+            self.assertEqual(merge_blocks[-1]["type"], "actions")
+            self.assertEqual(
+                [element["text"]["text"] for element in merge_blocks[-1]["elements"]],
+                ["장비 음성 안내"],
+            )
             self.append_sheet_mock.assert_called_once()
             merge_sheet_items = self.append_sheet_mock.call_args.args[0]
             self.assertEqual(merge_sheet_items[0]["device"], "MB2-C00992")
@@ -1159,6 +1208,9 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             post_root_mock.assert_called_once()
             self.assertTrue(post_root_mock.call_args.kwargs["include_blocks"])
             self.assertFalse(post_root_mock.call_args.kwargs["include_actions"])
+            self.assertTrue(
+                post_root_mock.call_args.kwargs["include_device_voice_action"]
+            )
             root_summary = post_root_mock.call_args.args[1]
             self.assertEqual(
                 root_summary["deviceResults"][0]["alertCategory"],
@@ -1170,17 +1222,18 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 "녹화 파일 증가 정지가 120초 (2분) 동안 지속됐어: "
                 "0.00 KB/sec (발생 2026-07-09 12:34:31 KST)",
             )
-            # 장비 이벤트는 공통 2열 카드를 쓰면서 모니터 조치 버튼만 제외해.
+            # 자동 문자 발송이 없어도 확실한 녹화 정체에는 음성 안내 버튼을 제공해.
             root_blocks = (
                 daily_device_round_reporter._build_daily_device_round_abnormal_alert_blocks(
                     root_summary,
                     permalink=None,
                     include_actions=False,
+                    include_device_voice_action=True,
                 )
             )
             self.assertEqual(
                 [block["type"] for block in root_blocks],
-                ["header", "section", "section", "section"],
+                ["header", "section", "section", "section", "actions"],
             )
             self.assertEqual(
                 root_blocks[0]["text"]["text"],
@@ -1192,6 +1245,13 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             self.assertEqual(
                 root_blocks[2]["fields"],
                 [{"type": "mrkdwn", "text": f"🔎 *감지 내용*\n`{root_issue}`"}],
+            )
+            self.assertEqual(
+                [
+                    element["text"]["text"]
+                    for element in root_blocks[-1]["elements"]
+                ],
+                ["장비 음성 안내"],
             )
             # Sheet 행은 최초 120초 루트만 기록하고 이후 지속 이벤트는 Slack 댓글로 잇는다.
             self.append_sheet_mock.assert_called_once()

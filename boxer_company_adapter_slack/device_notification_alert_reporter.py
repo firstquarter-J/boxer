@@ -1334,7 +1334,8 @@ def _process_recording_stall_event(
         logger=logger,
         include_blocks=True,
         include_actions=auto_sms_sender is not None,
-        include_device_voice_action=False,
+        # 문자 발송 설정과 무관하게 녹화 정체 알림에서 현장 음성 안내를 실행할 수 있게 한다.
+        include_device_voice_action=True,
     )
     message_ts = str((delivery or {}).get("messageTs") or "").strip()
     if delivery is None or not message_ts:
@@ -1443,7 +1444,8 @@ def _deliver_pending_device_notification_alerts(
                 logger=logger,
                 include_blocks=True,
                 include_actions=auto_sms_sender is not None,
-                include_device_voice_action=False,
+                # 캡처보드 연결 오류는 담당자가 확인 후 즉시 장비 음성을 보낼 수 있게 한다.
+                include_device_voice_action=True,
             )
             if posted is None:
                 logger.warning(
@@ -1516,7 +1518,9 @@ def _deliver_pending_device_notification_alerts(
                 logger=logger,
                 include_blocks=True,
                 include_actions=auto_sms_sender is not None,
-                include_device_voice_action=False,
+                # 병합 오류도 캡처보드 신호 이상이 원인일 수 있어 현장에서
+                # 캡처보드 연결 확인 안내를 바로 재생할 수 있게 한다.
+                include_device_voice_action=True,
             )
             if posted is None:
                 logger.warning(

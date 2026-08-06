@@ -56,6 +56,15 @@ _DEVICE_HEALTH_ALERT_CATEGORY_TITLES = {
     "device_connection": "장비 연결 확인 필요",
     "upload": "영상 업로드 확인 필요",
 }
+# 현재 마미박스의 voice_guide는 캡처보드 연결 확인 안내이므로, 캡처보드가
+# 직접 이상이거나 원인 후보가 될 수 있는 녹화 정체·녹화 처리 알림에 노출한다.
+_DEVICE_HEALTH_ALERT_VOICE_GUIDE_CATEGORIES = frozenset(
+    {
+        "recording",
+        "recording_processing",
+        "video_signal",
+    }
+)
 _DEVICE_HEALTH_ALERT_COMPONENT_CATEGORIES = {
     "audio": "audio",
     "pm2": "application",
@@ -1006,6 +1015,30 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:1900]
 
 
+def _is_device_health_alert_voice_guide_supported(item: dict[str, Any]) -> bool:
+    problem_components = (
+        [
+            _display_value(component, default="")
+            for component in item.get("problemComponents", [])
+            if _display_value(component, default="")
+        ]
+        if isinstance(item.get("problemComponents"), list)
+        else []
+    )
+    issue = _display_value(item.get("issue"), default="")
+    category = _resolve_device_health_alert_category(
+        item,
+        problem_components=problem_components,
+        issue=issue,
+    )
+    if category in _DEVICE_HEALTH_ALERT_VOICE_GUIDE_CATEGORIES:
+        return True
+
+    # 여러 구성 요소가 함께 이상인 카드는 mixed로 분류되므로 캡처보드 포함 여부를
+    # 한 번 더 확인해, 함께 표시된 LED·오디오 문제 때문에 음성 버튼이 사라지지 않게 한다.
+    return category == "mixed" and "캡처보드" in problem_components
+
+
 def _build_device_health_alert_item_blocks(
     item: dict[str, Any],
     *,
@@ -1057,15 +1090,19 @@ def _build_device_health_alert_item_blocks(
             "fields": contact_fields,
         },
     ]
-    if not include_actions:
-        # 장비 이벤트 알림도 같은 카드 레이아웃을 쓰되 모니터 전용 조치 버튼은 노출하지 않는다.
+    voice_action_enabled = (
+        include_device_voice_action
+        and _is_device_health_alert_voice_guide_supported(item)
+    )
+    if not include_actions and not voice_action_enabled:
+        # 문자·음성 조치가 모두 없는 장비 이벤트도 같은 카드 레이아웃은 유지한다.
         return blocks
 
     sms_status_text = _display_value(item.get("smsStatusText"), default="")
     sms_status_button_enabled = _is_device_health_alert_auto_sms_status_button_enabled(item)
     action_value = _build_device_health_alert_action_value(item)
     action_elements: list[dict[str, Any]] = []
-    if sms_status_button_enabled:
+    if include_actions and sms_status_button_enabled:
         # 발송 접수는 재발송 버튼 대신 확인 버튼으로 노출해 실제 발송 번호와 문구를 다시 볼 수 있게 한다.
         sms_status_action_value = _build_device_health_alert_action_value(
             {**item, "smsModalMode": _DEVICE_HEALTH_ALERT_SMS_MODAL_MODE_VIEW_AUTO_SENT}
@@ -1079,7 +1116,7 @@ def _build_device_health_alert_item_blocks(
                 "style": "primary",
             }
         )
-    elif _is_device_health_alert_contact_action_enabled(item):
+    elif include_actions and _is_device_health_alert_contact_action_enabled(item):
         # 자동 발송이 끝난 장비는 같은 문자가 중복 발송되지 않도록 수동 문자 버튼을 숨긴다.
         action_elements.append(
             {
@@ -1090,17 +1127,17 @@ def _build_device_health_alert_item_blocks(
                 "style": "primary",
             }
         )
-    if include_device_voice_action:
+    if voice_action_enabled:
         action_elements.append(
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "장비 음성 안내(미구현)"},
+                "text": {"type": "plain_text", "text": "장비 음성 안내"},
                 "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
                 "value": action_value,
             }
         )
     if action_elements:
-        # 실시간 이벤트 카드는 문자 조치만, 상태 모니터 카드는 기존 전체 조치를 노출한다.
+        # 문자 설정이 없어도 대상 장애에는 음성 안내 버튼을 독립적으로 노출한다.
         blocks.append({"type": "actions", "elements": action_elements})
     return blocks
 
