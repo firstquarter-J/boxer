@@ -451,14 +451,6 @@ def _extract_device_health_monitor_alert_delivery_control(question: str) -> str 
     return None
 
 
-def _is_device_health_monitor_alert_delivery_control_allowed(user_id: str | None) -> bool:
-    # 운영 알림의 발송 여부와 현재 설정은 Hyun만 제어·조회하게 하고,
-    # HYUN_USER_ID가 비어 있으면 전체 허용 대신 안전하게 차단한다.
-    hyun_user_id = str(cs.HYUN_USER_ID or "").strip()
-    normalized_user_id = str(user_id or "").strip()
-    return bool(hyun_user_id and normalized_user_id == hyun_user_id)
-
-
 def _format_device_health_monitor_alert_delivery_status(status_payload: dict[str, Any]) -> str:
     enabled = bool(status_payload.get("enabled"))
     env_default = bool(status_payload.get("envDefault"))
@@ -521,14 +513,8 @@ def _handle_device_routes(
                 "device health alert delivery control",
                 handler_type="router",
             )
-            if not _is_device_health_monitor_alert_delivery_control_allowed(context.user_id):
-                context.logger.info(
-                    "Rejected device health alert delivery control user=%s action=%s",
-                    context.user_id,
-                    alert_delivery_control,
-                )
-                context.reply("장비 이상 알림 제어는 Hyun만 할 수 있어", mention_user=False)
-                return True
+            # 사람별 권한은 Slack 공통 Boxer 진입 경계에서 한 번만 검사한다.
+            # 이 라우터는 기능 상태와 저장 성공 여부만 책임진다.
             if alert_delivery_control == "status":
                 status_payload = _resolve_device_health_monitor_alert_delivery_status()
             else:

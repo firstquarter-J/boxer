@@ -983,7 +983,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
 
         with (
             patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ENABLED", True),
-            patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS", set()),
             patch(
                 "boxer_company_adapter_slack.thread_learning_routes._learn_slack_thread_playbook",
                 return_value=type(
@@ -1031,7 +1030,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
 
         with (
             patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ENABLED", True),
-            patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS", set()),
             patch(
                 "boxer_company_adapter_slack.thread_learning_routes._learn_slack_thread_playbook",
                 return_value=type(
@@ -1074,7 +1072,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
 
         with (
             patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ENABLED", True),
-            patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS", set()),
             patch(
                 "boxer_company_adapter_slack.thread_learning_routes._learn_slack_thread_playbook",
                 return_value=ThreadPlaybookSaveResult(

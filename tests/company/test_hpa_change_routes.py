@@ -109,7 +109,6 @@ def _payload() -> dict[str, Any]:
 def _config(**overrides: Any) -> HpaChangeRoutesConfig:
     values: dict[str, Any] = {
         "enabled": True,
-        "allowed_user_ids": frozenset({"UJUSTIN"}),
         "allowed_channel_ids": frozenset({"CHPA"}),
         "max_thread_chars": 60_000,
         "max_attachment_count": 3,
@@ -397,10 +396,10 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 {"ts": "1.2", "user": "UJUSTIN", "text": "이전 답변"},
                 {"ts": "1.4", "bot_id": "BBOXER", "text": "추가 질문"},
                 {"ts": "1.5", "user": "UJUSTIN", "text": "새 답변"},
-                {"ts": "1.6", "user": "UOTHER", "text": "허용되지 않은 답변"},
+                {"ts": "1.6", "user": "UOTHER", "text": "다른 요청자의 답변"},
             ],
             thread_ts="1.0",
-            allowed_user_ids={"UJUSTIN"},
+            actor_user_id="UJUSTIN",
             after_event_ts="1.3",
         )
 
@@ -413,7 +412,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 "messages": [
                     {
                         "ts": "2.0",
-                        "user": "UJUSTIN",
+                        "user": "UOTHER",
                         "text": f"<@UBOXER> 요구사항 검토\n\n- {requirement}",
                     }
                 ],
@@ -438,6 +437,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 question=f"요구사항 검토\n\n- {requirement}",
                 current_ts="2.0",
                 thread_ts="2.0",
+                user_id="UOTHER",
             ),
             _config(),
             HpaChangeRoutesDeps(submit_request=submit_request),
@@ -447,7 +447,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertEqual(len(submitted), 1)
         request = submitted[0]
         self.assertEqual(request.selection_mode, "thread")
-        self.assertEqual(request.requester_user_id, "UJUSTIN")
+        self.assertEqual(request.requester_user_id, "UOTHER")
         self.assertEqual(request.source_channel_id, "CHPA")
         self.assertEqual(request.thread_message_count, 1)
         self.assertIn(requirement, request.thread_text)
@@ -455,36 +455,28 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertIn("TASK-DIRECT", replies[0][0])
         self.assertIn("스레드 1개", replies[0][0])
 
-    def test_direct_requirements_review_keeps_user_and_channel_allowlists(self) -> None:
+    def test_direct_requirements_review_keeps_channel_allowlist(self) -> None:
         question = "요구사항 검토\n- Basic과 Bonus 발송 버튼 분리"
-        cases = (
-            ({"user_id": "UOTHER"}, "권한이 없어"),
-            ({"channel_id": "COTHER"}, "이 채널에서는"),
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        submitted: list[HpaChangeRequest] = []
+
+        handled = _handle_hpa_change_request(
+            _context(client, replies, question=question, channel_id="COTHER"),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
+            ),
         )
 
-        for overrides, expected_text in cases:
-            with self.subTest(overrides=overrides):
-                client = _FakeSlackClient()
-                replies: list[tuple[str, dict[str, Any]]] = []
-                submitted: list[HpaChangeRequest] = []
+        self.assertTrue(handled)
+        self.assertIn("이 채널에서는", replies[0][0])
+        self.assertEqual(client.reply_calls, [])
+        self.assertEqual(submitted, [])
 
-                handled = _handle_hpa_change_request(
-                    _context(client, replies, question=question, **overrides),
-                    _config(),
-                    HpaChangeRoutesDeps(
-                        submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
-                    ),
-                )
-
-                self.assertTrue(handled)
-                self.assertIn(expected_text, replies[0][0])
-                self.assertEqual(client.reply_calls, [])
-                self.assertEqual(submitted, [])
-
-    def test_disabled_and_empty_allowlists_fail_closed(self) -> None:
+    def test_disabled_and_empty_channel_allowlist_fail_closed(self) -> None:
         cases = (
             (_config(enabled=False), "꺼져"),
-            (_config(allowed_user_ids=frozenset()), "설정이 없어"),
             (_config(allowed_channel_ids=frozenset()), "설정이 없어"),
         )
 
@@ -506,29 +498,22 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 self.assertIn(expected_text, replies[0][0])
                 self.assertEqual(client.reply_calls, [])
 
-    def test_rejects_unlisted_user_and_channel_before_fetch(self) -> None:
-        cases = (
-            ({"user_id": "UOTHER"}, "권한이 없어"),
-            ({"channel_id": "COTHER"}, "이 채널에서는"),
+    def test_rejects_unlisted_channel_before_fetch(self) -> None:
+        client = _FakeSlackClient()
+        replies: list[tuple[str, dict[str, Any]]] = []
+        handled = _handle_hpa_change_request(
+            _context(client, replies, channel_id="COTHER"),
+            _config(),
+            HpaChangeRoutesDeps(
+                submit_request=lambda request: HpaChangeSubmissionResult(
+                    HpaChangeSubmissionStatus.ACCEPTED
+                )
+            ),
         )
 
-        for overrides, expected_text in cases:
-            with self.subTest(overrides=overrides):
-                client = _FakeSlackClient()
-                replies: list[tuple[str, dict[str, Any]]] = []
-                handled = _handle_hpa_change_request(
-                    _context(client, replies, **overrides),
-                    _config(),
-                    HpaChangeRoutesDeps(
-                        submit_request=lambda request: HpaChangeSubmissionResult(
-                            HpaChangeSubmissionStatus.ACCEPTED
-                        )
-                    ),
-                )
-
-                self.assertTrue(handled)
-                self.assertIn(expected_text, replies[0][0])
-                self.assertEqual(client.reply_calls, [])
+        self.assertTrue(handled)
+        self.assertIn("이 채널에서는", replies[0][0])
+        self.assertEqual(client.reply_calls, [])
 
     def test_collects_all_pages_thread_and_allowed_attachments(self) -> None:
         first_content = b"export const classifier = 'gemini-2.5-flash';\n"
@@ -670,7 +655,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
                     {
                         "ts": target_ts,
                         "thread_ts": root_ts,
-                        "user": "UJUSTIN",
+                        "user": "U0629HDSJHG",
                         "text": "Basic만 발송할 수 있게 분리 요청",
                         "files": [
                             {
@@ -709,13 +694,12 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 client,
                 replies,
                 question=f"HPA 변경 요청 검토 이 댓글만 <{permalink}|저스틴 댓글>",
-                user_id="UHYUN",
+                user_id="U0629HDSJHG",
                 channel_id="CHPA",
                 current_ts=command_ts,
                 thread_ts=command_ts,
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN", "UJUSTIN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -734,8 +718,8 @@ class HpaChangeRoutesTests(unittest.TestCase):
         # 링크는 입력만 고르고 응답 목적지는 새로 멘션한 글의 thread로 유지한다.
         self.assertEqual(request.channel_id, "CHPA")
         self.assertEqual(request.thread_ts, command_ts)
-        self.assertEqual(request.requester_user_id, "UJUSTIN")
-        self.assertEqual(request.initiator_user_id, "UHYUN")
+        self.assertEqual(request.requester_user_id, "U0629HDSJHG")
+        self.assertEqual(request.initiator_user_id, "U0629HDSJHG")
         self.assertEqual(request.source_channel_id, "CSOURCE")
         self.assertEqual(request.source_message_ts, target_ts)
         self.assertEqual(request.selection_mode, "linked_message")
@@ -770,7 +754,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 question=f"HPA 변경 요청 검토 {permalink}",
                 user_id="UHYUN",
             ),
-            _config(allowed_user_ids=frozenset({"UHYUN"})),
+            _config(),
             HpaChangeRoutesDeps(
                 submit_request=lambda request: submitted.append(request)  # type: ignore[func-returns-value]
             ),
@@ -795,7 +779,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -820,7 +803,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -852,7 +834,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -879,7 +860,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -921,7 +901,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -931,7 +910,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertIn("현재 워크스페이스 메시지와 일치하지 않아", replies[-1][0])
         self.assertEqual(submitted, [])
 
-    def test_linked_reply_rejects_unallowed_human_author(self) -> None:
+    def test_linked_reply_rejects_different_human_actor(self) -> None:
         target_ts = "1720580000.000023"
         permalink = "https://workspace.slack.com/archives/CSOURCE/p1720580000000023"
         pages = {
@@ -958,7 +937,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN", "UJUSTIN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(
@@ -966,8 +944,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
             ),
         )
 
-        self.assertIn("댓글 작성자는", replies[-1][0])
-        self.assertIn("허용 사용자가 아니야", replies[-1][0])
+        self.assertIn("요청자 본인이 작성한 것만", replies[-1][0])
         self.assertEqual(submitted, [])
 
     def test_linked_reply_rejects_bot_author(self) -> None:
@@ -998,7 +975,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
                 user_id="UHYUN",
             ),
             _config(
-                allowed_user_ids=frozenset({"UHYUN"}),
                 allowed_channel_ids=frozenset({"CHPA", "CSOURCE"}),
             ),
             HpaChangeRoutesDeps(

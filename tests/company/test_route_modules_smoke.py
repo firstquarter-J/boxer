@@ -120,6 +120,40 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         self.assertFalse(handled)
 
+    def test_admin_routes_allows_request_log_for_boxer_user(self) -> None:
+        replies: list[str] = []
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.admin_routes."
+                "s.REQUEST_LOG_SQLITE_ENABLED",
+                True,
+            ),
+            patch(
+                "boxer_company_adapter_slack.admin_routes."
+                "_query_request_log_text",
+                return_value="*요청 로그*\n• 테스트",
+            ) as query_mock,
+        ):
+            handled = _handle_admin_routes(
+                AdminRoutesContext(
+                    question="요청 로그 최근 5개",
+                    payload=_payload(),  # type: ignore[arg-type]
+                    user_id="U_ANY_BOXER_USER",
+                    thread_ts="1.0",
+                    reply=lambda text, **kwargs: replies.append(text),
+                    logger=logging.getLogger(__name__),
+                ),
+                AdminRoutesDeps(
+                    get_s3_client=lambda: None,
+                    reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
+                ),
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(replies, ["*요청 로그*\n• 테스트"])
+        query_mock.assert_called_once()
+
     def test_structured_routes_returns_false_for_unrelated_question(self) -> None:
         handled = _handle_structured_routes(
             StructuredRoutesContext(
@@ -188,18 +222,11 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     "app-user 원인분석보다 먼저 호출되면 안 돼"
                 )
 
-        with (
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
-                {"U123"},
-            ),
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "_analyze_app_user_baby_selection_by_barcode",
-                return_value=expected,
-            ) as analysis_mock,
-        ):
+        with patch(
+            "boxer_company_adapter_slack.barcode_query_routes."
+            "_analyze_app_user_baby_selection_by_barcode",
+            return_value=expected,
+        ) as analysis_mock:
             handled = _handle_barcode_query_routes(
                 BarcodeQueryRoutesContext(
                     question=(
@@ -233,24 +260,17 @@ class RouteModulesSmokeTests(unittest.TestCase):
             "app_user_baby_selection_analysis",
         )
 
-    def test_barcode_query_routes_allows_baby_analysis_without_lookup_permission(
+    def test_barcode_query_routes_allows_baby_analysis_for_boxer_user(
         self,
     ) -> None:
         replies: list[str] = []
         expected = _APP_USER_BABY_SELECTION_REPLY
 
-        with (
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
-                set(),
-            ),
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "_analyze_app_user_baby_selection_by_barcode",
-                return_value=expected,
-            ) as analysis_mock,
-        ):
+        with patch(
+            "boxer_company_adapter_slack.barcode_query_routes."
+            "_analyze_app_user_baby_selection_by_barcode",
+            return_value=expected,
+        ) as analysis_mock:
             handled = _handle_barcode_query_routes(
                 BarcodeQueryRoutesContext(
                     question=(
@@ -278,27 +298,16 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertEqual(replies, [expected])
         analysis_mock.assert_called_once_with("16326662589")
 
-    def test_barcode_query_routes_keeps_permission_for_detailed_app_user_lookup(
+    def test_barcode_query_routes_allows_detailed_lookup_for_boxer_user(
         self,
     ) -> None:
         replies: list[tuple[str, bool]] = []
 
-        with (
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
-                set(),
-            ),
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "cs.DD_USER_ID",
-                "U_DD",
-            ),
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "_lookup_app_user_by_barcode",
-            ) as lookup_mock,
-        ):
+        with patch(
+            "boxer_company_adapter_slack.barcode_query_routes."
+            "_lookup_app_user_by_barcode",
+            return_value="*앱 사용자 조회 결과*\n• 테스트",
+        ) as lookup_mock:
             handled = _handle_barcode_query_routes(
                 BarcodeQueryRoutesContext(
                     question="16326662589 유저조회",
@@ -324,26 +333,19 @@ class RouteModulesSmokeTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(
             replies,
-            [("보안 책임자 <@U_DD> 의 승인이 필요합니다.", False)],
+            [("*앱 사용자 조회 결과*\n• 테스트", True)],
         )
-        lookup_mock.assert_not_called()
+        lookup_mock.assert_called_once_with("16326662589")
 
     def test_barcode_query_routes_safely_handles_baby_analysis_failure(
         self,
     ) -> None:
         replies: list[str] = []
 
-        with (
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "cs.APP_USER_LOOKUP_ALLOWED_USER_IDS",
-                {"U123"},
-            ),
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes."
-                "_analyze_app_user_baby_selection_by_barcode",
-                side_effect=RuntimeError("secret detail"),
-            ),
+        with patch(
+            "boxer_company_adapter_slack.barcode_query_routes."
+            "_analyze_app_user_baby_selection_by_barcode",
+            side_effect=RuntimeError("secret detail"),
         ):
             handled = _handle_barcode_query_routes(
                 BarcodeQueryRoutesContext(
@@ -431,10 +433,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
 
         with (
             patch("boxer_company_adapter_slack.barcode_query_routes.cs.RECORDING_STREAMING_RESTORE_ENABLED", True),
-            patch(
-                "boxer_company_adapter_slack.barcode_query_routes.cs.RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS",
-                {"U123"},
-            ),
             patch(
                 "boxer_company_adapter_slack.barcode_query_routes._query_recording_streaming_restore_by_barcode_month",
                 return_value="*스트리밍 종료 영상 복원 결과*\n• 결과: 테스트",
@@ -818,7 +816,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )
@@ -873,7 +870,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )
@@ -911,7 +907,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )
@@ -953,7 +948,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )
@@ -994,7 +988,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )
@@ -1034,7 +1027,6 @@ class RouteModulesSmokeTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )

@@ -174,17 +174,13 @@ class DeviceRouteHandlerTests(unittest.TestCase):
 
         with (
             patch(
-                "boxer_company_adapter_slack.device_routes.cs.HYUN_USER_ID",
-                "U_HYUN",
-            ),
-            patch(
                 "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled",
                 return_value={
                     "enabled": True,
                     "envDefault": False,
                     "source": "slack_override",
                     "updatedAt": "2026-07-08T10:00:00+09:00",
-                    "updatedBy": "U_HYUN",
+                    "updatedBy": "U_MEMBER",
                     "monitorEnabled": True,
                 },
             ) as set_alert_delivery,
@@ -196,7 +192,7 @@ class DeviceRouteHandlerTests(unittest.TestCase):
                     phase2_hospital_name=None,
                     phase2_room_name=None,
                     payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U_HYUN",
+                    user_id="U_MEMBER",
                     workspace_id="W123",
                     channel_id="C123",
                     thread_ts="1.0",
@@ -209,7 +205,7 @@ class DeviceRouteHandlerTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertTrue(set_alert_delivery.call_args.args[0])
-        self.assertEqual(set_alert_delivery.call_args.kwargs["user_id"], "U_HYUN")
+        self.assertEqual(set_alert_delivery.call_args.kwargs["user_id"], "U_MEMBER")
         self.assertIs(set_alert_delivery.call_args.kwargs["logger"], logger)
         self.assertIn("상태: *켜짐*", replies[0])
         self.assertIn("Slack 명령", replies[0])
@@ -219,10 +215,6 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         replies: list[str] = []
 
         with (
-            patch(
-                "boxer_company_adapter_slack.device_routes.cs.HYUN_USER_ID",
-                "U_HYUN",
-            ),
             patch(
                 "boxer_company_adapter_slack.device_routes._resolve_device_health_monitor_alert_delivery_status",
                 return_value={
@@ -245,7 +237,7 @@ class DeviceRouteHandlerTests(unittest.TestCase):
                     phase2_hospital_name=None,
                     phase2_room_name=None,
                     payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U_HYUN",
+                    user_id="U_MEMBER",
                     workspace_id="W123",
                     channel_id="C123",
                     thread_ts="1.0",
@@ -262,8 +254,8 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         self.assertIn("상태: *꺼짐*", replies[0])
         self.assertIn("DEVICE_HEALTH_MONITOR_ENABLED=true", replies[0])
 
-    def test_device_health_alert_delivery_control_rejects_non_hyun_for_every_action(self) -> None:
-        # 상태 조회도 현재 운영 설정을 노출하므로 켜기·끄기와 같은 권한 경계로 묶는다.
+    def test_device_health_alert_delivery_control_has_no_feature_user_acl(self) -> None:
+        # 공통 Boxer 진입 권한을 통과한 사용자는 별도 Hyun allowlist 없이 제어할 수 있다.
         for question in (
             "장비 이상 알림 켜",
             "장비 이상 알림 꺼",
@@ -273,14 +265,24 @@ class DeviceRouteHandlerTests(unittest.TestCase):
                 replies: list[str] = []
                 with (
                     patch(
-                        "boxer_company_adapter_slack.device_routes.cs.HYUN_USER_ID",
-                        "U_HYUN",
-                    ),
-                    patch(
-                        "boxer_company_adapter_slack.device_routes._resolve_device_health_monitor_alert_delivery_status"
+                        "boxer_company_adapter_slack.device_routes._resolve_device_health_monitor_alert_delivery_status",
+                        return_value={
+                            "enabled": True,
+                            "envDefault": True,
+                            "source": "env",
+                            "monitorEnabled": True,
+                        },
                     ) as resolve_status,
                     patch(
-                        "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled"
+                        "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled",
+                        return_value={
+                            "enabled": "꺼" not in question,
+                            "envDefault": True,
+                            "source": "slack_override",
+                            "updatedAt": "2026-08-11T18:00:00+09:00",
+                            "updatedBy": "U_MEMBER",
+                            "monitorEnabled": True,
+                        },
                     ) as set_alert_delivery,
                 ):
                     handled = _handle_device_routes(
@@ -290,7 +292,7 @@ class DeviceRouteHandlerTests(unittest.TestCase):
                             phase2_hospital_name=None,
                             phase2_room_name=None,
                             payload=_payload(),  # type: ignore[arg-type]
-                            user_id="U_OTHER",
+                            user_id="U_MEMBER",
                             workspace_id="W123",
                             channel_id="C123",
                             thread_ts="1.0",
@@ -302,42 +304,13 @@ class DeviceRouteHandlerTests(unittest.TestCase):
                     )
 
                 self.assertTrue(handled)
-                self.assertEqual(replies, ["장비 이상 알림 제어는 Hyun만 할 수 있어"])
-                resolve_status.assert_not_called()
-                set_alert_delivery.assert_not_called()
-
-    def test_device_health_alert_delivery_control_fails_closed_without_hyun_user_id(self) -> None:
-        replies: list[str] = []
-        with (
-            patch(
-                "boxer_company_adapter_slack.device_routes.cs.HYUN_USER_ID",
-                "",
-            ),
-            patch(
-                "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled"
-            ) as set_alert_delivery,
-        ):
-            handled = _handle_device_routes(
-                DeviceRoutesContext(
-                    question="장비 이상 알림 켜",
-                    barcode=None,
-                    phase2_hospital_name=None,
-                    phase2_room_name=None,
-                    payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U_HYUN",
-                    workspace_id="W123",
-                    channel_id="C123",
-                    thread_ts="1.0",
-                    reply=lambda text, **kwargs: replies.append(text),
-                    client=None,
-                    logger=logging.getLogger(__name__),
-                ),
-                _deps(),
-            )
-
-        self.assertTrue(handled)
-        self.assertEqual(replies, ["장비 이상 알림 제어는 Hyun만 할 수 있어"])
-        set_alert_delivery.assert_not_called()
+                self.assertIn("이상 알림 발송 설정", replies[0])
+                if "상태" in question:
+                    resolve_status.assert_called_once_with()
+                    set_alert_delivery.assert_not_called()
+                else:
+                    resolve_status.assert_not_called()
+                    set_alert_delivery.assert_called_once()
 
     def test_device_led_log_question_uses_log_analysis_before_pattern_guide(self) -> None:
         replies: list[str] = []

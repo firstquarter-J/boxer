@@ -17,7 +17,6 @@ from boxer_company.assistant.contracts import (
 
 AnswerValidator = Callable[[str], bool]
 ProviderReady = Callable[[], bool]
-ActorAllowedForLlm = Callable[[str | None], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +24,6 @@ class CompanyEvidenceAnswerComposerDeps:
     answer_engine: AnswerEngine
     synthesis_enabled: bool
     provider_ready: ProviderReady
-    actor_allowed_for_llm: ActorAllowedForLlm
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +65,6 @@ class CompanyEvidenceAnswerComposer:
         provider = self._deps.answer_engine.provider
         unavailable_reason = self._preflight_failure_reason(
             provider=provider,
-            actor_id=request.actor_id,
         )
         if unavailable_reason is not None:
             return self._fallback_result(
@@ -155,26 +152,11 @@ class CompanyEvidenceAnswerComposer:
         self,
         *,
         provider: str,
-        actor_id: str | None,
     ) -> str | None:
         if not self._deps.synthesis_enabled:
             return "synthesis_disabled"
         if provider not in {"claude", "ollama"}:
             return "provider_unavailable"
-
-        # 현재 actor allowlist는 외부 Claude 호출에만 적용하고
-        # 로컬 Ollama에는 적용하지 않는다.
-        if provider == "claude":
-            try:
-                if not self._deps.actor_allowed_for_llm(actor_id):
-                    return "actor_not_allowed_for_llm"
-            except Exception as exc:
-                self._logger.warning(
-                    "Company evidence actor policy failed provider=%s error_type=%s",
-                    provider,
-                    type(exc).__name__,
-                )
-                return "actor_not_allowed_for_llm"
 
         try:
             if not self._deps.provider_ready():

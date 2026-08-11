@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -5209,11 +5209,46 @@ def _device_health_monitor_loop(client: Any, logger: logging.Logger) -> None:
         time.sleep(poll_interval_sec)
 
 
-def _attach_device_health_monitor_alert_actions(app: Any, logger: logging.Logger) -> None:
+def _is_device_health_action_actor_allowed(
+    body: dict[str, Any],
+    base_access_checker: Callable[[str | None, str | None], bool] | None,
+    logger: logging.Logger,
+) -> bool:
+    """action/modal actor를 실행 직전에 같은 Boxer 사용 권한으로 다시 확인한다."""
+
+    team = body.get("team") if isinstance(body.get("team"), dict) else {}
+    user = body.get("user") if isinstance(body.get("user"), dict) else {}
+    workspace_id = str(team.get("id") or body.get("team_id") or "").strip()
+    actor_user_id = str(user.get("id") or "").strip()
+    if base_access_checker is None or not workspace_id or not actor_user_id:
+        logger.warning("장비 action 권한을 확인할 callback 또는 Slack 식별자가 없어")
+        return False
+    try:
+        return bool(base_access_checker(workspace_id, actor_user_id))
+    except Exception as exc:
+        # 클릭과 제출 시점의 저장소 장애도 장비 side effect를 실행하지 않는다.
+        logger.warning(
+            "장비 action의 Boxer 사용 권한 재검사에 실패했어 error_type=%s",
+            type(exc).__name__,
+        )
+        return False
+
+
+def _attach_device_health_monitor_alert_actions(
+    app: Any,
+    logger: logging.Logger,
+    base_access_checker: Callable[[str | None, str | None], bool] | None,
+) -> None:
     def _build_action_handler(action_id: str):
         def _handle_action(ack, body: dict[str, Any], client: Any) -> None:
             ack()
             action_body = body if isinstance(body, dict) else {}
+            if not _is_device_health_action_actor_allowed(
+                action_body,
+                base_access_checker,
+                logger,
+            ):
+                return
             # Slack action은 즉시 ack한 뒤, 병원 문자는 모달을 열고 나머지 action은 별도 handler에서 처리한다.
             _handle_device_health_monitor_slack_action(action_body, client, logger)
 
@@ -5224,6 +5259,13 @@ def _attach_device_health_monitor_alert_actions(app: Any, logger: logging.Logger
 
     def _handle_contact_modal_submission(ack, body: dict[str, Any], client: Any) -> None:
         action_body = body if isinstance(body, dict) else {}
+        if not _is_device_health_action_actor_allowed(
+            action_body,
+            base_access_checker,
+            logger,
+        ):
+            ack()
+            return
         errors = _validate_device_health_monitor_contact_modal_submission(action_body)
         if errors:
             ack(response_action="errors", errors=errors)
@@ -5234,7 +5276,12 @@ def _attach_device_health_monitor_alert_actions(app: Any, logger: logging.Logger
     app.view(_DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID)(_handle_contact_modal_submission)
 
 
-def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | None = None) -> None:
+def attach_device_health_monitor_reporter(
+    app: Any,
+    *,
+    logger: logging.Logger | None = None,
+    base_access_checker: Callable[[str | None, str | None], bool] | None = None,
+) -> None:
     health_monitor_enabled = bool(cs.DEVICE_HEALTH_MONITOR_ENABLED)
     notification_alert_enabled = bool(cs.DEVICE_NOTIFICATION_ALERT_ENABLED)
     if not health_monitor_enabled and not notification_alert_enabled:
@@ -5252,7 +5299,11 @@ def attach_device_health_monitor_reporter(app: Any, *, logger: logging.Logger | 
         actual_logger.warning("장비 상태 모니터를 시작하지 못했어. Slack client가 없어")
         return
 
-    _attach_device_health_monitor_alert_actions(app, actual_logger)
+    _attach_device_health_monitor_alert_actions(
+        app,
+        actual_logger,
+        base_access_checker,
+    )
     # 시트 H/R을 정본으로 삼아 프로세스 재시작 뒤에도 접수된 문자의 최종 수신 결과를 이어서 확인한다.
     attach_sms_delivery_reporter(logger=actual_logger)
 

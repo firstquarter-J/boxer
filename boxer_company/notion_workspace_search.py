@@ -95,11 +95,6 @@ def _is_company_notion_search_configured() -> bool:
     return bool(cs.NOTION_TOKEN_COMPANY and cs.COMPANY_NOTION_SEARCH_ROOT_PAGE_ID)
 
 
-def _is_company_notion_search_allowed(user_id: str | None) -> bool:
-    normalized_user_id = str(user_id or "").strip()
-    return bool(normalized_user_id and normalized_user_id in cs.COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS)
-
-
 def _extract_notion_object_title(payload: dict[str, Any]) -> str:
     if payload.get("object") == "page":
         properties = payload.get("properties")
@@ -600,7 +595,6 @@ __all__ = [
     "_build_company_notion_search_reply",
     "_build_company_notion_source_docs",
     "_extract_company_notion_search_query",
-    "_is_company_notion_search_allowed",
     "_is_company_notion_search_configured",
     "_looks_like_company_notion_search",
     "_load_company_notion_references",

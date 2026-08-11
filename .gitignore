@@ -19,6 +19,8 @@ data/sms_delivery_outbox.json
 data/sms_delivery_outbox.json.lock
 data/sms_delivery_outbox.json.reconcile.lock
 data/.sms_delivery_outbox.json.*.tmp
+data/boxer_base_access.json
+data/.boxer_base_access.json.*.tmp
 data/*-wal
 data/*-shm
 widget/node_modules/

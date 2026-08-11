@@ -38,12 +38,8 @@ _GITHUB_EVENT_TYPE = "boxer-hpa-change"
 _GITHUB_RUN_NAME_PREFIX = "Boxer HPA Review"
 _GITHUB_IMPLEMENTATION_RUN_NAME_PREFIX = "Boxer HPA Implementation"
 
-# HPA CR 자동 PR은 회사가 승인한 두 사람과 두 채널에서만 동작한다.
-# 저스틴은 Slack 계정이 두 개라 두 user ID를 동일한 허용 대상으로 관리한다.
-# 환경변수는 기능 on/off가 아니라 이 고정 정책과의 일치 여부를 검증하는 용도다.
-HPA_CHANGE_POLICY_ALLOWED_USER_IDS = frozenset(
-    {"U0629HDSJHG", "U07A5FM5XPD", "U096JA81T6X"}
-)
+# HPA CR 자동 PR은 회사가 승인한 두 채널에서만 동작한다.
+# 사용자는 공통 Boxer gate가 판정하고, runtime은 동일 actor provenance를 재검증한다.
 HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS = frozenset(
     {"C02C08K7YEN", "C068FVD5V7Y"}
 )
@@ -154,6 +150,7 @@ class HpaChangeRuntime:
             )
 
         continuation_of = str(request.continuation_of_request_id or "").strip()
+        request_actor_id = str(request.requester_user_id or "").strip()
         current_attachments = self._route_attachments(request)
         if not continuation_of:
             return WorkflowHpaChangeRequest(
@@ -161,15 +158,14 @@ class HpaChangeRuntime:
                 event_ts=request.event_ts,
                 channel_id=request.channel_id,
                 thread_ts=request.thread_ts,
-                requested_by=request.requester_user_id,
+                requested_by=request_actor_id,
                 request_text=request.thread_text,
                 thread_url=request.thread_url,
                 attachments=current_attachments,
                 metadata={
                     "source": "slack",
                     "request_key": request.request_key,
-                    "initiator_user_id": request.initiator_user_id
-                    or request.requester_user_id,
+                    "initiator_user_id": request_actor_id,
                     "source_channel_id": request.source_channel_id or request.channel_id,
                     "source_message_ts": request.source_message_ts or request.thread_ts,
                     "selection_mode": request.selection_mode,
@@ -185,10 +181,16 @@ class HpaChangeRuntime:
             existing_parent = str(
                 existing.metadata.get("continuation_of_request_id") or ""
             ).strip()
+            existing_actor_id = str(existing.requested_by or "").strip()
+            existing_initiator_id = str(
+                existing.metadata.get("initiator_user_id") or ""
+            ).strip()
             if (
                 existing_parent == continuation_of
                 and existing.channel_id == request.channel_id
                 and existing.thread_ts == request.thread_ts
+                and existing_actor_id == request_actor_id
+                and existing_initiator_id == request_actor_id
             ):
                 return HpaChangeSubmissionResult(
                     status=HpaChangeSubmissionStatus.DUPLICATE,
@@ -222,14 +224,20 @@ class HpaChangeRuntime:
         parent_source_channel_id = str(
             parent.metadata.get("source_channel_id") or parent.channel_id
         ).strip()
+        parent_actor_id = str(parent.requested_by or "").strip()
+        parent_initiator_id = str(
+            parent.metadata.get("initiator_user_id") or ""
+        ).strip()
         if (
-            parent.requested_by not in HPA_CHANGE_POLICY_ALLOWED_USER_IDS
+            not parent_actor_id
+            or parent_initiator_id != parent_actor_id
+            or request_actor_id != parent_actor_id
             or parent.channel_id not in HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
             or parent_source_channel_id not in HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
         ):
             return HpaChangeSubmissionResult(
                 status=HpaChangeSubmissionStatus.REJECTED,
-                user_message="이전 HPA 요청의 사용자·채널 정책을 확인하지 못했어",
+                user_message="이전 HPA 요청의 동일 요청자·채널 정책을 확인하지 못했어",
             )
 
         combined_text = "\n\n".join(
@@ -275,14 +283,13 @@ class HpaChangeRuntime:
                 user_message="기존 요청과 추가 답변의 첨부 크기 합계가 제한을 초과했어",
             )
 
-        # 원 요청자와 선택한 원문 소스는 그대로 두고, 실행자와 응답 thread만 이번 event로 갱신한다.
+        # 같은 요청자의 원문 소스는 그대로 두고 응답 thread와 event 정보만 갱신한다.
         metadata = dict(parent.metadata)
         metadata.update(
             {
                 "source": "slack",
                 "request_key": request.request_key,
-                "initiator_user_id": request.initiator_user_id
-                or request.requester_user_id,
+                "initiator_user_id": request_actor_id,
                 "response_thread_url": request.response_thread_url
                 or parent.metadata.get("response_thread_url")
                 or "",
@@ -296,7 +303,7 @@ class HpaChangeRuntime:
             event_ts=request.event_ts,
             channel_id=request.channel_id,
             thread_ts=request.thread_ts,
-            requested_by=parent.requested_by,
+            requested_by=parent_actor_id,
             request_text=combined_text,
             thread_url=parent.thread_url,
             attachments=tuple(merged_attachments),
@@ -310,17 +317,22 @@ class HpaChangeRuntime:
                 user_message="HPA 코드 변경 작업 큐가 활성화되지 않았어",
             )
 
-        # Slack route를 우회해 runtime이 직접 호출돼도 요청자·실행자와
+        # Slack route를 우회해 runtime이 직접 호출돼도 비어 있지 않은 동일 actor와
         # 응답·원문 채널이 모두 회사 고정 정책 안에 있어야 dispatch한다.
+        requester_user_id = str(request.requester_user_id or "").strip()
         initiator_user_id = str(request.initiator_user_id or "").strip()
         source_channel_id = str(request.source_channel_id or "").strip()
-        if not initiator_user_id or not source_channel_id or {
-            request.requester_user_id,
-            initiator_user_id,
-        } - HPA_CHANGE_POLICY_ALLOWED_USER_IDS or {
-            request.channel_id,
-            source_channel_id,
-        } - HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS:
+        if (
+            not requester_user_id
+            or not initiator_user_id
+            or requester_user_id != initiator_user_id
+            or not source_channel_id
+            or {
+                request.channel_id,
+                source_channel_id,
+            }
+            - HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
+        ):
             return HpaChangeSubmissionResult(
                 status=HpaChangeSubmissionStatus.REJECTED,
                 user_message=(
@@ -540,15 +552,11 @@ def create_hpa_change_runtime(
     """환경 설정을 한 번 검증하고 고정 coordinator용 runtime을 만든다."""
 
     enabled = bool(_setting(settings, "HPA_CHANGE_REQUEST_ENABLED", False))
-    allowed_user_ids = _normalized_ids(
-        _setting(settings, "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS", ())
-    )
     allowed_channel_ids = _normalized_ids(
         _setting(settings, "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS", ())
     )
     routes_config = HpaChangeRoutesConfig(
         enabled=enabled,
-        allowed_user_ids=allowed_user_ids,
         allowed_channel_ids=allowed_channel_ids,
         max_thread_chars=max(
             0,
@@ -582,18 +590,13 @@ def create_hpa_change_runtime(
             logger=logger,
         )
 
-    # 활성화 시 비어 있는 allowlist와 비정상 한도는
+    # 활성화 시 비어 있는 채널 allowlist와 비정상 한도는
     # 전체 허용이나 무제한으로 해석하지 않는다.
-    if not allowed_user_ids or not allowed_channel_ids:
+    if not allowed_channel_ids:
+        raise ValueError("HPA 코드 변경 요청의 채널 allowlist가 필요해")
+    if allowed_channel_ids != HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS:
         raise ValueError(
-            "HPA 코드 변경 요청의 사용자·채널 allowlist가 모두 필요해"
-        )
-    if (
-        allowed_user_ids != HPA_CHANGE_POLICY_ALLOWED_USER_IDS
-        or allowed_channel_ids != HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
-    ):
-        raise ValueError(
-            "HPA 코드 변경 요청 allowlist가 회사 고정 사용자·채널 정책과 달라"
+            "HPA 코드 변경 요청 allowlist가 회사 고정 채널 정책과 달라"
         )
     poll_interval_sec = _positive_int(settings, "HPA_CHANGE_POLL_INTERVAL_SEC")
     run_timeout_sec = _positive_int(settings, "HPA_CHANGE_RUN_TIMEOUT_SEC")

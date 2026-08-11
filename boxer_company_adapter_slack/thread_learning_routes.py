@@ -33,13 +33,6 @@ class ThreadLearningRoutesContext:
     claude_client: Any
 
 
-def _is_thread_playbook_learning_allowed(user_id: str | None) -> bool:
-    allowed_user_ids = cs.THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS
-    if not allowed_user_ids:
-        return True
-    return bool(user_id) and user_id in allowed_user_ids
-
-
 def _fetch_thread_messages_for_learning(
     client: Any,
     logger: logging.Logger,
@@ -162,11 +155,7 @@ def _handle_thread_learning_routes(context: ThreadLearningRoutesContext) -> bool
         context.reply("스레드 학습 기능이 꺼져 있어")
         return True
 
-    if not _is_thread_playbook_learning_allowed(context.user_id):
-        context.reply("스레드 학습은 지정된 사용자만 할 수 있어")
-        context.logger.info("Rejected thread playbook learning for user=%s", context.user_id)
-        return True
-
+    # 상위 mention gate를 통과한 사용자는 별도 기능별 allowlist 없이 학습할 수 있다.
     thread_context = _load_thread_context_for_learning(
         context.client,
         context.logger,

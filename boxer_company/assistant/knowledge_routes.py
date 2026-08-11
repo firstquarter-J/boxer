@@ -555,12 +555,6 @@ def _default_freeform_system_prompt(
     )
 
 
-def _deny_request_by_default(request: CompanyAssistantRequest) -> bool:
-    del request
-    # 채널별 인증 경계를 생략한 새 consumer가 문서 조회를 열지 않게 기본값은 거부다.
-    return False
-
-
 def _handle_request_by_default(request: CompanyAssistantRequest) -> bool:
     del request
     return True
@@ -767,9 +761,6 @@ def _is_safe_device_diagnostic_answer(text: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class NotionPlaybookQARouteDeps:
     answer_composer: CompanyEvidenceAnswerComposer
-    is_allowed: Callable[[CompanyAssistantRequest], bool] = (
-        _deny_request_by_default
-    )
     looks_like_question: Callable[[str], bool] = (
         looks_like_notion_playbook_question
     )
@@ -818,23 +809,6 @@ class NotionPlaybookQAAssistantRoute:
             context_text,
         ):
             return None
-
-        try:
-            allowed = self._deps.is_allowed(request)
-        except Exception as exc:
-            self._logger.warning(
-                "Notion playbook policy failed request_id=%s error_type=%s",
-                request.request_id,
-                type(exc).__name__,
-            )
-            allowed = False
-        if not allowed:
-            return _result(
-                route=self.name,
-                outcome="denied",
-                body="운영 문서 조회는 현재 허용된 사용자만 사용할 수 있어",
-                fallback_reason="actor_not_allowed",
-            )
 
         if self._deps.is_exfiltration_attempt(
             request.question,
@@ -967,9 +941,6 @@ class BarcodeEvidenceFreeformRouteDeps:
     should_handle: Callable[[CompanyAssistantRequest], bool] = (
         _handle_request_by_default
     )
-    is_allowed: Callable[[CompanyAssistantRequest], bool] = (
-        _deny_request_by_default
-    )
     build_system_prompt: FreeformSystemPromptBuilder = (
         _default_freeform_system_prompt
     )
@@ -1019,23 +990,6 @@ class BarcodeEvidenceFreeformAssistantRoute:
             should_handle = False
         if not should_handle:
             return None
-
-        try:
-            allowed = self._deps.is_allowed(request)
-        except Exception as exc:
-            self._logger.warning(
-                "Barcode freeform policy failed request_id=%s error_type=%s",
-                request.request_id,
-                type(exc).__name__,
-            )
-            allowed = False
-        if not allowed:
-            return _result(
-                route=self.name,
-                outcome="denied",
-                body="AI 질문은 현재 지정된 사용자만 사용할 수 있어",
-                fallback_reason="actor_not_allowed",
-            )
 
         context_text = _request_context_text(request)
         if is_prompt_exfiltration_attempt(request.question, context_text):
@@ -1116,8 +1070,6 @@ class CompanyReadOnlyKnowledgeRouteDeps:
     """채널 adapter가 정책·저장소 port만 주입하는 표준 지식 route 조립 입력이다."""
 
     load_diagnostic_snapshot: DiagnosticSnapshotLoader
-    notion_is_allowed: Callable[[CompanyAssistantRequest], bool]
-    barcode_is_allowed: Callable[[CompanyAssistantRequest], bool]
     db_configured: Callable[[], bool]
     barcode_should_handle: Callable[[CompanyAssistantRequest], bool] = (
         _handle_request_by_default
@@ -1160,7 +1112,6 @@ def build_company_read_only_knowledge_routes(
         NotionPlaybookQAAssistantRoute(
             NotionPlaybookQARouteDeps(
                 answer_composer=answer_composer,
-                is_allowed=deps.notion_is_allowed,
                 timeout_message=deps.timeout_message,
             ),
             logger=logger,
@@ -1174,7 +1125,6 @@ def build_company_read_only_knowledge_routes(
                     answer_composer=answer_composer,
                     db_configured=deps.db_configured,
                     should_handle=deps.barcode_should_handle,
-                    is_allowed=deps.barcode_is_allowed,
                     build_system_prompt=(
                         deps.build_barcode_system_prompt
                     ),

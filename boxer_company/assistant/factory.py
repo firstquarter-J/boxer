@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import threading
 import time
@@ -13,7 +12,6 @@ from boxer.core.llm import (
     _check_ollama_health,
 )
 from boxer.retrieval.connectors.s3 import _build_s3_client
-from boxer_company import settings as company_settings
 from boxer_company.assistant.barcode_log_route import (
     match_barcode_log_route,
 )
@@ -43,9 +41,6 @@ from boxer_company.assistant.runtime import (
     CompanyAssistantRuntimeDeps,
 )
 from boxer_company.notion_playbooks import _select_notion_references
-from boxer_company.notion_workspace_search import (
-    _is_company_notion_search_allowed,
-)
 from boxer_company.routers.box_db import (
     _load_recordings_context_by_barcode,
 )
@@ -57,32 +52,12 @@ from boxer_company.routers.device_diagnostics import (
 )
 
 
-ActorPolicy = Callable[[str | None], bool]
-RequestPolicy = Callable[[CompanyAssistantRequest], bool]
 DiagnosticSnapshotLoader = Callable[
     [CompanyAssistantRequest],
     dict[str, Any] | None,
 ]
 
 _RESOURCE_UNSET = object()
-
-
-def _allow_company_request(
-    request: CompanyAssistantRequest,
-) -> bool:
-    del request
-    # HTTP 경계의 caller capability 검증 이후 사용하는 회사 내부 기본값이다.
-    return True
-
-
-def _default_actor_allowed_for_llm(actor_id: str | None) -> bool:
-    allowlist = company_settings.CLAUDE_ALLOWED_USER_IDS
-    if not allowlist:
-        return True
-    normalized_actor_id = str(actor_id or "").strip()
-    return bool(
-        normalized_actor_id and normalized_actor_id in allowlist
-    )
 
 
 def _unavailable_diagnostic_snapshot(
@@ -139,20 +114,6 @@ def _guard_read_only_request(
         ),
         fallback_reason="read_only_boundary",
     )
-
-
-@dataclass(frozen=True, slots=True)
-class CompanyAssistantRuntimePolicy:
-    """인증된 요청에 적용할 회사 assistant 세부 권한을 모은다."""
-
-    actor_allowed_for_llm: ActorPolicy = (
-        _default_actor_allowed_for_llm
-    )
-    company_notion_search_allowed: ActorPolicy = (
-        _is_company_notion_search_allowed
-    )
-    notion_playbook_allowed: RequestPolicy = _allow_company_request
-    barcode_evidence_allowed: RequestPolicy | None = None
 
 
 def _answer_timeout_message(provider: str) -> str:
@@ -222,29 +183,13 @@ def _create_provider_ready(
     return provider_ready
 
 
-def _default_barcode_evidence_allowed(
-    request: CompanyAssistantRequest,
-    *,
-    provider: str,
-    actor_allowed_for_llm: ActorPolicy,
-) -> bool:
-    # 현재 actor allowlist는 외부 Claude 호출에만 적용하고
-    # 로컬 Ollama에는 적용하지 않는 기존 정책을 유지한다.
-    return (
-        provider != "claude"
-        or actor_allowed_for_llm(request.actor_id)
-    )
-
-
 def create_company_assistant_runtime(
     *,
-    policy: CompanyAssistantRuntimePolicy | None = None,
     diagnostic_snapshot_loader: DiagnosticSnapshotLoader | None = None,
     logger: logging.Logger | None = None,
 ) -> CompanyAssistantRuntime:
     """Slack/Web adapter 없이 회사 read-only runtime 전체를 조립한다."""
     app_logger = logger or logging.getLogger(__name__)
-    runtime_policy = policy or CompanyAssistantRuntimePolicy()
     provider = str(core_settings.LLM_PROVIDER or "").strip().lower()
 
     claude_client: Any | None = None
@@ -281,19 +226,6 @@ def create_company_assistant_runtime(
         else _unavailable_diagnostic_snapshot
     )
 
-    barcode_evidence_allowed = (
-        runtime_policy.barcode_evidence_allowed
-        or (
-            lambda request: _default_barcode_evidence_allowed(
-                request,
-                provider=provider,
-                actor_allowed_for_llm=(
-                    runtime_policy.actor_allowed_for_llm
-                ),
-            )
-        )
-    )
-
     def should_handle_barcode_evidence(
         request: CompanyAssistantRequest,
     ) -> bool:
@@ -327,10 +259,6 @@ def create_company_assistant_runtime(
             composer,
             CompanyReadOnlyKnowledgeRouteDeps(
                 load_diagnostic_snapshot=load_snapshot,
-                notion_is_allowed=(
-                    runtime_policy.notion_playbook_allowed
-                ),
-                barcode_is_allowed=barcode_evidence_allowed,
                 db_configured=lambda: bool(
                     core_settings.DB_HOST
                     and core_settings.DB_USERNAME
@@ -360,9 +288,6 @@ def create_company_assistant_runtime(
             answer_engine=answer_engine,
             synthesis_enabled=core_settings.LLM_SYNTHESIS_ENABLED,
             provider_ready=provider_ready,
-            actor_allowed_for_llm=(
-                runtime_policy.actor_allowed_for_llm
-            ),
             get_s3_client=get_s3_client,
             recordings_loader=_load_recordings_context_by_barcode,
             notion_reference_loader=_select_notion_references,
@@ -380,12 +305,6 @@ def create_company_assistant_runtime(
                     core_settings.LLM_SYNTHESIS_ENABLED
                 ),
                 provider_ready=provider_ready,
-                actor_allowed_for_llm=(
-                    runtime_policy.actor_allowed_for_llm
-                ),
-                is_search_allowed=(
-                    runtime_policy.company_notion_search_allowed
-                ),
             ),
             request_guard=_guard_read_only_request,
             # 장비 기본 정보는 DB-only로 제공하고 MDA/SSH 보강과
@@ -405,7 +324,6 @@ def create_company_assistant_runtime(
 
 
 __all__ = [
-    "CompanyAssistantRuntimePolicy",
     "DiagnosticSnapshotLoader",
     "create_company_assistant_runtime",
 ]

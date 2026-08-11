@@ -83,6 +83,21 @@ class SlackMessageReplyFn(Protocol):
 MessageHandler = Callable[[MessagePayload, SlackMessageReplyFn, Any, logging.Logger], None]
 
 
+def _extract_slack_workspace_id(
+    event: dict[str, Any],
+    body: dict[str, Any] | None,
+) -> str:
+    """Slack Events API envelope의 team_id를 우선해 workspace를 식별한다."""
+
+    envelope = body if isinstance(body, dict) else {}
+    return str(
+        envelope.get("team_id")
+        or event.get("team")
+        or event.get("team_id")
+        or ""
+    ).strip()
+
+
 def _ensure_request_log_context(
     payload: MentionPayload | MessagePayload,
 ) -> SlackRequestLogContext:
@@ -377,12 +392,17 @@ def create_slack_app(
     app = App(token=ss.SLACK_BOT_TOKEN, signing_secret=ss.SLACK_SIGNING_SECRET)
 
     @app.event("app_mention")
-    def handle_app_mention(event: dict[str, Any], say, client) -> None:
+    def handle_app_mention(
+        event: dict[str, Any],
+        say,
+        client,
+        body: dict[str, Any] | None = None,
+    ) -> None:
         raw_text = event.get("text") or ""
         text = raw_text.lower()
         user_id = event.get("user")
         thread_ts = event.get("thread_ts") or event.get("ts")
-        workspace_id = str(event.get("team") or event.get("team_id") or "").strip()
+        workspace_id = _extract_slack_workspace_id(event, body)
 
         payload: MentionPayload = {
             "raw_text": raw_text,
@@ -443,7 +463,12 @@ def create_slack_app(
             )
 
     @app.event("message")
-    def handle_message_events(event: dict[str, Any], say, client) -> None:
+    def handle_message_events(
+        event: dict[str, Any],
+        say,
+        client,
+        body: dict[str, Any] | None = None,
+    ) -> None:
         subtype = str(event.get("subtype") or "").strip()
         if subtype and subtype != "bot_message":
             logger.debug("Ignored message event subtype=%s", subtype)
@@ -478,7 +503,7 @@ def create_slack_app(
             return
 
         thread_ts = event.get("thread_ts") or event.get("ts") or ""
-        workspace_id = str(event.get("team") or event.get("team_id") or "").strip()
+        workspace_id = _extract_slack_workspace_id(event, body)
         payload: MessagePayload = {
             "raw_text": raw_text,
             "text": raw_text.lower(),

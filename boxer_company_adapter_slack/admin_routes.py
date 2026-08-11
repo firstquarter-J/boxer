@@ -13,7 +13,6 @@ from boxer_adapter_slack.common import (
 )
 from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _query_db, _validate_readonly_sql
-from boxer_company import settings as cs
 from boxer_company.routers.db_query import _extract_db_query, _format_db_query_result
 from boxer_company.routers.request_log_query import (
     _extract_request_log_query,
@@ -40,12 +39,6 @@ class AdminRoutesContext:
 class AdminRoutesDeps:
     get_s3_client: Callable[[], Any]
     reply_with_retrieval_synthesis: Callable[..., None]
-
-
-def _is_request_log_query_allowed(target_user_id: str | None) -> bool:
-    if not cs.REQUEST_LOG_QUERY_ALLOWED_USER_IDS:
-        return True
-    return bool(target_user_id) and target_user_id in cs.REQUEST_LOG_QUERY_ALLOWED_USER_IDS
 
 
 def _handle_admin_routes(
@@ -133,18 +126,8 @@ def _handle_admin_routes(
         if not s.REQUEST_LOG_SQLITE_ENABLED:
             context.reply("요청 로그 저장 기능이 꺼져 있어. .env에서 REQUEST_LOG_SQLITE_ENABLED=true로 설정해줘")
             return True
-        if not _is_request_log_query_allowed(context.user_id):
-            approval_text = "요청 로그 조회는 권한이 필요해"
-            if cs.DD_USER_ID:
-                approval_text = f"요청 로그 조회는 <@{cs.DD_USER_ID}> 승인이 필요해"
-            context.reply(approval_text, mention_user=False)
-            context.logger.info(
-                "Rejected request log query for unauthorized user=%s mode=%s date=%s",
-                context.user_id,
-                request_log_query.mode,
-                request_log_query.target_date,
-            )
-            return True
+        # 사람의 Boxer 진입 권한은 상위 mention gate에서 한 번만 확인한다.
+        # 이 route는 저장 기능 준비 여부와 조회 형식만 검증한다.
         try:
             result_text = _query_request_log_text(request_log_query)
             context.reply(result_text)

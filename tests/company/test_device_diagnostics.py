@@ -293,7 +293,6 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )
@@ -417,7 +416,6 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
                     timeout_reply_text=lambda: "timeout",
                     llm_unavailable_reply_text=lambda summary=None: "down",
                     is_timeout_error=lambda exc: False,
-                    is_claude_allowed_user=lambda user_id: True,
                     build_barcode_fallback_evidence=lambda: None,
                 ),
             )

@@ -85,7 +85,6 @@ def _composer(
             answer_engine=engine,  # type: ignore[arg-type]
             synthesis_enabled=synthesis_enabled,
             provider_ready=lambda: True,
-            actor_allowed_for_llm=lambda actor_id: True,
         ),
         logger=logger,
     )
@@ -246,7 +245,6 @@ class NotionPlaybookQAAssistantRouteTests(unittest.TestCase):
                     synthesis_enabled=synthesis_enabled,
                 ),
                 select_references=select,
-                is_allowed=lambda request: True,
                 is_configured=lambda: True,
             )
         )
@@ -382,29 +380,6 @@ class NotionPlaybookQAAssistantRouteTests(unittest.TestCase):
         self.assertEqual(selector_calls, [])
         self.assertEqual(engine.requests, [])
 
-    def test_permission_port_fails_closed_before_reference_lookup(self) -> None:
-        engine = _FakeAnswerEngine(
-            AnswerResult(text="사용 안 됨", provider="claude", used_llm=True)
-        )
-        selector_calls: list[tuple[str, dict]] = []
-        route = NotionPlaybookQAAssistantRoute(
-            NotionPlaybookQARouteDeps(
-                answer_composer=_composer(engine),
-                select_references=lambda query, evidence: (
-                    selector_calls.append((query, evidence)) or []
-                ),
-            )
-        )
-
-        result = route.handle(_request("LED 상태표시등 문서 뭐야?"))
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.outcome, "denied")
-        self.assertEqual(result.fallback_reason, "actor_not_allowed")
-        self.assertEqual(selector_calls, [])
-        self.assertEqual(engine.requests, [])
-
     def test_blocks_unsafe_generated_answer(self) -> None:
         engine = _FakeAnswerEngine(
             AnswerResult(
@@ -475,7 +450,6 @@ class BarcodeEvidenceFreeformAssistantRouteTests(unittest.TestCase):
         loader,
         db_configured: bool = True,
         synthesis_enabled: bool = True,
-        actor_allowed: bool = True,
         should_handle: bool = True,
     ) -> tuple[
         BarcodeEvidenceFreeformAssistantRoute,
@@ -494,7 +468,6 @@ class BarcodeEvidenceFreeformAssistantRouteTests(unittest.TestCase):
                 ),
                 db_configured=lambda: db_configured,
                 should_handle=lambda request: should_handle,
-                is_allowed=lambda request: actor_allowed,
                 build_system_prompt=lambda request, context: (
                     "조회 근거만 사용해"
                 ),
@@ -580,29 +553,7 @@ class BarcodeEvidenceFreeformAssistantRouteTests(unittest.TestCase):
         self.assertEqual(loaded_barcodes, [])
         self.assertEqual(engine.requests, [])
 
-    def test_actor_policy_denial_happens_before_db_lookup(self) -> None:
-        loaded_barcodes: list[str] = []
-        engine = _FakeAnswerEngine(
-            AnswerResult(text="사용 안 됨", provider="claude", used_llm=True)
-        )
-        route, _ = self._route(
-            engine,
-            loader=lambda barcode: loaded_barcodes.append(barcode) or {},
-            actor_allowed=False,
-        )
-
-        result = route.handle(
-            _request("상태 설명해줘", metadata={"barcode": BARCODE})
-        )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.outcome, "denied")
-        self.assertEqual(result.fallback_reason, "actor_not_allowed")
-        self.assertEqual(loaded_barcodes, [])
-        self.assertEqual(engine.requests, [])
-
-    def test_delegation_policy_skips_route_before_actor_or_db_lookup(
+    def test_delegation_policy_skips_route_before_db_lookup(
         self,
     ) -> None:
         loaded_barcodes: list[str] = []
@@ -689,8 +640,6 @@ class CompanyReadOnlyKnowledgeRouteFactoryTests(unittest.TestCase):
             _composer(engine),
             CompanyReadOnlyKnowledgeRouteDeps(
                 load_diagnostic_snapshot=lambda request: None,
-                notion_is_allowed=lambda request: True,
-                barcode_is_allowed=lambda request: True,
                 db_configured=lambda: True,
             ),
         )
@@ -719,8 +668,6 @@ class CompanyReadOnlyKnowledgeRouteFactoryTests(unittest.TestCase):
             _composer(engine),
             CompanyReadOnlyKnowledgeRouteDeps(
                 load_diagnostic_snapshot=lambda request: None,
-                notion_is_allowed=lambda request: True,
-                barcode_is_allowed=lambda request: True,
                 db_configured=lambda: True,
                 include_barcode_evidence=False,
             ),

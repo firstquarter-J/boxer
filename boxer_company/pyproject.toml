@@ -17,6 +17,9 @@ dependencies = [
   "requests==2.32.3",
 ]
 
+[project.scripts]
+boxer-company-base-access-seed = "boxer_company.base_access_seed:main"
+
 [project.urls]
 Repository = "https://github.com/firstquarter-J/boxer"
 

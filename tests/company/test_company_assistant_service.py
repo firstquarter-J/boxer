@@ -233,7 +233,6 @@ class CompanyNotionAssistantRouteTests(unittest.TestCase):
         *,
         answer_result: AnswerResult | None = None,
         provider: str = "claude",
-        allowed: bool = True,
         configured: bool = True,
         query: str = "Commerce",
         search_results: list[CompanyNotionSearchResult] | None = None,
@@ -262,9 +261,7 @@ class CompanyNotionAssistantRouteTests(unittest.TestCase):
             answer_engine=engine,  # type: ignore[arg-type]
             synthesis_enabled=synthesis_enabled,
             provider_ready=lambda: provider_ready,
-            actor_allowed_for_llm=lambda actor_id: True,
             looks_like_search=lambda question: "회사 노션" in question,
-            is_search_allowed=lambda actor_id: allowed,
             is_search_configured=lambda: configured,
             extract_query=lambda question: query,
             search=lambda target: search_calls.append(target)
@@ -286,15 +283,18 @@ class CompanyNotionAssistantRouteTests(unittest.TestCase):
             SimpleNamespace(engine=engine, search_calls=search_calls),
         )
 
-    def test_unrelated_and_denied_requests_are_terminal_without_search(self) -> None:
-        route, state = self._route(allowed=False)
+    def test_unrelated_and_unconfigured_requests_do_not_search(self) -> None:
+        route, state = self._route(configured=False)
 
         self.assertIsNone(route.handle(_request("일반 질문")))
-        denied = route.handle(_request("회사 노션에서 Commerce 찾아줘"))
+        unavailable = route.handle(
+            _request("회사 노션에서 Commerce 찾아줘")
+        )
 
-        self.assertIsNotNone(denied)
-        self.assertEqual(denied.outcome, "denied")
-        self.assertEqual(denied.route, "company_notion_search")
+        self.assertIsNotNone(unavailable)
+        self.assertEqual(unavailable.outcome, "failed")
+        self.assertEqual(unavailable.route, "company_notion_search")
+        self.assertEqual(unavailable.fallback_reason, "not_configured")
         self.assertEqual(state.search_calls, [])
 
     def test_missing_query_and_no_result_return_structured_outcomes(self) -> None:
@@ -597,7 +597,6 @@ class BarcodeQueryAssistantRouteTests(unittest.TestCase):
                 answer_engine=engine,  # type: ignore[arg-type]
                 synthesis_enabled=True,
                 provider_ready=lambda: True,
-                actor_allowed_for_llm=lambda actor_id: True,
             )
         )
         return (

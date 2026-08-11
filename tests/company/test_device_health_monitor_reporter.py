@@ -35,6 +35,26 @@ class _FakeSlackClient:
         return {"ok": True}
 
 
+class _FakeBoltActionApp:
+    def __init__(self) -> None:
+        self.actions: dict[str, object] = {}
+        self.views: dict[str, object] = {}
+
+    def action(self, action_id: str):
+        def decorator(handler):
+            self.actions[action_id] = handler
+            return handler
+
+        return decorator
+
+    def view(self, callback_id: str):
+        def decorator(handler):
+            self.views[callback_id] = handler
+            return handler
+
+        return decorator
+
+
 class _FakeWebhookResponse:
     def __init__(self, status_code: int = 202, text: str = "") -> None:
         self.status_code = status_code
@@ -1878,6 +1898,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         app = Mock()
         app.client = object()
         logger = logging.getLogger("test.device_health_monitor.event_actions")
+        base_access_checker = Mock(return_value=True)
 
         with (
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
@@ -1888,9 +1909,108 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 "_attach_device_health_monitor_alert_actions",
             ) as attach_actions_mock,
         ):
-            reporter.attach_device_health_monitor_reporter(app, logger=logger)
+            reporter.attach_device_health_monitor_reporter(
+                app,
+                logger=logger,
+                base_access_checker=base_access_checker,
+            )
 
-        attach_actions_mock.assert_called_once_with(app, logger)
+        attach_actions_mock.assert_called_once_with(
+            app,
+            logger,
+            base_access_checker,
+        )
+
+    def test_device_action_rechecks_current_actor_and_workspace_before_side_effect(self) -> None:
+        app = _FakeBoltActionApp()
+        logger = logging.getLogger("test.device_health_monitor.action_access")
+        checker = Mock(return_value=True)
+        reporter._attach_device_health_monitor_alert_actions(app, logger, checker)
+        handler = app.actions[reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE]
+        ack = Mock()
+        client = Mock()
+        body = {
+            "team": {"id": "T_TEST"},
+            "user": {"id": "U_ACTOR"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+                    "value": "{}",
+                }
+            ],
+        }
+
+        with patch.object(
+            reporter,
+            "_handle_device_health_monitor_slack_action",
+        ) as action_mock:
+            handler(ack, body, client)
+
+        ack.assert_called_once_with()
+        checker.assert_called_once_with("T_TEST", "U_ACTOR")
+        action_mock.assert_called_once_with(body, client, logger)
+
+    def test_device_action_missing_denied_or_failed_checker_has_zero_side_effect(self) -> None:
+        body = {
+            "team": {"id": "T_TEST"},
+            "user": {"id": "U_ACTOR"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+                    "value": "{}",
+                }
+            ],
+        }
+        checkers = (
+            None,
+            Mock(return_value=False),
+            Mock(side_effect=RuntimeError("down")),
+        )
+        for checker in checkers:
+            with self.subTest(checker=checker):
+                app = _FakeBoltActionApp()
+                logger = logging.getLogger("test.device_health_monitor.action_deny")
+                reporter._attach_device_health_monitor_alert_actions(app, logger, checker)
+                handler = app.actions[reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE]
+                ack = Mock()
+                with patch.object(
+                    reporter,
+                    "_handle_device_health_monitor_slack_action",
+                ) as action_mock:
+                    handler(ack, body, Mock())
+
+                ack.assert_called_once_with()
+                action_mock.assert_not_called()
+
+    def test_device_modal_submission_denial_has_zero_side_effect(self) -> None:
+        app = _FakeBoltActionApp()
+        logger = logging.getLogger("test.device_health_monitor.modal_access")
+        checker = Mock(return_value=False)
+        reporter._attach_device_health_monitor_alert_actions(app, logger, checker)
+        handler = app.views[reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID]
+        ack = Mock()
+        body = {
+            "team": {"id": "T_TEST"},
+            "user": {"id": "U_ACTOR"},
+            "view": {"state": {"values": {}}},
+        }
+
+        with (
+            patch.object(
+                reporter,
+                "_validate_device_health_monitor_contact_modal_submission",
+            ) as validate_mock,
+            patch.object(
+                reporter,
+                "_handle_device_health_monitor_contact_modal_submission",
+            ) as submission_mock,
+        ):
+            handler(ack, body, Mock())
+
+        ack.assert_called_once_with()
+        checker.assert_called_once_with("T_TEST", "U_ACTOR")
+        validate_mock.assert_not_called()
+        submission_mock.assert_not_called()
 
     def test_suppresses_alert_delivery_when_alerts_are_disabled(self) -> None:
         client = _FakeSlackClient()

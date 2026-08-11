@@ -70,7 +70,6 @@ class BarcodeLogRouteDeps:
     attach_recordings_context_to_evidence: Callable[[dict[str, Any], dict[str, Any]], None]
     reply_with_retrieval_synthesis: Callable[..., None]
     build_dependency_failure_reply: Callable[[str, Exception], str]
-    is_claude_allowed_user: Callable[[str | None], bool]
     is_timeout_error: Callable[[Exception], bool]
     attach_notion_playbooks_to_evidence: Callable[[dict[str, Any] | None], list[dict[str, Any]]]
 
@@ -371,12 +370,10 @@ def _handle_barcode_log_analysis_request(
             reply=lambda text: context.reply(text, mention_user=False),
             logger=context.logger,
             thread_ts=context.thread_ts,
-            user_id=context.user_id,
             claude_client=context.claude_client,
             client=context.client,
             channel_id=context.channel_id,
             current_ts=context.current_ts,
-            is_claude_allowed_user=deps.is_claude_allowed_user,
             is_timeout_error=deps.is_timeout_error,
             attach_notion_playbooks_to_evidence=deps.attach_notion_playbooks_to_evidence,
         )

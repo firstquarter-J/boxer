@@ -4,6 +4,8 @@ from pathlib import Path
 
 from boxer.core import settings as core_settings
 
+# 기본 사용 권한 관리자는 이름이나 배포 env만 신뢰하지 않고 고정 Slack ID와도 교차 검증한다.
+BOXER_ACCESS_ADMIN_USER_ID = "U0629HDSJHG"
 HYUN_USER_ID = os.getenv("HYUN_USER_ID", "").strip()
 MARK_USER_ID = os.getenv("MARK_USER_ID", "").strip()
 DD_USER_ID = os.getenv("DD_USER_ID", "").strip()
@@ -16,50 +18,18 @@ DANNY_USER_ID = os.getenv("DANNY_USER_ID", "").strip()
 LUKA_USER_ID = os.getenv("LUKA_USER_ID", "").strip()
 OLIVIA_USER_ID = os.getenv("OLIVIA_USER_ID", "").strip()
 SAGE_USER_ID = os.getenv("SAGE_USER_ID", "").strip()
-_raw_claude_allowed_ids = os.getenv("CLAUDE_ALLOWED_USER_IDS", "")
-CLAUDE_ALLOWED_USER_IDS = {
-    item.strip()
-    for item in _raw_claude_allowed_ids.split(",")
-    if item.strip()
-}
 
-_raw_lookup_ids = os.getenv("APP_USER_LOOKUP_ALLOWED_USER_IDS", "")
-if _raw_lookup_ids.strip():
-    APP_USER_LOOKUP_ALLOWED_USER_IDS = {
-        item.strip()
-        for item in _raw_lookup_ids.split(",")
-        if item.strip()
-    }
-else:
-    APP_USER_LOOKUP_ALLOWED_USER_IDS = {
-        user_id
-        for user_id in (HYUN_USER_ID, MARK_USER_ID)
-        if user_id
-    }
-
-_raw_request_log_query_ids = os.getenv("REQUEST_LOG_QUERY_ALLOWED_USER_IDS", "")
-if _raw_request_log_query_ids.strip():
-    REQUEST_LOG_QUERY_ALLOWED_USER_IDS = {
-        item.strip()
-        for item in _raw_request_log_query_ids.split(",")
-        if item.strip()
-    }
-else:
-    REQUEST_LOG_QUERY_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
+# 사람별 권한은 기능마다 나누지 않고 이 하나의 Boxer 사용 가능/불가
+# 로컬 파일에서만 판정하며 별도 활성화 스위치로 검사를 우회하지 않는다.
+BOXER_BASE_ACCESS_STATE_PATH = os.getenv(
+    "BOXER_BASE_ACCESS_STATE_PATH",
+    str(core_settings.PROJECT_ROOT / "data" / "boxer_base_access.json"),
+).strip()
 
 THREAD_PLAYBOOK_LEARNING_ENABLED = (
     os.getenv("THREAD_PLAYBOOK_LEARNING_ENABLED", "true").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-_raw_thread_playbook_learning_ids = os.getenv("THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS", "")
-if _raw_thread_playbook_learning_ids.strip():
-    THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS = {
-        item.strip()
-        for item in _raw_thread_playbook_learning_ids.split(",")
-        if item.strip()
-    }
-else:
-    THREAD_PLAYBOOK_LEARNING_ALLOWED_USER_IDS = set(CLAUDE_ALLOWED_USER_IDS)
 THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID = os.getenv("THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID", "").strip()
 # 회사 플레이북은 개인 Notion integration과 분리해서 읽고 쓸 수 있게 별도 토큰을 둔다.
 NOTION_TOKEN_COMPANY = os.getenv("NOTION_TOKEN_COMPANY", "").strip()
@@ -73,15 +43,6 @@ COMPANY_NOTION_ANSWER_MAX_PAGES = int(os.getenv("COMPANY_NOTION_ANSWER_MAX_PAGES
 COMPANY_NOTION_CONTENT_MAX_DEPTH = int(os.getenv("COMPANY_NOTION_CONTENT_MAX_DEPTH", "4"))
 COMPANY_NOTION_CONTENT_MAX_BLOCKS = int(os.getenv("COMPANY_NOTION_CONTENT_MAX_BLOCKS", "120"))
 COMPANY_NOTION_EVIDENCE_MAX_CHARS = int(os.getenv("COMPANY_NOTION_EVIDENCE_MAX_CHARS", "4500"))
-_raw_company_notion_search_ids = os.getenv("COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS", "")
-if _raw_company_notion_search_ids.strip():
-    COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS = {
-        item.strip()
-        for item in _raw_company_notion_search_ids.split(",")
-        if item.strip()
-    }
-else:
-    COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS = {HYUN_USER_ID} if HYUN_USER_ID else set()
 THREAD_PLAYBOOK_NOTION_SECTION = os.getenv(
     "THREAD_PLAYBOOK_NOTION_SECTION",
     "마미박스 장애 대응",
@@ -99,12 +60,6 @@ HPA_CHANGE_REQUEST_ENABLED = (
     os.getenv("HPA_CHANGE_REQUEST_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-_raw_hpa_change_request_ids = os.getenv("HPA_CHANGE_REQUEST_ALLOWED_USER_IDS", "")
-HPA_CHANGE_REQUEST_ALLOWED_USER_IDS = {
-    item.strip()
-    for item in _raw_hpa_change_request_ids.split(",")
-    if item.strip()
-}
 _raw_hpa_change_channel_ids = os.getenv("HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS", "")
 HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS = {
     item.strip()
@@ -151,15 +106,6 @@ RECORDING_STREAMING_RESTORE_ENABLED = (
     os.getenv("RECORDING_STREAMING_RESTORE_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-_raw_recording_streaming_restore_ids = os.getenv("RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS", "")
-if _raw_recording_streaming_restore_ids.strip():
-    RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS = {
-        item.strip()
-        for item in _raw_recording_streaming_restore_ids.split(",")
-        if item.strip()
-    }
-else:
-    RECORDING_STREAMING_RESTORE_ALLOWED_USER_IDS = set(APP_USER_LOOKUP_ALLOWED_USER_IDS)
 
 APP_USER_API_URL = os.getenv("APP_USER_API_URL", "").strip()
 APP_USER_API_TIMEOUT_SEC = int(os.getenv("APP_USER_API_TIMEOUT_SEC", "8"))

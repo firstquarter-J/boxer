@@ -599,6 +599,16 @@ def _is_dd_active(client: Any, logger: logging.Logger) -> bool:
     return presence == "active"
 
 
+def is_human_fun_trigger(payload: MessagePayload) -> bool:
+    """일반 사람 메시지 중 실제 fun 응답 후보만 기본 사용 권한 검사 대상으로 삼는다."""
+
+    return (
+        payload.get("channel_id") == ALLOWED_FUN_CHANNEL_ID
+        and payload.get("subtype") != "bot_message"
+        and "모대" in str(payload.get("raw_text") or "")
+    )
+
+
 def handle_fun_message(
     payload: MessagePayload,
     reply: SlackMessageReplyFn,
@@ -633,7 +643,7 @@ def handle_fun_message(
     if payload.get("subtype") == "bot_message":
         return
 
-    if "모대" not in raw_text:
+    if not is_human_fun_trigger(payload):
         return
 
     thread_context = _load_slack_thread_context(

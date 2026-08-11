@@ -145,8 +145,7 @@ class HpaChangeFileDownloader(Protocol):
 @dataclass(frozen=True)
 class HpaChangeRoutesConfig:
     enabled: bool = False
-    # 비어 있는 allowlist는 전체 허용이 아니라 기능 차단으로 해석한다.
-    allowed_user_ids: frozenset[str] = field(default_factory=frozenset)
+    # 사용자 진입 권한은 공통 Boxer gate에서 확인하고, HPA 고정 채널만 별도로 제한한다.
     allowed_channel_ids: frozenset[str] = field(default_factory=frozenset)
     max_thread_chars: int = 60_000
     max_attachment_count: int = 10
@@ -445,10 +444,10 @@ def _select_clarification_followup_messages(
     messages: list[dict[str, Any]],
     *,
     thread_ts: str,
-    allowed_user_ids: set[str],
+    actor_user_id: str,
     after_event_ts: str,
 ) -> list[dict[str, Any]]:
-    """부모 요청 뒤 사람이 직접 남긴 답변만 후속 worker 입력으로 사용한다."""
+    """부모 요청 뒤 현재 요청자가 직접 남긴 답변만 후속 worker 입력으로 사용한다."""
 
     def timestamp_key(value: str) -> tuple[int, str]:
         seconds, separator, fraction = str(value or "").strip().partition(".")
@@ -471,7 +470,7 @@ def _select_clarification_followup_messages(
             message_ts
             and message_ts != thread_ts
             and timestamp_key(message_ts) > after_key
-            and author_id in allowed_user_ids
+            and author_id == actor_user_id
             and not is_bot
         ):
             selected.append(message)
@@ -943,13 +942,13 @@ def _handle_hpa_change_request(
         reply_once("HPA 코드 변경 요청 접수 기능이 꺼져 있어")
         return True
 
-    allowed_user_ids = _normalize_allowlist(config.allowed_user_ids)
+    actor_user_id = str(context.user_id or "").strip()
     allowed_channel_ids = _normalize_allowlist(config.allowed_channel_ids)
-    if not allowed_user_ids or not allowed_channel_ids:
-        reply_once("HPA 코드 변경 요청의 허용 사용자 또는 채널 설정이 없어")
+    if not allowed_channel_ids:
+        reply_once("HPA 코드 변경 요청의 허용 채널 설정이 없어")
         return True
-    if not context.user_id or context.user_id not in allowed_user_ids:
-        reply_once("HPA 코드 변경 요청을 접수할 권한이 없어")
+    if not actor_user_id:
+        reply_once("Slack 요청자 식별 정보가 부족해서 접수하지 못했어")
         return True
     if context.channel_id not in allowed_channel_ids:
         reply_once("이 채널에서는 HPA 코드 변경 요청을 접수하지 않아")
@@ -993,7 +992,7 @@ def _handle_hpa_change_request(
         source_thread_ts = thread_ts
         source_message_ts = thread_ts
         source_permalink = ""
-        requester_user_id = str(context.user_id or "").strip()
+        requester_user_id = actor_user_id
         selection_mode = (
             "clarification_followup"
             if continuation_of_request_id
@@ -1042,20 +1041,20 @@ def _handle_hpa_change_request(
             selected_message = _select_linked_message(messages, linked_target)
             messages = [selected_message]
             requester_user_id = str(selected_message.get("user") or "").strip()
-            if requester_user_id not in allowed_user_ids:
+            if requester_user_id != actor_user_id:
                 raise HpaChangeIntakeError(
-                    "링크된 Slack 댓글 작성자는 HPA 변경 요청 허용 사용자가 아니야"
+                    "링크된 Slack 댓글은 요청자 본인이 작성한 것만 사용할 수 있어"
                 )
         elif continuation_of_request_id:
             messages = _select_clarification_followup_messages(
                 messages,
                 thread_ts=thread_ts,
-                allowed_user_ids=allowed_user_ids,
+                actor_user_id=actor_user_id,
                 after_event_ts=continuation_after_event_ts,
             )
             if not messages:
                 raise HpaChangeIntakeError(
-                    "추가 확인 질문에 대한 허용 사용자의 답변을 찾지 못했어"
+                    "추가 확인 질문에 대한 요청자 본인의 답변을 찾지 못했어"
                 )
         thread_text = _render_thread_text(messages)
         if not thread_text:
@@ -1108,7 +1107,7 @@ def _handle_hpa_change_request(
         thread_text=thread_text,
         thread_message_count=len(messages),
         attachments=attachments,
-        initiator_user_id=str(context.user_id or "").strip(),
+        initiator_user_id=actor_user_id,
         source_channel_id=source_channel_id,
         source_message_ts=source_message_ts,
         selection_mode=selection_mode,

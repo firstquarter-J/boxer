@@ -68,10 +68,6 @@ _LAZY_EXPORTS = {
         "boxer_company.assistant.runtime",
         "CompanyAssistantRuntimeDeps",
     ),
-    "CompanyAssistantRuntimePolicy": (
-        "boxer_company.assistant.factory",
-        "CompanyAssistantRuntimePolicy",
-    ),
     "CompanyAssistantTurn": (
         "boxer_company.assistant.runtime",
         "CompanyAssistantTurn",
@@ -149,7 +145,6 @@ __all__ = [
     "CompanyAssistantRoute",
     "CompanyAssistantRuntime",
     "CompanyAssistantRuntimeDeps",
-    "CompanyAssistantRuntimePolicy",
     "CompanyAssistantService",
     "CompanyAssistantTurn",
     "CompanyEvidenceAnswerComposer",

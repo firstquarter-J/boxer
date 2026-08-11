@@ -18,7 +18,6 @@ def _build_deps() -> BarcodeLogRouteDeps:
         attach_recordings_context_to_evidence=lambda evidence, context: None,
         reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
         build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-        is_claude_allowed_user=lambda user_id: True,
         is_timeout_error=lambda exc: False,
         attach_notion_playbooks_to_evidence=lambda evidence: [],
     )
@@ -293,7 +292,6 @@ class BarcodeRouteHandlerTests(unittest.TestCase):
                 (fallback_text, evidence_payload, route_name)
             ),
             build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-            is_claude_allowed_user=lambda user_id: True,
             is_timeout_error=lambda exc: False,
             attach_notion_playbooks_to_evidence=lambda evidence: [],
         )
@@ -361,7 +359,6 @@ class BarcodeRouteHandlerTests(unittest.TestCase):
                 (fallback_text, evidence_payload, route_name)
             ),
             build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-            is_claude_allowed_user=lambda user_id: True,
             is_timeout_error=lambda exc: False,
             attach_notion_playbooks_to_evidence=lambda evidence: [],
         )

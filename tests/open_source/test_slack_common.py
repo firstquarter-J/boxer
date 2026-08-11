@@ -21,6 +21,67 @@ class _FakeApp:
 
 
 class SlackCommonTests(unittest.TestCase):
+    def test_app_mention_prefers_official_events_envelope_workspace_id(self) -> None:
+        payloads: list[dict[str, Any]] = []
+
+        def mention_handler(payload, reply, client, logger: logging.Logger) -> None:
+            payloads.append(payload)
+
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(mention_handler)
+            app.handlers["app_mention"](
+                {
+                    "text": "<@U_BOT> ping",
+                    "user": "U_TEST",
+                    "channel": "C_TEST",
+                    "ts": "123.456",
+                    "team": "T_EVENT_FALLBACK",
+                },
+                lambda **kwargs: None,
+                object(),
+                {"team_id": "T_ENVELOPE"},
+            )
+
+        self.assertEqual(payloads[0]["workspace_id"], "T_ENVELOPE")
+
+    def test_message_prefers_official_events_envelope_workspace_id(self) -> None:
+        payloads: list[dict[str, Any]] = []
+
+        def mention_handler(payload, reply, client, logger: logging.Logger) -> None:
+            raise AssertionError("mention handler should not run")
+
+        def message_handler(payload, reply, client, logger: logging.Logger) -> None:
+            payloads.append(payload)
+
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(mention_handler, message_handler)
+            app.handlers["message"](
+                {
+                    "text": "모대",
+                    "user": "U_TEST",
+                    "channel": "C_TEST",
+                    "ts": "123.456",
+                    "team": "T_EVENT_FALLBACK",
+                },
+                lambda **kwargs: None,
+                object(),
+                {"team_id": "T_ENVELOPE"},
+            )
+
+        self.assertEqual(payloads[0]["workspace_id"], "T_ENVELOPE")
+
     def test_app_mention_reply_forwards_optional_client_msg_id(self) -> None:
         say_calls: list[dict[str, Any]] = []
 

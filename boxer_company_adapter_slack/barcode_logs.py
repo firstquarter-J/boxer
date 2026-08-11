@@ -21,7 +21,6 @@ from boxer_company_adapter_slack.notion_freeform import _append_notion_playbook_
 
 BarcodeLogReplyFn = Callable[[str], None]
 AttachNotionPlaybooksFn = Callable[[dict[str, Any] | None], list[dict[str, Any]]]
-ClaudeAllowedFn = Callable[[str | None], bool]
 TimeoutErrorFn = Callable[[BaseException], bool]
 
 
@@ -684,12 +683,10 @@ def _reply_with_barcode_log_error_summary(
     reply: BarcodeLogReplyFn,
     logger: logging.Logger,
     thread_ts: str,
-    user_id: str | None,
     claude_client: Any,
     client: Any,
     channel_id: str,
     current_ts: str,
-    is_claude_allowed_user: ClaudeAllowedFn,
     is_timeout_error: TimeoutErrorFn,
     attach_notion_playbooks_to_evidence: AttachNotionPlaybooksFn,
 ) -> None:
@@ -745,14 +742,6 @@ def _reply_with_barcode_log_error_summary(
             reply(_compose_barcode_log_error_summary_text(fallback_text, _build_rendered_fallback_sections()))
             logger.info("Responded with barcode log error summary (direct, claude client unavailable)")
             return
-        if not is_claude_allowed_user(user_id):
-            reply(_compose_barcode_log_error_summary_text(fallback_text, _build_rendered_fallback_sections()))
-            logger.info(
-                "Responded with barcode log error summary (direct, claude synthesis not allowed for user=%s)",
-                user_id,
-            )
-            return
-
     try:
         thread_context = ""
         if s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:

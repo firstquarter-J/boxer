@@ -68,7 +68,6 @@ def _composer(
     *,
     synthesis_enabled: bool = True,
     provider_ready: bool = True,
-    actor_allowed: bool = True,
 ) -> CompanyEvidenceAnswerComposer:
     logger = logging.Logger("test.company.answer_composer")
     logger.disabled = True
@@ -77,7 +76,6 @@ def _composer(
             answer_engine=engine,  # type: ignore[arg-type]
             synthesis_enabled=synthesis_enabled,
             provider_ready=lambda: provider_ready,
-            actor_allowed_for_llm=lambda actor_id: actor_allowed,
         ),
         logger=logger,
     )
@@ -135,43 +133,6 @@ class CompanyEvidenceAnswerComposerTests(unittest.TestCase):
                     "provider_unavailable",
                 )
                 self.assertEqual(engine.requests, [])
-
-    def test_claude_actor_denial_uses_fallback_but_ollama_skips_allowlist(self) -> None:
-        denied_engine = _FakeAnswerEngine(
-            AnswerResult(text="사용 안 됨", provider="claude", used_llm=True)
-        )
-        denied = _composer(
-            denied_engine,
-            actor_allowed=False,
-        ).compose(
-            _request(),
-            evidence={},
-            policy=_policy(),
-        )
-        self.assertEqual(
-            denied.fallback_reason,
-            "actor_not_allowed_for_llm",
-        )
-        self.assertEqual(denied_engine.requests, [])
-
-        ollama_engine = _FakeAnswerEngine(
-            AnswerResult(
-                text="로컬 합성 답변",
-                provider="ollama",
-                used_llm=True,
-            ),
-            provider="ollama",
-        )
-        allowed = _composer(
-            ollama_engine,
-            actor_allowed=False,
-        ).compose(
-            _request(),
-            evidence={},
-            policy=_policy(),
-        )
-        self.assertEqual(allowed.outcome, "answered")
-        self.assertTrue(allowed.used_llm)
 
     def test_success_passes_context_and_answer_options_to_engine(self) -> None:
         engine = _FakeAnswerEngine(

@@ -136,7 +136,6 @@ class CompanyAssistantRuntimeDeps:
 
     answer_engine: AnswerEngine
     provider_ready: Callable[[], bool]
-    actor_allowed_for_llm: Callable[[str | None], bool]
     get_s3_client: Callable[[], Any]
     synthesis_enabled: bool = True
     recordings_loader: RecordingsLoader = _load_recordings_context_by_barcode
@@ -280,7 +279,6 @@ class CompanyAssistantRuntime:
                 answer_engine=self._deps.answer_engine,
                 synthesis_enabled=self._deps.synthesis_enabled,
                 provider_ready=self._deps.provider_ready,
-                actor_allowed_for_llm=self._deps.actor_allowed_for_llm,
             ),
             logger=self._logger,
         )
@@ -289,7 +287,6 @@ class CompanyAssistantRuntime:
                 answer_engine=self._deps.answer_engine,
                 synthesis_enabled=self._deps.synthesis_enabled,
                 provider_ready=self._deps.provider_ready,
-                actor_allowed_for_llm=self._deps.actor_allowed_for_llm,
             )
         )
 

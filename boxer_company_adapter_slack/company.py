@@ -12,6 +12,7 @@ from boxer_adapter_slack.common import (
     _load_slack_user_name,
     _merge_request_log_metadata,
     _set_request_log_route,
+    _set_request_log_status,
     create_slack_app,
 )
 from boxer_adapter_slack.context import (
@@ -54,6 +55,11 @@ from boxer_company_adapter_slack.admin_routes import (
     AdminRoutesDeps,
     _handle_admin_routes,
 )
+from boxer_company_adapter_slack.access_routes import (
+    BASE_ACCESS_DENIED_REPLY,
+    build_slack_base_access_runtime,
+    handle_base_access_management_command,
+)
 from boxer_company_adapter_slack.company_notion_routes import (
     CompanyNotionRoutesContext,
     CompanyNotionRoutesDeps,
@@ -67,7 +73,7 @@ from boxer_company_adapter_slack.device_routes import (
     DeviceRoutesDeps,
     _handle_device_routes,
 )
-from boxer_company_adapter_slack.fun import handle_fun_message
+from boxer_company_adapter_slack.fun import handle_fun_message, is_human_fun_trigger
 from boxer_company_adapter_slack.health import (
     _build_dependency_failure_reply,
     _format_ping_llm_status,
@@ -149,7 +155,6 @@ from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.notion_workspace_search import (
     _build_company_notion_source_docs,
     _extract_company_notion_search_query,
-    _is_company_notion_search_allowed,
     _is_company_notion_search_configured,
     _load_company_notion_references,
     _looks_like_company_notion_search,
@@ -311,6 +316,7 @@ def create_app() -> App:
     _validate_ec2_runtime_aws_env()
     _validate_tokens(include_llm=True, include_data_sources=True)
     app_logger = logging.getLogger(__name__)
+    base_access_runtime = build_slack_base_access_runtime(logger=app_logger)
     company_api_settings = load_company_api_client_settings()
     company_api_client = (
         CompanyAssistantApiClient(company_api_settings)
@@ -357,11 +363,6 @@ def create_app() -> App:
         if s3_client is None:
             s3_client = _build_s3_client()
         return s3_client
-
-    def _is_claude_allowed_user(target_user_id: str | None) -> bool:
-        if not cs.CLAUDE_ALLOWED_USER_IDS:
-            return True
-        return bool(target_user_id) and target_user_id in cs.CLAUDE_ALLOWED_USER_IDS
 
     ollama_health_cache: tuple[float, dict[str, Any]] | None = None
 
@@ -466,12 +467,6 @@ def create_app() -> App:
                 load_diagnostic_snapshot=(
                     _load_read_only_diagnostic_snapshot
                 ),
-                # 기존 Slack mention은 내부 채널 정책을 통과한 요청이다.
-                notion_is_allowed=lambda request: True,
-                barcode_is_allowed=lambda request: (
-                    provider != "claude"
-                    or _is_claude_allowed_user(request.actor_id)
-                ),
                 barcode_should_handle=_should_handle_barcode_evidence,
                 db_configured=lambda: bool(
                     s.DB_HOST
@@ -499,7 +494,6 @@ def create_app() -> App:
             answer_engine=company_answer_engine,
             synthesis_enabled=s.LLM_SYNTHESIS_ENABLED,
             provider_ready=_is_answer_provider_ready,
-            actor_allowed_for_llm=_is_claude_allowed_user,
             get_s3_client=_get_s3_client,
             recordings_loader=_load_recordings_context_by_barcode,
             notion_reference_loader=_select_notion_references,
@@ -518,9 +512,7 @@ def create_app() -> App:
                 answer_engine=company_answer_engine,
                 synthesis_enabled=s.LLM_SYNTHESIS_ENABLED,
                 provider_ready=_is_answer_provider_ready,
-                actor_allowed_for_llm=_is_claude_allowed_user,
                 looks_like_search=_looks_like_company_notion_search,
-                is_search_allowed=_is_company_notion_search_allowed,
                 is_search_configured=_is_company_notion_search_configured,
                 extract_query=_extract_company_notion_search_query,
                 search=_search_company_notion,
@@ -544,6 +536,21 @@ def create_app() -> App:
         channel_id = payload["channel_id"]
         current_ts = payload["current_ts"]
         thread_ts = payload["thread_ts"]
+
+        # 현의 exact 관리 명령만 일반 진입권 검사보다 먼저 처리한다.
+        if handle_base_access_management_command(
+            payload,
+            reply,
+            client,
+            logger,
+            runtime=base_access_runtime,
+        ):
+            return
+        if not base_access_runtime.is_allowed(workspace_id, user_id):
+            _set_request_log_route(payload, "base_access")
+            _set_request_log_status(payload, "denied")
+            reply(BASE_ACCESS_DENIED_REPLY)
+            return
 
         # 코드 변경 요청은 일반 질의나 ping보다 먼저 격리 worker intake로 고정한다.
         if _handle_hpa_change_request(
@@ -661,9 +668,6 @@ def create_app() -> App:
                 not s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT
                 or not s.LLM_SYNTHESIS_ENABLED
             ):
-                return False
-            provider = (s.LLM_PROVIDER or "").lower().strip()
-            if provider == "claude" and not _is_claude_allowed_user(user_id):
                 return False
             return _is_answer_provider_ready()
 
@@ -874,15 +878,6 @@ def create_app() -> App:
                     reply(fallback_with_references)
                     logger.info("Responded with %s (direct, claude client unavailable)", route_name)
                     return
-                if not _is_claude_allowed_user(user_id):
-                    reply(fallback_with_references)
-                    logger.info(
-                        "Responded with %s (direct, claude synthesis not allowed for user=%s)",
-                        route_name,
-                        user_id,
-                    )
-                    return
-
             try:
                 thread_context = ""
                 # 전사 Work Board 답변에는 기존 마미박스 스레드 문맥을 섞지 않고
@@ -1219,7 +1214,6 @@ def create_app() -> App:
                 attach_recordings_context_to_evidence=_attach_recordings_context_to_evidence,
                 reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
                 build_dependency_failure_reply=_build_dependency_failure_reply,
-                is_claude_allowed_user=_is_claude_allowed_user,
                 is_timeout_error=_is_timeout_error,
                 attach_notion_playbooks_to_evidence=_attach_notion_playbooks_to_evidence,
             ),
@@ -1336,7 +1330,6 @@ def create_app() -> App:
                 timeout_reply_text=_timeout_reply_text,
                 llm_unavailable_reply_text=_llm_unavailable_reply_text,
                 is_timeout_error=_is_timeout_error,
-                is_claude_allowed_user=_is_claude_allowed_user,
                 build_barcode_fallback_evidence=_build_barcode_fallback_evidence,
                 check_ollama_health=_get_ollama_health,
             ),
@@ -1361,6 +1354,16 @@ def create_app() -> App:
         ):
             return
 
+        # 무관한 일반 대화에는 조회도 응답도 하지 않고 실제 사람 fun trigger만 검사한다.
+        if is_human_fun_trigger(payload) and not base_access_runtime.is_allowed(
+            payload.get("workspace_id"),
+            payload.get("user_id"),
+        ):
+            _set_request_log_route(payload, "base_access")
+            _set_request_log_status(payload, "denied")
+            reply(BASE_ACCESS_DENIED_REPLY, thread=True)
+            return
+
         handle_fun_message(
             payload,
             reply,
@@ -1372,7 +1375,11 @@ def create_app() -> App:
     app = create_slack_app(_handle_company_mention, _handle_company_message)
     attach_hpa_change_reporter(app, hpa_change_runtime, logger=app_logger)
     attach_weekly_recordings_reporter(app, logger=app_logger)
-    attach_device_health_monitor_reporter(app, logger=app_logger)
+    attach_device_health_monitor_reporter(
+        app,
+        logger=app_logger,
+        base_access_checker=base_access_runtime.is_allowed,
+    )
     # 실시간 장비 이벤트도 상태 모니터와 같은 번호 판정·공급자·감사 로그 경로를 사용한다.
     attach_device_notification_alert_reporter(
         app,

@@ -8,7 +8,6 @@ from boxer_company.notion_workspace_search import (
     _PARENT_CACHE,
     _build_company_notion_search_reply,
     _extract_company_notion_search_query,
-    _is_company_notion_search_allowed,
     _load_company_notion_page_lines,
     _load_company_notion_references,
     _looks_like_company_notion_search,
@@ -81,13 +80,6 @@ class CompanyNotionQueryTests(unittest.TestCase):
             _extract_company_notion_search_query("워크보드에서 Core Engineering 조회해줘"),
             "Core Engineering",
         )
-
-    def test_allowed_users_fail_closed_when_user_is_missing(self) -> None:
-        with patch.object(cs, "COMPANY_NOTION_SEARCH_ALLOWED_USER_IDS", {"U-HYUN"}):
-            self.assertTrue(_is_company_notion_search_allowed("U-HYUN"))
-            self.assertFalse(_is_company_notion_search_allowed("U-OTHER"))
-            self.assertFalse(_is_company_notion_search_allowed(None))
-
 
 class CompanyNotionSearchTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -78,7 +78,6 @@ class KnowledgeRoutesDeps:
     timeout_reply_text: Callable[[], str]
     llm_unavailable_reply_text: Callable[[str | None], str]
     is_timeout_error: Callable[[Exception], bool]
-    is_claude_allowed_user: Callable[[str | None], bool]
     build_barcode_fallback_evidence: Callable[[], dict[str, Any] | None]
     check_ollama_health: Callable[[], dict[str, Any]] = (
         _check_ollama_health
@@ -344,10 +343,6 @@ def _handle_knowledge_routes(
         )
         if not question:
             context.reply("질문 내용을 같이 보내줘. 지원 기능이 궁금하면 `사용법`이라고 보내줘")
-            return True
-        if not deps.is_claude_allowed_user(context.user_id):
-            context.reply("AI 질문은 현재 지정된 사용자만 사용할 수 있어")
-            context.logger.info("Rejected claude call for user=%s", context.user_id)
             return True
         try:
             thread_context = _load_slack_thread_context(

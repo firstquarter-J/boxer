@@ -23,7 +23,6 @@ from boxer_company_adapter_slack.hpa_change_routes import (
 )
 from boxer_company_adapter_slack.hpa_change_runtime import (
     HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS,
-    HPA_CHANGE_POLICY_ALLOWED_USER_IDS,
     create_hpa_change_runtime,
 )
 from boxer_company.hpa_change_workflow import (
@@ -51,9 +50,6 @@ class _FakeSession:
 def _settings(db_path: str, **overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
         "HPA_CHANGE_REQUEST_ENABLED": True,
-        "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": set(
-            HPA_CHANGE_POLICY_ALLOWED_USER_IDS
-        ),
         "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": set(
             HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
         ),
@@ -106,7 +102,7 @@ def _route_request(
                 message_ts="1720580000.000001",
             ),
         ),
-        initiator_user_id="U0629HDSJHG",
+        initiator_user_id=requester_user_id,
         source_channel_id="C068FVD5V7Y",
         source_message_ts="1720580000.000001",
         selection_mode="linked_message",
@@ -159,40 +155,25 @@ class HpaChangeRuntimeTests(unittest.TestCase):
         self.assertIsNone(runtime.store)
         self.assertEqual(runtime.auth_mode, "disabled")
 
-    def test_enabled_runtime_fails_closed_without_allowlists_or_auth(self) -> None:
+    def test_enabled_runtime_fails_closed_without_channel_allowlist_or_auth(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = _settings(
                 str(Path(temp_dir) / "jobs.sqlite3"),
-                HPA_CHANGE_REQUEST_ALLOWED_USER_IDS=set(),
+                HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS=set(),
                 HPA_CHANGE_GITHUB_TOKEN="",
             )
 
             with self.assertRaisesRegex(ValueError, "allowlist"):
                 create_hpa_change_runtime(settings=settings)
 
-            settings.HPA_CHANGE_REQUEST_ALLOWED_USER_IDS = set(
-                HPA_CHANGE_POLICY_ALLOWED_USER_IDS
+            settings.HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS = set(
+                HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS
             )
             with self.assertRaisesRegex(ValueError, "GitHub App 또는 static token"):
                 create_hpa_change_runtime(settings=settings)
 
-    def test_enabled_runtime_requires_exact_company_policy_allowlists(self) -> None:
+    def test_enabled_runtime_requires_exact_company_channel_policy(self) -> None:
         cases = (
-            {
-                "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": (
-                    set(HPA_CHANGE_POLICY_ALLOWED_USER_IDS) | {"UOTHER"}
-                )
-            },
-            {
-                "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": {"U0629HDSJHG"}
-            },
-            {
-                # 저스틴의 보조 Slack 계정이 누락된 기존 운영 설정도 거부한다.
-                "HPA_CHANGE_REQUEST_ALLOWED_USER_IDS": {
-                    "U0629HDSJHG",
-                    "U07A5FM5XPD",
-                }
-            },
             {
                 "HPA_CHANGE_REQUEST_ALLOWED_CHANNEL_IDS": (
                     set(HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS) | {"COTHER"}
@@ -301,7 +282,7 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             self.assertEqual(job.channel_id, "C02C08K7YEN")
             self.assertEqual(job.thread_ts, "1720580000.000001")
             self.assertEqual(job.requested_by, "U07A5FM5XPD")
-            self.assertEqual(job.metadata["initiator_user_id"], "U0629HDSJHG")
+            self.assertEqual(job.metadata["initiator_user_id"], "U07A5FM5XPD")
             self.assertEqual(job.metadata["source_channel_id"], "C068FVD5V7Y")
             self.assertEqual(job.metadata["selection_mode"], "linked_message")
             self.assertIn(
@@ -360,13 +341,13 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             )
 
             followup = replace(
-                _route_request(requester_user_id="U0629HDSJHG"),
+                _route_request(),
                 request_key="slack:TWORK:C02C08K7YEN:1720580500.000200",
                 event_ts="1720580500.000200",
                 question="진행해",
                 thread_text=(
                     "[1720580000.000001] U07A5FM5XPD\nHPA 요청사항 검토\n\n"
-                    "[1720580490.000100] U0629HDSJHG\n"
+                    "[1720580490.000100] U07A5FM5XPD\n"
                     "질문1 답변: Basic과 Bonus 각각 독립 버튼\n"
                     "질문2 답변: 최종 검증 실패 시 해당 결과 생성 실패 처리"
                 ),
@@ -380,12 +361,25 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                         message_ts="1720580490.000100",
                     ),
                 ),
-                initiator_user_id="U0629HDSJHG",
+                initiator_user_id="U07A5FM5XPD",
                 source_channel_id="C02C08K7YEN",
                 source_message_ts="1720580000.000001",
                 selection_mode="clarification_followup",
                 continuation_of_request_id=parent_result.request_id,
             )
+
+            # 후속 요청도 최초 요청자 본인만 이어갈 수 있다.
+            different_actor_followup = replace(
+                followup,
+                request_key="slack:TWORK:C02C08K7YEN:1720580495.000150",
+                event_ts="1720580495.000150",
+                requester_user_id="UOTHER",
+                initiator_user_id="UOTHER",
+            )
+            rejected = runtime.submit_request(different_actor_followup)
+            self.assertEqual(rejected.status, HpaChangeSubmissionStatus.REJECTED)
+            self.assertIn("동일 요청자", rejected.user_message)
+            self.assertEqual(len(session.calls), 1)
 
             child_result = runtime.submit_request(followup)
             duplicate = runtime.submit_request(followup)
@@ -414,7 +408,7 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(child.metadata["source_channel_id"], "C068FVD5V7Y")
             self.assertEqual(child.metadata["selection_mode"], "linked_message")
-            self.assertEqual(child.metadata["initiator_user_id"], "U0629HDSJHG")
+            self.assertEqual(child.metadata["initiator_user_id"], "U07A5FM5XPD")
 
             worker_request = session.calls[1]["json"]["client_payload"]["request"]
             self.assertEqual(worker_request["requester_slack_user_id"], "U07A5FM5XPD")
@@ -481,6 +475,7 @@ class HpaChangeRuntimeTests(unittest.TestCase):
             cases = (
                 replace(base_request, requester_user_id="UOTHER"),
                 replace(base_request, initiator_user_id="UOTHER"),
+                replace(base_request, requester_user_id=""),
                 replace(base_request, initiator_user_id=""),
                 replace(base_request, channel_id="COTHER"),
                 replace(base_request, source_channel_id="COTHER"),
@@ -498,10 +493,10 @@ class HpaChangeRuntimeTests(unittest.TestCase):
 
             self.assertEqual(session.calls, [])
 
-    def test_submit_accepts_both_justin_slack_accounts(self) -> None:
-        # 동일한 요청자가 사용하는 두 Slack 계정 모두 HPA 작업 큐에 들어가야 한다.
+    def test_submit_accepts_any_same_boxer_actor(self) -> None:
+        # 기능별 사용자 목록 없이 요청자와 실행자가 같은 actor면 작업 큐에 넣는다.
         for index, requester_user_id in enumerate(
-            ("U07A5FM5XPD", "U096JA81T6X")
+            ("U07A5FM5XPD", "U096JA81T6X", "UOTHER")
         ):
             with (
                 self.subTest(requester_user_id=requester_user_id),
@@ -515,11 +510,6 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                     session=session,
                 )
                 self.addCleanup(runtime.close)
-                self.assertIn(
-                    requester_user_id,
-                    runtime.routes_config.allowed_user_ids,
-                )
-
                 result = runtime.submit_request(
                     _route_request(requester_user_id=requester_user_id)
                 )
@@ -571,6 +561,13 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                 company,
                 "create_hpa_change_runtime",
                 return_value=fake_runtime,
+            ),
+            patch.object(
+                company,
+                "build_slack_base_access_runtime",
+                return_value=SimpleNamespace(
+                    is_allowed=Mock(return_value=True),
+                ),
             ),
             patch.object(
                 company,

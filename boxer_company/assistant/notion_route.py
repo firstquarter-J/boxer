@@ -24,7 +24,6 @@ from boxer_company.assistant.notion_answer_safety import (
 from boxer_company.notion_workspace_search import (
     CompanyNotionSearchResult,
     _extract_company_notion_search_query,
-    _is_company_notion_search_allowed,
     _is_company_notion_search_configured,
     _load_company_notion_references,
     _looks_like_company_notion_search,
@@ -41,9 +40,7 @@ class CompanyNotionAssistantRouteDeps:
     answer_engine: AnswerEngine
     synthesis_enabled: bool
     provider_ready: Callable[[], bool]
-    actor_allowed_for_llm: Callable[[str | None], bool]
     looks_like_search: Callable[[str], bool] = _looks_like_company_notion_search
-    is_search_allowed: Callable[[str | None], bool] = _is_company_notion_search_allowed
     is_search_configured: Callable[[], bool] = _is_company_notion_search_configured
     extract_query: Callable[[str], str] = _extract_company_notion_search_query
     search: Callable[[str], list[CompanyNotionSearchResult]] = _search_company_notion
@@ -69,7 +66,6 @@ class CompanyNotionAssistantRoute:
                 answer_engine=deps.answer_engine,
                 synthesis_enabled=deps.synthesis_enabled,
                 provider_ready=deps.provider_ready,
-                actor_allowed_for_llm=deps.actor_allowed_for_llm,
             ),
             logger=self._logger,
         )
@@ -81,13 +77,6 @@ class CompanyNotionAssistantRoute:
         if not self._deps.looks_like_search(request.question):
             return None
 
-        if not self._deps.is_search_allowed(request.actor_id):
-            return self._result(
-                route="company_notion_search",
-                outcome="denied",
-                body="회사 Notion 검색은 아직 허용된 사용자만 쓸 수 있어",
-                fallback_reason="actor_not_allowed",
-            )
         if not self._deps.is_search_configured():
             return self._result(
                 route="company_notion_search",

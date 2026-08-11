@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.factory import (
-    CompanyAssistantRuntimePolicy,
     _guard_read_only_request,
     create_company_assistant_runtime,
 )
@@ -83,65 +82,6 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
 
         # 별도 API 프로세스는 Slack의 메모리 snapshot을 읽지 않는다.
         self.assertIsNone(diagnostic_route.handle(turn.request))
-
-    def test_factory_wires_company_notion_actor_policy(self) -> None:
-        policy = CompanyAssistantRuntimePolicy(
-            company_notion_search_allowed=lambda actor_id: False,
-        )
-        with patch(
-            "boxer_company.assistant.factory."
-            "core_settings.LLM_PROVIDER",
-            "",
-        ):
-            runtime = create_company_assistant_runtime(policy=policy)
-
-        result = runtime.answer(
-            _request("회사 노션에서 커머스 찾아줘")
-        )
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.route, "company_notion_search")
-        self.assertEqual(result.outcome, "denied")
-        self.assertEqual(
-            result.fallback_reason,
-            "actor_not_allowed",
-        )
-
-    def test_barcode_policy_denies_before_recordings_lookup(self) -> None:
-        policy = CompanyAssistantRuntimePolicy(
-            barcode_evidence_allowed=lambda request: False,
-        )
-        with (
-            patch(
-                "boxer_company.assistant.factory."
-                "core_settings.LLM_PROVIDER",
-                "claude",
-            ),
-            patch(
-                "boxer_company.assistant.factory."
-                "core_settings.LLM_SYNTHESIS_ENABLED",
-                True,
-            ),
-            patch(
-                "boxer_company.assistant.factory."
-                "_build_claude_client",
-                return_value=object(),
-            ),
-            patch(
-                "boxer_company.assistant.factory."
-                "_load_recordings_context_by_barcode",
-            ) as recordings_loader,
-        ):
-            runtime = create_company_assistant_runtime(policy=policy)
-            result = runtime.answer(
-                _request(f"{_BARCODE} 이 근거를 요약해줘")
-            )
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.route, "barcode_evidence_freeform")
-        self.assertEqual(result.outcome, "denied")
-        self.assertEqual(result.fallback_reason, "actor_not_allowed")
-        recordings_loader.assert_not_called()
 
     def test_live_device_diagnostic_is_not_absorbed_by_freeform(
         self,

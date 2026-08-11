@@ -68,7 +68,6 @@ def _composer(
             answer_engine=engine,  # type: ignore[arg-type]
             synthesis_enabled=synthesis_enabled,
             provider_ready=lambda: True,
-            actor_allowed_for_llm=lambda actor_id: True,
         ),
         logger=_quiet_logger(),
     )
