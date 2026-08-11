@@ -1,3 +1,4 @@
+import json
 import logging
 import tempfile
 import unittest
@@ -52,8 +53,10 @@ def _captureboard_event(notification_id: int = 12) -> dict:
         "notificationId": notification_id,
         "deviceSeq": 992,
         "deviceName": "MB2-C00992",
+        "deviceVersion": "2.11.308",
         "code": "captureboard_connection_error",
         "message": "녹화 중 캡쳐보드 연결에 문제가 발생하여 녹화가 중단되었습니다.",
+        "details": {"voiceType": "n"},
         "occurredAt": "2026-07-09T03:34:31+00:00",
         "hospitalSeq": 69,
         "hospitalName": "뉴서울여성의원(인천)",
@@ -75,6 +78,7 @@ def _recording_stall_event(
     file_type: str = "",
 ) -> dict:
     details = {
+        "voiceType": "s",
         "currentSize": current_size,
         "growthRate": growth_rate,
         "expectedMinGrowth": 145984,
@@ -104,6 +108,7 @@ def _segmented_recordings_merge_error_event(notification_id: int = 15) -> dict:
         "message": "분할된 녹화 파일 병합 중 오류가 발생했습니다",
         "fileId": "recording-20260709-123431",
         "details": {
+            "voiceType": "ln",
             "error": "ffmpeg exited with code 1",
             "targetPath": "/home/pi/AppData/Videos/recording.mp4",
             "segmentCount": 3,
@@ -239,6 +244,8 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             alert_summary = post_mock.call_args.args[1]
             device_result = alert_summary["deviceResults"][0]
             self.assertEqual(device_result["deviceName"], "MB2-C00992")
+            self.assertEqual(device_result["deviceVersion"], "2.11.308")
+            self.assertEqual(device_result["voiceType"], "n")
             self.assertEqual(device_result["alertCategory"], "video_signal")
             self.assertEqual(device_result["componentLabels"]["captureboard"], "이상")
             self.assertIn("2026-07-09 12:34:31 KST", device_result["priorityReason"])
@@ -847,13 +854,25 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             "code": "recording_stalled",
         }
 
-        self.assertIsNotNone(reporter._normalize_pending_event(stalled_event))
-        self.assertIsNotNone(
-            reporter._normalize_pending_event(
-                _segmented_recordings_merge_error_event()
-            )
+        normalized_stalled = reporter._normalize_pending_event(stalled_event)
+        normalized_merge = reporter._normalize_pending_event(
+            _segmented_recordings_merge_error_event()
         )
+
+        self.assertIsNotNone(normalized_stalled)
+        self.assertEqual(normalized_stalled["voiceType"], "s")
+        self.assertIsNotNone(normalized_merge)
+        self.assertEqual(normalized_merge["voiceType"], "ln")
         self.assertIsNone(reporter._normalize_pending_event(unsupported_event))
+
+    def test_pending_event_does_not_guess_unknown_voice_type(self) -> None:
+        event = _captureboard_event(15)
+        event["details"]["voiceType"] = "unknown"
+
+        normalized = reporter._normalize_pending_event(event)
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["voiceType"], "")
 
     def test_all_root_event_types_use_common_auto_sms_path(self) -> None:
         scenarios = (
@@ -940,8 +959,14 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 self.assertEqual(sent_count, 1)
                 self.assertEqual(result_state["pendingEvents"], [])
                 auto_sms_sender.assert_called_once()
+                expected_voice_type = {
+                    "captureboard": "n",
+                    "recording_stall": "s",
+                    "recording_merge": "ln",
+                }[scenario]
                 sms_item = auto_sms_sender.call_args.args[0]
                 self.assertEqual(sms_item["alertCategory"], expected_category)
+                self.assertEqual(sms_item["voiceType"], expected_voice_type)
                 post_mock.assert_called_once()
                 self.assertTrue(post_mock.call_args.kwargs["include_actions"])
                 self.assertEqual(
@@ -949,6 +974,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                     expected_voice_action,
                 )
                 posted_result = post_mock.call_args.args[1]["deviceResults"][0]
+                self.assertEqual(posted_result["voiceType"], expected_voice_type)
                 self.assertEqual(posted_result["smsStatusText"], "문자 자동발송 완료")
                 self.assertEqual(posted_result["smsTemplateId"], template_id)
                 self.assertEqual(posted_result["smsContactActionEnabled"], "false")
@@ -963,6 +989,8 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 )
                 action_blocks = [block for block in blocks if block["type"] == "actions"]
                 self.assertEqual(len(action_blocks), 1)
+                action_value = json.loads(action_blocks[0]["elements"][-1]["value"])
+                self.assertEqual(action_value["voiceType"], expected_voice_type)
                 expected_action_labels = ["문자 자동발송 완료"]
                 if expected_voice_action:
                     # 캡처보드가 직접 이상이거나 원인 후보인 녹화 장애에 음성 버튼을 함께 둬.
@@ -1092,6 +1120,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             alert_summary = post_mock.call_args.args[1]
             device_result = alert_summary["deviceResults"][0]
             self.assertEqual(device_result["deviceName"], "MB2-C00992")
+            self.assertEqual(device_result["voiceType"], "ln")
             self.assertIn("분할 파일 3개", device_result["priorityReason"])
             self.assertIn(
                 "ffmpeg exited with code 1",
@@ -1216,6 +1245,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 root_summary["deviceResults"][0]["alertCategory"],
                 "recording",
             )
+            self.assertEqual(root_summary["deviceResults"][0]["voiceType"], "s")
             root_issue = root_summary["deviceResults"][0]["priorityReason"]
             self.assertEqual(
                 root_issue,
@@ -1908,6 +1938,9 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
         self.assertTrue(connection.closed)
         self.assertEqual(next_cursor, 30)
         self.assertEqual([event["notificationId"] for event in events], [21])
+        self.assertEqual(events[0]["deviceVersion"], "2.11.308")
+        self.assertEqual(events[0]["voiceType"], "n")
+        self.assertIn("d.version AS deviceVersion", cursor.execute_calls[1][0])
         self.assertEqual(
             cursor.execute_calls[1][1],
             (

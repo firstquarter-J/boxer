@@ -21,6 +21,7 @@ from boxer_company.sms_delivery import (
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _collect_daily_device_round_abnormal_alert_items,
+    _normalize_device_health_alert_voice_type,
     _post_daily_device_round_abnormal_alert,
 )
 from boxer_company_adapter_slack.sms_delivery_reporter import (
@@ -88,6 +89,17 @@ def _normalize_json_object(value: Any) -> dict[str, Any]:
     return dict(parsed) if isinstance(parsed, dict) else {}
 
 
+def _extract_device_notification_voice_type(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    details = _normalize_json_object(value.get("details"))
+    # 신규 이벤트는 details.voiceType을 정본으로 사용하고, 이미 pending state에
+    # 저장된 정규화 값도 재시도 시 잃지 않도록 top-level 값을 fallback으로 둔다.
+    return _normalize_device_health_alert_voice_type(
+        details.get("voiceType")
+    ) or _normalize_device_health_alert_voice_type(value.get("voiceType"))
+
+
 def _coerce_device_notification_alert_now(now: datetime | None = None) -> datetime:
     if now is None:
         return datetime.now(_DEVICE_NOTIFICATION_ALERT_TIMEZONE)
@@ -148,6 +160,8 @@ def _normalize_pending_event(value: Any) -> dict[str, Any] | None:
         "notificationId": notification_id,
         "deviceSeq": _coerce_int(value.get("deviceSeq")) or None,
         "deviceName": str(value.get("deviceName") or "").strip(),
+        "deviceVersion": str(value.get("deviceVersion") or "").strip(),
+        "voiceType": _extract_device_notification_voice_type(value),
         "code": code,
         "message": str(value.get("message") or "").strip(),
         "barcode": str(value.get("barcode") or "").strip(),
@@ -448,6 +462,7 @@ def _load_device_notification_batch(
                 "n.occurredAt AS occurredAt, "
                 "d.hospitalSeq AS hospitalSeq, "
                 "d.hospitalRoomSeq AS hospitalRoomSeq, "
+                "d.version AS deviceVersion, "
                 "h.hospitalName AS hospitalName, "
                 "h.telephone AS hospitalTelephone, "
                 "h.deviceAlertPhone AS hospitalDeviceAlertPhone, "
@@ -729,6 +744,8 @@ def _build_captureboard_notification_alert_summary(
                 "hospitalRoomSeq": _coerce_int(event.get("hospitalRoomSeq")) or None,
                 "roomName": room_name,
                 "deviceName": device_name,
+                "deviceVersion": str(event.get("deviceVersion") or "").strip(),
+                "voiceType": _extract_device_notification_voice_type(event),
                 "overallLabel": "이상",
                 "priorityReason": issue,
                 # 이벤트 코드를 사용자 영향 중심의 공통 Slack 제목 범주로 전달한다.
@@ -800,6 +817,8 @@ def _build_segmented_recordings_merge_alert_summary(
                 "hospitalRoomSeq": _coerce_int(event.get("hospitalRoomSeq")) or None,
                 "roomName": room_name,
                 "deviceName": device_name,
+                "deviceVersion": str(event.get("deviceVersion") or "").strip(),
+                "voiceType": _extract_device_notification_voice_type(event),
                 "overallLabel": "이상",
                 "priorityReason": issue,
                 # 병합 구현명보다 사용자가 이해하기 쉬운 녹화 파일 처리 범주로 표시한다.
@@ -1037,6 +1056,8 @@ def _build_recording_stall_alert_summary(
                 "hospitalRoomSeq": _coerce_int(event.get("hospitalRoomSeq")) or None,
                 "roomName": room_name,
                 "deviceName": context["deviceName"],
+                "deviceVersion": str(event.get("deviceVersion") or "").strip(),
+                "voiceType": _extract_device_notification_voice_type(event),
                 "overallLabel": "이상",
                 "priorityReason": issue,
                 # 파일 증가 정지는 원인이 확정되지 않았으므로 녹화 상태 확인으로 안내한다.

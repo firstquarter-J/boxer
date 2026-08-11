@@ -48,6 +48,7 @@ from boxer_company.routers.device_status_probe import (
     _parse_device_path_list,
     _parse_pm2_processes,
     _parse_usb_devices,
+    _parse_voice_config,
     _run_status_probe_command,
     _summarize_audio_path_probe,
     _summarize_captureboard_probe,
@@ -71,6 +72,7 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS,
     _collect_daily_device_round_abnormal_alert_items,
     _is_device_health_alert_voice_guide_supported,
+    _normalize_device_health_alert_voice_type,
     _post_daily_device_round_abnormal_alert,
 )
 from boxer_company_adapter_slack.device_notification_alert_reporter import (
@@ -932,6 +934,7 @@ def _normalize_device_health_monitor_alert_action_item(value: Any) -> dict[str, 
         ),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
+        "voiceType": _normalize_device_health_alert_voice_type(item.get("voiceType")),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
         "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
     }
@@ -4041,6 +4044,11 @@ def _build_device_health_monitor_status_payload(
         "captureboard": None,
         "led": None,
     }
+    device_payload = (
+        dict(evidence_payload.get("device"))
+        if isinstance(evidence_payload.get("device"), dict)
+        else {}
+    )
 
     if ssh.get("ready"):
         # 24시간 모니터는 앱 업데이트 상태 대신 장비 안의 Linux 명령 결과만 근거로 이상을 판단해.
@@ -4072,6 +4080,16 @@ def _build_device_health_monitor_status_payload(
                 missing_token="no_serial_device",
             ),
         )
+        # all 점검에서 이미 실행한 voice_config 결과를 재사용한다. 별도 SSH나
+        # MDA 호출 없이 네 지원 음성 타입만 Slack 알림 데이터에 전달한다.
+        voice_config = _parse_voice_config(
+            _display_value((checks.get("voice_config") or {}).get("output"), default="")
+        )
+        voice_type = _normalize_device_health_alert_voice_type(
+            voice_config.get("voiceType")
+        )
+        if voice_type:
+            device_payload["voiceType"] = voice_type
 
     return {
         **evidence_payload,
@@ -4081,6 +4099,7 @@ def _build_device_health_monitor_status_payload(
             "deviceName": device_name,
             "component": "all",
         },
+        "device": device_payload,
         "checks": checks,
         "overview": overview,
     }

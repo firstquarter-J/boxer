@@ -156,6 +156,7 @@ def _captureboard_abnormal_summary() -> dict:
                     "led": "정상",
                 },
                 "statusPayload": {
+                    "device": {"version": "2.11.308", "voiceType": "ls"},
                     "overview": {
                         "captureboard": {
                             "status": "fail",
@@ -875,6 +876,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "hospital": "#69 수지미래산부인과의원(용인)",
             "room": "1진료실",
             "device": "MB2-C00043",
+            "deviceVersion": "2.11.308",
             "issue": "상태 확인이 필요해",
         }
         scenarios = (
@@ -907,15 +909,123 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
                 self.assertEqual(bool(action_elements), expected)
                 if expected:
+                    voice_action = action_elements[0]
                     self.assertEqual(
-                        action_elements[0]["action_id"],
+                        voice_action["action_id"],
                         reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
                     )
                     self.assertEqual(
-                        action_elements[0]["text"]["text"],
+                        voice_action["text"]["text"],
                         "장비 음성 안내",
                     )
-                    self.assertIn('"device":"MB2-C00043"', action_elements[0]["value"])
+                    self.assertIn('"device":"MB2-C00043"', voice_action["value"])
+                    # 실제 병원 장비에서 소리가 나기 전에 대상·안내 내용을
+                    # 확인하고 명시적으로 재생해야 하는 Block Kit 계약을 고정해.
+                    confirmation = voice_action["confirm"]
+                    self.assertEqual(
+                        confirmation["title"]["text"],
+                        "장비 음성 안내",
+                    )
+                    confirmation_text = confirmation["text"]["text"]
+                    self.assertIn("대상: MB2-C00043", confirmation_text)
+                    self.assertIn(
+                        "안내 내용: 캡처보드 연결 상태 확인",
+                        confirmation_text,
+                    )
+                    self.assertIn(
+                        "장비에 설정된 음성으로 안내를 재생할까요?",
+                        confirmation_text,
+                    )
+                    # 버전은 버튼 노출·클릭 시점에 검증하고, voiceType이 없는
+                    # 구버전 이벤트의 음성 세트나 문구는 확인창에서 추정하지 않는다.
+                    self.assertNotIn("버전", confirmation_text)
+                    self.assertNotIn("n/s", confirmation_text)
+                    self.assertNotIn("기존 음성 설정", confirmation_text)
+                    self.assertEqual(confirmation["confirm"]["text"], "음성 재생")
+                    self.assertEqual(confirmation["deny"]["text"], "취소")
+
+    def test_voice_action_is_hidden_below_308_or_when_version_is_unknown(self) -> None:
+        for version in ("2.11.307", "0", "", "unknown"):
+            with self.subTest(version=version):
+                blocks = daily_device_round_reporter._build_device_health_alert_item_blocks(
+                    {
+                        "hospital": "#69 수지미래산부인과의원(용인)",
+                        "room": "1진료실",
+                        "device": "MB2-C00043",
+                        "deviceVersion": version,
+                        "issue": "캡처보드 연결 이상",
+                        "alertCategory": "video_signal",
+                        "problemComponents": ["캡처보드"],
+                    },
+                    include_actions=False,
+                    include_device_voice_action=True,
+                )
+
+                self.assertNotIn("actions", [block["type"] for block in blocks])
+
+    def test_voice_action_confirmation_uses_verified_device_voice_type(self) -> None:
+        scenarios = (
+            (
+                "n",
+                "귀여운 음성",
+                "캡처보드가 연결되지 않았습니다. 케이블을 확인해 주세요.",
+            ),
+            (
+                "s",
+                "진지한 음성",
+                "캡처보드가 연결되지 않았습니다. 케이블을 확인해 주세요.",
+            ),
+            ("ln", "기존 귀여운 음성", "영상 신호가 끊겼어요."),
+            ("ls", "기존 진지한 음성", "영상 신호가 끊겼어요."),
+        )
+
+        for voice_type, voice_label, voice_message in scenarios:
+            with self.subTest(voice_type=voice_type):
+                item = {
+                    "hospital": "#69 수지미래산부인과의원(용인)",
+                    "room": "1진료실",
+                    "device": "MB2-C00043",
+                    "deviceVersion": "2.11.308",
+                    "voiceType": voice_type,
+                    "issue": "캡처보드 연결 이상",
+                    "alertCategory": "video_signal",
+                    "problemComponents": ["캡처보드"],
+                }
+                blocks = daily_device_round_reporter._build_device_health_alert_item_blocks(
+                    item,
+                    include_actions=False,
+                    include_device_voice_action=True,
+                )
+                voice_action = blocks[-1]["elements"][0]
+                confirmation_text = voice_action["confirm"]["text"]["text"]
+
+                self.assertIn(
+                    f"설정 음성: {voice_label} ({voice_type})",
+                    confirmation_text,
+                )
+                self.assertIn(f"재생 문구: “{voice_message}”", confirmation_text)
+                self.assertEqual(
+                    json.loads(voice_action["value"])["voiceType"],
+                    voice_type,
+                )
+
+    def test_voice_action_confirmation_does_not_guess_unknown_voice_type(self) -> None:
+        confirmation = daily_device_round_reporter._build_device_health_alert_voice_guide_confirmation(
+            {"device": "MB2-C00043", "voiceType": "unknown"}
+        )
+
+        confirmation_text = confirmation["text"]["text"]
+        self.assertIn("장비에 설정된 음성으로 안내를 재생할까요?", confirmation_text)
+        self.assertNotIn("설정 음성:", confirmation_text)
+        self.assertNotIn("재생 문구:", confirmation_text)
+
+    def test_abnormal_alert_item_uses_status_payload_device_version(self) -> None:
+        items = daily_device_round_reporter._collect_daily_device_round_abnormal_alert_items(
+            _captureboard_abnormal_summary()
+        )
+
+        self.assertEqual(items[0]["deviceVersion"], "2.11.308")
+        self.assertEqual(items[0]["voiceType"], "ls")
 
     def test_abnormal_alert_header_falls_back_when_known_and_unknown_types_mix(self) -> None:
         summary = _abnormal_summary()
@@ -3406,6 +3516,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "ssh": {"ready": True, "reason": "ready", "host": "127.0.0.1", "port": 2222},
         }
         checks = {
+            "voice_config": {"output": "VOICE_TYPE=s\nLOCALE=ko_KR\nSILENT_START=false"},
             "pm2_jlist": {"output": "[]"},
             "lsusb": {"output": ""},
             "serial_devices": {"output": "no_serial_device"},
@@ -3460,6 +3571,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(result["statusPayload"]["route"], "device_health_monitor")
         self.assertEqual(result["statusPayload"]["source"], "mda_graphql+ssh_linux_commands")
         self.assertEqual(result["statusPayload"]["checks"], checks)
+        self.assertEqual(result["statusPayload"]["device"]["voiceType"], "s")
         alert_items = reporter._collect_daily_device_round_abnormal_alert_items(
             {
                 "hospitalSeq": 69,
@@ -3468,6 +3580,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             }
         )
         self.assertEqual(alert_items[0]["issue"], "LED USB 장치를 찾지 못했어")
+        self.assertEqual(alert_items[0]["voiceType"], "s")
 
     def test_builds_summary_from_redis_batch_without_ssh_for_normal_devices(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))

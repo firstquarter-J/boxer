@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -44,6 +45,29 @@ _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
 _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE = "device_health_alert_mark_done"
 _DEVICE_HEALTH_ALERT_ACTION_ITEM_LIMIT = 10
+_DEVICE_HEALTH_ALERT_VOICE_GUIDE_MINIMUM_VERSION = (2, 11, 308)
+# voice_guide가 실제로 선택하는 마미박스 음성 세트와 재생 문구를 고정해,
+# 알림 payload에 검증된 voiceType이 있을 때만 Slack 확인창에 표시한다.
+_DEVICE_HEALTH_ALERT_VOICE_GUIDE_DETAILS = {
+    "n": {
+        "label": "귀여운 음성",
+        "message": "캡처보드가 연결되지 않았습니다. 케이블을 확인해 주세요.",
+    },
+    "s": {
+        "label": "진지한 음성",
+        "message": "캡처보드가 연결되지 않았습니다. 케이블을 확인해 주세요.",
+    },
+    # v2.11.308의 legacy 음성 세트에는 no_captureboard 전용 파일이 없어
+    # MommyBox가 error_captureboard_signal 공통 음성으로 fallback한다.
+    "ln": {
+        "label": "기존 귀여운 음성",
+        "message": "영상 신호가 끊겼어요.",
+    },
+    "ls": {
+        "label": "기존 진지한 음성",
+        "message": "영상 신호가 끊겼어요.",
+    },
+}
 _DEVICE_HEALTH_ALERT_DEFAULT_TITLE = "장비 상태 확인 필요"
 _DEVICE_HEALTH_ALERT_CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
@@ -683,6 +707,27 @@ def _collect_daily_device_round_abnormal_alert_items(
             issue=issue,
         )
         device_name = _display_value(device_result.get("deviceName"), default="장비명 미확인")
+        status_payload = (
+            device_result.get("statusPayload")
+            if isinstance(device_result.get("statusPayload"), dict)
+            else {}
+        )
+        status_device = (
+            status_payload.get("device")
+            if isinstance(status_payload.get("device"), dict)
+            else {}
+        )
+        # 24시간 상태 점검은 statusPayload.device.version, 실시간 이벤트는
+        # deviceVersion으로 전달되므로 하나의 카드 필드로 정규화한다.
+        device_version = _display_value(
+            device_result.get("deviceVersion"),
+            default=_display_value(status_device.get("version"), default=""),
+        )
+        # 실시간 device_notification은 deviceResult에, SSH 상태 점검은
+        # statusPayload.device에 음성 타입을 싣는다. 네 지원값 외에는 추정하지 않는다.
+        voice_type = _normalize_device_health_alert_voice_type(
+            device_result.get("voiceType")
+        ) or _normalize_device_health_alert_voice_type(status_device.get("voiceType"))
         items.append(
             {
                 "hospitalSeq": str(hospital_seq or ""),
@@ -710,6 +755,8 @@ def _collect_daily_device_round_abnormal_alert_items(
                 "problemComponents": problem_components,
                 "room": _display_value(device_result.get("roomName"), default="병실 미확인"),
                 "device": device_name,
+                "deviceVersion": device_version,
+                "voiceType": voice_type,
                 "issue": issue,
                 "mdaUrl": _build_daily_device_round_mda_monitoring_url(
                     device_name=device_name,
@@ -1002,6 +1049,8 @@ def _build_device_health_alert_action_value(item: dict[str, Any]) -> str:
         ),
         "room": _display_value(item.get("room"), default="병실 미확인"),
         "device": _display_value(item.get("device"), default="장비명 미확인"),
+        "deviceVersion": _display_value(item.get("deviceVersion"), default=""),
+        "voiceType": _normalize_device_health_alert_voice_type(item.get("voiceType")),
         "issue": _display_value(item.get("issue"), default="상세 확인 필요"),
         "mdaUrl": _display_value(item.get("mdaUrl"), default=""),
         "mdaHospitalEditUrl": _display_value(item.get("mdaHospitalEditUrl"), default=""),
@@ -1037,6 +1086,72 @@ def _is_device_health_alert_voice_guide_supported(item: dict[str, Any]) -> bool:
     # 여러 구성 요소가 함께 이상인 카드는 mixed로 분류되므로 캡처보드 포함 여부를
     # 한 번 더 확인해, 함께 표시된 LED·오디오 문제 때문에 음성 버튼이 사라지지 않게 한다.
     return category == "mixed" and "캡처보드" in problem_components
+
+
+def _parse_device_health_alert_voice_guide_version(
+    value: Any,
+) -> tuple[int, int, int] | None:
+    matched = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(value or "").strip())
+    if not matched:
+        return None
+    return (
+        int(matched.group(1)),
+        int(matched.group(2)),
+        int(matched.group(3)),
+    )
+
+
+def _normalize_device_health_alert_voice_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in _DEVICE_HEALTH_ALERT_VOICE_GUIDE_DETAILS:
+        return ""
+    return normalized
+
+
+def _is_device_health_alert_voice_guide_available(item: dict[str, Any]) -> bool:
+    if not _is_device_health_alert_voice_guide_supported(item):
+        return False
+    parsed_version = _parse_device_health_alert_voice_guide_version(
+        item.get("deviceVersion")
+    )
+    # 버전이 없거나 잘못된 경우에도 구버전과 동일하게 버튼을 숨긴다. 클릭
+    # 시점의 MDA 재검증은 오래된 Slack 메시지 방어를 위해 별도로 유지한다.
+    return (
+        parsed_version is not None
+        and parsed_version >= _DEVICE_HEALTH_ALERT_VOICE_GUIDE_MINIMUM_VERSION
+    )
+
+
+def _build_device_health_alert_voice_guide_confirmation(
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    device_name = _display_value(item.get("device"), default="장비명 미확인")
+    voice_type = _normalize_device_health_alert_voice_type(item.get("voiceType"))
+    voice_detail = _DEVICE_HEALTH_ALERT_VOICE_GUIDE_DETAILS.get(voice_type)
+    if voice_detail:
+        confirmation_text = (
+            f"대상: {device_name}\n"
+            f"설정 음성: {voice_detail['label']} ({voice_type})\n"
+            f"재생 문구: “{voice_detail['message']}”\n"
+            "장비에서 안내 음성을 재생할까요?"
+        )
+    else:
+        # 구버전 이벤트나 알 수 없는 값은 음성 세트를 추정하지 않고 기존 안전
+        # 문구를 유지한다. 클릭 시 장비의 현재 설정으로 voice_guide가 실행된다.
+        confirmation_text = (
+            f"대상: {device_name}\n"
+            "안내 내용: 캡처보드 연결 상태 확인\n"
+            "장비에 설정된 음성으로 안내를 재생할까요?"
+        )
+    return {
+        "title": {"type": "plain_text", "text": "장비 음성 안내"},
+        "text": {
+            "type": "plain_text",
+            "text": confirmation_text,
+        },
+        "confirm": {"type": "plain_text", "text": "음성 재생"},
+        "deny": {"type": "plain_text", "text": "취소"},
+    }
 
 
 def _build_device_health_alert_item_blocks(
@@ -1092,7 +1207,7 @@ def _build_device_health_alert_item_blocks(
     ]
     voice_action_enabled = (
         include_device_voice_action
-        and _is_device_health_alert_voice_guide_supported(item)
+        and _is_device_health_alert_voice_guide_available(item)
     )
     if not include_actions and not voice_action_enabled:
         # 문자·음성 조치가 모두 없는 장비 이벤트도 같은 카드 레이아웃은 유지한다.
@@ -1134,6 +1249,7 @@ def _build_device_health_alert_item_blocks(
                 "text": {"type": "plain_text", "text": "장비 음성 안내"},
                 "action_id": _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
                 "value": action_value,
+                "confirm": _build_device_health_alert_voice_guide_confirmation(item),
             }
         )
     if action_elements:
