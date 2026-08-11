@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,10 +25,16 @@ from boxer_company.base_access import (
 )
 
 
-_BASE_ACCESS_COMMAND_RE = re.compile(
+_BASE_ACCESS_MENTION_COMMAND_RE = re.compile(
     r"^<@(?P<boxer_user_id>[UW][A-Z0-9]+)>\s+"
     r"<@(?P<target_user_id>[UW][A-Z0-9]+)>\s+박서\s+사용\s+(?P<state>가능|불가)$"
 )
+_BASE_ACCESS_NAME_COMMAND_RE = re.compile(
+    r"^<@(?P<boxer_user_id>[UW][A-Z0-9]+)>\s+"
+    r"(?P<target_name>[^<>\r\n]{1,80}?)\s+박서\s+사용\s+(?P<state>가능|불가)$"
+)
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+_MAX_USERS_LIST_PAGES = 100
 
 BASE_ACCESS_DENIED_REPLY = "박서 사용 권한이 없어. 현에게 요청해줘"
 BASE_ACCESS_UNAVAILABLE_REPLY = "박서 사용 권한을 확인할 수 없어. 잠시 후 다시 시도해줘"
@@ -58,6 +65,14 @@ class SlackBaseAccessRuntime:
             return False
 
 
+@dataclass(frozen=True, slots=True)
+class _BaseAccessManagementCommand:
+    boxer_user_id: str
+    target_user_id: str | None
+    target_name: str | None
+    allowed: bool
+
+
 def build_slack_base_access_runtime(
     *,
     logger: logging.Logger | None = None,
@@ -78,15 +93,31 @@ def build_slack_base_access_runtime(
     return SlackBaseAccessRuntime(settings=settings, store=store, logger=actual_logger)
 
 
-def _parse_base_access_management_command(raw_text: str) -> tuple[str, str, bool] | None:
-    # 공개 adapter의 question은 모든 멘션을 제거하므로 두 멘션이 남은 Slack 원문만 파싱한다.
-    match = _BASE_ACCESS_COMMAND_RE.fullmatch(str(raw_text or "").strip())
-    if match is None:
+def _parse_base_access_management_command(
+    raw_text: str,
+) -> _BaseAccessManagementCommand | None:
+    # 공개 adapter의 question은 모든 멘션을 제거하므로 Boxer 멘션이 남은 원문만 파싱한다.
+    normalized_text = str(raw_text or "").strip()
+    mention_match = _BASE_ACCESS_MENTION_COMMAND_RE.fullmatch(normalized_text)
+    if mention_match is not None:
+        return _BaseAccessManagementCommand(
+            boxer_user_id=mention_match.group("boxer_user_id"),
+            target_user_id=mention_match.group("target_user_id"),
+            target_name=None,
+            allowed=mention_match.group("state") == "가능",
+        )
+
+    name_match = _BASE_ACCESS_NAME_COMMAND_RE.fullmatch(normalized_text)
+    if name_match is None:
         return None
-    return (
-        match.group("boxer_user_id"),
-        match.group("target_user_id"),
-        match.group("state") == "가능",
+    target_name = " ".join(name_match.group("target_name").split())
+    if not target_name:
+        return None
+    return _BaseAccessManagementCommand(
+        boxer_user_id=name_match.group("boxer_user_id"),
+        target_user_id=None,
+        target_name=target_name,
+        allowed=name_match.group("state") == "가능",
     )
 
 
@@ -122,6 +153,28 @@ def _extract_user_display_name(user: dict[str, Any], user_id: str) -> str:
         if value:
             return value
     return user_id
+
+
+def _normalize_user_name(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+def _user_name_aliases(user: dict[str, Any]) -> set[str]:
+    profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+    aliases = {
+        _normalize_user_name(candidate)
+        for candidate in (
+            profile.get("display_name_normalized"),
+            profile.get("display_name"),
+            profile.get("real_name_normalized"),
+            profile.get("real_name"),
+            user.get("real_name"),
+            user.get("name"),
+        )
+    }
+    aliases.discard("")
+    return aliases
 
 
 def _is_active_internal_human(
@@ -168,6 +221,84 @@ def _load_boxer_identity(client: Any, workspace_id: str) -> str | None:
     return str(response.get("user_id") or "").strip() or None
 
 
+def _resolve_named_target_user_id(
+    *,
+    client: Any,
+    workspace_id: str,
+    boxer_user_id: str,
+    target_name: str,
+    allowed: bool,
+) -> tuple[str | None, str | None]:
+    """Slack 전체 사용자에서 정확히 한 명인 활성 내부 사람만 이름으로 확정한다."""
+
+    normalized_target_name = _normalize_user_name(target_name)
+    if not normalized_target_name:
+        return None, "invalid_name"
+
+    candidates: dict[str, dict[str, Any]] = {}
+    cursor = ""
+    seen_cursors: set[str] = set()
+    for _ in range(_MAX_USERS_LIST_PAGES):
+        arguments: dict[str, Any] = {"limit": 200, "team_id": workspace_id}
+        if cursor:
+            arguments["cursor"] = cursor
+        try:
+            response = _slack_response_data(client.users_list(**arguments))
+        except Exception:
+            return None, "slack_lookup_failed"
+        if response is None or response.get("ok") is False:
+            return None, "slack_lookup_failed"
+        members = response.get("members")
+        if not isinstance(members, list):
+            return None, "slack_lookup_failed"
+
+        # 첫 일치에서 멈추면 뒤 페이지의 동명이인을 놓치므로 끝까지 ID 기준으로 합친다.
+        for member in members:
+            if not isinstance(member, dict):
+                return None, "slack_lookup_failed"
+            member_user_id = str(member.get("id") or "").strip()
+            if _SLACK_USER_ID_RE.fullmatch(member_user_id) is None:
+                return None, "slack_lookup_failed"
+            if normalized_target_name in _user_name_aliases(member):
+                candidates[member_user_id] = member
+
+        metadata = response.get("response_metadata")
+        if not isinstance(metadata, dict):
+            return None, "slack_lookup_failed"
+        raw_next_cursor = metadata.get("next_cursor", "")
+        if not isinstance(raw_next_cursor, str):
+            return None, "slack_lookup_failed"
+        next_cursor = raw_next_cursor.strip()
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            return None, "slack_lookup_failed"
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    else:
+        return None, "slack_lookup_failed"
+
+    if not candidates:
+        return None, "name_not_found"
+    if len(candidates) != 1:
+        return None, "ambiguous_name"
+    target_user_id, target_user = next(iter(candidates.items()))
+    if (
+        str(target_user.get("team_id") or "").strip() != workspace_id
+        or target_user_id == boxer_user_id
+        or target_user_id in {"USLACK", "USLACKBOT"}
+    ):
+        return None, "invalid_name_target"
+    if allowed and not _is_active_internal_human(
+        target_user,
+        workspace_id=workspace_id,
+        target_user_id=target_user_id,
+        boxer_user_id=boxer_user_id,
+    ):
+        return None, "invalid_grant_target"
+    return target_user_id, None
+
+
 def _load_target_for_mutation(
     *,
     runtime: SlackBaseAccessRuntime,
@@ -176,6 +307,7 @@ def _load_target_for_mutation(
     target_user_id: str,
     boxer_user_id: str,
     allowed: bool,
+    expected_target_name: str | None = None,
 ) -> tuple[str | None, str | None]:
     try:
         response = client.users_info(user=target_user_id)
@@ -197,6 +329,12 @@ def _load_target_for_mutation(
         return None, "invalid_user"
     if str(user.get("team_id") or "").strip() != workspace_id:
         return None, "different_workspace"
+    if (
+        expected_target_name is not None
+        and _normalize_user_name(expected_target_name) not in _user_name_aliases(user)
+    ):
+        # users.list와 users.info 사이에 이름이 바뀌면 다른 사람으로 오인하지 않고 중단한다.
+        return None, "name_changed"
     display_name = _extract_user_display_name(user, target_user_id)
     if allowed and not _is_active_internal_human(
         user,
@@ -216,7 +354,7 @@ def handle_base_access_management_command(
     *,
     runtime: SlackBaseAccessRuntime,
 ) -> bool:
-    """Hyun의 두 가지 exact 명령만 확인 없이 즉시 적용한다."""
+    """Hyun의 exact 사용 가능/불가 명령을 이름 또는 멘션 대상으로 적용한다."""
 
     command = _parse_base_access_management_command(payload.get("raw_text") or "")
     if command is None:
@@ -232,7 +370,10 @@ def handle_base_access_management_command(
         reply("박서 사용 권한은 현만 변경할 수 있어")
         return True
 
-    mentioned_boxer_user_id, target_user_id, allowed = command
+    mentioned_boxer_user_id = command.boxer_user_id
+    target_user_id = command.target_user_id
+    target_name = command.target_name
+    allowed = command.allowed
     if not allowed and target_user_id == cs.BOXER_ACCESS_ADMIN_USER_ID:
         _set_request_log_status(payload, "denied")
         reply("현의 박서 사용 권한은 해제할 수 없어")
@@ -257,6 +398,53 @@ def handle_base_access_management_command(
         # app_mention의 첫 멘션이 Boxer가 아니면 이 관리 명령 문법으로 취급하지 않는다.
         return False
 
+    if target_user_id is None:
+        target_user_id, target_error = _resolve_named_target_user_id(
+            client=client,
+            workspace_id=workspace_id,
+            boxer_user_id=boxer_user_id,
+            target_name=str(target_name or ""),
+            allowed=allowed,
+        )
+        if target_error:
+            _set_request_log_status(
+                payload,
+                (
+                    "denied"
+                    if target_error
+                    in {
+                        "invalid_name",
+                        "invalid_name_target",
+                        "invalid_grant_target",
+                        "name_not_found",
+                        "ambiguous_name",
+                    }
+                    else "error"
+                ),
+            )
+            if target_error == "ambiguous_name":
+                reply("같은 이름의 사용자가 여러 명이야. 대상 사용자를 @멘션해줘")
+            elif target_error == "invalid_grant_target":
+                reply("활성 상태인 내부 사람 계정만 박서 사용을 허용할 수 있어")
+            elif target_error in {
+                "invalid_name",
+                "invalid_name_target",
+                "name_not_found",
+            }:
+                reply("이름으로 사용자를 찾지 못했어. 대상 사용자를 @멘션해줘")
+            else:
+                reply(BASE_ACCESS_UNAVAILABLE_REPLY)
+            return True
+
+    if not target_user_id:
+        _set_request_log_status(payload, "error")
+        reply(BASE_ACCESS_UNAVAILABLE_REPLY)
+        return True
+    if not allowed and target_user_id == cs.BOXER_ACCESS_ADMIN_USER_ID:
+        _set_request_log_status(payload, "denied")
+        reply("현의 박서 사용 권한은 해제할 수 없어")
+        return True
+
     display_name, target_error = _load_target_for_mutation(
         runtime=runtime,
         client=client,
@@ -264,6 +452,7 @@ def handle_base_access_management_command(
         target_user_id=target_user_id,
         boxer_user_id=boxer_user_id,
         allowed=allowed,
+        expected_target_name=target_name,
     )
     if target_error:
         _set_request_log_status(payload, "denied" if target_error.startswith("invalid") else "error")
@@ -271,6 +460,8 @@ def handle_base_access_management_command(
             reply("같은 워크스페이스 사용자만 변경할 수 있어")
         elif target_error == "invalid_grant_target":
             reply("활성 상태인 내부 사람 계정만 박서 사용을 허용할 수 있어")
+        elif target_error == "name_changed":
+            reply("사용자 이름이 변경됐어. 대상 사용자를 @멘션해줘")
         else:
             reply(BASE_ACCESS_UNAVAILABLE_REPLY)
         return True

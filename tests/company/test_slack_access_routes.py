@@ -151,6 +151,10 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             "team_id": _WORKSPACE_ID,
             "user_id": _BOXER_USER_ID,
         }
+        self.client.users_list.return_value = {
+            "members": [_active_internal_user()],
+            "response_metadata": {"next_cursor": ""},
+        }
         self.client.users_info.return_value = {"user": _active_internal_user()}
         self.replies: list[tuple[str, dict]] = []
 
@@ -177,19 +181,22 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
                 runtime=self.runtime,
             )
 
-    def test_only_two_exact_mention_commands_are_matched(self) -> None:
+    def test_only_exact_name_or_mention_commands_are_matched(self) -> None:
         for question in (
-            "Zion 박서 사용 가능",
             f"<@{_TARGET_USER_ID}> 박서 사용자 추가",
             "박서 사용자 목록",
             f"<@{_TARGET_USER_ID}> 박서 사용 가능 확인",
             f"<@{_TARGET_USER_ID}|zion> 박서 사용 가능",
+            "Zion 박서 사용 가능?",
+            "박서 사용 가능",
         ):
             with self.subTest(question=question):
                 self.assertFalse(self._handle(question))
 
         self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 박서 사용 가능"))
         self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 박서 사용 불가"))
+        self.assertTrue(self._handle("Zion 박서 사용 가능"))
+        self.assertTrue(self._handle("Zion 박서 사용 불가"))
 
     def test_first_mention_must_be_the_authenticated_boxer_user(self) -> None:
         payload = _payload(f"<@{_TARGET_USER_ID}> 박서 사용 가능")
@@ -217,9 +224,16 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             )
         )
         self.assertTrue(self._handle(f"<@{_HYUN_USER_ID}> 박서 사용 불가"))
+        self.assertTrue(
+            self._handle(
+                "Zion 박서 사용 가능",
+                actor_user_id="U_OTHER",
+            )
+        )
 
         self.store.set_allowed.assert_not_called()
         self.client.auth_test.assert_not_called()
+        self.client.users_list.assert_not_called()
 
     def test_misconfigured_hyun_env_fails_closed(self) -> None:
         # 배포 env가 다른 실제 사용자 ID로 바뀌어도 관리 권한을 넘기지 않는다.
@@ -249,6 +263,219 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             "00000000001784800000.000002",
         )
         self.assertNotIn("client_msg_id", self.replies[-1][1])
+
+    def test_plain_name_grant_resolves_unique_user_and_rechecks_with_users_info(self) -> None:
+        handled = self._handle("  zIoN   박서 사용 가능")
+
+        self.assertTrue(handled)
+        self.client.users_list.assert_called_once_with(
+            limit=200,
+            team_id=_WORKSPACE_ID,
+        )
+        self.client.users_info.assert_called_once_with(user=_TARGET_USER_ID)
+        self.store.set_allowed.assert_called_once_with(
+            _WORKSPACE_ID,
+            _TARGET_USER_ID,
+            True,
+            "Zion",
+            _HYUN_USER_ID,
+            "00000000001784800000.000002",
+        )
+
+    def test_plain_name_lookup_reads_every_page_and_accepts_space_name(self) -> None:
+        other_user = _active_internal_user(
+            id="U0999999998",
+            name="other",
+            real_name="Other",
+            profile={"display_name": "Other"},
+        )
+        justin_user = _active_internal_user(
+            name="justin.hyeon",
+            real_name="Justin Hyeon",
+            profile={"display_name": "Justin Hyeon"},
+        )
+        self.client.users_list.side_effect = (
+            {
+                "members": [other_user],
+                "response_metadata": {"next_cursor": "PAGE_2"},
+            },
+            _SlackResponse(
+                {
+                    "members": [justin_user],
+                    "response_metadata": {"next_cursor": ""},
+                }
+            ),
+        )
+        self.client.users_info.return_value = {"user": justin_user}
+
+        self.assertTrue(self._handle("Justin   Hyeon 박서 사용 가능"))
+
+        self.assertEqual(
+            self.client.users_list.call_args_list[0].kwargs,
+            {"limit": 200, "team_id": _WORKSPACE_ID},
+        )
+        self.assertEqual(
+            self.client.users_list.call_args_list[1].kwargs,
+            {"limit": 200, "team_id": _WORKSPACE_ID, "cursor": "PAGE_2"},
+        )
+        self.store.set_allowed.assert_called_once()
+
+    def test_plain_name_lookup_rejects_ambiguous_or_missing_users(self) -> None:
+        duplicate_user = _active_internal_user(id="U0999999997")
+        for members, expected_reply in (
+            (
+                [_active_internal_user(), duplicate_user],
+                "같은 이름의 사용자가 여러 명이야. 대상 사용자를 @멘션해줘",
+            ),
+            (
+                [
+                    _active_internal_user(
+                        name="rosa",
+                        real_name="Rosa",
+                        profile={"display_name": "Rosa"},
+                    )
+                ],
+                "이름으로 사용자를 찾지 못했어. 대상 사용자를 @멘션해줘",
+            ),
+        ):
+            with self.subTest(expected_reply=expected_reply):
+                self.store.reset_mock()
+                self.client.users_info.reset_mock()
+                self.replies.clear()
+                self.client.users_list.return_value = {
+                    "members": members,
+                    "response_metadata": {"next_cursor": ""},
+                }
+
+                self.assertTrue(self._handle("Zion 박서 사용 가능"))
+
+                self.store.set_allowed.assert_not_called()
+                self.client.users_info.assert_not_called()
+                self.assertEqual(self.replies[-1][0], expected_reply)
+
+    def test_plain_name_grant_counts_guest_with_same_name_as_ambiguous(self) -> None:
+        # 허용 불가 계정을 먼저 버리면 동명의 다른 사람을 잘못 허용할 수 있다.
+        guest_user = _active_internal_user(
+            id="U0999999996",
+            is_restricted=True,
+        )
+        self.client.users_list.return_value = {
+            "members": [_active_internal_user(), guest_user],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+        self.assertTrue(self._handle("Zion 박서 사용 가능"))
+
+        self.store.set_allowed.assert_not_called()
+        self.assertEqual(
+            self.replies[-1][0],
+            "같은 이름의 사용자가 여러 명이야. 대상 사용자를 @멘션해줘",
+        )
+
+    def test_plain_name_lookup_detects_ambiguous_users_across_pages(self) -> None:
+        self.client.users_list.side_effect = (
+            {
+                "members": [_active_internal_user()],
+                "response_metadata": {"next_cursor": "PAGE_2"},
+            },
+            {
+                "members": [_active_internal_user(id="U0999999995")],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+        self.assertTrue(self._handle("Zion 박서 사용 가능"))
+
+        self.client.users_info.assert_not_called()
+        self.store.set_allowed.assert_not_called()
+        self.assertEqual(
+            self.replies[-1][0],
+            "같은 이름의 사용자가 여러 명이야. 대상 사용자를 @멘션해줘",
+        )
+
+    def test_plain_name_grant_rejects_unique_guest(self) -> None:
+        self.client.users_list.return_value = {
+            "members": [_active_internal_user(is_restricted=True)],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+        self.assertTrue(self._handle("Zion 박서 사용 가능"))
+
+        self.client.users_info.assert_not_called()
+        self.store.set_allowed.assert_not_called()
+        self.assertEqual(
+            self.replies[-1][0],
+            "활성 상태인 내부 사람 계정만 박서 사용을 허용할 수 있어",
+        )
+
+    def test_plain_name_lookup_fails_closed_for_api_or_pagination_errors(self) -> None:
+        cases = (
+            RuntimeError("down"),
+            {"members": "invalid", "response_metadata": {"next_cursor": ""}},
+            {"members": [_active_internal_user()]},
+            {
+                "members": [_active_internal_user()],
+                "response_metadata": {"next_cursor": "REPEATED"},
+            },
+        )
+        for response in cases:
+            with self.subTest(response_type=type(response).__name__):
+                self.store.reset_mock()
+                self.replies.clear()
+                if isinstance(response, Exception):
+                    self.client.users_list.side_effect = response
+                elif (
+                    response.get("response_metadata", {}).get("next_cursor")
+                    == "REPEATED"
+                ):
+                    self.client.users_list.side_effect = (response, response)
+                else:
+                    self.client.users_list.side_effect = None
+                    self.client.users_list.return_value = response
+
+                self.assertTrue(self._handle("Zion 박서 사용 가능"))
+
+                self.store.set_allowed.assert_not_called()
+                self.assertEqual(
+                    self.replies[-1][0],
+                    access_routes.BASE_ACCESS_UNAVAILABLE_REPLY,
+                )
+                self.client.users_list.side_effect = None
+
+    def test_plain_name_change_between_list_and_info_is_rejected(self) -> None:
+        self.client.users_info.return_value = {
+            "user": _active_internal_user(
+                name="rosa",
+                real_name="Rosa",
+                profile={"display_name": "Rosa"},
+            )
+        }
+
+        self.assertTrue(self._handle("Zion 박서 사용 가능"))
+
+        self.store.set_allowed.assert_not_called()
+        self.assertEqual(
+            self.replies[-1][0],
+            "사용자 이름이 변경됐어. 대상 사용자를 @멘션해줘",
+        )
+
+    def test_plain_name_cannot_revoke_hyun(self) -> None:
+        hyun_user = _active_internal_user(
+            id=_HYUN_USER_ID,
+            name="hyun",
+            real_name="Hyun",
+            profile={"display_name": "Hyun"},
+        )
+        self.client.users_list.return_value = {
+            "members": [hyun_user],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+        self.assertTrue(self._handle("Hyun 박서 사용 불가"))
+
+        self.client.users_info.assert_not_called()
+        self.store.set_allowed.assert_not_called()
+        self.assertEqual(self.replies[-1][0], "현의 박서 사용 권한은 해제할 수 없어")
 
     def test_grant_accepts_real_slack_response_data_objects(self) -> None:
         self.client.auth_test.return_value = _SlackResponse(
@@ -302,6 +529,26 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
         )
 
         self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 박서 사용 불가"))
+
+        self.store.get_member.assert_called_once_with(_WORKSPACE_ID, _TARGET_USER_ID)
+        self.assertFalse(self.store.set_allowed.call_args.args[2])
+
+    def test_plain_name_revoke_allows_deleted_account_tombstone_cleanup(self) -> None:
+        deleted_user = _active_internal_user(deleted=True)
+        self.client.users_list.return_value = {
+            "members": [deleted_user],
+            "response_metadata": {"next_cursor": ""},
+        }
+        self.client.users_info.side_effect = _SlackLookupError("user_not_found")
+        self.store.get_member.return_value = _member()
+        self.store.set_allowed.return_value = BaseAccessMutationResult(
+            allowed=False,
+            changed=True,
+            stale=False,
+            member=_member(allowed=False),
+        )
+
+        self.assertTrue(self._handle("Zion 박서 사용 불가"))
 
         self.store.get_member.assert_called_once_with(_WORKSPACE_ID, _TARGET_USER_ID)
         self.assertFalse(self.store.set_allowed.call_args.args[2])
