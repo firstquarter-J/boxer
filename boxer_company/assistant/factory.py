@@ -15,6 +15,9 @@ from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.assistant.barcode_log_route import (
     match_barcode_log_route,
 )
+from boxer_company.assistant.barcode_query_route import (
+    match_barcode_query_route,
+)
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantRequest,
@@ -23,15 +26,22 @@ from boxer_company.assistant.contracts import (
 from boxer_company.assistant.device_led_routes import (
     match_device_read_route,
 )
+from boxer_company.assistant.device_db_detail_route import (
+    DeviceDbDetailAssistantRoute,
+)
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
 )
 from boxer_company.assistant.knowledge_routes import (
     CompanyReadOnlyKnowledgeRouteDeps,
     build_company_read_only_knowledge_routes,
+    match_barcode_evidence_freeform_route,
 )
 from boxer_company.assistant.notion_route import (
     CompanyNotionAssistantRouteDeps,
+)
+from boxer_company.assistant.operational_read_routes import (
+    WeeklyRecordingsSummaryAssistantRoute,
 )
 from boxer_company.assistant.recording_failure_route import (
     match_recording_failure_route,
@@ -71,6 +81,33 @@ def _unavailable_diagnostic_snapshot(
 def _guard_read_only_request(
     request: CompanyAssistantRequest,
 ) -> CompanyAssistantResult | None:
+    barcode_route = match_barcode_query_route(request)
+    route_group = str(
+        request.metadata.get("route_group") or ""
+    ).strip()
+    if (
+        route_group in {"", "barcode"}
+        and barcode_route in {
+            "barcode_pink_classification_reason",
+            "barcode_validation_status",
+        }
+    ):
+        # 두 route는 이름과 달리 MDA 조회를 포함한다. direct API나 잘못된
+        # stage 선택에서도 외부 MDA에 접근하지 않도록 route 실행 전에 닫는다.
+        return CompanyAssistantResult(
+            route="unsupported_mda_lookup",
+            outcome="denied",
+            messages=(
+                AssistantMessage(
+                    body=(
+                        "MDA 기반 바코드 판정은 읽기 전용 API에서 "
+                        "지원하지 않아"
+                    )
+                ),
+            ),
+            fallback_reason="read_only_boundary",
+        )
+
     has_live_start = _has_device_diagnostic_start_hint(
         request.question
     )
@@ -229,6 +266,14 @@ def create_company_assistant_runtime(
     def should_handle_barcode_evidence(
         request: CompanyAssistantRequest,
     ) -> bool:
+        # Slack rollout의 pure matcher를 API에서도 다시 적용한다. 신뢰된
+        # service caller가 routeGroup=knowledge를 직접 보내더라도 일반 대화,
+        # PII, mutation, 기존 전용 route를 마지막 LLM route가 흡수하지 않는다.
+        if (
+            match_barcode_evidence_freeform_route(request)
+            != "barcode_evidence_freeform"
+        ):
+            return False
         # live 진단은 SSH open을 유발할 수 있어 read-only HTTP turn이
         # 자유질문으로 흡수하지 않고 후속 action 경계로 넘긴다.
         if _select_device_diagnostic_followup_command_keys(
@@ -307,6 +352,17 @@ def create_company_assistant_runtime(
                 provider_ready=provider_ready,
             ),
             request_guard=_guard_read_only_request,
+            # API 프로세스에서만 안전한 DB-only 세부 route를 범용
+            # structured matcher 앞에 둔다. Slack runtime의 기본 graph에는
+            # 주입하지 않아 기존 local/enriched 동작을 보존한다.
+            structured_read_routes=(
+                WeeklyRecordingsSummaryAssistantRoute(
+                    logger=app_logger,
+                ),
+                DeviceDbDetailAssistantRoute(
+                    logger=app_logger,
+                ),
+            ),
             # 장비 기본 정보는 DB-only로 제공하고 MDA/SSH 보강과
             # sshOrder mutation은 Slack의 live 진단 경계에 남긴다.
             structured_device_filter_enabled=True,

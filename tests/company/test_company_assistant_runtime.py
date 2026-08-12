@@ -112,6 +112,7 @@ def _deps(
     recordings_loader: Any,
     db_configured: Any = lambda: True,
     notion_route_deps: CompanyNotionAssistantRouteDeps | None = None,
+    structured_read_routes: tuple[Any, ...] = (),
 ) -> CompanyAssistantRuntimeDeps:
     engine = _FakeAnswerEngine()
     return CompanyAssistantRuntimeDeps(
@@ -124,6 +125,7 @@ def _deps(
         s3_query_enabled=lambda: False,
         db_configured=db_configured,
         notion_route_deps=notion_route_deps,
+        structured_read_routes=structured_read_routes,
     )
 
 
@@ -176,6 +178,26 @@ class CompanyAssistantRuntimeTests(unittest.TestCase):
         for stage in ("failure", "log", "barcode"):
             route = turn.routes_for_stage(stage)[0]
             self.assertIs(route._recordings, turn.recordings)  # type: ignore[attr-defined]
+
+    def test_opt_in_structured_read_route_precedes_standard_route(self) -> None:
+        api_read_route = _KnowledgeRoute(name="api_db_read")
+        runtime = CompanyAssistantRuntime(
+            _deps(
+                recordings_loader=lambda barcode: {"rows": []},
+                structured_read_routes=(api_read_route,),
+            )
+        )
+
+        turn = runtime.start_turn(_request())
+        result = turn.answer_stage("structured")
+
+        self.assertEqual(
+            turn.service_for_stage("structured").route_names,
+            ("api_db_read", "structured"),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.route, "api_db_read")
+        self.assertEqual(api_read_route.calls, ["REQ-RUNTIME-1"])
 
     def test_latest_context_barcode_is_recovered_without_mutating_input(self) -> None:
         request = _request(

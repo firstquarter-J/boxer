@@ -193,6 +193,37 @@ class CompanyAssistantSlackBridgeTests(unittest.TestCase):
         self.assertIn("생성 링크", replies[0])
         self.assertIn("[링크 생략]", replies[0])
 
+    def test_baby_magic_source_keeps_the_verified_result_link_clickable(
+        self,
+    ) -> None:
+        replies: list[str] = []
+        uri = "https://cdn-kr.mmtalkbox.com/results/one.jpg"
+        render_company_assistant_result(
+            CompanyAssistantResult(
+                route="barcode_baby_ai_list",
+                outcome="answered",
+                messages=(
+                    AssistantMessage(body=f"결과: [열기]({uri})"),
+                ),
+                sources=(
+                    SourceReference(
+                        source_id=uri,
+                        title="베이비매직 결과 1",
+                        uri=uri,
+                    ),
+                ),
+            ),
+            reply=lambda text, **kwargs: replies.append(text),
+            actor_id="U1",
+            client=None,
+            logger=logging.getLogger(__name__),
+        )
+
+        self.assertEqual(
+            replies,
+            [f"결과: <{uri}|열기>"],
+        )
+
     def test_plain_text_pipe_is_preserved(self) -> None:
         replies: list[str] = []
         render_company_assistant_result(

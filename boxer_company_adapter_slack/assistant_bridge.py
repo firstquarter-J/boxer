@@ -26,6 +26,8 @@ _LEGACY_SLACK_ROUTE_NAMES = {
     "device_diagnostic_followup": "device diagnostic followup",
     "notion_playbook_qa": "notion playbook qa",
     "barcode_evidence_freeform": "llm_freeform",
+    "device_db_detail": "devices_filter",
+    "weekly_recordings_summary": "weekly recordings report",
 }
 
 

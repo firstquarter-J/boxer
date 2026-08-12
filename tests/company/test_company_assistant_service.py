@@ -20,6 +20,12 @@ from boxer_company.assistant import (
     StructuredAssistantRoute,
 )
 from boxer_company.assistant.commonmark import slack_mrkdwn_to_commonmark
+from boxer_company.assistant.barcode_query_route import (
+    COMMON_API_BARCODE_QUERY_ROUTES,
+    is_safe_baby_magic_source_uri,
+    match_barcode_timeline_route,
+    match_common_api_barcode_query_route,
+)
 from boxer_company.assistant.structured_route import (
     match_structured_read_route,
 )
@@ -438,6 +444,45 @@ class StructuredAssistantRouteTests(unittest.TestCase):
         )
         self.assertIsNone(match_structured_read_route(mismatched))
 
+    def test_timeline_questions_defer_but_general_date_queries_stay_structured(
+        self,
+    ) -> None:
+        timeline_cases = (
+            ("12345678910 마지막 녹화 날짜", "barcode last recordedAt"),
+            ("12345678910 최신 영상은?", "barcode last recordedAt"),
+            (
+                "12345678910 2026-08-04 녹화됐어?",
+                "barcode recordedAt-on-date",
+            ),
+            (
+                "12345678910 어제 영상 있어?",
+                "barcode recordedAt-on-date",
+            ),
+        )
+        for question, expected in timeline_cases:
+            with self.subTest(question=question):
+                request = _request(question)
+                self.assertEqual(
+                    match_barcode_timeline_route(request),
+                    expected,
+                )
+                self.assertIsNone(match_structured_read_route(request))
+
+        # 날짜만으로는 timeline 존재 질문이 아니다. 목록·조회·개수는
+        # 기존 structured route가 전체 DB 범위를 그대로 처리한다.
+        for question in (
+            "12345678910 2026-08-04 영상 조회",
+            "12345678910 2026-08-04 영상 목록",
+            "12345678910 2026-08-04 영상 몇 개야?",
+        ):
+            with self.subTest(question=question):
+                request = _request(question)
+                self.assertIsNone(match_barcode_timeline_route(request))
+                self.assertEqual(
+                    match_structured_read_route(request),
+                    "recordings_filter",
+                )
+
     def test_hospital_room_query_returns_channel_neutral_result(self) -> None:
         route = StructuredAssistantRoute(
             is_weekly_report_request=lambda *args, **kwargs: False,
@@ -688,6 +733,150 @@ class BarcodeQueryAssistantRouteTests(unittest.TestCase):
 
         self.assertIsNone(
             route.handle(_request("12345678910 2024년 4월 영상 복원"))
+        )
+
+    def test_common_api_matcher_includes_db_only_residual_routes(self) -> None:
+        cases = (
+            ("베이비매직 목록", "baby_ai_list"),
+            ("12345678910 베이비매직 목록", "barcode_baby_ai_list"),
+        )
+
+        # Slack 표현을 분류할 뿐 DB/MDA/LLM은 호출하지 않는 공통 계약이다.
+        for question, expected_route in cases:
+            with self.subTest(route=expected_route):
+                self.assertIn(
+                    expected_route,
+                    COMMON_API_BARCODE_QUERY_ROUTES,
+                )
+                self.assertEqual(
+                    match_common_api_barcode_query_route(
+                        _request(question)
+                    ),
+                    expected_route,
+                )
+
+    def test_common_api_matcher_excludes_mda_mutation_and_precedence_routes(
+        self,
+    ) -> None:
+        for question in (
+            "10255657857 이건 유효성 검사에 걸리는 바코드냐",
+            "58291583958 왜 핑크바코드로 분류되지 않았어?",
+            "12345678910 2024년 4월 영상 복원",
+            "12345678910 마지막 녹화 날짜",
+            "12345678910 2026-08-04 녹화됐어?",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(
+                    match_common_api_barcode_query_route(
+                        _request(question)
+                    )
+                )
+
+    def test_baby_ai_list_is_channel_neutral_db_result(self) -> None:
+        route, load_calls, _ = self._route()
+        with patch(
+            "boxer_company.assistant.barcode_query_route."
+            "_query_baby_ai_list_by_barcode",
+            return_value=(
+                "*베이비매직 목록*\n"
+                "• 결과: "
+                "<https://cdn-kr.mmtalkbox.com/result.jpg|열기>"
+            ),
+        ) as query:
+            result = route.handle(
+                _request("12345678910 2026-08-04 베이비매직 목록")
+            )
+
+        self.assertEqual(result.route, "barcode_baby_ai_list")
+        self.assertEqual(result.outcome, "answered")
+        self.assertEqual(
+            result.messages[0].body,
+            "**베이비매직 목록**\n"
+            "• 결과: "
+            "[열기](https://cdn-kr.mmtalkbox.com/result.jpg)",
+        )
+        self.assertEqual(len(result.sources), 1)
+        self.assertEqual(
+            result.sources[0].uri,
+            "https://cdn-kr.mmtalkbox.com/result.jpg",
+        )
+        self.assertEqual(load_calls, [])
+        query.assert_called_once_with("12345678910", "2026-08-04")
+
+    def test_baby_ai_sources_ignore_env_host_and_sensitive_urls(self) -> None:
+        route, _, _ = self._route()
+        unsafe_urls = (
+            "https://example.invalid/result.jpg",
+            "https://cdn-kr.mmtalkbox.com/result.jpg?token=x",
+            "https://cdn-kr.mmtalkbox.com/result.jpg#token",
+            "https://user@cdn-kr.mmtalkbox.com/result.jpg",
+        )
+        for unsafe_url in unsafe_urls:
+            with self.subTest(unsafe_url=unsafe_url), patch(
+                "boxer_company.assistant.barcode_query_route."
+                "cs.BABY_MAGIC_CDN_BASE_URL",
+                "https://example.invalid",
+            ), patch(
+                "boxer_company.assistant.barcode_query_route."
+                "_query_baby_ai_list_by_barcode",
+                return_value=f"• 결과: <{unsafe_url}|열기>",
+            ):
+                result = route.handle(
+                    _request("12345678910 베이비매직 목록")
+                )
+
+            self.assertEqual(result.outcome, "answered")
+            self.assertEqual(result.sources, ())
+            self.assertNotIn(unsafe_url, result.messages[0].body)
+            self.assertIn(
+                "열기 [링크 생략]",
+                result.messages[0].body,
+            )
+
+        # Transport validator는 renderer의 2차 필터에 기대지 않고
+        # parser 혼동 문자와 제어문자를 source 계약에서 직접 거부한다.
+        for unsafe_url in (
+            "https://cdn-kr.mmtalkbox.com/x<y.jpg",
+            "https://cdn-kr.mmtalkbox.com/x>y.jpg",
+            "https://cdn-kr.mmtalkbox.com/x|y.jpg",
+            "https://cdn-kr.mmtalkbox.com/x\\y.jpg",
+            "https://cdn-kr.mmtalkbox.com/x\x00y.jpg",
+        ):
+            with self.subTest(unsafe_transport_url=unsafe_url):
+                self.assertFalse(
+                    is_safe_baby_magic_source_uri(unsafe_url)
+                )
+
+    def test_recorded_on_date_uses_db_context_and_shared_composer(self) -> None:
+        route, load_calls, engine = self._route(
+            answer_result=AnswerResult(
+                text="해당 날짜에 녹화 1건이 있어",
+                provider="claude",
+                used_llm=True,
+            )
+        )
+        with patch(
+            "boxer_company.assistant.barcode_query_route."
+            "_query_recordings_on_date_by_barcode",
+            return_value="*날짜별 녹화 여부*\n• 1개",
+        ) as query:
+            result = route.handle(
+                _request("12345678910 2026-08-04 녹화됐어?")
+            )
+
+        self.assertEqual(result.route, "barcode recordedAt-on-date")
+        self.assertEqual(result.outcome, "answered")
+        self.assertTrue(result.used_llm)
+        self.assertEqual(load_calls, ["12345678910"])
+        self.assertEqual(len(engine.requests), 1)
+        self.assertEqual(
+            engine.requests[0].evidence["request"]["targetDate"],
+            "2026-08-04",
+        )
+        query.assert_called_once()
+        self.assertEqual(
+            query.call_args.args[:2],
+            ("12345678910", "2026-08-04"),
         )
 
     def test_last_recorded_at_uses_shared_composer_and_safe_fallback(self) -> None:

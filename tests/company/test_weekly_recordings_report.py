@@ -120,6 +120,35 @@ class WeeklyRecordingsReportSummaryTests(unittest.TestCase):
         self.assertEqual(week_start_date, date(2026, 3, 23))
         self.assertEqual(week_end_date, date(2026, 3, 29))
 
+    def test_resolves_explicit_current_week_question_in_kst(self) -> None:
+        now = datetime(2026, 4, 3, 13, 0, 0)
+
+        current = (
+            report._resolve_weekly_recordings_report_question_target_date(
+                "이번 주 초음파 영상 현황",
+                explicit_target_date=None,
+                now=now,
+            )
+        )
+        previous = (
+            report._resolve_weekly_recordings_report_question_target_date(
+                "지난주 초음파 영상 현황",
+                explicit_target_date=None,
+                now=now,
+            )
+        )
+        explicit = (
+            report._resolve_weekly_recordings_report_question_target_date(
+                "이번 주 초음파 영상 현황",
+                explicit_target_date=date(2026, 3, 23),
+                now=now,
+            )
+        )
+
+        self.assertEqual(current, date(2026, 4, 3))
+        self.assertIsNone(previous)
+        self.assertEqual(explicit, date(2026, 3, 23))
+
 
 class WeeklyRecordingsReportFormatTests(unittest.TestCase):
     def test_formats_weekly_report_message(self) -> None:

@@ -36,6 +36,9 @@ class _AssistantRuntime(Protocol):
     def answer(self, request: Any) -> Any:
         ...
 
+    def answer_stage(self, request: Any, stage: str) -> Any:
+        ...
+
 
 ReadinessProbe = Callable[[], bool]
 
@@ -181,9 +184,16 @@ def create_company_api_app(
         started_at = time.monotonic()
         domain_request = turn.to_company_request(request_id)
         try:
-            result = cast(_AssistantRuntime, runtime).answer(
-                domain_request
-            )
+            typed_runtime = cast(_AssistantRuntime, runtime)
+            if turn.routeGroup is None:
+                result = typed_runtime.answer(domain_request)
+            else:
+                # rollout client가 고른 route group만 실행해 thread scope가
+                # 앞선 DB/MDA route를 뜻하지 않게 선점하는 일을 막는다.
+                result = typed_runtime.answer_stage(
+                    domain_request,
+                    turn.routeGroup,
+                )
             payload = serialize_result(result, request_id)
         except Exception:
             # 예외 문자열에는 credential이나 조회 원문이 섞일 수 있어
@@ -192,6 +202,7 @@ def create_company_api_app(
                 "company_api_turn_failed",
                 caller_id=principal.caller_id,
                 channel=turn.channel,
+                route_group=str(turn.routeGroup or "all"),
                 request_id=request_id,
                 status=500,
                 duration_ms=int(
@@ -209,6 +220,7 @@ def create_company_api_app(
             "company_api_turn_completed",
             caller_id=principal.caller_id,
             channel=turn.channel,
+            route_group=str(turn.routeGroup or "all"),
             request_id=request_id,
             route=str(payload["route"]),
             outcome=str(payload["outcome"]),

@@ -37,13 +37,19 @@ from boxer_company_adapter_slack.company_api_client import (
 )
 from boxer_company_adapter_slack.company_api_rollout import (
     BoundedShadowRunner,
+    wrap_company_barcode_freeform_service,
     wrap_company_barcode_log_service,
+    wrap_company_barcode_residual_service,
     wrap_company_barcode_service,
+    wrap_company_barcode_timeline_service,
+    wrap_company_device_db_detail_service,
     wrap_company_device_filter_service,
     wrap_company_device_service,
     wrap_company_notion_service,
+    wrap_company_playbook_service,
     wrap_company_recording_failure_service,
     wrap_company_structured_service,
+    wrap_company_weekly_summary_service,
 )
 from boxer_company_adapter_slack.barcode_routes import (
     BarcodeLogRouteContext,
@@ -165,6 +171,7 @@ from boxer_company.retrieval_rules import (
     _transform_company_retrieval_payload,
 )
 from boxer_company.assistant import (
+    CompanyAssistantService,
     CompanyAssistantRuntime,
     CompanyAssistantRuntimeDeps,
     CompanyAssistantRequest,
@@ -333,21 +340,39 @@ def create_app() -> App:
         "notion_mode=%s notion_local_fallback=%s "
         "structured_mode=%s structured_local_fallback=%s "
         "device_mode=%s device_local_fallback=%s "
+        "device_detail_mode=%s device_detail_local_fallback=%s "
+        "weekly_summary_mode=%s weekly_summary_local_fallback=%s "
         "recording_failure_mode=%s recording_failure_local_fallback=%s "
         "barcode_log_mode=%s barcode_log_local_fallback=%s "
-        "barcode_mode=%s barcode_local_fallback=%s",
+        "barcode_mode=%s barcode_local_fallback=%s "
+        "barcode_residual_mode=%s barcode_residual_local_fallback=%s "
+        "barcode_timeline_mode=%s barcode_timeline_local_fallback=%s "
+        "playbook_mode=%s playbook_local_fallback=%s "
+        "barcode_freeform_mode=%s barcode_freeform_local_fallback=%s",
         company_api_settings.notion_mode,
         company_api_settings.notion_fallback_enabled,
         company_api_settings.structured_mode,
         company_api_settings.structured_fallback_enabled,
         company_api_settings.device_mode,
         company_api_settings.device_fallback_enabled,
+        company_api_settings.device_detail_mode,
+        company_api_settings.device_detail_fallback_enabled,
+        company_api_settings.weekly_summary_mode,
+        company_api_settings.weekly_summary_fallback_enabled,
         company_api_settings.recording_failure_mode,
         company_api_settings.recording_failure_fallback_enabled,
         company_api_settings.barcode_log_mode,
         company_api_settings.barcode_log_fallback_enabled,
         company_api_settings.barcode_mode,
         company_api_settings.barcode_fallback_enabled,
+        company_api_settings.barcode_residual_mode,
+        company_api_settings.barcode_residual_fallback_enabled,
+        company_api_settings.barcode_timeline_mode,
+        company_api_settings.barcode_timeline_fallback_enabled,
+        company_api_settings.playbook_mode,
+        company_api_settings.playbook_fallback_enabled,
+        company_api_settings.barcode_freeform_mode,
+        company_api_settings.barcode_freeform_fallback_enabled,
     )
     claude_client = None
     if s.LLM_PROVIDER == "claude":
@@ -1220,8 +1245,9 @@ def create_app() -> App:
         ):
             return
 
-        # 기존 네 종류 DB route에 더해 장비는 개수·존재 조회만 API로
-        # 전환한다. 상세·상태 조회는 live enrichment 때문에 local이다.
+        # 기존 네 종류 DB route에 장비 개수·존재와 DB-only 상세,
+        # 사용자 요청형 주간 요약을 독립 rollout으로 더한다. 실시간 상태와
+        # MDA/SSH enrichment는 계속 Slack local 경로에 남긴다.
         structured_assistant_service = wrap_company_structured_service(
             assistant_turn.service_for_stage("structured"),
             company_api_settings,
@@ -1230,6 +1256,20 @@ def create_app() -> App:
             shadow_runner=company_api_shadow_runner,
         )
         structured_assistant_service = wrap_company_device_filter_service(
+            structured_assistant_service,
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
+        structured_assistant_service = wrap_company_device_db_detail_service(
+            structured_assistant_service,
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
+        structured_assistant_service = wrap_company_weekly_summary_service(
             structured_assistant_service,
             company_api_settings,
             company_api_client,
@@ -1252,6 +1292,24 @@ def create_app() -> App:
 
         barcode_assistant_service = wrap_company_barcode_service(
             assistant_turn.service_for_stage("barcode"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
+        # 이미 remote인 결정적 5개 route와 분리해 새 DB-only 조회가
+        # 배포만으로 즉시 전환되지 않도록 독립 rollout 경계를 둔다.
+        barcode_assistant_service = wrap_company_barcode_residual_service(
+            barcode_assistant_service,
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+        )
+        # LLM 합성이 가능한 녹화 시점 조회는 Baby AI와 독립적인
+        # local -> shadow -> remote 전환 경계를 사용한다.
+        barcode_assistant_service = wrap_company_barcode_timeline_service(
+            barcode_assistant_service,
             company_api_settings,
             company_api_client,
             logger,
@@ -1307,6 +1365,42 @@ def create_app() -> App:
                 context_entries=knowledge_context_entries,
             )
         )
+        knowledge_routes = knowledge_turn.routes_for_stage("knowledge")
+        playbook_route_index = next(
+            (
+                index
+                for index, route in enumerate(knowledge_routes)
+                if route.name == "notion_playbook_qa"
+            ),
+            len(knowledge_routes),
+        )
+        knowledge_precedence_service = CompanyAssistantService(
+            knowledge_routes[:playbook_route_index]
+        )
+        # Slack thread 수집과 최종 렌더링은 adapter에 남기고, 운영
+        # 플레이북 조회·근거 합성만 독립 API rollout 경계로 감싼다.
+        # 앞선 진단 snapshot route는 Slack 프로세스 메모리를 쓰므로
+        # API 호출 전에 같은 우선순위로 먼저 판정한다.
+        knowledge_assistant_service = wrap_company_playbook_service(
+            knowledge_turn.service_for_stage("knowledge"),
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
+            precedence_service=knowledge_precedence_service,
+        )
+        # 운영 문서와 live 진단 우선순위는 그대로 두고, 현재 질문이
+        # recordings 근거 해석을 명시한 경우만 knowledge API로 보낸다.
+        knowledge_assistant_service = (
+            wrap_company_barcode_freeform_service(
+                knowledge_assistant_service,
+                company_api_settings,
+                company_api_client,
+                logger,
+                shadow_runner=company_api_shadow_runner,
+                precedence_service=knowledge_precedence_service,
+            )
+        )
         if _handle_knowledge_routes(
             KnowledgeRoutesContext(
                 question=question,
@@ -1320,9 +1414,7 @@ def create_app() -> App:
                 logger=logger,
                 client=client,
                 claude_client=claude_client,
-                assistant_service=knowledge_turn.service_for_stage(
-                    "knowledge"
-                ),
+                assistant_service=knowledge_assistant_service,
                 context_entries=knowledge_context_entries,
             ),
             KnowledgeRoutesDeps(

@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from datetime import date
 
 import pymysql
 
@@ -10,7 +11,12 @@ from boxer_adapter_slack.common import (
     _set_request_log_route,
 )
 from boxer_company.assistant import CompanyAssistantService
+from boxer_company.assistant.barcode_query_route import (
+    match_barcode_timeline_route,
+)
 from boxer_company_adapter_slack.assistant_bridge import (
+    _commonmark_to_slack,
+    assistant_slack_route_name,
     build_company_assistant_request,
     render_company_assistant_result,
 )
@@ -38,6 +44,9 @@ from boxer_company.routers.barcode_log import (
 from boxer_company.routers.recording_streaming_restore import (
     _is_recording_streaming_restore_request,
 )
+from boxer_company.weekly_recordings_report import (
+    _resolve_weekly_recordings_report_question_target_date,
+)
 from boxer_company.routers.box_db import (
     _query_devices_by_filters,
     _query_hospitals_by_filters,
@@ -62,18 +71,18 @@ class StructuredRoutesContext:
 def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
     question = context.question
     barcode = context.barcode
+    assistant_request = build_company_assistant_request(
+        context.payload,
+        metadata={"barcode": barcode},
+    )
 
     if context.assistant_service is not None:
-        result = context.assistant_service.answer(
-            build_company_assistant_request(
-                context.payload,
-                metadata={"barcode": barcode},
-            )
-        )
+        result = context.assistant_service.answer(assistant_request)
         if result is not None:
+            route_name = assistant_slack_route_name(result.route)
             _set_request_log_route(
                 context.payload,
-                result.route,
+                route_name,
                 handler_type="router",
             )
             _merge_request_log_metadata(
@@ -82,13 +91,19 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
                 assistantFallbackReason=result.fallback_reason,
                 assistantUsedLlm=result.used_llm,
             )
-            render_company_assistant_result(
-                result,
-                reply=context.reply,
-                actor_id=context.payload.get("user_id"),
-                client=context.client,
-                logger=context.logger,
-            )
+            if result.route == "weekly_recordings_summary":
+                # API는 집계와 CommonMark까지만 소유하고 Slack adapter가
+                # 최종 Block transport를 만든다. scheduler/state는 기존
+                # reporter에 그대로 남고 사용자 요청에만 이 경로를 쓴다.
+                _reply_weekly_summary_result(context, result)
+            else:
+                render_company_assistant_result(
+                    result,
+                    reply=context.reply,
+                    actor_id=context.payload.get("user_id"),
+                    client=context.client,
+                    logger=context.logger,
+                )
             context.logger.info(
                 "Responded with structured assistant route=%s outcome=%s thread_ts=%s",
                 result.route,
@@ -101,6 +116,10 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
         # 복원 요청은 "영상 + 연월" 형태라 구조화 영상 조회가 먼저 잡기 쉬워서
         # 전용 MDA 복원 라우터까지 내려가게 한다.
         return False
+    if match_barcode_timeline_route(assistant_request) is not None:
+        # service가 None을 반환한 뒤 실행되는 legacy fallback도 같은
+        # precedence를 지켜 timeline 질문을 barcode handler로 넘긴다.
+        return False
 
     try:
         structured_target_date, _ = _extract_optional_requested_date(question)
@@ -109,6 +128,25 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
         structured_date_error = exc
     else:
         structured_date_error = None
+
+    weekly_target_date = structured_target_date
+    if structured_date_error is None:
+        explicit_weekly_date = (
+            date.fromisoformat(structured_target_date)
+            if structured_target_date
+            else None
+        )
+        resolved_weekly_date = (
+            _resolve_weekly_recordings_report_question_target_date(
+                question,
+                explicit_target_date=explicit_weekly_date,
+            )
+        )
+        weekly_target_date = (
+            resolved_weekly_date.isoformat()
+            if resolved_weekly_date is not None
+            else None
+        )
 
     structured_target_year = _extract_year_filter(question)
     if structured_target_year is not None and structured_target_date is None:
@@ -244,7 +282,7 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
     if _is_weekly_recordings_report_request(
         question,
         barcode=barcode,
-        target_date=structured_target_date,
+        target_date=weekly_target_date,
     ):
         try:
             if structured_date_error is not None:
@@ -254,7 +292,7 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
                 "weekly recordings report",
                 route_mode="summary",
                 handler_type="router",
-                requested_date=structured_target_date,
+                requested_date=weekly_target_date,
             )
             (
                 result_text,
@@ -262,7 +300,7 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
                 resolved_week_start_date,
                 resolved_week_end_date,
             ) = _build_weekly_recordings_report_reply_payload(
-                target_date=structured_target_date
+                target_date=weekly_target_date
             )
             if resolved_week_start_date:
                 _set_request_log_route(
@@ -384,3 +422,54 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
         return True
 
     return False
+
+
+def _reply_weekly_summary_result(
+    context: StructuredRoutesContext,
+    result: object,
+) -> None:
+    messages = getattr(result, "messages", ())
+    body = "\n\n".join(
+        str(message.body or "").strip()
+        for message in messages
+        if str(message.body or "").strip()
+    )
+    slack_text = _commonmark_to_slack(body)
+    # section text 상한보다 여유 있게 줄 단위로 나눠 긴 병원 목록도
+    # Block 계약 안에서 보낸다. fallback text는 전체 내용을 유지한다.
+    blocks: list[dict[str, object]] = []
+    chunk_lines: list[str] = []
+    chunk_chars = 0
+    for line in slack_text.splitlines() or [slack_text]:
+        added = len(line) + (1 if chunk_lines else 0)
+        if chunk_lines and chunk_chars + added > 2_800:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "\n".join(chunk_lines),
+                    },
+                }
+            )
+            chunk_lines = []
+            chunk_chars = 0
+        chunk_lines.append(line[:2_800])
+        chunk_chars += min(len(line), 2_800) + (
+            1 if len(chunk_lines) > 1 else 0
+        )
+    if chunk_lines:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "\n".join(chunk_lines),
+                },
+            }
+        )
+    context.reply(
+        slack_text,
+        mention_user=False,
+        blocks=blocks,
+    )

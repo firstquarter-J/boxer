@@ -80,6 +80,10 @@ _LAZY_EXPORTS = {
         "boxer_company.assistant.knowledge_routes",
         "DeviceDiagnosticFollowupRouteDeps",
     ),
+    "DeviceDbDetailAssistantRoute": (
+        "boxer_company.assistant.device_db_detail_route",
+        "DeviceDbDetailAssistantRoute",
+    ),
     "DeviceLedLogAssistantRoute": (
         "boxer_company.assistant.device_led_routes",
         "DeviceLedLogAssistantRoute",
@@ -107,6 +111,10 @@ _LAZY_EXPORTS = {
     "StructuredAssistantRoute": (
         "boxer_company.assistant.structured_route",
         "StructuredAssistantRoute",
+    ),
+    "WeeklyRecordingsSummaryAssistantRoute": (
+        "boxer_company.assistant.operational_read_routes",
+        "WeeklyRecordingsSummaryAssistantRoute",
     ),
     "build_company_read_only_knowledge_routes": (
         "boxer_company.assistant.knowledge_routes",
@@ -155,6 +163,7 @@ __all__ = [
     "CompanyReadOnlyKnowledgeRouteDeps",
     "DeviceDiagnosticFollowupAssistantRoute",
     "DeviceDiagnosticFollowupRouteDeps",
+    "DeviceDbDetailAssistantRoute",
     "DeviceLedLogAssistantRoute",
     "DeviceLedPatternGuideAssistantRoute",
     "NotionPlaybookQAAssistantRoute",
@@ -164,6 +173,7 @@ __all__ = [
     "SourceReference",
     "StructuredAssistantRoute",
     "SuggestedAction",
+    "WeeklyRecordingsSummaryAssistantRoute",
     "build_company_freeform_system_prompt",
     "build_company_read_only_knowledge_routes",
     "create_company_assistant_runtime",

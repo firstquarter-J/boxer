@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable
+from urllib.parse import urlsplit
 
 import pymysql
 
@@ -16,6 +18,7 @@ from boxer_company.assistant.contracts import (
     AssistantOutcome,
     CompanyAssistantRequest,
     CompanyAssistantResult,
+    SourceReference,
 )
 from boxer_company.assistant.service import (
     RecordingsContextBarcodeMismatch,
@@ -65,6 +68,54 @@ from boxer_company.routers.recording_streaming_restore import (
 )
 
 
+# 공통 API는 DB 조회와 입력 안내로 끝나는 route만 허용한다. MDA를 보는
+# 핑크/유효성 분류와 복원 mutation은 이 목록 밖에 두어 adapter에 남긴다.
+COMMON_API_BARCODE_QUERY_ROUTES = frozenset(
+    {
+        "barcode_video_count",
+        "baby_ai_list",
+        "barcode_baby_ai_list",
+        "barcode_video_info",
+        "barcode_video_list",
+        "barcode_video_length",
+        "barcode_all_recorded_dates",
+    }
+)
+BARCODE_TIMELINE_ROUTES = frozenset(
+    {
+        "barcode last recordedAt",
+        "barcode recordedAt-on-date",
+    }
+)
+_BARCODE_DATE_EXISTENCE_HINTS = (
+    "있어",
+    "있나",
+    "있는지",
+    "있었",
+    "유무",
+    "여부",
+    "존재",
+    "됐",
+    "되었",
+    "된 거",
+    "된게",
+    "된 게",
+    "was recorded",
+    "exists",
+    "existence",
+    "any recording",
+    "any video",
+)
+_BABY_MAGIC_RESULT_LINK_PATTERN = re.compile(
+    r"<(https?://[^>|\s]+)\|([^>]*)>"
+)
+# env가 임의 host로 바뀌어도 transport source 신뢰 경계는 회사 기본 CDN에
+# 고정한다. 이 host 밖 링크는 source와 본문 양쪽에서 클릭 가능하게 만들지 않는다.
+_BABY_MAGIC_SOURCE_HOST = (
+    urlsplit(cs.BABY_MAGIC_CDN_DEFAULT_BASE_URL).hostname or ""
+).lower()
+
+
 def match_barcode_query_route(
     request: CompanyAssistantRequest,
 ) -> str | None:
@@ -99,6 +150,39 @@ def match_barcode_query_route(
         return "barcode last recordedAt"
     if _is_barcode_video_recorded_on_date_request(question, barcode):
         return "barcode recordedAt-on-date"
+    return None
+
+
+def match_common_api_barcode_query_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """외부 조회 없이 공통 API에서 실행할 DB-only 바코드 route를 고른다."""
+
+    route = match_barcode_query_route(request)
+    if route in COMMON_API_BARCODE_QUERY_ROUTES:
+        return route
+    return None
+
+
+def match_barcode_timeline_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """일반 날짜 목록은 제외하고 명시적인 녹화 시점·존재 질문만 고른다."""
+
+    # 기존 barcode matcher의 개수·목록·정보·길이 우선순위를 먼저 적용해
+    # 날짜가 있다는 이유만으로 일반 structured 조회를 가로채지 않는다.
+    route = match_barcode_query_route(request)
+    if route == "barcode last recordedAt":
+        return route
+    if route != "barcode recordedAt-on-date":
+        return None
+
+    lowered = request.question.lower()
+    if any(
+        hint in request.question or hint in lowered
+        for hint in _BARCODE_DATE_EXISTENCE_HINTS
+    ):
+        return route
     return None
 
 
@@ -192,6 +276,8 @@ class BarcodeQueryAssistantRoute:
             return self._run_query(
                 route="barcode_baby_ai_list",
                 query=query_baby_ai,
+                body_builder=_to_baby_magic_commonmark,
+                source_builder=_build_baby_magic_sources,
                 format_error_prefix="베이비매직 목록 조회 요청 형식 오류",
                 dependency_error="베이비매직 목록 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
                 retry_error="베이비매직 목록 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
@@ -416,12 +502,22 @@ class BarcodeQueryAssistantRoute:
         dependency_error: str,
         retry_error: str,
         request_id: str,
+        body_builder: Callable[[str], str] | None = None,
+        source_builder: (
+            Callable[[str], tuple[SourceReference, ...]] | None
+        ) = None,
     ) -> CompanyAssistantResult:
         try:
+            query_result = query()
             return _result(
                 route=route,
                 outcome="answered",
-                body=_to_commonmark(query()),
+                body=(body_builder or _to_commonmark)(query_result),
+                sources=(
+                    source_builder(query_result)
+                    if source_builder is not None
+                    else ()
+                ),
             )
         except ValueError as exc:
             return _result(
@@ -463,6 +559,74 @@ def _to_commonmark(text: str) -> str:
     return slack_mrkdwn_to_commonmark(text)
 
 
+def _to_baby_magic_commonmark(text: str) -> str:
+    """검증된 CDN 결과만 링크로 남기고 나머지 URL 원문은 제거한다."""
+
+    def replace_link(matched: re.Match[str]) -> str:
+        if is_safe_baby_magic_source_uri(matched.group(1)):
+            return matched.group(0)
+        # label도 DB 결과에 포함된 문자열이므로 재사용하지 않고 고정 문구로
+        # 바꿔 Markdown/Slack 자동 링크와 delimiter 주입을 함께 막는다.
+        return "열기 [링크 생략]"
+
+    return _to_commonmark(
+        _BABY_MAGIC_RESULT_LINK_PATTERN.sub(replace_link, text or "")
+    )
+
+
+def _build_baby_magic_sources(
+    query_result: str,
+) -> tuple[SourceReference, ...]:
+    """고정된 공개 CDN의 credential 없는 결과 링크만 transport source로 만든다."""
+
+    sources: list[SourceReference] = []
+    seen: set[str] = set()
+    for matched in _BABY_MAGIC_RESULT_LINK_PATTERN.finditer(
+        query_result or ""
+    ):
+        uri = matched.group(1).strip()
+        if uri in seen or not is_safe_baby_magic_source_uri(uri):
+            continue
+        seen.add(uri)
+        sources.append(
+            SourceReference(
+                source_id=uri,
+                title=f"베이비매직 결과 {len(sources) + 1}",
+                uri=uri,
+            )
+        )
+    return tuple(sources)
+
+
+def is_safe_baby_magic_source_uri(value: object) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized or any(
+        character.isspace()
+        or ord(character) < 32
+        or character in "<>|\\"
+        for character in normalized
+    ):
+        # API source 자체도 Slack/CommonMark delimiter와 URL parser별로
+        # 다르게 해석될 수 있는 제어문자·역슬래시를 신뢰하지 않는다.
+        return False
+    try:
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme.lower() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() == _BABY_MAGIC_SOURCE_HOST
+        and port is None
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path not in {"", "/"}
+    )
+
+
 def _is_safe_barcode_answer(text: str) -> bool:
     lowered = (text or "").lower()
     return "다른 바코드" not in text and "다른 barcode" not in lowered
@@ -474,16 +638,23 @@ def _result(
     outcome: AssistantOutcome,
     body: str,
     fallback_reason: str | None = None,
+    sources: tuple[SourceReference, ...] = (),
 ) -> CompanyAssistantResult:
     return CompanyAssistantResult(
         route=route,
         outcome=outcome,
         messages=(AssistantMessage(body=body),),
+        sources=sources,
         fallback_reason=fallback_reason,
     )
 
 
 __all__ = [
+    "BARCODE_TIMELINE_ROUTES",
     "BarcodeQueryAssistantRoute",
+    "COMMON_API_BARCODE_QUERY_ROUTES",
+    "is_safe_baby_magic_source_uri",
+    "match_barcode_timeline_route",
     "match_barcode_query_route",
+    "match_common_api_barcode_query_route",
 ]

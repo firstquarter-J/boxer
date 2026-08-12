@@ -111,6 +111,26 @@ _SENSITIVE_SOURCE_PARAMETER_MARKERS = (
     "token",
 )
 _RolloutMode = Literal["local", "shadow", "remote"]
+_RouteGroup = Literal[
+    "notion",
+    "device",
+    "failure",
+    "log",
+    "structured",
+    "barcode",
+    "knowledge",
+]
+_ROUTE_GROUPS = frozenset(
+    {
+        "notion",
+        "device",
+        "failure",
+        "log",
+        "structured",
+        "barcode",
+        "knowledge",
+    }
+)
 
 
 class CompanyApiClientError(RuntimeError):
@@ -159,12 +179,25 @@ class CompanyApiClientSettings:
     structured_fallback_enabled: bool = False
     device_mode: _RolloutMode = "local"
     device_fallback_enabled: bool = False
+    # 세부 route군은 기존 상위 route군과 독립적으로 전환·롤백한다.
+    device_detail_mode: _RolloutMode = "local"
+    device_detail_fallback_enabled: bool = False
     recording_failure_mode: _RolloutMode = "local"
     recording_failure_fallback_enabled: bool = False
     barcode_log_mode: _RolloutMode = "local"
     barcode_log_fallback_enabled: bool = False
     barcode_mode: _RolloutMode = "local"
     barcode_fallback_enabled: bool = False
+    barcode_residual_mode: _RolloutMode = "local"
+    barcode_residual_fallback_enabled: bool = False
+    barcode_timeline_mode: _RolloutMode = "local"
+    barcode_timeline_fallback_enabled: bool = False
+    barcode_freeform_mode: _RolloutMode = "local"
+    barcode_freeform_fallback_enabled: bool = False
+    playbook_mode: _RolloutMode = "local"
+    playbook_fallback_enabled: bool = False
+    weekly_summary_mode: _RolloutMode = "local"
+    weekly_summary_fallback_enabled: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -174,9 +207,15 @@ class CompanyApiClientSettings:
                 self.notion_mode,
                 self.structured_mode,
                 self.device_mode,
+                self.device_detail_mode,
                 self.recording_failure_mode,
                 self.barcode_log_mode,
                 self.barcode_mode,
+                self.barcode_residual_mode,
+                self.barcode_timeline_mode,
+                self.barcode_freeform_mode,
+                self.playbook_mode,
+                self.weekly_summary_mode,
             )
         )
 
@@ -186,9 +225,15 @@ class CompanyApiClientSettings:
             self.notion_mode,
             self.structured_mode,
             self.device_mode,
+            self.device_detail_mode,
             self.recording_failure_mode,
             self.barcode_log_mode,
             self.barcode_mode,
+            self.barcode_residual_mode,
+            self.barcode_timeline_mode,
+            self.barcode_freeform_mode,
+            self.playbook_mode,
+            self.weekly_summary_mode,
         }
 
 
@@ -210,6 +255,10 @@ def load_company_api_client_settings(
         source,
         "BOXER_COMPANY_API_DEVICE_MODE",
     )
+    device_detail_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
+    )
     recording_failure_mode = _rollout_mode_setting(
         source,
         "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
@@ -222,6 +271,26 @@ def load_company_api_client_settings(
         source,
         "BOXER_COMPANY_API_BARCODE_MODE",
     )
+    barcode_residual_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE",
+    )
+    barcode_timeline_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE",
+    )
+    barcode_freeform_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
+    )
+    playbook_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_PLAYBOOK_MODE",
+    )
+    weekly_summary_mode = _rollout_mode_setting(
+        source,
+        "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
+    )
 
     # 모든 route group이 local이면 즉시 롤백 상태다. 이전 remote
     # transport 값이 잘못 남아 있어도 전부 폐기해 Slack 기동을 막지 않는다.
@@ -231,9 +300,15 @@ def load_company_api_client_settings(
             notion_mode,
             structured_mode,
             device_mode,
+            device_detail_mode,
             recording_failure_mode,
             barcode_log_mode,
             barcode_mode,
+            barcode_residual_mode,
+            barcode_timeline_mode,
+            barcode_freeform_mode,
+            playbook_mode,
+            weekly_summary_mode,
         )
     ):
         return CompanyApiClientSettings(
@@ -305,6 +380,15 @@ def load_company_api_client_settings(
         if device_mode != "local"
         else False
     )
+    device_detail_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED",
+            False,
+        )
+        if device_detail_mode != "local"
+        else False
+    )
     recording_failure_fallback_enabled = (
         _boolean_setting(
             source,
@@ -332,6 +416,51 @@ def load_company_api_client_settings(
         if barcode_mode != "local"
         else False
     )
+    barcode_residual_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED",
+            False,
+        )
+        if barcode_residual_mode != "local"
+        else False
+    )
+    barcode_timeline_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED",
+            False,
+        )
+        if barcode_timeline_mode != "local"
+        else False
+    )
+    barcode_freeform_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED",
+            False,
+        )
+        if barcode_freeform_mode != "local"
+        else False
+    )
+    playbook_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED",
+            False,
+        )
+        if playbook_mode != "local"
+        else False
+    )
+    weekly_summary_fallback_enabled = (
+        _boolean_setting(
+            source,
+            "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED",
+            False,
+        )
+        if weekly_summary_mode != "local"
+        else False
+    )
     return CompanyApiClientSettings(
         base_url=base_url,
         token=token,
@@ -346,6 +475,10 @@ def load_company_api_client_settings(
         ),
         device_mode=device_mode,
         device_fallback_enabled=device_fallback_enabled,
+        device_detail_mode=device_detail_mode,
+        device_detail_fallback_enabled=(
+            device_detail_fallback_enabled
+        ),
         recording_failure_mode=recording_failure_mode,
         recording_failure_fallback_enabled=(
             recording_failure_fallback_enabled
@@ -354,6 +487,24 @@ def load_company_api_client_settings(
         barcode_log_fallback_enabled=barcode_log_fallback_enabled,
         barcode_mode=barcode_mode,
         barcode_fallback_enabled=barcode_fallback_enabled,
+        barcode_residual_mode=barcode_residual_mode,
+        barcode_residual_fallback_enabled=(
+            barcode_residual_fallback_enabled
+        ),
+        barcode_timeline_mode=barcode_timeline_mode,
+        barcode_timeline_fallback_enabled=(
+            barcode_timeline_fallback_enabled
+        ),
+        barcode_freeform_mode=barcode_freeform_mode,
+        barcode_freeform_fallback_enabled=(
+            barcode_freeform_fallback_enabled
+        ),
+        playbook_mode=playbook_mode,
+        playbook_fallback_enabled=playbook_fallback_enabled,
+        weekly_summary_mode=weekly_summary_mode,
+        weekly_summary_fallback_enabled=(
+            weekly_summary_fallback_enabled
+        ),
     )
 
 
@@ -381,6 +532,8 @@ class CompanyAssistantApiClient:
     def answer(
         self,
         request: CompanyAssistantRequest,
+        *,
+        route_group: _RouteGroup | None = None,
     ) -> CompanyAssistantResult:
         if not self._settings.enabled:
             raise CompanyApiContractError(
@@ -395,7 +548,10 @@ class CompanyAssistantApiClient:
                 "company_api_traceparent_invalid",
                 request_id=request_id,
             )
-        payload = _serialize_request(request)
+        payload = _serialize_request(
+            request,
+            route_group=route_group,
+        )
         headers = {
             "Authorization": f"Bearer {self._settings.token}",
             "X-Request-ID": request_id,
@@ -639,11 +795,32 @@ def _validate_client_settings(
         (settings.structured_mode, settings.structured_fallback_enabled),
         (settings.device_mode, settings.device_fallback_enabled),
         (
+            settings.device_detail_mode,
+            settings.device_detail_fallback_enabled,
+        ),
+        (
             settings.recording_failure_mode,
             settings.recording_failure_fallback_enabled,
         ),
         (settings.barcode_log_mode, settings.barcode_log_fallback_enabled),
         (settings.barcode_mode, settings.barcode_fallback_enabled),
+        (
+            settings.barcode_residual_mode,
+            settings.barcode_residual_fallback_enabled,
+        ),
+        (
+            settings.barcode_timeline_mode,
+            settings.barcode_timeline_fallback_enabled,
+        ),
+        (
+            settings.barcode_freeform_mode,
+            settings.barcode_freeform_fallback_enabled,
+        ),
+        (settings.playbook_mode, settings.playbook_fallback_enabled),
+        (
+            settings.weekly_summary_mode,
+            settings.weekly_summary_fallback_enabled,
+        ),
     )
     if any(
         mode not in {"local", "shadow", "remote"}
@@ -793,7 +970,14 @@ def _validate_request(request: CompanyAssistantRequest) -> str:
 
 def _serialize_request(
     request: CompanyAssistantRequest,
+    *,
+    route_group: _RouteGroup | None = None,
 ) -> dict[str, Any]:
+    if route_group is not None and route_group not in _ROUTE_GROUPS:
+        raise CompanyApiContractError(
+            "company_api_route_group_invalid",
+            request_id=request.request_id,
+        )
     payload: dict[str, Any] = {
         "tenantId": str(request.tenant_id).strip(),
         "actorId": str(request.actor_id).strip(),
@@ -808,6 +992,9 @@ def _serialize_request(
     scope = _serialize_scope(request.metadata)
     if scope:
         payload["scope"] = scope
+    if route_group is not None:
+        # routeGroup은 권한이 아니라 실행 범위를 더 좁히는 transport hint다.
+        payload["routeGroup"] = route_group
     return payload
 
 

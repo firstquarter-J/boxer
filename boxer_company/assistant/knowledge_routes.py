@@ -12,6 +12,12 @@ from boxer_company.assistant.answer_composer import (
     CompanyEvidenceAnswerComposer,
     CompanyEvidenceAnswerPolicy,
 )
+from boxer_company.assistant.barcode_log_route import (
+    match_barcode_log_route,
+)
+from boxer_company.assistant.barcode_query_route import (
+    match_barcode_query_route,
+)
 from boxer_company.assistant.commonmark import slack_mrkdwn_to_commonmark
 from boxer_company.assistant.contracts import (
     AssistantMessage,
@@ -20,12 +26,18 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
     SourceReference,
 )
+from boxer_company.assistant.device_led_routes import (
+    match_device_read_route,
+)
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
 )
 from boxer_company.assistant.notion_answer_safety import (
     build_notion_document_security_refusal,
     needs_notion_document_security_refusal,
+)
+from boxer_company.assistant.recording_failure_route import (
+    match_recording_failure_route,
 )
 from boxer_company.assistant.scope_guard import (
     AssistantRequestScopeMismatch,
@@ -37,9 +49,15 @@ from boxer_company.assistant.service import (
     RecordingsContextBarcodeMismatch,
     RequestScopedRecordingsContext,
 )
+from boxer_company.assistant.structured_route import (
+    match_structured_read_route,
+)
 from boxer_company.notion_playbooks import (
     _is_company_notion_configured,
     _select_notion_references,
+)
+from boxer_company.notion_workspace_search import (
+    _looks_like_company_notion_search,
 )
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
@@ -50,8 +68,19 @@ from boxer_company.retrieval_rules import (
     _is_notion_doc_general_overview_question,
     _transform_company_retrieval_payload,
 )
+from boxer_company.routers.app_user import (
+    _should_analyze_app_user_baby_selection,
+    _should_lookup_barcode,
+)
 from boxer_company.routers.device_diagnostics import (
     _build_device_diagnostic_followup_fallback,
+    _extract_device_name_for_diagnostic_freeform,
+    _has_device_diagnostic_start_hint,
+    _is_device_diagnostic_freeform_request,
+    _select_device_diagnostic_followup_command_keys,
+)
+from boxer_company.routers.recording_streaming_restore import (
+    _is_recording_streaming_restore_request,
 )
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
 
@@ -339,6 +368,148 @@ _SAFE_NOTION_URL_HOSTS = {
     "notion.so",
     "app.notion.com",
 }
+_NOTION_PLAYBOOK_ROUTE = "notion_playbook_qa"
+_BARCODE_EVIDENCE_FREEFORM_ROUTE = "barcode_evidence_freeform"
+_BARCODE_EVIDENCE_SCOPE_HINTS = (
+    "이 바코드",
+    "해당 바코드",
+    "그 바코드",
+    "위 바코드",
+    "방금 바코드",
+)
+_BARCODE_EVIDENCE_SUBJECT_HINTS = (
+    "녹화",
+    "영상",
+    "촬영",
+    "업로드",
+    "recording",
+    "recordings",
+)
+_BARCODE_EVIDENCE_BASIS_HINTS = (
+    "근거",
+    "기록",
+    "이력",
+    "데이터",
+    "recordedat",
+    "recorded at",
+    " row",
+    " rows",
+)
+_BARCODE_EVIDENCE_INTERPRETATION_HINTS = (
+    "설명",
+    "분석",
+    "판단",
+    "확인",
+    "비교",
+    "경향",
+    "간격",
+    "정상",
+    "이상",
+    "문제",
+    "성공",
+    "실패",
+    "원인",
+    "왜",
+    "어때",
+    "어떻게",
+)
+_BARCODE_EVIDENCE_PII_HINTS = (
+    "유저",
+    "사용자",
+    "산모",
+    "회원",
+    "환자",
+    "개인정보",
+    "전화번호",
+    "휴대폰",
+    "이메일",
+    "생년월일",
+    "출산예정일",
+    "태아",
+    "app user",
+    "app-user",
+    "user email",
+    "email",
+    "phone number",
+    "phone",
+    "mobile",
+    "patient",
+    "personal data",
+    "date of birth",
+    "birth date",
+    "due date",
+    "lambda",
+    "람다",
+)
+_BARCODE_EVIDENCE_MUTATION_HINTS = (
+    "다운로드",
+    "복구",
+    "복원",
+    "삭제",
+    "수정",
+    "변경",
+    "업데이트",
+    "재부팅",
+    "재시작",
+    "전원 꺼",
+    "꺼줘",
+    "켜줘",
+    "명령 실행",
+    "전송해",
+    "전송 해",
+    "실행해",
+    "실행 해",
+    "보내줘",
+    "보내 줘",
+    "발송해",
+    "발송 해",
+    "원격 접속",
+    "download",
+    "recover",
+    "recovery",
+    "restore",
+    "delete",
+    "remove",
+    "modify",
+    "edit",
+    "update",
+    "upgrade",
+    "reboot",
+    "restart",
+    "shutdown",
+    "power off",
+    "turn off",
+    "turn on",
+    "run command",
+    "execute",
+    "remote access",
+    "ssh",
+)
+_BARCODE_EVIDENCE_LIVE_HINTS = (
+    "온라인",
+    "오프라인",
+    "연결 상태",
+    "실시간",
+    "현재 상태",
+    "버전",
+    "캡처 보드",
+    "캡처보드",
+    "캡쳐 카드",
+    "캡쳐카드",
+    "엠디에이",
+    "online",
+    "offline",
+    "connection status",
+    "live status",
+    "current status",
+    "real-time",
+    "realtime",
+    "version",
+    "capture board",
+    "capture card",
+    "mda",
+    "pm2",
+)
 
 
 def _request_context_text(request: CompanyAssistantRequest) -> str:
@@ -403,6 +574,42 @@ def looks_like_notion_playbook_followup(
     return any(token in text for token in _NOTION_FOLLOWUP_TOKENS) or any(
         token in lowered
         for token in ("alternative", "workaround", "other way", "else")
+    )
+
+
+def _match_notion_playbook_route(
+    request: CompanyAssistantRequest,
+    *,
+    looks_like_question: Callable[[str], bool],
+    looks_like_followup: Callable[[str, str], bool],
+    context_text: str | None = None,
+) -> str | None:
+    """조회 없이 직접·후속 플레이북 질문의 공통 route만 확정한다."""
+
+    # HTTP rollout matcher와 실제 route가 같은 정규화 문맥·판정 순서를
+    # 공유해 adapter별 분류 차이로 다른 route를 호출하지 않게 한다.
+    normalized_context = (
+        _request_context_text(request)
+        if context_text is None
+        else context_text
+    )
+    if looks_like_question(request.question) or looks_like_followup(
+        request.question,
+        normalized_context,
+    ):
+        return _NOTION_PLAYBOOK_ROUTE
+    return None
+
+
+def match_notion_playbook_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """외부 조회·LLM 호출 없이 기본 플레이북 route를 분류한다."""
+
+    return _match_notion_playbook_route(
+        request,
+        looks_like_question=looks_like_notion_playbook_question,
+        looks_like_followup=looks_like_notion_playbook_followup,
     )
 
 
@@ -786,7 +993,7 @@ class NotionPlaybookQARouteDeps:
 
 
 class NotionPlaybookQAAssistantRoute:
-    name = "notion_playbook_qa"
+    name = _NOTION_PLAYBOOK_ROUTE
 
     def __init__(
         self,
@@ -802,12 +1009,12 @@ class NotionPlaybookQAAssistantRoute:
         request: CompanyAssistantRequest,
     ) -> CompanyAssistantResult | None:
         context_text = _request_context_text(request)
-        if not self._deps.looks_like_question(
-            request.question
-        ) and not self._deps.looks_like_followup(
-            request.question,
-            context_text,
-        ):
+        if _match_notion_playbook_route(
+            request,
+            looks_like_question=self._deps.looks_like_question,
+            looks_like_followup=self._deps.looks_like_followup,
+            context_text=context_text,
+        ) is None:
             return None
 
         if self._deps.is_exfiltration_attempt(
@@ -933,6 +1140,103 @@ class NotionPlaybookQAAssistantRoute:
         return result
 
 
+def match_barcode_evidence_freeform_route(
+    request: CompanyAssistantRequest,
+) -> str | None:
+    """외부 조회 없이 명시적인 recordings 근거 해석 요청만 고른다."""
+
+    try:
+        barcode = resolve_assistant_request_scope(request).barcode
+    except AssistantRequestScopeMismatch:
+        return None
+
+    question = (request.question or "").strip()
+    lowered = question.lower()
+    if not barcode or not question:
+        return None
+
+    # thread에서 우연히 남은 barcode scope가 일반 대화를 원격 LLM으로
+    # 보내지 않도록 현재 질문이 대상을 직접 가리키는 경우만 허용한다.
+    if barcode not in question and not any(
+        hint in question for hint in _BARCODE_EVIDENCE_SCOPE_HINTS
+    ):
+        return None
+
+    context_text = _request_context_text(request)
+    if is_prompt_exfiltration_attempt(question, context_text):
+        return None
+    if _looks_like_company_notion_search(question):
+        return None
+    if match_notion_playbook_route(request) is not None:
+        return None
+
+    # PII/app-user, 상태 변경, 실시간 장비 조회는 언어가 섞여도 Slack의
+    # 기존 권한·확인 경계를 계속 타게 하고 API matcher에서는 fail-closed한다.
+    if any(hint in lowered for hint in _BARCODE_EVIDENCE_PII_HINTS):
+        return None
+    if any(hint in lowered for hint in _BARCODE_EVIDENCE_MUTATION_HINTS):
+        return None
+    if any(hint in lowered for hint in _BARCODE_EVIDENCE_LIVE_HINTS):
+        return None
+    if _should_analyze_app_user_baby_selection(question, barcode):
+        return None
+    if _should_lookup_barcode(question, barcode):
+        return None
+    if _is_recording_streaming_restore_request(question, barcode):
+        return None
+
+    device_name = _extract_device_name_for_diagnostic_freeform(question)
+    if (
+        _has_device_diagnostic_start_hint(question)
+        or _select_device_diagnostic_followup_command_keys(question)
+        or _is_device_diagnostic_freeform_request(
+            question,
+            device_name=device_name,
+        )
+    ):
+        return None
+
+    try:
+        earlier_route = next(
+            (
+                route
+                for route in (
+                    match_device_read_route(request),
+                    match_recording_failure_route(request),
+                    match_barcode_log_route(request),
+                    match_structured_read_route(request),
+                    match_barcode_query_route(request),
+                )
+                if route is not None
+            ),
+            None,
+        )
+    except Exception:
+        # 사전 분류가 예상 밖 입력을 처리하지 못하면 원격 fallback으로
+        # 넓히지 않고 기존 Slack 경로에 남긴다.
+        return None
+    if earlier_route is not None:
+        return None
+
+    has_recording_subject = any(
+        hint in lowered for hint in _BARCODE_EVIDENCE_SUBJECT_HINTS
+    )
+    has_evidence_basis = any(
+        hint in lowered for hint in _BARCODE_EVIDENCE_BASIS_HINTS
+    )
+    has_interpretation_intent = any(
+        hint in lowered
+        for hint in _BARCODE_EVIDENCE_INTERPRETATION_HINTS
+    )
+    if not (
+        has_recording_subject
+        and has_evidence_basis
+        and has_interpretation_intent
+    ):
+        return None
+    return _BARCODE_EVIDENCE_FREEFORM_ROUTE
+
+
 @dataclass(frozen=True, slots=True)
 class BarcodeEvidenceFreeformRouteDeps:
     recordings: RequestScopedRecordingsContext
@@ -950,7 +1254,7 @@ class BarcodeEvidenceFreeformRouteDeps:
 
 
 class BarcodeEvidenceFreeformAssistantRoute:
-    name = "barcode_evidence_freeform"
+    name = _BARCODE_EVIDENCE_FREEFORM_ROUTE
 
     def __init__(
         self,
@@ -1201,5 +1505,7 @@ __all__ = [
     "is_notion_playbook_exfiltration_attempt",
     "looks_like_notion_playbook_followup",
     "looks_like_notion_playbook_question",
+    "match_barcode_evidence_freeform_route",
+    "match_notion_playbook_route",
     "sanitize_notion_playbook_references",
 ]

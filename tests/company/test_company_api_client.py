@@ -199,18 +199,30 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertEqual(settings.notion_mode, "local")
         self.assertEqual(settings.structured_mode, "local")
         self.assertEqual(settings.device_mode, "local")
+        self.assertEqual(settings.device_detail_mode, "local")
         self.assertEqual(settings.recording_failure_mode, "local")
         self.assertEqual(settings.barcode_log_mode, "local")
         self.assertEqual(settings.barcode_mode, "local")
+        self.assertEqual(settings.barcode_residual_mode, "local")
+        self.assertEqual(settings.barcode_timeline_mode, "local")
+        self.assertEqual(settings.barcode_freeform_mode, "local")
+        self.assertEqual(settings.playbook_mode, "local")
+        self.assertEqual(settings.weekly_summary_mode, "local")
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
         self.assertFalse(settings.notion_fallback_enabled)
         self.assertFalse(settings.structured_fallback_enabled)
         self.assertFalse(settings.device_fallback_enabled)
+        self.assertFalse(settings.device_detail_fallback_enabled)
         self.assertFalse(settings.recording_failure_fallback_enabled)
         self.assertFalse(settings.barcode_log_fallback_enabled)
         self.assertFalse(settings.barcode_fallback_enabled)
+        self.assertFalse(settings.barcode_residual_fallback_enabled)
+        self.assertFalse(settings.barcode_timeline_fallback_enabled)
+        self.assertFalse(settings.barcode_freeform_fallback_enabled)
+        self.assertFalse(settings.playbook_fallback_enabled)
+        self.assertFalse(settings.weekly_summary_fallback_enabled)
 
     def test_local_rollback_ignores_stale_remote_credentials(self) -> None:
         settings = load_company_api_client_settings(
@@ -218,9 +230,15 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_NOTION_MODE": "local",
                 "BOXER_COMPANY_API_STRUCTURED_MODE": "local",
                 "BOXER_COMPANY_API_DEVICE_MODE": "local",
+                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "local",
                 "BOXER_COMPANY_API_RECORDING_FAILURE_MODE": "local",
                 "BOXER_COMPANY_API_BARCODE_LOG_MODE": "local",
                 "BOXER_COMPANY_API_BARCODE_MODE": "local",
+                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "local",
+                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "local",
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "local",
+                "BOXER_COMPANY_API_PLAYBOOK_MODE": "local",
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "local",
                 "BOXER_COMPANY_API_BASE_URL": "http://public.example.com",
                 "BOXER_COMPANY_API_SERVICE_TOKEN": "stale-invalid-token",
                 "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "invalid",
@@ -229,18 +247,30 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_DEVICE_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_RECORDING_FAILURE_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_BARCODE_LOG_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_BARCODE_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED": "invalid",
             }
         )
 
         self.assertEqual(settings.notion_mode, "local")
         self.assertEqual(settings.structured_mode, "local")
         self.assertEqual(settings.device_mode, "local")
+        self.assertEqual(settings.device_detail_mode, "local")
         self.assertEqual(settings.recording_failure_mode, "local")
         self.assertEqual(settings.barcode_log_mode, "local")
         self.assertEqual(settings.barcode_mode, "local")
+        self.assertEqual(settings.barcode_residual_mode, "local")
+        self.assertEqual(settings.barcode_timeline_mode, "local")
+        self.assertEqual(settings.barcode_freeform_mode, "local")
+        self.assertEqual(settings.playbook_mode, "local")
+        self.assertEqual(settings.weekly_summary_mode, "local")
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
 
@@ -257,6 +287,21 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             replace(_settings(), max_retries=3),
             replace(_settings(), structured_mode="invalid"),
             replace(_settings(), structured_fallback_enabled="true"),
+            replace(_settings(), device_detail_mode="invalid"),
+            replace(
+                _settings(),
+                device_detail_fallback_enabled="true",
+            ),
+            replace(_settings(), weekly_summary_mode="invalid"),
+            replace(
+                _settings(),
+                weekly_summary_fallback_enabled="true",
+            ),
+            replace(_settings(), barcode_freeform_mode="invalid"),
+            replace(
+                _settings(),
+                barcode_freeform_fallback_enabled="true",
+            ),
         )
 
         for settings in invalid_settings:
@@ -330,6 +375,10 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "device_mode",
             ),
             (
+                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
+                "device_detail_mode",
+            ),
+            (
                 "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
                 "recording_failure_mode",
             ),
@@ -340,6 +389,26 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             (
                 "BOXER_COMPANY_API_BARCODE_MODE",
                 "barcode_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_PLAYBOOK_MODE",
+                "playbook_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE",
+                "barcode_residual_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE",
+                "barcode_timeline_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
+                "barcode_freeform_mode",
+            ),
+            (
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
+                "weekly_summary_mode",
             ),
         )
         for env_key, field_name in mode_keys:
@@ -361,6 +430,42 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                     "shadow",
                 )
         self.assertNotIn(_TOKEN, repr(settings))
+
+    def test_new_route_fallbacks_load_only_for_non_local_modes(self) -> None:
+        # 신규 route는 같은 transport를 써도 fallback 정책은 각자 가진다.
+        cases = (
+            (
+                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
+                "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED",
+                "device_detail_fallback_enabled",
+            ),
+            (
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED",
+                "weekly_summary_fallback_enabled",
+            ),
+            (
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED",
+                "barcode_freeform_fallback_enabled",
+            ),
+        )
+        for mode_key, fallback_key, field_name in cases:
+            with self.subTest(field_name=field_name):
+                settings = load_company_api_client_settings(
+                    {
+                        "BOXER_COMPANY_API_BASE_URL": (
+                            "http://10.40.102.50:8010"
+                        ),
+                        "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                        mode_key: "remote",
+                        fallback_key: "true",
+                    }
+                )
+
+                self.assertTrue(settings.enabled)
+                self.assertFalse(settings.shadow_enabled)
+                self.assertTrue(getattr(settings, field_name))
 
     def test_notion_and_structured_modes_enable_transport_independently(
         self,
@@ -406,12 +511,78 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_STRUCTURED_MODE": "invalid",
             },
             {
+                "BOXER_COMPANY_API_PLAYBOOK_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "remote",
+            },
+            {
                 "BOXER_COMPANY_API_BASE_URL": (
                     "http://10.40.102.50:8010"
                 ),
                 "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
                 "BOXER_COMPANY_API_STRUCTURED_MODE": "shadow",
                 "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_PLAYBOOK_MODE": "shadow",
+                "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "shadow",
+                "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "shadow",
+                "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "shadow",
+                "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "shadow",
+                "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "shadow",
+                "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED": "invalid",
             },
             {
                 "BOXER_COMPANY_API_NOTION_MODE": "remote",
@@ -442,6 +613,26 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
 
 
 class CompanyApiClientContractTests(unittest.TestCase):
+    def test_serializes_valid_route_group_and_rejects_unknown_group(
+        self,
+    ) -> None:
+        request = _request()
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="knowledge")
+
+        self.assertEqual(
+            session.calls[0]["json"]["routeGroup"],
+            "knowledge",
+        )
+        invalid_session = _FakeSession()
+        with self.assertRaises(CompanyApiContractError):
+            _client(invalid_session).answer(
+                request,
+                route_group="unsafe",  # type: ignore[arg-type]
+            )
+        self.assertEqual(invalid_session.calls, [])
+
     def test_serializes_headers_scope_and_success_result(self) -> None:
         request = _request(
             metadata={

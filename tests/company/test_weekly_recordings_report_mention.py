@@ -1,11 +1,16 @@
 import unittest
 from datetime import date, datetime
-from unittest.mock import patch
+import logging
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from boxer_company_adapter_slack.company import (
     _build_weekly_recordings_report_reply_payload,
     _is_weekly_recordings_report_request,
+)
+from boxer_company_adapter_slack.structured_routes import (
+    StructuredRoutesContext,
+    _handle_structured_routes,
 )
 
 
@@ -104,6 +109,46 @@ class WeeklyRecordingsReportMentionTests(unittest.TestCase):
         )
         self.assertEqual(week_start_text, "2026-03-23")
         self.assertEqual(week_end_text, "2026-03-29")
+
+    def test_local_mention_resolves_current_week_before_legacy_query(
+        self,
+    ) -> None:
+        reply = Mock()
+        payload = {
+            "workspace_id": "TENANT-1",
+            "channel_id": "CHANNEL-1",
+            "current_ts": "1.0",
+            "thread_ts": "1.0",
+            "user_id": "ACTOR-1",
+            "question": "이번 주 초음파 영상 현황",
+        }
+
+        with (
+            patch(
+                "boxer_company_adapter_slack.structured_routes."
+                "_resolve_weekly_recordings_report_question_target_date",
+                return_value=date(2026, 4, 3),
+            ),
+            patch(
+                "boxer_company_adapter_slack.structured_routes."
+                "_build_weekly_recordings_report_reply_payload",
+                return_value=("report", [], "2026-03-30", "2026-04-05"),
+            ) as report_builder,
+        ):
+            handled = _handle_structured_routes(
+                StructuredRoutesContext(
+                    question="이번 주 초음파 영상 현황",
+                    barcode=None,
+                    payload=payload,
+                    thread_ts="1.0",
+                    reply=reply,
+                    logger=logging.getLogger(__name__),
+                )
+            )
+
+        self.assertTrue(handled)
+        report_builder.assert_called_once_with(target_date="2026-04-03")
+        reply.assert_called_once_with("report", mention_user=False, blocks=[])
 
 
 if __name__ == "__main__":

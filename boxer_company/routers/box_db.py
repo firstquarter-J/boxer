@@ -732,12 +732,53 @@ def _query_recordings_length_by_barcode(
     return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
 
 
+def _load_recordings_timeline_summary_by_barcode(
+    barcode: str,
+    *,
+    utc_start: datetime | None = None,
+    utc_end: datetime | None = None,
+) -> dict[str, Any]:
+    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
+        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
+
+    # 타임라인 질문은 최근 context 제한과 무관해야 하므로 DB 전체에서 read-only aggregate한다.
+    where_clauses = [
+        "(CAST(r.fullBarcode AS CHAR) = %s OR CAST(r.barcode AS CHAR) = %s)"
+    ]
+    params: list[Any] = [barcode, barcode]
+    if utc_start is not None and utc_end is not None:
+        where_clauses.extend(
+            [
+                "r.recordedAt >= %s",
+                "r.recordedAt < %s",
+            ]
+        )
+        params.extend([utc_start, utc_end])
+
+    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT "
+                "COUNT(*) AS recordingCount, "
+                "MIN(r.recordedAt) AS firstRecordedAt, "
+                "MAX(r.recordedAt) AS lastRecordedAt "
+                "FROM recordings r "
+                f"WHERE {' AND '.join(where_clauses)}",
+                tuple(params),
+            )
+            return cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+
 def _query_last_recorded_at_by_barcode(
     barcode: str,
     recordings_context: dict[str, Any] | None = None,
 ) -> str:
-    context = recordings_context or _load_recordings_context_by_barcode(barcode)
-    summary = context.get("summary") or {}
+    # 기존 호출 시그니처는 유지하되, 최근 context의 summary가 아닌 정확한 전체 집계를 사용한다.
+    _ = recordings_context
+    summary = _load_recordings_timeline_summary_by_barcode(barcode)
     count = int(summary.get("recordingCount") or 0)
     last_recorded_at = summary.get("lastRecordedAt")
     if count <= 0 or not last_recorded_at:
@@ -760,60 +801,39 @@ def _query_recordings_on_date_by_barcode(
     target_date: str,
     recordings_context: dict[str, Any] | None = None,
 ) -> str:
-    context = recordings_context or _load_recordings_context_by_barcode(barcode)
+    # 호출부가 넘기는 최근 context는 evidence 호환용이며, 날짜 존재 여부 집계에는 사용하지 않는다.
+    _ = recordings_context
     utc_start, utc_end = _local_date_to_utc_range(target_date)
-    utc_start_aware = utc_start.replace(tzinfo=timezone.utc)
-    utc_end_aware = utc_end.replace(tzinfo=timezone.utc)
-
-    matched_rows: list[dict[str, Any]] = []
-    for row in context.get("rows") or []:
-        recorded_at_utc = _to_utc_datetime(row.get("recordedAt"))
-        if not recorded_at_utc:
-            continue
-        if utc_start_aware <= recorded_at_utc < utc_end_aware:
-            matched_rows.append(row)
-
-    count = len(matched_rows)
-    first_recorded_at = None
-    last_recorded_at = None
-    if matched_rows:
-        recorded_values: list[datetime] = []
-        for row in matched_rows:
-            recorded_at_utc = _to_utc_datetime(row.get("recordedAt"))
-            if recorded_at_utc:
-                recorded_values.append(recorded_at_utc)
-        if recorded_values:
-            first_recorded_at = min(recorded_values)
-            last_recorded_at = max(recorded_values)
-
-    has_more = bool(context.get("has_more"))
-    limit = int(context.get("limit") or _context_limit())
+    summary = _load_recordings_timeline_summary_by_barcode(
+        barcode,
+        utc_start=utc_start,
+        utc_end=utc_end,
+    )
+    count = int(summary.get("recordingCount") or 0)
+    first_recorded_at = summary.get("firstRecordedAt")
+    last_recorded_at = summary.get("lastRecordedAt")
     if count <= 0:
-        lines = [
+        return "\n".join(
+            [
+                "*바코드 날짜별 녹화 여부 조회 결과*\n"
+                f"• 바코드: `{barcode}`\n"
+                f"• 날짜: `{target_date}`\n"
+                "• 결과: 날짜 기준 recordings DB row가 없어",
+                "• 참고: 실제 녹화 시도가 있었더라도 영상 손상 또는 업로드/DB 기록 생성 실패 가능성은 별도 로그 확인이 필요해",
+            ]
+        )
+
+    return "\n".join(
+        [
             "*바코드 날짜별 녹화 여부 조회 결과*\n"
             f"• 바코드: `{barcode}`\n"
-            f"• 날짜: `{target_date}`\n"
-            "• 결과: 날짜 기준 recordings DB row가 없어",
-            "• 참고: 실제 녹화 시도가 있었더라도 영상 손상 또는 업로드/DB 기록 생성 실패 가능성은 별도 로그 확인이 필요해",
+            f"• 날짜(KST): `{target_date}`\n"
+            f"• 조회 범위(UTC): `{utc_start:%Y-%m-%d %H:%M:%S}` ~ `{utc_end:%Y-%m-%d %H:%M:%S}`\n"
+            f"• recordings row 수: *{count}개*\n"
+            f"• 첫 recordedAt(KST): `{_format_recorded_at_local(first_recorded_at)}`\n"
+            f"• 마지막 recordedAt(KST): `{_format_recorded_at_local(last_recorded_at)}`"
         ]
-        if has_more:
-            lines.append(
-                f"• 참고: 최근 `{limit}개` 컨텍스트 기준 결과야(전체는 더 있을 수 있어)"
-            )
-        return "\n".join(lines)
-
-    lines = [
-        "*바코드 날짜별 녹화 여부 조회 결과*\n"
-        f"• 바코드: `{barcode}`\n"
-        f"• 날짜(KST): `{target_date}`\n"
-        f"• 조회 범위(UTC): `{utc_start:%Y-%m-%d %H:%M:%S}` ~ `{utc_end:%Y-%m-%d %H:%M:%S}`\n"
-        f"• recordings row 수: *{count}개*\n"
-        f"• 첫 recordedAt(KST): `{_format_recorded_at_local(first_recorded_at)}`\n"
-        f"• 마지막 recordedAt(KST): `{_format_recorded_at_local(last_recorded_at)}`"
-    ]
-    if has_more:
-        lines.append(f"• 참고: 최근 `{limit}개` 컨텍스트 기준 결과야(전체는 더 있을 수 있어)")
-    return "\n".join(lines)
+    )
 
 
 def _load_recordings_rows_on_date_by_barcode(

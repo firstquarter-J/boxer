@@ -7,6 +7,9 @@ from typing import Callable
 import pymysql
 
 from boxer_company import settings as cs
+from boxer_company.assistant.barcode_query_route import (
+    match_barcode_timeline_route,
+)
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     AssistantOutcome,
@@ -340,6 +343,10 @@ def _build_structured_query_match(
     if _is_barcode_all_recorded_dates_request(question, barcode):
         # 더 구체적인 바코드 날짜 route가 뒤 stage에서 응답하도록
         # 일반 recordings 필터가 같은 질문을 먼저 흡수하지 않는다.
+        return None
+    if match_barcode_timeline_route(request) is not None:
+        # 일반 날짜 목록·개수는 유지하고 명시적인 마지막 시점·날짜별
+        # 존재 여부만 뒤의 barcode stage가 같은 질문을 처리하게 한다.
         return None
 
     try:

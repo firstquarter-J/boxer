@@ -132,6 +132,33 @@ def _resolve_weekly_recordings_report_target_week(
     return target_week_start, target_week_start + timedelta(days=6)
 
 
+def _resolve_weekly_recordings_report_question_target_date(
+    question: str,
+    *,
+    explicit_target_date: date | None,
+    now: datetime | None = None,
+) -> date | None:
+    """질문의 상대 주간을 기존 target-date 계약으로 정규화한다."""
+
+    if explicit_target_date is not None:
+        return explicit_target_date
+    normalized = " ".join(str(question or "").split()).lower()
+    # target_date=None은 완결된 직전 주라는 기존 reporter 의미다. 현재 주를
+    # 명시한 경우에만 KST 오늘을 넘겨 이번 월요일~일요일을 선택한다.
+    if any(
+        hint in normalized
+        for hint in (
+            "이번주",
+            "이번 주",
+            "금주",
+            "this week",
+            "current week",
+        )
+    ):
+        return _coerce_weekly_recordings_report_now(now).date()
+    return None
+
+
 def _weekly_recordings_report_date_range_to_utc_range(
     start_date: date,
     end_date: date,

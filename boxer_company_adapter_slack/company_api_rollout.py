@@ -23,10 +23,25 @@ from boxer_company.assistant.barcode_log_route import (
     match_barcode_log_route,
 )
 from boxer_company.assistant.barcode_query_route import (
+    BARCODE_TIMELINE_ROUTES,
+    is_safe_baby_magic_source_uri,
+    match_barcode_timeline_route,
+    match_common_api_barcode_query_route,
     match_barcode_query_route,
 )
 from boxer_company.assistant.device_led_routes import (
     match_device_read_route,
+)
+from boxer_company.assistant.device_db_detail_route import (
+    match_device_db_detail_route,
+)
+from boxer_company.assistant.knowledge_routes import (
+    match_barcode_evidence_freeform_route,
+    match_notion_playbook_route,
+)
+from boxer_company.assistant.operational_read_routes import (
+    WeeklyRecordingsSummaryAssistantRoute,
+    match_weekly_recordings_summary_route,
 )
 from boxer_company.assistant.recording_failure_route import (
     match_recording_failure_route,
@@ -35,6 +50,7 @@ from boxer_company.assistant.structured_route import (
     match_structured_device_count_route,
     match_structured_read_route,
 )
+from boxer_company.assistant.service import CompanyAssistantService
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiAmbiguousTimeoutError,
     CompanyApiAvailabilityError,
@@ -67,6 +83,10 @@ _ALLOWED_DEVICE_ROUTES = frozenset(
     }
 )
 _ALLOWED_DEVICE_FILTER_ROUTES = frozenset({"devices_filter"})
+_ALLOWED_DEVICE_DETAIL_ROUTES = frozenset({"device_db_detail"})
+_ALLOWED_WEEKLY_SUMMARY_ROUTES = frozenset(
+    {"weekly_recordings_summary"}
+)
 _ALLOWED_RECORDING_FAILURE_ROUTES = frozenset(
     {"recording_failure_analysis"}
 )
@@ -79,6 +99,17 @@ _ALLOWED_BARCODE_ROUTES = frozenset(
         "barcode_video_length",
         "barcode_all_recorded_dates",
     }
+)
+_ALLOWED_BARCODE_RESIDUAL_ROUTES = frozenset(
+    {
+        "baby_ai_list",
+        "barcode_baby_ai_list",
+    }
+)
+_ALLOWED_BARCODE_TIMELINE_ROUTES = BARCODE_TIMELINE_ROUTES
+_ALLOWED_PLAYBOOK_ROUTES = frozenset({"notion_playbook_qa"})
+_ALLOWED_BARCODE_FREEFORM_ROUTES = frozenset(
+    {"barcode_evidence_freeform"}
 )
 _SAFE_REQUEST_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
@@ -169,11 +200,16 @@ class _RolloutProfile:
     ]
     failure_route: str
     failure_body: str
+    route_group: str
     expected_route: (
         Callable[[CompanyAssistantRequest], str | None]
         | None
     ) = None
     fallback_on_unexpected_route: bool = False
+    # 일부 신규 remote route는 local rollback route 이름이 다르다.
+    # shadow 실행 여부만 별도 local route 집합으로 판단하고 remote
+    # allowlist·expected route 검증은 계속 엄격하게 유지한다.
+    shadow_eligible_routes: frozenset[str] | None = None
 
 
 class _CompanyApiRolloutService:
@@ -252,7 +288,7 @@ class _CompanyApiRolloutService:
         )
         if _is_shadow_eligible_result(
             comparable_result,
-            self._profile.allowed_routes,
+            self._shadow_eligible_routes,
         ):
             assert comparable_result is not None
             self._submit_shadow_comparison(
@@ -268,11 +304,18 @@ class _CompanyApiRolloutService:
         local_result = self._local_service.answer(request)
         if not _is_shadow_eligible_result(
             local_result,
-            self._profile.allowed_routes,
+            self._shadow_eligible_routes,
         ):
             return local_result
         self._submit_shadow_comparison(request, local_result)
         return local_result
+
+    @property
+    def _shadow_eligible_routes(self) -> frozenset[str]:
+        return (
+            self._profile.shadow_eligible_routes
+            or self._profile.allowed_routes
+        )
 
     def _submit_shadow_comparison(
         self,
@@ -470,7 +513,10 @@ class _CompanyApiRolloutService:
     ) -> CompanyAssistantResult | None:
         if self._api_client is None:
             raise CompanyApiAvailabilityError("client_not_configured")
-        return self._api_client.answer(request)
+        return self._api_client.answer(
+            request,
+            route_group=self._profile.route_group,
+        )
 
     def _log_shadow_error(
         self,
@@ -539,6 +585,7 @@ class CompanyNotionApiRolloutService(
                     "회사 Notion 답변 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="notion",
                 fallback_on_unexpected_route=True,
             ),
             api_client=api_client,
@@ -577,6 +624,7 @@ class CompanyStructuredApiRolloutService(
                     "구조화 조회 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="structured",
                 expected_route=match_structured_read_route,
             ),
             api_client=api_client,
@@ -614,6 +662,7 @@ class CompanyDeviceApiRolloutService(_CompanyApiRolloutService):
                     "장비 조회 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="device",
                 expected_route=match_device_read_route,
             ),
             api_client=api_client,
@@ -653,12 +702,124 @@ class CompanyDeviceFilterApiRolloutService(
                     "장비 DB 조회 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="structured",
                 expected_route=match_structured_device_count_route,
             ),
             api_client=api_client,
             logger=logger,
             shadow_runner=shadow_runner,
         )
+
+
+class CompanyDeviceDbDetailApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """MDA/SSH를 제외한 장비 DB 상세만 별도 스위치로 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+    ) -> None:
+        super().__init__(
+            local_service,
+            mode=settings.device_detail_mode,
+            fallback_enabled=settings.device_detail_fallback_enabled,
+            profile=_RolloutProfile(
+                log_label="Company Device DB Detail API",
+                allowed_routes=_ALLOWED_DEVICE_DETAIL_ROUTES,
+                matches_request=lambda request: (
+                    match_device_db_detail_route(request)
+                    == "device_db_detail"
+                ),
+                validate_result=_validate_remote_device_detail_result,
+                failure_route="device_db_detail",
+                failure_body=(
+                    "장비 DB 상세 조회 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="structured",
+                expected_route=match_device_db_detail_route,
+                # Slack local은 기존 enriched `devices_filter`를 유지하고
+                # remote에서만 명시적인 DB-only route 이름을 쓴다.
+                shadow_eligible_routes=frozenset({"devices_filter"}),
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+
+class CompanyWeeklySummaryApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """사용자 요청형 주간 DB 요약만 API로 점진 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+    ) -> None:
+        # shadow에서 비교용 CommonMark 결과를 만들되 사용자 응답은 아래
+        # 기존 Slack Block handler로 계속 내려가 중복·형식 변화를 막는다.
+        self._shadow_reference_service = CompanyAssistantService(
+            (WeeklyRecordingsSummaryAssistantRoute(logger=logger),)
+        )
+        super().__init__(
+            local_service,
+            mode=settings.weekly_summary_mode,
+            fallback_enabled=settings.weekly_summary_fallback_enabled,
+            profile=_RolloutProfile(
+                log_label="Company Weekly Summary API",
+                allowed_routes=_ALLOWED_WEEKLY_SUMMARY_ROUTES,
+                matches_request=lambda request: (
+                    match_weekly_recordings_summary_route(request)
+                    == "weekly_recordings_summary"
+                ),
+                validate_result=_validate_remote_weekly_summary_result,
+                failure_route="weekly_recordings_summary",
+                failure_body=(
+                    "주간 영상 현황 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="structured",
+                expected_route=match_weekly_recordings_summary_route,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+    def answer(
+        self,
+        request: CompanyAssistantRequest,
+    ) -> CompanyAssistantResult | None:
+        if (
+            self._mode == "shadow"
+            and self._profile.matches_request(request)
+        ):
+            local_result = self._shadow_reference_service.answer(request)
+            if _is_shadow_eligible_result(
+                local_result,
+                self._shadow_eligible_routes,
+            ):
+                assert local_result is not None
+                self._submit_shadow_comparison(request, local_result)
+            if local_result is not None:
+                # 비교에 쓴 동일 결과를 Slack Block renderer로 한 번만 보낸다.
+                # legacy handler로 다시 내려가 동일 주간 DB 집계를 반복하지
+                # 않으면서 shadow 원격 결과는 사용자에게 반환하지 않는다.
+                return local_result
+            return self._local_service.answer(request)
+        return super().answer(request)
 
 
 class CompanyRecordingFailureApiRolloutService(
@@ -695,6 +856,7 @@ class CompanyRecordingFailureApiRolloutService(
                     "녹화 실패 분석 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="failure",
                 expected_route=match_recording_failure_route,
             ),
             api_client=api_client,
@@ -735,6 +897,7 @@ class CompanyBarcodeLogApiRolloutService(
                     "바코드 로그 분석 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="log",
                 expected_route=match_barcode_log_route,
             ),
             api_client=api_client,
@@ -772,7 +935,213 @@ class CompanyBarcodeApiRolloutService(_CompanyApiRolloutService):
                     "바코드 조회 서비스 상태를 확인할 수 없어. "
                     "잠시 후 다시 시도해줘"
                 ),
+                route_group="barcode",
                 expected_route=match_barcode_query_route,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+
+class CompanyPlaybookApiRolloutService(_CompanyApiRolloutService):
+    """운영 플레이북 read-only Q&A만 공통 API로 점진 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+        precedence_service: _LocalAssistantService | None = None,
+    ) -> None:
+        self._precedence_service = precedence_service
+        super().__init__(
+            local_service,
+            mode=settings.playbook_mode,
+            fallback_enabled=settings.playbook_fallback_enabled,
+            profile=_RolloutProfile(
+                log_label="Company Playbook API",
+                allowed_routes=_ALLOWED_PLAYBOOK_ROUTES,
+                matches_request=lambda request: (
+                    match_notion_playbook_route(request)
+                    == "notion_playbook_qa"
+                ),
+                validate_result=_validate_remote_playbook_result,
+                failure_route="notion_playbook_qa",
+                failure_body=(
+                    "운영 문서 답변 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="knowledge",
+                expected_route=match_notion_playbook_route,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+    def answer(
+        self,
+        request: CompanyAssistantRequest,
+    ) -> CompanyAssistantResult | None:
+        if (
+            self._precedence_service is not None
+            and match_notion_playbook_route(request)
+            == "notion_playbook_qa"
+        ):
+            # knowledge stage에서 플레이북보다 앞선 Slack 진단 snapshot
+            # route를 먼저 보존한다. API 프로세스에는 이 메모리 snapshot이
+            # 없으므로 remote 호출 뒤에는 우선순위를 복구할 수 없다.
+            precedence_result = self._precedence_service.answer(request)
+            if precedence_result is not None:
+                return precedence_result
+        return super().answer(request)
+
+
+class CompanyBarcodeFreeformApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """recordings 근거형 바코드 해석만 knowledge API로 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+        precedence_service: _LocalAssistantService | None = None,
+    ) -> None:
+        self._precedence_service = precedence_service
+        super().__init__(
+            local_service,
+            mode=settings.barcode_freeform_mode,
+            fallback_enabled=(
+                settings.barcode_freeform_fallback_enabled
+            ),
+            profile=_RolloutProfile(
+                log_label="Company Barcode Freeform API",
+                allowed_routes=_ALLOWED_BARCODE_FREEFORM_ROUTES,
+                # 일반 대화·PII·mutation·live 진단과 기존 전용 route는
+                # pure matcher에서 제외해 knowledge stage의 마지막 LLM
+                # route가 API 전환 범위를 넓히지 못하게 한다.
+                matches_request=lambda request: (
+                    match_barcode_evidence_freeform_route(request)
+                    == "barcode_evidence_freeform"
+                ),
+                validate_result=_validate_remote_barcode_freeform_result,
+                failure_route="barcode_evidence_freeform",
+                failure_body=(
+                    "바코드 녹화 근거 답변 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="knowledge",
+                expected_route=match_barcode_evidence_freeform_route,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+    def answer(
+        self,
+        request: CompanyAssistantRequest,
+    ) -> CompanyAssistantResult | None:
+        if (
+            self._precedence_service is not None
+            and match_barcode_evidence_freeform_route(request)
+            == "barcode_evidence_freeform"
+        ):
+            # Slack thread의 진단 snapshot은 API 프로세스와 공유되지 않는다.
+            # freeform matcher가 맞아도 knowledge 앞선 local route가 답하면
+            # 원격 LLM보다 그 저장 근거를 우선한다.
+            precedence_result = self._precedence_service.answer(request)
+            if precedence_result is not None:
+                return precedence_result
+        return super().answer(request)
+
+
+class CompanyBarcodeResidualApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """기존 remote 묶음 밖의 DB-only 바코드 조회를 따로 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+    ) -> None:
+        super().__init__(
+            local_service,
+            mode=settings.barcode_residual_mode,
+            fallback_enabled=(
+                settings.barcode_residual_fallback_enabled
+            ),
+            profile=_RolloutProfile(
+                log_label="Company Barcode Residual API",
+                allowed_routes=_ALLOWED_BARCODE_RESIDUAL_ROUTES,
+                matches_request=lambda request: (
+                    match_common_api_barcode_query_route(request)
+                    in _ALLOWED_BARCODE_RESIDUAL_ROUTES
+                ),
+                validate_result=_validate_remote_barcode_residual_result,
+                failure_route="barcode_query",
+                failure_body=(
+                    "바코드 추가 조회 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="barcode",
+                expected_route=match_common_api_barcode_query_route,
+            ),
+            api_client=api_client,
+            logger=logger,
+            shadow_runner=shadow_runner,
+        )
+
+
+class CompanyBarcodeTimelineApiRolloutService(
+    _CompanyApiRolloutService
+):
+    """마지막 녹화일·날짜별 존재 조회를 별도 API 경계로 전환한다."""
+
+    def __init__(
+        self,
+        local_service: _LocalAssistantService,
+        *,
+        settings: CompanyApiClientSettings,
+        api_client: CompanyAssistantApiClient | None,
+        logger: logging.Logger,
+        shadow_runner: _ShadowRunner,
+    ) -> None:
+        super().__init__(
+            local_service,
+            mode=settings.barcode_timeline_mode,
+            fallback_enabled=(
+                settings.barcode_timeline_fallback_enabled
+            ),
+            profile=_RolloutProfile(
+                log_label="Company Barcode Timeline API",
+                allowed_routes=_ALLOWED_BARCODE_TIMELINE_ROUTES,
+                matches_request=lambda request: (
+                    match_barcode_timeline_route(request)
+                    in _ALLOWED_BARCODE_TIMELINE_ROUTES
+                ),
+                validate_result=_validate_remote_barcode_timeline_result,
+                failure_route="barcode_timeline",
+                failure_body=(
+                    "바코드 녹화 시점 조회 서비스 상태를 확인할 수 없어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="barcode",
+                expected_route=match_barcode_timeline_route,
             ),
             api_client=api_client,
             logger=logger,
@@ -860,6 +1229,46 @@ def wrap_company_device_filter_service(
     )
 
 
+def wrap_company_device_db_detail_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+) -> _LocalAssistantService:
+    """장비 DB 상세를 기존 개수·live 조회와 독립적으로 전환한다."""
+
+    if settings.device_detail_mode == "local":
+        return local_service
+    return CompanyDeviceDbDetailApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
+    )
+
+
+def wrap_company_weekly_summary_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+) -> _LocalAssistantService:
+    """사용자 요청형 주간 요약만 자동 reporter와 분리해 전환한다."""
+
+    if settings.weekly_summary_mode == "local":
+        return local_service
+    return CompanyWeeklySummaryApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
+    )
+
+
 def wrap_company_recording_failure_service(
     local_service: _LocalAssistantService,
     settings: CompanyApiClientSettings,
@@ -906,6 +1315,90 @@ def wrap_company_barcode_service(
     if settings.barcode_mode == "local":
         return local_service
     return CompanyBarcodeApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
+    )
+
+
+def wrap_company_playbook_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+    precedence_service: _LocalAssistantService | None = None,
+) -> _LocalAssistantService:
+    """knowledge stage 중 운영 플레이북 Q&A만 전용 스위치로 감싼다."""
+
+    if settings.playbook_mode == "local":
+        return local_service
+    return CompanyPlaybookApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
+        precedence_service=precedence_service,
+    )
+
+
+def wrap_company_barcode_freeform_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+    precedence_service: _LocalAssistantService | None = None,
+) -> _LocalAssistantService:
+    """명시적인 recordings 근거 해석만 독립 스위치로 감싼다."""
+
+    if settings.barcode_freeform_mode == "local":
+        return local_service
+    return CompanyBarcodeFreeformApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
+        precedence_service=precedence_service,
+    )
+
+
+def wrap_company_barcode_residual_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+) -> _LocalAssistantService:
+    """새 DB-only 바코드 route를 기존 운영 remote 묶음과 분리한다."""
+
+    if settings.barcode_residual_mode == "local":
+        return local_service
+    return CompanyBarcodeResidualApiRolloutService(
+        local_service,
+        settings=settings,
+        api_client=api_client,
+        logger=logger,
+        shadow_runner=shadow_runner or _DEFAULT_SHADOW_RUNNER,
+    )
+
+
+def wrap_company_barcode_timeline_service(
+    local_service: _LocalAssistantService,
+    settings: CompanyApiClientSettings,
+    api_client: CompanyAssistantApiClient | None,
+    logger: logging.Logger,
+    shadow_runner: _ShadowRunner | None = None,
+) -> _LocalAssistantService:
+    """timeline route가 Baby AI 전환 mode를 공유하지 않게 따로 감싼다."""
+
+    if settings.barcode_timeline_mode == "local":
+        return local_service
+    return CompanyBarcodeTimelineApiRolloutService(
         local_service,
         settings=settings,
         api_client=api_client,
@@ -1039,6 +1532,24 @@ def _validate_remote_device_filter_result(
     )
 
 
+def _validate_remote_device_detail_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    return _validate_remote_deterministic_result(
+        result,
+        _ALLOWED_DEVICE_DETAIL_ROUTES,
+    )
+
+
+def _validate_remote_weekly_summary_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    return _validate_remote_deterministic_result(
+        result,
+        _ALLOWED_WEEKLY_SUMMARY_ROUTES,
+    )
+
+
 def _validate_remote_recording_failure_result(
     result: CompanyAssistantResult | None,
 ) -> _RemoteResultValidation:
@@ -1063,6 +1574,68 @@ def _validate_remote_barcode_result(
     return _validate_remote_deterministic_result(
         result,
         _ALLOWED_BARCODE_ROUTES,
+    )
+
+
+def _validate_remote_playbook_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    base_validation = _validate_remote_result_base(
+        result,
+        _ALLOWED_PLAYBOOK_ROUTES,
+    )
+    if not base_validation.accepted:
+        return base_validation
+    assert result is not None
+    if any(
+        not _is_notion_source_uri(source.uri)
+        for source in result.sources
+    ):
+        return _RemoteResultValidation(False, "unsafe_source_host")
+    return _RemoteResultValidation(True)
+
+
+def _validate_remote_barcode_freeform_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    # 근거 합성 route라 used_llm은 허용하지만, 외부 링크·DM·action/job은
+    # 공통 base 계약에서 계속 fail-closed한다.
+    return _validate_remote_analysis_result(
+        result,
+        _ALLOWED_BARCODE_FREEFORM_ROUTES,
+    )
+
+
+def _validate_remote_barcode_residual_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    base_validation = _validate_remote_result_base(
+        result,
+        _ALLOWED_BARCODE_RESIDUAL_ROUTES,
+    )
+    if not base_validation.accepted:
+        return base_validation
+    assert result is not None
+    if result.used_llm:
+        return _RemoteResultValidation(False, "unexpected_llm")
+    if result.route != "barcode_baby_ai_list" and result.sources:
+        return _RemoteResultValidation(False, "unexpected_sources")
+    if any(
+        not is_safe_baby_magic_source_uri(source.uri)
+        for source in result.sources
+    ):
+        return _RemoteResultValidation(False, "unsafe_source_host")
+    return _RemoteResultValidation(True)
+
+
+def _validate_remote_barcode_timeline_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    # 두 route는 조회 근거를 LLM으로 문장화할 수 있다. sources/action/DM
+    # 경계는 그대로 검사하되 used_llm 자체는 정상 계약으로 허용한다.
+    return _validate_remote_analysis_result(
+        result,
+        _ALLOWED_BARCODE_TIMELINE_ROUTES,
     )
 
 
@@ -1258,17 +1831,29 @@ def _safe_request_id(value: object) -> str:
 __all__ = [
     "BoundedShadowRunner",
     "CompanyBarcodeApiRolloutService",
+    "CompanyBarcodeFreeformApiRolloutService",
+    "CompanyBarcodeResidualApiRolloutService",
+    "CompanyBarcodeTimelineApiRolloutService",
     "CompanyBarcodeLogApiRolloutService",
     "CompanyDeviceApiRolloutService",
+    "CompanyDeviceDbDetailApiRolloutService",
     "CompanyDeviceFilterApiRolloutService",
     "CompanyNotionApiRolloutService",
+    "CompanyPlaybookApiRolloutService",
     "CompanyRecordingFailureApiRolloutService",
     "CompanyStructuredApiRolloutService",
+    "CompanyWeeklySummaryApiRolloutService",
+    "wrap_company_barcode_freeform_service",
     "wrap_company_barcode_log_service",
+    "wrap_company_barcode_residual_service",
+    "wrap_company_barcode_timeline_service",
     "wrap_company_barcode_service",
     "wrap_company_device_filter_service",
+    "wrap_company_device_db_detail_service",
     "wrap_company_device_service",
     "wrap_company_notion_service",
+    "wrap_company_playbook_service",
     "wrap_company_recording_failure_service",
     "wrap_company_structured_service",
+    "wrap_company_weekly_summary_service",
 ]

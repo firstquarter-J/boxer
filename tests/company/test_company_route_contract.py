@@ -438,6 +438,583 @@ class CompanyRouteContractTests(unittest.TestCase):
             },
         )
 
+    def test_playbook_remote_mode_keeps_slack_context_and_rendering_only(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            playbook_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="notion_playbook_qa",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body="**문서 기반 답변**\n• 결론: API 운영 기준"
+                ),
+            ),
+            sources=(
+                SourceReference(
+                    source_id="https://www.notion.so/playbook-contract",
+                    title="운영 플레이북",
+                    uri="https://www.notion.so/playbook-contract",
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=(),
+            ) as context_loader,
+            patch(
+                "boxer_company.assistant.knowledge_routes."
+                "_select_notion_references"
+            ) as local_selector,
+        ):
+            result = self._invoke_mention(
+                text="마미박스 초기화 방법 알려줘",
+                question="마미박스 초기화 방법 알려줘",
+                real_handlers={"_handle_knowledge_routes"},
+            )
+
+        api_client.answer.assert_called_once()
+        local_selector.assert_not_called()
+        context_loader.assert_called_once()
+        self.assertEqual(len(result.reply_calls), 1)
+        self.assertIn("*문서 기반 답변*", result.reply_calls[0][0])
+        self.assertIn(
+            "<https://www.notion.so/playbook-contract|운영 플레이북>",
+            result.reply_calls[0][0],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "notion playbook qa",
+        )
+
+    def test_playbook_remote_keeps_diagnostic_snapshot_precedence(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            playbook_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="notion_playbook_qa",
+            outcome="answered",
+            messages=(AssistantMessage(body="원격 문서 답변"),),
+        )
+        snapshot = {
+            "route": "device_diagnostic_snapshot",
+            "request": {"deviceName": "MB2-C00419"},
+            "device": {"deviceName": "MB2-C00419"},
+            "summary": {},
+        }
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "_load_device_diagnostic_snapshot",
+                return_value=snapshot,
+            ),
+        ):
+            result = self._invoke_mention(
+                text="증상은 어때?",
+                question="증상은 어때?",
+                real_handlers={"_handle_knowledge_routes"},
+            )
+
+        api_client.answer.assert_not_called()
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "device diagnostic followup",
+        )
+        self.assertEqual(len(result.reply_calls), 1)
+        self.assertNotIn("원격 문서 답변", result.reply_calls[0][0])
+
+    def test_barcode_freeform_remote_uses_knowledge_api_without_local_llm(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            barcode_freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="barcode_evidence_freeform",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body="**녹화 근거 답변**\n• 간격이 일정해"
+                ),
+            ),
+            used_llm=True,
+        )
+
+        # create_app의 실제 knowledge 조립을 통과하되 Slack·LLM은 모두
+        # fake로 고정해 remote가 로컬 생성 경로를 건너뛰는지 검증한다.
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=(),
+            ),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes."
+                "_ask_claude",
+                return_value="로컬 일반 답변",
+            ) as local_chat,
+        ):
+            result = self._invoke_mention(
+                text=(
+                    "12345678910 녹화 기록들 사이 간격이 "
+                    "일정한지 설명해줘"
+                ),
+                question=(
+                    "12345678910 녹화 기록들 사이 간격이 "
+                    "일정한지 설명해줘"
+                ),
+                barcode="12345678910",
+                real_handlers={"_handle_knowledge_routes"},
+                llm_provider="claude",
+                llm_synthesis_enabled=True,
+                synthesized_text="로컬 근거 답변",
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs["route_group"],
+            "knowledge",
+        )
+        self.assertEqual(
+            api_client.answer.call_args.args[0].question,
+            (
+                "12345678910 녹화 기록들 사이 간격이 "
+                "일정한지 설명해줘"
+            ),
+        )
+        result.synthesis_mock.assert_not_called()
+        local_chat.assert_not_called()
+        self.assertNotIn("recordings_context_prefetch", result.route_calls)
+        self.assertEqual(
+            result.reply_calls,
+            [("*녹화 근거 답변*\n• 간격이 일정해", {})],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "llm_freeform",
+        )
+
+    def test_barcode_freeform_remote_keeps_general_and_pii_local(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            barcode_freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="barcode_evidence_freeform",
+            outcome="answered",
+            messages=(AssistantMessage(body="원격 답변"),),
+            used_llm=True,
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=(),
+            ),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes."
+                "_load_slack_thread_context",
+                return_value="",
+            ),
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes."
+                "_ask_claude",
+                return_value="로컬 일반 답변",
+            ) as local_chat,
+        ):
+            general = self._invoke_mention(
+                text="오늘 기분 어때?",
+                question="오늘 기분 어때?",
+                real_handlers={"_handle_knowledge_routes"},
+                llm_provider="claude",
+                llm_synthesis_enabled=True,
+            )
+            pii = self._invoke_mention(
+                text=(
+                    "12345678910 산모 전화번호를 녹화 기록 "
+                    "근거로 확인해줘"
+                ),
+                question=(
+                    "12345678910 산모 전화번호를 녹화 기록 "
+                    "근거로 확인해줘"
+                ),
+                barcode="12345678910",
+                real_handlers={"_handle_knowledge_routes"},
+                llm_provider="claude",
+                llm_synthesis_enabled=True,
+                synthesized_text="로컬 PII 경계 답변",
+            )
+
+        api_client.answer.assert_not_called()
+        local_chat.assert_called_once()
+        self.assertEqual(
+            general.reply_calls,
+            [("로컬 일반 답변", {})],
+        )
+        general.synthesis_mock.assert_not_called()
+        pii.synthesis_mock.assert_called_once()
+        self.assertEqual(
+            pii.reply_calls,
+            [("로컬 PII 경계 답변", {})],
+        )
+
+    def test_barcode_freeform_remote_keeps_diagnostic_snapshot_precedence(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            barcode_freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="barcode_evidence_freeform",
+            outcome="answered",
+            messages=(AssistantMessage(body="원격 답변"),),
+            used_llm=True,
+        )
+        snapshot = {
+            "route": "device_diagnostic_snapshot",
+            "request": {"deviceName": "MB2-C00419"},
+            "device": {"deviceName": "MB2-C00419"},
+            "summary": {},
+        }
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "_load_device_diagnostic_snapshot",
+                return_value=snapshot,
+            ),
+        ):
+            result = self._invoke_mention(
+                text=(
+                    "12345678910 녹화 기록들 사이 간격이 "
+                    "일정한지 설명해줘"
+                ),
+                question=(
+                    "12345678910 녹화 기록들 사이 간격이 "
+                    "일정한지 설명해줘"
+                ),
+                barcode="12345678910",
+                real_handlers={"_handle_knowledge_routes"},
+                llm_provider="claude",
+                llm_synthesis_enabled=True,
+            )
+
+        api_client.answer.assert_not_called()
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "device diagnostic followup",
+        )
+
+    def test_baby_ai_remote_mode_uses_api_without_local_db_query(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            barcode_residual_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="barcode_baby_ai_list",
+            outcome="answered",
+            messages=(
+                AssistantMessage(body="**베이비매직 목록**\n• 결과: 2개"),
+            ),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch(
+                "boxer_company.assistant.barcode_query_route."
+                "_query_baby_ai_list_by_barcode"
+            ) as local_query,
+        ):
+            result = self._invoke_mention(
+                text="12345678910 베이비매직 목록",
+                question="12345678910 베이비매직 목록",
+                barcode="12345678910",
+                real_handlers={"_handle_barcode_query_routes"},
+            )
+
+        api_client.answer.assert_called_once()
+        local_query.assert_not_called()
+        self.assertEqual(
+            result.reply_calls,
+            [("*베이비매직 목록*\n• 결과: 2개", {})],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "barcode_baby_ai_list",
+        )
+
+    def test_weekly_summary_remote_keeps_slack_block_transport(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            weekly_summary_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="weekly_recordings_summary",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body=(
+                        "**주간 초음파 촬영 요약**\n"
+                        "• 기준 주간: `2026-08-03 ~ 2026-08-09`"
+                    ),
+                    mention_actor=False,
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                structured_routes,
+                "_build_weekly_recordings_report_reply_payload",
+            ) as local_weekly,
+        ):
+            result = self._invoke_mention(
+                text="지난주 초음파 영상 현황",
+                question="지난주 초음파 영상 현황",
+                real_handlers={"_handle_structured_routes"},
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "structured"},
+        )
+        local_weekly.assert_not_called()
+        self.assertEqual(len(result.reply_calls), 1)
+        reply_text, reply_kwargs = result.reply_calls[0]
+        self.assertIn("*주간 초음파 촬영 요약*", reply_text)
+        self.assertFalse(reply_kwargs["mention_user"])
+        self.assertEqual(
+            reply_kwargs["blocks"][0]["type"],
+            "section",
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "weekly recordings report",
+        )
+
+    def test_device_detail_remote_skips_local_mda_and_ssh(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            device_detail_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="device_db_detail",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body=(
+                        "**장비 조회 결과**\n"
+                        "• 상태 기준: `devices.status` DB 저장값\n"
+                        "• 장비명: `MB2-C00419`"
+                    )
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch(
+                "boxer_company.assistant.structured_route."
+                "_query_devices_by_filters"
+            ) as local_query,
+            patch(
+                "boxer_company.routers.box_db._lookup_mda_device_details"
+            ) as local_mda,
+            patch(
+                "boxer_company.routers.box_db._lookup_device_ssh_status"
+            ) as local_ssh,
+        ):
+            result = self._invoke_mention(
+                text="MB2-C00419 장비 정보",
+                question="MB2-C00419 장비 정보",
+                real_handlers={"_handle_structured_routes"},
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "structured"},
+        )
+        local_query.assert_not_called()
+        local_mda.assert_not_called()
+        local_ssh.assert_not_called()
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "devices_filter",
+        )
+
+    def test_timeline_remote_defers_structured_and_skips_local_db_query(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            barcode_timeline_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="barcode last recordedAt",
+            outcome="answered",
+            messages=(AssistantMessage(body="마지막 녹화는 8월 4일이야"),),
+            used_llm=True,
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch(
+                "boxer_company.assistant.structured_route."
+                "_query_recordings_by_filters"
+            ) as structured_query,
+            patch(
+                "boxer_company.assistant.barcode_query_route."
+                "_query_last_recorded_at_by_barcode"
+            ) as local_timeline_query,
+        ):
+            result = self._invoke_mention(
+                text="12345678910 마지막 녹화 날짜",
+                question="12345678910 마지막 녹화 날짜",
+                barcode="12345678910",
+                real_handlers={
+                    "_handle_structured_routes",
+                    "_handle_barcode_query_routes",
+                },
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "barcode"},
+        )
+        structured_query.assert_not_called()
+        local_timeline_query.assert_not_called()
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "barcode last recordedAt",
+        )
+        self.assertEqual(
+            result.reply_calls,
+            [("마지막 녹화는 8월 4일이야", {})],
+        )
+
     def test_unmatched_barcode_question_does_not_eagerly_prefetch_recordings(
         self,
     ) -> None:

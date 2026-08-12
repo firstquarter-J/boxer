@@ -35,9 +35,21 @@ class _FakeRuntime:
         self.result = result
         self.error = error
         self.requests: list[Any] = []
+        self.stages: list[str] = []
 
     def answer(self, request: Any) -> CompanyAssistantResult | None:
         self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+    def answer_stage(
+        self,
+        request: Any,
+        stage: str,
+    ) -> CompanyAssistantResult | None:
+        self.requests.append(request)
+        self.stages.append(stage)
         if self.error is not None:
             raise self.error
         return self.result
@@ -111,6 +123,53 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 
 class CompanyApiContractTests(unittest.TestCase):
+    def test_route_group_executes_only_the_requested_runtime_stage(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="notion_playbook_qa",
+                outcome="answered",
+                messages=(AssistantMessage(body="운영 문서 답변"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(routeGroup="knowledge"),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["route"], "notion_playbook_qa")
+        self.assertEqual(runtime.stages, ["knowledge"])
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_unknown_route_group_is_rejected_before_runtime(self) -> None:
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(routeGroup="unsafe"),
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["code"], "validation_failed")
+        self.assertEqual(runtime.requests, [])
+
     def test_long_message_is_windowed_at_client_contract_boundary(
         self,
     ) -> None:

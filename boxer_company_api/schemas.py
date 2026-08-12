@@ -212,6 +212,15 @@ class AssistantTurnInput(_StrictInputModel):
         max_length=_MAX_CONTEXT_ENTRIES,
     )
     scope: AssistantTurnScopeInput | None = None
+    routeGroup: Literal[
+        "notion",
+        "device",
+        "failure",
+        "log",
+        "structured",
+        "barcode",
+        "knowledge",
+    ] | None = None
 
     @field_validator("question")
     @classmethod
@@ -240,6 +249,10 @@ class AssistantTurnInput(_StrictInputModel):
             if self.scope is not None
             else {}
         )
+        if self.routeGroup is not None:
+            # strict enum 검증을 통과한 실행 범위만 request guard에 알려
+            # 선택되지 않은 stage의 외부 조회 가드가 오탐하지 않게 한다.
+            metadata["route_group"] = self.routeGroup
         return CompanyAssistantRequest(
             request_id=request_id,
             tenant_id=self.tenantId,

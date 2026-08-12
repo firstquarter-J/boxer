@@ -148,6 +148,10 @@ class CompanyAssistantRuntimeDeps:
     context_max_chars: int = core_settings.THREAD_CONTEXT_MAX_CHARS
     notion_route_deps: CompanyNotionAssistantRouteDeps | None = None
     request_guard: RequestGuard | None = None
+    # API처럼 더 좁은 read-only 구현이 필요한 프로세스만 표준
+    # structured route 앞에 주입한다. Slack local runtime은 기본 빈 tuple로
+    # 기존 enrichment와 route 우선순위를 그대로 유지한다.
+    structured_read_routes: tuple[CompanyAssistantRoute, ...] = ()
     structured_device_filter_enabled: bool = True
     structured_device_live_enrichment_enabled: bool = True
     log_analysis_live_enrichment_enabled: bool = False
@@ -267,6 +271,23 @@ class CompanyAssistantRuntime:
             on_partial_result=on_partial_result,
         )
 
+    def answer_stage(
+        self,
+        request: CompanyAssistantRequest,
+        stage: CompanyAssistantStage,
+        *,
+        on_partial_result: PartialResultHandler | None = None,
+    ) -> CompanyAssistantResult | None:
+        """HTTP rollout이 의도한 stage만 실행해 앞선 route의 선점을 막는다."""
+
+        # adapter의 pure matcher가 고른 route group을 transport가 명시하면
+        # 공통 API도 같은 group만 실행한다. request guard와 scope guard는
+        # start_turn/answer_stage 안에서 그대로 먼저 적용된다.
+        return self.start_turn(request).answer_stage(
+            stage,
+            on_partial_result=on_partial_result,
+        )
+
     def _build_route_groups(
         self,
         *,
@@ -348,7 +369,7 @@ class CompanyAssistantRuntime:
                     logger=self._logger,
                 ),
             ),
-            "structured": (
+            "structured": self._deps.structured_read_routes + (
                 StructuredAssistantRoute(
                     device_filter_enabled=(
                         self._deps.structured_device_filter_enabled
@@ -379,7 +400,10 @@ class CompanyAssistantRuntime:
                 )
             ),
         }
-        _validate_route_groups(groups)
+        _validate_route_groups(
+            groups,
+            structured_read_routes=self._deps.structured_read_routes,
+        )
         return groups
 
 
@@ -765,6 +789,8 @@ def _validate_route_groups(
         CompanyAssistantStage,
         Sequence[CompanyAssistantRoute],
     ],
+    *,
+    structured_read_routes: Sequence[CompanyAssistantRoute] = (),
 ) -> None:
     routes = [
         route
@@ -776,6 +802,13 @@ def _validate_route_groups(
     for stage, expected_names in COMPANY_ASSISTANT_MIGRATED_ROUTE_GROUPS.items():
         if stage == "knowledge":
             continue
+        if stage == "structured":
+            # API 전용 세부 read route는 범용 structured matcher보다 먼저
+            # 실행하되, Slack 기본 runtime의 표준 route 이름은 바꾸지 않는다.
+            expected_names = (
+                tuple(route.name for route in structured_read_routes)
+                + expected_names
+            )
         actual_names = tuple(route.name for route in groups.get(stage, ()))
         if actual_names != expected_names:
             raise ValueError(

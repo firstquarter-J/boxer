@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.factory import (
@@ -59,6 +59,8 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 "device_led_pattern_guide",
                 "recording_failure_analysis",
                 "barcode_log_analysis",
+                "weekly_recordings_summary",
+                "device_db_detail",
                 "structured",
                 "barcode_query",
                 "device_diagnostic_followup",
@@ -126,6 +128,45 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                         result.fallback_reason,
                         "read_only_boundary",
                     )
+        recordings_loader.assert_not_called()
+
+    def test_knowledge_stage_rechecks_freeform_rollout_boundary(self) -> None:
+        with (
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.LLM_PROVIDER",
+                "claude",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.LLM_SYNTHESIS_ENABLED",
+                True,
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "_build_claude_client",
+                return_value=object(),
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "_load_recordings_context_by_barcode",
+            ) as recordings_loader,
+        ):
+            runtime = create_company_assistant_runtime()
+            # routeGroup은 권한이 아니라 실행 범위 힌트다. API runtime도
+            # 일반 질문과 PII 의도를 자체 matcher로 다시 거부해야 한다.
+            for question in (
+                f"{_BARCODE} 오늘 기분 어때?",
+                f"{_BARCODE} 산모 전화번호를 녹화 기록 근거로 알려줘",
+                f"{_BARCODE} 녹화 기록을 수정해줘",
+            ):
+                with self.subTest(question=question):
+                    result = runtime.answer_stage(
+                        _request(question),
+                        "knowledge",
+                    )
+                    self.assertIsNone(result)
+
         recordings_loader.assert_not_called()
 
     def test_read_only_guard_preserves_supported_s3_log_routes(
@@ -218,28 +259,55 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(result.route, "unsupported_live_diagnostic")
         self.assertEqual(result.outcome, "denied")
 
-    def test_device_detail_query_uses_db_without_live_enrichment(
+    def test_read_only_guard_blocks_mda_barcode_routes_before_lookup(
         self,
     ) -> None:
-        with (
-            patch(
+        with patch(
+            "boxer_company.assistant.barcode_query_route."
+            "_query_barcode_validation_status"
+        ) as mda_query:
+            with patch(
                 "boxer_company.assistant.factory."
                 "core_settings.LLM_PROVIDER",
                 "",
-            ),
-            patch(
-                "boxer_company.assistant.structured_route."
-                "_query_devices_by_filters",
-                return_value="*장비 조회 결과*\n• MB2-C00419",
-            ) as device_query,
+            ):
+                runtime = create_company_assistant_runtime()
+                result = runtime.answer(
+                    _request(
+                        f"{_BARCODE} 유효성 검사 결과 알려줘"
+                    )
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.route, "unsupported_mda_lookup")
+        self.assertEqual(result.outcome, "denied")
+        self.assertEqual(result.fallback_reason, "read_only_boundary")
+        mda_query.assert_not_called()
+
+    def test_device_detail_query_uses_db_without_live_enrichment(
+        self,
+    ) -> None:
+        with patch(
+            "boxer_company.assistant.factory."
+            "core_settings.LLM_PROVIDER",
+            "",
         ):
             runtime = create_company_assistant_runtime()
-            result = runtime.answer(
+            turn = runtime.start_turn(
                 _request("MB2-C00419 장비 정보")
             )
 
+        # factory가 실제로 주입한 API 전용 route의 DB 함수를 대체해
+        # live enrichment=false 계약과 선행 순서를 함께 검증한다.
+        device_query = Mock(
+            return_value="*장비 조회 결과*\n• MB2-C00419"
+        )
+        device_route = turn.routes_for_stage("structured")[1]
+        device_route._query_devices = device_query
+        result = turn.answer()
+
         self.assertIsNotNone(result)
-        self.assertEqual(result.route, "devices_filter")
+        self.assertEqual(result.route, "device_db_detail")
         self.assertEqual(result.outcome, "answered")
         device_query.assert_called_once_with(
             device_name="MB2-C00419",
