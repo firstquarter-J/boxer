@@ -181,4 +181,9 @@ jobs:
         env:
           BOXER_SKIP_DOTENV: "true"
           AWS_REGION: ap-northeast-2
-        run: python -m pytest -q tests/company
+        run: |
+          # State/recovery tests intentionally reject world-writable /tmp parents.
+          protected_tmp_root="$(mktemp -d "${HOME}/boxer-company-tests.XXXXXX")"
+          python -m pytest -q \
+            --basetemp="${protected_tmp_root}/pytest" \
+            tests/company
