@@ -2,6 +2,7 @@ import json
 import logging
 import threading
 import unittest
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -691,50 +692,92 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             },
         }
 
-        with (
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True),
-            patch.object(reporter.s, "DB_QUERY_ENABLED", True),
-            patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql"),
-            patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret"),
-            patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"),
-            patch.object(reporter.cs, "MDA_GRAPHQL_ORIGIN", "https://mda.kr.mmtalkbox.com"),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY"),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
-            patch(
-                "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
-                return_value={
-                    "windowKey": "2026-04-08",
-                    "hospitalScope": "free_barcode",
-                    "hospitalOrder": "recordings_month_asc",
-                    "processedHospitalSeqs": [10],
-                    "lastHospitalSeq": 10,
-                    "nextHospitalSeq": 20,
-                },
-            ),
-            patch(
-                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
-                return_value=summary,
-            ) as build_summary_mock,
-            patch(
-                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
-                return_value="daily round body",
-            ) as format_mock,
-            patch(
-                "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
-                return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "daily round block"}}],
-            ) as blocks_mock,
-            patch(
-                "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
-            ) as save_state_mock,
-        ):
+        # Python 3.11은 단일 with의 정적 중첩 블록 수를 제한하므로
+        # ExitStack으로 같은 patch 범위와 검증 대상을 유지한다.
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(reporter.cs, "DAILY_DEVICE_ROUND_ENABLED", True))
+            stack.enter_context(patch.object(reporter.s, "DB_QUERY_ENABLED", True))
+            stack.enter_context(
+                patch.object(reporter.cs, "MDA_GRAPHQL_URL", "https://example.com/graphql")
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "MDA_ADMIN_USER_PASSWORD", "secret")
+            )
+            stack.enter_context(patch.object(reporter.cs, "DEVICE_SSH_PASSWORD", "ssh-secret"))
+            stack.enter_context(
+                patch.object(
+                    reporter.cs,
+                    "MDA_GRAPHQL_ORIGIN",
+                    "https://mda.kr.mmtalkbox.com",
+                )
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_CHANNEL_ID", "C_DAILY")
+            )
+            stack.enter_context(patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22))
+            stack.enter_context(patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0))
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5)
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0)
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True)
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False)
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False)
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False)
+            )
+            stack.enter_context(
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True)
+            )
+            stack.enter_context(
+                patch(
+                    "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
+                    return_value={
+                        "windowKey": "2026-04-08",
+                        "hospitalScope": "free_barcode",
+                        "hospitalOrder": "recordings_month_asc",
+                        "processedHospitalSeqs": [10],
+                        "lastHospitalSeq": 10,
+                        "nextHospitalSeq": 20,
+                    },
+                )
+            )
+            build_summary_mock = stack.enter_context(
+                patch(
+                    "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
+                    return_value=summary,
+                )
+            )
+            format_mock = stack.enter_context(
+                patch(
+                    "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_report_text",
+                    return_value="daily round body",
+                )
+            )
+            blocks_mock = stack.enter_context(
+                patch(
+                    "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_blocks",
+                    return_value=[
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": "daily round block"},
+                        }
+                    ],
+                )
+            )
+            save_state_mock = stack.enter_context(
+                patch(
+                    "boxer_company_adapter_slack.daily_device_round_reporter._save_daily_device_round_state"
+                )
+            )
             sent = reporter._run_daily_device_round_if_due(
                 client,
                 logger,
