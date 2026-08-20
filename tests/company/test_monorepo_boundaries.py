@@ -47,6 +47,7 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
         project = data.get("project") or {}
         dependencies = project.get("dependencies", [])
         packages = ((data.get("tool") or {}).get("setuptools") or {}).get("packages", [])
+        scripts = project.get("scripts", {})
 
         self.assertEqual(project.get("name"), "boxer-company")
         self.assertIn("boxer[db,s3]>=0.1.0", dependencies)
@@ -60,12 +61,26 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
         )
         self.assertNotIn("boxer", packages)
         self.assertNotIn("boxer_adapter_slack", packages)
+        self.assertEqual(
+            scripts,
+            {
+                "boxer-company-base-access-seed": (
+                    "boxer_company.base_access_seed:main"
+                ),
+                # Slack/API 모두가 설치하는 회사 domain CLI로
+                # 각 host의 canonical SMS 상태를 create-only 초기화한다.
+                "boxer-company-sms-recovery-state-init": (
+                    "boxer_company.sms_recovery_state_initializer:main"
+                ),
+            },
+        )
 
     def test_company_slack_pyproject_depends_on_public_and_company_layers(self) -> None:
         data = _load_toml(PROJECT_ROOT / "boxer_company_adapter_slack" / "pyproject.toml")
         project = data.get("project") or {}
         dependencies = project.get("dependencies", [])
         packages = ((data.get("tool") or {}).get("setuptools") or {}).get("packages", [])
+        scripts = project.get("scripts", {})
 
         self.assertEqual(project.get("name"), "boxer-company-adapter-slack")
         self.assertEqual(packages, ["boxer_company_adapter_slack"])
@@ -76,6 +91,16 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
                 "boxer-company>=0.1.0",
                 "requests==2.32.3",
             ],
+        )
+        self.assertEqual(
+            scripts,
+            {
+                # Slack 호스트만 설치해도 상태 이전 CLI를 직접 실행할 수 있어야 한다.
+                "boxer-company-slack-device-health-state": (
+                    "boxer_company_adapter_slack."
+                    "device_health_state_migration:main"
+                ),
+            },
         )
 
     def test_company_api_pyproject_is_private_install_unit(self) -> None:
@@ -102,6 +127,9 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
             {
                 "boxer-company-api": (
                     "boxer_company_api.runtime:main"
+                ),
+                "boxer-company-api-automation-resolve": (
+                    "boxer_company_api.automation_recovery:main"
                 ),
             },
         )

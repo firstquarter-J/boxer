@@ -147,6 +147,64 @@ class DeviceReadOnlyQueryTests(unittest.TestCase):
         mda_lookup.assert_not_called()
         ssh_lookup.assert_not_called()
 
+    def test_api_device_detail_keeps_slack_enrichment_and_disables_open_resend(
+        self,
+    ) -> None:
+        # API 상세도 기존 Slack과 같은 version/captureBoard/SSH 필드를 만들되
+        # 하나의 HTTP 요청 안에서는 sshOrder를 재전송하지 않는다.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"deviceCount": 1}
+        cursor.fetchall.return_value = [
+            {
+                "seq": 2410,
+                "deviceName": "MB2-C00419",
+                "hospitalName": "아이사랑산부인과의원(부산)",
+                "roomName": "2진료실",
+                "status": "NOSESS",
+                "activeFlag": 1,
+                "installFlag": 1,
+            }
+        ]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.object(box_db.s, "DB_HOST", "db-host"),
+            patch.object(box_db.s, "DB_USERNAME", "db-user"),
+            patch.object(box_db.s, "DB_PASSWORD", "db-pass"),
+            patch.object(box_db.s, "DB_DATABASE", "db-name"),
+            patch(
+                "boxer_company.routers.box_db._create_db_connection",
+                return_value=connection,
+            ),
+            patch(
+                "boxer_company.routers.box_db._lookup_mda_device_details",
+                return_value={
+                    "MB2-C00419": {
+                        "version": "2.11.307",
+                        "captureBoardType": "YUH01",
+                    }
+                },
+            ),
+            patch(
+                "boxer_company.routers.box_db._lookup_device_ssh_status",
+                return_value="연결 가능",
+            ) as ssh_lookup,
+        ):
+            rendered = box_db._query_devices_by_filters(
+                device_name="MB2-C00419",
+                include_live_enrichment=True,
+                allow_ssh_open_resend=False,
+            )
+
+        self.assertIn("버전: `2.11.307`", rendered)
+        self.assertIn("캡처보드 종류: `YUH01`", rendered)
+        self.assertIn("SSH 연결 상태: 🔵 *연결 가능*", rendered)
+        ssh_lookup.assert_called_once_with(
+            "MB2-C00419",
+            allow_ssh_open_resend=False,
+        )
+
 
 class RecordingTimelineAggregateTests(unittest.TestCase):
     def test_last_recorded_at_uses_exact_full_or_short_barcode_aggregate(self) -> None:

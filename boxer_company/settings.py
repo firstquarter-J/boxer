@@ -128,6 +128,24 @@ DEVICE_SSH_USER = os.getenv("DEVICE_SSH_USER", "mommytalk").strip()
 DEVICE_SSH_PASSWORD = os.getenv("DEVICE_SSH_PASSWORD", "").strip()
 DEVICE_SSH_CONNECT_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_CONNECT_TIMEOUT_SEC", "8"))
 DEVICE_SSH_COMMAND_TIMEOUT_SEC = int(os.getenv("DEVICE_SSH_COMMAND_TIMEOUT_SEC", "20"))
+# API EC2는 MDA가 반환한 public host에 credential을 보내지 않고, 사설
+# tunnel host와 장비별 pinned ed25519 key를 모두 검증한 뒤에만 접속한다.
+BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS = tuple(
+    item.strip()
+    for item in os.getenv(
+        "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS",
+        "",
+    ).split(",")
+    if item.strip()
+)
+BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST = os.getenv(
+    "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST",
+    "",
+).strip()
+BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH = os.getenv(
+    "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH",
+    "",
+).strip()
 DEVICE_DIAGNOSTIC_SNAPSHOT_TTL_SEC = int(os.getenv("DEVICE_DIAGNOSTIC_SNAPSHOT_TTL_SEC", "3600"))
 DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC = int(os.getenv("DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC", "600"))
 DEVICE_POWER_OFF_COMMAND = os.getenv("DEVICE_POWER_OFF_COMMAND", "").strip()
@@ -197,6 +215,18 @@ WEEKLY_RECORDINGS_REPORT_STATE_PATH = os.getenv(
     "WEEKLY_RECORDINGS_REPORT_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "weekly_recordings_report_state.json"),
 ).strip()
+# remote automation의 Slack 발송 receipt만 보존한다. 도메인 cursor와
+# provider 상태는 공통 API가 소유하고 이 파일에는 payload를 저장하지 않는다.
+AUTOMATION_DELIVERY_STATE_PATH = os.getenv(
+    "BOXER_COMPANY_AUTOMATION_DELIVERY_STATE_PATH",
+    str(core_settings.PROJECT_ROOT / "data" / "company_automation_delivery_state.json"),
+).strip()
+# health/notification intake를 끈 뒤에도 이미 접수된 Solapi outbox를 비울 수
+# 있도록 SMS 최종 상태 poller를 독립적으로 유지한다.
+SMS_DELIVERY_REPORTER_ENABLED = (
+    os.getenv("SMS_DELIVERY_REPORTER_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 DAILY_DEVICE_ROUND_ENABLED = (
     os.getenv("DAILY_DEVICE_ROUND_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

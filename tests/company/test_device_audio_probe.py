@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from boxer_company.routers.device_audio_probe import (
     _extract_device_name_for_audio_probe,
@@ -6,6 +7,7 @@ from boxer_company.routers.device_audio_probe import (
     _parse_mixer_control,
     _parse_playback_devices,
     _parse_playback_test,
+    _probe_device_audio_output,
     _render_device_audio_probe_result,
     _summarize_device_audio_probe,
 )
@@ -137,6 +139,29 @@ class DeviceAudioProbeParsingTests(unittest.TestCase):
         self.assertIn("• 판정: *정상*", rendered)
         self.assertIn("• 근거:", rendered)
         self.assertIn("• 안내:", rendered)
+
+    def test_api_audio_probe_disables_ssh_open_poll_resend(self) -> None:
+        # endpoint가 없어도 API operation은 initial open 뒤 poll 재발송을 막는다.
+        with patch(
+            "boxer_company.routers.device_audio_probe._wait_for_mda_device_agent_ssh",
+            return_value={
+                "ready": False,
+                "pollCount": 3,
+                "reusedExisting": False,
+                "device": {"deviceName": "MB2-C00419", "agentSsh": None},
+            },
+        ) as wait_for_ssh:
+            result_text, evidence = _probe_device_audio_output(
+                "MB2-C00419",
+                resend_ssh_open=False,
+            )
+
+        wait_for_ssh.assert_called_once_with(
+            "MB2-C00419",
+            resend_enabled=False,
+        )
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertIn("점검 불가", result_text)
 
 
 if __name__ == "__main__":

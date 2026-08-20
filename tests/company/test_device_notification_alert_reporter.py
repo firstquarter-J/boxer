@@ -204,6 +204,7 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
                 },
                 state_path,
             )
+            self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
             event = _captureboard_event()
             enabled_patch, db_patch, channel_patch = self._settings_patches()
             with (
@@ -1703,6 +1704,66 @@ class DeviceNotificationAlertReporterTests(unittest.TestCase):
             incident = result_state["recordingStallIncidents"][incident_key]
             self.assertEqual(incident["lastDurationSeconds"], 360)
             self.assertEqual(result_state["captureboardIncidents"], {})
+
+    def test_api_rollback_hashed_recording_incident_keeps_original_thread(
+        self,
+    ) -> None:
+        event = _recording_stall_event(
+            43,
+            duration_seconds=360,
+            current_size=1000,
+            occurred_at="2026-07-09T03:38:31+00:00",
+        )
+        context = reporter._recording_stall_context(event)
+        assert context is not None
+        incident_key = reporter._recording_stall_incident_hash_key(context)
+        state = reporter._normalize_device_notification_alert_state(
+            {
+                "initialized": True,
+                "lastSeenId": 43,
+                "pendingEvents": [event],
+                "recordingStallIncidents": {
+                    incident_key: {
+                        "phase": "alerted",
+                        "deviceName": "MB2-C00992",
+                        "firstNotificationId": 41,
+                        "firstOccurredAt": "2026-07-09T03:34:31+00:00",
+                        "firstDurationSeconds": 120,
+                        "lastNotificationId": 42,
+                        "lastOccurredAt": "2026-07-09T03:36:31+00:00",
+                        "lastDurationSeconds": 240,
+                        "lastCurrentSize": 1000,
+                        "slackMessageTs": "1000.001",
+                    }
+                },
+            }
+        )
+        client = Mock()
+        client.chat_postMessage.return_value = {"ts": "1000.043"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_state, sent_count = (
+                reporter._deliver_pending_device_notification_alerts(
+                    client,
+                    self.logger,
+                    state,
+                    channel_id="C094UC05PQW",
+                    now=self.now,
+                    state_path=Path(temp_dir) / "state.json",
+                )
+            )
+
+        self.assertEqual(sent_count, 1)
+        self.assertEqual(
+            client.chat_postMessage.call_args.kwargs["thread_ts"],
+            "1000.001",
+        )
+        self.assertEqual(
+            result_state["recordingStallIncidents"][incident_key][
+                "lastNotificationId"
+            ],
+            43,
+        )
 
     def test_missing_sheet_row_preserves_non_sheet_recording_thread(
         self,

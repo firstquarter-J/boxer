@@ -44,6 +44,7 @@ _SMS_SHEET_NOT_SENT = "미발송"
 _SMS_SHEET_REQUEST_FAILED = "발송 실패"
 _SMS_SHEET_CONFIRM_REQUIRED = "확인 필요"
 _SMS_TRACKING_METADATA_VERSION = 1
+_SHEET_DELIVERY_ID_MAX_LENGTH = 512
 
 
 def _build_device_health_sheet_authorized_session() -> Any:
@@ -147,26 +148,70 @@ def _build_device_health_sheet_sms_tracking_metadata(
     detected_at: datetime,
 ) -> str:
     group_id = _display_value(item.get("smsGroupId"), default="")
-    if not group_id:
+    delivery_key = _device_health_sheet_delivery_tracking_key(item)
+    if not group_id and not delivery_key:
         return ""
-    metadata: dict[str, Any] = {
-        "v": _SMS_TRACKING_METADATA_VERSION,
-        "g": group_id,
-        "k": _device_health_sheet_sms_tracking_key(
-            device_name,
-            issue,
-            slack_permalink,
-        ),
-        "t": _device_health_sheet_sms_tracking_time(
-            item,
-            detected_at=detected_at,
-        ),
-    }
-    message_id = _display_value(item.get("smsMessageId"), default="")
-    if message_id:
-        metadata["m"] = message_id
+    metadata: dict[str, Any] = {"v": _SMS_TRACKING_METADATA_VERSION}
+    if delivery_key:
+        # POST 응답이 유실돼도 다음 poll이 T열의 비가역 해시를 읽어 이미
+        # 반영된 delivery를 재확인한다. 원본 delivery ID는 Sheet에 남기지 않는다.
+        metadata["d"] = delivery_key
+    if group_id:
+        metadata.update(
+            {
+                "g": group_id,
+                "k": _device_health_sheet_sms_tracking_key(
+                    device_name,
+                    issue,
+                    slack_permalink,
+                ),
+                "t": _device_health_sheet_sms_tracking_time(
+                    item,
+                    detected_at=detected_at,
+                ),
+            }
+        )
+        message_id = _display_value(item.get("smsMessageId"), default="")
+        if message_id:
+            metadata["m"] = message_id
     # 숨김 T열에는 원문 식별값 대신 버전이 있는 compact JSON만 남긴다.
     return json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+
+def _device_health_sheet_delivery_tracking_key(item: dict[str, Any]) -> str:
+    """내부 delivery ID를 Sheet 재시도용 고정 길이 식별자로 바꾼다."""
+
+    delivery_id = _display_value(item.get("sheetDeliveryId"), default="")
+    if not delivery_id:
+        return ""
+    if len(delivery_id) > _SHEET_DELIVERY_ID_MAX_LENGTH:
+        raise ValueError("장비 장애 시트 delivery ID가 너무 길어")
+    return hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()
+
+
+def _parse_device_health_sheet_delivery_tracking_key(value: Any) -> str:
+    """T열 metadata 중 append 멱등성 식별자만 엄격하게 읽는다."""
+
+    raw_value = _display_value(value, default="")
+    if not raw_value:
+        return ""
+    try:
+        payload = json.loads(raw_value)
+    except (TypeError, ValueError):
+        return ""
+    if (
+        not isinstance(payload, dict)
+        or type(payload.get("v")) is not int
+        or payload.get("v") != _SMS_TRACKING_METADATA_VERSION
+    ):
+        return ""
+    delivery_key = _display_value(payload.get("d"), default="")
+    if (
+        len(delivery_key) != 64
+        or any(character not in "0123456789abcdef" for character in delivery_key)
+    ):
+        return ""
+    return delivery_key
 
 
 def _parse_device_health_sheet_sms_tracking_metadata(
@@ -692,6 +737,48 @@ def _append_device_health_sheet_alerts(
         f"/values/{append_range}:append"
     )
     session = authorized_session or _build_device_health_sheet_authorized_session()
+    delivery_keys = {
+        delivery_key
+        for row in rows
+        if (
+            delivery_key := _parse_device_health_sheet_delivery_tracking_key(
+                row[19]
+            )
+        )
+    }
+
+    if delivery_keys:
+        # Sheets append는 idempotency key를 받지 않는다. 쓰기 전에 같은 T열
+        # delivery hash를 읽어, 이전 POST가 반영된 뒤 timeout 난 재시도는 건너뛴다.
+        existing_rows = _load_device_health_sheet_sms_tracking_rows(
+            spreadsheet_id=spreadsheet_id,
+            tab_name=tab_name,
+            authorized_session=session,
+        )
+        existing_keys = {
+            delivery_key
+            for existing_row in existing_rows
+            if (
+                delivery_key := _parse_device_health_sheet_delivery_tracking_key(
+                    existing_row[18] if len(existing_row) > 18 else None
+                )
+            )
+        }
+        unique_new_keys: set[str] = set()
+        pending_rows: list[list[Any]] = []
+        for row in rows:
+            delivery_key = _parse_device_health_sheet_delivery_tracking_key(
+                row[19]
+            )
+            if delivery_key in existing_keys or delivery_key in unique_new_keys:
+                continue
+            if delivery_key:
+                unique_new_keys.add(delivery_key)
+            pending_rows.append(row)
+        rows = pending_rows
+        if not rows:
+            return 0
+
     response = session.post(
         url,
         params={

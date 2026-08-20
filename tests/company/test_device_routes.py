@@ -313,6 +313,45 @@ class DeviceRouteHandlerTests(unittest.TestCase):
                     resolve_status.assert_not_called()
                     set_alert_delivery.assert_called_once()
 
+    def test_device_health_alert_control_remote_mode_never_reads_legacy_state(self) -> None:
+        for question in (
+            "장비 이상 알림 켜",
+            "장비 이상 알림 꺼",
+            "장비 이상 알림 상태 확인",
+        ):
+            replies: list[str] = []
+            with (
+                patch(
+                    "boxer_company_adapter_slack.device_routes._resolve_device_health_monitor_alert_delivery_status"
+                ) as resolve_status,
+                patch(
+                    "boxer_company_adapter_slack.device_routes._set_device_health_monitor_alert_delivery_enabled"
+                ) as set_alert_delivery,
+            ):
+                handled = _handle_device_routes(
+                    DeviceRoutesContext(
+                        question=question,
+                        barcode=None,
+                        phase2_hospital_name=None,
+                        phase2_room_name=None,
+                        payload=_payload(),  # type: ignore[arg-type]
+                        user_id="U_MEMBER",
+                        workspace_id="W123",
+                        channel_id="C123",
+                        thread_ts="1.0",
+                        reply=lambda text, **kwargs: replies.append(text),
+                        client=None,
+                        logger=logging.getLogger(__name__),
+                    ),
+                    replace(_deps(), automation_remote=True),
+                )
+
+            with self.subTest(question=question):
+                self.assertTrue(handled)
+                resolve_status.assert_not_called()
+                set_alert_delivery.assert_not_called()
+                self.assertIn("API durable state", replies[0])
+
     def test_device_led_log_question_uses_log_analysis_before_pattern_guide(self) -> None:
         replies: list[str] = []
         synth_calls: list[tuple[object, ...]] = []

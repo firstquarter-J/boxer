@@ -16,7 +16,11 @@ from boxer_company.assistant.freeform_prompt import (
 _BARCODE = "12345678910"
 
 
-def _request(question: str) -> CompanyAssistantRequest:
+def _request(
+    question: str,
+    *,
+    route_group: str | None = None,
+) -> CompanyAssistantRequest:
     return CompanyAssistantRequest(
         request_id="REQ-FACTORY-1",
         tenant_id="TENANT-1",
@@ -25,6 +29,11 @@ def _request(question: str) -> CompanyAssistantRequest:
         conversation_id="CONVERSATION-1",
         question=question,
         locale="ko",
+        metadata=(
+            {"route_group": route_group}
+            if route_group is not None
+            else {}
+        ),
     )
 
 
@@ -60,13 +69,96 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 "recording_failure_analysis",
                 "barcode_log_analysis",
                 "weekly_recordings_summary",
+                "device_detail",
                 "device_db_detail",
                 "structured",
                 "barcode_query",
                 "device_diagnostic_followup",
                 "notion_playbook_qa",
                 "barcode_evidence_freeform",
+                "company_llm_health",
+                "company_daily_fortune",
+                "company_team_fun",
+                "company_freeform",
+                "operation_single_target_required",
+                "operation_confirmation_required",
+                "security_review",
+                "device_health_alert_action",
+                "device_file_operations",
+                "app_user_baby_selection_analysis",
+                "app_user_lookup",
+                "recording_streaming_restore",
+                "barcode_pink_classification_reason",
+                "barcode_validation_status",
+                "admin_s3_ultrasound",
+                "admin_s3_device_log",
+                "admin_request_log",
+                "admin_readonly_sql",
+                "device_operations",
+                "thread_playbook_learning",
             ),
+        )
+
+    def test_factory_assembles_operations_behind_explicit_stage(
+        self,
+    ) -> None:
+        with patch(
+            "boxer_company.assistant.factory.core_settings.LLM_PROVIDER",
+            "",
+        ):
+            turn = create_company_assistant_runtime().start_turn(
+                _request("일반 질문", route_group="operations")
+            )
+
+        # operations capability는 HTTP 정책에서 검사하고 factory는
+        # 구체 route를 전용 stage에만 조립한다.
+        self.assertEqual(
+            turn.service_for_stage("operations").route_names,
+            (
+                "operation_single_target_required",
+                "operation_confirmation_required",
+                "security_review",
+                "device_health_alert_action",
+                "device_file_operations",
+                "app_user_baby_selection_analysis",
+                "app_user_lookup",
+                "recording_streaming_restore",
+                "barcode_pink_classification_reason",
+                "barcode_validation_status",
+                "admin_s3_ultrasound",
+                "admin_s3_device_log",
+                "admin_request_log",
+                "admin_readonly_sql",
+                "device_operations",
+                "thread_playbook_learning",
+            ),
+        )
+        self.assertIsNone(_guard_read_only_request(turn.request))
+
+    def test_factory_assembles_freeform_behind_explicit_stage(
+        self,
+    ) -> None:
+        with patch(
+            "boxer_company.assistant.factory.core_settings.LLM_PROVIDER",
+            "",
+        ):
+            turn = create_company_assistant_runtime().start_turn(
+                _request("오늘 기분 어때?", route_group="freeform")
+            )
+
+        # 채널 중립 provider route는 전용 final fallback stage에만 있다.
+        self.assertEqual(
+            turn.service_for_stage("freeform").route_names,
+            (
+                "company_llm_health",
+                "company_daily_fortune",
+                "company_team_fun",
+                "company_freeform",
+            ),
+        )
+        self.assertNotIn(
+            "company_freeform",
+            turn.service_for_stage("knowledge").route_names,
         )
 
     def test_separate_process_snapshot_is_unavailable_by_default(
@@ -302,7 +394,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
         device_query = Mock(
             return_value="*장비 조회 결과*\n• MB2-C00419"
         )
-        device_route = turn.routes_for_stage("structured")[1]
+        device_route = turn.routes_for_stage("structured")[2]
         device_route._query_devices = device_query
         result = turn.answer()
 
@@ -323,7 +415,48 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
             include_live_enrichment=False,
         )
 
-    def test_api_factory_disables_live_enrichment_for_all_log_routes(
+    def test_explicit_device_detail_stage_uses_live_enrichment(
+        self,
+    ) -> None:
+        with patch(
+            "boxer_company.assistant.factory."
+            "core_settings.LLM_PROVIDER",
+            "",
+        ):
+            runtime = create_company_assistant_runtime()
+            turn = runtime.start_turn(
+                _request(
+                    "MB2-C00419 장비 정보",
+                    route_group="device_detail",
+                )
+            )
+
+        # full route가 기존 Slack 보강 흐름을 쓰되 poll 중 open을
+        # 재전송하지 않는지와 CommonMark 계약을 함께 고정한다.
+        device_query = Mock(
+            return_value=(
+                "*장비 조회 결과*\n"
+                "• 장비명: `MB2-C00419`\n"
+                "• 버전: `2.11.307`\n"
+                "• SSH 연결 상태: 🔵 *연결 가능*"
+            )
+        )
+        full_route = turn.routes_for_stage("structured")[1]
+        full_route._query_devices = device_query
+        result = turn.answer()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.route, "device_detail")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("버전: `2.11.307`", result.messages[0].body)
+        self.assertTrue(
+            device_query.call_args.kwargs["include_live_enrichment"]
+        )
+        self.assertFalse(
+            device_query.call_args.kwargs["allow_ssh_open_resend"]
+        )
+
+    def test_api_factory_enables_bounded_undated_db_s3_log_routes(
         self,
     ) -> None:
         with patch(
@@ -335,14 +468,14 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 _request(f"{_BARCODE} 2026-08-04 로그 분석")
             )
 
-        # API factory의 두 로그 경로가 MDA sshOrder·장비 SSH를 열 수 없게
-        # 같은 fail-closed 설정을 공유하는지 조립 경계에서 고정한다.
+        # 날짜 없는 요청은 route의 고정 phase1 window로 허용하되 API에서
+        # MDA sshOrder·장비 SSH를 열 수 없는 설정을 조립 경계에 고정한다.
         failure_route = turn.routes_for_stage("failure")[0]
         barcode_log_route = turn.routes_for_stage("log")[0]
         self.assertFalse(failure_route._live_enrichment_enabled)
         self.assertFalse(barcode_log_route._live_enrichment_enabled)
-        self.assertTrue(failure_route._explicit_date_required)
-        self.assertTrue(barcode_log_route._explicit_date_required)
+        self.assertFalse(failure_route._explicit_date_required)
+        self.assertFalse(barcode_log_route._explicit_date_required)
 
     def test_ollama_health_result_is_cached_for_requests(self) -> None:
         with (

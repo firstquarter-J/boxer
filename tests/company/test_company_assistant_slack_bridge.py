@@ -8,12 +8,33 @@ from boxer_company.assistant import (
     SourceReference,
 )
 from boxer_company_adapter_slack.assistant_bridge import (
+    assistant_slack_route_name,
     build_company_assistant_request,
     render_company_assistant_result,
 )
 
 
 class CompanyAssistantSlackBridgeTests(unittest.TestCase):
+    def test_company_freeform_keeps_legacy_request_log_name(self) -> None:
+        self.assertEqual(
+            assistant_slack_route_name("company_freeform"),
+            "llm_freeform",
+        )
+
+    def test_device_detail_keeps_canonical_slack_request_log_name(
+        self,
+    ) -> None:
+        # full API route를 전환해도 기존 운영 대시보드의 route cardinality가
+        # 갈라지지 않도록 DB-only/full alias를 같은 이름으로 유지한다.
+        self.assertEqual(
+            assistant_slack_route_name("device_detail"),
+            "devices_filter",
+        )
+        self.assertEqual(
+            assistant_slack_route_name("device_db_detail"),
+            "devices_filter",
+        )
+
     def test_payload_maps_to_exact_channel_neutral_request(self) -> None:
         payload = {
             "raw_text": "<@BOT> 회사 노션",

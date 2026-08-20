@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from boxer.context.entries import ContextEntry
 from boxer_adapter_slack.common import MentionPayload, SlackReplyFn
 from boxer_company.assistant import (
+    AssistantLink,
     CompanyAssistantRequest,
     CompanyAssistantResult,
     SourceReference,
@@ -18,6 +19,7 @@ _COMMONMARK_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _COMMONMARK_BOLD_PATTERN = re.compile(r"\*\*([^*\n]+)\*\*")
 _HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]|]+")
 _HANGUL_PATTERN = re.compile(r"[가-힣ㄱ-ㅎㅏ-ㅣ]")
+_MAX_PRIVATE_LINK_URI_CHARS = 16_384
 _LEGACY_SLACK_ROUTE_NAMES = {
     "device_led_log_analysis": "device led log analysis",
     "device_led_pattern_guide": "device led pattern guide",
@@ -26,7 +28,9 @@ _LEGACY_SLACK_ROUTE_NAMES = {
     "device_diagnostic_followup": "device diagnostic followup",
     "notion_playbook_qa": "notion playbook qa",
     "barcode_evidence_freeform": "llm_freeform",
+    "company_freeform": "llm_freeform",
     "device_db_detail": "devices_filter",
+    "device_detail": "devices_filter",
     "weekly_recordings_summary": "weekly recordings report",
 }
 
@@ -102,6 +106,17 @@ def render_company_assistant_result(
                 logger=logger,
             ):
                 sent_count += 1
+            # API가 명시한 privateLinks만 요청자 DM에 별도 렌더링한다.
+            # 공개 reply 경로에는 링크 객체를 절대 넘기지 않는다.
+            for link in message.private_links:
+                link_text = _render_private_link(link)
+                if link_text and _send_requester_dm(
+                    client=client,
+                    actor_id=actor_id,
+                    text=link_text,
+                    logger=logger,
+                ):
+                    sent_count += 1
             continue
 
         # 여러 공개 메시지를 내보내도 첫 메시지만 요청자를 mention한다.
@@ -274,6 +289,35 @@ def _render_plain_segment(
 
 def _escape_slack_link_label(text: str) -> str:
     return _escape_slack_body_text(text).replace("|", "/")
+
+
+def _render_private_link(link: AssistantLink) -> str | None:
+    uri = str(link.uri or "").strip()
+    label = str(link.label or "").strip()
+    if not label or not _is_safe_private_link_uri(uri):
+        return None
+    return f"<{uri}|{_escape_slack_link_label(label)}>"
+
+
+def _is_safe_private_link_uri(uri: str) -> bool:
+    normalized = (uri or "").strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_PRIVATE_LINK_URI_CHARS
+        or any(char.isspace() or ord(char) < 32 for char in normalized)
+        or any(char in normalized for char in "<>|")
+    ):
+        return False
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme.lower() == "https"
+        and parsed.hostname
+        and parsed.username is None
+        and parsed.password is None
+    )
 
 
 def _is_safe_http_uri(uri: str) -> bool:

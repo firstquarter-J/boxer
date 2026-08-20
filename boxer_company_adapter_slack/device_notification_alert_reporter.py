@@ -1,5 +1,8 @@
+import hashlib
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -26,6 +29,16 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
 )
 from boxer_company_adapter_slack.sms_delivery_reporter import (
     remember_sms_delivery_sheet_record,
+)
+from boxer_company_adapter_slack.automation_api_client import (
+    CompanyAutomationApiClient,
+)
+from boxer_company_adapter_slack.automation_reporter import (
+    build_automation_delivery_client_msg_id,
+    AutomationSlackDelivery,
+    build_automation_request_id,
+    flush_automation_deliveries,
+    remember_automation_delivery,
 )
 
 _CAPTUREBOARD_CONNECTION_ERROR = "captureboard_connection_error"
@@ -402,17 +415,31 @@ def _save_device_notification_alert_state(
 ) -> None:
     path = state_path or _device_notification_alert_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.tmp")
     payload = _normalize_device_notification_alert_state(state)
 
     # 커서와 발송 대기 목록은 같은 파일로 원자 교체해 둘 중 하나만 반영되는 상태를 막는다.
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temp_path = Path(temporary_name)
     try:
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        # notification state에는 pending event와 incident context가 있으므로
+        # 일반 umask에 기대지 않고 생성 순간부터 owner-only로 고정한다.
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(
+                json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
         temp_path.replace(path)
     finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         if temp_path.exists():
             temp_path.unlink()
 
@@ -941,6 +968,20 @@ def _recording_stall_incident_key(context: dict[str, Any]) -> str:
     )
 
 
+def _recording_stall_incident_hash_key(context: dict[str, Any]) -> str:
+    """API rollback이 원문 없이 복원한 incident key를 local에서도 찾는다."""
+
+    api_key = "\0".join(
+        (
+            str(context.get("deviceName") or "").strip(),
+            str(context.get("fileId") or "-").strip(),
+            str(context.get("barcode") or "-").strip(),
+            str(context.get("fileType") or "recording").strip(),
+        )
+    )
+    return f"sha256:{hashlib.sha256(api_key.encode('utf-8')).hexdigest()}"
+
+
 def _is_recording_stall_scope(context: dict[str, Any]) -> bool:
     duration_seconds = context.get("durationSeconds")
     return (
@@ -1300,6 +1341,14 @@ def _process_recording_stall_event(
     incident_key = _recording_stall_incident_key(context)
     incidents = dict(state.get("recordingStallIncidents") or {})
     incident = incidents.get(incident_key)
+    if not isinstance(incident, dict):
+        rollback_incident_key = _recording_stall_incident_hash_key(context)
+        rollback_incident = incidents.get(rollback_incident_key)
+        if isinstance(rollback_incident, dict):
+            # rollback bundle은 barcode/fileId 원문 대신 hash key를 복원한다.
+            # 기존 raw-key state는 그대로 우선해 local 운영 의미를 바꾸지 않는다.
+            incident_key = rollback_incident_key
+            incident = rollback_incident
     is_zero_growth_candidate = _is_zero_growth_recording_stall_candidate(context)
 
     if isinstance(incident, dict) and incident.get("phase") == "alerted":
@@ -1600,10 +1649,11 @@ def _run_device_notification_alert_once(
     now: datetime | None = None,
     state_path: Path | None = None,
     auto_sms_sender: _DeviceNotificationAutoSmsSender | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
 ) -> bool:
     if not cs.DEVICE_NOTIFICATION_ALERT_ENABLED:
         return False
-    if not s.DB_QUERY_ENABLED:
+    if automation_client is None and not s.DB_QUERY_ENABLED:
         logger.warning("장비 이벤트 알림을 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
 
@@ -1615,6 +1665,14 @@ def _run_device_notification_alert_once(
         return False
 
     local_now = _coerce_device_notification_alert_now(now)
+    if automation_client is not None:
+        return _run_device_notification_alert_remote_once(
+            client,
+            logger,
+            automation_client=automation_client,
+            local_now=local_now,
+            channel_id=channel_id,
+        )
     state = _load_device_notification_alert_state(state_path, logger=logger)
     if not state["initialized"]:
         latest_id = _load_latest_device_notification_id()
@@ -1666,10 +1724,151 @@ def _run_device_notification_alert_once(
     return sent_count + newly_sent_count > 0
 
 
+def _run_device_notification_alert_remote_once(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    automation_client: CompanyAutomationApiClient,
+    local_now: datetime,
+    channel_id: str,
+) -> bool:
+    """DB cursor·SMS·Sheets는 API에 두고 Slack delivery만 처리한다."""
+
+    cycle_key = "continuous"
+    if flush_automation_deliveries(
+        automation_client,
+        cycle="device_notification_alert",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+        logger=logger,
+    ):
+        return False
+    result = automation_client.run(
+        request_id=build_automation_request_id(
+            cycle="device_notification_alert",
+            cycle_key=cycle_key,
+            scheduled_at=local_now,
+        ),
+        cycle="device_notification_alert",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+    )
+    if len(result.deliveries) > 1:
+        raise RuntimeError("장비 이벤트 API delivery 계약이 올바르지 않아")
+    if not result.deliveries:
+        return False
+
+    delivery = result.deliveries[0]
+    payload = dict(delivery.payload)
+    if delivery.kind == "device_notification_alert":
+        alert_summary = payload.get("alertSummary")
+        render = payload.get("render")
+        if not isinstance(alert_summary, dict) or not isinstance(render, dict):
+            raise RuntimeError("장비 이벤트 API alert payload가 올바르지 않아")
+        posted = _post_daily_device_round_abnormal_alert(
+            client,
+            alert_summary,
+            channel_id=channel_id,
+            message_ts="",
+            logger=logger,
+            include_blocks=True,
+            include_actions=bool(render.get("includeActions")),
+            include_device_voice_action=bool(
+                render.get("includeDeviceVoiceAction")
+            ),
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle="device_notification_alert",
+                cycle_key=cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="alert",
+            ),
+        )
+    elif delivery.kind == "device_notification_thread_reply":
+        posted = _post_remote_recording_stall_thread_reply(
+            client,
+            payload,
+            channel_id=channel_id,
+            logger=logger,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle="device_notification_alert",
+                cycle_key=cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="thread-reply",
+            ),
+        )
+    else:
+        raise RuntimeError("장비 이벤트 API delivery 종류가 올바르지 않아")
+    if posted is None:
+        return False
+
+    remember_automation_delivery(
+        cycle="device_notification_alert",
+        cycle_key=cycle_key,
+        delivery=AutomationSlackDelivery(
+            delivery_id=delivery.delivery_id,
+            external_message_id=str(posted.get("messageTs") or "").strip(),
+            permalink=str(posted.get("permalink") or "").strip(),
+            delivered_at=local_now,
+        ),
+    )
+    logger.info(
+        "Posted remote device notification delivery channel=%s kind=%s",
+        channel_id,
+        delivery.kind,
+    )
+    return True
+
+
+def _post_remote_recording_stall_thread_reply(
+    client: Any,
+    payload: dict[str, Any],
+    *,
+    channel_id: str,
+    logger: logging.Logger,
+    client_msg_id: str,
+) -> dict[str, str] | None:
+    """API가 확정한 thread target과 표시값만 Slack 메시지로 바꾼다."""
+
+    thread_ts = str(
+        payload.get("replyToExternalMessageId") or ""
+    ).strip()
+    if not thread_ts:
+        raise RuntimeError("장비 이벤트 API thread target이 비어 있어")
+    text = "\n".join(
+        (
+            ":warning: *녹화 파일 증가 정지 지속*",
+            f"> *지속 시간*  `{str(payload.get('durationText') or '-').strip()}`",
+            f"> *현재 증가율*  `{str(payload.get('growthRateText') or '-').strip()}`",
+            f"> *발생 시각*  `{str(payload.get('occurredAt') or '-').strip()}`",
+        )
+    )
+    try:
+        response = client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=text,
+            unfurl_links=False,
+            unfurl_media=False,
+            client_msg_id=client_msg_id,
+        )
+    except Exception:
+        logger.warning(
+            "Remote recording stall thread delivery failed channel=%s",
+            channel_id,
+            exc_info=True,
+        )
+        return None
+    return {
+        "messageTs": _extract_slack_message_ts(response),
+        "permalink": "",
+    }
+
+
 def _device_notification_alert_loop(
     client: Any,
     logger: logging.Logger,
     auto_sms_sender: _DeviceNotificationAutoSmsSender | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
     poll_interval_sec = max(
         10,
@@ -1681,6 +1880,7 @@ def _device_notification_alert_loop(
                 client,
                 logger,
                 auto_sms_sender=auto_sms_sender,
+                automation_client=automation_client,
             )
         except Exception:
             logger.exception("장비 이벤트 알림 처리 중 오류가 발생했어")
@@ -1692,12 +1892,13 @@ def attach_device_notification_alert_reporter(
     *,
     logger: logging.Logger | None = None,
     auto_sms_sender: _DeviceNotificationAutoSmsSender | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
     if not cs.DEVICE_NOTIFICATION_ALERT_ENABLED:
         return
 
     actual_logger = logger or logging.getLogger(__name__)
-    if not s.DB_QUERY_ENABLED:
+    if automation_client is None and not s.DB_QUERY_ENABLED:
         actual_logger.warning(
             "장비 이벤트 알림이 활성화됐는데 DB_QUERY_ENABLED가 꺼져 있어 시작하지 않을게"
         )
@@ -1725,7 +1926,12 @@ def attach_device_notification_alert_reporter(
             return
         _DEVICE_NOTIFICATION_ALERT_THREAD = threading.Thread(
             target=_device_notification_alert_loop,
-            args=(client, actual_logger, auto_sms_sender),
+            args=(
+                client,
+                actual_logger,
+                auto_sms_sender,
+                automation_client,
+            ),
             name="boxer-device-notification-alert",
             daemon=True,
         )

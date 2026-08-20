@@ -58,6 +58,7 @@ class CompanyApiRuntimeTest(unittest.TestCase):
                     "emit_api_event("
                     "'company_api_turn_completed',"
                     "request_id='runtime-log-test',"
+                    "route_group='device_detail',"
                     "status=200)"
                 ),
             ],
@@ -73,6 +74,7 @@ class CompanyApiRuntimeTest(unittest.TestCase):
         payload = json.loads(child.stderr.strip())
         self.assertEqual(payload["event"], "company_api_turn_completed")
         self.assertEqual(payload["request_id"], "runtime-log-test")
+        self.assertEqual(payload["route_group"], "device_detail")
         self.assertEqual(payload["status"], 200)
         self.assertNotIn("question", payload)
 

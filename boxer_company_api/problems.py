@@ -21,6 +21,8 @@ _DEFAULT_TITLES = {
     "authentication_failed": "Authentication failed",
     "caller_not_allowed": "Caller is not allowed",
     "validation_failed": "Request validation failed",
+    "request_id_conflict": "Request ID conflicts with an earlier request",
+    "operation_in_progress": "Operation is already in progress",
     "service_not_ready": "Service is not ready",
     "not_found": "Resource not found",
     "method_not_allowed": "Method not allowed",

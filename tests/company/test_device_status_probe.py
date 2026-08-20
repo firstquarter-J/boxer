@@ -645,6 +645,143 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
 
 
 class DeviceRemoteAccessAndMemoryPatchExecutionTests(unittest.TestCase):
+    def test_api_memory_patch_disables_ssh_open_poll_resend(self) -> None:
+        # mutation precheck가 endpoint를 기다려도 API에서는 open 재발송을 막는다.
+        with patch(
+            "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+            return_value={
+                "ready": False,
+                "pollCount": 3,
+                "reusedExisting": False,
+                "device": {"deviceName": "MB2-C00419", "agentSsh": None},
+            },
+        ) as wait_for_ssh:
+            result_text, evidence = _patch_device_pm2_memory(
+                "MB2-C00419",
+                resend_ssh_open=False,
+            )
+
+        wait_for_ssh.assert_called_once_with(
+            "MB2-C00419",
+            resend_enabled=False,
+        )
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertIn("실행 불가", result_text)
+
+    def test_api_runtime_probe_opens_missing_endpoint_once_without_resend(
+        self,
+    ) -> None:
+        missing_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": None,
+        }
+        with (
+            patch(
+                "boxer_company.routers.mda_graphql.time.monotonic",
+                side_effect=[0, 0, 1, 2],
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql.time.sleep",
+                return_value=None,
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql.cs.MDA_SSH_POLL_TIMEOUT_SEC",
+                2,
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql.cs.MDA_SSH_POLL_INTERVAL_SEC",
+                1,
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql.cs.MDA_SSH_POLL_RESEND_EVERY",
+                1,
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql.cs.MDA_SSH_OPEN_HOST",
+                "remotes.example",
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql._get_mda_device_agent_ssh",
+                return_value=missing_device,
+            ),
+            patch(
+                "boxer_company.routers.mda_graphql._open_mda_device_ssh",
+                return_value={"status": True},
+            ) as open_ssh,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+                resend_ssh_open=False,
+                allow_force_reopen=False,
+            )
+
+        open_ssh.assert_called_once_with(
+            "MB2-C00419",
+            host="remotes.example",
+        )
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertEqual(checks, {})
+
+    def test_api_runtime_probe_never_force_reopens_stale_endpoint(
+        self,
+    ) -> None:
+        cached_device = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {"host": "remotes.example", "port": 61001},
+        }
+        failed_connection = {
+            "ok": False,
+            "reason": "connectionrefusederror",
+            "retryable": True,
+        }
+        with (
+            patch(
+                "boxer_company.routers.device_status_probe._wait_for_mda_device_agent_ssh",
+                side_effect=[
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                    {
+                        "ready": True,
+                        "pollCount": 0,
+                        "reusedExisting": True,
+                        "device": cached_device,
+                    },
+                ],
+            ) as wait_for_ssh,
+            patch(
+                "boxer_company.routers.device_status_probe._connect_device_ssh_client",
+                side_effect=[failed_connection, failed_connection],
+            ),
+            patch(
+                "boxer_company.routers.device_status_probe._get_active_device_ssh_client_count",
+            ) as get_active_count,
+        ):
+            evidence, _, checks = _collect_runtime_checks(
+                "MB2-C00419",
+                "pm2",
+                resend_ssh_open=False,
+                allow_force_reopen=False,
+            )
+
+        self.assertEqual(wait_for_ssh.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs == {"resend_enabled": False}
+                for call in wait_for_ssh.call_args_list
+            )
+        )
+        get_active_count.assert_not_called()
+        self.assertFalse(evidence["ssh"]["ready"])
+        self.assertTrue(
+            evidence["ssh"]["refreshSkippedForceReopenDisabled"]
+        )
+        self.assertEqual(checks, {})
+
     def test_refreshes_cached_ssh_tunnel_once_after_connection_failure(self) -> None:
         client = _FakeSshClient(
             [

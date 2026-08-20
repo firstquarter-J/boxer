@@ -85,6 +85,92 @@ class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
 
         self.assertEqual(chunks, ["1234567890", "1\nabc"])
 
+    def test_remote_renderer_accepts_only_presentation_dto(self) -> None:
+        payload = {
+            "runDate": "2026-08-10",
+            "hospitalSeq": 24,
+            "hospitalName": "테스트병원",
+            "deviceCount": 1,
+            "scheduledDeviceCount": 1,
+            "statusCounts": {
+                "정상": 0,
+                "확인 필요": 1,
+                "이상": 0,
+                "점검 불가": 0,
+            },
+            "updateCounts": {
+                "agentCandidates": 1,
+                "agentUpdated": 1,
+                "agentUpdateFailed": 0,
+                "boxCandidates": 0,
+                "boxUpdated": 0,
+                "boxUpdateFailed": 0,
+            },
+            "cleanupCounts": {"candidates": 0, "executed": 0, "failed": 0},
+            "powerCounts": {
+                "requested": 0,
+                "poweredOff": 0,
+                "alreadyOffline": 0,
+                "powerOffFailed": 0,
+            },
+            "summaryLine": "확인 필요 1",
+            "deviceResults": [
+                {
+                    "deviceName": "MB2-TEST",
+                    "roomName": "1진료실",
+                    "overallLabel": "확인 필요",
+                    "networkUnavailable": False,
+                    "issueSummary": "스토리지 확인 필요",
+                    "storage": {
+                        "label": "확인 필요",
+                        "filesystemUsedPercent": 81,
+                    },
+                    "cleanup": {
+                        "visible": False,
+                        "statusKind": "latest",
+                        "label": "불필요",
+                        "summary": "정리 대상 아님",
+                    },
+                    "agentUpdate": {
+                        "actionable": True,
+                        "statusKind": "success",
+                        "label": "업데이트 완료",
+                        "summary": "버전 1.0.0 -> 1.1.0",
+                    },
+                    "boxUpdate": {
+                        "actionable": False,
+                        "statusKind": "latest",
+                        "label": "업데이트 불필요",
+                        "summary": "버전 2.1.0",
+                    },
+                    "power": {
+                        "visible": False,
+                        "statusKind": "latest",
+                        "label": "미실행",
+                        "summary": "종료 요청 없음",
+                    },
+                }
+            ],
+        }
+
+        validated = reporter._validate_remote_daily_device_round_presentation(
+            payload
+        )
+        blocks = reporter._build_remote_daily_device_round_blocks(
+            validated,
+            now=datetime(2026, 8, 10, 23, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+        rendered = json.dumps(blocks, ensure_ascii=False)
+
+        self.assertIn("MB2-TEST", rendered)
+        self.assertIn("버전 1.0.0 -> 1.1.0", rendered)
+        poisoned = json.loads(json.dumps(payload, ensure_ascii=False))
+        poisoned["deviceResults"][0]["statusPayload"] = {
+            "ssh": {"host": "synthetic-secret-host"}
+        }
+        with self.assertRaises(RuntimeError):
+            reporter._validate_remote_daily_device_round_presentation(poisoned)
+
 
 class DailyDeviceRoundReporterDueTests(unittest.TestCase):
     def setUp(self) -> None:

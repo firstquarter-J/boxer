@@ -5,7 +5,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 from boxer.core import settings as s
 
@@ -92,6 +92,8 @@ def _notion_request(
     method: str = "GET",
     payload: dict[str, Any] | None = None,
     token: str | None = None,
+    before_request: Callable[[], None] | None = None,
+    retry_rate_limit: bool = True,
 ) -> dict[str, Any]:
     body = None
     if payload is not None:
@@ -102,8 +104,13 @@ def _notion_request(
         headers=_build_notion_headers(token),
         method=method,
     )
-    for attempt in range(3):
+    max_attempts = 3 if retry_rate_limit else 1
+    for attempt in range(max_attempts):
         try:
+            # 인증/header/request preflight가 끝난 뒤 실제 transport 직전에만
+            # caller가 외부 write 시도를 기록할 수 있게 한다.
+            if before_request is not None:
+                before_request()
             with urllib.request.urlopen(request, timeout=max(1, s.NOTION_API_TIMEOUT_SEC)) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -112,7 +119,7 @@ def _notion_request(
                 detail = exc.read().decode("utf-8", errors="replace")
             finally:
                 exc.close()
-            if exc.code == 429 and attempt < 2:
+            if exc.code == 429 and retry_rate_limit and attempt < max_attempts - 1:
                 # Notion의 Retry-After를 따라 일회성 rate limit 때문에 전체 조회가 실패하지 않게 한다.
                 raw_retry_after = str((response_headers or {}).get("Retry-After") or "1").strip()
                 try:

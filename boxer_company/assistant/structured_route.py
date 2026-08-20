@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import re
 from typing import Callable
 
 import pymysql
@@ -51,6 +52,14 @@ from boxer_company.routers.recording_streaming_restore import (
 )
 from boxer_company.weekly_recordings_report import (
     _is_weekly_recordings_report_request,
+)
+
+
+_EXPLICIT_DEVICE_NAME_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9-]*\d[A-Za-z0-9-]*)"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
 )
 
 
@@ -108,6 +117,14 @@ class StructuredAssistantRoute:
             return build_scope_mismatch_result(mismatch)
         if matched is None:
             return None
+
+        if (
+            matched.route == "devices_filter"
+            and _has_multiple_explicit_device_names(request.question)
+        ):
+            # 기존 parser는 첫 장비명만 반환한다. 복수 대상을 첫 장비로
+            # 축소하면 상세 조회 중 MDA/SSH가 엉뚱한 한 대에 실행될 수 있다.
+            return _ambiguous_device_scope_result()
 
         if (
             matched.route == "devices_filter"
@@ -474,6 +491,29 @@ def _is_generic_count_or_existence_request(question: str) -> bool:
     ) or "count" in lowered
 
 
+def _has_multiple_explicit_device_names(question: str) -> bool:
+    """질문 본문에 서로 다른 장비명이 둘 이상 명시됐는지 확인한다."""
+
+    names = {
+        token.casefold()
+        for token in _EXPLICIT_DEVICE_NAME_PATTERN.findall(
+            str(question or "")
+        )
+    }
+    return len(names) > 1
+
+
+def _ambiguous_device_scope_result() -> CompanyAssistantResult:
+    """복수 장비를 임의로 한 대로 축소하지 않는 공통 안전 응답이다."""
+
+    return _result(
+        route="devices_filter",
+        outcome="needs_input",
+        body="장비명을 하나만 입력해줘",
+        fallback_reason="device_scope_ambiguous",
+    )
+
+
 def _to_commonmark(text: str) -> str:
     return slack_mrkdwn_to_commonmark(text)
 
@@ -495,6 +535,8 @@ def _result(
 
 __all__ = [
     "StructuredAssistantRoute",
+    "_ambiguous_device_scope_result",
+    "_has_multiple_explicit_device_names",
     "match_structured_device_count_route",
     "match_structured_read_route",
 ]

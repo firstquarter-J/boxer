@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import requests
 
@@ -65,6 +65,10 @@ from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
     _load_device_health_sheet_captureboard_incidents,
 )
+from boxer_company.device_health_fingerprint import (
+    canonical_device_health_alert_fingerprint,
+    canonicalize_device_health_alert_fingerprint_key,
+)
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
@@ -81,6 +85,21 @@ from boxer_company_adapter_slack.device_notification_alert_reporter import (
 from boxer_company_adapter_slack.sms_delivery_reporter import (
     attach_sms_delivery_reporter,
     remember_sms_delivery_sheet_record,
+)
+from boxer_company_adapter_slack.device_health_alert_api import (
+    DeviceHealthAlertApiBridge,
+    build_device_health_alert_api_target,
+    build_device_health_alert_request_id,
+)
+from boxer_company_adapter_slack.automation_api_client import (
+    CompanyAutomationApiClient,
+)
+from boxer_company_adapter_slack.automation_reporter import (
+    build_automation_delivery_client_msg_id,
+    AutomationSlackDelivery,
+    build_automation_request_id,
+    flush_automation_deliveries,
+    remember_automation_delivery,
 )
 
 _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
@@ -600,15 +619,20 @@ def _normalize_device_health_monitor_alerts(value: Any) -> dict[str, dict[str, A
     for key, raw in value.items():
         if not isinstance(raw, dict):
             continue
-        normalized_key = str(key or "").strip()
+        normalized_key = canonicalize_device_health_alert_fingerprint_key(key)
         if not normalized_key:
             continue
-        alerts[normalized_key] = {
+        normalized = {
             "firstAlertedAt": str(raw.get("firstAlertedAt") or "").strip(),
             "lastAlertedAt": str(raw.get("lastAlertedAt") or "").strip(),
             "lastSeenAt": str(raw.get("lastSeenAt") or "").strip(),
             "count": max(0, int(raw.get("count") or 0)),
         }
+        alerts[normalized_key] = _merge_device_health_monitor_fingerprint_state(
+            alerts.get(normalized_key),
+            normalized,
+            timestamp_key="firstAlertedAt",
+        )
     return alerts
 
 
@@ -620,15 +644,66 @@ def _normalize_device_health_monitor_pending_alerts(value: Any) -> dict[str, dic
     for key, raw in value.items():
         if not isinstance(raw, dict):
             continue
-        normalized_key = str(key or "").strip()
+        normalized_key = canonicalize_device_health_alert_fingerprint_key(key)
         if not normalized_key:
             continue
-        alerts[normalized_key] = {
+        normalized = {
             "firstSeenAt": str(raw.get("firstSeenAt") or "").strip(),
             "lastSeenAt": str(raw.get("lastSeenAt") or "").strip(),
             "count": max(0, int(raw.get("count") or 0)),
         }
+        alerts[normalized_key] = _merge_device_health_monitor_fingerprint_state(
+            alerts.get(normalized_key),
+            normalized,
+            timestamp_key="firstSeenAt",
+        )
     return alerts
+
+
+def _merge_device_health_monitor_fingerprint_state(
+    current: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any],
+    *,
+    timestamp_key: str,
+) -> dict[str, Any]:
+    """과거 두 병원 라벨 key가 겹치면 최근 발송 시각을 잃지 않는다."""
+
+    if not current:
+        return dict(incoming)
+    merged = dict(current)
+    for key, latest in (
+        (timestamp_key, False),
+        ("lastSeenAt", True),
+        ("lastAlertedAt", True),
+    ):
+        if key in current or key in incoming:
+            merged[key] = _select_device_health_monitor_fingerprint_time(
+                current.get(key),
+                incoming.get(key),
+                latest=latest,
+            )
+    merged["count"] = max(
+        int(current.get("count") or 0),
+        int(incoming.get("count") or 0),
+    )
+    return merged
+
+
+def _select_device_health_monitor_fingerprint_time(
+    left: Any,
+    right: Any,
+    *,
+    latest: bool,
+) -> str:
+    candidates = [
+        (_parse_device_health_monitor_datetime(value), str(value or "").strip())
+        for value in (left, right)
+        if _parse_device_health_monitor_datetime(value) is not None
+    ]
+    if not candidates:
+        return str(right or left or "").strip()
+    selected = max(candidates) if latest else min(candidates)
+    return selected[1]
 
 
 def _normalize_device_health_monitor_ssh_tunnel_records(value: Any) -> dict[str, dict[str, Any]]:
@@ -866,14 +941,7 @@ def _device_health_monitor_alert_reminder_delta() -> timedelta:
 
 
 def _build_device_health_monitor_alert_fingerprint(item: dict[str, str]) -> str:
-    return "|".join(
-        [
-            _display_value(item.get("hospital"), default=""),
-            _display_value(item.get("room"), default=""),
-            _display_value(item.get("device"), default=""),
-            _display_value(item.get("issue"), default=""),
-        ]
-    )
+    return canonical_device_health_alert_fingerprint(item)
 
 
 def _device_health_monitor_required_confirmation_polls(item: dict[str, Any]) -> int:
@@ -2277,6 +2345,38 @@ def _post_device_health_monitor_action_reply(
         logger.warning("장비 이상 알림 action 응답을 Slack에 남기지 못했어", exc_info=True)
 
 
+def _reject_device_health_monitor_remote_action_unavailable(
+    *,
+    raw_item: Any,
+    actor_user_id: str,
+    channel_id: str,
+    thread_ts: str,
+    client: Any,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    """remote 소유권에서 API bridge 누락을 legacy mutation 없이 종결한다."""
+
+    item = _normalize_device_health_monitor_alert_action_item(raw_item)
+    actor = f"<@{actor_user_id}>" if actor_user_id else "요청자"
+    logger.error(
+        "remote 장비 상태 action API bridge가 없어 legacy 실행을 차단했어"
+    )
+    _post_device_health_monitor_action_reply(
+        client,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        text=(
+            f":warning: {actor} 원격 장비 작업 경로가 준비되지 않아 "
+            "요청을 실행하지 않았어. 운영 설정을 확인해줘."
+        ),
+        logger=logger,
+    )
+    return {
+        "item": item,
+        "result": {"status": "remote_action_unavailable", "ok": False},
+    }
+
+
 def _build_device_health_monitor_sms_modal_view(
     *,
     item: dict[str, str],
@@ -2285,6 +2385,8 @@ def _build_device_health_monitor_sms_modal_view(
     message_ts: str,
     thread_ts: str,
     mode: str = _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND,
+    prepared_contact: dict[str, Any] | None = None,
+    workspace_id: str = "",
 ) -> dict[str, Any]:
     normalized_mode = _display_value(mode, default=_DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND)
     is_view_auto_sent = normalized_mode == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
@@ -2303,13 +2405,25 @@ def _build_device_health_monitor_sms_modal_view(
             default=_display_value(sms_guide.get("message"), default=""),
         )
     else:
-        try:
-            # 기본 번호를 채우는 조회가 실패해도 사용자가 직접 입력할 수 있게 모달은 연다.
-            contact = _lookup_device_health_monitor_hospital_contact(hospital_seq)
-        except Exception:
+        if prepared_contact is not None:
+            # remote mode에서는 API가 exact DB row와 템플릿을 검증한 typed
+            # requester 결과만 사용하고 Slack 프로세스에서 DB를 다시 읽지 않는다.
             contact = {}
-        default_phone_number = _device_health_monitor_default_modal_phone_number(contact)
-        default_message = _display_value(sms_guide.get("message"), default="")
+            default_phone_number = _device_health_monitor_korean_national_phone_number(
+                prepared_contact.get("phoneNumber")
+            )
+            default_message = _display_value(
+                prepared_contact.get("message"),
+                default="",
+            )
+        else:
+            try:
+                # local rollback에서는 기존 연락처 조회와 직접 입력 fallback을 보존한다.
+                contact = _lookup_device_health_monitor_hospital_contact(hospital_seq)
+            except Exception:
+                contact = {}
+            default_phone_number = _device_health_monitor_default_modal_phone_number(contact)
+            default_message = _display_value(sms_guide.get("message"), default="")
     target = _format_device_health_monitor_action_target(item)
     metadata = {
         "actionId": (
@@ -2322,6 +2436,7 @@ def _build_device_health_monitor_sms_modal_view(
         "channelId": channel_id,
         "messageTs": message_ts,
         "threadTs": thread_ts,
+        "workspaceId": workspace_id,
         "item": item,
     }
     phone_element: dict[str, Any] = {
@@ -2408,6 +2523,9 @@ def _handle_device_health_monitor_contact_modal_action(
     logger: logging.Logger,
     now: datetime | None = None,
     mode: str = _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND,
+    workspace_id: str = "",
+    interaction_id: str = "",
+    action_api_bridge: DeviceHealthAlertApiBridge | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
     item = _normalize_device_health_monitor_alert_action_item(raw_item)
@@ -2428,6 +2546,30 @@ def _handle_device_health_monitor_contact_modal_action(
         result = {"status": "missing_trigger_id", "ok": False}
     else:
         try:
+            prepared_contact: dict[str, Any] | None = None
+            if (
+                action_api_bridge is not None
+                and normalized_mode != _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
+            ):
+                target = build_device_health_alert_api_target(item)
+                request_id = build_device_health_alert_request_id(
+                    workspace_id=workspace_id,
+                    actor_user_id=actor_user_id,
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                    interaction_id=interaction_id,
+                    action_name=_DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                    phase="prepare",
+                )
+                remote_result = action_api_bridge.prepare_sms(
+                    request_id=request_id,
+                    workspace_id=workspace_id,
+                    actor_user_id=actor_user_id,
+                    channel_id=channel_id,
+                    conversation_id=thread_ts or message_ts,
+                    target=target,
+                )
+                prepared_contact = dict(remote_result.operation_result or {})
             view = _build_device_health_monitor_sms_modal_view(
                 item=item,
                 actor_user_id=actor_user_id,
@@ -2435,6 +2577,8 @@ def _handle_device_health_monitor_contact_modal_action(
                 message_ts=message_ts,
                 thread_ts=thread_ts,
                 mode=normalized_mode,
+                prepared_contact=prepared_contact,
+                workspace_id=workspace_id,
             )
             client.views_open(trigger_id=normalized_trigger_id, view=view)
             result = {"status": "modal_opened", "ok": True}
@@ -2489,6 +2633,7 @@ def _extract_device_health_monitor_modal_input_value(
 def _extract_device_health_monitor_contact_modal_submission(body: dict[str, Any]) -> dict[str, Any]:
     view = body.get("view") if isinstance(body.get("view"), dict) else {}
     user = body.get("user") if isinstance(body.get("user"), dict) else {}
+    team = body.get("team") if isinstance(body.get("team"), dict) else {}
     try:
         metadata = json.loads(str(view.get("private_metadata") or "{}"))
     except json.JSONDecodeError:
@@ -2510,6 +2655,20 @@ def _extract_device_health_monitor_contact_modal_submission(body: dict[str, Any]
         "channelId": _display_value(metadata.get("channelId"), default=""),
         "messageTs": _display_value(metadata.get("messageTs"), default=""),
         "threadTs": _display_value(metadata.get("threadTs"), default=""),
+        "workspaceId": _display_value(
+            team.get("id"),
+            default=_display_value(metadata.get("workspaceId"), default=""),
+        ),
+        # view id/hash는 동일 modal submission redelivery에서 안정적이고,
+        # 다른 제출은 새 request ID를 만들기 위한 transport identity다.
+        "interactionId": ":".join(
+            part
+            for part in (
+                _display_value(view.get("id"), default=""),
+                _display_value(view.get("hash"), default=""),
+            )
+            if part
+        ),
         "smsPhoneNumber": _extract_device_health_monitor_modal_input_value(
             body,
             block_id=_DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID,
@@ -2547,8 +2706,19 @@ def _handle_device_health_monitor_contact_modal_submission(
     logger: logging.Logger,
     *,
     now: datetime | None = None,
+    action_api_bridge: DeviceHealthAlertApiBridge | None = None,
+    require_action_api_bridge: bool = False,
 ) -> dict[str, Any]:
     payload = _extract_device_health_monitor_contact_modal_submission(body)
+    if require_action_api_bridge and action_api_bridge is None:
+        return _reject_device_health_monitor_remote_action_unavailable(
+            raw_item=payload.get("rawItem"),
+            actor_user_id=_display_value(payload.get("actorUserId"), default=""),
+            channel_id=_display_value(payload.get("channelId"), default=""),
+            thread_ts=_display_value(payload.get("threadTs"), default=""),
+            client=client,
+            logger=logger,
+        )
     if (
         _display_value(payload.get("mode"), default="")
         == _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
@@ -2572,6 +2742,9 @@ def _handle_device_health_monitor_contact_modal_submission(
         now=now,
         sms_phone_number=_display_value(payload.get("smsPhoneNumber"), default=""),
         sms_message=_display_value(payload.get("smsMessage"), default=""),
+        workspace_id=_display_value(payload.get("workspaceId"), default=""),
+        interaction_id=_display_value(payload.get("interactionId"), default=""),
+        action_api_bridge=action_api_bridge,
     )
 
 
@@ -2588,10 +2761,33 @@ def _handle_device_health_monitor_alert_action(
     now: datetime | None = None,
     sms_phone_number: str | None = None,
     sms_message: str | None = None,
+    workspace_id: str = "",
+    interaction_id: str = "",
+    action_api_bridge: DeviceHealthAlertApiBridge | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
     item = _normalize_device_health_monitor_alert_action_item(raw_item)
     result: dict[str, Any]
+
+    if action_api_bridge is not None:
+        # remote cutover에서는 DB/MDA/SMS 실행을 API 한 번으로 고정하고,
+        # 어떤 오류에도 아래 legacy local branch로 되돌아가지 않는다.
+        return _handle_device_health_monitor_remote_alert_action(
+            action_api_bridge=action_api_bridge,
+            action_id=action_id,
+            item=item,
+            actor_user_id=actor_user_id,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            message_ts=message_ts,
+            thread_ts=thread_ts,
+            interaction_id=interaction_id,
+            client=client,
+            logger=logger,
+            now=local_now,
+            sms_phone_number=sms_phone_number,
+            sms_message=sms_message,
+        )
 
     if action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
         state, result = _dispatch_device_health_monitor_voice_guide(
@@ -2662,12 +2858,116 @@ def _handle_device_health_monitor_alert_action(
     return {"item": item, "state": state, "result": result}
 
 
+def _handle_device_health_monitor_remote_alert_action(
+    *,
+    action_api_bridge: DeviceHealthAlertApiBridge,
+    action_id: str,
+    item: dict[str, Any],
+    actor_user_id: str,
+    workspace_id: str,
+    channel_id: str,
+    message_ts: str,
+    thread_ts: str,
+    interaction_id: str,
+    client: Any,
+    logger: logging.Logger,
+    now: datetime,
+    sms_phone_number: str | None,
+    sms_message: str | None,
+) -> dict[str, Any]:
+    """API 결과만 Slack에 전달하고 provider receipt는 outbox에 보존한다."""
+
+    try:
+        target = build_device_health_alert_api_target(item)
+        request_id = build_device_health_alert_request_id(
+            workspace_id=workspace_id,
+            actor_user_id=actor_user_id,
+            channel_id=channel_id,
+            message_ts=message_ts,
+            interaction_id=interaction_id,
+            action_name=action_id,
+            phase="execute",
+        )
+        common_kwargs = {
+            "request_id": request_id,
+            "workspace_id": workspace_id,
+            "actor_user_id": actor_user_id,
+            "channel_id": channel_id,
+            "conversation_id": thread_ts or message_ts,
+            "target": target,
+        }
+        if action_id == _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL:
+            remote_result = action_api_bridge.send_sms(
+                **common_kwargs,
+                phone_number=_display_value(sms_phone_number, default=""),
+                message=_display_value(sms_message, default=""),
+            )
+        elif action_id == _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE:
+            remote_result = action_api_bridge.send_voice_guide(**common_kwargs)
+        elif action_id == _DEVICE_HEALTH_ALERT_ACTION_MARK_DONE:
+            remote_result = action_api_bridge.mark_done(**common_kwargs)
+        else:
+            raise ValueError("unsupported remote device health alert action")
+    except Exception as exc:
+        # mutation transport의 timeout/오류 뒤에는 처리 여부를 단정하거나
+        # local provider를 재호출하지 않고 고정 안내만 남긴다.
+        logger.warning(
+            "장비 이상 알림 API action 결과를 확인하지 못했어 action=%s error_type=%s",
+            action_id,
+            type(exc).__name__,
+        )
+        remote_messages = (
+            "장비 이상 알림 작업 결과를 확인하지 못했어. "
+            "중복 실행하지 말고 운영 로그를 확인해줘",
+        )
+        outcome = "failed"
+    else:
+        remote_messages = remote_result.messages
+        outcome = remote_result.outcome
+
+    # remote provider receipt는 실행한 API가 자체 outbox에 먼저 보존한다.
+    # Slack adapter는 공급자 ID나 도메인 상태를 복제하지 않고 메시지만 전달한다.
+
+    for message in remote_messages:
+        _post_device_health_monitor_action_reply(
+            client,
+            channel_id=channel_id,
+            thread_ts=thread_ts or message_ts,
+            text=message,
+            logger=logger,
+        )
+    safe_result = {
+        "status": outcome,
+        "ok": outcome == "answered",
+        "routeMode": "remote",
+    }
+    _append_device_health_monitor_event(
+        "alert_action_requested",
+        {
+            "actionId": action_id,
+            "actorUserId": actor_user_id,
+            "channelId": channel_id,
+            "messageTs": message_ts,
+            "threadTs": thread_ts,
+            "hospital": item["hospital"],
+            "room": item["room"],
+            "device": item["device"],
+            "issue": item["issue"],
+            "result": safe_result,
+        },
+        now=now,
+        logger=logger,
+    )
+    return {"item": item, "state": {}, "result": safe_result}
+
+
 def _extract_device_health_monitor_slack_action_payload(body: dict[str, Any]) -> dict[str, Any]:
     actions = body.get("actions") if isinstance(body.get("actions"), list) else []
     action = actions[0] if actions and isinstance(actions[0], dict) else {}
     user = body.get("user") if isinstance(body.get("user"), dict) else {}
     channel = body.get("channel") if isinstance(body.get("channel"), dict) else {}
     message = body.get("message") if isinstance(body.get("message"), dict) else {}
+    team = body.get("team") if isinstance(body.get("team"), dict) else {}
     return {
         "actionId": _display_value(action.get("action_id"), default=""),
         "value": action.get("value"),
@@ -2676,6 +2976,14 @@ def _extract_device_health_monitor_slack_action_payload(body: dict[str, Any]) ->
         "messageTs": _display_value(message.get("ts"), default=""),
         "threadTs": _display_value(message.get("thread_ts"), default=_display_value(message.get("ts"), default="")),
         "triggerId": _display_value(body.get("trigger_id"), default=""),
+        "workspaceId": _display_value(
+            team.get("id"),
+            default=_display_value(body.get("team_id"), default=""),
+        ),
+        "interactionId": _display_value(
+            action.get("action_ts"),
+            default=_display_value(body.get("trigger_id"), default=""),
+        ),
     }
 
 
@@ -2683,12 +2991,27 @@ def _handle_device_health_monitor_slack_action(
     body: dict[str, Any],
     client: Any,
     logger: logging.Logger,
+    *,
+    action_api_bridge: DeviceHealthAlertApiBridge | None = None,
+    require_action_api_bridge: bool = False,
 ) -> dict[str, Any]:
     payload = _extract_device_health_monitor_slack_action_payload(body)
     action_id = _display_value(payload.get("actionId"), default="")
     if action_id not in _DEVICE_HEALTH_MONITOR_ACTION_IDS:
         return {"result": {"status": "ignored", "ok": False}}
-    if action_id in {_DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL, _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS}:
+    if require_action_api_bridge and action_api_bridge is None:
+        return _reject_device_health_monitor_remote_action_unavailable(
+            raw_item=payload.get("value"),
+            actor_user_id=_display_value(payload.get("actorUserId"), default=""),
+            channel_id=_display_value(payload.get("channelId"), default=""),
+            thread_ts=_display_value(payload.get("threadTs"), default=""),
+            client=client,
+            logger=logger,
+        )
+    if action_id in {
+        _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+        _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS,
+    }:
         action_item = _normalize_device_health_monitor_alert_action_item(payload.get("value"))
         modal_mode = (
             _DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_VIEW_AUTO_SENT
@@ -2706,6 +3029,9 @@ def _handle_device_health_monitor_slack_action(
             client=client,
             logger=logger,
             mode=modal_mode,
+            workspace_id=_display_value(payload.get("workspaceId"), default=""),
+            interaction_id=_display_value(payload.get("interactionId"), default=""),
+            action_api_bridge=action_api_bridge,
         )
     return _handle_device_health_monitor_alert_action(
         action_id=action_id,
@@ -2716,6 +3042,9 @@ def _handle_device_health_monitor_slack_action(
         thread_ts=_display_value(payload.get("threadTs"), default=""),
         client=client,
         logger=logger,
+        workspace_id=_display_value(payload.get("workspaceId"), default=""),
+        interaction_id=_display_value(payload.get("interactionId"), default=""),
+        action_api_bridge=action_api_bridge,
     )
 
 
@@ -4904,14 +5233,22 @@ def _run_device_health_monitor_once(
     logger: logging.Logger,
     *,
     now: datetime | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
 ) -> bool:
     if not cs.DEVICE_HEALTH_MONITOR_ENABLED:
         return False
-    if not s.DB_QUERY_ENABLED:
+    if automation_client is None and not s.DB_QUERY_ENABLED:
         logger.warning("장비 상태 모니터를 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
 
     local_now = _coerce_daily_device_round_now(now)
+    if automation_client is not None:
+        return _run_device_health_monitor_remote_once(
+            client,
+            logger,
+            automation_client=automation_client,
+            local_now=local_now,
+        )
     state = _normalize_device_health_monitor_state(_load_device_health_monitor_state(logger=logger))
     report_summary = _build_device_health_monitor_summary(
         now=local_now,
@@ -5166,6 +5503,181 @@ def _run_device_health_monitor_once(
     return True
 
 
+def _run_device_health_monitor_remote_once(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    automation_client: CompanyAutomationApiClient,
+    local_now: datetime,
+) -> bool:
+    """Slack은 API delivery transport만 맡고 legacy domain state는 읽지 않는다."""
+
+    channel_id = _device_health_monitor_channel_id()
+    if not channel_id:
+        logger.warning(
+            "장비 상태 모니터 채널 ID가 없어. "
+            "DEVICE_HEALTH_MONITOR_CHANNEL_ID를 확인해줘"
+        )
+        return False
+
+    cycle_key = "continuous"
+    if flush_automation_deliveries(
+        automation_client,
+        cycle="device_health_monitor",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+        logger=logger,
+    ):
+        return False
+    result = automation_client.run(
+        request_id=build_automation_request_id(
+            cycle="device_health_monitor",
+            cycle_key=cycle_key,
+            scheduled_at=local_now,
+        ),
+        cycle="device_health_monitor",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+    )
+    if any(
+        delivery.kind != "device_health_alert"
+        for delivery in result.deliveries
+    ):
+        raise RuntimeError("장비 상태 모니터 API delivery 계약이 올바르지 않아")
+
+    sent_count = 0
+    for delivery in result.deliveries:
+        report_summary = _build_remote_device_health_alert_summary(
+            delivery.payload
+        )
+        slack_delivery = _post_daily_device_round_abnormal_alert(
+            client,
+            report_summary,
+            channel_id=channel_id,
+            message_ts="",
+            logger=logger,
+            include_blocks=True,
+            include_actions=True,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle="device_health_monitor",
+                cycle_key=cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="alert",
+            ),
+        )
+        if slack_delivery is None:
+            # API pending delivery를 유지하고 local fallback은 실행하지 않는다.
+            break
+        remember_automation_delivery(
+            cycle="device_health_monitor",
+            cycle_key=cycle_key,
+            delivery=AutomationSlackDelivery(
+                delivery_id=delivery.delivery_id,
+                external_message_id=_display_value(
+                    slack_delivery.get("messageTs"),
+                    default="",
+                ),
+                permalink=_display_value(
+                    slack_delivery.get("permalink"),
+                    default="",
+                ),
+                delivered_at=local_now,
+            ),
+        )
+        sent_count += 1
+    logger.info(
+        "Completed remote device health poll deliveries=%s sent=%s",
+        len(result.deliveries),
+        sent_count,
+    )
+    return sent_count > 0
+
+
+def _build_remote_device_health_alert_summary(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """API semantic alert를 기존 Slack Block renderer 입력으로만 바꾼다."""
+
+    raw_alert = payload.get("alert")
+    if not isinstance(raw_alert, Mapping):
+        raise RuntimeError("장비 상태 모니터 API alert가 올바르지 않아")
+    problem_components = [
+        _display_value(item, default="")
+        for item in (raw_alert.get("problemComponents") or [])
+        if _display_value(item, default="")
+    ]
+    component_labels = {
+        "audio": "이상" if "스피커" in problem_components else "정상",
+        "pm2": "이상" if "PM2" in problem_components else "정상",
+        "storage": "이상" if "저장 공간" in problem_components else "정상",
+        "captureboard": "이상" if "캡처보드" in problem_components else "정상",
+        "led": "이상" if "LED" in problem_components else "정상",
+    }
+    hospital_seq = _coerce_int(raw_alert.get("hospitalSeq"))
+    hospital_name = _display_value(
+        raw_alert.get("hospitalName") or raw_alert.get("hospital"),
+        default="병원 미확인",
+    )
+    device_result = {
+        "hospitalSeq": hospital_seq,
+        "hospitalName": hospital_name,
+        "roomName": _display_value(
+            raw_alert.get("room"),
+            default="병실 미확인",
+        ),
+        "deviceName": _display_value(
+            raw_alert.get("device"),
+            default="장비명 미확인",
+        ),
+        "deviceVersion": _display_value(
+            raw_alert.get("deviceVersion"),
+            default="",
+        ),
+        "voiceType": _display_value(
+            raw_alert.get("voiceType"),
+            default="",
+        ),
+        "overallLabel": "이상",
+        "priorityReason": _display_value(
+            raw_alert.get("issue"),
+            default="상세 확인 필요",
+        ),
+        "alertCategory": _display_value(
+            raw_alert.get("alertCategory"),
+            default="device_connection",
+        ),
+        "componentLabels": component_labels,
+        "smsStatusText": _display_value(
+            raw_alert.get("smsStatusText"),
+            default="",
+        ),
+        "smsContactActionEnabled": (
+            "true"
+            if bool(raw_alert.get("smsContactActionEnabled", True))
+            else "false"
+        ),
+        "smsDeliveryStatus": _display_value(
+            raw_alert.get("smsDeliveryStatus"),
+            default="",
+        ),
+        "smsAcceptedAt": _display_value(
+            raw_alert.get("smsAcceptedAt"),
+            default="",
+        ),
+    }
+    return {
+        "hospitalSeq": hospital_seq,
+        "hospitalName": hospital_name,
+        "statusCounts": {
+            "정상": 0,
+            "확인 필요": 0,
+            "이상": 1,
+            "점검 불가": 0,
+        },
+        "deviceResults": [device_result],
+    }
+
+
 def _archive_device_health_monitor_event_logs_best_effort(logger: logging.Logger) -> None:
     try:
         archive_result = _archive_device_health_monitor_event_logs(logger=logger)
@@ -5184,14 +5696,19 @@ def _archive_device_health_monitor_event_logs_best_effort(logger: logging.Logger
         logger.exception("장비 상태 이벤트 로그 보관 중 오류가 발생했어")
 
 
-def _device_health_monitor_loop(client: Any, logger: logging.Logger) -> None:
+def _device_health_monitor_loop(
+    client: Any,
+    logger: logging.Logger,
+    automation_client: CompanyAutomationApiClient | None = None,
+) -> None:
     poll_interval_sec = max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC))
     archive_attempt_date = None
     archive_thread: threading.Thread | None = None
     while True:
         local_date = _coerce_daily_device_round_now().date()
         if (
-            archive_attempt_date != local_date
+            automation_client is None
+            and archive_attempt_date != local_date
             and (archive_thread is None or not archive_thread.is_alive())
         ):
             archive_attempt_date = local_date
@@ -5203,7 +5720,11 @@ def _device_health_monitor_loop(client: Any, logger: logging.Logger) -> None:
             )
             archive_thread.start()
         try:
-            _run_device_health_monitor_once(client, logger)
+            _run_device_health_monitor_once(
+                client,
+                logger,
+                automation_client=automation_client,
+            )
         except Exception:
             logger.exception("장비 상태 모니터 중 오류가 발생했어")
         time.sleep(poll_interval_sec)
@@ -5238,6 +5759,8 @@ def _attach_device_health_monitor_alert_actions(
     app: Any,
     logger: logging.Logger,
     base_access_checker: Callable[[str | None, str | None], bool] | None,
+    action_api_bridge: DeviceHealthAlertApiBridge | None = None,
+    require_action_api_bridge: bool = False,
 ) -> None:
     def _build_action_handler(action_id: str):
         def _handle_action(ack, body: dict[str, Any], client: Any) -> None:
@@ -5250,7 +5773,22 @@ def _attach_device_health_monitor_alert_actions(
             ):
                 return
             # Slack action은 즉시 ack한 뒤, 병원 문자는 모달을 열고 나머지 action은 별도 handler에서 처리한다.
-            _handle_device_health_monitor_slack_action(action_body, client, logger)
+            # local mode의 기존 호출 모양은 유지하고 remote일 때만 bridge를
+            # 전달해 기존 확장 지점과 테스트의 호출 계약을 보존한다.
+            if action_api_bridge is None and not require_action_api_bridge:
+                _handle_device_health_monitor_slack_action(
+                    action_body,
+                    client,
+                    logger,
+                )
+            else:
+                _handle_device_health_monitor_slack_action(
+                    action_body,
+                    client,
+                    logger,
+                    action_api_bridge=action_api_bridge,
+                    require_action_api_bridge=require_action_api_bridge,
+                )
 
         return _handle_action
 
@@ -5266,12 +5804,30 @@ def _attach_device_health_monitor_alert_actions(
         ):
             ack()
             return
+        if require_action_api_bridge and action_api_bridge is None:
+            # remote 설정 불일치는 입력 검증이나 legacy 연락처 조회보다 먼저
+            # 종결해 어떤 local domain 경로도 실행하지 않는다.
+            ack()
+            _handle_device_health_monitor_contact_modal_submission(
+                action_body,
+                client,
+                logger,
+                action_api_bridge=None,
+                require_action_api_bridge=True,
+            )
+            return
         errors = _validate_device_health_monitor_contact_modal_submission(action_body)
         if errors:
             ack(response_action="errors", errors=errors)
             return
         ack()
-        _handle_device_health_monitor_contact_modal_submission(action_body, client, logger)
+        _handle_device_health_monitor_contact_modal_submission(
+            action_body,
+            client,
+            logger,
+            action_api_bridge=action_api_bridge,
+            require_action_api_bridge=require_action_api_bridge,
+        )
 
     app.view(_DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID)(_handle_contact_modal_submission)
 
@@ -5281,14 +5837,46 @@ def attach_device_health_monitor_reporter(
     *,
     logger: logging.Logger | None = None,
     base_access_checker: Callable[[str | None, str | None], bool] | None = None,
+    action_api_bridge: DeviceHealthAlertApiBridge | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
+    notification_automation_client: CompanyAutomationApiClient | None = None,
+    sms_delivery_automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
     health_monitor_enabled = bool(cs.DEVICE_HEALTH_MONITOR_ENABLED)
     notification_alert_enabled = bool(cs.DEVICE_NOTIFICATION_ALERT_ENABLED)
-    if not health_monitor_enabled and not notification_alert_enabled:
+    sms_delivery_enabled = bool(cs.SMS_DELIVERY_REPORTER_ENABLED)
+    if not any(
+        (
+            health_monitor_enabled,
+            notification_alert_enabled,
+            sms_delivery_enabled,
+        )
+    ):
         return
 
     actual_logger = logger or logging.getLogger(__name__)
-    if not s.DB_QUERY_ENABLED:
+    # 신규 SMS 접수를 먼저 끈 뒤에도 API outbox가 빌 때까지 최종 결과 poller만
+    # 독립적으로 유지할 수 있다. local rollback은 기존 health/notification
+    # reporter가 켜질 때 자동으로 붙던 동작을 그대로 보존한다.
+    if sms_delivery_enabled or (
+        sms_delivery_automation_client is None
+        and (health_monitor_enabled or notification_alert_enabled)
+    ):
+        attach_sms_delivery_reporter(
+            logger=actual_logger,
+            automation_client=sms_delivery_automation_client,
+        )
+
+    if not health_monitor_enabled and not notification_alert_enabled:
+        return
+
+    local_data_reporter_enabled = (
+        health_monitor_enabled and automation_client is None
+    ) or (
+        notification_alert_enabled
+        and notification_automation_client is None
+    )
+    if local_data_reporter_enabled and not s.DB_QUERY_ENABLED:
         actual_logger.warning(
             "장비 상태 모니터가 활성화됐는데 DB_QUERY_ENABLED가 꺼져 있어 시작하지 않을게"
         )
@@ -5299,14 +5887,26 @@ def attach_device_health_monitor_reporter(
         actual_logger.warning("장비 상태 모니터를 시작하지 못했어. Slack client가 없어")
         return
 
-    _attach_device_health_monitor_alert_actions(
-        app,
-        actual_logger,
-        base_access_checker,
+    # 두 remote cycle 모두 같은 action ID를 내보내므로 어느 한 쪽이라도
+    # API 소유이면 bridge 누락 시 legacy mutation을 실행하지 않는다.
+    require_action_api_bridge = (
+        automation_client is not None
+        or notification_automation_client is not None
     )
-    # 시트 H/R을 정본으로 삼아 프로세스 재시작 뒤에도 접수된 문자의 최종 수신 결과를 이어서 확인한다.
-    attach_sms_delivery_reporter(logger=actual_logger)
-
+    if action_api_bridge is None and not require_action_api_bridge:
+        _attach_device_health_monitor_alert_actions(
+            app,
+            actual_logger,
+            base_access_checker,
+        )
+    else:
+        _attach_device_health_monitor_alert_actions(
+            app,
+            actual_logger,
+            base_access_checker,
+            action_api_bridge,
+            require_action_api_bridge=require_action_api_bridge,
+        )
     # 상태 모니터가 꺼져 있어도 실시간 이벤트 카드의 문자 확인·수동 발송 버튼은 동작해야 한다.
     if not health_monitor_enabled:
         return
@@ -5317,7 +5917,7 @@ def attach_device_health_monitor_reporter(
             return
         _DEVICE_HEALTH_MONITOR_THREAD = threading.Thread(
             target=_device_health_monitor_loop,
-            args=(client, actual_logger),
+            args=(client, actual_logger, automation_client),
             name="boxer-device-health-monitor",
             daemon=True,
         )

@@ -2,6 +2,7 @@ from importlib import import_module
 from typing import Any
 
 from boxer_company.assistant.contracts import (
+    AssistantLink,
     AssistantMessage,
     CompanyAssistantRequest,
     CompanyAssistantResult,
@@ -56,6 +57,18 @@ _LAZY_EXPORTS = {
         "boxer_company.assistant.notion_route",
         "CompanyNotionAssistantRouteDeps",
     ),
+    "CompanyLlmHealthAssistantRoute": (
+        "boxer_company.assistant.team_fun_route",
+        "CompanyLlmHealthAssistantRoute",
+    ),
+    "CompanyDailyFortuneAssistantRoute": (
+        "boxer_company.assistant.team_fun_route",
+        "CompanyDailyFortuneAssistantRoute",
+    ),
+    "CompanyTeamFunAssistantRoute": (
+        "boxer_company.assistant.team_fun_route",
+        "CompanyTeamFunAssistantRoute",
+    ),
     "CompanyReadOnlyKnowledgeRouteDeps": (
         "boxer_company.assistant.knowledge_routes",
         "CompanyReadOnlyKnowledgeRouteDeps",
@@ -83,6 +96,10 @@ _LAZY_EXPORTS = {
     "DeviceDbDetailAssistantRoute": (
         "boxer_company.assistant.device_db_detail_route",
         "DeviceDbDetailAssistantRoute",
+    ),
+    "DeviceDetailAssistantRoute": (
+        "boxer_company.assistant.device_db_detail_route",
+        "DeviceDetailAssistantRoute",
     ),
     "DeviceLedLogAssistantRoute": (
         "boxer_company.assistant.device_led_routes",
@@ -143,6 +160,7 @@ def __getattr__(name: str) -> Any:
     return value
 
 __all__ = [
+    "AssistantLink",
     "AssistantMessage",
     "BarcodeEvidenceFreeformAssistantRoute",
     "BarcodeEvidenceFreeformRouteDeps",
@@ -160,9 +178,13 @@ __all__ = [
     "CompanyEvidenceAnswerPolicy",
     "CompanyNotionAssistantRoute",
     "CompanyNotionAssistantRouteDeps",
+    "CompanyDailyFortuneAssistantRoute",
+    "CompanyLlmHealthAssistantRoute",
+    "CompanyTeamFunAssistantRoute",
     "CompanyReadOnlyKnowledgeRouteDeps",
     "DeviceDiagnosticFollowupAssistantRoute",
     "DeviceDiagnosticFollowupRouteDeps",
+    "DeviceDetailAssistantRoute",
     "DeviceDbDetailAssistantRoute",
     "DeviceLedLogAssistantRoute",
     "DeviceLedPatternGuideAssistantRoute",

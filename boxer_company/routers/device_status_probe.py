@@ -21,6 +21,9 @@ from boxer_company.routers.device_file_probe import (
     _connect_device_ssh_client,
     _get_active_device_ssh_client_count,
 )
+from boxer_company.routers.device_ssh_security import (
+    _mark_company_api_mutation_attempted,
+)
 from boxer_company.routers.mda_graphql import (
     _get_mda_device_detail,
     _send_mda_device_ping,
@@ -902,6 +905,7 @@ def _run_remote_ssh_command(
     command: str,
     summary: str,
     timeout_sec: int,
+    mutation: bool = False,
 ) -> dict[str, Any]:
     normalized_command = str(command or "").strip()
     actual_timeout = max(1, int(timeout_sec or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10))
@@ -909,6 +913,8 @@ def _run_remote_ssh_command(
     stdout = None
     stderr = None
     try:
+        if mutation:
+            _mark_company_api_mutation_attempted()
         stdin, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
         exit_status = _wait_for_ssh_exit_status(stdout, stderr, timeout_sec=actual_timeout)
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
@@ -3100,11 +3106,18 @@ def _build_runtime_probe_payload(
     device_name: str,
     component: str,
     force_reopen: bool = False,
+    resend_ssh_open: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    wait_result = (
-        _wait_for_mda_device_agent_ssh(device_name, force_reopen=True)
-        if force_reopen
-        else _wait_for_mda_device_agent_ssh(device_name)
+    # local 호출은 기존 기본값과 호출 형태를 유지하고, API가 명시적으로
+    # 끈 경우에만 poll 중 sshOrder 재전송을 비활성화한다.
+    wait_options: dict[str, Any] = {}
+    if force_reopen:
+        wait_options["force_reopen"] = True
+    if not resend_ssh_open:
+        wait_options["resend_enabled"] = False
+    wait_result = _wait_for_mda_device_agent_ssh(
+        device_name,
+        **wait_options,
     )
     device_info = wait_result.get("device") if isinstance(wait_result.get("device"), dict) else {}
     agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
@@ -3180,8 +3193,18 @@ def _connect_runtime_ssh_endpoint(
     return agent_ssh, _connect_device_ssh_client(host, port)
 
 
-def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
-    evidence_payload, device_info = _build_runtime_probe_payload(device_name=device_name, component=component)
+def _collect_runtime_checks(
+    device_name: str,
+    component: str,
+    *,
+    resend_ssh_open: bool = True,
+    allow_force_reopen: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    evidence_payload, device_info = _build_runtime_probe_payload(
+        device_name=device_name,
+        component=component,
+        resend_ssh_open=resend_ssh_open,
+    )
     if not evidence_payload["ssh"]["ready"]:
         return evidence_payload, device_info, {}
 
@@ -3190,6 +3213,7 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
     refresh_skipped_active_client = False
     refresh_skipped_non_retryable = False
     refresh_skipped_already_opened = False
+    refresh_skipped_force_reopen_disabled = False
     refresh_error = ""
     initial_reason = _display_value(
         connection.get("reason"),
@@ -3212,6 +3236,7 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
             evidence_payload, rechecked_device_info = _build_runtime_probe_payload(
                 device_name=device_name,
                 component=component,
+                resend_ssh_open=resend_ssh_open,
             )
             if rechecked_device_info:
                 device_info = rechecked_device_info
@@ -3237,6 +3262,15 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
                             default="ssh_connect_failed",
                         ),
                     )
+                elif not allow_force_reopen:
+                    # API operations는 stale endpoint를 근거로 기존 tunnel을
+                    # 끊지 않고 최초 연결 실패를 그대로 반환한다.
+                    refresh_skipped_force_reopen_disabled = True
+                    logger.info(
+                        "Skipping device SSH tunnel force reopen by caller policy "
+                        "deviceName=%s",
+                        device_name,
+                    )
                 else:
                     _, rechecked_host, rechecked_port = _runtime_ssh_endpoint(
                         evidence_payload
@@ -3253,6 +3287,7 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
                 if (
                     not refresh_skipped_already_opened
                     and not refresh_skipped_non_retryable
+                    and not refresh_skipped_force_reopen_disabled
                     and active_client_count > 0
                 ):
                     refresh_skipped_active_client = True
@@ -3265,6 +3300,7 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
                 elif (
                     not refresh_skipped_already_opened
                     and not refresh_skipped_non_retryable
+                    and not refresh_skipped_force_reopen_disabled
                     and active_client_count <= 0
                 ):
                     try:
@@ -3273,6 +3309,7 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
                                 device_name=device_name,
                                 component=component,
                                 force_reopen=True,
+                                resend_ssh_open=resend_ssh_open,
                             )
                         )
                     except Exception as exc:
@@ -3309,6 +3346,10 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
             evidence_payload["ssh"]["refreshSkippedNonRetryable"] = True
         if refresh_skipped_already_opened:
             evidence_payload["ssh"]["refreshSkippedAlreadyOpened"] = True
+        if refresh_skipped_force_reopen_disabled:
+            evidence_payload["ssh"][
+                "refreshSkippedForceReopenDisabled"
+            ] = True
         if refresh_error:
             evidence_payload["ssh"]["refreshError"] = refresh_error
         logger.warning(
@@ -3347,12 +3388,23 @@ def _collect_runtime_checks(device_name: str, component: str) -> tuple[dict[str,
     return evidence_payload, device_info, results
 
 
-def _probe_device_runtime_component(device_name: str, *, component: str) -> tuple[str, dict[str, Any]]:
+def _probe_device_runtime_component(
+    device_name: str,
+    *,
+    component: str,
+    resend_ssh_open: bool = True,
+    allow_force_reopen: bool = True,
+) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 장비 상태`")
 
-    evidence_payload, device_info, checks = _collect_runtime_checks(normalized_device_name, component)
+    evidence_payload, device_info, checks = _collect_runtime_checks(
+        normalized_device_name,
+        component,
+        resend_ssh_open=resend_ssh_open,
+        allow_force_reopen=allow_force_reopen,
+    )
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     ssh_ready = bool(ssh.get("ready"))
     ssh_reason = _display_value(ssh.get("reason"), default="")
@@ -3397,13 +3449,23 @@ def _probe_device_runtime_component(device_name: str, *, component: str) -> tupl
     return result_text, evidence_payload
 
 
-def _probe_device_status_overview(device_name: str) -> tuple[str, dict[str, Any]]:
+def _probe_device_status_overview(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+    allow_force_reopen: bool = True,
+) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 장비 상태`")
 
     ping_result = _send_mda_device_ping(normalized_device_name)
-    evidence_payload, device_info, checks = _collect_runtime_checks(normalized_device_name, "all")
+    evidence_payload, device_info, checks = _collect_runtime_checks(
+        normalized_device_name,
+        "all",
+        resend_ssh_open=resend_ssh_open,
+        allow_force_reopen=allow_force_reopen,
+    )
     evidence_payload["ping"] = ping_result
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     ssh_ready = bool(ssh.get("ready"))
@@ -3518,7 +3580,11 @@ def _probe_device_remote_access(device_name: str) -> tuple[str, dict[str, Any]]:
     return result_text, evidence_payload
 
 
-def _patch_device_pm2_memory(device_name: str) -> tuple[str, dict[str, Any]]:
+def _patch_device_pm2_memory(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 메모리 패치`")
@@ -3526,6 +3592,8 @@ def _patch_device_pm2_memory(device_name: str) -> tuple[str, dict[str, Any]]:
     evidence_payload, device_info = _build_runtime_probe_payload(
         device_name=normalized_device_name,
         component="pm2_memory_patch",
+        # API operation은 endpoint poll 중 sshOrder를 재전송하지 않는다.
+        resend_ssh_open=resend_ssh_open,
     )
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     ssh_ready = bool(ssh.get("ready"))
@@ -3586,6 +3654,7 @@ def _patch_device_pm2_memory(device_name: str) -> tuple[str, dict[str, Any]]:
                 command=_MEMORY_PATCH_EXECUTION_COMMAND,
                 summary="메모리 패치 실행",
                 timeout_sec=max(30, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+                mutation=True,
             )
             if execution.get("ok"):
                 verification_command = _run_remote_ssh_command(

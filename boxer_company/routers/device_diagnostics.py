@@ -534,6 +534,7 @@ def _collect_device_diagnostic_snapshot(
     channel_id: str,
     thread_ts: str,
     requested_by: str | None,
+    resend_ssh_open: bool = True,
 ) -> dict[str, Any]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
@@ -542,7 +543,10 @@ def _collect_device_diagnostic_snapshot(
     # 진단 시작은 원인 조사 접근을 위해 SSH open만 허용한다. 이후 원격 실행은 상태 조회와 로그 확인
     # 같은 read-only 명령으로 제한하고, 업데이트/재시작/종료 계열 조작 명령은 넣지 않는다.
     device_info, ssh_state = _build_device_diagnostic_ssh_state(
-        _wait_for_mda_device_agent_ssh(normalized_device_name)
+        _wait_for_mda_device_agent_ssh(
+            normalized_device_name,
+            resend_enabled=resend_ssh_open,
+        )
     )
 
     snapshot: dict[str, Any] = {
@@ -612,6 +616,7 @@ def _start_device_diagnostic_snapshot(
     channel_id: str,
     thread_ts: str,
     requested_by: str | None,
+    resend_ssh_open: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     snapshot = _collect_device_diagnostic_snapshot(
         device_name=device_name,
@@ -620,6 +625,7 @@ def _start_device_diagnostic_snapshot(
         channel_id=channel_id,
         thread_ts=thread_ts,
         requested_by=requested_by,
+        resend_ssh_open=resend_ssh_open,
     )
     _save_device_diagnostic_snapshot(
         workspace_id=workspace_id,
@@ -633,6 +639,8 @@ def _start_device_diagnostic_snapshot(
 def _build_device_diagnostic_followup_evidence(
     question: str,
     snapshot: dict[str, Any],
+    *,
+    resend_ssh_open: bool = True,
 ) -> dict[str, Any]:
     evidence = dict(snapshot)
     command_keys = _select_device_diagnostic_followup_command_keys(question)
@@ -660,7 +668,10 @@ def _build_device_diagnostic_followup_evidence(
 
     try:
         device_info, ssh_state = _build_device_diagnostic_ssh_state(
-            _wait_for_mda_device_agent_ssh(device_name)
+            _wait_for_mda_device_agent_ssh(
+                device_name,
+                resend_enabled=resend_ssh_open,
+            )
         )
         live_check["device"] = {
             "deviceName": _display_value(device_info.get("deviceName"), default=device_name),
@@ -786,6 +797,7 @@ def _start_device_diagnostic_freeform_analysis(
     channel_id: str,
     thread_ts: str,
     requested_by: str | None,
+    resend_ssh_open: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
@@ -799,7 +811,11 @@ def _start_device_diagnostic_freeform_analysis(
         thread_ts=thread_ts,
         requested_by=requested_by,
     )
-    evidence = _build_device_diagnostic_followup_evidence(question, snapshot)
+    evidence = _build_device_diagnostic_followup_evidence(
+        question,
+        snapshot,
+        resend_ssh_open=resend_ssh_open,
+    )
     _save_device_diagnostic_snapshot(
         workspace_id=workspace_id,
         channel_id=channel_id,

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from boxer_company_adapter_slack import sms_delivery_reporter
+from boxer_company import sms_delivery_cycle as sms_delivery_reporter
 
 
 class SmsDeliveryReporterTests(unittest.TestCase):
@@ -64,6 +64,114 @@ class SmsDeliveryReporterTests(unittest.TestCase):
             permalink=permalink,
         )
         self.assertTrue(remembered)
+
+    def test_automatic_sms_claim_is_atomic_and_only_settled_claim_expires(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 14, 1, 0, tzinfo=timezone.utc)
+
+        def claim(_: int) -> bool:
+            return sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now,
+                outbox_path=self.outbox_path,
+            )
+
+        # health/notification thread가 동시에 진입해도 파일 lock 안에서 한 건만
+        # provider 호출권을 얻어야 한다.
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            results = list(executor.map(claim, range(24)))
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 23)
+
+        # provider 결과를 쓰기 전 pending은 timeout/crash 뒤에도 자동 만료되지 않는다.
+        self.assertFalse(
+            sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now + timedelta(days=1),
+                outbox_path=self.outbox_path,
+            )
+        )
+        self.assertTrue(
+            sms_delivery_reporter.hold_automatic_sms_delivery_claim(
+                "MB2-C00419",
+                "video_signal",
+                held_at=now,
+                state="settled",
+                outbox_path=self.outbox_path,
+            )
+        )
+        self.assertFalse(
+            sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now + timedelta(seconds=59),
+                outbox_path=self.outbox_path,
+            )
+        )
+        self.assertTrue(
+            sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now + timedelta(seconds=60),
+                outbox_path=self.outbox_path,
+            )
+        )
+
+        claim_path = self.outbox_path.with_name(
+            f"{self.outbox_path.name}.automatic-claims.json"
+        )
+        serialized = claim_path.read_text(encoding="utf-8")
+        self.assertNotIn("MB2-C00419", serialized)
+        self.assertNotIn("video_signal", serialized)
+        self.assertEqual(claim_path.stat().st_mode & 0o777, 0o600)
+
+    def test_accepted_claim_stays_sticky_until_group_reconciliation(self) -> None:
+        now = datetime(2026, 8, 14, 1, 0, tzinfo=timezone.utc)
+        self.assertTrue(
+            sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now,
+                outbox_path=self.outbox_path,
+            )
+        )
+        self.assertTrue(
+            sms_delivery_reporter.hold_automatic_sms_delivery_claim(
+                "MB2-C00419",
+                "video_signal",
+                held_at=now,
+                state="accepted",
+                group_id="group-accepted",
+                outbox_path=self.outbox_path,
+            )
+        )
+        self.assertFalse(
+            sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now + timedelta(days=2),
+                outbox_path=self.outbox_path,
+            )
+        )
+
+        self.assertTrue(
+            sms_delivery_reporter._settle_automatic_sms_delivery_claim_by_group_id(
+                "group-accepted",
+                settled_at=now,
+                outbox_path=self.outbox_path,
+            )
+        )
+        self.assertTrue(
+            sms_delivery_reporter.claim_automatic_sms_delivery(
+                "MB2-C00419",
+                "video_signal",
+                claimed_at=now + timedelta(seconds=60),
+                outbox_path=self.outbox_path,
+            )
+        )
 
     def test_remembers_only_allowlisted_fields_and_merges_permalink(self) -> None:
         self._remember_accepted()
@@ -380,7 +488,9 @@ class SmsDeliveryReporterTests(unittest.TestCase):
 
     def test_reconciles_after_temporary_append_failure_without_duplicate(self) -> None:
         logger = logging.getLogger("test.sms_delivery_reporter")
-        detected_at = datetime(2026, 7, 23, 9, 0, tzinfo=timezone.utc)
+        # provider 접수 시각을 실제 테스트 실행 시각에 맞춰 48시간 만료
+        # 정책과 append 재시도 시나리오가 서로 간섭하지 않게 한다.
+        detected_at = datetime.now(timezone.utc)
         self._remember_accepted(detected_at=detected_at)
         # outbox 저장 시각은 실제 현재시각이므로 그 값 이후를 reconcile 시계로 사용한다.
         stored_at = datetime.fromisoformat(

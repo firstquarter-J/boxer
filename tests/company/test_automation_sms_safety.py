@@ -1,0 +1,355 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+import json
+import logging
+import threading
+from typing import Any, Mapping, Sequence
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from boxer_company.automation import (
+    AutomationCycleRequest,
+    AutomationDeliveryReceipt,
+)
+from boxer_company.device_health_monitor_cycle import (
+    DeviceHealthMonitorCycleDeps,
+    build_device_health_monitor_seed_cursor,
+    run_device_health_monitor_cycle,
+)
+from boxer_company.device_notification_cycle import (
+    DeviceNotificationAlertCycleHandler,
+    DeviceNotificationCycleDeps,
+)
+from boxer_company.sms_delivery_cycle import (
+    _load_sms_delivery_outbox_items,
+    claim_automatic_sms_delivery,
+    remember_sms_delivery_sheet_record,
+)
+
+
+_KST = ZoneInfo("Asia/Seoul")
+_NOW = datetime(2026, 8, 14, 10, 0, tzinfo=_KST)
+_DEVICE_NAME = "MB2-SHARED-SMS"
+
+
+def _notification_request(*, cursor: Mapping[str, Any]) -> AutomationCycleRequest:
+    return AutomationCycleRequest(
+        request_id="notification:shared-sms:1",
+        tenant_id="lifex",
+        cycle="device_notification_alert",
+        scheduled_at=_NOW,
+        cursor=cursor,
+    )
+
+
+def _notification_event() -> dict[str, Any]:
+    return {
+        "notificationId": 12,
+        "deviceSeq": 10,
+        "deviceName": _DEVICE_NAME,
+        "deviceVersion": "2.11.308",
+        "code": "captureboard_connection_error",
+        "details": {"voiceType": "n"},
+        "occurredAt": _NOW.isoformat(),
+        "hospitalSeq": 20,
+        "hospitalName": "테스트병원",
+        "hospitalDeviceAlertPhone": "01012345678",
+        "hospitalRoomSeq": 30,
+        "roomName": "2진료실",
+    }
+
+
+def _health_deps(
+    *,
+    send_sms: Any,
+    claim_sms: Any,
+    remember_sms: Any,
+    append_sheet: Any | None = None,
+) -> DeviceHealthMonitorCycleDeps:
+    device = {
+        "deviceSeq": 10,
+        "deviceName": _DEVICE_NAME,
+        "hospitalSeq": 20,
+        "hospitalRoomSeq": 30,
+        "hospitalName": "테스트병원",
+        "hospitalTelephone": "0212345678",
+        "hospitalDeviceAlertPhone": "01012345678",
+        "roomName": "2진료실",
+    }
+
+    def verify(
+        value: Mapping[str, Any],
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        del now
+        return {
+            **dict(value),
+            "overallLabel": "이상",
+            "componentLabels": {
+                "audio": "정상",
+                "pm2": "정상",
+                "storage": "정상",
+                "captureboard": "이상",
+                "led": "정상",
+            },
+            "deviceVersion": "2.11.308",
+            "voiceType": "n",
+            "issue": "캡처보드 USB 연결을 확인할 수 없어",
+            "sshReady": True,
+            "sshReason": "ready",
+        }
+
+    return DeviceHealthMonitorCycleDeps(
+        load_devices=lambda: [device],
+        load_redis_snapshot=lambda names: {
+            _DEVICE_NAME: {
+                "deviceState": {
+                    "isConnected": True,
+                    "updatedAt": _NOW.isoformat(),
+                    "status": "RUNNING",
+                    "captureBoardStatus": "missing",
+                    "captureBoardType": "YUH01",
+                    "acme": {"usbList": [{"name": "MMTLED"}]},
+                },
+                "agentState": {"isConnected": True},
+            }
+        },
+        verify_device=verify,
+        load_captureboard_incidents=lambda: {},
+        send_sms=send_sms,
+        claim_sms_delivery=claim_sms,
+        hold_sms_delivery_claim=lambda *args, **kwargs: True,
+        clock=lambda: _NOW,
+        remember_sms_delivery=remember_sms,
+        append_sheet_alerts=append_sheet or (
+            lambda items, detected_at, permalink: 1
+        ),
+        archive_event=lambda request_id, now, payload: True,
+    )
+
+
+def _notification_handler(
+    *,
+    send_sms: Any,
+    claim_sms: Any,
+    remember_sms: Any,
+    append_sheet: Any | None = None,
+) -> DeviceNotificationAlertCycleHandler:
+    deps = DeviceNotificationCycleDeps(
+        load_latest_id=lambda: 12,
+        load_next_event=lambda last_seen_id: (12, _notification_event()),
+        load_sheet_incidents=lambda: {},
+        append_sheet_alerts=append_sheet or (
+            lambda items, **kwargs: 1
+        ),
+        send_sms=send_sms,
+        claim_sms_delivery=claim_sms,
+        hold_sms_delivery_claim=lambda *args, **kwargs: True,
+        clock=lambda: _NOW,
+        remember_sms_delivery=remember_sms,
+    )
+    return DeviceNotificationAlertCycleHandler(
+        deps,
+        logger=logging.getLogger("test.automation_sms_safety"),
+    )
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_health_and_notification_share_one_provider_claim(
+    tmp_path: Any,
+    concurrent: bool,
+) -> None:
+    outbox_path = tmp_path / "sms-outbox.json"
+    provider_calls: list[dict[str, Any]] = []
+    provider_lock = threading.Lock()
+
+    def send_sms(payload: Mapping[str, Any], logger: Any) -> dict[str, Any]:
+        del logger
+        with provider_lock:
+            provider_calls.append(dict(payload))
+        return {
+            "status": "sent",
+            "ok": True,
+            "provider": "solapi",
+            "groupId": "group-shared",
+            "messageId": "message-shared",
+            "smsDeliveryStatus": "accepted",
+        }
+
+    def claim_sms(
+        device_name: str,
+        alert_category: str,
+        *,
+        claimed_at: datetime,
+    ) -> bool:
+        return claim_automatic_sms_delivery(
+            device_name,
+            alert_category,
+            claimed_at=claimed_at,
+            outbox_path=outbox_path,
+        )
+
+    def remember_sms(alert_item: dict[str, Any], **kwargs: Any) -> bool:
+        return remember_sms_delivery_sheet_record(
+            alert_item,
+            outbox_path=outbox_path,
+            **kwargs,
+        )
+
+    health_deps = _health_deps(
+        send_sms=send_sms,
+        claim_sms=claim_sms,
+        remember_sms=remember_sms,
+    )
+    # hardware 경보의 두 번 확인 규칙은 provider claim 전에 미리 통과시킨다.
+    health_first = run_device_health_monitor_cycle(
+        request_id="health:shared-sms:seed",
+        now=_NOW - timedelta(minutes=1),
+        cursor=build_device_health_monitor_seed_cursor(
+            legacy_alert_delivery_enabled=True,
+            alert_fingerprints={},
+            pending_alert_fingerprints={},
+            pending_decision="preserve",
+            seeded_at=_NOW - timedelta(minutes=2),
+        ),
+        deps=health_deps,
+    )
+    notification_handler = _notification_handler(
+        send_sms=send_sms,
+        claim_sms=claim_sms,
+        remember_sms=remember_sms,
+    )
+
+    def run_health() -> Any:
+        return run_device_health_monitor_cycle(
+            request_id="health:shared-sms:send",
+            now=_NOW,
+            cursor=health_first.cursor,
+            deps=health_deps,
+        )
+
+    def run_notification() -> Any:
+        return notification_handler.run(
+            _notification_request(
+                cursor={
+                    "initialized": True,
+                    "lastSeenId": 11,
+                    "pendingDeliveryContexts": {},
+                }
+            )
+        )
+
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            health_future = executor.submit(run_health)
+            notification_future = executor.submit(run_notification)
+            health_result = health_future.result()
+            notification_result = notification_future.result()
+    else:
+        health_result = run_health()
+        notification_result = run_notification()
+
+    assert len(provider_calls) == 1
+    assert len(health_result.deliveries) == 1
+    assert len(notification_result.deliveries) == 1
+    serialized_deliveries = json.dumps(
+        [
+            health_result.deliveries[0].payload,
+            notification_result.deliveries[0].payload,
+        ],
+        ensure_ascii=False,
+    )
+    for private_value in (
+        "01012345678",
+        "group-shared",
+        "message-shared",
+        "solapi",
+    ):
+        assert private_value not in serialized_deliveries
+    assert len(_load_sms_delivery_outbox_items(outbox_path=outbox_path)) == 1
+
+
+def test_notification_sheet_timeout_keeps_durable_receipt_for_repair(
+    tmp_path: Any,
+) -> None:
+    outbox_path = tmp_path / "sms-outbox.json"
+
+    def claim_sms(
+        device_name: str,
+        alert_category: str,
+        *,
+        claimed_at: datetime,
+    ) -> bool:
+        return claim_automatic_sms_delivery(
+            device_name,
+            alert_category,
+            claimed_at=claimed_at,
+            outbox_path=outbox_path,
+        )
+
+    def remember_sms(alert_item: dict[str, Any], **kwargs: Any) -> bool:
+        return remember_sms_delivery_sheet_record(
+            alert_item,
+            outbox_path=outbox_path,
+            **kwargs,
+        )
+
+    def send_sms(payload: Mapping[str, Any], logger: Any) -> dict[str, Any]:
+        del payload, logger
+        return {
+            "status": "sent",
+            "ok": True,
+            "provider": "solapi",
+            "groupId": "group-sheet-repair",
+            "messageId": "message-sheet-repair",
+            "smsDeliveryStatus": "accepted",
+        }
+
+    def append_failure(
+        items: Sequence[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> int:
+        del items, kwargs
+        raise TimeoutError("private sheet timeout")
+
+    handler = _notification_handler(
+        send_sms=send_sms,
+        claim_sms=claim_sms,
+        remember_sms=remember_sms,
+        append_sheet=append_failure,
+    )
+    result = handler.run(
+        _notification_request(
+            cursor={
+                "initialized": True,
+                "lastSeenId": 11,
+                "pendingDeliveryContexts": {},
+            }
+        )
+    )
+    delivery_id = result.deliveries[0].delivery_id
+    acknowledged = handler.acknowledge(
+        _notification_request(cursor=result.cursor),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=delivery_id,
+                status="sent",
+                external_message_id="1710000000.012",
+                permalink="https://lifexio.slack.com/archives/C1/p12",
+            ),
+        ),
+    )
+
+    items = _load_sms_delivery_outbox_items(outbox_path=outbox_path)
+    assert len(items) == 1
+    assert items[0]["smsGroupId"] == "group-sheet-repair"
+    assert items[0]["permalink"] == (
+        "https://lifexio.slack.com/archives/C1/p12"
+    )
+    assert acknowledged["pendingSheetRepairs"][delivery_id]["status"] == (
+        "outbox_pending"
+    )
+    assert delivery_id not in acknowledged["pendingDeliveryContexts"]

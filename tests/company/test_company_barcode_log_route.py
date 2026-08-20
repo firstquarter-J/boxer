@@ -5,6 +5,7 @@ from unittest.mock import patch
 from botocore.exceptions import ClientError
 
 from boxer.core import settings as s
+from boxer_company import settings as cs
 from boxer_company.assistant.answer_composer import CompanyEvidenceAnswerPolicy
 from boxer_company.assistant.barcode_log_route import (
     BarcodeLogAssistantRoute,
@@ -350,6 +351,29 @@ class BarcodeLogAssistantRouteTests(unittest.TestCase):
                 self.assertEqual(result.fallback_reason, reason)
                 self.assertIn(marker, result.messages[0].body)
                 self.assertEqual(s3_calls, [])
+
+    @patch(
+        "boxer_company.assistant.barcode_log_route."
+        "_analyze_barcode_log_phase1_window"
+    )
+    def test_undated_request_uses_fixed_phase1_without_live_enrichment(
+        self,
+        analyze_phase1,
+    ) -> None:
+        # API와 local이 공유하는 날짜 없는 경로의 최대 탐색 폭을 고정한다.
+        analyze_phase1.return_value = (
+            "*로그 분석 결과*\n• 확인된 로그가 없어",
+            _analysis_payload(),
+        )
+        route, _ = self._route()
+
+        result = route.handle(_request(f"{_BARCODE} 로그 분석"))
+
+        self.assertIsNotNone(result)
+        call = analyze_phase1.call_args
+        self.assertEqual(call.args[1], _BARCODE)
+        self.assertEqual(call.kwargs["max_days"], cs.LOG_PHASE1_MAX_DAYS)
+        self.assertFalse(call.kwargs["include_live_enrichment"])
 
     def test_missing_device_scope_returns_complete_phase2_guidance(self) -> None:
         s3_calls: list[str] = []

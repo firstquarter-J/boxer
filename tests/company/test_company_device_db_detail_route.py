@@ -5,12 +5,18 @@ from unittest.mock import Mock
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.device_db_detail_route import (
+    DeviceDetailAssistantRoute,
     DeviceDbDetailAssistantRoute,
+    match_device_detail_route,
     match_device_db_detail_route,
 )
 
 
-def _request(question: str) -> CompanyAssistantRequest:
+def _request(
+    question: str,
+    *,
+    route_group: str | None = None,
+) -> CompanyAssistantRequest:
     return CompanyAssistantRequest(
         request_id="REQ-DEVICE-DB-1",
         tenant_id="TENANT-1",
@@ -19,10 +25,25 @@ def _request(question: str) -> CompanyAssistantRequest:
         conversation_id="CONVERSATION-1",
         question=question,
         locale="ko",
+        metadata=(
+            {"route_group": route_group}
+            if route_group is not None
+            else {}
+        ),
     )
 
 
 class DeviceDbDetailRouteTests(unittest.TestCase):
+    def test_full_matcher_classifies_original_generic_request(self) -> None:
+        # Slack transport 전 원본에는 route_group이 없으므로 pure matcher는
+        # metadata 없이도 full rollout 대상으로 분류해야 한다.
+        self.assertEqual(
+            match_device_detail_route(
+                _request("MB2-C00419 장비 정보")
+            ),
+            "device_detail",
+        )
+
     def test_matcher_accepts_only_device_detail_and_list_queries(self) -> None:
         expected = (
             "MB2-C00419 장비 정보",
@@ -37,6 +58,33 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
                 self.assertEqual(
                     match_device_db_detail_route(_request(question)),
                     "device_db_detail",
+                )
+
+    def test_full_matcher_preserves_exact_and_filter_route_names(self) -> None:
+        exact_queries = (
+            "MB2-C00419 장비 정보",
+            "장비명=MB2-C00419 장비 상세",
+        )
+        filter_queries = (
+            "deviceSeq=42 devices",
+            "status=ACTIVE 장비 목록",
+            "activeFlag=1 장비 목록",
+            "병원=아이사랑산부인과 장비 목록",
+            "병원=아이사랑산부인과 병실=2진료실 장비 목록",
+            "MB2-C00419와 MB2-C00999 장비 정보",
+        )
+
+        for question in exact_queries:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    match_device_detail_route(_request(question)),
+                    "device_detail",
+                )
+        for question in filter_queries:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    match_device_detail_route(_request(question)),
+                    "devices_filter",
                 )
 
     def test_matcher_leaves_count_and_existence_on_devices_filter(self) -> None:
@@ -54,7 +102,7 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
                     match_device_db_detail_route(_request(question))
                 )
 
-    def test_matcher_rejects_live_probe_and_enrichment_intents(self) -> None:
+    def test_db_only_matcher_rejects_live_probe_and_enrichment_intents(self) -> None:
         live_queries = (
             "MB2-C00419 온라인이야?",
             "MB2-C00419 오프라인인지 확인해줘",
@@ -80,6 +128,222 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
                 self.assertIsNone(
                     match_device_db_detail_route(_request(question))
                 )
+
+    def test_full_matcher_accepts_live_device_queries(self) -> None:
+        # DB-only fallback과 달리 API live route는 deviceSeq와 장비명의
+        # 상태·연결 질문을 받아 Slack 로컬 DB/MDA/SSH 실행을 막는다.
+        expected = (
+            ("deviceSeq 2410 장비 상태 확인", "devices_filter"),
+            ("MB2-C00419 온라인이야?", "device_detail"),
+            ("MB2-C00419 오프라인인지 확인해줘", "device_detail"),
+            ("MB2-C00419 연결 상태 확인", "device_detail"),
+            ("MB2-C00419 PM2 프로세스 상태 확인", "device_detail"),
+        )
+
+        for question, route in expected:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    match_device_detail_route(_request(question)),
+                    route,
+                )
+
+    def test_full_matcher_routes_unsupported_mutations_to_api_denial(
+        self,
+    ) -> None:
+        mutation_queries = (
+            ("MB2-C00419 장비 정보 삭제해줘", "device_detail"),
+            ("MB2-C00419 status 변경해줘", "device_detail"),
+            ("deviceSeq 2410 박스 업데이트해줘", "devices_filter"),
+        )
+
+        for question, route in mutation_queries:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    match_device_detail_route(_request(question)),
+                    route,
+                )
+
+    def test_full_route_denies_unsupported_mutation_without_query(self) -> None:
+        query = Mock(return_value="호출되면 안 됨")
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        for question in (
+            "MB2-C00419 장비 정보 삭제해줘",
+            "deviceSeq 2410 박스 업데이트해줘",
+        ):
+            with self.subTest(question=question):
+                result = route.handle(
+                    _request(question, route_group="device_detail")
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result.outcome, "denied")
+                self.assertEqual(
+                    result.fallback_reason,
+                    "unsupported_device_mutation",
+                )
+
+        query.assert_not_called()
+
+    def test_full_route_requires_explicit_route_group(self) -> None:
+        query = Mock(return_value="호출되면 안 됨")
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        self.assertIsNone(route.handle(_request("MB2-C00419 장비 정보")))
+        query.assert_not_called()
+
+    def test_full_route_returns_existing_slack_enriched_output(self) -> None:
+        query = Mock(
+            return_value=(
+                "*장비 조회 결과*\n"
+                "• 장비명: `MB2-C00419`\n"
+                "• 버전: `2.11.307`\n"
+                "• SSH 연결 상태: 🔵 *연결 가능*\n"
+                "• 초음파 영상 다운로드 가능 상태: 🔵 *가능*\n"
+                "• 캡처보드 종류: `YUH01`"
+            )
+        )
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        result = route.handle(
+            _request(
+                "MB2-C00419 장비 정보",
+                route_group="device_detail",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route, "device_detail")
+        self.assertEqual(result.outcome, "answered")
+        self.assertEqual(result.sources, ())
+        self.assertFalse(result.used_llm)
+        query.assert_called_once_with(
+            device_name="MB2-C00419",
+            device_seq=None,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status=None,
+            active_flag=None,
+            install_flag=None,
+            count_only=False,
+            include_live_enrichment=True,
+            allow_ssh_open_resend=False,
+        )
+        body = result.messages[0].body
+        self.assertIn("**장비 조회 결과**", body)
+        self.assertIn("버전: `2.11.307`", body)
+        self.assertIn("SSH 연결 상태: 🔵 **연결 가능**", body)
+        self.assertIn("다운로드 가능 상태: 🔵 **가능**", body)
+        self.assertIn("캡처보드 종류: `YUH01`", body)
+
+    def test_full_route_preserves_filter_route_with_live_enrichment(self) -> None:
+        query = Mock(
+            return_value=(
+                "*장비 조회 결과*\n"
+                "• status: `ACTIVE`\n"
+                "• devices row 수: *2개*"
+            )
+        )
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        result = route.handle(
+            _request(
+                "status=ACTIVE 장비 목록",
+                route_group="device_detail",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route, "devices_filter")
+        self.assertEqual(result.outcome, "answered")
+        query.assert_called_once_with(
+            device_name=None,
+            device_seq=None,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status="ACTIVE",
+            active_flag=None,
+            install_flag=None,
+            count_only=False,
+            include_live_enrichment=True,
+            allow_ssh_open_resend=False,
+        )
+
+    def test_full_route_handles_device_seq_live_status_in_api(self) -> None:
+        query = Mock(return_value="*장비 조회 결과*\n• 장비 번호: `2410`")
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        result = route.handle(
+            _request(
+                "deviceSeq 2410 장비 상태 확인",
+                route_group="device_detail",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route, "devices_filter")
+        self.assertEqual(result.outcome, "answered")
+        query.assert_called_once_with(
+            device_name=None,
+            device_seq=2410,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status=None,
+            active_flag=None,
+            install_flag=None,
+            count_only=False,
+            include_live_enrichment=True,
+            allow_ssh_open_resend=False,
+        )
+
+    def test_full_route_rejects_multiple_devices_before_live_query(self) -> None:
+        # parser가 첫 이름만 선택하더라도 API는 MDA/SSH를 실행하지 않는다.
+        query = Mock(return_value="호출되면 안 됨")
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        result = route.handle(
+            _request(
+                "MB2-C00419와 MB2-C00999 장비 정보",
+                route_group="device_detail",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route, "devices_filter")
+        self.assertEqual(result.outcome, "needs_input")
+        self.assertEqual(
+            result.fallback_reason,
+            "device_scope_ambiguous",
+        )
+        query.assert_not_called()
+
+    def test_full_route_hides_dependency_error_detail(self) -> None:
+        query = Mock(side_effect=RuntimeError("secret-mda-token"))
+        route = DeviceDetailAssistantRoute(query_devices=query)
+
+        result = route.handle(
+            _request(
+                "MB2-C00419 장비 정보",
+                route_group="device_detail",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.fallback_reason, "dependency_error")
+        self.assertNotIn("secret-mda-token", result.messages[0].body)
 
     def test_route_calls_only_db_query_without_live_enrichment(self) -> None:
         query = Mock(

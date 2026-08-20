@@ -1,12 +1,23 @@
+import hashlib
 import json
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib import error, request
 
 from boxer_company import settings as cs
 from boxer.core.utils import _display_value
+from boxer_company.routers.device_ssh_security import (
+    _mark_company_api_device_ssh_open_attempted,
+    _mark_company_api_mutation_attempted,
+    _register_mda_ssh_endpoint_device,
+)
 
 _mda_access_token_cache: str | None = None
+_DEVICE_SSH_LOCK_STRIPE_COUNT = 64
+_device_ssh_lock_stripes = tuple(
+    threading.Lock() for _ in range(_DEVICE_SSH_LOCK_STRIPE_COUNT)
+)
 
 _ADMIN_USER_QUERY = """
 query AdminUser($userPassword: String!) {
@@ -299,6 +310,26 @@ def _execute_mda_graphql(
         )
 
 
+def _execute_mda_graphql_once(
+    query: str,
+    variables: dict[str, Any],
+    *,
+    before_request: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """외부 mutation용 GraphQL 요청은 인증 오류에도 자동 재전송하지 않는다."""
+
+    token = _get_mda_access_token()
+    # adminUser token 발급은 대상 mutation이 아니므로 완료된 뒤에만 caller가
+    # 실제 mutation 전송 시점을 표시하게 한다.
+    marker = before_request or _mark_company_api_mutation_attempted
+    marker()
+    return _execute_mda_graphql_request(
+        query,
+        variables,
+        auth_token=token,
+    )
+
+
 def _normalize_agent_ssh(agent_ssh: Any) -> dict[str, Any] | None:
     if not isinstance(agent_ssh, dict):
         return None
@@ -439,9 +470,9 @@ def _send_mda_device_command(
     command: str,
     acme: Any | None = None,
 ) -> dict[str, Any]:
-    # MDA의 범용 명령 mutation 형식을 그대로 사용하되, payload가 없는 기존
-    # ping/fdla 호출도 같은 함수에서 계속 처리한다.
-    data = _execute_mda_graphql(
+    # MDA의 범용 명령 mutation 형식을 그대로 사용하되, 장비가 실제 작업을
+    # 시작할 수 있으므로 인증 오류에도 같은 요청을 자동 재전송하지 않는다.
+    data = _execute_mda_graphql_once(
         _SEND_COMMAND_MUTATION,
         {
             "deviceName": device_name,
@@ -584,7 +615,7 @@ def _restore_mda_stopped_recordings(
     if not normalized_reason:
         raise RuntimeError("스트리밍 종료 영상 복원 사유가 필요해")
 
-    data = _execute_mda_graphql(
+    data = _execute_mda_graphql_once(
         _RESTORE_STOPPED_RECORDINGS_MUTATION,
         {
             "input": {
@@ -630,13 +661,17 @@ def _open_mda_device_ssh(
     if not actual_host:
         raise RuntimeError("MDA_SSH_OPEN_HOST가 비어 있어")
 
-    data = _execute_mda_graphql(
+    # sshOrder는 기존 reverse tunnel을 끊고 다시 열 수 있는 mutation이다.
+    # Unauthorized 응답도 처리 여부가 모호하므로 공용 auth-refresh retry를 쓰지 않는다.
+    data = _execute_mda_graphql_once(
         _SSH_ORDER_MUTATION,
         {
             "deviceName": device_name,
             "action": "open",
             "host": actual_host,
         },
+        # adminUser token 확보 뒤 sshOrder request를 보내기 직전에만 표시한다.
+        before_request=_mark_company_api_device_ssh_open_attempted,
     )
     result = data.get("sshOrder")
     if not isinstance(result, dict):
@@ -658,7 +693,7 @@ def _close_mda_device_ssh(
     if not actual_host:
         raise RuntimeError("MDA_SSH_OPEN_HOST가 비어 있어")
 
-    data = _execute_mda_graphql(
+    data = _execute_mda_graphql_once(
         _SSH_ORDER_MUTATION,
         {
             "deviceName": device_name,
@@ -683,7 +718,7 @@ def _update_mda_device_box(
     version: str,
     silent: bool = False,
 ) -> dict[str, Any]:
-    data = _execute_mda_graphql(
+    data = _execute_mda_graphql_once(
         _UPDATE_BOX_MUTATION,
         {
             "deviceName": device_name,
@@ -706,7 +741,7 @@ def _update_mda_device_agent(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
-    data = _execute_mda_graphql(
+    data = _execute_mda_graphql_once(
         _UPDATE_AGENT_MUTATION,
         {
             "deviceName": device_name,
@@ -781,7 +816,8 @@ def _create_mda_activity_log(input_payload: dict[str, Any]) -> dict[str, Any]:
     if not normalized_input:
         raise RuntimeError("activity log 입력이 비어 있어")
 
-    data = _execute_mda_graphql(
+    # 감사 로그 생성도 외부 write라 한 HTTP 요청 이상 보내지 않는다.
+    data = _execute_mda_graphql_once(
         _CREATE_ACTIVITY_LOG_MUTATION,
         {
             "input": normalized_input,
@@ -801,6 +837,28 @@ def _create_mda_activity_log(input_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _device_ssh_lock(device_name: str) -> Any:
+    """고정 크기 stripe에서 같은 장비의 tunnel lifecycle lock을 고른다."""
+
+    normalized = str(device_name or "").strip().casefold()
+    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    stripe_index = int.from_bytes(digest[:4], "big") % len(
+        _device_ssh_lock_stripes
+    )
+    return _device_ssh_lock_stripes[stripe_index]
+
+
+def _has_usable_agent_ssh_endpoint(agent_ssh: Any) -> bool:
+    """Redis의 stale close metadata를 열린 reverse tunnel로 오인하지 않는다."""
+
+    if not isinstance(agent_ssh, dict):
+        return False
+    status = str(agent_ssh.get("status") or "").strip().lower()
+    if status and status not in {"open", "opened", "ready", "connected"}:
+        return False
+    return bool(agent_ssh.get("host")) and bool(agent_ssh.get("port"))
+
+
 def _wait_for_mda_device_agent_ssh(
     device_name: str,
     *,
@@ -809,6 +867,41 @@ def _wait_for_mda_device_agent_ssh(
     poll_interval_sec: int | None = None,
     resend_every: int | None = None,
     force_reopen: bool = False,
+    resend_enabled: bool = True,
+) -> dict[str, Any]:
+    # 한 process 안에서 같은 장비의 동시 요청은 첫 endpoint 재조회부터
+    # open과 poll 종료까지 직렬화한다. 고정 stripe라 장비 수만큼 상태가 늘지
+    # 않고, 서로 다른 stripe의 장비 요청은 병렬로 진행된다.
+    with _device_ssh_lock(device_name):
+        result = _wait_for_mda_device_agent_ssh_locked(
+            device_name,
+            host=host,
+            poll_timeout_sec=poll_timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            resend_every=resend_every,
+            force_reopen=force_reopen,
+            resend_enabled=resend_enabled,
+        )
+    if result.get("ready"):
+        device = result.get("device") if isinstance(result.get("device"), dict) else {}
+        agent_ssh = device.get("agentSsh") if isinstance(device.get("agentSsh"), dict) else {}
+        _register_mda_ssh_endpoint_device(
+            device_name,
+            agent_ssh.get("host"),
+            agent_ssh.get("port"),
+        )
+    return result
+
+
+def _wait_for_mda_device_agent_ssh_locked(
+    device_name: str,
+    *,
+    host: str | None = None,
+    poll_timeout_sec: int | None = None,
+    poll_interval_sec: int | None = None,
+    resend_every: int | None = None,
+    force_reopen: bool = False,
+    resend_enabled: bool = True,
 ) -> dict[str, Any]:
     actual_poll_timeout = max(
         1,
@@ -826,8 +919,12 @@ def _wait_for_mda_device_agent_ssh(
     current_state = _get_mda_device_agent_ssh(device_name)
     current_agent_ssh = ((current_state or {}).get("agentSsh") or {}) if isinstance(current_state, dict) else {}
     current_endpoint = (
-        _display_value(current_agent_ssh.get("host"), default=""),
-        current_agent_ssh.get("port"),
+        (
+            _display_value(current_agent_ssh.get("host"), default=""),
+            current_agent_ssh.get("port"),
+        )
+        if _has_usable_agent_ssh_endpoint(current_agent_ssh)
+        else ("", None)
     )
     current_agent_updated_at = _display_value(
         (current_state or {}).get("agentUpdatedAt")
@@ -837,8 +934,7 @@ def _wait_for_mda_device_agent_ssh(
     )
     if (
         not force_reopen
-        and current_agent_ssh.get("host")
-        and current_agent_ssh.get("port")
+        and _has_usable_agent_ssh_endpoint(current_agent_ssh)
     ):
         return {
             "opened": None,
@@ -849,9 +945,10 @@ def _wait_for_mda_device_agent_ssh(
         }
 
     host_to_use = (
-        _display_value(((current_state or {}).get("agentSsh") or {}).get("host"), default="")
-        or (host or cs.MDA_SSH_OPEN_HOST).strip()
-    )
+        _display_value(current_agent_ssh.get("host"), default="")
+        if _has_usable_agent_ssh_endpoint(current_agent_ssh)
+        else ""
+    ) or (host or cs.MDA_SSH_OPEN_HOST).strip()
     # 캐시된 endpoint의 실제 handshake가 실패한 호출자는 강제 재개방을 요청한다.
     # 이 경우 기존 host/port가 남아 있어도 sshOrder를 다시 보내고 poll 결과를 쓴다.
     open_result = _open_mda_device_ssh(device_name, host=host_to_use)
@@ -874,9 +971,7 @@ def _wait_for_mda_device_agent_ssh(
             else "",
             default="",
         )
-        has_ready_endpoint = bool(agent_ssh.get("host")) and bool(
-            agent_ssh.get("port")
-        )
+        has_ready_endpoint = _has_usable_agent_ssh_endpoint(agent_ssh)
         endpoint_refreshed = (
             not force_reopen
             or not all(current_endpoint)
@@ -897,7 +992,11 @@ def _wait_for_mda_device_agent_ssh(
 
         # 강제 재개방은 기존 reverse SSH를 끊을 수 있어 한 번만 보낸다.
         # 일반 최초 개방에서만 기존 주기 재전송 동작을 유지한다.
-        if not force_reopen and poll_count % actual_resend_every == 0:
+        if (
+            resend_enabled
+            and not force_reopen
+            and poll_count % actual_resend_every == 0
+        ):
             open_result = _open_mda_device_ssh(device_name, host=host_to_use)
 
     return {

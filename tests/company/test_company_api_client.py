@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 import logging
 import threading
 from typing import Any
@@ -193,6 +193,70 @@ def _client(
 
 
 class CompanyApiClientSettingsTests(unittest.TestCase):
+    def test_transport_only_remote_requires_every_route_and_fallback(
+        self,
+    ) -> None:
+        # 새 rollout field가 추가돼도 완전 remote 판정에서 빠지지 않도록
+        # dataclass field 전체를 기준으로 경계를 고정한다.
+        base = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token=_TOKEN,
+        )
+        mode_fields = tuple(
+            item.name
+            for item in fields(base)
+            if item.name.endswith("_mode")
+        )
+        fallback_fields = tuple(
+            item.name
+            for item in fields(base)
+            if item.name.endswith("_fallback_enabled")
+        )
+        remote = replace(
+            base,
+            **{name: "remote" for name in mode_fields},
+            **{name: False for name in fallback_fields},
+            automation_remote_cycles=(
+                "weekly_recordings",
+                "daily_device_round",
+                "device_health_monitor",
+                "device_notification_alert",
+                "sms_delivery",
+            ),
+        )
+
+        self.assertTrue(remote.transport_only_remote)
+        for field_name in mode_fields:
+            for mode in ("local", "shadow"):
+                with self.subTest(field_name=field_name, mode=mode):
+                    changes: dict[str, Any] = {field_name: mode}
+                    if field_name == "operations_mode":
+                        # remote action cycle은 operations와 분리할 수
+                        # 없으므로 이 property 테스트에서만 함께 놓는다.
+                        changes["automation_remote_cycles"] = tuple(
+                            cycle
+                            for cycle in remote.automation_remote_cycles
+                            if cycle
+                            not in {
+                                "device_health_monitor",
+                                "device_notification_alert",
+                            }
+                        )
+                    self.assertFalse(
+                        replace(
+                            remote,
+                            **changes,
+                        ).transport_only_remote
+                    )
+        for field_name in fallback_fields:
+            with self.subTest(field_name=field_name):
+                self.assertFalse(
+                    replace(
+                        remote,
+                        **{field_name: True},
+                    ).transport_only_remote
+                )
+
     def test_local_is_the_credential_free_rollback_default(self) -> None:
         settings = load_company_api_client_settings({})
 
@@ -206,8 +270,11 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertEqual(settings.barcode_residual_mode, "local")
         self.assertEqual(settings.barcode_timeline_mode, "local")
         self.assertEqual(settings.barcode_freeform_mode, "local")
+        self.assertEqual(settings.freeform_mode, "local")
         self.assertEqual(settings.playbook_mode, "local")
         self.assertEqual(settings.weekly_summary_mode, "local")
+        self.assertEqual(settings.operations_mode, "local")
+        self.assertEqual(settings.operations_read_timeout_sec, 700.0)
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
@@ -221,8 +288,10 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertFalse(settings.barcode_residual_fallback_enabled)
         self.assertFalse(settings.barcode_timeline_fallback_enabled)
         self.assertFalse(settings.barcode_freeform_fallback_enabled)
+        self.assertFalse(settings.freeform_fallback_enabled)
         self.assertFalse(settings.playbook_fallback_enabled)
         self.assertFalse(settings.weekly_summary_fallback_enabled)
+        self.assertFalse(settings.operations_fallback_enabled)
 
     def test_local_rollback_ignores_stale_remote_credentials(self) -> None:
         settings = load_company_api_client_settings(
@@ -237,12 +306,15 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "local",
                 "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "local",
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "local",
+                "BOXER_COMPANY_API_FREEFORM_MODE": "local",
                 "BOXER_COMPANY_API_PLAYBOOK_MODE": "local",
                 "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "local",
+                "BOXER_COMPANY_API_OPERATIONS_MODE": "local",
                 "BOXER_COMPANY_API_BASE_URL": "http://public.example.com",
                 "BOXER_COMPANY_API_SERVICE_TOKEN": "stale-invalid-token",
                 "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "invalid",
                 "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "-1",
+                "BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC": "invalid",
                 "BOXER_COMPANY_API_MAX_RETRIES": "999",
                 "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
@@ -254,8 +326,10 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED": "invalid",
                 "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED": "invalid",
+                "BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED": "invalid",
             }
         )
 
@@ -269,8 +343,10 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertEqual(settings.barcode_residual_mode, "local")
         self.assertEqual(settings.barcode_timeline_mode, "local")
         self.assertEqual(settings.barcode_freeform_mode, "local")
+        self.assertEqual(settings.freeform_mode, "local")
         self.assertEqual(settings.playbook_mode, "local")
         self.assertEqual(settings.weekly_summary_mode, "local")
+        self.assertEqual(settings.operations_mode, "local")
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
 
@@ -284,6 +360,10 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             ),
             replace(_settings(), token="short"),
             replace(_settings(), read_timeout_sec=float("nan")),
+            replace(
+                _settings(),
+                operations_read_timeout_sec=float("nan"),
+            ),
             replace(_settings(), max_retries=3),
             replace(_settings(), structured_mode="invalid"),
             replace(_settings(), structured_fallback_enabled="true"),
@@ -301,6 +381,17 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             replace(
                 _settings(),
                 barcode_freeform_fallback_enabled="true",
+            ),
+            replace(_settings(), freeform_mode="invalid"),
+            replace(
+                _settings(),
+                freeform_fallback_enabled="true",
+            ),
+            replace(_settings(), operations_mode="shadow"),
+            replace(
+                _settings(),
+                operations_mode="remote",
+                operations_fallback_enabled=True,
             ),
         )
 
@@ -322,6 +413,7 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_NOTION_MODE": "shadow",
                 "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "1.5",
                 "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "75",
+                "BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC": "720",
                 "BOXER_COMPANY_API_MAX_RETRIES": "2",
                 "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "false",
             }
@@ -335,6 +427,7 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertEqual(settings.structured_mode, "local")
         self.assertEqual(settings.connect_timeout_sec, 1.5)
         self.assertEqual(settings.read_timeout_sec, 75)
+        self.assertEqual(settings.operations_read_timeout_sec, 720)
         self.assertEqual(settings.max_retries, 2)
         self.assertFalse(settings.notion_fallback_enabled)
         self.assertFalse(settings.structured_fallback_enabled)
@@ -407,6 +500,10 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "barcode_freeform_mode",
             ),
             (
+                "BOXER_COMPANY_API_FREEFORM_MODE",
+                "freeform_mode",
+            ),
+            (
                 "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
                 "weekly_summary_mode",
             ),
@@ -435,11 +532,6 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         # 신규 route는 같은 transport를 써도 fallback 정책은 각자 가진다.
         cases = (
             (
-                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
-                "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED",
-                "device_detail_fallback_enabled",
-            ),
-            (
                 "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
                 "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED",
                 "weekly_summary_fallback_enabled",
@@ -448,6 +540,11 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED",
                 "barcode_freeform_fallback_enabled",
+            ),
+            (
+                "BOXER_COMPANY_API_FREEFORM_MODE",
+                "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED",
+                "freeform_fallback_enabled",
             ),
         )
         for mode_key, fallback_key, field_name in cases:
@@ -466,6 +563,73 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 self.assertTrue(settings.enabled)
                 self.assertFalse(settings.shadow_enabled)
                 self.assertTrue(getattr(settings, field_name))
+
+    def test_device_detail_rejects_local_fallback_when_non_local(
+        self,
+    ) -> None:
+        # remote 전환 뒤 tunnel lifecycle을 가진 legacy local 경로로
+        # 조용히 되돌아가지 않도록 env와 수동 settings를 fail-closed한다.
+        with self.assertRaisesRegex(
+            CompanyApiContractError,
+            "company_api_device_detail_fallback_unsafe",
+        ):
+            load_company_api_client_settings(
+                {
+                    "BOXER_COMPANY_API_BASE_URL": (
+                        "http://10.40.102.50:8010"
+                    ),
+                    "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                    "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "remote",
+                    "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED": (
+                        "true"
+                    ),
+                }
+            )
+
+        with self.assertRaisesRegex(
+            CompanyApiContractError,
+            "company_api_device_detail_fallback_unsafe",
+        ):
+            CompanyAssistantApiClient(
+                replace(
+                    _settings(),
+                    device_detail_mode="remote",
+                    device_detail_fallback_enabled=True,
+                )
+            )
+
+    def test_operations_allows_only_remote_without_fallback(
+        self,
+    ) -> None:
+        settings = load_company_api_client_settings(
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_OPERATIONS_MODE": "remote",
+            }
+        )
+
+        self.assertTrue(settings.enabled)
+        self.assertEqual(settings.operations_mode, "remote")
+        self.assertFalse(settings.operations_fallback_enabled)
+        self.assertFalse(settings.shadow_enabled)
+
+        for env in (
+            {"BOXER_COMPANY_API_OPERATIONS_MODE": "shadow"},
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_OPERATIONS_MODE": "remote",
+                "BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED": "true",
+            },
+        ):
+            with self.subTest(env_keys=sorted(env)):
+                with self.assertRaises(CompanyApiContractError):
+                    load_company_api_client_settings(env)
 
     def test_notion_and_structured_modes_enable_transport_independently(
         self,
@@ -523,10 +687,16 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "remote",
             },
             {
+                "BOXER_COMPANY_API_FREEFORM_MODE": "remote",
+            },
+            {
                 "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "remote",
             },
             {
                 "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "remote",
+            },
+            {
+                "BOXER_COMPANY_API_OPERATIONS_MODE": "remote",
             },
             {
                 "BOXER_COMPANY_API_BASE_URL": (
@@ -567,6 +737,14 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "shadow",
                 "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED": "invalid",
+            },
+            {
+                "BOXER_COMPANY_API_BASE_URL": (
+                    "http://10.40.102.50:8010"
+                ),
+                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+                "BOXER_COMPANY_API_FREEFORM_MODE": "shadow",
+                "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED": "invalid",
             },
             {
                 "BOXER_COMPANY_API_BASE_URL": (
@@ -617,13 +795,36 @@ class CompanyApiClientContractTests(unittest.TestCase):
         self,
     ) -> None:
         request = _request()
-        session = _FakeSession(_success_response(request.request_id))
+        session = _FakeSession(
+            *(
+                _success_response(request.request_id)
+                for _ in range(6)
+            )
+        )
 
-        _client(session).answer(request, route_group="knowledge")
+        for route_group in (
+            "knowledge",
+            "freeform",
+            "health",
+            "fun",
+            "device_detail",
+            "operations",
+        ):
+            _client(session).answer(
+                request,
+                route_group=route_group,
+            )
 
         self.assertEqual(
-            session.calls[0]["json"]["routeGroup"],
-            "knowledge",
+            [call["json"]["routeGroup"] for call in session.calls],
+            [
+                "knowledge",
+                "freeform",
+                "health",
+                "fun",
+                "device_detail",
+                "operations",
+            ],
         )
         invalid_session = _FakeSession()
         with self.assertRaises(CompanyApiContractError):
@@ -632,6 +833,155 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 route_group="unsafe",  # type: ignore[arg-type]
             )
         self.assertEqual(invalid_session.calls, [])
+
+    def test_operations_use_the_dedicated_long_read_timeout(self) -> None:
+        request = _request()
+        session = _FakeSession(_success_response(request.request_id))
+        settings = replace(
+            _settings(),
+            operations_mode="remote",
+            operations_read_timeout_sec=701,
+        )
+
+        _client(session, settings=settings).answer(
+            request,
+            route_group="operations",
+        )
+
+        self.assertEqual(session.calls[0]["timeout"], (2.0, 701))
+
+    def test_serializes_typed_device_health_alert_operation(self) -> None:
+        request = _request(
+            metadata={
+                "channel_id": "C1",
+                "device_name": "MB2-C00419",
+                "operation_action": {
+                    "name": "device_health_alert_contact_hospital",
+                    "phase": "execute",
+                    "target": {
+                        "hospital_seq": 7,
+                        "hospital_name": "테스트병원",
+                        "room_name": "2진료실",
+                        "device_name": "MB2-C00419",
+                        "issue": "캡처보드 연결 확인 필요",
+                        "alert_category": "video_signal",
+                        "problem_components": ["캡처보드"],
+                    },
+                    "sms": {
+                        "phone_number": "010-1234-5678",
+                        "message": "연결 상태를 확인해 주세요.",
+                    },
+                },
+            }
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="operations")
+
+        self.assertEqual(
+            session.calls[0]["json"]["operationAction"],
+            {
+                "name": "device_health_alert_contact_hospital",
+                "phase": "execute",
+                "target": {
+                    "hospitalSeq": 7,
+                    "hospitalName": "테스트병원",
+                    "roomName": "2진료실",
+                    "deviceName": "MB2-C00419",
+                    "issue": "캡처보드 연결 확인 필요",
+                    "alertCategory": "video_signal",
+                    "problemComponents": ["캡처보드"],
+                },
+                "sms": {
+                    "phoneNumber": "010-1234-5678",
+                    "message": "연결 상태를 확인해 주세요.",
+                },
+            },
+        )
+
+    def test_operation_action_requires_operations_group(self) -> None:
+        request = _request(
+            metadata={"operation_action": {"name": "invalid"}}
+        )
+        session = _FakeSession()
+
+        with self.assertRaises(CompanyApiContractError):
+            _client(session).answer(request, route_group="structured")
+
+        self.assertEqual(session.calls, [])
+
+    def test_deserializes_allowlisted_operation_receipts(self) -> None:
+        request = _request()
+        preparation = _success_payload(request.request_id)
+        preparation["operationResult"] = {
+            "kind": "sms_contact_preparation",
+            "deliveryScope": "requester",
+            "phoneNumber": "01012345678",
+            "message": "케이블을 확인해 주세요.",
+            "templateId": "captureboard_disconnected",
+            "target": {
+                "hospital": "테스트병원",
+                "room": "2진료실",
+                "device": "MB2-C00419",
+                "components": ["캡처보드"],
+                "issue": "캡처보드 연결 확인 필요",
+            },
+        }
+        delivery = _success_payload(request.request_id)
+        delivery["operationResult"] = {
+            "kind": "sms_delivery",
+            "provider": "solapi",
+            "deliveryStatus": "accepted",
+            "groupId": "GROUP-1",
+            "messageId": "MESSAGE-1",
+            "acceptedAt": "2026-08-14T12:34:56+09:00",
+            "target": {
+                "hospital": "테스트병원",
+                "room": "2진료실",
+                "device": "MB2-C00419",
+                "components": ["캡처보드"],
+                "issue": "캡처보드 연결 확인 필요",
+            },
+        }
+        session = _FakeSession(
+            _FakeResponse(200, preparation, "application/json"),
+            _FakeResponse(200, delivery, "application/json"),
+        )
+
+        prepared = _client(session).answer(request, route_group="operations")
+        sent = _client(session).answer(request, route_group="operations")
+
+        self.assertEqual(
+            prepared.operation_result["phoneNumber"],
+            "01012345678",
+        )
+        self.assertEqual(sent.operation_result["groupId"], "GROUP-1")
+
+    def test_rejects_unknown_or_sensitive_operation_receipt_shape(self) -> None:
+        request = _request()
+        payload = _success_payload(request.request_id)
+        payload["operationResult"] = {
+            "kind": "sms_delivery",
+            "provider": "solapi",
+            "deliveryStatus": "accepted",
+            "groupId": "GROUP-1",
+            "messageId": "MESSAGE-1",
+            "acceptedAt": "2026-08-14T12:34:56+09:00",
+            "target": {
+                "hospital": "테스트병원",
+                "room": "2진료실",
+                "device": "MB2-C00419",
+                "components": [],
+                "issue": "확인 필요",
+            },
+            "phoneNumber": "01012345678",
+        }
+        session = _FakeSession(
+            _FakeResponse(200, payload, "application/json")
+        )
+
+        with self.assertRaises(CompanyApiContractError):
+            _client(session).answer(request, route_group="operations")
 
     def test_serializes_headers_scope_and_success_result(self) -> None:
         request = _request(
@@ -773,6 +1123,62 @@ class CompanyApiClientContractTests(unittest.TestCase):
             },
             {_TRACEPARENT},
         )
+
+    def test_mutating_turn_never_retries_transport_or_503(
+        self,
+    ) -> None:
+        # mutation 수행 여부가 불명확한 모든 실패와 명시적
+        # 503도 두 번째 POST로 이어지지 않는다.
+        request = replace(
+            _request(),
+            question="MB2-C00419 장비 정보",
+        )
+        cases = (
+            (
+                requests.exceptions.ConnectTimeout(),
+                CompanyApiAvailabilityError,
+            ),
+            (
+                requests.exceptions.ReadTimeout(),
+                CompanyApiAmbiguousTimeoutError,
+            ),
+            (
+                requests.exceptions.ConnectionError(
+                    "reset-after-send"
+                ),
+                CompanyApiAvailabilityError,
+            ),
+            (
+                _problem_response(
+                    request.request_id,
+                    status=503,
+                    code="service_not_ready",
+                    retryable=True,
+                ),
+                CompanyApiAvailabilityError,
+            ),
+        )
+        for route_group in ("device_detail", "operations"):
+            for first_result, error_type in cases:
+                with self.subTest(
+                    route_group=route_group,
+                    result_type=type(first_result).__name__,
+                ):
+                    session = _FakeSession(
+                        first_result,
+                        _success_response(request.request_id),
+                    )
+
+                    with self.assertRaises(error_type):
+                        _client(
+                            session,
+                            settings=_settings(max_retries=2),
+                        ).answer(
+                            request,
+                            route_group=route_group,
+                        )
+
+                    self.assertEqual(len(session.calls), 1)
 
     def test_connection_reset_is_not_retried(self) -> None:
         session = _FakeSession(

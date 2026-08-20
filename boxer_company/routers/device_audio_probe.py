@@ -541,12 +541,23 @@ def _render_device_audio_probe_result(
     return _truncate_text("\n".join(lines), 38000)
 
 
-def _probe_device_audio_output(device_name: str) -> tuple[str, dict[str, Any]]:
+def _probe_device_audio_output(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 장비 소리 출력 점검`")
 
-    wait_result = _wait_for_mda_device_agent_ssh(normalized_device_name)
+    # local 기본 재전송은 보존하고 API가 끈 경우에는 initial open 뒤 poll만 한다.
+    wait_options: dict[str, Any] = {}
+    if not resend_ssh_open:
+        wait_options["resend_enabled"] = False
+    wait_result = _wait_for_mda_device_agent_ssh(
+        normalized_device_name,
+        **wait_options,
+    )
     device_info = wait_result.get("device") if isinstance(wait_result.get("device"), dict) else {}
     agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
     host = _display_value(agent_ssh.get("host"), default="")

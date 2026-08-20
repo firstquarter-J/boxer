@@ -72,6 +72,8 @@ CompanyAssistantStage = Literal[
     "structured",
     "barcode",
     "knowledge",
+    "freeform",
+    "operations",
 ]
 RecordingsLoader = Callable[[str], dict[str, Any]]
 ConfigFlag = Callable[[], bool]
@@ -98,6 +100,8 @@ COMPANY_ASSISTANT_STAGE_ORDER: tuple[CompanyAssistantStage, ...] = (
     "structured",
     "barcode",
     "knowledge",
+    "freeform",
+    "operations",
 )
 COMPANY_ASSISTANT_MIGRATED_ROUTE_GROUPS: Mapping[
     CompanyAssistantStage,
@@ -114,6 +118,10 @@ COMPANY_ASSISTANT_MIGRATED_ROUTE_GROUPS: Mapping[
     "barcode": ("barcode_query",),
     # Knowledge는 별도 read-only route 묶음을 외부에서 주입한다.
     "knowledge": (),
+    # 일반 대화는 모든 근거 route 뒤의 명시적 final fallback이다.
+    "freeform": (),
+    # Mutation route는 구체 구현을 조립하는 프로세스만 주입한다.
+    "operations": (),
 }
 
 
@@ -152,6 +160,11 @@ class CompanyAssistantRuntimeDeps:
     # structured route 앞에 주입한다. Slack local runtime은 기본 빈 tuple로
     # 기존 enrichment와 route 우선순위를 그대로 유지한다.
     structured_read_routes: tuple[CompanyAssistantRoute, ...] = ()
+    # 작업 route는 read route와 분리한 stage에 주입해 transport가
+    # 별도 capability와 재시도 금지 정책을 적용할 수 있게 한다.
+    operation_routes: tuple[CompanyAssistantRoute, ...] = ()
+    # provider-backed 일반 대화도 API 프로세스에서만 주입한다.
+    freeform_routes: tuple[CompanyAssistantRoute, ...] = ()
     structured_device_filter_enabled: bool = True
     structured_device_live_enrichment_enabled: bool = True
     log_analysis_live_enrichment_enabled: bool = False
@@ -399,10 +412,14 @@ class CompanyAssistantRuntime:
                     else ()
                 )
             ),
+            "operations": self._deps.operation_routes,
+            "freeform": self._deps.freeform_routes,
         }
         _validate_route_groups(
             groups,
             structured_read_routes=self._deps.structured_read_routes,
+            operation_routes=self._deps.operation_routes,
+            freeform_routes=self._deps.freeform_routes,
         )
         return groups
 
@@ -791,6 +808,8 @@ def _validate_route_groups(
     ],
     *,
     structured_read_routes: Sequence[CompanyAssistantRoute] = (),
+    operation_routes: Sequence[CompanyAssistantRoute] = (),
+    freeform_routes: Sequence[CompanyAssistantRoute] = (),
 ) -> None:
     routes = [
         route
@@ -808,6 +827,16 @@ def _validate_route_groups(
             expected_names = (
                 tuple(route.name for route in structured_read_routes)
                 + expected_names
+            )
+        if stage == "operations":
+            # operation route 목록은 프로세스 조립 시점의 주입 순서가
+            # 그대로 표준 순서다.
+            expected_names = tuple(
+                route.name for route in operation_routes
+            )
+        if stage == "freeform":
+            expected_names = tuple(
+                route.name for route in freeform_routes
             )
         actual_names = tuple(route.name for route in groups.get(stage, ()))
         if actual_names != expected_names:

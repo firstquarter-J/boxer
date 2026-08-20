@@ -154,6 +154,37 @@ class NotionConnectorTests(unittest.TestCase):
         self.assertEqual(urlopen_mock.call_count, 2)
         sleep_mock.assert_called_once_with(0.1)
 
+    def test_notion_write_callback_runs_after_preflight_without_retry(self) -> None:
+        rate_limit_error = urllib.error.HTTPError(
+            "https://api.notion.test/pages",
+            429,
+            "rate limited",
+            {"Retry-After": "0"},
+            io.BytesIO(b'{"message":"slow down"}'),
+        )
+        before_request = MagicMock()
+
+        with (
+            patch(
+                "boxer.retrieval.connectors.notion.urllib.request.urlopen",
+                side_effect=rate_limit_error,
+            ) as urlopen_mock,
+            patch("boxer.retrieval.connectors.notion.time.sleep") as sleep_mock,
+            self.assertRaisesRegex(RuntimeError, "Notion API 오류: 429"),
+        ):
+            _notion_request(
+                "/pages",
+                method="POST",
+                payload={"parent": {"page_id": "root"}},
+                token="company-token",
+                before_request=before_request,
+                retry_rate_limit=False,
+            )
+
+        before_request.assert_called_once_with()
+        self.assertEqual(urlopen_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
     def test_notion_request_wraps_response_transport_failures(self) -> None:
         for error in (
             ConnectionResetError("connection reset"),

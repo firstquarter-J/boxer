@@ -113,6 +113,8 @@ def _deps(
     db_configured: Any = lambda: True,
     notion_route_deps: CompanyNotionAssistantRouteDeps | None = None,
     structured_read_routes: tuple[Any, ...] = (),
+    operation_routes: tuple[Any, ...] = (),
+    freeform_routes: tuple[Any, ...] = (),
 ) -> CompanyAssistantRuntimeDeps:
     engine = _FakeAnswerEngine()
     return CompanyAssistantRuntimeDeps(
@@ -126,6 +128,8 @@ def _deps(
         db_configured=db_configured,
         notion_route_deps=notion_route_deps,
         structured_read_routes=structured_read_routes,
+        operation_routes=operation_routes,
+        freeform_routes=freeform_routes,
     )
 
 
@@ -198,6 +202,58 @@ class CompanyAssistantRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.route, "api_db_read")
         self.assertEqual(api_read_route.calls, ["REQ-RUNTIME-1"])
+
+    def test_injected_operation_route_runs_only_in_operations_stage(
+        self,
+    ) -> None:
+        # operation 구현은 read stage와 섞여 있지 않고 전용
+        # stage를 명시했을 때만 실행된다.
+        operation = _KnowledgeRoute(name="device_update_operation")
+        runtime = CompanyAssistantRuntime(
+            _deps(
+                recordings_loader=lambda barcode: {"rows": []},
+                operation_routes=(operation,),
+            )
+        )
+
+        turn = runtime.start_turn(_request("장비 업데이트"))
+
+        self.assertEqual(
+            turn.service_for_stage("operations").route_names,
+            ("device_update_operation",),
+        )
+        self.assertIsNone(turn.answer_stage("knowledge"))
+        self.assertEqual(operation.calls, [])
+        result = turn.answer_stage("operations")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.route, "device_update_operation")
+        self.assertEqual(operation.calls, ["REQ-RUNTIME-1"])
+
+    def test_injected_freeform_route_runs_only_in_freeform_stage(
+        self,
+    ) -> None:
+        # 최종 LLM fallback은 앞선 knowledge와 섞이지 않고 adapter가
+        # 명시한 freeform stage에서만 실행된다.
+        freeform = _KnowledgeRoute(name="company_freeform")
+        runtime = CompanyAssistantRuntime(
+            _deps(
+                recordings_loader=lambda barcode: {"rows": []},
+                freeform_routes=(freeform,),
+            )
+        )
+
+        turn = runtime.start_turn(_request("오늘 기분 어때?"))
+
+        self.assertEqual(
+            turn.service_for_stage("freeform").route_names,
+            ("company_freeform",),
+        )
+        self.assertIsNone(turn.answer_stage("knowledge"))
+        self.assertEqual(freeform.calls, [])
+        result = turn.answer_stage("freeform")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.route, "company_freeform")
+        self.assertEqual(freeform.calls, ["REQ-RUNTIME-1"])
 
     def test_latest_context_barcode_is_recovered_without_mutating_input(self) -> None:
         request = _request(

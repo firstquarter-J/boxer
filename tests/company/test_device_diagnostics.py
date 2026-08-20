@@ -46,6 +46,7 @@ def _diagnostic_snapshot() -> dict[str, object]:
             "deviceName": "MB2-C00419",
             "question": "MB2-C00419 진단 시작",
             "capturedAt": "2026-06-17T10:00:00+09:00",
+            "requestedBy": "U123",
         },
         "device": {
             "deviceName": "MB2-C00419",
@@ -240,7 +241,10 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
                 requested_by="U123",
             )
 
-        wait_ssh.assert_called_once_with("MB2-C00419")
+        wait_ssh.assert_called_once_with(
+            "MB2-C00419",
+            resend_enabled=True,
+        )
         connect_ssh.assert_not_called()
         self.assertEqual(snapshot["source"], "mda_graphql_ssh_open+ssh_read")
         self.assertFalse(snapshot["ssh"]["ready"])  # type: ignore[index]
@@ -354,7 +358,10 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
                 _diagnostic_snapshot(),  # type: ignore[arg-type]
             )
 
-        wait_ssh.assert_called_once_with("MB2-C00419")
+        wait_ssh.assert_called_once_with(
+            "MB2-C00419",
+            resend_enabled=True,
+        )
         connect_ssh.assert_called_once_with("127.0.0.1", 2222)
         self.assertTrue(fake_client.closed)
         live_check = evidence["followupLiveCheck"]

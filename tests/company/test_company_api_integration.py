@@ -104,7 +104,7 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
                     "• status: `ACTIVE`"
                 )
             )
-            runtime.start_turn(
+            structured_routes = runtime.start_turn(
                 CompanyAssistantRequest(
                     request_id="stub-probe",
                     tenant_id="TENANT-1",
@@ -114,9 +114,13 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
                     question="MB2-C00419 장비 정보",
                     locale="ko",
                 )
-            ).routes_for_stage("structured")[1]._query_devices = (
-                device_query
+            ).routes_for_stage("structured")
+            device_db_detail_route = next(
+                route
+                for route in structured_routes
+                if route.name == "device_db_detail"
             )
+            device_db_detail_route._query_devices = device_query
             weekly = client.post(
                 "/internal/v1/assistant/turns",
                 headers=headers,
@@ -157,6 +161,177 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
         )
         mda_query.assert_not_called()
         ssh_query.assert_not_called()
+
+    def test_http_full_device_detail_uses_enrichment_safety_flags(
+        self,
+    ) -> None:
+        token = "e" * 48
+        settings = CompanyApiSettings(
+            host="127.0.0.1",
+            port=8010,
+            callers=(
+                CompanyApiCallerSettings(
+                    caller_id="device-detail-integration-test",
+                    token=token,
+                    tenant_ids=frozenset({"TENANT-1"}),
+                    channels=frozenset({"slack"}),
+                    actor_ids=frozenset({"ACTOR-1"}),
+                    allow_anonymous_actor=False,
+                    capabilities=frozenset(
+                        {
+                            "assistant.turn.read",
+                            "assistant.device.probe",
+                            "assistant.device.ssh.open",
+                        }
+                    ),
+                ),
+            ),
+        )
+        with patch(
+            "boxer_company.assistant.factory.core_settings.LLM_PROVIDER",
+            "",
+        ):
+            runtime = create_company_assistant_runtime()
+
+        # 실제 MDA/SSH 접근 대신 full route의 query 경계를 주입해 HTTP에서
+        # 내려온 단일 open·poll 계약과 최종 CommonMark만 검증한다.
+        device_query = Mock(
+            return_value=(
+                "*장비 조회 결과*\n"
+                "• 장비명: `MB2-C00419`\n"
+                "• 버전: `2.11.307`\n"
+                "• SSH 연결 상태: :large_blue_circle: *연결 가능*\n"
+                "• 초음파 영상 다운로드 가능 상태: "
+                ":large_blue_circle: *가능*\n"
+                "• 캡처보드 종류: `YUH01`"
+            )
+        )
+        structured_routes = runtime.start_turn(
+            CompanyAssistantRequest(
+                request_id="device-detail-stub-probe",
+                tenant_id="TENANT-1",
+                actor_id="ACTOR-1",
+                channel="slack",
+                conversation_id="THREAD-DEVICE-DETAIL-1",
+                question="MB2-C00419 장비 정보",
+                locale="ko",
+                metadata={"route_group": "device_detail"},
+            )
+        ).routes_for_stage("structured")
+        device_detail_route = next(
+            route
+            for route in structured_routes
+            if route.name == "device_detail"
+        )
+        device_detail_route._query_devices = device_query
+
+        app = create_company_api_app(
+            settings=settings,
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Request-ID": "req-device-detail-001",
+        }
+        payload = {
+            "tenantId": "TENANT-1",
+            "actorId": "ACTOR-1",
+            "channel": "slack",
+            "conversationId": "THREAD-DEVICE-DETAIL-1",
+            "question": "MB2-C00419 장비 정보",
+            "locale": "ko",
+            "contextEntries": [],
+            "scope": {"deviceName": "MB2-C00419"},
+            "routeGroup": "device_detail",
+        }
+
+        with TestClient(app) as client:
+            remote = client.post(
+                "/internal/v1/assistant/turns",
+                headers=headers,
+                json=payload,
+            )
+
+        self.assertEqual(remote.status_code, 200)
+        self.assertEqual(remote.json()["route"], "device_detail")
+        self.assertEqual(remote.json()["outcome"], "answered")
+        body = remote.json()["messages"][0]["body"]
+        self.assertIn("**장비 조회 결과**", body)
+        self.assertEqual(
+            remote.json()["messages"][0]["format"],
+            "commonmark",
+        )
+        self.assertIn("2.11.307", body)
+        self.assertIn("SSH 연결 상태", body)
+        self.assertIn("초음파 영상 다운로드 가능", body)
+        self.assertIn("캡처보드", body)
+        device_query.assert_called_once()
+        self.assertTrue(
+            device_query.call_args.kwargs["include_live_enrichment"]
+        )
+        self.assertFalse(
+            device_query.call_args.kwargs["allow_ssh_open_resend"]
+        )
+        self.assertNotIn(
+            "secure_endpoint_required",
+            device_query.call_args.kwargs,
+        )
+        self.assertNotIn("request_id", device_query.call_args.kwargs)
+
+        # 같은 capability/retry 경계로 deviceSeq·병원·status 목록도 API가
+        # 처리하고, Slack legacy DB/MDA/SSH 경로로 내려보내지 않는다.
+        device_query.reset_mock()
+        device_query.return_value = (
+            "*장비 조회 결과*\n"
+            "• status: `ACTIVE`\n"
+            "• devices row 수: *2개*"
+        )
+        with TestClient(app) as client:
+            filtered = client.post(
+                "/internal/v1/assistant/turns",
+                headers={
+                    **headers,
+                    "X-Request-ID": "req-device-filter-001",
+                },
+                json={
+                    **payload,
+                    "question": "status=ACTIVE 장비 목록",
+                    "scope": None,
+                },
+            )
+
+        self.assertEqual(filtered.status_code, 200)
+        self.assertEqual(filtered.json()["route"], "devices_filter")
+        self.assertTrue(
+            device_query.call_args.kwargs["include_live_enrichment"]
+        )
+        self.assertFalse(
+            device_query.call_args.kwargs["allow_ssh_open_resend"]
+        )
+        self.assertEqual(device_query.call_args.kwargs["status"], "ACTIVE")
+
+        # 같은 turn이 재전달돼도 poll 중 open 재전송은 허용하지 않는다.
+        device_query.reset_mock()
+        with TestClient(app) as client:
+            repeated = client.post(
+                "/internal/v1/assistant/turns",
+                headers={
+                    **headers,
+                    "X-Request-ID": "req-device-detail-repeat-001",
+                },
+                json=payload,
+            )
+
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.json()["route"], "device_detail")
+        device_query.assert_called_once()
+        self.assertTrue(
+            device_query.call_args.kwargs["include_live_enrichment"]
+        )
+        self.assertFalse(
+            device_query.call_args.kwargs["allow_ssh_open_resend"]
+        )
 
     def test_http_barcode_group_runs_exact_timeline_routes(self) -> None:
         token = "t" * 48
@@ -853,7 +1028,7 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(undated.json()["outcome"], "needs_input")
         self.assertEqual(
             undated.json()["fallbackReason"],
-            "explicit_date_required",
+            "scope_not_found",
         )
         analyzer.assert_called_once()
 
@@ -1179,6 +1354,90 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(answered.json()["outcome"], "answered")
         self.assertTrue(answered.json()["messages"][0]["body"])
+
+    def test_http_fun_stage_owns_bot_fortune_classification_and_reply(self) -> None:
+        token = "f" * 48
+        settings = CompanyApiSettings(
+            host="127.0.0.1",
+            port=8010,
+            callers=(
+                CompanyApiCallerSettings(
+                    caller_id="fortune-integration-test",
+                    token=token,
+                    tenant_ids=frozenset({"TENANT-1"}),
+                    channels=frozenset({"slack"}),
+                    actor_ids=frozenset({"BOT-1"}),
+                    allow_anonymous_actor=False,
+                    capabilities=frozenset({"assistant.turn.read"}),
+                ),
+            ),
+        )
+        with patch(
+            "boxer_company.assistant.factory.core_settings.LLM_PROVIDER",
+            "",
+        ):
+            runtime = create_company_assistant_runtime()
+        app = create_company_api_app(
+            settings=settings,
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        base_payload = {
+            "tenantId": "TENANT-1",
+            "actorId": "BOT-1",
+            "channel": "slack",
+            "conversationId": "THREAD-FORTUNE-1",
+            "locale": "ko",
+            "routeGroup": "fun",
+        }
+
+        with TestClient(app) as client:
+            fortune = client.post(
+                "/internal/v1/assistant/turns",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Request-ID": "req-fortune-001",
+                },
+                json={
+                    **base_payload,
+                    "question": "1990년생은 행운이 있지만 지출은 조심해",
+                    "contextEntries": [
+                        {
+                            "kind": "message",
+                            "source": "slack",
+                            "text": "2026년 8월 14일 오늘의 운세",
+                        }
+                    ],
+                },
+            )
+            unrelated = client.post(
+                "/internal/v1/assistant/turns",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Request-ID": "req-fortune-002",
+                },
+                json={
+                    **base_payload,
+                    "question": "배포 완료 알림",
+                    "contextEntries": [
+                        {
+                            "kind": "message",
+                            "source": "slack",
+                            "text": "자동화 결과",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(fortune.status_code, 200)
+        self.assertEqual(fortune.json()["route"], "company_daily_fortune")
+        self.assertEqual(fortune.json()["outcome"], "answered")
+        self.assertFalse(fortune.json()["usedLlm"])
+        self.assertFalse(fortune.json()["messages"][0]["mentionActor"])
+        self.assertIn("1990년생", fortune.json()["messages"][0]["body"])
+        self.assertEqual(unrelated.status_code, 200)
+        self.assertEqual(unrelated.json()["route"], "unhandled")
+        self.assertEqual(unrelated.json()["outcome"], "no_evidence")
 
 
 if __name__ == "__main__":

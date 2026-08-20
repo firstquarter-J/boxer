@@ -46,6 +46,12 @@ from boxer_company.routers.mda_graphql import (
     _is_mda_graphql_configured,
     _wait_for_mda_device_agent_ssh,
 )
+from boxer_company.routers.device_ssh_security import (
+    DeviceSshSecurityError,
+    _mark_company_api_mutation_attempted,
+    _prepare_device_ssh_client,
+    _resolve_mda_ssh_endpoint_device,
+)
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
 _DEVICE_FILE_ID_HINTS = (
@@ -347,10 +353,16 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
         }
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
+        connect_host = _prepare_device_ssh_client(
+            client,
+            device_name=_resolve_mda_ssh_endpoint_device(host, port),
+            reported_host=host,
+            port=int(port),
+            paramiko_module=paramiko,
+        )
         client.connect(
-            hostname=host,
+            hostname=connect_host,
             port=int(port),
             username=cs.DEVICE_SSH_USER,
             password=cs.DEVICE_SSH_PASSWORD,
@@ -360,6 +372,13 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
             look_for_keys=False,
             allow_agent=False,
         )
+    except DeviceSshSecurityError as exc:
+        client.close()
+        return {
+            "ok": False,
+            "reason": str(exc),
+            "retryable": False,
+        }
     except paramiko.AuthenticationException:
         client.close()
         return {
@@ -619,6 +638,7 @@ def _upload_device_files_to_uploader(
     uploads: list[dict[str, Any]] = []
     temp_paths: list[str] = []
     upload_url = f"{uploader_base_url}{uploader_path}"
+    request_timeout_sec = max(1, int(cs.BOX_UPLOADER_TIMEOUT_SEC))
     temp_dir = _ensure_device_temp_dir()
     _cleanup_device_temp_dir()
 
@@ -639,6 +659,9 @@ def _upload_device_files_to_uploader(
                 sftp.get(target["remotePath"], local_temp_path)
 
                 with open(local_temp_path, "rb") as recording_fp:
+                    # uploader는 복구 write라 실제 POST 직전에만 API mutation
+                    # state를 표시해 앞선 SSH/S3 precheck 실패와 구분한다.
+                    _mark_company_api_mutation_attempted()
                     response = requests.post(
                         upload_url,
                         headers={"Authorization": f"Bearer {token}"},
@@ -651,7 +674,7 @@ def _upload_device_files_to_uploader(
                         files={
                             "recording": (upload_name, recording_fp, "video/mp4"),
                         },
-                        timeout=max(1, cs.BOX_UPLOADER_TIMEOUT_SEC),
+                        timeout=request_timeout_sec,
                     )
 
                 try:
@@ -754,6 +777,8 @@ def _download_device_files_to_s3(
                     ) as tmp_file:
                         temp_path = tmp_file.name
                     sftp.get(remote_path, temp_path)
+                    # 로컬 임시 다운로드는 제외하고 S3 object write부터 표시한다.
+                    _mark_company_api_mutation_attempted()
                     s3_client.upload_file(temp_path, bucket, key)
                     presigned_url = s3_client.generate_presigned_url(
                         "get_object",
@@ -799,7 +824,12 @@ def _download_device_files_to_s3(
     }
 
 
-def _probe_device_files_for_record(record: dict[str, Any]) -> dict[str, Any]:
+def _probe_device_files_for_record(
+    record: dict[str, Any],
+    *,
+    retry_remote_probe: bool = True,
+    resend_ssh_open: bool = True,
+) -> dict[str, Any]:
     device_name = str(record.get("deviceName") or "").strip()
     if not device_name:
         return {
@@ -807,7 +837,10 @@ def _probe_device_files_for_record(record: dict[str, Any]) -> dict[str, Any]:
             "sshReason": "missing_device_name",
         }
 
-    wait_result = _wait_for_mda_device_agent_ssh(device_name)
+    wait_result = _wait_for_mda_device_agent_ssh(
+        device_name,
+        resend_enabled=resend_ssh_open,
+    )
     device_info = wait_result.get("device") if isinstance(wait_result, dict) else {}
     agent_ssh = (device_info or {}).get("agentSsh") if isinstance(device_info, dict) else None
     if not wait_result.get("ready") or not isinstance(agent_ssh, dict):
@@ -850,9 +883,12 @@ def _probe_device_files_for_record(record: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and not item.get("ok")
     )
 
-    if should_retry:
+    if retry_remote_probe and should_retry:
         _open_mda_device_ssh(device_name)
-        wait_result = _wait_for_mda_device_agent_ssh(device_name)
+        wait_result = _wait_for_mda_device_agent_ssh(
+            device_name,
+            resend_enabled=resend_ssh_open,
+        )
         device_info = wait_result.get("device") if isinstance(wait_result, dict) else {}
         retried_agent_ssh = (device_info or {}).get("agentSsh") if isinstance(device_info, dict) else None
         if wait_result.get("ready") and isinstance(retried_agent_ssh, dict):
@@ -1285,6 +1321,8 @@ def _locate_barcode_file_candidates(
     compact_download: bool = False,
     recover_remote_files: bool = False,
     compact_recovery: bool = False,
+    retry_remote_probe: bool = True,
+    resend_ssh_open: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     mapped_device_contexts = device_contexts
     if mapped_device_contexts is None:
@@ -1373,7 +1411,11 @@ def _locate_barcode_file_candidates(
 
     if probe_remote_files and records:
         for record in records:
-            device_probe = _probe_device_files_for_record(record)
+            device_probe = _probe_device_files_for_record(
+                record,
+                retry_remote_probe=retry_remote_probe,
+                resend_ssh_open=resend_ssh_open,
+            )
             record["deviceProbe"] = device_probe
             download_cache: dict[tuple[str, int, tuple[str, ...]], dict[str, Any]] = {}
             upload_cache: dict[tuple[str, int, tuple[str, ...], str], dict[str, Any]] = {}

@@ -19,6 +19,10 @@ from boxer_company.routers.mda_graphql import (
     _is_mda_graphql_configured,
     _wait_for_mda_device_agent_ssh,
 )
+from boxer_company.routers.device_ssh_security import (
+    DeviceSshSecurityError,
+    _prepare_device_ssh_client,
+)
 
 
 def _local_zone() -> ZoneInfo:
@@ -135,7 +139,11 @@ def _derive_device_download_availability(ssh_status: object) -> str:
     return "미확인"
 
 
-def _lookup_device_ssh_status(device_name: str) -> str:
+def _lookup_device_ssh_status(
+    device_name: str,
+    *,
+    allow_ssh_open_resend: bool = True,
+) -> str:
     normalized_name = str(device_name or "").strip()
     if not normalized_name or not _is_mda_graphql_configured() or not cs.DEVICE_SSH_PASSWORD or paramiko is None:
         return "미확인"
@@ -144,6 +152,9 @@ def _lookup_device_ssh_status(device_name: str) -> str:
         wait_result = _wait_for_mda_device_agent_ssh(
             normalized_name,
             poll_timeout_sec=min(10, max(1, cs.MDA_SSH_POLL_TIMEOUT_SEC)),
+            # API로 이전한 generic 장비 상세는 요청 하나에서 open을 한 번만
+            # 보낸다. 기존 Slack local 호출은 기본값으로 기존 재전송 동작을 유지한다.
+            resend_enabled=allow_ssh_open_resend,
         )
     except Exception:
         return "미확인"
@@ -163,10 +174,16 @@ def _lookup_device_ssh_status(device_name: str) -> str:
         return "연결 불가"
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
+        connect_host = _prepare_device_ssh_client(
+            client,
+            device_name=normalized_name,
+            reported_host=host,
+            port=port,
+            paramiko_module=paramiko,
+        )
         client.connect(
-            hostname=host,
+            hostname=connect_host,
             port=port,
             username=cs.DEVICE_SSH_USER,
             password=cs.DEVICE_SSH_PASSWORD,
@@ -176,6 +193,8 @@ def _lookup_device_ssh_status(device_name: str) -> str:
             look_for_keys=False,
             allow_agent=False,
         )
+    except DeviceSshSecurityError:
+        return "미확인"
     except (
         paramiko.AuthenticationException,
         paramiko.SSHException,
@@ -1757,6 +1776,7 @@ def _query_devices_by_filters(
     install_flag: int | None = None,
     count_only: bool = False,
     include_live_enrichment: bool = True,
+    allow_ssh_open_resend: bool = True,
 ) -> str:
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
@@ -1883,8 +1903,8 @@ def _query_devices_by_filters(
         connection.close()
 
     if rows and include_live_enrichment:
-        # Slack local 경로만 MDA/SSH 상태를 보강한다. 공통 read-only API는
-        # DB 결과만 사용해 sshOrder mutation과 장비 접속을 원천 차단한다.
+        # 기존 Slack local과 명시적인 API device_detail만 MDA 메타데이터를
+        # 보강한다. 범용 API 장비 조회는 include_live_enrichment=False다.
         detail_by_name = _lookup_mda_device_details([row.get("deviceName") for row in rows])
         if detail_by_name:
             for row in rows:
@@ -1935,7 +1955,8 @@ def _query_devices_by_filters(
                 _display_value(
                     rows[0].get("deviceName"),
                     default="",
-                )
+                ),
+                allow_ssh_open_resend=allow_ssh_open_resend,
             )
             if include_live_enrichment
             else None

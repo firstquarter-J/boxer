@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from boxer_company.routers.device_update import (
     _AGENT_GIT_STATUS_COMMAND,
+    _DeviceSshOpenBudget,
     _build_device_update_activity_input,
     _extract_device_name_for_update,
     _is_device_agent_update_request,
@@ -15,6 +16,7 @@ from boxer_company.routers.device_update import (
     _request_device_box_update,
     _request_device_power_off,
     _run_remote_ssh_command,
+    _wait_for_device_update_ssh,
 )
 
 
@@ -130,10 +132,23 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             },
         }
 
-        result_text, payload = _request_device_box_update("MB2-C00419 장비 업데이트")
+        result_text, payload = _request_device_box_update(
+            "MB2-C00419 장비 업데이트",
+            resend_ssh_open=False,
+        )
 
         mock_update_box.assert_called_once_with("MB2-C00419", version="2.11.300", silent=False)
-        mock_wait_for_box_update_completion.assert_called_once_with("MB2-C00419", "2.11.300")
+        box_budget = mock_read_box_runtime_state.call_args.kwargs["ssh_open_budget"]
+        self.assertIs(
+            mock_read_agent_runtime_state.call_args.kwargs["ssh_open_budget"],
+            box_budget,
+        )
+        mock_wait_for_box_update_completion.assert_called_once_with(
+            "MB2-C00419",
+            "2.11.300",
+            resend_ssh_open=False,
+            ssh_open_budget=box_budget,
+        )
         self.assertIn("*장비 박스 업데이트*", result_text)
         self.assertIn("최신 박스 버전", result_text)
         self.assertIn("완료", result_text)
@@ -186,12 +201,22 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             "status": "completed",
         }
 
-        result_text, payload = _request_device_power_off("MB2-C00419 장비 종료")
+        result_text, payload = _request_device_power_off(
+            "MB2-C00419 장비 종료",
+            resend_ssh_open=False,
+        )
 
         self.assertIn("*장비 전원 종료*", result_text)
         self.assertIn("완료", result_text)
         self.assertEqual(payload["route"], "device_power_off")
         self.assertTrue(payload["dispatch"]["status"])
+        self.assertFalse(
+            mock_open_device_ssh_for_update.call_args.kwargs["resend_ssh_open"]
+        )
+        self.assertIsInstance(
+            mock_open_device_ssh_for_update.call_args.kwargs["ssh_open_budget"],
+            _DeviceSshOpenBudget,
+        )
         mock_wait_for_device_power_off_completion.assert_called_once_with("MB2-C00419")
         client.close.assert_called()
 
@@ -436,12 +461,24 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             },
         }
 
-        result_text, payload = _request_device_agent_update("MB2-C00819 에이전트 업데이트")
+        result_text, payload = _request_device_agent_update(
+            "MB2-C00819 에이전트 업데이트",
+            resend_ssh_open=False,
+        )
 
-        mock_dispatch_device_agent_install_script.assert_called_once_with("MB2-C00819")
+        agent_budget = mock_read_agent_runtime_state.call_args.kwargs[
+            "ssh_open_budget"
+        ]
+        mock_dispatch_device_agent_install_script.assert_called_once_with(
+            "MB2-C00819",
+            resend_ssh_open=False,
+            ssh_open_budget=agent_budget,
+        )
         mock_wait_for_agent_update_completion.assert_called_once_with(
             "MB2-C00819",
             baseline_runtime=mock_read_agent_runtime_state.return_value,
+            resend_ssh_open=False,
+            ssh_open_budget=agent_budget,
         )
         self.assertIn("install-agent.sh -f 1", result_text)
         self.assertIn("SSH 스크립트", result_text)
@@ -558,7 +595,10 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             },
         }
 
-        result_text, payload = _query_device_update_status("MB2-C00419")
+        result_text, payload = _query_device_update_status(
+            "MB2-C00419",
+            resend_ssh_open=False,
+        )
 
         self.assertIn("*장비 업데이트 상태*", result_text)
         self.assertIn("최신 박스 버전", result_text)
@@ -569,6 +609,53 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         self.assertFalse(payload["agentGate"]["ok"])
         self.assertEqual(payload["agentGate"]["version"], "1.2.0")
         self.assertIn("에이전트 1.2.0", payload["agentGate"]["reason"])
+        status_budget = mock_read_box_runtime_state.call_args.kwargs[
+            "ssh_open_budget"
+        ]
+        self.assertIs(
+            mock_read_agent_runtime_state.call_args.kwargs["ssh_open_budget"],
+            status_budget,
+        )
+
+    @patch("boxer_company.routers.device_update._get_mda_device_agent_ssh")
+    @patch("boxer_company.routers.device_update._wait_for_mda_device_agent_ssh")
+    def test_api_update_operation_uses_one_initial_open_budget(
+        self,
+        mock_wait_for_mda_device_agent_ssh,
+        mock_get_mda_device_agent_ssh,
+    ) -> None:
+        # 첫 wait가 open을 사용한 뒤 같은 operation의 후속 조회는 상태만 읽는다.
+        mock_wait_for_mda_device_agent_ssh.return_value = {
+            "opened": {"status": True},
+            "device": {"deviceName": "MB2-C00419", "agentSsh": None},
+            "pollCount": 3,
+            "ready": False,
+            "reusedExisting": False,
+        }
+        mock_get_mda_device_agent_ssh.return_value = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": None,
+        }
+        budget = _DeviceSshOpenBudget()
+
+        first = _wait_for_device_update_ssh(
+            "MB2-C00419",
+            resend_ssh_open=False,
+            ssh_open_budget=budget,
+        )
+        second = _wait_for_device_update_ssh(
+            "MB2-C00419",
+            resend_ssh_open=False,
+            ssh_open_budget=budget,
+        )
+
+        self.assertFalse(first["ready"])
+        self.assertFalse(second["ready"])
+        mock_wait_for_mda_device_agent_ssh.assert_called_once_with(
+            "MB2-C00419",
+            resend_enabled=False,
+        )
+        mock_get_mda_device_agent_ssh.assert_called_once_with("MB2-C00419")
 
 
 class _FakeSshChannel:

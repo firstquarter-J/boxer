@@ -573,6 +573,19 @@ def _handle_device_routes(
     auto_update_control = _extract_daily_device_round_auto_update_control(question)
 
     if alert_delivery_control:
+        if deps.automation_remote:
+            # remote health의 override와 dedupe cursor는 API durable state가
+            # 정본이다. Slack legacy 파일을 상태 조회나 변경에 사용하지 않는다.
+            _set_request_log_route(
+                context.payload,
+                "device health alert delivery control remote blocked",
+                handler_type="router",
+            )
+            context.reply(
+                "원격 자동화 모드에서는 장비 이상 알림 설정의 정본이 API "
+                "durable state야. Slack 명령으로 상태를 확인하거나 바꿀 수 없어"
+            )
+            return True
         try:
             _set_request_log_route(
                 context.payload,

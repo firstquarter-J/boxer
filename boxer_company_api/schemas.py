@@ -26,6 +26,8 @@ _MAX_CONTEXT_CHARS = 5_000
 _MAX_QUESTION_CHARS = 4_000
 _MAX_RESPONSE_MESSAGES = 8
 _MAX_RESPONSE_SOURCES = 20
+_MAX_PRIVATE_LINKS = 20
+_MAX_PRIVATE_LINK_URI_CHARS = 16_384
 _MAX_MESSAGE_CHARS = 30_000
 _MAX_RESPONSE_BYTES = 1_048_576
 _TRUNCATED_MARKER = "...(truncated)"
@@ -180,6 +182,186 @@ class AssistantTurnScopeInput(_StrictInputModel):
         return metadata
 
 
+class DeviceHealthAlertTargetInput(_StrictInputModel):
+    """Slack button value에서 API가 다시 검증할 exact 장비 대상을 받는다."""
+
+    hospitalSeq: int = Field(ge=1)
+    hospitalName: str = Field(min_length=1, max_length=160)
+    roomName: str = Field(min_length=1, max_length=160)
+    deviceName: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$",
+    )
+    issue: str = Field(min_length=1, max_length=1_000)
+    alertCategory: str = Field(default="", max_length=80)
+    problemComponents: list[str] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator(
+        "hospitalName",
+        "roomName",
+        "issue",
+        "alertCategory",
+    )
+    @classmethod
+    def _normalize_text(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("problemComponents")
+    @classmethod
+    def _normalize_components(cls, value: list[str]) -> list[str]:
+        normalized = [" ".join(component.split()) for component in value]
+        if any(not component or len(component) > 80 for component in normalized):
+            raise ValueError("problem component is invalid")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("problem components must be unique")
+        return normalized
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "hospital_seq": self.hospitalSeq,
+            "hospital_name": self.hospitalName,
+            "room_name": self.roomName,
+            "device_name": self.deviceName,
+            "issue": self.issue,
+            "alert_category": self.alertCategory,
+            "problem_components": list(self.problemComponents),
+        }
+
+
+class DeviceHealthAlertSmsInput(_StrictInputModel):
+    phoneNumber: str = Field(
+        min_length=10,
+        max_length=24,
+        pattern=r"^[+0-9() -]+$",
+    )
+    message: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("phoneNumber", "message")
+    @classmethod
+    def _strip_value(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("SMS value must not be blank")
+        return normalized
+
+    def to_metadata(self) -> dict[str, str]:
+        return {
+            "phone_number": self.phoneNumber,
+            "message": self.message,
+        }
+
+
+class DeviceHealthAlertActionInput(_StrictInputModel):
+    """질문 추론 없이 실행할 수 있는 장비 이상 알림 action 계약이다."""
+
+    name: Literal[
+        "device_health_alert_contact_hospital",
+        "device_health_alert_device_voice_guide",
+        "device_health_alert_mark_done",
+    ]
+    phase: Literal["prepare", "execute"]
+    target: DeviceHealthAlertTargetInput
+    sms: DeviceHealthAlertSmsInput | None = None
+
+    @model_validator(mode="after")
+    def _validate_sms_payload(self) -> "DeviceHealthAlertActionInput":
+        is_sms_action = self.name == "device_health_alert_contact_hospital"
+        if not is_sms_action and self.phase != "execute":
+            raise ValueError("non-SMS action phase must be execute")
+        if not is_sms_action and self.sms is not None:
+            raise ValueError("SMS payload is only valid for the SMS action")
+        if is_sms_action and self.phase == "prepare" and self.sms is not None:
+            raise ValueError("SMS prepare phase must not include SMS input")
+        if is_sms_action and self.phase == "execute" and self.sms is None:
+            raise ValueError("SMS execute phase requires SMS input")
+        return self
+
+    def to_metadata(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "name": self.name,
+            "phase": self.phase,
+            "target": self.target.to_metadata(),
+        }
+        if self.sms is not None:
+            metadata["sms"] = self.sms.to_metadata()
+        return metadata
+
+
+class SecurityReviewTargetInput(_StrictInputModel):
+    """Slack이 확인한 봇 identity만 받고 사용자 profile 원문은 받지 않는다."""
+
+    userId: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    botId: str = Field(
+        default="",
+        max_length=256,
+        pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255})?$",
+    )
+    appId: str = Field(
+        default="",
+        max_length=256,
+        pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255})?$",
+    )
+    name: str = Field(default="", max_length=160)
+
+    @field_validator("name")
+    @classmethod
+    def _normalize_name(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if any(ord(character) < 32 for character in normalized):
+            raise ValueError("security review target name is invalid")
+        return normalized
+
+    def to_metadata(self) -> dict[str, str]:
+        return {
+            "user_id": self.userId,
+            "bot_id": self.botId,
+            "app_id": self.appId,
+            "name": self.name,
+        }
+
+
+class SecurityReviewActionInput(_StrictInputModel):
+    """Slack UI와 API 소유 보안검토 state machine 사이의 typed action이다."""
+
+    name: Literal["security_review"]
+    phase: Literal["start", "respond", "summary", "cancel"]
+    target: SecurityReviewTargetInput | None = None
+    responseText: str = Field(default="", max_length=30_000)
+
+    @field_validator("responseText")
+    @classmethod
+    def _strip_response_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _validate_phase_payload(self) -> "SecurityReviewActionInput":
+        if self.phase in {"start", "respond"} and self.target is None:
+            raise ValueError("security review phase requires target")
+        if self.phase != "respond" and self.responseText:
+            raise ValueError("security review response is only valid for respond")
+        if self.phase in {"summary", "cancel"} and self.target is not None:
+            raise ValueError("security review terminal phase must not include target")
+        return self
+
+    def to_metadata(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "name": self.name,
+            "phase": self.phase,
+            "response_text": self.responseText,
+        }
+        if self.target is not None:
+            metadata["target"] = self.target.to_metadata()
+        return metadata
+
+
 class AssistantTurnInput(_StrictInputModel):
     tenantId: str = Field(
         min_length=1,
@@ -215,12 +397,22 @@ class AssistantTurnInput(_StrictInputModel):
     routeGroup: Literal[
         "notion",
         "device",
+        "device_detail",
         "failure",
         "log",
         "structured",
         "barcode",
         "knowledge",
+        "freeform",
+        "health",
+        "fun",
+        "operations",
     ] | None = None
+    operationAction: (
+        DeviceHealthAlertActionInput
+        | SecurityReviewActionInput
+        | None
+    ) = None
 
     @field_validator("question")
     @classmethod
@@ -239,6 +431,24 @@ class AssistantTurnInput(_StrictInputModel):
             raise ValueError("contextEntries exceed the text budget")
         return self
 
+    @model_validator(mode="after")
+    def _validate_operation_action_scope(self) -> "AssistantTurnInput":
+        if self.operationAction is not None and self.routeGroup != "operations":
+            raise ValueError("operationAction requires routeGroup=operations")
+        if (
+            isinstance(
+                self.operationAction,
+                DeviceHealthAlertActionInput,
+            )
+            and self.scope is not None
+            and self.scope.deviceName is not None
+            and self.scope.deviceName.casefold()
+            != self.operationAction.target.deviceName.casefold()
+        ):
+            # scope는 target을 보충하지 않고 같은 exact 장비인지 검증만 한다.
+            raise ValueError("scope deviceName must match operationAction target")
+        return self
+
     def to_company_request(
         self,
         request_id: str,
@@ -253,6 +463,9 @@ class AssistantTurnInput(_StrictInputModel):
             # strict enum 검증을 통과한 실행 범위만 request guard에 알려
             # 선택되지 않은 stage의 외부 조회 가드가 오탐하지 않게 한다.
             metadata["route_group"] = self.routeGroup
+        if self.operationAction is not None:
+            # 질문 원문과 분리된 typed action만 operation route가 읽는다.
+            metadata["operation_action"] = self.operationAction.to_metadata()
         return CompanyAssistantRequest(
             request_id=request_id,
             tenant_id=self.tenantId,
@@ -269,11 +482,23 @@ class AssistantTurnInput(_StrictInputModel):
         )
 
 
+class AssistantLinkOutput(BaseModel):
+    label: str = Field(min_length=1, max_length=255)
+    uri: str = Field(
+        min_length=1,
+        max_length=_MAX_PRIVATE_LINK_URI_CHARS,
+    )
+
+
 class AssistantMessageOutput(BaseModel):
     body: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
     deliveryScope: Literal["conversation", "requester"]
     mentionActor: bool
     format: Literal["commonmark"]
+    privateLinks: list[AssistantLinkOutput] = Field(
+        default_factory=list,
+        max_length=_MAX_PRIVATE_LINKS,
+    )
 
 
 class SourceReferenceOutput(BaseModel):
@@ -281,6 +506,113 @@ class SourceReferenceOutput(BaseModel):
     title: str = Field(min_length=1, max_length=2_000)
     uri: str = Field(min_length=1, max_length=2_048)
     score: float | None
+
+
+class SmsDeliveryTargetOutput(_StrictInputModel):
+    hospital: str = Field(min_length=1, max_length=160)
+    room: str = Field(min_length=1, max_length=160)
+    device: str = Field(min_length=1, max_length=160)
+    components: list[str] = Field(default_factory=list, max_length=16)
+    issue: str = Field(min_length=1, max_length=1_000)
+
+
+class SmsDeliveryOperationResultOutput(_StrictInputModel):
+    """전화번호·본문 없이 delivery reporter가 보존할 최소 provider receipt다."""
+
+    kind: Literal["sms_delivery"]
+    provider: Literal["solapi"]
+    deliveryStatus: Literal[
+        "accepted",
+        "delivered",
+        "delivery_failed",
+        "confirm_required",
+    ]
+    groupId: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9._:@/-]+$",
+    )
+    messageId: str = Field(
+        default="",
+        max_length=256,
+        pattern=r"^[A-Za-z0-9._:@/-]*$",
+    )
+    acceptedAt: str = Field(min_length=1, max_length=64)
+    target: SmsDeliveryTargetOutput
+
+    @field_validator("acceptedAt")
+    @classmethod
+    def _validate_accepted_at(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("acceptedAt must be ISO-8601") from exc
+        return normalized
+
+
+class SmsContactPreparationOutput(_StrictInputModel):
+    """모달 렌더에만 쓰고 대화 본문/로그에는 넣지 않는 requester PII다."""
+
+    kind: Literal["sms_contact_preparation"]
+    deliveryScope: Literal["requester"]
+    phoneNumber: str = Field(
+        default="",
+        max_length=24,
+        pattern=r"^[0-9]*$",
+    )
+    message: str = Field(default="", max_length=1_000)
+    templateId: str = Field(min_length=1, max_length=80)
+    target: SmsDeliveryTargetOutput
+
+
+class SecurityReviewStepOutput(_StrictInputModel):
+    """Slack renderer가 다음 probe 또는 최종 report만 전달받는 안전한 DTO다."""
+
+    kind: Literal["security_review_step"]
+    status: Literal[
+        "started",
+        "continued",
+        "completed",
+        "summary",
+        "no_session",
+        "ignored",
+        "cancelled",
+    ]
+    targetUserId: str = Field(
+        default="",
+        max_length=256,
+        pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255})?$",
+    )
+    probeIndex: int = Field(ge=0, le=128)
+    probeTotal: int = Field(ge=1, le=128)
+    probeTitle: str = Field(default="", max_length=160)
+    probePrompt: str = Field(default="", max_length=4_000)
+    report: str = Field(default="", max_length=20_000)
+
+    @model_validator(mode="after")
+    def _validate_status_payload(self) -> "SecurityReviewStepOutput":
+        if self.status in {"started", "continued"}:
+            if (
+                not self.targetUserId
+                or not self.probeTitle.strip()
+                or not self.probePrompt.strip()
+                or self.report
+                or not 1 <= self.probeIndex <= self.probeTotal
+            ):
+                raise ValueError("security review probe result is invalid")
+        elif self.status in {"completed", "summary"}:
+            if (
+                not self.targetUserId
+                or self.probeTitle
+                or self.probePrompt
+                or not self.report.strip()
+                or self.probeIndex > self.probeTotal
+            ):
+                raise ValueError("security review report result is invalid")
+        elif self.probeTitle or self.probePrompt or self.report:
+            raise ValueError("security review empty result is invalid")
+        return self
 
 
 class AssistantTurnOutput(BaseModel):
@@ -304,6 +636,33 @@ class AssistantTurnOutput(BaseModel):
     fallbackReason: str | None = Field(default=None, max_length=256)
     suggestedAction: None = None
     asyncJob: None = None
+    operationResult: (
+        SmsDeliveryOperationResultOutput
+        | SmsContactPreparationOutput
+        | SecurityReviewStepOutput
+        | None
+    ) = None
+
+
+def _serialize_operation_result(
+    value: Any,
+) -> (
+    SmsDeliveryOperationResultOutput
+    | SmsContactPreparationOutput
+    | SecurityReviewStepOutput
+    | None
+):
+    if not isinstance(value, dict):
+        return None
+    # route가 만든 allowlisted receipt만 직렬화해 전화번호·문자본문 같은
+    # provider 요청 원문이 HTTP 응답에 섞이지 않게 한다.
+    if value.get("kind") == "sms_delivery":
+        return SmsDeliveryOperationResultOutput.model_validate(value)
+    if value.get("kind") == "sms_contact_preparation":
+        return SmsContactPreparationOutput.model_validate(value)
+    if value.get("kind") == "security_review_step":
+        return SecurityReviewStepOutput.model_validate(value)
+    return None
 
 
 def serialize_result(
@@ -329,7 +688,7 @@ def serialize_result(
             usedLlm=False,
             fallbackReason="no_matching_route",
         )
-        return payload.model_dump(mode="json")
+        return _dump_turn_output(payload)
 
     sources: list[SourceReferenceOutput] = []
     for source in result.sources[:_MAX_RESPONSE_SOURCES]:
@@ -369,8 +728,11 @@ def serialize_result(
         # 변경 작업과 job payload는 별도 typed API가 생기기 전에는 노출하지 않는다.
         suggestedAction=None,
         asyncJob=None,
+        operationResult=_serialize_operation_result(
+            result.operation_result
+        ),
     )
-    return _fit_response_byte_budget(payload).model_dump(mode="json")
+    return _dump_turn_output(_fit_response_byte_budget(payload))
 
 
 def _serialize_messages(
@@ -378,8 +740,21 @@ def _serialize_messages(
 ) -> list[AssistantMessageOutput]:
     chunks: list[AssistantMessageOutput] = []
     was_truncated = False
+    links_by_message = tuple(
+        _serialize_private_links(message) for message in messages
+    )
+    private_uris = {
+        link.uri
+        for links in links_by_message
+        for link in links
+    }
     for message_index, message in enumerate(messages):
         body = str(message.body or "")
+        private_links = links_by_message[message_index]
+        # presigned URL은 typed privateLinks 필드 하나로만 전달한다. 다른
+        # 공개 메시지나 code fence에 같은 URI가 섞여도 전역으로 제거한다.
+        for private_uri in private_uris:
+            body = body.replace(private_uri, "[비공개 링크 생략]")
         if not body.strip():
             continue
         for offset in range(0, len(body), _MAX_MESSAGE_CHARS):
@@ -395,6 +770,13 @@ def _serialize_messages(
                         message.mention_actor and offset == 0
                     ),
                     format=message.format,
+                    # presigned URL은 요청자 전용 메시지의 첫 transport
+                    # chunk에만 싣고 공개 메시지나 후속 chunk로 복제하지 않는다.
+                    privateLinks=(
+                        private_links
+                        if offset == 0
+                        else []
+                    ),
                 )
             )
         if len(chunks) >= _MAX_RESPONSE_MESSAGES:
@@ -416,6 +798,73 @@ def _serialize_messages(
             }
         )
     return chunks
+
+
+def _serialize_private_links(message: Any) -> list[AssistantLinkOutput]:
+    if getattr(message, "delivery_scope", None) != "requester":
+        return []
+    serialized: list[AssistantLinkOutput] = []
+    seen_uris: set[str] = set()
+    for link in tuple(getattr(message, "private_links", ()) or ()):
+        if len(serialized) >= _MAX_PRIVATE_LINKS:
+            break
+        label = _safe_private_link_label(getattr(link, "label", None))
+        uri = _safe_private_link_uri(getattr(link, "uri", None))
+        if label is None or uri is None or uri in seen_uris:
+            continue
+        seen_uris.add(uri)
+        serialized.append(AssistantLinkOutput(label=label, uri=uri))
+    return serialized
+
+
+def _safe_private_link_label(value: object) -> str | None:
+    normalized = str(value or "").strip()
+    if (
+        not normalized
+        or any(ord(character) < 32 for character in normalized)
+    ):
+        return None
+    return normalized[:255]
+
+
+def _safe_private_link_uri(value: object) -> str | None:
+    # source와 달리 requester-only 다운로드 링크는 서명 query를 보존한다.
+    normalized = str(value or "").strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_PRIVATE_LINK_URI_CHARS
+        or any(
+            character.isspace() or ord(character) < 32
+            for character in normalized
+        )
+        or any(character in normalized for character in "<>|")
+    ):
+        return None
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return None
+    if not (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname
+        and parsed.username is None
+        and parsed.password is None
+    ):
+        return None
+    return normalized
+
+
+def _dump_turn_output(payload: AssistantTurnOutput) -> dict[str, Any]:
+    # 기존 client와의 additive 호환을 위해 링크가 없는 메시지에는 새 키를
+    # 내보내지 않는다. 링크가 있을 때만 requester 전용 확장 계약을 사용한다.
+    serialized = payload.model_dump(mode="json")
+    for message in serialized.get("messages") or []:
+        if not message.get("privateLinks"):
+            message.pop("privateLinks", None)
+    if serialized.get("operationResult") is None:
+        # 기존 read-only client에는 action 전용 확장 키를 내보내지 않는다.
+        serialized.pop("operationResult", None)
+    return serialized
 
 
 def _fit_response_byte_budget(
@@ -570,6 +1019,7 @@ def _safe_score(value: object) -> float | None:
 
 
 __all__ = [
+    "AssistantLinkOutput",
     "AssistantMessageOutput",
     "AssistantTurnInput",
     "AssistantTurnOutput",

@@ -4,6 +4,7 @@ import logging
 import unittest
 from unittest.mock import patch
 
+from boxer_company import settings as cs
 from boxer_company.assistant.answer_composer import (
     CompanyEvidenceAnswerPolicy,
 )
@@ -352,6 +353,33 @@ class RecordingFailureAssistantRouteTests(unittest.TestCase):
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(result.fallback_reason, "s3_not_configured")
         self.assertEqual(composer.calls, [])
+
+    @patch(
+        "boxer_company.assistant.recording_failure_route."
+        "_analyze_barcode_log_phase1_window"
+    )
+    def test_undated_request_uses_fixed_phase1_without_live_enrichment(
+        self,
+        analyze_phase1,
+    ) -> None:
+        # 날짜가 없어도 무제한 탐색하지 않고 서버 상수 범위만 조회한다.
+        analyze_phase1.return_value = (
+            "*로그 분석 결과*\n"
+            "• 2차 조회를 위해 아래 3가지를 같이 입력해줘:",
+            {"request": {"barcode": _BARCODE}},
+        )
+        route, _ = self._route()
+
+        result = route.handle(
+            _request(f"{_BARCODE} 녹화 실패 원인 분석")
+        )
+
+        self.assertEqual(result.outcome, "needs_input")
+        self.assertEqual(result.fallback_reason, "scope_required")
+        call = analyze_phase1.call_args
+        self.assertEqual(call.args[1], _BARCODE)
+        self.assertEqual(call.kwargs["max_days"], cs.LOG_PHASE1_MAX_DAYS)
+        self.assertFalse(call.kwargs["include_live_enrichment"])
 
     def test_explicit_scope_followup_claims_invalid_date(self) -> None:
         route, composer = self._route()

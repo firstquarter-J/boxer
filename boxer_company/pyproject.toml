@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 boxer-company-base-access-seed = "boxer_company.base_access_seed:main"
+boxer-company-sms-recovery-state-init = "boxer_company.sms_recovery_state_initializer:main"
 
 [project.urls]
 Repository = "https://github.com/firstquarter-J/boxer"

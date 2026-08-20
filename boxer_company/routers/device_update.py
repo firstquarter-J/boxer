@@ -3,14 +3,20 @@ import re
 import shlex
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from boxer.core.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
+from boxer_company.routers.device_ssh_security import (
+    _mark_company_api_mutation_attempted,
+    _register_mda_ssh_endpoint_device,
+)
 from boxer_company.routers.device_status_probe import _parse_pm2_processes
 from boxer_company.routers.mda_graphql import (
+    _get_mda_device_agent_ssh,
     _get_mda_device_detail,
     _get_mda_latest_device_version,
     _send_mda_device_ping,
@@ -138,6 +144,13 @@ _AGENT_MINIMUM_FOR_BOX_UPDATE = (2, 0, 0)
 _BOX_PM2_NAMES = {"mommybox-v2"}
 _AGENT_PM2_NAMES = {"mommybox-v2-agent", "mommybox-agent"}
 _DeviceUpdateDispatchNoticeFn = Callable[[str], None]
+
+
+@dataclass
+class _DeviceSshOpenBudget:
+    """API operation 하나가 신규 reverse SSH를 한 번만 열게 한다."""
+
+    initial_open_used: bool = False
 
 
 def _normalize_device_update_question(question: str) -> str:
@@ -300,6 +313,7 @@ def _run_remote_ssh_command(
     *,
     command: str,
     timeout_sec: int,
+    mutation: bool = False,
 ) -> dict[str, Any]:
     normalized_command = str(command or "").strip()
     actual_timeout = max(1, int(timeout_sec or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10))
@@ -307,6 +321,9 @@ def _run_remote_ssh_command(
     stdout = None
     stderr = None
     try:
+        if mutation:
+            # command/timeout preflight를 끝낸 뒤 실제 remote exec 직전에 표시한다.
+            _mark_company_api_mutation_attempted()
         stdin, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
         exit_status = _wait_for_ssh_exit_status(stdout, stderr, timeout_sec=actual_timeout)
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
@@ -333,8 +350,67 @@ def _run_remote_ssh_command(
         _close_ssh_streams(stdin, stdout, stderr)
 
 
-def _open_device_ssh_for_update(device_name: str) -> tuple[dict[str, Any], dict[str, Any], Any | None]:
-    wait_result = _wait_for_mda_device_agent_ssh(device_name)
+def _wait_for_device_update_ssh(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
+) -> dict[str, Any]:
+    """로컬 재전송은 유지하고 API operation의 최초 open만 한 번 허용한다."""
+
+    if resend_ssh_open:
+        return _wait_for_mda_device_agent_ssh(device_name)
+    if ssh_open_budget is None:
+        return _wait_for_mda_device_agent_ssh(
+            device_name,
+            resend_enabled=False,
+        )
+    if not ssh_open_budget.initial_open_used:
+        result = _wait_for_mda_device_agent_ssh(
+            device_name,
+            resend_enabled=False,
+        )
+        # reusedExisting=False면 성공 여부와 무관하게 initial open은 이미 전송됐다.
+        if not bool(result.get("reusedExisting")):
+            ssh_open_budget.initial_open_used = True
+        return result
+
+    # operation 안에서 open 예산을 쓴 뒤에는 MDA 상태만 읽는다. 늦게 열린
+    # endpoint는 strict SSH identity map에 등록하되 sshOrder는 다시 보내지 않는다.
+    current_state = _get_mda_device_agent_ssh(device_name)
+    device_info = current_state if isinstance(current_state, dict) else {}
+    agent_ssh = (
+        device_info.get("agentSsh")
+        if isinstance(device_info.get("agentSsh"), dict)
+        else {}
+    )
+    ready = bool(agent_ssh.get("host")) and bool(agent_ssh.get("port"))
+    if ready:
+        _register_mda_ssh_endpoint_device(
+            device_name,
+            agent_ssh.get("host"),
+            agent_ssh.get("port"),
+        )
+    return {
+        "opened": None,
+        "device": current_state,
+        "pollCount": 0,
+        "ready": ready,
+        "reusedExisting": ready,
+    }
+
+
+def _open_device_ssh_for_update(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Any | None]:
+    wait_result = _wait_for_device_update_ssh(
+        device_name,
+        resend_ssh_open=resend_ssh_open,
+        ssh_open_budget=ssh_open_budget,
+    )
     device_info = wait_result.get("device") if isinstance(wait_result.get("device"), dict) else {}
     agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
     host = _display_value(agent_ssh.get("host"), default="")
@@ -418,8 +494,17 @@ def _parse_agent_repo_state(output: str) -> dict[str, Any]:
     }
 
 
-def _read_box_runtime_state(device_name: str) -> dict[str, Any]:
-    device_info, ssh_state, client = _open_device_ssh_for_update(device_name)
+def _read_box_runtime_state(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
+) -> dict[str, Any]:
+    device_info, ssh_state, client = _open_device_ssh_for_update(
+        device_name,
+        resend_ssh_open=resend_ssh_open,
+        ssh_open_budget=ssh_open_budget,
+    )
     state: dict[str, Any] = {
         "device": _build_device_snapshot(device_name, device_info),
         "ssh": ssh_state,
@@ -442,8 +527,17 @@ def _read_box_runtime_state(device_name: str) -> dict[str, Any]:
     return state
 
 
-def _read_agent_runtime_state(device_name: str) -> dict[str, Any]:
-    device_info, ssh_state, client = _open_device_ssh_for_update(device_name)
+def _read_agent_runtime_state(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
+) -> dict[str, Any]:
+    device_info, ssh_state, client = _open_device_ssh_for_update(
+        device_name,
+        resend_ssh_open=resend_ssh_open,
+        ssh_open_budget=ssh_open_budget,
+    )
     state: dict[str, Any] = {
         "device": _build_device_snapshot(device_name, device_info),
         "ssh": ssh_state,
@@ -594,13 +688,23 @@ def _describe_agent_box_update_gate(agent_runtime: dict[str, Any]) -> dict[str, 
     }
 
 
-def _wait_for_box_update_completion(device_name: str, target_version: str) -> dict[str, Any]:
+def _wait_for_box_update_completion(
+    device_name: str,
+    target_version: str,
+    *,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
+) -> dict[str, Any]:
     deadline = time.monotonic() + _BOX_UPDATE_WAIT_TIMEOUT_SEC
     attempts = 0
     last_state: dict[str, Any] = {}
     while True:
         attempts += 1
-        last_state = _read_box_runtime_state(device_name)
+        last_state = _read_box_runtime_state(
+            device_name,
+            resend_ssh_open=resend_ssh_open,
+            ssh_open_budget=ssh_open_budget,
+        )
         process = last_state.get("process") if isinstance(last_state.get("process"), dict) else {}
         status = _display_value((process or {}).get("status"), default="").strip().lower()
         version = _display_value((process or {}).get("version"), default="")
@@ -632,6 +736,8 @@ def _wait_for_agent_update_completion(
     device_name: str,
     *,
     baseline_runtime: dict[str, Any] | None = None,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + _AGENT_UPDATE_WAIT_TIMEOUT_SEC
     attempts = 0
@@ -639,7 +745,11 @@ def _wait_for_agent_update_completion(
     baseline_parts = _parse_semver_parts(_resolve_agent_runtime_version(baseline_runtime or {}))
     while True:
         attempts += 1
-        last_state = _read_agent_runtime_state(device_name)
+        last_state = _read_agent_runtime_state(
+            device_name,
+            resend_ssh_open=resend_ssh_open,
+            ssh_open_budget=ssh_open_budget,
+        )
         process = last_state.get("process") if isinstance(last_state.get("process"), dict) else {}
         status = _display_value((process or {}).get("status"), default="").strip().lower()
         current_version = _resolve_agent_runtime_version(last_state)
@@ -814,8 +924,17 @@ def _wait_for_device_power_off_completion(device_name: str) -> dict[str, Any]:
     }
 
 
-def _dispatch_device_agent_install_script(device_name: str) -> dict[str, Any]:
-    device_info, ssh_state, client = _open_device_ssh_for_update(device_name)
+def _dispatch_device_agent_install_script(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+    ssh_open_budget: _DeviceSshOpenBudget | None = None,
+) -> dict[str, Any]:
+    device_info, ssh_state, client = _open_device_ssh_for_update(
+        device_name,
+        resend_ssh_open=resend_ssh_open,
+        ssh_open_budget=ssh_open_budget,
+    )
     dispatch_payload: dict[str, Any] = {
         "affected": 0,
         "status": False,
@@ -836,6 +955,7 @@ def _dispatch_device_agent_install_script(device_name: str) -> dict[str, Any]:
             client,
             command=_AGENT_INSTALL_SCRIPT_COMMAND,
             timeout_sec=_AGENT_INSTALL_SCRIPT_TIMEOUT_SEC,
+            mutation=True,
         )
     finally:
         client.close()
@@ -946,6 +1066,8 @@ def _request_device_box_update(
     question: str,
     device_name: str | None = None,
     on_dispatched: _DeviceUpdateDispatchNoticeFn | None = None,
+    *,
+    resend_ssh_open: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     normalized_device_name = _resolve_update_device_name(question, device_name)
     if _extract_requested_update_version(question):
@@ -955,8 +1077,26 @@ def _request_device_box_update(
     latest_device_version = _get_mda_latest_device_version()
     latest_version = _display_value(latest_device_version.get("versionName"), default="")
     snapshot = _build_device_snapshot(normalized_device_name, device_info)
-    precheck_runtime = _read_box_runtime_state(normalized_device_name)
-    agent_runtime = _read_agent_runtime_state(normalized_device_name)
+    # API 요청은 precheck와 완료 poll이 같은 initial-open 예산을 공유한다.
+    ssh_open_budget = (
+        None if resend_ssh_open else _DeviceSshOpenBudget()
+    )
+    ssh_options = (
+        {}
+        if resend_ssh_open
+        else {
+            "resend_ssh_open": False,
+            "ssh_open_budget": ssh_open_budget,
+        }
+    )
+    precheck_runtime = _read_box_runtime_state(
+        normalized_device_name,
+        **ssh_options,
+    )
+    agent_runtime = _read_agent_runtime_state(
+        normalized_device_name,
+        **ssh_options,
+    )
     agent_gate = _describe_agent_box_update_gate(agent_runtime)
     payload: dict[str, Any] = {
         "route": "device_box_update",
@@ -1031,7 +1171,11 @@ def _request_device_box_update(
     if on_dispatched is not None:
         on_dispatched(_build_device_update_started_notice(payload))
 
-    wait_result = _wait_for_box_update_completion(normalized_device_name, latest_version)
+    wait_result = _wait_for_box_update_completion(
+        normalized_device_name,
+        latest_version,
+        **ssh_options,
+    )
     payload["wait"] = wait_result
     wait_runtime = wait_result.get("runtime") if isinstance(wait_result.get("runtime"), dict) else {}
     lines.append("• MDA 응답: 업데이트 요청 전송 완료")
@@ -1054,6 +1198,8 @@ def _request_device_agent_update(
     question: str,
     device_name: str | None = None,
     on_dispatched: _DeviceUpdateDispatchNoticeFn | None = None,
+    *,
+    resend_ssh_open: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     normalized_device_name = _resolve_update_device_name(question, device_name)
     if _extract_requested_update_version(question):
@@ -1061,7 +1207,22 @@ def _request_device_agent_update(
 
     device_info = _get_mda_device_detail(normalized_device_name)
     snapshot = _build_device_snapshot(normalized_device_name, device_info)
-    precheck_runtime = _read_agent_runtime_state(normalized_device_name)
+    # precheck·install dispatch·completion poll을 operation 하나의 open 예산으로 묶는다.
+    ssh_open_budget = (
+        None if resend_ssh_open else _DeviceSshOpenBudget()
+    )
+    ssh_options = (
+        {}
+        if resend_ssh_open
+        else {
+            "resend_ssh_open": False,
+            "ssh_open_budget": ssh_open_budget,
+        }
+    )
+    precheck_runtime = _read_agent_runtime_state(
+        normalized_device_name,
+        **ssh_options,
+    )
     payload: dict[str, Any] = {
         "route": "device_agent_update",
         "source": "mda_graphql+ssh_install_script",
@@ -1110,7 +1271,10 @@ def _request_device_agent_update(
         lines.append("• 안내: 장비 agent 연결이 끊겨 있어. 장비 온라인 상태를 먼저 확인해")
         return "\n".join(lines), payload
 
-    dispatch_result = _dispatch_device_agent_install_script(normalized_device_name)
+    dispatch_result = _dispatch_device_agent_install_script(
+        normalized_device_name,
+        **ssh_options,
+    )
     payload["dispatch"] = dispatch_result
     if not dispatch_result.get("status"):
         lines.append("• 결과: *요청 실패*")
@@ -1123,6 +1287,7 @@ def _request_device_agent_update(
     wait_result = _wait_for_agent_update_completion(
         normalized_device_name,
         baseline_runtime=precheck_runtime,
+        **ssh_options,
     )
     payload["wait"] = wait_result
     wait_runtime = wait_result.get("runtime") if isinstance(wait_result.get("runtime"), dict) else {}
@@ -1152,9 +1317,25 @@ def _request_device_power_off(
     question: str,
     device_name: str | None = None,
     on_dispatched: _DeviceUpdateDispatchNoticeFn | None = None,
+    *,
+    resend_ssh_open: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     normalized_device_name = _resolve_update_device_name(question, device_name)
-    device_info, ssh_state, client = _open_device_ssh_for_update(normalized_device_name)
+    ssh_open_budget = (
+        None if resend_ssh_open else _DeviceSshOpenBudget()
+    )
+    ssh_options = (
+        {}
+        if resend_ssh_open
+        else {
+            "resend_ssh_open": False,
+            "ssh_open_budget": ssh_open_budget,
+        }
+    )
+    device_info, ssh_state, client = _open_device_ssh_for_update(
+        normalized_device_name,
+        **ssh_options,
+    )
     snapshot = _build_device_snapshot(normalized_device_name, device_info)
     payload: dict[str, Any] = {
         "route": "device_power_off",
@@ -1221,6 +1402,7 @@ def _request_device_power_off(
             client,
             command=dispatch_command,
             timeout_sec=max(10, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+            mutation=True,
         )
     finally:
         client.close()
@@ -1267,7 +1449,11 @@ def _request_device_power_off(
     return "\n".join(lines), payload
 
 
-def _query_device_update_status(device_name: str) -> tuple[str, dict[str, Any]]:
+def _query_device_update_status(
+    device_name: str,
+    *,
+    resend_ssh_open: bool = True,
+) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 업데이트 상태`")
@@ -1275,8 +1461,26 @@ def _query_device_update_status(device_name: str) -> tuple[str, dict[str, Any]]:
     device_info = _get_mda_device_detail(normalized_device_name)
     latest_device_version = _get_mda_latest_device_version()
     latest_version = _display_value(latest_device_version.get("versionName"), default="")
-    box_runtime = _read_box_runtime_state(normalized_device_name)
-    agent_runtime = _read_agent_runtime_state(normalized_device_name)
+    # 두 runtime 조회가 endpoint를 못 찾아도 API turn에서는 open을 한 번만 보낸다.
+    ssh_open_budget = (
+        None if resend_ssh_open else _DeviceSshOpenBudget()
+    )
+    ssh_options = (
+        {}
+        if resend_ssh_open
+        else {
+            "resend_ssh_open": False,
+            "ssh_open_budget": ssh_open_budget,
+        }
+    )
+    box_runtime = _read_box_runtime_state(
+        normalized_device_name,
+        **ssh_options,
+    )
+    agent_runtime = _read_agent_runtime_state(
+        normalized_device_name,
+        **ssh_options,
+    )
     agent_gate = _describe_agent_box_update_gate(agent_runtime)
     payload = {
         "route": "device_update_status",

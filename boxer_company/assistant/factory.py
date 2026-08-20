@@ -9,6 +9,7 @@ from boxer import AnswerEngine
 from boxer.core import settings as core_settings
 from boxer.core.llm import (
     _build_claude_client,
+    _check_claude_health,
     _check_ollama_health,
 )
 from boxer.retrieval.connectors.s3 import _build_s3_client
@@ -27,10 +28,15 @@ from boxer_company.assistant.device_led_routes import (
     match_device_read_route,
 )
 from boxer_company.assistant.device_db_detail_route import (
+    DeviceDetailAssistantRoute,
     DeviceDbDetailAssistantRoute,
 )
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
+)
+from boxer_company.assistant.freeform_runtime import (
+    build_company_freeform_route,
+    build_company_provider_answerer,
 )
 from boxer_company.assistant.knowledge_routes import (
     CompanyReadOnlyKnowledgeRouteDeps,
@@ -43,12 +49,20 @@ from boxer_company.assistant.notion_route import (
 from boxer_company.assistant.operational_read_routes import (
     WeeklyRecordingsSummaryAssistantRoute,
 )
+from boxer_company.assistant.operations import (
+    build_company_operation_routes,
+)
 from boxer_company.assistant.recording_failure_route import (
     match_recording_failure_route,
 )
 from boxer_company.assistant.runtime import (
     CompanyAssistantRuntime,
     CompanyAssistantRuntimeDeps,
+)
+from boxer_company.assistant.team_fun_route import (
+    CompanyDailyFortuneAssistantRoute,
+    CompanyLlmHealthAssistantRoute,
+    CompanyTeamFunAssistantRoute,
 )
 from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.box_db import (
@@ -85,6 +99,10 @@ def _guard_read_only_request(
     route_group = str(
         request.metadata.get("route_group") or ""
     ).strip()
+    if route_group == "operations":
+        # operations transport는 별도 execute capability를 통과한 뒤
+        # 이 runtime에 진입하므로 read-only guard의 차단 대상이 아니다.
+        return None
     if (
         route_group in {"", "barcode"}
         and barcode_route in {
@@ -225,7 +243,7 @@ def create_company_assistant_runtime(
     diagnostic_snapshot_loader: DiagnosticSnapshotLoader | None = None,
     logger: logging.Logger | None = None,
 ) -> CompanyAssistantRuntime:
-    """Slack/Web adapter 없이 회사 read-only runtime 전체를 조립한다."""
+    """Slack/Web adapter 없이 회사 내부 assistant runtime을 조립한다."""
     app_logger = logger or logging.getLogger(__name__)
     provider = str(core_settings.LLM_PROVIDER or "").strip().lower()
 
@@ -247,6 +265,21 @@ def create_company_assistant_runtime(
         provider=provider,
         claude_client=claude_client,
     )
+    provider_answerer = build_company_provider_answerer(
+        provider=provider,
+        claude_client=claude_client,
+    )
+
+    def probe_llm_health() -> bool | None:
+        # ping provider probe도 Slack credential이나 client를 사용하지 않고
+        # 공통 API 프로세스가 가진 provider 설정으로만 실행한다.
+        if provider == "claude":
+            if claude_client is None:
+                return False
+            return bool(_check_claude_health(claude_client).get("ok"))
+        if provider == "ollama":
+            return bool(_check_ollama_health().get("ok"))
+        return None
     get_s3_client = _create_lazy_s3_provider()
     timeout_message = _answer_timeout_message(provider)
     answer_engine = AnswerEngine(
@@ -352,27 +385,65 @@ def create_company_assistant_runtime(
                 provider_ready=provider_ready,
             ),
             request_guard=_guard_read_only_request,
-            # API 프로세스에서만 안전한 DB-only 세부 route를 범용
-            # structured matcher 앞에 둔다. Slack runtime의 기본 graph에는
-            # 주입하지 않아 기존 local/enriched 동작을 보존한다.
+            # 명시적인 device_detail stage에서는 full 보강 route가 먼저
+            # 처리하고, stage가 없는 기존 API 요청은 뒤의 DB-only route로
+            # 내려가 backward compatibility를 유지한다.
             structured_read_routes=(
                 WeeklyRecordingsSummaryAssistantRoute(
+                    logger=app_logger,
+                ),
+                DeviceDetailAssistantRoute(
                     logger=app_logger,
                 ),
                 DeviceDbDetailAssistantRoute(
                     logger=app_logger,
                 ),
             ),
-            # 장비 기본 정보는 DB-only로 제공하고 MDA/SSH 보강과
-            # sshOrder mutation은 Slack의 live 진단 경계에 남긴다.
+            # 기존 운영 도메인 함수를 채널 중립 route로 조립하고,
+            # API가 operations stage를 명시했을 때만 실행한다.
+            operation_routes=(
+                *build_company_operation_routes(
+                    context_max_chars=(
+                        core_settings.THREAD_CONTEXT_MAX_CHARS
+                    ),
+                    logger=app_logger,
+                ),
+            ),
+            freeform_routes=(
+                CompanyLlmHealthAssistantRoute(
+                    probe_llm_health,
+                    logger=app_logger,
+                ),
+                # bot event의 thread root와 본문 의미 판정까지 API가 맡아
+                # remote Slack adapter에는 운세 parser가 남지 않게 한다.
+                CompanyDailyFortuneAssistantRoute(),
+                CompanyTeamFunAssistantRoute(
+                    provider_answerer,
+                    provider_ready=provider_ready,
+                    context_max_chars=max(
+                        1,
+                        core_settings.THREAD_CONTEXT_MAX_CHARS,
+                    ),
+                    logger=app_logger,
+                ),
+                build_company_freeform_route(
+                    provider=provider,
+                    claude_client=claude_client,
+                    provider_ready=provider_ready,
+                    timeout_message=timeout_message,
+                    logger=app_logger,
+                ),
+            ),
+            # 범용 structured fallback은 계속 DB-only로 고정한다. MDA/SSH
+            # 보강은 위의 명시적인 device_detail route에서만 실행된다.
             structured_device_filter_enabled=True,
             structured_device_live_enrichment_enabled=False,
             # 로그 분석은 S3/DB까지만 허용하고 MDA sshOrder와 실제
             # 장비 SSH lifecycle 보강은 Slack local runtime에 남긴다.
             log_analysis_live_enrichment_enabled=False,
-            # 초기 API 전환은 최대 30일 자동 탐색 없이 날짜 지정
-            # 요청만 허용해 S3 호출량과 timeout 범위를 제한한다.
-            log_analysis_explicit_date_required=True,
+            # 날짜가 없으면 domain route가 서버 고정 LOG_PHASE1_MAX_DAYS
+            # 범위까지만 탐색한다. 추가 범위는 needs_input으로 끝낸다.
+            log_analysis_explicit_date_required=False,
         ),
         knowledge_route_factory=build_knowledge_routes,
         logger=app_logger,

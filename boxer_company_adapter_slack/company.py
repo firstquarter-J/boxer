@@ -12,6 +12,7 @@ from boxer_adapter_slack.common import (
     _load_slack_user_name,
     _merge_request_log_metadata,
     _set_request_log_route,
+    _set_request_log_skip_persist,
     _set_request_log_status,
     create_slack_app,
 )
@@ -29,11 +30,18 @@ from boxer_company_adapter_slack.barcode_query_routes import (
     _handle_barcode_query_routes,
 )
 from boxer_company_adapter_slack.assistant_bridge import (
+    assistant_slack_route_name,
     build_company_assistant_request,
+    render_company_assistant_result,
 )
 from boxer_company_adapter_slack.company_api_client import (
+    CompanyApiContractError,
+    CompanyApiClientSettings,
     CompanyAssistantApiClient,
     load_company_api_client_settings,
+)
+from boxer_company_adapter_slack.automation_api_client import (
+    CompanyAutomationApiClient,
 )
 from boxer_company_adapter_slack.company_api_rollout import (
     BoundedShadowRunner,
@@ -45,7 +53,9 @@ from boxer_company_adapter_slack.company_api_rollout import (
     wrap_company_device_db_detail_service,
     wrap_company_device_filter_service,
     wrap_company_device_service,
+    wrap_company_freeform_service,
     wrap_company_notion_service,
+    wrap_company_operations_service,
     wrap_company_playbook_service,
     wrap_company_recording_failure_service,
     wrap_company_structured_service,
@@ -142,6 +152,9 @@ from boxer_company_adapter_slack.device_health_monitor_reporter import (
     _send_device_health_monitor_auto_sms_for_item,
     attach_device_health_monitor_reporter,
 )
+from boxer_company_adapter_slack.device_health_alert_api import (
+    DeviceHealthAlertApiBridge,
+)
 from boxer_company_adapter_slack.device_notification_alert_reporter import (
     attach_device_notification_alert_reporter,
 )
@@ -178,6 +191,19 @@ from boxer_company.assistant import (
     CompanyNotionAssistantRouteDeps,
     CompanyReadOnlyKnowledgeRouteDeps,
     build_company_read_only_knowledge_routes,
+)
+from boxer_company.assistant.knowledge_routes import (
+    match_barcode_evidence_freeform_route,
+)
+from boxer_company.assistant.operations import (
+    OPERATION_CONFIRMATION_REQUIRED_ROUTE,
+    OPERATION_SINGLE_TARGET_REQUIRED_ROUTE,
+    build_operation_confirmation_required_result,
+    build_operation_single_target_required_result,
+    company_operation_route_names,
+    has_device_diagnostic_followup_query,
+    match_company_operation_route,
+    needs_device_file_operation_context,
 )
 from boxer_company import settings as cs
 # 기존 characterization test와 외부 patch 지점만 유지하고 실제 추출은 runtime이 맡는다.
@@ -319,15 +345,161 @@ def _synthesize_retrieval_answer(
     )
 
 
+def _has_enabled_local_data_reporter(
+    *,
+    automation_remote_cycles: tuple[str, ...] = (),
+) -> bool:
+    """Slack 프로세스에서 DB/S3 근거를 직접 읽는 리포터 활성 여부다."""
+
+    # cycle별로 소유권을 바꾸므로 allowlist 밖에 남은 리포터는
+    # 기존 Slack DB·S3·MDA 설정을 계속 요구한다.
+    remote_cycles = frozenset(automation_remote_cycles)
+    return any(
+        (
+            cs.WEEKLY_RECORDINGS_REPORT_ENABLED
+            and "weekly_recordings" not in remote_cycles,
+            cs.DEVICE_HEALTH_MONITOR_ENABLED
+            and "device_health_monitor" not in remote_cycles,
+            cs.DEVICE_NOTIFICATION_ALERT_ENABLED
+            and "device_notification_alert" not in remote_cycles,
+            cs.DAILY_DEVICE_ROUND_ENABLED
+            and "daily_device_round" not in remote_cycles,
+        )
+    )
+
+
+def _validate_automation_sms_cycle_ownership(
+    settings: CompanyApiClientSettings,
+) -> None:
+    """Solapi outbox producer와 consumer가 다른 프로세스로 갈라지지 않게 한다."""
+
+    remote_cycles = (
+        frozenset(settings.automation_remote_cycles)
+        if settings.automation_mode == "remote"
+        else frozenset()
+    )
+    enabled_producers = (
+        (
+            "device_health_monitor",
+            bool(cs.DEVICE_HEALTH_MONITOR_ENABLED),
+        ),
+        (
+            "device_notification_alert",
+            bool(cs.DEVICE_NOTIFICATION_ALERT_ENABLED),
+        ),
+    )
+    has_local_producer = any(
+        enabled and cycle not in remote_cycles
+        for cycle, enabled in enabled_producers
+    )
+    has_remote_producer = any(
+        enabled and cycle in remote_cycles
+        for cycle, enabled in enabled_producers
+    )
+    sms_delivery_remote = "sms_delivery" in remote_cycles
+    manual_api_solapi_producer = bool(
+        settings.operations_mode == "remote"
+        and any(enabled for _cycle, enabled in enabled_producers)
+        and str(cs.DEVICE_HEALTH_MONITOR_SMS_PROVIDER or "")
+        .strip()
+        .lower()
+        == "solapi"
+    )
+
+    # local producer가 Slack 상태에 기록한 delivery를 API outbox
+    # consumer가 볼 수 없으므로 혼합 소유권을 기동 전에 차단한다.
+    if has_local_producer and sms_delivery_remote:
+        raise CompanyApiContractError(
+            "company_api_remote_sms_with_local_producer_unsafe"
+        )
+    if (
+        has_remote_producer
+        and cs.SMS_DELIVERY_REPORTER_ENABLED
+        and not sms_delivery_remote
+    ):
+        raise CompanyApiContractError(
+            "company_api_remote_sms_producer_without_consumer_unsafe"
+        )
+    if manual_api_solapi_producer and (
+        has_local_producer
+        or not cs.SMS_DELIVERY_REPORTER_ENABLED
+        or not sms_delivery_remote
+    ):
+        # operations remote의 수동 문자도 API outbox producer다. 로컬 자동
+        # producer와 공존하거나 API SMS drain이 없으면 어느 한쪽 receipt가
+        # 영구 고립되므로 source cycle과 consumer를 함께 넘긴다.
+        raise CompanyApiContractError(
+            "company_api_remote_action_sms_ownership_unsafe"
+        )
+
+
 def create_app() -> App:
     _validate_ec2_runtime_aws_env()
-    _validate_tokens(include_llm=True, include_data_sources=True)
     app_logger = logging.getLogger(__name__)
-    base_access_runtime = build_slack_base_access_runtime(logger=app_logger)
     company_api_settings = load_company_api_client_settings()
+    _validate_automation_sms_cycle_ownership(company_api_settings)
+    transport_only_remote = company_api_settings.transport_only_remote
+    local_llm_required = not transport_only_remote
+    local_data_sources_required = (
+        not transport_only_remote
+        or _has_enabled_local_data_reporter(
+            automation_remote_cycles=(
+                company_api_settings.automation_remote_cycles
+            ),
+        )
+    )
+    _validate_tokens(
+        include_llm=local_llm_required,
+        include_data_sources=local_data_sources_required,
+    )
+    base_access_runtime = build_slack_base_access_runtime(logger=app_logger)
     company_api_client = (
         CompanyAssistantApiClient(company_api_settings)
         if company_api_settings.enabled
+        else None
+    )
+    automation_api_client = (
+        CompanyAutomationApiClient(
+            company_api_settings,
+            logger=app_logger,
+        )
+        if company_api_settings.automation_mode == "remote"
+        else None
+    )
+
+    def _automation_client_for_cycle(
+        cycle: str,
+    ) -> CompanyAutomationApiClient | None:
+        """allowlist에 명시된 cycle에만 remote transport를 주입한다."""
+
+        if (
+            automation_api_client is not None
+            and company_api_settings.is_automation_cycle_remote(cycle)
+        ):
+            return automation_api_client
+        return None
+
+    weekly_automation_client = _automation_client_for_cycle(
+        "weekly_recordings"
+    )
+    daily_automation_client = _automation_client_for_cycle(
+        "daily_device_round"
+    )
+    health_automation_client = _automation_client_for_cycle(
+        "device_health_monitor"
+    )
+    notification_automation_client = _automation_client_for_cycle(
+        "device_notification_alert"
+    )
+    sms_delivery_automation_client = _automation_client_for_cycle(
+        "sms_delivery"
+    )
+    device_health_alert_api_bridge = (
+        DeviceHealthAlertApiBridge(company_api_client)
+        if (
+            company_api_client is not None
+            and company_api_settings.operations_mode == "remote"
+        )
         else None
     )
     company_api_shadow_runner = (
@@ -335,6 +507,153 @@ def create_app() -> App:
         if company_api_settings.shadow_enabled
         else None
     )
+
+    def _remote_ping_health(payload: MentionPayload) -> bool | None:
+        """remote freeform 소유권에서는 provider probe도 공통 API에서 읽는다."""
+
+        if company_api_client is None:
+            raise CompanyApiContractError("company_api_client_not_configured")
+        request = build_company_assistant_request(payload)
+        result = company_api_client.answer(request, route_group="health")
+        if (
+            result.route != "company_llm_health"
+            or result.outcome != "answered"
+            or result.used_llm
+            or len(result.messages) != 1
+            or result.sources
+            or result.messages[0].delivery_scope != "conversation"
+            or result.messages[0].mention_actor
+            or result.messages[0].private_links
+        ):
+            raise CompanyApiContractError("company_api_health_result_invalid")
+        status = str(result.messages[0].body or "").strip()
+        if status == "available":
+            return True
+        if status == "unavailable":
+            return False
+        if status == "unconfigured":
+            return None
+        raise CompanyApiContractError("company_api_health_result_invalid")
+
+    def _remote_fun_reply(
+        payload: Any,
+        raw_text: str,
+        thread_context: str,
+        speaker_user_id: str,
+    ) -> tuple[str, str, bool]:
+        """Slack context만 직렬화하고 fun 생성 자체는 공통 API에 맡긴다."""
+
+        if company_api_client is None:
+            raise CompanyApiContractError("company_api_client_not_configured")
+        if speaker_user_id != str(payload.get("user_id") or "").strip():
+            raise CompanyApiContractError("company_api_fun_actor_invalid")
+        request_payload = dict(payload)
+        request_payload["question"] = raw_text
+        context_entries: tuple[ContextEntry, ...] = (
+            (
+                {
+                    "kind": "message",
+                    "source": "slack",
+                    "text": thread_context,
+                },
+            )
+            if thread_context
+            else ()
+        )
+        request = build_company_assistant_request(
+            request_payload,
+            context_entries=context_entries,
+        )
+        result = company_api_client.answer(request, route_group="fun")
+        if (
+            result.route != "company_team_fun"
+            or result.outcome != "answered"
+            or not result.used_llm
+            or len(result.messages) != 1
+            or result.sources
+            or result.messages[0].delivery_scope != "conversation"
+            or result.messages[0].private_links
+        ):
+            raise CompanyApiContractError("company_api_fun_result_invalid")
+        body = str(result.messages[0].body or "").strip()
+        if not body:
+            raise CompanyApiContractError("company_api_fun_result_invalid")
+        return body, "company_api", True
+
+    def _remote_fortune_reply(
+        payload: Any,
+        raw_text: str,
+        thread_root_text: str,
+        speaker_user_id: str,
+    ) -> str | None:
+        """bot event 문맥만 보내고 운세 의미 판정과 조립은 API에 맡긴다."""
+
+        if company_api_client is None:
+            raise CompanyApiContractError("company_api_client_not_configured")
+        expected_bot_actor_id = str(
+            payload.get("user_id")
+            or payload.get("bot_user_id")
+            or payload.get("bot_id")
+            or payload.get("app_id")
+            or ""
+        ).strip()
+        if (
+            not speaker_user_id
+            or speaker_user_id != expected_bot_actor_id
+        ):
+            raise CompanyApiContractError("company_api_fun_actor_invalid")
+        request_payload = dict(payload)
+        request_payload["question"] = raw_text
+        # Slack bot event에는 user가 없을 수 있어 bot_user_id를 서버가 검증할
+        # non-null actor로 승격하되, payload 밖 값을 받아들이지는 않는다.
+        request_payload["user_id"] = speaker_user_id
+        context_entries: tuple[ContextEntry, ...] = (
+            (
+                {
+                    "kind": "message",
+                    "source": "slack",
+                    "text": thread_root_text,
+                },
+            )
+            if thread_root_text
+            else ()
+        )
+        request = build_company_assistant_request(
+            request_payload,
+            context_entries=context_entries,
+        )
+        result = company_api_client.answer(request, route_group="fun")
+
+        if (
+            result.route == "unhandled"
+            and result.outcome == "no_evidence"
+            and not result.used_llm
+            and result.fallback_reason == "no_matching_route"
+            and len(result.messages) == 1
+            and not result.sources
+            and result.messages[0].delivery_scope == "conversation"
+            and result.messages[0].mention_actor
+            and not result.messages[0].private_links
+        ):
+            # 같은 채널의 다른 bot thread는 API의 no-match를 그대로 무응답 처리한다.
+            return None
+        if (
+            result.route != "company_daily_fortune"
+            or result.outcome != "answered"
+            or result.used_llm
+            or result.fallback_reason is not None
+            or len(result.messages) != 1
+            or result.sources
+            or result.messages[0].delivery_scope != "conversation"
+            or result.messages[0].mention_actor
+            or result.messages[0].private_links
+        ):
+            raise CompanyApiContractError("company_api_fortune_result_invalid")
+        body = str(result.messages[0].body or "").strip()
+        if not body:
+            raise CompanyApiContractError("company_api_fortune_result_invalid")
+        return body
+
     app_logger.info(
         "Company API rollout configured "
         "notion_mode=%s notion_local_fallback=%s "
@@ -348,7 +667,10 @@ def create_app() -> App:
         "barcode_residual_mode=%s barcode_residual_local_fallback=%s "
         "barcode_timeline_mode=%s barcode_timeline_local_fallback=%s "
         "playbook_mode=%s playbook_local_fallback=%s "
-        "barcode_freeform_mode=%s barcode_freeform_local_fallback=%s",
+        "barcode_freeform_mode=%s barcode_freeform_local_fallback=%s "
+        "freeform_mode=%s freeform_local_fallback=%s "
+        "operations_mode=%s operations_local_fallback=%s "
+        "automation_mode=%s automation_local_fallback=%s",
         company_api_settings.notion_mode,
         company_api_settings.notion_fallback_enabled,
         company_api_settings.structured_mode,
@@ -373,9 +695,22 @@ def create_app() -> App:
         company_api_settings.playbook_fallback_enabled,
         company_api_settings.barcode_freeform_mode,
         company_api_settings.barcode_freeform_fallback_enabled,
+        company_api_settings.freeform_mode,
+        company_api_settings.freeform_fallback_enabled,
+        company_api_settings.operations_mode,
+        company_api_settings.operations_fallback_enabled,
+        company_api_settings.automation_mode,
+        company_api_settings.automation_fallback_enabled,
+    )
+    # 완전 remote 상태에서는 provider 이름조차 local AnswerEngine에 넣지
+    # 않아 Slack 프로세스가 LLM client나 health probe를 소유하지 않는다.
+    local_answer_provider = (
+        (s.LLM_PROVIDER or "").lower().strip()
+        if local_llm_required
+        else ""
     )
     claude_client = None
-    if s.LLM_PROVIDER == "claude":
+    if local_answer_provider == "claude":
         try:
             claude_client = _build_claude_client(timeout_sec=s.ANTHROPIC_TIMEOUT_SEC)
         except Exception:
@@ -406,7 +741,7 @@ def create_app() -> App:
         return health
 
     def _is_answer_provider_ready() -> bool:
-        provider = (s.LLM_PROVIDER or "").lower().strip()
+        provider = local_answer_provider
         if provider == "claude":
             return claude_client is not None
         if provider == "ollama":
@@ -414,7 +749,7 @@ def create_app() -> App:
         return False
 
     def _answer_timeout_reply_text() -> str:
-        provider = (s.LLM_PROVIDER or "").lower().strip()
+        provider = local_answer_provider
         if provider == "claude":
             timeout_sec = max(1, s.ANTHROPIC_TIMEOUT_SEC)
             return f"AI API가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
@@ -422,7 +757,7 @@ def create_app() -> App:
         return f"LLM 서버가 {timeout_sec}초 내 응답하지 않아 AI 답변 생성이 타임아웃됐어"
 
     company_answer_engine = AnswerEngine(
-        provider=s.LLM_PROVIDER,
+        provider=local_answer_provider,
         provider_client=claude_client,
         synthesize=_synthesize_retrieval_answer,
         logger=app_logger,
@@ -472,19 +807,23 @@ def create_app() -> App:
             device_name=device_name,
         ):
             return False
-        provider = (s.LLM_PROVIDER or "").lower().strip()
+        provider = local_answer_provider
         if (
             not s.LLM_SYNTHESIS_ENABLED
             or provider not in {"claude", "ollama"}
         ):
             return False
-        return _is_answer_provider_ready()
+        return (
+            _is_answer_provider_ready()
+            and match_barcode_evidence_freeform_route(request)
+            == "barcode_evidence_freeform"
+        )
 
     def _build_read_only_knowledge_routes(
         recordings,
         composer,
     ):
-        provider = (s.LLM_PROVIDER or "").lower().strip()
+        provider = local_answer_provider
         return build_company_read_only_knowledge_routes(
             recordings,
             composer,
@@ -601,7 +940,28 @@ def create_app() -> App:
 
         if "ping" in text:
             _set_request_log_route(payload, "ping")
-            provider = (s.LLM_PROVIDER or "").lower().strip()
+            if company_api_settings.freeform_mode == "remote":
+                try:
+                    health_ok = _remote_ping_health(payload)
+                except Exception as exc:
+                    # remote 전환 뒤 API 장애를 Slack-local provider probe로
+                    # 우회하지 않고 안전한 불가 상태로만 응답한다.
+                    logger.warning(
+                        "Company API ping health failed thread_ts=%s error_type=%s",
+                        thread_ts,
+                        type(exc).__name__,
+                    )
+                    health_ok = False
+                reply(
+                    f"🏓 pong\n• llm: {_format_ping_llm_status(health_ok)}"
+                )
+                logger.info(
+                    "Responded with remote ping health in thread_ts=%s ok=%s",
+                    thread_ts,
+                    health_ok,
+                )
+                return
+            provider = local_answer_provider
             if provider == "ollama":
                 health = _get_ollama_health()
                 reply(f"🏓 pong\n• llm: {_format_ping_llm_status(bool(health['ok']))}")
@@ -636,7 +996,7 @@ def create_app() -> App:
             return _answer_timeout_reply_text()
 
         def _llm_unavailable_reply_text(summary: str | None = None) -> str:
-            provider = (s.LLM_PROVIDER or "").lower().strip()
+            provider = local_answer_provider
             if provider == "claude":
                 base = "AI API가 응답하지 않아 지금은 AI 답변을 생성할 수 없어"
             else:
@@ -879,7 +1239,7 @@ def create_app() -> App:
                 )
                 return
 
-            provider = (s.LLM_PROVIDER or "").lower().strip()
+            provider = local_answer_provider
             if not s.LLM_SYNTHESIS_ENABLED or not question:
                 reply(fallback_with_references)
                 logger.info("Responded with %s (direct)", route_name)
@@ -985,6 +1345,89 @@ def create_app() -> App:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
                 reply(fallback_with_references)
 
+        # remote operations에서는 Slack이 실행하지 않고 질문·thread 문맥만
+        # 공통 API로 넘긴다. API 실패나 timeout 뒤에는 같은 작업을 local로
+        # 다시 실행하지 않아 장비 명령·복원·학습의 중복 실행을 막는다.
+        operation_context_entries: tuple[ContextEntry, ...] = ()
+        if (
+            has_device_diagnostic_followup_query(question)
+            or needs_device_file_operation_context(question)
+        ):
+            # 후속 질문 후보일 때만 bounded thread context를 읽고, 앞선
+            # 진단 시작 힌트가 없으면 matcher가 operations로 보내지 않는다.
+            operation_context_entries = _get_assistant_context_entries()
+        operation_probe_request = build_company_assistant_request(
+            payload,
+            context_entries=operation_context_entries,
+        )
+        operation_route = match_company_operation_route(
+            operation_probe_request
+        )
+        if operation_route in {
+            OPERATION_CONFIRMATION_REQUIRED_ROUTE,
+            OPERATION_SINGLE_TARGET_REQUIRED_ROUTE,
+        }:
+            # mode와 무관하게 질문형 mutation과 불명확한 target을 여기서
+            # 종결해 API와 기존 Slack local handler 어느 쪽도 실행하지 않는다.
+            guarded_result = (
+                build_operation_single_target_required_result()
+                if operation_route == OPERATION_SINGLE_TARGET_REQUIRED_ROUTE
+                else build_operation_confirmation_required_result()
+            )
+            _set_request_log_route(
+                payload,
+                guarded_result.route,
+                handler_type="router",
+            )
+            _set_request_log_status(payload, guarded_result.outcome)
+            render_company_assistant_result(
+                guarded_result,
+                reply=reply,
+                actor_id=user_id,
+                client=client,
+                logger=logger,
+            )
+            return
+        if (
+            operation_route is not None
+            and company_api_settings.operations_mode == "remote"
+        ):
+            if operation_route == "thread_playbook_learning":
+                operation_context_entries = _get_assistant_context_entries()
+            operation_request = build_company_assistant_request(
+                payload,
+                context_entries=operation_context_entries,
+            )
+            operation_service = wrap_company_operations_service(
+                CompanyAssistantService(()),
+                company_api_settings,
+                company_api_client,
+                logger,
+                match_company_operation_route,
+                company_operation_route_names(),
+                shadow_runner=company_api_shadow_runner,
+            )
+            operation_result = operation_service.answer(operation_request)
+            if operation_result is not None:
+                # PII·SQL·복구·장비 변경 원문은 API 감사 DB가 마스킹해
+                # 소유하므로 Slack 로컬 request-log에 중복 저장하지 않는다.
+                _set_request_log_skip_persist(payload, True)
+                _set_request_log_route(
+                    payload,
+                    assistant_slack_route_name(operation_result.route),
+                    handler_type="company_api",
+                    route_mode="remote",
+                )
+                _set_request_log_status(payload, operation_result.outcome)
+                render_company_assistant_result(
+                    operation_result,
+                    reply=reply,
+                    actor_id=user_id,
+                    client=client,
+                    logger=logger,
+                )
+                return
+
         if _handle_thread_learning_routes(
             ThreadLearningRoutesContext(
                 question=question,
@@ -1012,6 +1455,10 @@ def create_app() -> App:
                 reply=reply,
                 client=client,
                 logger=logger,
+                api_client=company_api_client,
+                operations_remote=(
+                    company_api_settings.operations_mode == "remote"
+                ),
             )
         ):
             return
@@ -1138,6 +1585,9 @@ def create_app() -> App:
                 send_dm_message=_send_dm_message,
                 build_dependency_failure_reply=_build_dependency_failure_reply,
                 reply_with_retrieval_synthesis=_reply_with_retrieval_synthesis,
+                automation_remote=(
+                    company_api_settings.automation_mode == "remote"
+                ),
             ),
         ):
             return
@@ -1245,9 +1695,10 @@ def create_app() -> App:
         ):
             return
 
-        # 기존 네 종류 DB route에 장비 개수·존재와 DB-only 상세,
-        # 사용자 요청형 주간 요약을 독립 rollout으로 더한다. 실시간 상태와
-        # MDA/SSH enrichment는 계속 Slack local 경로에 남긴다.
+        # 기존 네 종류 DB route에 장비 개수·존재와 live-enriched 장비 필터,
+        # 사용자 요청형 주간 요약을 독립 rollout으로 더한다. 비-count 장비
+        # 조회는 remote에서 공통 API turn 한 번으로 처리하고, 명시적 상태
+        # 점검·PM2·복구 같은 operation은 앞선 공통 API gateway가 처리한다.
         structured_assistant_service = wrap_company_structured_service(
             assistant_turn.service_for_stage("structured"),
             company_api_settings,
@@ -1375,12 +1826,14 @@ def create_app() -> App:
             len(knowledge_routes),
         )
         knowledge_precedence_service = CompanyAssistantService(
-            knowledge_routes[:playbook_route_index]
+            ()
+            if company_api_settings.operations_mode == "remote"
+            else knowledge_routes[:playbook_route_index]
         )
         # Slack thread 수집과 최종 렌더링은 adapter에 남기고, 운영
         # 플레이북 조회·근거 합성만 독립 API rollout 경계로 감싼다.
-        # 앞선 진단 snapshot route는 Slack 프로세스 메모리를 쓰므로
-        # API 호출 전에 같은 우선순위로 먼저 판정한다.
+        # operations remote에서는 진단 snapshot도 API 프로세스가 소유하므로
+        # Slack-local snapshot/LLM precedence를 비워 로컬 실행 누수를 막는다.
         knowledge_assistant_service = wrap_company_playbook_service(
             knowledge_turn.service_for_stage("knowledge"),
             company_api_settings,
@@ -1400,6 +1853,15 @@ def create_app() -> App:
                 shadow_runner=company_api_shadow_runner,
                 precedence_service=knowledge_precedence_service,
             )
+        )
+        # 모든 전용 knowledge route가 답하지 않았을 때만 일반 대화를
+        # freeform stage로 보내고, local mode에서는 기존 Slack LLM 흐름을 유지한다.
+        knowledge_assistant_service = wrap_company_freeform_service(
+            knowledge_assistant_service,
+            company_api_settings,
+            company_api_client,
+            logger,
+            shadow_runner=company_api_shadow_runner,
         )
         if _handle_knowledge_routes(
             KnowledgeRoutesContext(
@@ -1442,6 +1904,10 @@ def create_app() -> App:
                 reply=reply,
                 client=client,
                 logger=logger,
+                api_client=company_api_client,
+                operations_remote=(
+                    company_api_settings.operations_mode == "remote"
+                ),
             )
         ):
             return
@@ -1462,21 +1928,66 @@ def create_app() -> App:
             client,
             logger,
             claude_client=claude_client,
+            remote_reply_generator=(
+                (
+                    lambda raw_text, thread_context, speaker_user_id: (
+                        _remote_fun_reply(
+                            payload,
+                            raw_text,
+                            thread_context,
+                            speaker_user_id,
+                        )
+                    )
+                )
+                if company_api_settings.freeform_mode == "remote"
+                else None
+            ),
+            remote_fortune_reply_generator=(
+                (
+                    lambda raw_text, thread_root_text, speaker_user_id: (
+                        _remote_fortune_reply(
+                            payload,
+                            raw_text,
+                            thread_root_text,
+                            speaker_user_id,
+                        )
+                    )
+                )
+                if company_api_settings.freeform_mode == "remote"
+                else None
+            ),
         )
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
     attach_hpa_change_reporter(app, hpa_change_runtime, logger=app_logger)
-    attach_weekly_recordings_reporter(app, logger=app_logger)
+    attach_weekly_recordings_reporter(
+        app,
+        logger=app_logger,
+        automation_client=weekly_automation_client,
+    )
     attach_device_health_monitor_reporter(
         app,
         logger=app_logger,
         base_access_checker=base_access_runtime.is_allowed,
+        action_api_bridge=device_health_alert_api_bridge,
+        automation_client=health_automation_client,
+        notification_automation_client=notification_automation_client,
+        sms_delivery_automation_client=sms_delivery_automation_client,
     )
     # 실시간 장비 이벤트도 상태 모니터와 같은 번호 판정·공급자·감사 로그 경로를 사용한다.
     attach_device_notification_alert_reporter(
         app,
         logger=app_logger,
-        auto_sms_sender=_send_device_health_monitor_auto_sms_for_item,
+        auto_sms_sender=(
+            _send_device_health_monitor_auto_sms_for_item
+            if notification_automation_client is None
+            else None
+        ),
+        automation_client=notification_automation_client,
     )
-    attach_daily_device_round_reporter(app, logger=app_logger)
+    attach_daily_device_round_reporter(
+        app,
+        logger=app_logger,
+        automation_client=daily_automation_client,
+    )
     return app

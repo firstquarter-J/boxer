@@ -16,6 +16,7 @@ from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
     _build_daily_device_round_issue_summary,
+    _build_daily_device_round_summary_lines,
     _build_daily_device_round_summary,
     _coerce_daily_device_round_hospital_seqs,
     _coerce_daily_device_round_now,
@@ -27,6 +28,16 @@ from boxer_company.daily_device_round import (
     _format_daily_device_round_report,
     _normalize_daily_device_round_hospital_order,
     _normalize_daily_device_round_hospital_scope,
+)
+from boxer_company_adapter_slack.automation_api_client import (
+    CompanyAutomationApiClient,
+)
+from boxer_company_adapter_slack.automation_reporter import (
+    AutomationSlackDelivery,
+    build_automation_delivery_client_msg_id,
+    build_automation_request_id,
+    flush_automation_deliveries,
+    remember_automation_delivery,
 )
 
 _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
@@ -1444,6 +1455,7 @@ def _post_daily_device_round_abnormal_alert(
     include_blocks: bool = False,
     include_actions: bool = False,
     include_device_voice_action: bool = True,
+    client_msg_id: str = "",
 ) -> dict[str, str] | None:
     if not _daily_device_round_has_abnormal_result(report_summary):
         return
@@ -1470,6 +1482,8 @@ def _post_daily_device_round_abnormal_alert(
                 include_actions=include_actions,
                 include_device_voice_action=include_device_voice_action,
             )
+        if client_msg_id:
+            message_kwargs["client_msg_id"] = client_msg_id
         response = client.chat_postMessage(**message_kwargs)
         posted_message_ts = _extract_daily_device_round_thread_ts(response)
         posted_permalink = _load_daily_device_round_message_permalink(
@@ -1508,13 +1522,17 @@ def _run_daily_device_round_if_due(
     logger: logging.Logger,
     *,
     now: datetime | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
 ) -> bool:
     if not cs.DAILY_DEVICE_ROUND_ENABLED:
         return False
-    if not s.DB_QUERY_ENABLED:
+    if automation_client is None and not s.DB_QUERY_ENABLED:
         logger.warning("일일 장비 순회를 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
-    if not _is_daily_device_round_runtime_configured():
+    if (
+        automation_client is None
+        and not _is_daily_device_round_runtime_configured()
+    ):
         logger.warning("일일 장비 순회를 켤 수 없어. MDA/SSH 설정이 부족해")
         return False
 
@@ -1526,6 +1544,15 @@ def _run_daily_device_round_if_due(
     local_now = _coerce_daily_device_round_now(now)
     raw_state = _load_daily_device_round_state(logger=logger)
     state = _normalize_daily_device_round_state(raw_state, now=local_now)
+    if automation_client is not None:
+        return _run_daily_device_round_remote(
+            client,
+            logger,
+            automation_client=automation_client,
+            local_now=local_now,
+            state=state,
+            channel_id=channel_id,
+        )
     if not _is_daily_device_round_due(local_now, state):
         return False
 
@@ -1757,6 +1784,508 @@ def _run_daily_device_round_if_due(
     return True
 
 
+def _run_daily_device_round_remote(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    automation_client: CompanyAutomationApiClient,
+    local_now: datetime,
+    state: dict[str, Any],
+    channel_id: str,
+) -> bool:
+    """일정·Slack thread만 관리하고 장비 순회 실행은 API에 위임한다."""
+
+    window_key = _daily_device_round_window_key(local_now)
+    if window_key is None:
+        return False
+    cycle_key = f"daily:{window_key}"
+    # remote mutation 옵션은 Slack 저장 override가 아니라 API EC2와 같은
+    # company env 네 값을 전송하고 API가 다시 exact-match 검증한다.
+    options = {
+        "autoUpdateAgent": bool(
+            cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT
+        ),
+        "autoUpdateBoxFree": bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE),
+        "autoUpdateBoxPaid": bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID),
+        "autoCleanupTrashCan": bool(
+            cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN
+        ),
+        "autoPowerOff": bool(cs.DAILY_DEVICE_ROUND_AUTO_POWER_OFF),
+    }
+    if flush_automation_deliveries(
+        automation_client,
+        cycle="daily_device_round",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+        options=options,
+        logger=logger,
+    ):
+        return False
+    if not _is_daily_device_round_due(local_now, state):
+        return False
+
+    request_id = build_automation_request_id(
+        cycle="daily_device_round",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+    )
+    result = automation_client.run(
+        request_id=request_id,
+        cycle="daily_device_round",
+        cycle_key=cycle_key,
+        scheduled_at=local_now,
+        options=options,
+    )
+    if not result.deliveries:
+        # API가 더 처리할 병원이 없다고 확정한 뒤에만 local scheduler
+        # window를 닫는다. 도메인 cursor 자체는 Slack에 복사하지 않는다.
+        completed_state = {
+            **state,
+            "windowKey": window_key,
+            "windowCompletedAt": local_now.isoformat(),
+            "lastRunDate": local_now.date().isoformat(),
+            "channelId": channel_id,
+        }
+        _persist_daily_device_round_state(
+            completed_state,
+            now=local_now,
+            logger=logger,
+            preserve_latest_auto_update_controls=True,
+        )
+        return False
+    if len(result.deliveries) != 1 or (
+        result.deliveries[0].kind != "daily_device_round_report"
+    ):
+        raise RuntimeError("일일 장비 순회 API delivery 계약이 올바르지 않아")
+
+    delivery = result.deliveries[0]
+    report_summary = _validate_remote_daily_device_round_presentation(
+        delivery.payload
+    )
+    thread_ts = str(state.get("windowThreadTs") or "").strip()
+    thread_channel_id = str(
+        state.get("windowThreadChannelId") or ""
+    ).strip()
+    if not thread_ts or thread_channel_id != channel_id:
+        title_response = client.chat_postMessage(
+            channel=channel_id,
+            text=_build_daily_device_round_window_title_text(local_now),
+            unfurl_links=False,
+            unfurl_media=False,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle="daily_device_round",
+                cycle_key=cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="title",
+            ),
+        )
+        thread_ts = _extract_daily_device_round_thread_ts(title_response)
+        if not thread_ts:
+            raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+        thread_channel_id = channel_id
+        state = {
+            **state,
+            "windowKey": window_key,
+            "windowThreadTs": thread_ts,
+            "windowThreadChannelId": thread_channel_id,
+            "channelId": channel_id,
+        }
+        state = _persist_daily_device_round_state(
+            state,
+            now=local_now,
+            logger=logger,
+            preserve_latest_auto_update_controls=True,
+        )
+
+    message_text = _build_daily_device_round_report_text(
+        report_summary,
+        now=local_now,
+    )
+    message_blocks = _build_remote_daily_device_round_blocks(
+        report_summary,
+        now=local_now,
+    )
+    message_block_chunks = _split_daily_device_round_blocks(message_blocks)
+    last_message_ts = ""
+    try:
+        for index, block_chunk in enumerate(message_block_chunks):
+            response = client.chat_postMessage(
+                channel=channel_id,
+                text=_build_daily_device_round_chunk_text(
+                    message_text,
+                    chunk_index=index,
+                    chunk_count=len(message_block_chunks),
+                ),
+                blocks=block_chunk,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+                client_msg_id=build_automation_delivery_client_msg_id(
+                    cycle="daily_device_round",
+                    cycle_key=cycle_key,
+                    delivery_id=delivery.delivery_id,
+                    part=f"chunk:{index}",
+                ),
+            )
+            last_message_ts = (
+                _extract_daily_device_round_thread_ts(response)
+                or last_message_ts
+            )
+    except Exception:
+        logger.warning(
+            "Remote daily device round block delivery failed; pending "
+            "delivery will resume with stable client_msg_id channel=%s",
+            channel_id,
+            exc_info=True,
+        )
+        raise
+
+    remember_automation_delivery(
+        cycle="daily_device_round",
+        cycle_key=cycle_key,
+        delivery=AutomationSlackDelivery(
+            delivery_id=delivery.delivery_id,
+            external_message_id=last_message_ts or thread_ts,
+            permalink="",
+            delivered_at=local_now,
+        ),
+    )
+    next_state = {
+        **state,
+        "windowKey": window_key,
+        "windowThreadTs": thread_ts,
+        "windowThreadChannelId": thread_channel_id,
+        "windowCompletedAt": "",
+        "lastRunDate": local_now.date().isoformat(),
+        "lastHospitalSeq": report_summary.get("hospitalSeq"),
+        "lastHospitalName": report_summary.get("hospitalName"),
+        "lastSentAt": local_now.isoformat(),
+        "channelId": channel_id,
+    }
+    _persist_daily_device_round_state(
+        next_state,
+        now=local_now,
+        logger=logger,
+        preserve_latest_auto_update_controls=True,
+    )
+    logger.info(
+        "Posted remote daily device round channel=%s hospitalSeq=%s",
+        channel_id,
+        report_summary.get("hospitalSeq"),
+    )
+    return True
+
+
+def _validate_remote_daily_device_round_presentation(
+    payload: Any,
+) -> dict[str, Any]:
+    """API presentation DTO 외 실행용 필드가 Slack renderer에 못 들어오게 한다."""
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+    allowed_top_level = {
+        "runDate",
+        "hospitalSeq",
+        "hospitalName",
+        "deviceCount",
+        "scheduledDeviceCount",
+        "statusCounts",
+        "updateCounts",
+        "cleanupCounts",
+        "powerCounts",
+        "summaryLine",
+        "deviceResults",
+    }
+    if set(payload) != allowed_top_level:
+        raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+    devices = payload.get("deviceResults")
+    if not isinstance(devices, list):
+        raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+    allowed_device_fields = {
+        "deviceName",
+        "roomName",
+        "overallLabel",
+        "networkUnavailable",
+        "issueSummary",
+        "storage",
+        "cleanup",
+        "agentUpdate",
+        "boxUpdate",
+        "power",
+    }
+    allowed_storage_fields = {
+        "label",
+        "filesystemUsedPercent",
+        "filesystemAvailableBytes",
+        "filesystemSizeBytes",
+        "directorySizeBytes",
+        "directorySharePercent",
+        "fileCount",
+        "expiredFileCount",
+        "cleanupAgeDays",
+    }
+    allowed_action_fields = {
+        "visible",
+        "actionable",
+        "statusKind",
+        "label",
+        "summary",
+    }
+    for item in devices:
+        if not isinstance(item, dict) or set(item) != allowed_device_fields:
+            raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+        if not all(
+            isinstance(item.get(key), dict)
+            for key in ("storage", "cleanup", "agentUpdate", "boxUpdate", "power")
+        ):
+            raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+        storage = item["storage"]
+        if "label" not in storage or set(storage) - allowed_storage_fields:
+            raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+        for key in ("cleanup", "agentUpdate", "boxUpdate", "power"):
+            if set(item[key]) - allowed_action_fields:
+                raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
+    return dict(payload)
+
+
+def _format_remote_daily_device_round_report(
+    report_summary: dict[str, Any],
+    *,
+    now: datetime,
+) -> str:
+    """명시적 presentation DTO만 사용해 text fallback을 만든다."""
+
+    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
+    hospital_label = _format_daily_device_round_hospital_label(
+        report_summary.get("hospitalName"),
+        hospital_seq,
+    )
+    lines = [
+        f"*{hospital_label}*",
+        f"• 실행: `{now:%Y-%m-%d %H:%M:%S} KST`",
+        f"• 장비: `{int(report_summary.get('deviceCount') or 0)}대`",
+    ]
+    if hospital_seq is None:
+        lines.append(
+            f"• 결과: {_display_value(report_summary.get('summaryLine'), default='점검 대상 병원이 없어')}"
+        )
+        return "\n".join(lines)
+    lines.extend(_build_daily_device_round_summary_lines(report_summary))
+    devices = [
+        item
+        for item in report_summary.get("deviceResults", [])
+        if isinstance(item, dict)
+        and _is_remote_daily_device_actionable(item)
+    ]
+    if not devices:
+        lines.append("• 결과: 확인하거나 작업한 장비가 없어")
+        return "\n".join(lines)
+    lines.extend(("", "*확인/작업 장비*"))
+    for item in devices:
+        lines.extend(("", _build_remote_daily_device_line(item)))
+    return "\n".join(lines)
+
+
+def _build_remote_daily_device_round_blocks(
+    report_summary: dict[str, Any],
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """raw SSH/action 구조를 모르는 Slack presentation renderer다."""
+
+    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
+    hospital_label = _format_daily_device_round_hospital_label(
+        report_summary.get("hospitalName"),
+        hospital_seq,
+    )
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": hospital_label,
+            },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"발송 `{now:%Y-%m-%d %H:%M:%S} KST` | "
+                        f"장비 `{int(report_summary.get('deviceCount') or 0)}대`"
+                    ),
+                }
+            ],
+        },
+    ]
+    if hospital_seq is None:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*결과*\n"
+                        + _display_value(
+                            report_summary.get("summaryLine"),
+                            default="점검 대상 병원이 없어",
+                        )
+                    ),
+                },
+            }
+        )
+        return blocks
+    blocks.append(_build_daily_device_round_summary_rich_text_block_safe(report_summary))
+    devices = [
+        item
+        for item in report_summary.get("deviceResults", [])
+        if isinstance(item, dict)
+        and _is_remote_daily_device_actionable(item)
+    ]
+    if not devices:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*결과*\n확인하거나 작업한 장비가 없어",
+                },
+            }
+        )
+        return blocks
+    blocks.append({"type": "divider"})
+    blocks.extend(
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _build_remote_daily_device_line(item),
+            },
+        }
+        for item in devices
+    )
+    return blocks
+
+
+def _build_daily_device_round_summary_rich_text_block_safe(
+    report_summary: dict[str, Any],
+) -> dict[str, Any]:
+    items = []
+    for line in _build_daily_device_round_summary_lines(report_summary):
+        items.append(
+            {
+                "type": "rich_text_section",
+                "elements": [
+                    {
+                        "type": "text",
+                        "text": line[2:] if line.startswith("• ") else line,
+                    }
+                ],
+            }
+        )
+    return {
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_list",
+                "style": "bullet",
+                "elements": items,
+            }
+        ],
+    }
+
+
+def _is_remote_daily_device_actionable(item: dict[str, Any]) -> bool:
+    if _display_value(item.get("overallLabel"), default="점검 불가") != "정상":
+        return True
+    return any(
+        bool((item.get(key) or {}).get(flag))
+        for key, flag in (
+            ("cleanup", "visible"),
+            ("agentUpdate", "actionable"),
+            ("boxUpdate", "actionable"),
+            ("power", "visible"),
+        )
+        if isinstance(item.get(key), dict)
+    )
+
+
+def _build_remote_daily_device_line(item: dict[str, Any]) -> str:
+    room_name = _display_value(item.get("roomName"), default="")
+    device_name = _display_value(item.get("deviceName"), default="미확인")
+    overall_label = _display_value(item.get("overallLabel"), default="점검 불가")
+    icon = {
+        "정상": "🟢",
+        "확인 필요": "🟠",
+        "이상": "🔴",
+        "점검 불가": "⚫",
+    }.get(overall_label, "⚫")
+    headings = []
+    if room_name and room_name != "미확인":
+        headings.append(f"*{room_name}*")
+    headings.extend((f"*{device_name}*", f"{icon} *{overall_label}*"))
+    lines = [f"• {'  |  '.join(headings)}"]
+    issue = _display_value(item.get("issueSummary"), default="")
+    if issue:
+        lines.append(f"  *확인*  {issue}")
+    storage_summary = _build_remote_daily_storage_summary(item.get("storage"))
+    if storage_summary:
+        lines.append(f"  *용량*  {storage_summary}")
+    for title, key, flag in (
+        ("디스크 정리", "cleanup", "visible"),
+        ("에이전트 업데이트", "agentUpdate", "actionable"),
+        ("박스 업데이트", "boxUpdate", "actionable"),
+        ("장비 종료", "power", "visible"),
+    ):
+        presentation = item.get(key)
+        if not isinstance(presentation, dict) or not presentation.get(flag):
+            continue
+        lines.append(
+            f"  *{title}*  {_format_remote_daily_action(presentation)}"
+        )
+    return "\n".join(lines)
+
+
+def _build_remote_daily_storage_summary(value: Any) -> str:
+    storage = value if isinstance(value, dict) else {}
+    parts: list[str] = []
+    used_percent = storage.get("filesystemUsedPercent")
+    if isinstance(used_percent, (int, float)):
+        parts.append(f"사용량 `{used_percent:g}%`")
+    available_bytes = storage.get("filesystemAvailableBytes")
+    if isinstance(available_bytes, (int, float)) and available_bytes > 0:
+        parts.append(f"여유 `{_format_remote_daily_bytes(available_bytes)}`")
+    expired_count = storage.get("expiredFileCount")
+    if isinstance(expired_count, (int, float)) and expired_count > 0:
+        age_days = int(storage.get("cleanupAgeDays") or 30)
+        parts.append(f"{age_days}일 초과 `{int(expired_count):,}개`")
+    return " / ".join(parts)
+
+
+def _format_remote_daily_action(value: dict[str, Any]) -> str:
+    status_kind = _display_value(value.get("statusKind"), default="check")
+    icon = {
+        "success": "🟢",
+        "latest": "⚪",
+        "pending": "🟠",
+        "failed": "🔴",
+        "check": "🟡",
+    }.get(status_kind, "🟡")
+    label = _display_value(value.get("label"), default="확인 필요")
+    summary = _display_value(value.get("summary"), default="재확인 필요")
+    return f"{icon} *{label}* | {summary}"
+
+
+def _format_remote_daily_bytes(value: int | float) -> str:
+    size = max(0.0, float(value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024
+    return "0B"
+
+
 def _build_daily_device_round_report_text(
     report_summary: dict[str, Any],
     *,
@@ -1822,25 +2351,41 @@ def _build_daily_device_round_report_text(
     return hospital_label
 
 
-def _daily_device_round_loop(client: Any, logger: logging.Logger) -> None:
+def _daily_device_round_loop(
+    client: Any,
+    logger: logging.Logger,
+    automation_client: CompanyAutomationApiClient | None = None,
+) -> None:
     poll_interval_sec = max(5, int(cs.DAILY_DEVICE_ROUND_POLL_INTERVAL_SEC))
     while True:
         try:
-            _run_daily_device_round_if_due(client, logger)
+            _run_daily_device_round_if_due(
+                client,
+                logger,
+                automation_client=automation_client,
+            )
         except Exception:
             logger.exception("일일 장비 순회 중 오류가 발생했어")
         time.sleep(poll_interval_sec)
 
 
-def attach_daily_device_round_reporter(app: Any, *, logger: logging.Logger | None = None) -> None:
+def attach_daily_device_round_reporter(
+    app: Any,
+    *,
+    logger: logging.Logger | None = None,
+    automation_client: CompanyAutomationApiClient | None = None,
+) -> None:
     if not cs.DAILY_DEVICE_ROUND_ENABLED:
         return
 
     actual_logger = logger or logging.getLogger(__name__)
-    if not s.DB_QUERY_ENABLED:
+    if automation_client is None and not s.DB_QUERY_ENABLED:
         actual_logger.warning("일일 장비 순회가 활성화됐는데 DB_QUERY_ENABLED가 꺼져 있어 시작하지 않을게")
         return
-    if not _is_daily_device_round_runtime_configured():
+    if (
+        automation_client is None
+        and not _is_daily_device_round_runtime_configured()
+    ):
         actual_logger.warning("일일 장비 순회가 활성화됐는데 MDA/SSH 설정이 부족해 시작하지 않을게")
         return
 
@@ -1862,7 +2407,7 @@ def attach_daily_device_round_reporter(app: Any, *, logger: logging.Logger | Non
             return
         _DAILY_DEVICE_ROUND_THREAD = threading.Thread(
             target=_daily_device_round_loop,
-            args=(client, actual_logger),
+            args=(client, actual_logger, automation_client),
             name="daily-device-round",
             daemon=True,
         )

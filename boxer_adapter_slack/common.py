@@ -455,12 +455,26 @@ def create_slack_app(
             _set_request_log_status(payload, "error", error_type=type(exc).__name__)
             raise
         finally:
-            _persist_request_log(
+            # 원격 실행 계층이 감사 로그를 직접 소유하는 요청은 adapter가
+            # 같은 원문을 다시 저장하지 않도록 message event와 동일한
+            # skip_persist 계약을 app_mention에도 적용한다.
+            if _should_persist_request_log_event(
                 payload,
                 event_type="app_mention",
-                client=client,
-                logger=logger,
-            )
+            ):
+                _persist_request_log(
+                    payload,
+                    event_type="app_mention",
+                    client=client,
+                    logger=logger,
+                )
+            else:
+                logger.debug(
+                    "Skipped request log persistence for app_mention "
+                    "channel=%s ts=%s",
+                    payload.get("channel_id"),
+                    payload.get("current_ts"),
+                )
 
     @app.event("message")
     def handle_message_events(

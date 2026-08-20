@@ -21,6 +21,35 @@ class _FakeApp:
 
 
 class SlackCommonTests(unittest.TestCase):
+    def test_app_mention_honors_request_log_skip_persist(self) -> None:
+        def mention_handler(payload, reply, client, logger) -> None:
+            # 원격 실행 계층이 정본 감사 로그를 남기는 요청을 재현한다.
+            common._set_request_log_skip_persist(payload, True)
+            reply("원격 응답", mention_user=False)
+
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", True),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "_persist_request_log") as persist,
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(mention_handler)
+            app.handlers["app_mention"](
+                {
+                    "text": "<@U_BOT> 민감 operation",
+                    "user": "U_TEST",
+                    "channel": "C_TEST",
+                    "ts": "123.456",
+                    "team": "T_TEST",
+                },
+                lambda **kwargs: None,
+                object(),
+            )
+
+        persist.assert_not_called()
+
     def test_app_mention_prefers_official_events_envelope_workspace_id(self) -> None:
         payloads: list[dict[str, Any]] = []
 

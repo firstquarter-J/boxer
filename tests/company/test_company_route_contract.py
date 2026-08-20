@@ -12,6 +12,7 @@ from boxer_company.assistant import (
     SourceReference,
 )
 from boxer_company_adapter_slack import company, structured_routes
+import boxer_company_adapter_slack.fun as fun_routes
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiClientSettings,
 )
@@ -149,6 +150,20 @@ class CompanyRouteContractTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(company, "_validate_ec2_runtime_aws_env"))
             stack.enter_context(patch.object(company, "_validate_tokens"))
+            # 라우팅 계약은 자동 reporter의 운영 env와 독립적으로 검증한다.
+            # Solapi producer/consumer 조합은 remote-startup 전용 테스트가 맡는다.
+            stack.enter_context(
+                patch.object(company.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False)
+            )
+            stack.enter_context(
+                patch.object(company.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", False)
+            )
+            stack.enter_context(
+                patch.object(company.cs, "SMS_DELIVERY_REPORTER_ENABLED", False)
+            )
+            stack.enter_context(
+                patch.object(company.cs, "DEVICE_HEALTH_MONITOR_SMS_PROVIDER", "none")
+            )
             stack.enter_context(patch.object(company.s, "LLM_PROVIDER", llm_provider))
             stack.enter_context(
                 patch.object(
@@ -353,6 +368,390 @@ class CompanyRouteContractTests(unittest.TestCase):
             "company_notion_qa",
         )
 
+    def test_operations_remote_short_circuits_sensitive_local_handlers(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+        )
+        cases = (
+            (
+                "12345678910 유저 조회",
+                "app_user_lookup",
+                "민감 조회 결과는 DM으로 보냈어",
+            ),
+            (
+                "MB2-C00419 장비 종료",
+                "device_power_off",
+                "장비 종료 요청을 처리했어",
+            ),
+        )
+
+        for question, route, body in cases:
+            with self.subTest(route=route):
+                api_client = Mock()
+                api_client.answer.return_value = CompanyAssistantResult(
+                    route=route,
+                    outcome="answered",
+                    messages=(AssistantMessage(body=body),),
+                )
+                with (
+                    patch.object(
+                        company,
+                        "load_company_api_client_settings",
+                        return_value=settings,
+                    ),
+                    patch.object(
+                        company,
+                        "CompanyAssistantApiClient",
+                        return_value=api_client,
+                    ),
+                    patch(
+                        "boxer_company.routers.app_user."
+                        "_lookup_app_user_by_barcode"
+                    ) as local_app_user,
+                    patch(
+                        "boxer_company.routers.device_update."
+                        "_request_device_power_off"
+                    ) as local_power_off,
+                ):
+                    result = self._invoke_mention(
+                        text=question,
+                        question=question,
+                    )
+
+                api_client.answer.assert_called_once()
+                self.assertEqual(
+                    api_client.answer.call_args.kwargs,
+                    {"route_group": "operations"},
+                )
+                local_app_user.assert_not_called()
+                local_power_off.assert_not_called()
+                # HPA gate만 먼저 보고 operations gateway가 기존 thread/admin/
+                # device handler 진입 전에 요청을 끝낸다.
+                self.assertEqual(
+                    result.route_calls,
+                    ["_handle_hpa_change_request"],
+                )
+                self.assertEqual(len(result.reply_calls), 1)
+                self.assertIn(body, result.reply_calls[0][0])
+                self.assertEqual(
+                    result.payload["request_log"]["route_name"],
+                    route,
+                )
+                self.assertTrue(
+                    result.payload["request_log"]["skip_persist"]
+                )
+
+    def test_mutation_question_is_guarded_in_local_and_remote_modes(self) -> None:
+        question = "MB2-C00419 박스 업데이트 방법 알려줘"
+        for mode in ("local", "remote"):
+            with self.subTest(mode=mode):
+                settings = CompanyApiClientSettings(
+                    base_url=(
+                        "http://127.0.0.1:8010"
+                        if mode == "remote"
+                        else ""
+                    ),
+                    token=(
+                        "service-token-" + ("x" * 40)
+                        if mode == "remote"
+                        else ""
+                    ),
+                    operations_mode=mode,
+                )
+                api_client = Mock()
+                with (
+                    patch.object(
+                        company,
+                        "load_company_api_client_settings",
+                        return_value=settings,
+                    ),
+                    patch.object(
+                        company,
+                        "CompanyAssistantApiClient",
+                        return_value=api_client,
+                    ),
+                    patch.object(
+                        company,
+                        "_request_device_box_update",
+                    ) as local_mutation,
+                ):
+                    result = self._invoke_mention(
+                        text=question,
+                        question=question,
+                    )
+
+                local_mutation.assert_not_called()
+                api_client.answer.assert_not_called()
+                self.assertEqual(
+                    result.route_calls,
+                    ["_handle_hpa_change_request"],
+                )
+                self.assertEqual(len(result.reply_calls), 1)
+                self.assertIn(
+                    "방법·가능 여부 질문으로는 작업을 실행하지 않아",
+                    result.reply_calls[0][0],
+                )
+                self.assertEqual(
+                    result.payload["request_log"]["route_name"],
+                    "operation_confirmation_required",
+                )
+
+    def test_ambiguous_mutation_targets_never_reach_local_or_remote_domain(
+        self,
+    ) -> None:
+        cases = (
+            ("MB2-C00419 MB2-C00570 전원 꺼줘", None),
+            ("MB2-C00419 MB2-C00570 박스 업데이트", None),
+            ("MB2-C00419 MB2-C00570 PM2 상태", None),
+            (
+                "48194663047 48194663048 2026년 3월 "
+                "스트리밍 종료 영상 복원",
+                "48194663047",
+            ),
+            (
+                "48194663047 48194663048 2026-03-06 영상 복구",
+                "48194663047",
+            ),
+        )
+        for mode in ("local", "remote"):
+            for question, barcode in cases:
+                with self.subTest(mode=mode, question=question):
+                    settings = CompanyApiClientSettings(
+                        base_url=(
+                            "http://127.0.0.1:8010"
+                            if mode == "remote"
+                            else ""
+                        ),
+                        token=(
+                            "service-token-" + ("x" * 40)
+                            if mode == "remote"
+                            else ""
+                        ),
+                        operations_mode=mode,
+                    )
+                    api_client = Mock()
+                    with (
+                        patch.object(
+                            company,
+                            "load_company_api_client_settings",
+                            return_value=settings,
+                        ),
+                        patch.object(
+                            company,
+                            "CompanyAssistantApiClient",
+                            return_value=api_client,
+                        ),
+                        patch(
+                            "boxer_company_adapter_slack.device_routes."
+                            "_request_device_power_off"
+                        ) as power_off,
+                        patch(
+                            "boxer_company_adapter_slack.device_routes."
+                            "_request_device_box_update"
+                        ) as box_update,
+                        patch(
+                            "boxer_company_adapter_slack.barcode_query_routes."
+                            "_query_recording_streaming_restore_by_barcode_month"
+                        ) as streaming_restore,
+                        patch(
+                            "boxer_company_adapter_slack.device_routes."
+                            "_locate_barcode_file_candidates"
+                        ) as file_recovery,
+                        patch(
+                            "boxer_company_adapter_slack.device_routes."
+                            "_probe_device_runtime_component"
+                        ) as live_probe,
+                    ):
+                        result = self._invoke_mention(
+                            text=question,
+                            question=question,
+                            barcode=barcode,
+                            real_handlers={
+                                "_handle_device_routes",
+                                "_handle_barcode_query_routes",
+                            },
+                        )
+
+                    api_client.answer.assert_not_called()
+                    power_off.assert_not_called()
+                    box_update.assert_not_called()
+                    streaming_restore.assert_not_called()
+                    file_recovery.assert_not_called()
+                    live_probe.assert_not_called()
+                    self.assertEqual(
+                        result.route_calls,
+                        ["_handle_hpa_change_request"],
+                    )
+                    self.assertIn(
+                        "작업 대상을 하나로 확정할 수 없어",
+                        result.reply_calls[0][0],
+                    )
+                    self.assertEqual(
+                        result.payload["request_log"]["route_name"],
+                        "operation_single_target_required",
+                    )
+
+    def test_diagnostic_followup_context_is_sent_to_remote_operations(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="device_diagnostic_followup",
+            outcome="answered",
+            messages=(AssistantMessage(body="**장비 진단 답변**"),),
+        )
+        context_entries = (
+            {
+                "kind": "message",
+                "source": "slack",
+                "author_id": "U-CONTRACT",
+                "text": "MB2-C00419 진단 시작",
+            },
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=context_entries,
+            ) as context_loader,
+        ):
+            result = self._invoke_mention(
+                text="최근 종료 원인",
+                question="최근 종료 원인",
+            )
+
+        context_loader.assert_called_once()
+        api_client.answer.assert_called_once()
+        request = api_client.answer.call_args.args[0]
+        self.assertEqual(request.context_entries, context_entries)
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "operations"},
+        )
+        self.assertEqual(
+            result.route_calls,
+            ["_handle_hpa_change_request"],
+        )
+        self.assertIn("*장비 진단 답변*", result.reply_calls[0][0])
+
+    def test_contextless_device_diagnostic_analysis_uses_remote_operation(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="device_diagnostic_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="**장비 진단 답변**"),),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=(),
+            ),
+        ):
+            result = self._invoke_mention(
+                text="MB2-C00419 최근 종료 원인 알려줘",
+                question="MB2-C00419 최근 종료 원인 알려줘",
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "operations"},
+        )
+        self.assertEqual(
+            result.route_calls,
+            ["_handle_hpa_change_request"],
+        )
+        self.assertIn("*장비 진단 답변*", result.reply_calls[0][0])
+
+    def test_file_operation_uses_same_actor_thread_barcode_scope(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="device_file_download",
+            outcome="answered",
+            messages=(AssistantMessage(body="다운로드 준비 완료"),),
+        )
+        context_entries = (
+            {
+                "kind": "message",
+                "source": "slack",
+                "author_id": "U-CONTRACT",
+                "text": "48194663047 파일을 확인해줘",
+            },
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=context_entries,
+            ) as context_loader,
+        ):
+            result = self._invoke_mention(
+                text="2026-03-06 영상 다운로드",
+                question="2026-03-06 영상 다운로드",
+            )
+
+        context_loader.assert_called_once()
+        api_client.answer.assert_called_once()
+        request = api_client.answer.call_args.args[0]
+        self.assertEqual(request.context_entries, context_entries)
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "operations"},
+        )
+        self.assertEqual(
+            result.route_calls,
+            ["_handle_hpa_change_request"],
+        )
+
     def test_structured_remote_mode_uses_api_without_local_db_query(self) -> None:
         settings = CompanyApiClientSettings(
             base_url="http://127.0.0.1:8010",
@@ -521,7 +920,10 @@ class CompanyRouteContractTests(unittest.TestCase):
         )
         snapshot = {
             "route": "device_diagnostic_snapshot",
-            "request": {"deviceName": "MB2-C00419"},
+            "request": {
+                "deviceName": "MB2-C00419",
+                "requestedBy": "U-CONTRACT",
+            },
             "device": {"deviceName": "MB2-C00419"},
             "summary": {},
         }
@@ -556,6 +958,48 @@ class CompanyRouteContractTests(unittest.TestCase):
         )
         self.assertEqual(len(result.reply_calls), 1)
         self.assertNotIn("원격 문서 답변", result.reply_calls[0][0])
+
+    def test_fully_remote_playbook_never_reads_slack_diagnostic_snapshot(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+            playbook_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="notion_playbook_qa",
+            outcome="answered",
+            messages=(AssistantMessage(body="원격 문서 답변"),),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "_load_device_diagnostic_snapshot",
+            ) as local_snapshot,
+        ):
+            result = self._invoke_mention(
+                text="증상은 어때?",
+                question="증상은 어때?",
+                real_handlers={"_handle_knowledge_routes"},
+            )
+
+        api_client.answer.assert_called_once()
+        local_snapshot.assert_not_called()
+        self.assertEqual(result.reply_calls, [("원격 문서 답변", {})])
 
     def test_barcode_freeform_remote_uses_knowledge_api_without_local_llm(
         self,
@@ -708,16 +1152,142 @@ class CompanyRouteContractTests(unittest.TestCase):
             )
 
         api_client.answer.assert_not_called()
-        local_chat.assert_called_once()
+        self.assertEqual(local_chat.call_count, 2)
         self.assertEqual(
             general.reply_calls,
             [("로컬 일반 답변", {})],
         )
         general.synthesis_mock.assert_not_called()
-        pii.synthesis_mock.assert_called_once()
+        pii.synthesis_mock.assert_not_called()
         self.assertEqual(
             pii.reply_calls,
-            [("로컬 PII 경계 답변", {})],
+            [("로컬 일반 답변", {})],
+        )
+
+    def test_company_freeform_remote_uses_api_without_local_llm(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="company_freeform",
+            outcome="answered",
+            messages=(AssistantMessage(body="공통 API 일반 답변"),),
+            used_llm=True,
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "load_slack_thread_context_entries",
+                return_value=(),
+            ) as context_loader,
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes."
+                "_ask_claude",
+                return_value="로컬 일반 답변",
+            ) as local_chat,
+        ):
+            result = self._invoke_mention(
+                text="오늘 기분 어때?",
+                question="오늘 기분 어때?",
+                real_handlers={"_handle_knowledge_routes"},
+                llm_provider="claude",
+                llm_synthesis_enabled=True,
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "freeform"},
+        )
+        self.assertEqual(
+            api_client.answer.call_args.args[0].question,
+            "오늘 기분 어때?",
+        )
+        context_loader.assert_called_once()
+        local_chat.assert_not_called()
+        result.synthesis_mock.assert_not_called()
+        self.assertEqual(
+            result.reply_calls,
+            [("공통 API 일반 답변", {})],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "llm_freeform",
+        )
+
+    def test_company_freeform_barcode_chat_skips_local_db_and_llm(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="company_freeform",
+            outcome="answered",
+            messages=(AssistantMessage(body="공통 API 농담"),),
+            used_llm=True,
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "_load_recordings_context_by_barcode",
+            ) as local_recordings,
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes."
+                "_ask_claude",
+            ) as local_chat,
+        ):
+            result = self._invoke_mention(
+                text="81037525522 농담 하나 해줘",
+                question="81037525522 농담 하나 해줘",
+                barcode="81037525522",
+                real_handlers={"_handle_knowledge_routes"},
+                llm_provider="claude",
+                llm_synthesis_enabled=True,
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "freeform"},
+        )
+        local_recordings.assert_not_called()
+        local_chat.assert_not_called()
+        result.synthesis_mock.assert_not_called()
+        self.assertEqual(result.reply_calls, [("공통 API 농담", {})])
+        self.assertEqual(
+            result.payload["request_log"]["handler_type"],
+            "llm_freeform",
         )
 
     def test_barcode_freeform_remote_keeps_diagnostic_snapshot_precedence(
@@ -737,7 +1307,10 @@ class CompanyRouteContractTests(unittest.TestCase):
         )
         snapshot = {
             "route": "device_diagnostic_snapshot",
-            "request": {"deviceName": "MB2-C00419"},
+            "request": {
+                "deviceName": "MB2-C00419",
+                "requestedBy": "U-CONTRACT",
+            },
             "device": {"deviceName": "MB2-C00419"},
             "summary": {},
         }
@@ -899,14 +1472,18 @@ class CompanyRouteContractTests(unittest.TestCase):
         )
         api_client = Mock()
         api_client.answer.return_value = CompanyAssistantResult(
-            route="device_db_detail",
+            route="device_detail",
             outcome="answered",
             messages=(
                 AssistantMessage(
                     body=(
                         "**장비 조회 결과**\n"
-                        "• 상태 기준: `devices.status` DB 저장값\n"
-                        "• 장비명: `MB2-C00419`"
+                        "• 장비명: `MB2-C00419`\n"
+                        "• 버전: `2.11.307`\n"
+                        "• SSH 연결 상태: 🔵 **연결 가능**\n"
+                        "• 초음파 영상 다운로드 가능 상태: "
+                        "🔵 **가능**\n"
+                        "• 캡처보드 종류: `YUH01`"
                     )
                 ),
             ),
@@ -943,15 +1520,164 @@ class CompanyRouteContractTests(unittest.TestCase):
         api_client.answer.assert_called_once()
         self.assertEqual(
             api_client.answer.call_args.kwargs,
-            {"route_group": "structured"},
+            {"route_group": "device_detail"},
         )
+        # Slack adapter는 별도 action 없이 공통 API turn 하나만 호출한다.
+        self.assertEqual(
+            [call[0] for call in api_client.method_calls],
+            ["answer"],
+        )
+        # remote 모드에서는 Slack structured route와 그 내부 MDA/SSH
+        # enrichment를 한 번도 실행하지 않고 API 결과만 공개 응답한다.
         local_query.assert_not_called()
         local_mda.assert_not_called()
         local_ssh.assert_not_called()
+        self.assertEqual(len(result.reply_calls), 1)
+        reply_text, reply_kwargs = result.reply_calls[0]
+        self.assertEqual(reply_kwargs, {})
+        self.assertIn("*장비 조회 결과*", reply_text)
+        self.assertIn("버전: `2.11.307`", reply_text)
+        self.assertIn("SSH 연결 상태: 🔵 *연결 가능*", reply_text)
+        self.assertIn(
+            "초음파 영상 다운로드 가능 상태: 🔵 *가능*",
+            reply_text,
+        )
+        self.assertIn("캡처보드 종류: `YUH01`", reply_text)
+        # channel-neutral route가 달라져도 기존 Slack request-log 집계명은
+        # canonical devices_filter로 유지한다.
         self.assertEqual(
             result.payload["request_log"]["route_name"],
             "devices_filter",
         )
+
+    def test_unsupported_device_mutation_never_falls_back_to_local_query(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            device_detail_mode="remote",
+        )
+        cases = (
+            ("MB2-C00419 장비 정보 삭제해줘", "device_detail"),
+            ("deviceSeq 2410 박스 업데이트해줘", "devices_filter"),
+        )
+
+        for question, route in cases:
+            with self.subTest(question=question):
+                api_client = Mock()
+                api_client.answer.return_value = CompanyAssistantResult(
+                    route=route,
+                    outcome="denied",
+                    messages=(
+                        AssistantMessage(body="지원하지 않는 장비 변경 요청"),
+                    ),
+                    fallback_reason="unsupported_device_mutation",
+                )
+                with (
+                    patch.object(
+                        company,
+                        "load_company_api_client_settings",
+                        return_value=settings,
+                    ),
+                    patch.object(
+                        company,
+                        "CompanyAssistantApiClient",
+                        return_value=api_client,
+                    ),
+                    patch(
+                        "boxer_company.assistant.structured_route."
+                        "_query_devices_by_filters"
+                    ) as local_query,
+                    patch(
+                        "boxer_company.routers.box_db."
+                        "_lookup_mda_device_details"
+                    ) as local_mda,
+                    patch(
+                        "boxer_company.routers.box_db."
+                        "_lookup_device_ssh_status"
+                    ) as local_ssh,
+                ):
+                    result = self._invoke_mention(
+                        text=question,
+                        question=question,
+                        real_handlers={"_handle_structured_routes"},
+                    )
+
+                api_client.answer.assert_called_once()
+                self.assertEqual(
+                    api_client.answer.call_args.kwargs,
+                    {"route_group": "device_detail"},
+                )
+                local_query.assert_not_called()
+                local_mda.assert_not_called()
+                local_ssh.assert_not_called()
+                self.assertIn(
+                    "지원하지 않는 장비 변경 요청",
+                    result.reply_calls[0][0],
+                )
+
+    def test_device_filter_remote_skips_all_slack_domain_queries(self) -> None:
+        # 비-count 목록도 exact 장비 상세와 같은 capability·무재시도 경계를
+        # 사용하고 Slack structured fallback을 한 번도 실행하지 않는다.
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            device_detail_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="devices_filter",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body=(
+                        "**장비 조회 결과**\n"
+                        "• status: `ACTIVE`\n"
+                        "• devices row 수: **2개**"
+                    )
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch(
+                "boxer_company.assistant.structured_route."
+                "_query_devices_by_filters"
+            ) as local_query,
+            patch(
+                "boxer_company.routers.box_db._lookup_mda_device_details"
+            ) as local_mda,
+            patch(
+                "boxer_company.routers.box_db._lookup_device_ssh_status"
+            ) as local_ssh,
+        ):
+            result = self._invoke_mention(
+                text="status=ACTIVE 장비 목록",
+                question="status=ACTIVE 장비 목록",
+                real_handlers={"_handle_structured_routes"},
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "device_detail"},
+        )
+        local_query.assert_not_called()
+        local_mda.assert_not_called()
+        local_ssh.assert_not_called()
+        self.assertEqual(len(result.reply_calls), 1)
+        self.assertIn("devices row 수: *2개*", result.reply_calls[0][0])
 
     def test_timeline_remote_defers_structured_and_skips_local_db_query(
         self,
@@ -1015,6 +1741,86 @@ class CompanyRouteContractTests(unittest.TestCase):
             [("마지막 녹화는 8월 4일이야", {})],
         )
 
+    def test_all_recorded_dates_remote_defers_structured_without_local_db(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            barcode_mode="remote",
+            barcode_fallback_enabled=False,
+        )
+
+        for question in (
+            "12345678910 전체 녹화 날짜",
+            "12345678910 모든 녹화 날짜",
+        ):
+            with self.subTest(question=question):
+                api_client = Mock()
+                api_client.answer.return_value = CompanyAssistantResult(
+                    route="barcode_all_recorded_dates",
+                    outcome="answered",
+                    messages=(
+                        AssistantMessage(body="**전체 녹화 날짜**\n- 2026-08-04"),
+                    ),
+                )
+
+                with (
+                    patch.object(
+                        company,
+                        "load_company_api_client_settings",
+                        return_value=settings,
+                    ),
+                    patch.object(
+                        company,
+                        "CompanyAssistantApiClient",
+                        return_value=api_client,
+                    ),
+                    patch(
+                        "boxer_company_adapter_slack.structured_routes."
+                        "_query_recordings_by_filters"
+                    ) as local_structured_query,
+                    patch(
+                        "boxer_company_adapter_slack.barcode_query_routes."
+                        "_query_all_recorded_dates_by_barcode"
+                    ) as local_barcode_query,
+                    patch(
+                        "boxer_company.assistant.structured_route."
+                        "_query_recordings_by_filters"
+                    ) as local_runtime_structured_query,
+                    patch(
+                        "boxer_company.assistant.barcode_query_route."
+                        "_query_all_recorded_dates_by_barcode"
+                    ) as local_runtime_barcode_query,
+                ):
+                    result = self._invoke_mention(
+                        text=question,
+                        question=question,
+                        barcode="12345678910",
+                        real_handlers={
+                            "_handle_structured_routes",
+                            "_handle_barcode_query_routes",
+                        },
+                    )
+
+                api_client.answer.assert_called_once()
+                self.assertEqual(
+                    api_client.answer.call_args.kwargs,
+                    {"route_group": "barcode"},
+                )
+                local_structured_query.assert_not_called()
+                local_barcode_query.assert_not_called()
+                local_runtime_structured_query.assert_not_called()
+                local_runtime_barcode_query.assert_not_called()
+                self.assertEqual(
+                    result.payload["request_log"]["route_name"],
+                    "barcode_all_recorded_dates",
+                )
+                self.assertEqual(
+                    result.reply_calls,
+                    [("*전체 녹화 날짜*\n- 2026-08-04", {})],
+                )
+
     def test_unmatched_barcode_question_does_not_eagerly_prefetch_recordings(
         self,
     ) -> None:
@@ -1071,6 +1877,86 @@ class CompanyRouteContractTests(unittest.TestCase):
             "usage_help",
         )
 
+    def test_remote_ping_uses_api_health_without_local_provider_probe(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="company_llm_health",
+            outcome="answered",
+            messages=(AssistantMessage(body="available", mention_actor=False),),
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(company, "_check_claude_health") as local_claude_health,
+            patch.object(company, "_check_ollama_health") as local_ollama_health,
+        ):
+            result = self._invoke_mention(
+                text="ping",
+                question="ping",
+                llm_provider="claude",
+            )
+
+        api_client.answer.assert_called_once()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "health"},
+        )
+        local_claude_health.assert_not_called()
+        local_ollama_health.assert_not_called()
+        self.assertEqual(
+            result.reply_calls,
+            [("🏓 pong\n• llm: 가능", {})],
+        )
+
+    def test_remote_ping_failure_does_not_fallback_to_local_provider(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.side_effect = RuntimeError("api down")
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(company, "_check_claude_health") as local_claude_health,
+            patch.object(company, "_check_ollama_health") as local_ollama_health,
+        ):
+            result = self._invoke_mention(
+                text="ping",
+                question="ping",
+                llm_provider="ollama",
+            )
+
+        local_claude_health.assert_not_called()
+        local_ollama_health.assert_not_called()
+        self.assertEqual(
+            result.reply_calls,
+            [("🏓 pong\n• llm: 불가", {})],
+        )
     def test_evidence_route_keeps_direct_and_llm_synthesis_outcomes(self) -> None:
         notion_reference = {
             "title": "Commerce",
@@ -1466,7 +2352,10 @@ class CompanyRouteContractTests(unittest.TestCase):
     ) -> None:
         snapshot = {
             "route": "device_diagnostic_snapshot",
-            "request": {"deviceName": "MB2-C00419"},
+            "request": {
+                "deviceName": "MB2-C00419",
+                "requestedBy": "U-CONTRACT",
+            },
             "summary": {},
         }
         with (
@@ -1535,6 +2424,11 @@ class CompanyRouteContractTests(unittest.TestCase):
                 "_load_device_diagnostic_snapshot",
                 return_value=None,
             ) as legacy_snapshot,
+            patch(
+                "boxer_company_adapter_slack.knowledge_routes."
+                "_ask_claude",
+                return_value="로컬 일반 답변이야",
+            ) as local_chat,
         ):
             result = self._invoke_mention(
                 text="pm2 확인해줘 12345678910",
@@ -1547,16 +2441,14 @@ class CompanyRouteContractTests(unittest.TestCase):
             )
 
         core_snapshot.assert_called_once()
-        legacy_snapshot.assert_not_called()
-        self.assertIn(
-            "recordings_context_prefetch",
-            result.route_calls,
-        )
+        legacy_snapshot.assert_called_once()
+        local_chat.assert_called_once()
+        self.assertNotIn("recordings_context_prefetch", result.route_calls)
         self.assertEqual(
             result.payload["request_log"]["route_name"],
             "llm_freeform",
         )
-        self.assertIn("바코드 근거 답변이야", result.reply_calls[0][0])
+        self.assertIn("로컬 일반 답변이야", result.reply_calls[0][0])
 
     def test_unavailable_provider_delegates_to_existing_slack_error_reply(
         self,
@@ -1792,6 +2684,345 @@ class CompanyRouteContractTests(unittest.TestCase):
         self.assertEqual(bot_result.reply_calls, [])
         bot_result.base_access_runtime.is_allowed.assert_not_called()
         self.assertEqual(fun_handler.call_count, 2)
+
+    def test_remote_human_fun_uses_api_without_local_llm(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="company_team_fun",
+            outcome="answered",
+            messages=(AssistantMessage(body="배포가 또 삐끗했네 모대?"),),
+            used_llm=True,
+        )
+        payload = _message_payload(text="배포도 쉽지 모대")
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_slack_thread_context",
+                return_value="DD가 방금 배포를 시작했어",
+            ),
+            patch.object(fun_routes, "_generate_fun_reply") as local_generator,
+            patch.object(fun_routes, "_build_fun_template") as local_template,
+            patch.object(fun_routes, "_is_dd_active", return_value=True),
+            patch.object(fun_routes.cs, "DD_USER_ID", "U-DD"),
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        local_generator.assert_not_called()
+        local_template.assert_not_called()
+        api_client.answer.assert_called_once()
+        request = api_client.answer.call_args.args[0]
+        self.assertEqual(request.question, "배포도 쉽지 모대")
+        self.assertEqual(
+            request.context_entries[0]["text"],
+            "DD가 방금 배포를 시작했어",
+        )
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "fun"},
+        )
+        self.assertEqual(
+            result.reply_calls,
+            [("<@U-DD> 배포가 또 삐끗했네 모대?", {"thread": True})],
+        )
+
+    def test_remote_human_fun_failure_uses_fixed_notice_not_local_llm(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.side_effect = RuntimeError("api down")
+        payload = _message_payload(text="배포도 쉽지 모대")
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_slack_thread_context",
+                return_value="",
+            ),
+            patch.object(fun_routes, "_generate_fun_reply") as local_generator,
+            patch.object(fun_routes, "_build_fun_template") as local_template,
+            patch.object(fun_routes, "_is_dd_active", return_value=True),
+            patch.object(fun_routes.cs, "DD_USER_ID", "U-DD"),
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        local_generator.assert_not_called()
+        local_template.assert_not_called()
+        self.assertEqual(
+            result.reply_calls,
+            [("지금은 모대 답변을 만들 수 없어.", {"thread": True})],
+        )
+
+    def test_remote_bot_fortune_uses_api_without_local_parser(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="company_daily_fortune",
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body="운세 분석 결과",
+                    mention_actor=False,
+                ),
+            ),
+        )
+        payload = _message_payload(
+            text="오늘의 운세 1990년생 행운",
+            subtype="bot_message",
+        )
+        payload["user_id"] = None
+        payload["thread_ts"] = "1784800000.000001"
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_thread_root_text",
+                return_value="2026년 8월 14일 오늘의 운세",
+            ),
+            patch.object(fun_routes, "_is_daily_fortune_message") as local_matcher,
+            patch.object(
+                fun_routes,
+                "_build_daily_fortune_reply",
+            ) as local_builder,
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        local_matcher.assert_not_called()
+        local_builder.assert_not_called()
+        api_client.answer.assert_called_once()
+        request = api_client.answer.call_args.args[0]
+        self.assertEqual(request.question, "오늘의 운세 1990년생 행운")
+        self.assertEqual(request.actor_id, "U-BOT")
+        self.assertEqual(
+            request.context_entries[0]["text"],
+            "2026년 8월 14일 오늘의 운세",
+        )
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "fun"},
+        )
+        self.assertEqual(
+            result.reply_calls,
+            [("운세 분석 결과", {"thread": True})],
+        )
+
+    def test_remote_bot_fortune_failure_has_no_local_fallback(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.side_effect = RuntimeError("api down")
+        payload = _message_payload(
+            text="1990년생 행운과 재물운",
+            subtype="bot_message",
+        )
+        payload["thread_ts"] = "1784800000.000001"
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_thread_root_text",
+                return_value="오늘의 운세",
+            ),
+            patch.object(fun_routes, "_is_daily_fortune_message") as local_matcher,
+            patch.object(
+                fun_routes,
+                "_build_daily_fortune_reply",
+            ) as local_builder,
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        api_client.answer.assert_called_once()
+        local_matcher.assert_not_called()
+        local_builder.assert_not_called()
+        self.assertEqual(result.reply_calls, [])
+
+    def test_remote_non_fortune_bot_reply_uses_api_no_match_as_silence(self) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            freeform_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route="unhandled",
+            outcome="no_evidence",
+            messages=(AssistantMessage(body="처리할 경로가 없어"),),
+            fallback_reason="no_matching_route",
+        )
+        payload = _message_payload(
+            text="배포 완료 알림",
+            subtype="bot_message",
+        )
+        payload["thread_ts"] = "1784800000.000001"
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_thread_root_text",
+                return_value="자동화 결과",
+            ),
+            patch.object(fun_routes, "_is_daily_fortune_message") as local_matcher,
+            patch.object(
+                fun_routes,
+                "_build_daily_fortune_reply",
+            ) as local_builder,
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        api_client.answer.assert_called_once()
+        local_matcher.assert_not_called()
+        local_builder.assert_not_called()
+        self.assertEqual(result.reply_calls, [])
+
+    def test_local_mode_keeps_daily_fortune_rollback(self) -> None:
+        settings = CompanyApiClientSettings(base_url="", token="")
+        api_client_factory = Mock()
+        payload = _message_payload(
+            text="1990년생 행운과 재물운",
+            subtype="bot_message",
+        )
+        payload["thread_ts"] = "1784800000.000001"
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                api_client_factory,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_thread_root_text",
+                return_value="오늘의 운세",
+            ),
+            patch.object(
+                fun_routes,
+                "_is_daily_fortune_message",
+                return_value=True,
+            ) as local_matcher,
+            patch.object(
+                fun_routes,
+                "_build_daily_fortune_reply",
+                return_value="기존 로컬 운세 분석",
+            ) as local_builder,
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        api_client_factory.assert_not_called()
+        local_matcher.assert_called_once_with(payload, "오늘의 운세")
+        local_builder.assert_called_once_with(
+            "1990년생 행운과 재물운",
+            "오늘의 운세",
+        )
+        self.assertEqual(
+            result.reply_calls,
+            [("기존 로컬 운세 분석", {"thread": True})],
+        )
+
+    def test_local_mode_keeps_existing_human_fun_generator_as_rollback(self) -> None:
+        settings = CompanyApiClientSettings(base_url="", token="")
+        api_client_factory = Mock()
+        payload = _message_payload(text="배포도 쉽지 모대")
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                api_client_factory,
+            ),
+            patch.object(
+                fun_routes,
+                "_load_slack_thread_context",
+                return_value="",
+            ),
+            patch.object(
+                fun_routes,
+                "_generate_fun_reply",
+                return_value=("기존 로컬 답변 모대?", "local", False),
+            ) as local_generator,
+        ):
+            result = self._invoke_mention(message_payload=payload)
+
+        api_client_factory.assert_not_called()
+        local_generator.assert_called_once()
+        self.assertEqual(
+            result.reply_calls,
+            [("기존 로컬 답변 모대?", {"thread": True})],
+        )
 
 
 if __name__ == "__main__":

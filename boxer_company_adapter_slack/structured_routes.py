@@ -35,6 +35,7 @@ from boxer_company.routers.barcode_log import (
     _extract_hospital_room_scope,
     _extract_leading_hospital_scope,
     _extract_year_filter,
+    _is_barcode_all_recorded_dates_request,
     _is_devices_filter_query_request,
     _is_hospitals_filter_query_request,
     _is_hospital_rooms_filter_query_request,
@@ -115,6 +116,10 @@ def _handle_structured_routes(context: StructuredRoutesContext) -> bool:
     if _is_recording_streaming_restore_request(question, barcode):
         # 복원 요청은 "영상 + 연월" 형태라 구조화 영상 조회가 먼저 잡기 쉬워서
         # 전용 MDA 복원 라우터까지 내려가게 한다.
+        return False
+    if _is_barcode_all_recorded_dates_request(question, barcode):
+        # `전체`/`모든`을 병원명으로 오인하는 legacy parser보다 구체적인
+        # 바코드 날짜 route를 우선해 뒤의 공통 API stage로 넘긴다.
         return False
     if match_barcode_timeline_route(assistant_request) is not None:
         # service가 None을 반환한 뒤 실행되는 legacy fallback도 같은

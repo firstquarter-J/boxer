@@ -19,7 +19,7 @@ from boxer.retrieval.connectors.notion import (
     _fetch_all_notion_blocks,
     _load_notion_page_content_cached,
     _normalize_notion_id,
-    _notion_request,
+    _notion_request as _raw_notion_request,
 )
 from boxer_company import settings as cs
 from boxer_company.notion_playbooks import (
@@ -30,8 +30,35 @@ from boxer_company.notion_playbooks import (
     _parse_notion_rag_index_line,
     _resolve_notion_root_page_id,
 )
+from boxer_company.routers.device_ssh_security import (
+    _mark_company_api_mutation_attempted,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _notion_request(
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """회사 Notion write만 API request의 실제 mutation으로 표시한다."""
+
+    is_write = str(method or "GET").strip().upper() != "GET"
+    return _raw_notion_request(
+        path,
+        method=method,
+        payload=payload,
+        token=token,
+        # 공개 connector의 body/header/Request preflight 뒤 실제 transport
+        # 직전에만 표시하고, write는 결과 불명 재전송을 하지 않는다.
+        before_request=(
+            _mark_company_api_mutation_attempted if is_write else None
+        ),
+        retry_rate_limit=not is_write,
+    )
 
 
 @dataclass(frozen=True)

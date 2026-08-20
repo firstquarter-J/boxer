@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -63,6 +64,9 @@ def _settings(
     allow_anonymous_actor: bool = False,
     capabilities: tuple[str, ...] = ("assistant.turn.read",),
     configuration_error: str | None = None,
+    live_device_enabled: bool = True,
+    operations_enabled: bool = True,
+    request_log_enabled: bool = False,
 ) -> CompanyApiSettings:
     callers = ()
     if configuration_error is None:
@@ -82,6 +86,9 @@ def _settings(
         port=8010,
         callers=callers,
         configuration_error=configuration_error,
+        live_device_enabled=live_device_enabled,
+        operations_enabled=operations_enabled,
+        request_log_enabled=request_log_enabled,
     )
 
 
@@ -123,6 +130,676 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 
 class CompanyApiContractTests(unittest.TestCase):
+    def test_live_device_feature_off_blocks_only_live_routes(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="app_user_lookup",
+                outcome="answered",
+                messages=(AssistantMessage(body="조회 결과"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                    "assistant.operation.execute",
+                    "assistant.device.alert.execute",
+                ),
+                live_device_enabled=False,
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            device_detail = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-live-detail-off"),
+                json=_payload(
+                    question="MB2-C00419 장비 정보",
+                    routeGroup="device_detail",
+                    scope={"deviceName": "MB2-C00419"},
+                ),
+            )
+            device_operation = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-live-operation-off"),
+                json=_payload(
+                    question="MB2-C00419 장비 종료해줘",
+                    routeGroup="operations",
+                    scope={"deviceName": "MB2-C00419"},
+                ),
+            )
+            private_read = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-private-read-on"),
+                json=_payload(
+                    question="12345678910 유저 조회",
+                    routeGroup="operations",
+                ),
+            )
+
+        self.assertEqual(device_detail.status_code, 503)
+        self.assertFalse(device_detail.json()["retryable"])
+        self.assertEqual(device_operation.status_code, 503)
+        self.assertFalse(device_operation.json()["retryable"])
+        self.assertEqual(private_read.status_code, 200)
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_operations_feature_off_blocks_before_runtime(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="app_user_lookup",
+                outcome="answered",
+                messages=(AssistantMessage(body="조회 결과"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+                operations_enabled=False,
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-operations-off"),
+                json=_payload(
+                    question="12345678910 유저 조회",
+                    routeGroup="operations",
+                ),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json()["retryable"])
+        self.assertEqual(runtime.requests, [])
+
+    def test_operation_request_id_replay_returns_cached_result_once(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_power_off",
+                outcome="answered",
+                messages=(AssistantMessage(body="종료 요청 완료"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 종료해줘",
+            routeGroup="operations",
+            scope={"deviceName": "MB2-C00419", "channelContextId": "C01"},
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=payload,
+            )
+            replay = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.json(), first.json())
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_operation_request_id_conflict_fails_before_second_runtime(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_power_off",
+                outcome="answered",
+                messages=(AssistantMessage(body="종료 요청 완료"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(
+                    question="MB2-C00419 장비 종료해줘",
+                    routeGroup="operations",
+                ),
+            )
+            conflict = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(
+                    question="MB2-C00570 장비 종료해줘",
+                    routeGroup="operations",
+                ),
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["code"], "request_id_conflict")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_failed_operation_request_stays_uncertain_without_reexecution(self) -> None:
+        class _AttemptedMutationRuntime(_FakeRuntime):
+            def answer_stage(self, request: Any, stage: str) -> CompanyAssistantResult:
+                from boxer_company.routers.device_ssh_security import (
+                    _mark_company_api_mutation_attempted,
+                )
+
+                self.requests.append(request)
+                self.stages.append(stage)
+                # 실제 write 직전 marker가 있으면 예외가 결과 불명 상태다.
+                _mark_company_api_mutation_attempted()
+                raise RuntimeError("mutation status unknown")
+
+        runtime = _AttemptedMutationRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 종료해줘",
+            routeGroup="operations",
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=payload,
+            )
+            replay = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 500)
+        self.assertFalse(first.json()["retryable"])
+        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.json()["code"], "operation_in_progress")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_precheck_operation_exception_releases_target(self) -> None:
+        runtime = _FakeRuntime(error=RuntimeError("precheck unavailable"))
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 종료해줘",
+            routeGroup="operations",
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-precheck-exception-1"),
+                json=payload,
+            )
+            second = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-precheck-exception-2"),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 500)
+        self.assertTrue(first.json()["retryable"])
+        self.assertEqual(second.status_code, 500)
+        self.assertTrue(second.json()["retryable"])
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_read_only_operation_failure_does_not_lock_later_mutation(self) -> None:
+        # app-user/S3/admin 조회 예외는 mutation registry를 만들지 않고,
+        # 뒤이은 실제 mutation 실패만 tenant-wide uncertain 상태로 남긴다.
+        read_only_questions = (
+            "12345678910 유저 조회",
+            "s3 영상 12345678910",
+            "db 조회 select seq from recordings limit 1",
+        )
+        for index, read_only_question in enumerate(read_only_questions):
+            with self.subTest(question=read_only_question):
+                class _ConditionalAttemptRuntime(_FakeRuntime):
+                    def answer_stage(
+                        self,
+                        request: Any,
+                        stage: str,
+                    ) -> CompanyAssistantResult:
+                        self.requests.append(request)
+                        self.stages.append(stage)
+                        if "장비 종료" in request.question:
+                            from boxer_company.routers.device_ssh_security import (
+                                _mark_company_api_mutation_attempted,
+                            )
+
+                            # read-only precheck와 달리 mutation 전송 뒤 오류를
+                            # 재현해 tenant-wide 불명 lock 계약을 검증한다.
+                            _mark_company_api_mutation_attempted()
+                        raise RuntimeError("dependency failed")
+
+                runtime = _ConditionalAttemptRuntime()
+                app = create_company_api_app(
+                    settings=_settings(
+                        capabilities=(
+                            "assistant.turn.read",
+                            "assistant.operation.execute",
+                        )
+                    ),
+                    assistant_runtime=runtime,
+                    readiness_probe=lambda: True,
+                )
+
+                with TestClient(
+                    app,
+                    raise_server_exceptions=False,
+                ) as client:
+                    read_failure = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(request_id=f"req-read-{index}"),
+                        json=_payload(
+                            question=read_only_question,
+                            routeGroup="operations",
+                        ),
+                    )
+                    mutation_failure = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(request_id=f"req-mutation-{index}"),
+                        json=_payload(
+                            question="MB2-C00419 장비 종료해줘",
+                            routeGroup="operations",
+                        ),
+                    )
+                    blocked_mutation = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(request_id=f"req-next-{index}"),
+                        json=_payload(
+                            question="MB2-C00570 장비 종료해줘",
+                            routeGroup="operations",
+                        ),
+                    )
+
+                self.assertEqual(read_failure.status_code, 500)
+                self.assertTrue(read_failure.json()["retryable"])
+                self.assertEqual(mutation_failure.status_code, 500)
+                self.assertFalse(mutation_failure.json()["retryable"])
+                self.assertEqual(blocked_mutation.status_code, 409)
+                self.assertEqual(
+                    blocked_mutation.json()["code"],
+                    "operation_in_progress",
+                )
+                self.assertEqual(len(runtime.requests), 2)
+
+    def test_failed_mutation_result_with_unknown_status_stays_sticky(self) -> None:
+        # route 내부 catch가 HTTP 예외 대신 failed 결과를 반환해도 실제
+        # mutation 처리 여부가 불명이면 다른 request ID로 재실행하지 않는다.
+        result = CompanyAssistantResult(
+            route="device_power_off",
+            outcome="failed",
+            messages=(AssistantMessage(body="처리 여부 불명"),),
+            fallback_reason="operation_error",
+        )
+
+        class _AttemptedMutationRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+            ) -> CompanyAssistantResult:
+                from boxer_company.routers.mda_graphql import (
+                    _send_mda_device_command,
+                )
+
+                self.requests.append(request)
+                self.stages.append(stage)
+                try:
+                    _send_mda_device_command(
+                        "MB2-C00419",
+                        command="power_off",
+                    )
+                except TimeoutError:
+                    pass
+                return result
+
+        runtime = _AttemptedMutationRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 종료해줘",
+            routeGroup="operations",
+        )
+
+        with patch(
+            "boxer_company.routers.mda_graphql._get_mda_access_token",
+            return_value="access-token",
+        ), patch(
+            "boxer_company.routers.mda_graphql._execute_mda_graphql_request",
+            side_effect=TimeoutError("result unknown"),
+        ):
+            with TestClient(app) as client:
+                first = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-uncertain-result-1"),
+                    json=payload,
+                )
+                blocked = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-uncertain-result-2"),
+                    json=payload,
+                )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["outcome"], "failed")
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.json()["code"], "operation_in_progress")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_precheck_operation_error_releases_mutation_target(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_file_lookup",
+                outcome="failed",
+                messages=(AssistantMessage(body="사전 조회 실패"),),
+                fallback_reason="operation_error",
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="12345678910 2026-03-06 영상 다운로드",
+            routeGroup="operations",
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-operation-precheck-1"),
+                json=payload,
+            )
+            second = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-operation-precheck-2"),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_known_precheck_failure_releases_mutation_target(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="recording_streaming_restore",
+                outcome="denied",
+                messages=(AssistantMessage(body="기능 비활성"),),
+                fallback_reason="feature_disabled",
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="12345678910 2026년 3월 영상 복원",
+            routeGroup="operations",
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-known-failure-1"),
+                json=payload,
+            )
+            second = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-known-failure-2"),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_device_detail_preopen_failure_releases_mutation_target(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_detail",
+                outcome="failed",
+                messages=(AssistantMessage(body="DB 조회 실패"),),
+                fallback_reason="dependency_error",
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 정보",
+            routeGroup="device_detail",
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-detail-preopen-1"),
+                json=payload,
+            )
+            second = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-detail-preopen-2"),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_device_detail_failure_after_ssh_open_attempt_stays_sticky(
+        self,
+    ) -> None:
+        result = CompanyAssistantResult(
+            route="device_detail",
+            outcome="failed",
+            messages=(AssistantMessage(body="SSH open 결과 불명"),),
+            fallback_reason="dependency_error",
+        )
+
+        class _SshOpenFailureRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+            ) -> CompanyAssistantResult:
+                from boxer_company.routers.mda_graphql import (
+                    _open_mda_device_ssh,
+                )
+
+                self.requests.append(request)
+                self.stages.append(stage)
+                try:
+                    _open_mda_device_ssh(
+                        "MB2-C00419",
+                        host="private-ssh-host",
+                    )
+                except TimeoutError:
+                    pass
+                return result
+
+        runtime = _SshOpenFailureRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 정보",
+            routeGroup="device_detail",
+        )
+
+        with patch(
+            "boxer_company.routers.mda_graphql._get_mda_access_token",
+            return_value="access-token",
+        ), patch(
+            "boxer_company.routers.mda_graphql._execute_mda_graphql_request",
+            side_effect=TimeoutError("result unknown"),
+        ):
+            with TestClient(app) as client:
+                first = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-detail-open-1"),
+                    json=payload,
+                )
+                blocked = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-detail-open-2"),
+                    json=payload,
+                )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.json()["code"], "operation_in_progress")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_device_detail_auth_failure_before_ssh_open_releases_target(
+        self,
+    ) -> None:
+        result = CompanyAssistantResult(
+            route="device_detail",
+            outcome="failed",
+            messages=(AssistantMessage(body="MDA 인증 실패"),),
+            fallback_reason="dependency_error",
+        )
+
+        class _SshAuthFailureRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+            ) -> CompanyAssistantResult:
+                from boxer_company.routers.mda_graphql import (
+                    _open_mda_device_ssh,
+                )
+
+                self.requests.append(request)
+                self.stages.append(stage)
+                try:
+                    _open_mda_device_ssh(
+                        "MB2-C00419",
+                        host="private-ssh-host",
+                    )
+                except TimeoutError:
+                    pass
+                return result
+
+        runtime = _SshAuthFailureRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 정보",
+            routeGroup="device_detail",
+        )
+
+        with patch(
+            "boxer_company.routers.mda_graphql._get_mda_access_token",
+            side_effect=TimeoutError("auth unavailable"),
+        ):
+            with TestClient(app) as client:
+                first = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-detail-auth-1"),
+                    json=payload,
+                )
+                second = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-detail-auth-2"),
+                    json=payload,
+                )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+
     def test_route_group_executes_only_the_requested_runtime_stage(
         self,
     ) -> None:
@@ -169,6 +846,377 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["code"], "validation_failed")
         self.assertEqual(runtime.requests, [])
+
+    def test_freeform_route_group_runs_only_freeform_stage(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="company_freeform",
+                outcome="answered",
+                messages=(AssistantMessage(body="일반 답변"),),
+                used_llm=True,
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(
+                    question="오늘 기분 어때?",
+                    routeGroup="freeform",
+                ),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["route"], "company_freeform")
+        self.assertEqual(runtime.stages, ["freeform"])
+        self.assertEqual(
+            runtime.requests[0].metadata["route_group"],
+            "freeform",
+        )
+
+    def test_health_and_fun_route_groups_share_only_freeform_runtime_stage(
+        self,
+    ) -> None:
+        # wire routeGroup은 관찰·matcher 경계로 보존하고 실제 route graph는
+        # provider-backed freeform stage 하나만 실행한다.
+        cases = (
+            ("health", "company_llm_health", "available", False),
+            ("fun", "company_team_fun", "배포도 쉽지 모대?", True),
+        )
+        for route_group, route_name, body, used_llm in cases:
+            with self.subTest(route_group=route_group):
+                runtime = _FakeRuntime(
+                    CompanyAssistantResult(
+                        route=route_name,
+                        outcome="answered",
+                        messages=(AssistantMessage(body=body),),
+                        used_llm=used_llm,
+                    )
+                )
+                app = create_company_api_app(
+                    settings=_settings(),
+                    assistant_runtime=runtime,
+                    readiness_probe=lambda: True,
+                )
+
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(
+                            request_id=f"req-{route_group}-route"
+                        ),
+                        json=_payload(
+                            question=(
+                                "ping"
+                                if route_group == "health"
+                                else "배포도 쉽지 모대"
+                            ),
+                            routeGroup=route_group,
+                        ),
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["route"], route_name)
+                self.assertEqual(runtime.stages, ["freeform"])
+                self.assertEqual(
+                    runtime.requests[0].metadata["route_group"],
+                    route_group,
+                )
+
+    def test_device_detail_requires_probe_and_open_capabilities_before_runtime(
+        self,
+    ) -> None:
+        # 단일 turn이 probe와 필요 시 tunnel open까지 수행하므로 어느 한
+        # 권한이라도 빠지면 runtime 호출 전에 거절해야 한다.
+        for capabilities in (
+            ("assistant.turn.read",),
+            ("assistant.turn.read", "assistant.device.probe"),
+            ("assistant.turn.read", "assistant.device.ssh.open"),
+        ):
+            with self.subTest(capabilities=capabilities):
+                runtime = _FakeRuntime()
+                app = create_company_api_app(
+                    settings=_settings(capabilities=capabilities),
+                    assistant_runtime=runtime,
+                    readiness_probe=lambda: True,
+                )
+
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(),
+                        json=_payload(routeGroup="device_detail"),
+                    )
+
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(
+                    response.json()["code"],
+                    "caller_not_allowed",
+                )
+                self.assertEqual(runtime.requests, [])
+                self.assertEqual(runtime.stages, [])
+
+    def test_device_detail_maps_to_structured_and_preserves_wire_scope(
+        self,
+    ) -> None:
+        # transport의 별도 권한·관찰 범위는 device_detail로 유지하면서
+        # 회사 runtime에는 기존 structured stage로 안전하게 연결한다.
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_detail",
+                outcome="answered",
+                messages=(AssistantMessage(body="장비 상세 결과"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with patch(
+            "boxer_company_api.app.emit_api_event"
+        ) as emit_api_event:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_payload(routeGroup="device_detail"),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["route"], "device_detail")
+        self.assertEqual(runtime.stages, ["structured"])
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(
+            runtime.requests[0].metadata["route_group"],
+            "device_detail",
+        )
+        completed_events = [
+            call
+            for call in emit_api_event.call_args_list
+            if call.args == ("company_api_turn_completed",)
+        ]
+        self.assertEqual(len(completed_events), 1)
+        self.assertEqual(
+            completed_events[0].kwargs["route_group"],
+            "device_detail",
+        )
+
+    def test_operations_requires_execute_capability_before_runtime(
+        self,
+    ) -> None:
+        # 기본 turn read 권한만으로는 mutation stage를 실행할
+        # 수 없고 runtime 진입 전에 fail-closed한다.
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(routeGroup="operations"),
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "caller_not_allowed")
+        self.assertEqual(runtime.requests, [])
+        self.assertEqual(runtime.stages, [])
+
+    def test_operations_capability_runs_only_operations_stage(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_update_operation",
+                outcome="answered",
+                messages=(AssistantMessage(body="작업 접수"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(routeGroup="operations"),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["route"], "device_update_operation")
+        self.assertEqual(runtime.stages, ["operations"])
+        self.assertEqual(
+            runtime.requests[0].metadata["route_group"],
+            "operations",
+        )
+
+    def test_success_persists_central_api_request_log_best_effort(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="barcode_query",
+                outcome="answered",
+                messages=(AssistantMessage(body="조회 결과"),),
+            )
+        )
+        with patch(
+            "boxer_company_api.app._ensure_request_log_schema"
+        ), patch(
+            "boxer_company_api.app._save_request_log_record"
+        ) as save_request_log:
+            app = create_company_api_app(
+                settings=_settings(request_log_enabled=True),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_payload(routeGroup="barcode"),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        save_request_log.assert_called_once()
+        record = save_request_log.call_args.args[0]
+        self.assertEqual(record["sourcePlatform"], "slack")
+        self.assertEqual(record["workspaceId"], "TENANT-1")
+        self.assertEqual(record["channelId"], "C01")
+        self.assertEqual(record["messageId"], _REQUEST_ID)
+        self.assertEqual(record["routeName"], "barcode_query")
+        self.assertEqual(record["status"], "answered")
+        self.assertEqual(record["replyCount"], 1)
+
+    def test_request_log_failure_latches_readiness_after_success_response(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="barcode_query",
+                outcome="answered",
+                messages=(AssistantMessage(body="조회 결과"),),
+            )
+        )
+        with patch(
+            "boxer_company_api.app._ensure_request_log_schema"
+        ), patch(
+            "boxer_company_api.app._save_request_log_record",
+            side_effect=RuntimeError("secret-must-not-leak"),
+        ), patch("boxer_company_api.app.emit_api_event") as emit_api_event:
+            app = create_company_api_app(
+                settings=_settings(request_log_enabled=True),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_payload(routeGroup="barcode"),
+                )
+                readiness = client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(readiness.status_code, 503)
+        failed_events = [
+            call
+            for call in emit_api_event.call_args_list
+            if call.args == ("company_api_request_log_persist_failed",)
+        ]
+        self.assertEqual(len(failed_events), 1)
+        self.assertEqual(failed_events[0].kwargs["error_type"], "RuntimeError")
+
+    def test_request_log_schema_failure_blocks_startup_readiness(self) -> None:
+        with patch(
+            "boxer_company_api.app._ensure_request_log_schema",
+            side_effect=OSError("raw-path-must-not-leak"),
+        ), patch("boxer_company_api.app.emit_api_event") as emit_api_event:
+            app = create_company_api_app(
+                settings=_settings(request_log_enabled=True),
+                assistant_runtime=_FakeRuntime(),
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                readiness = client.get("/health/ready")
+
+        self.assertEqual(readiness.status_code, 503)
+        startup_events = [
+            call
+            for call in emit_api_event.call_args_list
+            if call.args == ("company_api_request_log_startup_failed",)
+        ]
+        self.assertEqual(len(startup_events), 1)
+        self.assertEqual(startup_events[0].kwargs["error_type"], "OSError")
+
+    def test_operations_request_log_does_not_copy_sensitive_question(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="app_user_lookup",
+                outcome="answered",
+                messages=(
+                    AssistantMessage(
+                        body="민감 조회 결과",
+                        delivery_scope="requester",
+                    ),
+                ),
+            )
+        )
+        question = "12345678910 유저 전화번호 조회"
+
+        with patch(
+            "boxer_company_api.app._ensure_request_log_schema"
+        ), patch(
+            "boxer_company_api.app._save_request_log_record"
+        ) as save_request_log:
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=(
+                        "assistant.turn.read",
+                        "assistant.operation.execute",
+                    ),
+                    request_log_enabled=True,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_payload(
+                        question=question,
+                        routeGroup="operations",
+                    ),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        record = save_request_log.call_args.args[0]
+        self.assertEqual(record["requestText"], "[민감 operations 요청]")
+        self.assertNotIn(question, str(record))
 
     def test_long_message_is_windowed_at_client_contract_boundary(
         self,
@@ -264,7 +1312,9 @@ class CompanyApiContractTests(unittest.TestCase):
         deserialized = _deserialize_result(response, _REQUEST_ID)
         self.assertEqual(deserialized.route, "barcode_log_analysis")
 
-    def test_exposes_only_internal_turn_and_health_endpoints(self) -> None:
+    def test_exposes_only_internal_assistant_and_health_endpoints(
+        self,
+    ) -> None:
         runtime = _FakeRuntime()
         app = create_company_api_app(
             settings=_settings(),
@@ -284,6 +1334,7 @@ class CompanyApiContractTests(unittest.TestCase):
                 "/health/live",
                 "/health/ready",
                 "/internal/v1/assistant/turns",
+                "/internal/v1/automation/cycles",
             },
         )
         with TestClient(app) as client:
@@ -342,6 +1393,31 @@ class CompanyApiContractTests(unittest.TestCase):
                 },
             },
         )
+
+    @patch(
+        "boxer_company_api.app.company_api_local_readiness",
+        return_value=False,
+    )
+    def test_readiness_fails_closed_when_local_automation_state_is_unsafe(
+        self,
+        _local_readiness: Any,
+    ) -> None:
+        # dependency path나 credential 원문은 응답하지 않고 공통 503만 낸다.
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=_FakeRuntime(),
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.get(
+                "/health/ready",
+                headers={"X-Request-ID": _REQUEST_ID},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "service_not_ready")
+        self.assertNotIn("automation", response.text)
 
     def test_not_ready_uses_problem_json_without_configuration_detail(self) -> None:
         app = create_company_api_app(

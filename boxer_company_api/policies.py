@@ -23,6 +23,13 @@ _CHANNEL_CONTEXT_SOURCES = {
     "api": frozenset(),
 }
 _TURN_CAPABILITY = "assistant.turn.read"
+_DEVICE_PROBE_CAPABILITY = "assistant.device.probe"
+_DEVICE_SSH_OPEN_CAPABILITY = "assistant.device.ssh.open"
+_OPERATION_EXECUTE_CAPABILITY = "assistant.operation.execute"
+_DEVICE_HEALTH_ALERT_EXECUTE_CAPABILITY = (
+    "assistant.device.alert.execute"
+)
+_AUTOMATION_EXECUTE_CAPABILITY = "assistant.automation.execute"
 
 
 def validate_request_id(value: str | None) -> str:
@@ -73,6 +80,36 @@ def authorize_turn(
         principal.capabilities,
     ):
         _raise_not_allowed(request_id)
+    if turn.routeGroup == "device_detail" and any(
+        not _matches_scope(capability, principal.capabilities)
+        for capability in (
+            _DEVICE_PROBE_CAPABILITY,
+            _DEVICE_SSH_OPEN_CAPABILITY,
+        )
+    ):
+        # 이 assistant turn 하나가 MDA/SSH probe와 필요 시 tunnel open까지
+        # 수행하므로 두 장비 권한을 모두 가진 caller만 진입시킨다.
+        _raise_not_allowed(request_id)
+    if turn.routeGroup == "operations" and not _matches_scope(
+        _OPERATION_EXECUTE_CAPABILITY,
+        principal.capabilities,
+    ):
+        # 작업 stage는 조회 capability로 우회할 수 없고,
+        # mutation 실행을 명시적으로 허용한 caller만 받는다.
+        _raise_not_allowed(request_id)
+    operation_action_name = str(
+        getattr(turn.operationAction, "name", "") or ""
+    ).strip()
+    if (
+        operation_action_name.startswith("device_health_alert_")
+        and not _matches_scope(
+            _DEVICE_HEALTH_ALERT_EXECUTE_CAPABILITY,
+            principal.capabilities,
+        )
+    ):
+        # 일반 operations 권한만으로 기존 Slack 알림 카드의 MDA/SMS
+        # mutation을 만들 수 없게 별도 capability를 한 번 더 요구한다.
+        _raise_not_allowed(request_id)
     if not _matches_scope(turn.tenantId, principal.tenant_ids):
         _raise_not_allowed(request_id)
     if not _matches_scope(turn.channel, principal.channels):
@@ -98,6 +135,25 @@ def authorize_turn(
     return principal
 
 
+def authorize_automation_cycle(
+    principal: CallerPrincipal,
+    tenant_id: str,
+    request_id: str | None = None,
+) -> CallerPrincipal:
+    """사람 actor를 가장하지 않는 Slack scheduler caller를 별도로 검증한다."""
+
+    if not _matches_scope(
+        _AUTOMATION_EXECUTE_CAPABILITY,
+        principal.capabilities,
+    ):
+        _raise_not_allowed(request_id)
+    if not _matches_scope(tenant_id, principal.tenant_ids):
+        _raise_not_allowed(request_id)
+    if not _matches_scope("slack", principal.channels):
+        _raise_not_allowed(request_id)
+    return principal
+
+
 def _matches_scope(value: str, allowed: frozenset[str]) -> bool:
     return "*" in allowed or value in allowed
 
@@ -111,6 +167,7 @@ def _raise_not_allowed(request_id: str | None) -> None:
 
 
 __all__ = [
+    "authorize_automation_cycle",
     "authorize_turn",
     "validate_request_id",
     "validate_traceparent",

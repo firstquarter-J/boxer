@@ -1921,6 +1921,166 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             base_access_checker,
         )
 
+    def test_sms_drain_only_mode_starts_without_db_or_slack_client(self) -> None:
+        app = Mock(spec=[])
+        api_client = Mock()
+        logger = logging.getLogger("test.device_health_monitor.sms_drain")
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
+            patch.object(reporter.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", False),
+            patch.object(reporter.cs, "SMS_DELIVERY_REPORTER_ENABLED", True),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", False),
+            patch.object(
+                reporter,
+                "attach_sms_delivery_reporter",
+            ) as attach_sms_mock,
+            patch.object(
+                reporter,
+                "_attach_device_health_monitor_alert_actions",
+            ) as attach_actions_mock,
+        ):
+            reporter.attach_device_health_monitor_reporter(
+                app,
+                logger=logger,
+                sms_delivery_automation_client=api_client,
+            )
+
+        attach_sms_mock.assert_called_once_with(
+            logger=logger,
+            automation_client=api_client,
+        )
+        attach_actions_mock.assert_not_called()
+
+    def test_remote_health_without_action_bridge_never_registers_legacy_path(
+        self,
+    ) -> None:
+        app = Mock()
+        app.client = object()
+        health_api_client = Mock()
+        logger = logging.getLogger("test.device_health_monitor.bridge_guard")
+        base_access_checker = Mock(return_value=True)
+        running_thread = Mock()
+        running_thread.is_alive.return_value = True
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
+            patch.object(reporter.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", False),
+            patch.object(reporter.cs, "SMS_DELIVERY_REPORTER_ENABLED", False),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", False),
+            patch.object(
+                reporter,
+                "_DEVICE_HEALTH_MONITOR_THREAD",
+                running_thread,
+            ),
+            patch.object(
+                reporter,
+                "attach_sms_delivery_reporter",
+            ) as attach_sms_mock,
+            patch.object(
+                reporter,
+                "_attach_device_health_monitor_alert_actions",
+            ) as attach_actions_mock,
+        ):
+            reporter.attach_device_health_monitor_reporter(
+                app,
+                logger=logger,
+                base_access_checker=base_access_checker,
+                action_api_bridge=None,
+                automation_client=health_api_client,
+                sms_delivery_automation_client=None,
+            )
+
+        # health remote의 bridge 누락은 callback 내부에서도 fail-closed하고,
+        # 별도 sms cycle은 allowlist 밖이므로 로컬 경로를 유지한다.
+        attach_actions_mock.assert_called_once_with(
+            app,
+            logger,
+            base_access_checker,
+            None,
+            require_action_api_bridge=True,
+        )
+        attach_sms_mock.assert_called_once_with(
+            logger=logger,
+            automation_client=None,
+        )
+
+    def test_remote_health_callback_without_bridge_executes_zero_legacy_actions(
+        self,
+    ) -> None:
+        body = {
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "1.001"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+                    "value": "{}",
+                }
+            ],
+        }
+        rejected = {"result": {"status": "remote_unavailable", "ok": False}}
+
+        with (
+            patch.object(
+                reporter,
+                "_reject_device_health_monitor_remote_action_unavailable",
+                return_value=rejected,
+            ) as reject_mock,
+            patch.object(
+                reporter,
+                "_handle_device_health_monitor_alert_action",
+            ) as legacy_action_mock,
+        ):
+            result = reporter._handle_device_health_monitor_slack_action(
+                body,
+                Mock(),
+                logging.getLogger("test.device_health_monitor.callback_guard"),
+                action_api_bridge=None,
+                require_action_api_bridge=True,
+            )
+
+        self.assertEqual(result, rejected)
+        reject_mock.assert_called_once()
+        legacy_action_mock.assert_not_called()
+
+    def test_remote_notification_shared_attach_does_not_require_local_db(
+        self,
+    ) -> None:
+        app = Mock()
+        app.client = object()
+        notification_api_client = Mock()
+        logger = logging.getLogger(
+            "test.device_health_monitor.remote_notification_attach"
+        )
+        checker = Mock(return_value=True)
+
+        with (
+            patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
+            patch.object(reporter.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", True),
+            patch.object(reporter.cs, "SMS_DELIVERY_REPORTER_ENABLED", False),
+            patch.object(reporter.s, "DB_QUERY_ENABLED", False),
+            patch.object(reporter, "attach_sms_delivery_reporter"),
+            patch.object(
+                reporter,
+                "_attach_device_health_monitor_alert_actions",
+            ) as attach_actions_mock,
+        ):
+            reporter.attach_device_health_monitor_reporter(
+                app,
+                logger=logger,
+                base_access_checker=checker,
+                notification_automation_client=notification_api_client,
+            )
+
+        attach_actions_mock.assert_called_once_with(
+            app,
+            logger,
+            checker,
+            None,
+            require_action_api_bridge=True,
+        )
+
     def test_device_action_rechecks_current_actor_and_workspace_before_side_effect(self) -> None:
         app = _FakeBoltActionApp()
         logger = logging.getLogger("test.device_health_monitor.action_access")
@@ -1949,6 +2109,58 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         ack.assert_called_once_with()
         checker.assert_called_once_with("T_TEST", "U_ACTOR")
         action_mock.assert_called_once_with(body, client, logger)
+
+    def test_remote_action_without_api_bridge_fails_closed_with_safe_reply(self) -> None:
+        app = _FakeBoltActionApp()
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.remote_bridge_missing")
+        checker = Mock(return_value=True)
+        reporter._attach_device_health_monitor_alert_actions(
+            app,
+            logger,
+            checker,
+            action_api_bridge=None,
+            require_action_api_bridge=True,
+        )
+        handler = app.actions[reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE]
+        ack = Mock()
+        body = {
+            "team": {"id": "T_TEST"},
+            "user": {"id": "U_ACTOR"},
+            "channel": {"id": "C_HEALTH"},
+            "message": {"ts": "3000.001"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+                    "value": json.dumps(
+                        {
+                            "hospital": "#69 테스트병원",
+                            "room": "1진료실",
+                            "device": "MB2-C1",
+                            "issue": "LED 오류",
+                        }
+                    ),
+                }
+            ],
+        }
+
+        with (
+            patch.object(
+                reporter,
+                "_dispatch_device_health_monitor_voice_guide",
+            ) as legacy_voice,
+            patch.object(
+                reporter,
+                "_post_device_health_monitor_action_webhook",
+            ) as legacy_webhook,
+        ):
+            handler(ack, body, client)
+
+        ack.assert_called_once_with()
+        legacy_voice.assert_not_called()
+        legacy_webhook.assert_not_called()
+        self.assertEqual(len(client.messages), 1)
+        self.assertIn("요청을 실행하지 않았어", client.messages[0]["text"])
 
     def test_device_action_missing_denied_or_failed_checker_has_zero_side_effect(self) -> None:
         body = {
@@ -2187,6 +2399,284 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             message_block["element"]["initial_value"],
         )
         self.assertIn("\n\n", message_block["element"]["initial_value"])
+
+    def test_remote_contact_action_prepares_typed_modal_without_local_db_lookup(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.remote_contact_prepare")
+        bridge = Mock()
+        app = _FakeBoltActionApp()
+        checker = Mock(return_value=True)
+        reporter._attach_device_health_monitor_alert_actions(
+            app,
+            logger,
+            checker,
+            bridge,
+        )
+        handler = app.actions[reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL]
+        ack = Mock()
+        bridge.prepare_sms.return_value = Mock(
+            operation_result={
+                "kind": "sms_contact_preparation",
+                "deliveryScope": "requester",
+                "phoneNumber": "01098765432",
+                "message": "API가 준비한 병원 안내 문자",
+                "templateId": "captureboard_disconnected",
+                "target": {
+                    "hospital": "수지미래산부인과의원(용인)",
+                    "room": "1진료실",
+                    "device": "MB2-C00043",
+                    "components": ["캡처보드"],
+                    "issue": "캡처보드 연결 오류",
+                },
+            }
+        )
+        item = {
+            "hospitalSeq": "69",
+            "hospitalName": "수지미래산부인과의원(용인)",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "alertCategory": "video_signal",
+            "problemComponents": ["캡처보드"],
+            "issue": "캡처보드 연결 오류",
+            "mdaUrl": "https://mda.example/device",
+        }
+        body = {
+            "team": {"id": "T_TEST"},
+            "trigger_id": "TRIGGER_REMOTE",
+            "user": {"id": "U123"},
+            "channel": {"id": "C_HEALTH"},
+            "message": {"ts": "3000.010"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                    "action_ts": "3000.011",
+                    "value": json.dumps(item, ensure_ascii=False),
+                }
+            ],
+        }
+
+        with (
+            # remote prepare는 Slack DB를 읽지 않고 API typed requester 결과만 모달에 채운다.
+            patch.object(reporter, "_lookup_device_health_monitor_hospital_contact") as lookup_mock,
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            handler(ack, body, client)
+
+        ack.assert_called_once_with()
+        checker.assert_called_once_with("T_TEST", "U123")
+        lookup_mock.assert_not_called()
+        bridge.prepare_sms.assert_called_once()
+        prepare_kwargs = bridge.prepare_sms.call_args.kwargs
+        self.assertEqual(prepare_kwargs["workspace_id"], "T_TEST")
+        self.assertEqual(prepare_kwargs["actor_user_id"], "U123")
+        self.assertEqual(prepare_kwargs["channel_id"], "C_HEALTH")
+        self.assertEqual(prepare_kwargs["conversation_id"], "3000.010")
+        self.assertTrue(prepare_kwargs["request_id"].startswith("slack-device-alert-"))
+        self.assertEqual(prepare_kwargs["target"].hospital_seq, 69)
+        self.assertEqual(
+            prepare_kwargs["target"].hospital_name,
+            "수지미래산부인과의원(용인)",
+        )
+        self.assertEqual(len(client.views), 1)
+        view = client.views[0]["view"]
+        metadata = json.loads(view["private_metadata"])
+        self.assertEqual(metadata["workspaceId"], "T_TEST")
+        phone_block = next(
+            block
+            for block in view["blocks"]
+            if block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID
+        )
+        message_block = next(
+            block
+            for block in view["blocks"]
+            if block.get("block_id") == reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID
+        )
+        self.assertEqual(phone_block["element"]["initial_value"], "01098765432")
+        self.assertEqual(
+            message_block["element"]["initial_value"],
+            "API가 준비한 병원 안내 문자",
+        )
+
+    def test_remote_voice_action_uses_bridge_once_without_local_mda(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.remote_voice")
+        bridge = Mock()
+        app = _FakeBoltActionApp()
+        checker = Mock(return_value=True)
+        reporter._attach_device_health_monitor_alert_actions(
+            app,
+            logger,
+            checker,
+            bridge,
+        )
+        handler = app.actions[reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE]
+        ack = Mock()
+        bridge.send_voice_guide.return_value = Mock(
+            messages=("API에서 장비 음성 안내 명령을 보냈어",),
+            outcome="answered",
+            operation_result=None,
+        )
+        item = {
+            "hospitalSeq": "69",
+            "hospitalName": "수지미래산부인과의원(용인)",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "alertCategory": "recording",
+            "problemComponents": [],
+            "issue": "녹화 파일 증가 정지가 120초 동안 지속됐어",
+            "mdaUrl": "https://mda.example/device",
+        }
+        body = {
+            "team": {"id": "T_TEST"},
+            "user": {"id": "U123"},
+            "channel": {"id": "C_HEALTH"},
+            "message": {"ts": "3000.020", "thread_ts": "3000.001"},
+            "actions": [
+                {
+                    "action_id": reporter._DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                    "action_ts": "3000.021",
+                    "value": json.dumps(item, ensure_ascii=False),
+                }
+            ],
+        }
+
+        with (
+            # remote action에서는 legacy dispatcher와 MDA helper를 모두 건너뛴다.
+            patch.object(reporter, "_dispatch_device_health_monitor_voice_guide") as local_dispatch_mock,
+            patch.object(reporter, "_get_mda_device_agent_ssh") as mda_lookup_mock,
+            patch.object(reporter, "_send_mda_device_command") as mda_command_mock,
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            handler(ack, body, client)
+
+        ack.assert_called_once_with()
+        checker.assert_called_once_with("T_TEST", "U123")
+        local_dispatch_mock.assert_not_called()
+        mda_lookup_mock.assert_not_called()
+        mda_command_mock.assert_not_called()
+        bridge.send_voice_guide.assert_called_once()
+        voice_kwargs = bridge.send_voice_guide.call_args.kwargs
+        self.assertEqual(voice_kwargs["workspace_id"], "T_TEST")
+        self.assertEqual(voice_kwargs["conversation_id"], "3000.001")
+        self.assertEqual(voice_kwargs["target"].device_name, "MB2-C00043")
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(client.messages[0]["thread_ts"], "3000.001")
+        self.assertEqual(client.messages[0]["text"], "API에서 장비 음성 안내 명령을 보냈어")
+
+    def test_remote_contact_modal_submission_leaves_receipt_storage_to_api(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.device_health_monitor.remote_sms_submit")
+        local_now = datetime(2026, 8, 14, 15, 30, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        bridge = Mock()
+        app = _FakeBoltActionApp()
+        checker = Mock(return_value=True)
+        reporter._attach_device_health_monitor_alert_actions(
+            app,
+            logger,
+            checker,
+            bridge,
+        )
+        handler = app.views[reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_CALLBACK_ID]
+        ack = Mock()
+        bridge.send_sms.return_value = Mock(
+            messages=("API에서 병원 문자 발송을 접수했어",),
+            outcome="answered",
+            operation_result={
+                "kind": "sms_delivery",
+                "deliveryStatus": "accepted",
+                "groupId": "G_REMOTE",
+                "messageId": "M_REMOTE",
+                "acceptedAt": "2026-08-14T06:30:00+00:00",
+                "target": {
+                    "hospital": "수지미래산부인과의원(용인)",
+                    "room": "1진료실",
+                    "device": "MB2-C00043",
+                    "components": ["LED"],
+                    "issue": "LED USB 장치를 찾지 못했어",
+                },
+            },
+        )
+        item = {
+            "hospitalSeq": "69",
+            "hospitalName": "수지미래산부인과의원(용인)",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "alertCategory": "led",
+            "problemComponents": ["LED"],
+            "issue": "LED USB 장치를 찾지 못했어",
+            "mdaUrl": "https://mda.example/device",
+        }
+        body = {
+            "team": {"id": "T_TEST"},
+            "user": {"id": "U999"},
+            "view": {
+                "id": "V_REMOTE",
+                "hash": "HASH_REMOTE",
+                "private_metadata": json.dumps(
+                    {
+                        "actionId": reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+                        "mode": reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MODE_SEND,
+                        "actorUserId": "U123",
+                        "workspaceId": "T_TEST",
+                        "channelId": "C_HEALTH",
+                        "messageTs": "3000.030",
+                        "threadTs": "3000.001",
+                        "item": item,
+                    },
+                    ensure_ascii=False,
+                ),
+                "state": {
+                    "values": {
+                        reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_BLOCK_ID: {
+                            reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_PHONE_ACTION_ID: {
+                                "value": "010-9999-0000",
+                            }
+                        },
+                        reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_BLOCK_ID: {
+                            reporter._DEVICE_HEALTH_MONITOR_SMS_MODAL_MESSAGE_ACTION_ID: {
+                                "value": "병원에 보낼 확정 문자",
+                            }
+                        },
+                    }
+                },
+            },
+        }
+
+        with (
+            # modal submit은 provider와 receipt 저장을 모두 API에 맡긴다.
+            patch.object(reporter, "_lookup_device_health_monitor_hospital_contact") as lookup_mock,
+            patch.object(reporter, "_post_device_health_monitor_action_webhook") as webhook_mock,
+            patch.object(reporter, "_post_device_health_monitor_sms_payload") as sms_payload_mock,
+            patch.object(reporter.requests, "post") as http_post_mock,
+            patch.object(reporter, "_append_device_health_monitor_event"),
+        ):
+            with patch.object(
+                reporter,
+                "_coerce_daily_device_round_now",
+                return_value=local_now,
+            ):
+                handler(ack, body, client)
+
+        ack.assert_called_once_with()
+        checker.assert_called_once_with("T_TEST", "U999")
+        lookup_mock.assert_not_called()
+        webhook_mock.assert_not_called()
+        sms_payload_mock.assert_not_called()
+        http_post_mock.assert_not_called()
+        bridge.send_sms.assert_called_once()
+        send_kwargs = bridge.send_sms.call_args.kwargs
+        self.assertEqual(send_kwargs["workspace_id"], "T_TEST")
+        self.assertEqual(send_kwargs["actor_user_id"], "U999")
+        self.assertEqual(send_kwargs["conversation_id"], "3000.001")
+        self.assertEqual(send_kwargs["phone_number"], "010-9999-0000")
+        self.assertEqual(send_kwargs["message"], "병원에 보낼 확정 문자")
+        self.remember_sms_delivery_mock.assert_not_called()
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(client.messages[0]["thread_ts"], "3000.001")
+        self.assertEqual(client.messages[0]["text"], "API에서 병원 문자 발송을 접수했어")
 
     def test_auto_sms_status_action_opens_confirmation_modal_without_resending(self) -> None:
         client = _FakeSlackClient()

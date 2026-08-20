@@ -4,7 +4,7 @@ import logging
 from types import SimpleNamespace
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 import unittest
 from unittest.mock import patch
 
@@ -31,13 +31,17 @@ from boxer_company_adapter_slack.company_api_rollout import (
     CompanyDeviceApiRolloutService,
     CompanyDeviceDbDetailApiRolloutService,
     CompanyDeviceFilterApiRolloutService,
+    CompanyFreeformApiRolloutService,
     CompanyNotionApiRolloutService,
+    CompanyOperationsApiRolloutService,
     CompanyPlaybookApiRolloutService,
     CompanyRecordingFailureApiRolloutService,
     CompanyStructuredApiRolloutService,
     CompanyWeeklySummaryApiRolloutService,
     wrap_company_device_db_detail_service,
+    wrap_company_freeform_service,
     wrap_company_notion_service,
+    wrap_company_operations_service,
     wrap_company_barcode_freeform_service,
     wrap_company_barcode_timeline_service,
     wrap_company_playbook_service,
@@ -112,10 +116,14 @@ def _settings(
     barcode_timeline_fallback_enabled: bool = False,
     barcode_freeform_mode: str = "local",
     barcode_freeform_fallback_enabled: bool = False,
+    freeform_mode: str = "local",
+    freeform_fallback_enabled: bool = False,
     playbook_mode: str = "local",
     playbook_fallback_enabled: bool = False,
     weekly_summary_mode: str = "local",
     weekly_summary_fallback_enabled: bool = False,
+    operations_mode: str = "local",
+    operations_fallback_enabled: bool = False,
 ) -> SimpleNamespace:
     # rollout 단위 테스트는 transport 설정과 분리해 전환 필드만 고정한다.
     return SimpleNamespace(
@@ -149,12 +157,16 @@ def _settings(
         barcode_freeform_fallback_enabled=(
             barcode_freeform_fallback_enabled
         ),
+        freeform_mode=freeform_mode,
+        freeform_fallback_enabled=freeform_fallback_enabled,
         playbook_mode=playbook_mode,
         playbook_fallback_enabled=playbook_fallback_enabled,
         weekly_summary_mode=weekly_summary_mode,
         weekly_summary_fallback_enabled=(
             weekly_summary_fallback_enabled
         ),
+        operations_mode=operations_mode,
+        operations_fallback_enabled=operations_fallback_enabled,
     )
 
 
@@ -573,7 +585,7 @@ class CompanyApiRolloutTests(unittest.TestCase):
                 )
                 self.assertEqual(local.requests, [])
 
-    def test_remote_unexpected_or_unhandled_route_uses_local(
+    def test_remote_unexpected_or_unhandled_route_fails_closed(
         self,
     ) -> None:
         for remote_result in (
@@ -596,8 +608,17 @@ class CompanyApiRolloutTests(unittest.TestCase):
 
                 returned = wrapped.answer(_request())
 
-                self.assertIs(returned, local.result)
-                self.assertEqual(len(local.requests), 1)
+                # remote cutover 뒤 route drift가 Slack-local Notion/LLM을
+                # 다시 실행하지 않도록 실패 결과만 반환한다.
+                self.assertEqual(returned.outcome, "failed")
+                self.assertIn(
+                    returned.fallback_reason,
+                    {
+                        "company_api_unexpected_route",
+                        "company_api_route_mismatch",
+                    },
+                )
+                self.assertEqual(local.requests, [])
 
     def test_remote_unexpected_denial_does_not_bypass_api_policy(
         self,
@@ -1224,6 +1245,211 @@ class CompanyBarcodeFreeformApiRolloutTests(unittest.TestCase):
         self.assertEqual(api.requests, [request])
 
 
+class CompanyFreeformApiRolloutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.logger = logging.getLogger(
+            f"{__name__}.{self._testMethodName}"
+        )
+        self.logger.handlers.clear()
+        self.logger.addHandler(logging.NullHandler())
+        self.logger.propagate = False
+
+    def _settings(
+        self,
+        mode: str,
+        *,
+        fallback_enabled: bool = False,
+    ) -> SimpleNamespace:
+        return _settings(
+            "local",
+            fallback_enabled=False,
+            freeform_mode=mode,
+            freeform_fallback_enabled=fallback_enabled,
+        )
+
+    def test_local_mode_preserves_existing_slack_chain(self) -> None:
+        local = _FakeLocalService(None)
+        api = _FakeApiClient(
+            _result(route="company_freeform", used_llm=True)
+        )
+
+        wrapped = wrap_company_freeform_service(
+            local,  # type: ignore[arg-type]
+            self._settings("local"),  # type: ignore[arg-type]
+            api,  # type: ignore[arg-type]
+            self.logger,
+        )
+        request = _request("오늘 기분 어때?")
+
+        self.assertIs(wrapped, local)
+        self.assertIsNone(wrapped.answer(request))
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [])
+
+    def test_remote_calls_precedence_and_freeform_api_once(self) -> None:
+        request = _request("오늘 기분 어때?")
+        remote = _result(
+            route="company_freeform",
+            body="좋아. 오늘도 차근차근 해보자.",
+            used_llm=True,
+        )
+        local = _FakeLocalService(None)
+        api = _FakeApiClient(remote)
+        service = CompanyFreeformApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._settings("remote"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        self.assertIs(service.answer(request), remote)
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [request])
+        self.assertEqual(api.route_groups, ["freeform"])
+
+    def test_remote_preserves_prior_knowledge_route_precedence(self) -> None:
+        request = _request("마미박스 초기화 방법 알려줘")
+        prior_result = _result(
+            route="notion_playbook_qa",
+            body="기존 운영 문서 답변",
+        )
+        local = _FakeLocalService(prior_result)
+        api = _FakeApiClient(
+            _result(route="company_freeform", used_llm=True)
+        )
+        service = CompanyFreeformApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._settings("remote"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        self.assertIs(service.answer(request), prior_result)
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [])
+
+    def test_shadow_probes_once_then_continues_legacy_freeform(self) -> None:
+        request = _request("오늘 기분 어때?")
+        local = _FakeLocalService(None)
+        api = _FakeApiClient(
+            _result(route="company_freeform", used_llm=True)
+        )
+        runner = _CapturingShadowRunner()
+        service = CompanyFreeformApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._settings("shadow"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=runner,
+        )
+
+        # None은 outer Slack knowledge handler가 기존 freeform을 딱 한 번
+        # 실행하라는 계약이고 shadow 결과는 사용자에게 반환하지 않는다.
+        self.assertIsNone(service.answer(request))
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [])
+        self.assertEqual(len(runner.tasks), 1)
+
+        runner.tasks[0]()
+
+        self.assertEqual(api.requests, [request])
+        self.assertEqual(api.route_groups, ["freeform"])
+
+    def test_availability_fallback_continues_legacy_freeform_once(self) -> None:
+        request = _request("오늘 기분 어때?")
+        local = _FakeLocalService(None)
+        api = _FakeApiClient(
+            error=CompanyApiAvailabilityError("unavailable")
+        )
+        service = CompanyFreeformApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._settings(
+                "remote",
+                fallback_enabled=True,
+            ),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        self.assertIsNone(service.answer(request))
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [request])
+        self.assertEqual(api.route_groups, ["freeform"])
+
+    def test_operation_request_never_reaches_freeform_api(self) -> None:
+        request = _request("MB2-C00419 PM2 상태 확인해줘")
+        local = _FakeLocalService(None)
+        api = _FakeApiClient(
+            _result(route="company_freeform", used_llm=True)
+        )
+        service = CompanyFreeformApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._settings("remote"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        self.assertIsNone(service.answer(request))
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [])
+
+    def test_remote_rejects_sources_and_side_effect_contracts(self) -> None:
+        request = _request("오늘 기분 어때?")
+        unsafe_results = (
+            (
+                _result(
+                    route="company_freeform",
+                    sources=(
+                        SourceReference(
+                            source_id="unexpected",
+                            title="unexpected",
+                            uri="https://example.invalid/evidence",
+                        ),
+                    ),
+                    used_llm=True,
+                ),
+                "company_api_unexpected_sources",
+            ),
+            (
+                CompanyAssistantResult(
+                    route="company_freeform",
+                    outcome="answered",
+                    messages=(AssistantMessage(body="결과"),),
+                    used_llm=True,
+                    suggested_action=SuggestedAction(
+                        action="unsafe",
+                        label="실행",
+                    ),
+                ),
+                "company_api_unsafe_action",
+            ),
+        )
+        for remote, expected_reason in unsafe_results:
+            with self.subTest(expected_reason=expected_reason):
+                local = _FakeLocalService(None)
+                service = CompanyFreeformApiRolloutService(
+                    local,  # type: ignore[arg-type]
+                    settings=self._settings(
+                        "remote",
+                        fallback_enabled=True,
+                    ),  # type: ignore[arg-type]
+                    api_client=_FakeApiClient(remote),  # type: ignore[arg-type]
+                    logger=self.logger,
+                    shadow_runner=_CapturingShadowRunner(),
+                )
+
+                result = service.answer(request)
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.outcome, "failed")
+                self.assertEqual(result.fallback_reason, expected_reason)
+                self.assertEqual(local.requests, [request])
+
+
 class CompanyRemainingReadApiRolloutTests(unittest.TestCase):
     def setUp(self) -> None:
         self.logger = logging.getLogger(
@@ -1710,30 +1936,35 @@ class CompanyRemainingReadApiRolloutTests(unittest.TestCase):
         self.assertEqual(local.requests, [request])
         self.assertEqual(api.requests, [])
 
-    def test_s3_rollout_requires_an_explicit_date(self) -> None:
+    def test_s3_rollout_routes_undated_needs_input_without_local_retry(
+        self,
+    ) -> None:
         cases = (
             (
                 CompanyRecordingFailureApiRolloutService,
                 "recording_failure_mode",
                 "12345678910 녹화 실패 원인 분석",
-                "12345678910 2026-07-01 녹화 실패 원인 분석",
                 "recording_failure_analysis",
             ),
             (
                 CompanyBarcodeLogApiRolloutService,
                 "barcode_log_mode",
                 "12345678910 로그 분석",
-                "12345678910 2026-07-01 로그 분석",
                 "barcode_log_analysis",
             ),
         )
-        for service_type, mode_key, undated, dated, route in cases:
+        for service_type, mode_key, undated, route in cases:
             with self.subTest(route=route):
                 settings = _settings("local", **{mode_key: "remote"})
-                remote = _result(
+                remote = CompanyAssistantResult(
                     route=route,
-                    body="원격 S3 결과",
-                    used_llm=True,
+                    outcome="needs_input",
+                    messages=(
+                        AssistantMessage(
+                            body="병원명, 병실명, 날짜를 입력해줘"
+                        ),
+                    ),
+                    fallback_reason="scope_required",
                 )
                 local_result = _result(route=route, body="로컬 결과")
                 local = _FakeLocalService(local_result)
@@ -1746,9 +1977,8 @@ class CompanyRemainingReadApiRolloutTests(unittest.TestCase):
                     shadow_runner=_CapturingShadowRunner(),
                 )
 
-                self.assertIs(service.answer(_request(undated)), local_result)
-                self.assertEqual(api.requests, [])
-                self.assertIs(service.answer(_request(dated)), remote)
+                self.assertIs(service.answer(_request(undated)), remote)
+                self.assertEqual(local.requests, [])
                 self.assertEqual(len(api.requests), 1)
 
     def test_barcode_log_shadow_preserves_partial_delivery_once(
@@ -1834,7 +2064,7 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
         self,
     ) -> None:
         local = _FakeLocalService(_result(route="devices_filter"))
-        api = _FakeApiClient(_result(route="device_db_detail"))
+        api = _FakeApiClient(_result(route="device_detail"))
 
         wrapped = wrap_company_device_db_detail_service(
             local,  # type: ignore[arg-type]
@@ -1849,10 +2079,10 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
         self.assertEqual(local.requests, [request])
         self.assertEqual(api.requests, [])
 
-    def test_device_detail_remote_calls_structured_api_once_without_local(
+    def test_device_detail_remote_calls_single_turn_without_local(
         self,
     ) -> None:
-        remote = _result(route="device_db_detail", body="원격 DB 상세")
+        remote = _result(route="device_detail", body="원격 전체 상세")
         local = _FakeLocalService(_result(route="devices_filter"))
         api = _FakeApiClient(remote)
         wrapped = wrap_company_device_db_detail_service(
@@ -1867,21 +2097,29 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
         self.assertIs(wrapped.answer(request), remote)
         self.assertEqual(local.requests, [])
         self.assertEqual(api.requests, [request])
-        self.assertEqual(api.route_groups, ["structured"])
+        self.assertEqual(api.route_groups, ["device_detail"])
 
-    def test_device_detail_count_and_live_queries_remain_local(
+    def test_device_detail_remote_covers_every_non_count_filter(
         self,
     ) -> None:
-        for question in (
-            "MB2-C00419 장비 몇 개야",
-            "MB2-C00419 장비 상태 확인",
-        ):
+        questions = (
+            "deviceSeq=42 devices",
+            "status=ACTIVE 장비 목록",
+            "activeFlag=1 장비 목록",
+            "installFlag=1 장비 목록",
+            "병원=아이사랑산부인과 장비 목록",
+            "병원=아이사랑산부인과 병실=2진료실 장비 목록",
+        )
+        for question in questions:
             with self.subTest(question=question):
-                local_result = _result(route="devices_filter")
-                local = _FakeLocalService(local_result)
-                api = _FakeApiClient(
-                    _result(route="device_db_detail")
+                remote = _result(
+                    route="devices_filter",
+                    body="원격 live-enriched 장비 조회",
                 )
+                local = _FakeLocalService(
+                    _result(route="devices_filter", body="로컬 조회")
+                )
+                api = _FakeApiClient(remote)
                 service = CompanyDeviceDbDetailApiRolloutService(
                     local,  # type: ignore[arg-type]
                     settings=self._device_settings("remote"),  # type: ignore[arg-type]
@@ -1891,21 +2129,59 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
                 )
                 request = _request(question)
 
-                self.assertIs(service.answer(request), local_result)
-                self.assertEqual(local.requests, [request])
-                self.assertEqual(api.requests, [])
+                self.assertIs(service.answer(request), remote)
+                self.assertEqual(local.requests, [])
+                self.assertEqual(api.requests, [request])
+                self.assertEqual(api.route_groups, ["device_detail"])
+
+    def test_device_detail_count_query_remains_on_count_rollout(
+        self,
+    ) -> None:
+        local_result = _result(route="devices_filter")
+        local = _FakeLocalService(local_result)
+        api = _FakeApiClient(_result(route="device_detail"))
+        service = CompanyDeviceDbDetailApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._device_settings("remote"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+        request = _request("MB2-C00419 장비 몇 개야")
+
+        self.assertIs(service.answer(request), local_result)
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [])
+
+    def test_device_detail_live_query_uses_remote_without_local(self) -> None:
+        remote = _result(route="device_detail")
+        local = _FakeLocalService(_result(route="devices_filter"))
+        api = _FakeApiClient(remote)
+        service = CompanyDeviceDbDetailApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._device_settings("remote"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+        request = _request("MB2-C00419 장비 상태 확인")
+
+        self.assertIs(service.answer(request), remote)
+        self.assertEqual(local.requests, [])
+        self.assertEqual(api.requests, [request])
+        self.assertEqual(api.route_groups, ["device_detail"])
 
     def test_device_detail_remote_unsafe_results_fail_closed(
         self,
     ) -> None:
         unsafe_results = (
             (
-                _result(route="device_db_detail", used_llm=True),
+                _result(route="device_detail", used_llm=True),
                 "company_api_unexpected_llm",
             ),
             (
                 _result(
-                    route="device_db_detail",
+                    route="device_detail",
                     sources=(
                         SourceReference(
                             source_id="unexpected",
@@ -1918,7 +2194,7 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
             ),
             (
                 CompanyAssistantResult(
-                    route="device_db_detail",
+                    route="device_detail",
                     outcome="answered",
                     messages=(AssistantMessage(body="결과"),),
                     suggested_action=SuggestedAction(
@@ -1930,7 +2206,7 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
             ),
             (
                 _result(
-                    route="device_db_detail",
+                    route="device_detail",
                     delivery_scope="requester",
                 ),
                 "company_api_unsafe_message_scope",
@@ -1958,11 +2234,70 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
                 self.assertEqual(local.requests, [])
                 self.assertEqual(api.requests, [request])
 
-    def test_device_detail_shadow_compares_existing_devices_filter_once(
+    def test_device_detail_availability_never_replays_local_probe(
+        self,
+    ) -> None:
+        # stale fallback 설정이 남아 있어도 tunnel lifecycle을 가진 Slack
+        # legacy enrichment로 cutover가 되돌아가지 않게 한다.
+        local = _FakeLocalService(_result(route="devices_filter"))
+        api = _FakeApiClient(
+            error=CompanyApiAvailabilityError("service_not_ready")
+        )
+        service = CompanyDeviceDbDetailApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=_settings(
+                "local",
+                device_detail_mode="remote",
+                device_detail_fallback_enabled=True,
+            ),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        result = service.answer(_request("MB2-C00419 장비 정보"))
+
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(
+            result.fallback_reason,
+            "company_api_availability",
+        )
+        self.assertEqual(local.requests, [])
+        self.assertEqual(len(api.requests), 1)
+        self.assertEqual(api.route_groups, ["device_detail"])
+
+    def test_device_detail_ambiguous_turn_never_calls_local(
+        self,
+    ) -> None:
+        request = _request("MB2-C00419 장비 정보")
+        local = _FakeLocalService(_result(route="devices_filter"))
+        api = _FakeApiClient(
+            error=CompanyApiAmbiguousTimeoutError("ambiguous"),
+        )
+        service = CompanyDeviceDbDetailApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=self._device_settings("remote"),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        result = service.answer(request)
+
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(
+            result.fallback_reason,
+            "company_api_ambiguous_timeout",
+        )
+        self.assertEqual(api.requests, [request])
+        self.assertEqual(api.route_groups, ["device_detail"])
+        self.assertEqual(local.requests, [])
+
+    def test_device_detail_shadow_returns_local_without_api_call(
         self,
     ) -> None:
         local_result = _result(route="devices_filter", body="로컬 상세")
-        remote = _result(route="device_db_detail", body="원격 DB 상세")
+        remote = _result(route="device_detail", body="로컬 상세")
         local = _FakeLocalService(local_result)
         api = _FakeApiClient(remote)
         runner = _CapturingShadowRunner()
@@ -1978,12 +2313,8 @@ class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
         self.assertIs(service.answer(request), local_result)
         self.assertEqual(local.requests, [request])
         self.assertEqual(api.requests, [])
-        self.assertEqual(len(runner.tasks), 1)
-
-        runner.tasks[0]()
-
-        self.assertEqual(api.requests, [request])
-        self.assertEqual(api.route_groups, ["structured"])
+        self.assertEqual(api.route_groups, [])
+        self.assertEqual(runner.tasks, [])
 
     def test_weekly_local_wrapper_preserves_legacy_service(self) -> None:
         local = _FakeLocalService(None)
@@ -2478,6 +2809,165 @@ class CompanyStructuredApiRolloutTests(unittest.TestCase):
                         for message in returned.messages
                     )
                 )
+
+
+class CompanyOperationsApiRolloutTests(unittest.TestCase):
+    _ALLOWED_ROUTES = frozenset({"device_update_operation"})
+
+    def setUp(self) -> None:
+        self.logger = logging.getLogger(
+            f"{__name__}.{self._testMethodName}"
+        )
+        self.logger.handlers.clear()
+        self.logger.addHandler(logging.NullHandler())
+        self.logger.propagate = False
+
+    @staticmethod
+    def _matcher(request: CompanyAssistantRequest) -> str | None:
+        return (
+            "device_update_operation"
+            if "업데이트" in request.question
+            else None
+        )
+
+    def _wrap(
+        self,
+        local: _FakeLocalService,
+        api: _FakeApiClient,
+        *,
+        mode: str = "remote",
+        fallback_enabled: bool = False,
+    ) -> Any:
+        return wrap_company_operations_service(
+            local,  # type: ignore[arg-type]
+            _settings(
+                "local",
+                fallback_enabled=False,
+                operations_mode=mode,
+                operations_fallback_enabled=fallback_enabled,
+            ),  # type: ignore[arg-type]
+            api,  # type: ignore[arg-type]
+            self.logger,
+            self._matcher,
+            self._ALLOWED_ROUTES,
+            _CapturingShadowRunner(),
+        )
+
+    def test_local_mode_returns_original_service(self) -> None:
+        local = _FakeLocalService(
+            _result(route="device_update_operation")
+        )
+        api = _FakeApiClient(
+            _result(route="device_update_operation")
+        )
+
+        wrapped = self._wrap(local, api, mode="local")
+
+        self.assertIs(wrapped, local)
+        self.assertIsNotNone(wrapped.answer(_request("장비 업데이트")))
+        self.assertEqual(len(local.requests), 1)
+        self.assertEqual(api.requests, [])
+
+    def test_remote_match_calls_operations_api_once_without_local(
+        self,
+    ) -> None:
+        request = _request("장비 업데이트")
+        remote = _result(
+            route="device_update_operation",
+            delivery_scope="requester",
+        )
+        local = _FakeLocalService(remote)
+        api = _FakeApiClient(remote)
+
+        wrapped = self._wrap(local, api)
+        result = wrapped.answer(request)
+
+        self.assertIsInstance(
+            wrapped,
+            CompanyOperationsApiRolloutService,
+        )
+        self.assertIs(result, remote)
+        self.assertEqual(
+            result.messages[0].delivery_scope,
+            "requester",
+        )
+        self.assertEqual(api.requests, [request])
+        self.assertEqual(api.route_groups, ["operations"])
+        self.assertEqual(local.requests, [])
+
+    def test_non_matching_request_stays_local_without_api(self) -> None:
+        request = _request("장비 정보 보여줘")
+        local_result = _result(route="devices_filter")
+        local = _FakeLocalService(local_result)
+        api = _FakeApiClient(
+            _result(route="device_update_operation")
+        )
+
+        wrapped = self._wrap(local, api)
+
+        self.assertIs(wrapped.answer(request), local_result)
+        self.assertEqual(local.requests, [request])
+        self.assertEqual(api.requests, [])
+
+    def test_remote_errors_never_replay_local_operation(self) -> None:
+        errors = (
+            CompanyApiAvailabilityError("unavailable"),
+            CompanyApiAmbiguousTimeoutError("ambiguous"),
+            CompanyApiPolicyError("policy"),
+            CompanyApiContractError("contract"),
+            RuntimeError("unexpected"),
+        )
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                local = _FakeLocalService(
+                    _result(route="device_update_operation")
+                )
+                api = _FakeApiClient(error=error)
+                wrapped = self._wrap(local, api)
+
+                result = wrapped.answer(_request("장비 업데이트"))
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.outcome, "failed")
+                self.assertEqual(local.requests, [])
+                self.assertEqual(len(api.requests), 1)
+                self.assertEqual(api.route_groups, ["operations"])
+
+    def test_remote_route_mismatch_fails_without_local_fallback(
+        self,
+    ) -> None:
+        local = _FakeLocalService(
+            _result(route="device_update_operation")
+        )
+        api = _FakeApiClient(_result(route="another_operation"))
+        wrapped = self._wrap(local, api)
+
+        result = wrapped.answer(_request("장비 업데이트"))
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(
+            result.fallback_reason,
+            "company_api_unexpected_route",
+        )
+        self.assertEqual(local.requests, [])
+
+    def test_shadow_and_fallback_settings_are_rejected(self) -> None:
+        for mode, fallback_enabled in (
+            ("shadow", False),
+            ("remote", True),
+        ):
+            with self.subTest(
+                mode=mode,
+                fallback_enabled=fallback_enabled,
+            ):
+                with self.assertRaises(CompanyApiContractError):
+                    self._wrap(
+                        _FakeLocalService(None),
+                        _FakeApiClient(),
+                        mode=mode,
+                        fallback_enabled=fallback_enabled,
+                    )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ dependencies = [
   "requests==2.32.3",
 ]
 
+[project.scripts]
+boxer-company-slack-device-health-state = "boxer_company_adapter_slack.device_health_state_migration:main"
+
 [project.urls]
 Repository = "https://github.com/firstquarter-J/boxer"
 

@@ -39,11 +39,20 @@ class SourceReference:
 
 
 @dataclass(frozen=True, slots=True)
+class AssistantLink:
+    """요청자 전용 메시지에만 붙일 수 있는 신뢰된 실행 결과 링크다."""
+
+    label: str
+    uri: str
+
+
+@dataclass(frozen=True, slots=True)
 class AssistantMessage:
     body: str
     delivery_scope: DeliveryScope = "conversation"
     mention_actor: bool = True
     format: Literal["commonmark"] = "commonmark"
+    private_links: tuple[AssistantLink, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,10 +73,14 @@ class CompanyAssistantResult:
     fallback_reason: str | None = None
     suggested_action: SuggestedAction | None = None
     async_job: Mapping[str, Any] | None = None
+    # 실행 receipt는 대화 본문에 섞지 않고 adapter의 후속 추적 저장에만 쓴다.
+    # transport는 route별 고정 schema로 다시 검증해야 한다.
+    operation_result: Mapping[str, Any] | None = None
 
 
 __all__ = [
     "AssistantChannel",
+    "AssistantLink",
     "AssistantMessage",
     "AssistantOutcome",
     "CompanyAssistantRequest",

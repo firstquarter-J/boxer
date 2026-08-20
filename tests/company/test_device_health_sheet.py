@@ -269,6 +269,68 @@ class DeviceHealthSheetTests(unittest.TestCase):
         self.assertEqual(call["json"]["values"][0][12], "")
         self.assertEqual(call["timeout"], 7)
 
+    def test_append_retry_reads_delivery_hash_and_skips_committed_row(self) -> None:
+        class _CommittedTimeoutSession(_FakeAuthorizedSession):
+            def __init__(self) -> None:
+                super().__init__()
+                self.committed_rows: list[list[object]] = []
+                self.post_count = 0
+
+            def get(self, url: str, **kwargs) -> _FakeResponse:
+                self.calls.append({"method": "GET", "url": url, **kwargs})
+                # Sheets B:T 조회와 같은 열 offset으로 방금 반영된 A:T 행을 돌려준다.
+                return _FakeResponse(
+                    {"values": [row[1:20] for row in self.committed_rows]}
+                )
+
+            def post(self, url: str, **kwargs) -> _FakeResponse:
+                self.calls.append({"method": "POST", "url": url, **kwargs})
+                self.post_count += 1
+                self.committed_rows.extend(kwargs["json"]["values"])
+                raise TimeoutError("response lost after append commit")
+
+        session = _CommittedTimeoutSession()
+        detected_at = datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+        item = {
+            "device": "MB2-C00043",
+            "hospitalName": "테스트 병원",
+            "room": "1진료실",
+            "problemComponents": ["LED"],
+            "issue": "LED 이상",
+            "sheetDeliveryId": "device_health_monitor:stable-delivery",
+        }
+
+        with (
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_ENABLED", True),
+            patch.object(
+                device_health_sheet.cs,
+                "DEVICE_HEALTH_SHEET_SPREADSHEET_ID",
+                "spreadsheet-id",
+            ),
+            patch.object(device_health_sheet.cs, "DEVICE_HEALTH_SHEET_TAB_NAME", "현황"),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "response lost"):
+                device_health_sheet._append_device_health_sheet_alerts(
+                    [item],
+                    detected_at=detected_at,
+                    slack_permalink="https://slack.example/stable",
+                    authorized_session=session,
+                )
+            reconciled_count = device_health_sheet._append_device_health_sheet_alerts(
+                [item],
+                detected_at=detected_at,
+                slack_permalink="https://slack.example/stable",
+                authorized_session=session,
+            )
+
+        self.assertEqual(reconciled_count, 0)
+        self.assertEqual(session.post_count, 1)
+        self.assertEqual(len(session.committed_rows), 1)
+        metadata = json.loads(session.committed_rows[0][19])
+        self.assertEqual(metadata["v"], 1)
+        self.assertEqual(len(metadata["d"]), 64)
+        self.assertNotIn(item["sheetDeliveryId"], session.committed_rows[0][19])
+
     def test_loads_only_pending_sms_deliveries_with_group_id(self) -> None:
         device_one = "MB2-C00043"
         issue_one = "캡처보드 이상"

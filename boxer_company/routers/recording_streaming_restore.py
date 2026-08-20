@@ -7,6 +7,9 @@ from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.routers.box_db import _local_zone
+from boxer_company.routers.device_ssh_security import (
+    _mark_company_api_mutation_attempted,
+)
 from boxer_company.routers.mda_graphql import (
     _get_mda_stopped_recording_restore_candidates,
     _restore_mda_stopped_recordings,
@@ -316,6 +319,7 @@ def _request_s3_archive_restore(
 
     # S3 보관 복원은 비동기 작업이라 요청 성공 이후에도 재생 가능 상태까지 시간이 걸린다.
     try:
+        _mark_company_api_mutation_attempted()
         s3_client.restore_object(
             Bucket=bucket,
             Key=key,

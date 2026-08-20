@@ -20,6 +20,7 @@ Repository = "https://github.com/firstquarter-J/boxer"
 
 [project.scripts]
 boxer-company-api = "boxer_company_api.runtime:main"
+boxer-company-api-automation-resolve = "boxer_company_api.automation_recovery:main"
 
 [tool.setuptools]
 packages = ["boxer_company_api"]
