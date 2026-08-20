@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -31,6 +33,7 @@ _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
 _DAILY_DEVICE_ROUND_THREAD_LOCK = threading.Lock()
 _DAILY_DEVICE_ROUND_RUNTIME_STATE: dict[str, Any] = {}
 _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK = threading.Lock()
+_DAILY_DEVICE_ROUND_STATE_LOCK = threading.RLock()
 _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
 _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12000
 _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
@@ -47,6 +50,20 @@ _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_BY_KEY = "autoUpdateBoxPaidUpda
 _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_OVERRIDE_KEY = "autoUpdateBoxOverride"
 _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_AT_KEY = "autoUpdateBoxUpdatedAt"
 _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_BY_KEY = "autoUpdateBoxUpdatedBy"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_CONTROL_KEYS = (
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_OVERRIDE_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_AT_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_BY_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_OVERRIDE_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_UPDATED_AT_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_UPDATED_BY_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_OVERRIDE_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_AT_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_BY_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_OVERRIDE_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_AT_KEY,
+    _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_BY_KEY,
+)
 _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = "device_health_alert_contact_hospital"
 _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
@@ -134,34 +151,60 @@ def _load_daily_device_round_state(
     *,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    path = state_path or _daily_device_round_state_path()
-    runtime_state = _load_daily_device_round_runtime_state()
-    if not path.exists():
-        return runtime_state
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        if logger is not None:
-            logger.warning("일일 장비 순회 상태 파일을 읽지 못했어: %s", path, exc_info=True)
-        return runtime_state
-    state = data if isinstance(data, dict) else {}
-    if runtime_state:
-        merged_state = dict(state)
-        merged_state.update(runtime_state)
-        return merged_state
-    return state
+    with _DAILY_DEVICE_ROUND_STATE_LOCK:
+        path = state_path or _daily_device_round_state_path()
+        runtime_state = _load_daily_device_round_runtime_state()
+        if not path.exists():
+            return runtime_state
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            if logger is not None:
+                logger.warning("일일 장비 순회 상태 파일을 읽지 못했어: %s", path, exc_info=True)
+            return runtime_state
+        state = data if isinstance(data, dict) else {}
+        if runtime_state:
+            merged_state = dict(state)
+            merged_state.update(runtime_state)
+            return merged_state
+        return state
 
 
 def _save_daily_device_round_state(
     state: dict[str, Any],
     state_path: Path | None = None,
 ) -> None:
-    path = state_path or _daily_device_round_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with _DAILY_DEVICE_ROUND_STATE_LOCK:
+        path = state_path or _daily_device_round_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            # 독자가 반쯤 쓰인 제어 상태를 보지 않도록 같은 디렉터리에 완전히
+            # fsync한 임시 파일을 만든 뒤 원자 교체한다.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                json.dump(
+                    state,
+                    temp_file,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                )
+                temp_file.write("\n")
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
 
 def _load_daily_device_round_runtime_state() -> dict[str, Any]:
@@ -186,14 +229,62 @@ def _persist_daily_device_round_state_best_effort(
     *,
     now: datetime | None = None,
     logger: logging.Logger | None = None,
+    preserve_latest_auto_update_controls: bool = False,
 ) -> dict[str, Any]:
-    normalized_state = _remember_daily_device_round_runtime_state(state, now=now)
-    try:
-        _save_daily_device_round_state(normalized_state)
-    except Exception:
-        if logger is not None:
-            logger.warning("일일 장비 순회 상태를 즉시 저장하지 못했어", exc_info=True)
+    with _DAILY_DEVICE_ROUND_STATE_LOCK:
+        normalized_state = _prepare_daily_device_round_state_for_persistence(
+            state,
+            now=now,
+            preserve_latest_auto_update_controls=preserve_latest_auto_update_controls,
+            logger=logger,
+        )
+        try:
+            _save_daily_device_round_state(normalized_state)
+        except Exception:
+            if logger is not None:
+                logger.warning("일일 장비 순회 상태를 즉시 저장하지 못했어", exc_info=True)
+        return _remember_daily_device_round_runtime_state(normalized_state, now=now)
+
+
+def _prepare_daily_device_round_state_for_persistence(
+    state: dict[str, Any],
+    *,
+    now: datetime | None,
+    preserve_latest_auto_update_controls: bool,
+    logger: logging.Logger | None,
+) -> dict[str, Any]:
+    normalized_state = _normalize_daily_device_round_state(state, now=now)
+    if not preserve_latest_auto_update_controls:
+        return normalized_state
+
+    # 라운드는 오래된 전체 snapshot을 들고 있을 수 있으므로 Slack 명령이 가장
+    # 최근에 저장한 override와 변경 메타데이터를 현재 store에서 다시 합친다.
+    latest_state = _load_daily_device_round_state(logger=logger)
+    for key in _DAILY_DEVICE_ROUND_AUTO_UPDATE_CONTROL_KEYS:
+        if key in latest_state:
+            normalized_state[key] = latest_state[key]
+        else:
+            normalized_state.pop(key, None)
     return normalized_state
+
+
+def _persist_daily_device_round_state(
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+    preserve_latest_auto_update_controls: bool = False,
+) -> dict[str, Any]:
+    with _DAILY_DEVICE_ROUND_STATE_LOCK:
+        normalized_state = _prepare_daily_device_round_state_for_persistence(
+            state,
+            now=now,
+            preserve_latest_auto_update_controls=preserve_latest_auto_update_controls,
+            logger=logger,
+        )
+        # 사용자 제어값은 디스크 저장이 성공한 뒤에만 runtime에 반영한다.
+        _save_daily_device_round_state(normalized_state)
+        return _remember_daily_device_round_runtime_state(normalized_state, now=now)
 
 
 def _coerce_daily_device_round_optional_bool(value: Any) -> bool | None:
@@ -334,6 +425,7 @@ def _build_daily_device_round_auto_update_status(
 ) -> dict[str, Any]:
     state_payload = state if isinstance(state, dict) else _load_daily_device_round_state()
     return {
+        "hospitalScope": _daily_device_round_hospital_scope(),
         "agent": _build_daily_device_round_auto_update_target_status("agent", state_payload),
         "boxFree": _build_daily_device_round_auto_update_target_status("box_free", state_payload),
         "boxPaid": _build_daily_device_round_auto_update_target_status("box_paid", state_payload),
@@ -349,17 +441,26 @@ def _set_daily_device_round_auto_update(
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     local_now = _coerce_daily_device_round_now(now)
-    state = _load_daily_device_round_state(logger=logger)
-    override_key, updated_at_key, updated_by_key = _daily_device_round_auto_update_keys(target)
-    next_state = {
-        **state,
-        override_key: bool(enabled),
-        updated_at_key: local_now.isoformat(),
-        updated_by_key: str(user_id or "").strip(),
-    }
-    # 사용자가 직접 켜고 끄는 설정은 저장 실패를 숨기지 말고 호출자에게 알려야 한다.
-    persisted_state = _remember_daily_device_round_runtime_state(next_state, now=local_now)
-    _save_daily_device_round_state(persisted_state)
+    with _DAILY_DEVICE_ROUND_STATE_LOCK:
+        # 서로 다른 대상의 Slack 명령이 동시에 와도 read-modify-write 전체를
+        # 직렬화해서 먼저 저장된 override를 다음 명령이 지우지 않게 한다.
+        state = _load_daily_device_round_state(logger=logger)
+        override_key, updated_at_key, updated_by_key = (
+            _daily_device_round_auto_update_keys(target)
+        )
+        next_state = {
+            **state,
+            override_key: bool(enabled),
+            updated_at_key: local_now.isoformat(),
+            updated_by_key: str(user_id or "").strip(),
+        }
+        # 사용자가 직접 켜고 끄는 설정은 원자 저장이 끝난 뒤에만 runtime에 반영한다.
+        # 실패는 숨기지 않고 호출자에게 전파해 실제 적용값과 응답이 어긋나지 않게 한다.
+        persisted_state = _persist_daily_device_round_state(
+            next_state,
+            now=local_now,
+            logger=logger,
+        )
     return _build_daily_device_round_auto_update_status(persisted_state)
 
 
@@ -385,7 +486,16 @@ def _format_daily_device_round_auto_update_status(status: dict[str, Any]) -> str
     agent_status = status.get("agent") if isinstance(status.get("agent"), dict) else {}
     box_free_status = status.get("boxFree") if isinstance(status.get("boxFree"), dict) else {}
     box_paid_status = status.get("boxPaid") if isinstance(status.get("boxPaid"), dict) else {}
-    lines = ["*데일리 자동 업데이트 설정*"]
+    hospital_scope = str(status.get("hospitalScope") or "").strip()
+    hospital_scope_label = {
+        "all": "전체 병원",
+        "free_barcode": "무료병원",
+        "non_free_barcode": "유료병원",
+    }.get(hospital_scope, "확인 필요")
+    lines = [
+        "*데일리 자동 업데이트 설정*",
+        f"• 순회 범위: *{hospital_scope_label}* (`{hospital_scope or 'unknown'}`)",
+    ]
     lines.extend(_format_daily_device_round_auto_update_target_line(box_free_status))
     lines.extend(_format_daily_device_round_auto_update_target_line(box_paid_status))
     lines.extend(_format_daily_device_round_auto_update_target_line(agent_status))
@@ -1451,6 +1561,7 @@ def _run_daily_device_round_if_due(
             },
             now=local_now,
             logger=logger,
+            preserve_latest_auto_update_controls=True,
         )
         return thread_ts
 
@@ -1488,6 +1599,7 @@ def _run_daily_device_round_if_due(
             ),
             now=local_now,
             logger=logger,
+            preserve_latest_auto_update_controls=True,
         )
 
     def _handle_daily_device_round_progress(event: str, payload: dict[str, Any]) -> None:
@@ -1560,8 +1672,12 @@ def _run_daily_device_round_if_due(
         "powerCounts": report_summary.get("powerCounts"),
     }
     if hospital_seq is None:
-        _remember_daily_device_round_runtime_state(next_state, now=local_now)
-        _save_daily_device_round_state(next_state)
+        _persist_daily_device_round_state(
+            next_state,
+            now=local_now,
+            logger=logger,
+            preserve_latest_auto_update_controls=True,
+        )
         logger.info(
             "Daily device round window paused channel=%s windowKey=%s reason=%s",
             channel_id,
@@ -1622,8 +1738,12 @@ def _run_daily_device_round_if_due(
                 unfurl_links=False,
                 unfurl_media=False,
             )
-    _remember_daily_device_round_runtime_state(next_state, now=local_now)
-    _save_daily_device_round_state(next_state)
+    _persist_daily_device_round_state(
+        next_state,
+        now=local_now,
+        logger=logger,
+        preserve_latest_auto_update_controls=True,
+    )
     logger.info(
         "Posted daily device round channel=%s hospitalSeq=%s hospitalName=%s deviceCount=%s windowKey=%s processed=%s/%s",
         channel_id,

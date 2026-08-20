@@ -171,6 +171,7 @@ class DeviceRoutesDeps:
     send_dm_message: Callable[[str | None, str], bool]
     build_dependency_failure_reply: Callable[[str, Exception], str]
     reply_with_retrieval_synthesis: Callable[..., None]
+    automation_remote: bool = False
 
 
 def _is_device_runtime_configured() -> bool:
@@ -391,6 +392,7 @@ def _extract_daily_device_round_auto_update_control(
     question: str,
 ) -> tuple[str, str] | None:
     normalized = _normalize_daily_device_round_control_question(question)
+    compact = normalized.replace(" ", "")
     if not normalized:
         return None
     if "자동" not in normalized or "업데이트" not in normalized:
@@ -401,31 +403,88 @@ def _extract_daily_device_round_auto_update_control(
     if not (has_agent_target or has_box_target or has_daily_context):
         return None
 
-    # 운영자가 자연어로 켜고 끌 수 있게 하되, 상태 조회는 실행 변경보다 뒤에 둔다.
-    if any(token in normalized for token in ("꺼", "끄", "off", "disable", "비활성", "중단", "멈춰", "정지")):
-        action = "disable"
-    elif any(token in normalized for token in ("켜", "on", "enable", "활성", "재개", "시작")):
-        action = "enable"
-    elif any(token in normalized for token in ("상태", "확인", "조회", "알려", "보여")):
+    status_tokens = (
+        "상태",
+        "확인",
+        "조회",
+        "알려",
+        "보여",
+        "여부",
+        "인지",
+        "어때",
+    )
+    # 질문형의 "켜져/꺼져"와 disable 의미의 "비활성"을 반대 action으로
+    # 잘못 세지 않도록 먼저 action 언급만 분리한다.
+    has_disable_mention = bool(
+        re.search(r"꺼(?!져|짐)|끄|\boff\b|\bdisable\b|비활성|중단|멈춰|정지", normalized)
+    )
+    has_enable_mention = bool(
+        re.search(r"켜(?!져|짐)|\bon\b|\benable\b|(?<!비)활성|재개|시작", normalized)
+    )
+    has_status_request = (
+        any(token in normalized for token in status_tokens)
+        or any(
+            token in compact
+            for token in ("켜져있", "꺼져있", "켜짐", "꺼짐", "되어있", "돼있")
+        )
+        or any(marker in normalized for marker in ("?", "？"))
+    )
+    has_negated_action = bool(
+        re.search(
+            r"(?:안|못|절대)\s*(?:켜|꺼|끄)|"
+            r"(?:켜|꺼|끄).{0,12}(?:안\s*(?:돼|되)|지\s*(?:마|말|않|못))",
+            compact,
+        )
+    )
+
+    # 설정 조회 문장에 들어간 "켜져/꺼져"를 mutation으로 실행하지 않는다.
+    # mutation은 문장 끝의 승인된 짧은 명령형만 허용하고, 부정형·조건형·
+    # 반대 동작 혼합은 추측하지 않고 어느 대상도 바꾸지 않는다.
+    if has_status_request:
         action = "status"
+    elif has_negated_action or (has_disable_mention and has_enable_mention):
+        return "ambiguous", "change"
+    elif has_disable_mention and re.search(
+        r"(?:꺼|끄)(?:\s*(?:줘|주세요|줘요|세요|라|자|기))?$|"
+        r"(?:\boff\b|\bdisable\b)$|"
+        r"(?:비활성(?:화)?|중단|정지)(?:\s*(?:해|해줘|해주세요))?$|"
+        r"멈춰(?:\s*줘)?$",
+        normalized.rstrip(" .!~"),
+    ):
+        action = "disable"
+    elif has_enable_mention and re.search(
+        r"켜(?:\s*(?:줘|주세요|줘요|세요|라|자|기))?$|"
+        r"(?:\bon\b|\benable\b)$|"
+        r"(?<!비)활성(?:화)?(?:\s*(?:해|해줘|해주세요))?$|"
+        r"(?:재개|시작)(?:\s*(?:해|해줘|해주세요))?$",
+        normalized.rstrip(" .!~"),
+    ):
+        action = "enable"
+    elif has_disable_mention or has_enable_mention:
+        return "ambiguous", "change"
     else:
         return None
 
     if action == "status":
         return "all", action
+    has_free_qualifier = "무료" in normalized or "free" in normalized
+    has_paid_qualifier = "유료" in normalized or "paid" in normalized
     if has_agent_target and not has_box_target:
+        if has_free_qualifier or has_paid_qualifier:
+            return "ambiguous", action
         return "agent", action
     if has_box_target and not has_agent_target:
-        # 마미박스는 무료/유료 병원 대상을 따로 켜고 끌 수 있고, 한정어가 없으면 둘 다 바꾼다.
-        has_free_qualifier = "무료" in normalized or "free" in normalized
-        has_paid_qualifier = "유료" in normalized or "paid" in normalized
+        # 마미박스 mutation은 무료/유료 한 대상을 정확히 지정해야 한다.
+        # 기존 무한정 "박스" 명령으로 유료병원까지 함께 켜는 동작은 허용하지 않는다.
         if has_free_qualifier and not has_paid_qualifier:
             return "box_free", action
         if has_paid_qualifier and not has_free_qualifier:
             return "box_paid", action
-        return "box", action
+        if has_free_qualifier and has_paid_qualifier:
+            return "ambiguous", action
+        return "box_qualifier_required", action
     if has_agent_target and has_box_target:
-        return "all", action
+        return "ambiguous", action
     return "unknown", action
 
 
@@ -546,6 +605,19 @@ def _handle_device_routes(
 
     if auto_update_control:
         auto_update_target, auto_update_action = auto_update_control
+        if deps.automation_remote:
+            # remote 자동화의 실행 정본은 API 서버 env라 Slack 로컬 state를
+            # 보여주거나 바꾸면 성공 응답과 실제 장비 동작이 어긋난다.
+            _set_request_log_route(
+                context.payload,
+                "daily device round auto update control remote blocked",
+                handler_type="router",
+            )
+            context.reply(
+                "원격 자동화 모드에서는 자동 업데이트 설정의 정본이 API 서버 "
+                "`.env`야. Slack 명령으로 상태를 확인하거나 바꿀 수 없어"
+            )
+            return True
         try:
             _set_request_log_route(
                 context.payload,
@@ -554,31 +626,25 @@ def _handle_device_routes(
             )
             if auto_update_action == "status":
                 status_payload = _build_daily_device_round_auto_update_status()
-            elif auto_update_target == "unknown":
+            elif auto_update_target == "box_qualifier_required":
                 context.reply(
-                    "자동 업데이트 켜고 끄기는 `박스` 또는 `에이전트` 중 대상을 같이 써줘. "
-                    "마미박스는 `무료`/`유료`를 붙여 병원 대상만 바꿀 수도 있어"
+                    "마미박스 자동 업데이트는 `무료병원` 또는 `유료병원` 중 "
+                    "한 대상을 정확히 써줘"
                 )
                 return True
-            elif auto_update_target in {"all", "box"}:
-                enabled = auto_update_action == "enable"
-                # 마미박스는 무료/유료 두 값을 함께 바꾸고, 전체 지정이면 에이전트도 바꾼다.
-                status_payload = _set_daily_device_round_auto_update(
-                    "box_free",
-                    enabled,
-                    user_id=context.user_id,
+            elif auto_update_target == "ambiguous":
+                context.reply(
+                    "자동 업데이트 설정은 한 번에 한 대상만 바꿀 수 있어. "
+                    "`에이전트`, `마미박스 무료병원`, `마미박스 유료병원` 중 "
+                    "하나씩 나눠서 요청해줘"
                 )
-                status_payload = _set_daily_device_round_auto_update(
-                    "box_paid",
-                    enabled,
-                    user_id=context.user_id,
+                return True
+            elif auto_update_target == "unknown":
+                context.reply(
+                    "자동 업데이트 켜고 끄기는 `에이전트`, `마미박스 무료병원`, "
+                    "`마미박스 유료병원` 중 한 대상을 같이 써줘"
                 )
-                if auto_update_target == "all":
-                    status_payload = _set_daily_device_round_auto_update(
-                        "agent",
-                        enabled,
-                        user_id=context.user_id,
-                    )
+                return True
             else:
                 status_payload = _set_daily_device_round_auto_update(
                     auto_update_target,
@@ -597,7 +663,10 @@ def _handle_device_routes(
             )
         except Exception:
             context.logger.exception("Daily auto update control failed")
-            context.reply("마미박스 자동 업데이트 설정 변경 중 오류가 발생했어. 상태 파일 권한을 확인해줘")
+            context.reply(
+                "데일리 자동 업데이트 설정 변경 중 오류가 발생했어. "
+                "상태 파일 권한을 확인해줘"
+            )
         return True
 
     if _is_missing_barcode_device_download_request(question, barcode):

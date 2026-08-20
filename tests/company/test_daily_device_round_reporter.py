@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -138,6 +139,7 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
     def test_auto_update_status_shows_single_effective_source(self) -> None:
         rendered = reporter._format_daily_device_round_auto_update_status(
             {
+                "hospitalScope": "all",
                 "boxFree": {
                     "label": "마미박스(무료병원)",
                     "enabled": False,
@@ -165,6 +167,7 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
             }
         )
 
+        self.assertIn("순회 범위: *전체 병원* (`all`)", rendered)
         self.assertIn("마미박스(무료병원): *꺼짐* | 기준 `저장 설정`", rendered)
         self.assertIn("마미박스(유료병원): *켜짐* | 기준 `저장 설정`", rendered)
         self.assertIn("에이전트: *켜짐* | 기준 `초기 기본값`", rendered)
@@ -221,6 +224,187 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
         self.assertTrue(saved["autoUpdateBoxPaidOverride"])
         self.assertEqual(saved["autoUpdateBoxPaidUpdatedAt"], local_now.isoformat())
         self.assertEqual(saved["autoUpdateBoxPaidUpdatedBy"], "U123")
+
+    def test_auto_update_save_failure_keeps_file_and_runtime_unchanged(self) -> None:
+        local_now = datetime(2026, 4, 8, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "daily_device_round_state.json"
+            with patch.object(
+                reporter.cs,
+                "DAILY_DEVICE_ROUND_STATE_PATH",
+                str(state_path),
+            ):
+                reporter._set_daily_device_round_auto_update(
+                    "box_paid",
+                    False,
+                    user_id="U_OLD",
+                    now=local_now,
+                )
+                file_before = state_path.read_text(encoding="utf-8")
+                runtime_before = reporter._load_daily_device_round_runtime_state()
+
+                # 저장 실패를 성공처럼 runtime에 먼저 게시하면 다음 라운드가
+                # 오류 응답과 반대로 유료병원 박스를 업데이트할 수 있다.
+                with patch.object(
+                    reporter,
+                    "_save_daily_device_round_state",
+                    side_effect=PermissionError("read only"),
+                ):
+                    with self.assertRaises(PermissionError):
+                        reporter._set_daily_device_round_auto_update(
+                            "box_paid",
+                            True,
+                            user_id="U_NEW",
+                            now=local_now,
+                        )
+
+                self.assertEqual(
+                    state_path.read_text(encoding="utf-8"),
+                    file_before,
+                )
+                self.assertEqual(
+                    reporter._load_daily_device_round_runtime_state(),
+                    runtime_before,
+                )
+
+    def test_round_persistence_preserves_latest_auto_update_controls(self) -> None:
+        local_now = datetime(2026, 4, 8, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "daily_device_round_state.json"
+            with patch.object(
+                reporter.cs,
+                "DAILY_DEVICE_ROUND_STATE_PATH",
+                str(state_path),
+            ):
+                reporter._set_daily_device_round_auto_update(
+                    "box_paid",
+                    False,
+                    user_id="U_OLD",
+                    now=local_now,
+                )
+                stale_round_state = reporter._load_daily_device_round_state()
+                reporter._set_daily_device_round_auto_update(
+                    "box_paid",
+                    True,
+                    user_id="U_NEW",
+                    now=local_now,
+                )
+
+                # 장시간 실행된 라운드의 과거 snapshot을 저장해도 그 사이 들어온
+                # Slack 설정과 변경 메타데이터는 최신 값으로 다시 합쳐야 한다.
+                reporter._persist_daily_device_round_state(
+                    {**stale_round_state, "lastHospitalSeq": 99},
+                    now=local_now,
+                    preserve_latest_auto_update_controls=True,
+                )
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(saved["autoUpdateBoxPaidOverride"])
+        self.assertEqual(saved["autoUpdateBoxPaidUpdatedBy"], "U_NEW")
+        self.assertEqual(saved["lastHospitalSeq"], 99)
+
+    def test_concurrent_auto_update_commands_do_not_lose_each_other(self) -> None:
+        local_now = datetime(2026, 4, 8, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        first_save_started = threading.Event()
+        release_first_save = threading.Event()
+        second_finished = threading.Event()
+        failures: list[BaseException] = []
+
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "daily_device_round_state.json"
+            original_save = reporter._save_daily_device_round_state
+            save_count = 0
+            save_count_lock = threading.Lock()
+
+            def _blocking_first_save(state, state_path_override=None):
+                nonlocal save_count
+                with save_count_lock:
+                    save_count += 1
+                    current_save_count = save_count
+                if current_save_count == 1:
+                    first_save_started.set()
+                    if not release_first_save.wait(timeout=2):
+                        raise TimeoutError("first state save was not released")
+                return original_save(state, state_path_override)
+
+            def _set_target(target: str, user_id: str) -> None:
+                try:
+                    reporter._set_daily_device_round_auto_update(
+                        target,
+                        True,
+                        user_id=user_id,
+                        now=local_now,
+                    )
+                except Exception as exc:  # pragma: no cover - assertion below reports it
+                    failures.append(exc)
+                finally:
+                    if target == "box_paid":
+                        second_finished.set()
+
+            with (
+                patch.object(
+                    reporter.cs,
+                    "DAILY_DEVICE_ROUND_STATE_PATH",
+                    str(state_path),
+                ),
+                patch.object(
+                    reporter,
+                    "_save_daily_device_round_state",
+                    side_effect=_blocking_first_save,
+                ),
+            ):
+                free_thread = threading.Thread(
+                    target=_set_target,
+                    args=("box_free", "U_FREE"),
+                )
+                paid_thread = threading.Thread(
+                    target=_set_target,
+                    args=("box_paid", "U_PAID"),
+                )
+                free_thread.start()
+                self.assertTrue(first_save_started.wait(timeout=2))
+                paid_thread.start()
+                # 첫 transaction이 끝나기 전에는 두 번째 명령이 저장까지 갈 수 없다.
+                self.assertFalse(second_finished.wait(timeout=0.1))
+                release_first_save.set()
+                free_thread.join(timeout=2)
+                paid_thread.join(timeout=2)
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(failures)
+        self.assertFalse(free_thread.is_alive())
+        self.assertFalse(paid_thread.is_alive())
+        self.assertTrue(saved["autoUpdateBoxFreeOverride"])
+        self.assertEqual(saved["autoUpdateBoxFreeUpdatedBy"], "U_FREE")
+        self.assertTrue(saved["autoUpdateBoxPaidOverride"])
+        self.assertEqual(saved["autoUpdateBoxPaidUpdatedBy"], "U_PAID")
+
+    def test_atomic_state_replace_failure_keeps_previous_json(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "daily_device_round_state.json"
+            reporter._save_daily_device_round_state(
+                {"autoUpdateBoxPaidOverride": False},
+                state_path,
+            )
+            file_before = state_path.read_text(encoding="utf-8")
+
+            # replace 직전 실패해도 기존 JSON은 온전히 남고 임시 파일은 정리돼야 한다.
+            with patch.object(
+                reporter.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaises(OSError):
+                    reporter._save_daily_device_round_state(
+                        {"autoUpdateBoxPaidOverride": True},
+                        state_path,
+                    )
+
+            self.assertEqual(state_path.read_text(encoding="utf-8"), file_before)
+            self.assertEqual(list(state_path.parent.glob(f".{state_path.name}.*.tmp")), [])
 
     def test_clears_legacy_fixed_target_self_loop_on_new_window(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")

@@ -1,12 +1,13 @@
 import logging
 import unittest
 from dataclasses import replace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 from boxer_company.assistant import AssistantMessage, CompanyAssistantResult
 from boxer_company_adapter_slack.device_routes import (
     DeviceRoutesContext,
     DeviceRoutesDeps,
+    _extract_daily_device_round_auto_update_control,
     _handle_device_routes,
     _lookup_device_file_scope_from_mda_recovery_root,
     _parse_mda_recovery_alert_text,
@@ -358,37 +359,11 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         self.assertEqual(replies, ["*장비 LED 로그 확인*\n• 결론: 테스트"])
         self.assertEqual(synth_calls, [])
 
-    def test_daily_box_auto_update_enable_command_updates_runtime_setting(self) -> None:
+    def test_daily_box_auto_update_requires_free_or_paid_target(self) -> None:
         replies: list[str] = []
 
         with patch(
             "boxer_company_adapter_slack.device_routes._set_daily_device_round_auto_update",
-            return_value={
-                "boxFree": {
-                    "label": "마미박스(무료병원)",
-                    "enabled": True,
-                    "envDefault": False,
-                    "source": "slack_override",
-                    "updatedAt": "2026-06-17T10:00:00+09:00",
-                    "updatedBy": "U123",
-                },
-                "boxPaid": {
-                    "label": "마미박스(유료병원)",
-                    "enabled": True,
-                    "envDefault": False,
-                    "source": "slack_override",
-                    "updatedAt": "2026-06-17T10:00:00+09:00",
-                    "updatedBy": "U123",
-                },
-                "agent": {
-                    "label": "에이전트",
-                    "enabled": True,
-                    "envDefault": True,
-                    "source": "env",
-                    "updatedAt": "",
-                    "updatedBy": "",
-                },
-            },
         ) as set_auto_update:
             handled = _handle_device_routes(
                 DeviceRoutesContext(
@@ -409,18 +384,65 @@ class DeviceRouteHandlerTests(unittest.TestCase):
             )
 
         self.assertTrue(handled)
-        # 대상 한정어가 없는 마미박스 명령은 무료/유료 두 값을 함께 바꾼다.
-        self.assertEqual(
-            set_auto_update.call_args_list,
-            [
-                call("box_free", True, user_id="U123"),
-                call("box_paid", True, user_id="U123"),
-            ],
-        )
-        self.assertIn("마미박스(무료병원): *켜짐*", replies[0])
-        self.assertIn("마미박스(유료병원): *켜짐*", replies[0])
-        self.assertIn("에이전트: *켜짐*", replies[0])
-        self.assertIn("적용: 다음 데일리 순회부터", replies[0])
+        set_auto_update.assert_not_called()
+        self.assertIn("`무료병원` 또는 `유료병원`", replies[0])
+
+    def test_daily_auto_update_control_parser_is_fail_closed(self) -> None:
+        # 질문형·혼합형·범위가 잘못된 명령은 설정 변경 대상으로 분류하지 않는다.
+        cases = {
+            "마미박스 유료병원 자동 업데이트 켜져 있어?": ("all", "status"),
+            "마미박스 무료병원 자동 업데이트 꺼져 있는지 확인해줘": ("all", "status"),
+            "마미박스 무료병원 자동 업데이트 활성화 여부": ("all", "status"),
+            "마미박스 유료병원 자동 업데이트 비활성화 여부": ("all", "status"),
+            "에이전트 자동 업데이트 활성인지 알려줘": ("all", "status"),
+            "마미박스 무료병원 자동 업데이트 켜": ("box_free", "enable"),
+            "마미박스 유료병원 자동 업데이트 꺼": ("box_paid", "disable"),
+            "에이전트 자동 업데이트 켜": ("agent", "enable"),
+            "마미박스 무료병원 자동 업데이트 켜고 유료병원 자동 업데이트 꺼": (
+                "ambiguous",
+                "change",
+            ),
+            "마미박스 무료병원 자동 업데이트 상태 확인하고 켜": ("all", "status"),
+            "마미박스 무료병원 자동 업데이트 켜지 마": (
+                "ambiguous",
+                "change",
+            ),
+            "마미박스 무료병원 자동 업데이트 안 켜": (
+                "ambiguous",
+                "change",
+            ),
+            "마미박스 무료병원 자동 업데이트 켜면 안 돼": (
+                "ambiguous",
+                "change",
+            ),
+            "마미박스 무료병원 자동 업데이트 끄면 안 돼": (
+                "ambiguous",
+                "change",
+            ),
+            "마미박스 무료병원 자동 업데이트 꺼 두지 마": (
+                "ambiguous",
+                "change",
+            ),
+            "마미박스 무료병원 자동 업데이트 켜 놓지 마": (
+                "ambiguous",
+                "change",
+            ),
+            "에이전트와 박스 자동 업데이트 켜": ("ambiguous", "enable"),
+            "무료병원 에이전트 자동 업데이트 켜": ("ambiguous", "enable"),
+            "박스 자동 업데이트 켜": ("box_qualifier_required", "enable"),
+            "박스 자동 업데이트 꺼": ("box_qualifier_required", "disable"),
+            "마미박스 무료 유료병원 자동 업데이트 켜": (
+                "ambiguous",
+                "enable",
+            ),
+        }
+
+        for question, expected in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(
+                    _extract_daily_device_round_auto_update_control(question),
+                    expected,
+                )
 
     def test_daily_agent_auto_update_disable_command_updates_runtime_setting(self) -> None:
         replies: list[str] = []
@@ -532,7 +554,7 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         set_auto_update.assert_called_once_with("box_paid", True, user_id="U123")
         self.assertIn("마미박스(유료병원): *켜짐*", replies[0])
 
-    def test_daily_box_auto_update_status_command_does_not_change_setting(self) -> None:
+    def test_daily_box_auto_update_question_does_not_change_setting(self) -> None:
         replies: list[str] = []
 
         with (
@@ -571,7 +593,7 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         ):
             handled = _handle_device_routes(
                 DeviceRoutesContext(
-                    question="데일리 자동 업데이트 상태",
+                    question="마미박스 유료병원 자동 업데이트 켜져 있어?",
                     barcode=None,
                     phase2_hospital_name=None,
                     phase2_room_name=None,
@@ -593,6 +615,46 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         self.assertIn("마미박스(무료병원): *꺼짐*", replies[0])
         self.assertIn("마미박스(유료병원): *꺼짐*", replies[0])
         self.assertIn("에이전트: *켜짐*", replies[0])
+
+    def test_daily_auto_update_remote_mode_rejects_local_control(self) -> None:
+        # remote 실행값은 API 서버 env가 정본이므로 local state를 성공처럼
+        # 조회하거나 변경하지 않고 두 요청 모두 같은 방식으로 막는다.
+        for question in (
+            "마미박스 유료병원 자동 업데이트 켜",
+            "데일리 자동 업데이트 상태",
+        ):
+            replies: list[str] = []
+            with (
+                patch(
+                    "boxer_company_adapter_slack.device_routes._build_daily_device_round_auto_update_status"
+                ) as build_status,
+                patch(
+                    "boxer_company_adapter_slack.device_routes._set_daily_device_round_auto_update"
+                ) as set_auto_update,
+            ):
+                handled = _handle_device_routes(
+                    DeviceRoutesContext(
+                        question=question,
+                        barcode=None,
+                        phase2_hospital_name=None,
+                        phase2_room_name=None,
+                        payload=_payload(),  # type: ignore[arg-type]
+                        user_id="U123",
+                        workspace_id="W123",
+                        channel_id="C123",
+                        thread_ts="1.0",
+                        reply=lambda text, **kwargs: replies.append(text),
+                        client=None,
+                        logger=logging.getLogger(__name__),
+                    ),
+                    replace(_deps(), automation_remote=True),
+                )
+
+            with self.subTest(question=question):
+                self.assertTrue(handled)
+                build_status.assert_not_called()
+                set_auto_update.assert_not_called()
+                self.assertIn("정본이 API 서버 `.env`", replies[0])
 
     def test_monthly_streaming_restore_request_bypasses_device_recovery(self) -> None:
         replies: list[str] = []
