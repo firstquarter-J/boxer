@@ -1023,7 +1023,8 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")),
             state={"lastHospitalSeq": 10},
             auto_update_agent=True,
-            auto_update_box=False,
+            auto_update_box_free=False,
+            auto_update_box_paid=False,
         )
 
         self.assertEqual(summary["hospitalSeq"], 20)
@@ -1086,7 +1087,8 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
             state={"lastHospitalSeq": 10},
             auto_update_agent=True,
-            auto_update_box=False,
+            auto_update_box_free=False,
+            auto_update_box_paid=False,
             progress_callback=lambda event, payload: events.append((event, payload)),
         )
 
@@ -1140,7 +1142,8 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
             now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
             state={},
             auto_update_agent=True,
-            auto_update_box=True,
+            auto_update_box_free=True,
+            auto_update_box_paid=False,
         )
 
         self.assertEqual(summary["hospitalSeq"], 20)
@@ -1149,6 +1152,10 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         self.assertEqual(summary["hospitalOrder"], "recordings_month_asc")
         self.assertEqual(summary["updateCounts"]["boxCandidates"], 1)
         self.assertEqual(summary["updateCounts"]["boxUpdated"], 1)
+        self.assertTrue(summary["hospitalFreeBarcode"])
+        self.assertTrue(summary["autoUpdateBox"])
+        self.assertTrue(summary["autoUpdateBoxFree"])
+        self.assertFalse(summary["autoUpdateBoxPaid"])
         mock_load_candidates.assert_called_once_with(
             hospital_scope="free_barcode",
             hospital_order="recordings_month_asc",
@@ -1156,6 +1163,110 @@ class DailyDeviceRoundSummaryTests(unittest.TestCase):
         )
         mock_run_daily_device_round_for_device.assert_called_once_with(
             "MB2-C00001",
+            auto_update_agent=True,
+            auto_update_box=True,
+            auto_cleanup_trashcan=False,
+            auto_power_off=False,
+        )
+
+    @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_devices")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_hospital_candidates")
+    def test_paid_hospital_uses_paid_box_flag_and_keeps_cleanup_power_off_free_only(
+        self,
+        mock_load_candidates,
+        mock_load_devices,
+        mock_run_daily_device_round_for_device,
+    ) -> None:
+        mock_load_candidates.return_value = [
+            {
+                "hospitalSeq": 30,
+                "hospitalName": "유료병원",
+                "isPinkBarcode": None,
+                "deviceCount": 1,
+            },
+        ]
+        mock_load_devices.return_value = [
+            {"deviceName": "MB2-C00010", "hospitalSeq": 30, "hospitalName": "유료병원", "roomName": "1진료실"},
+        ]
+        mock_run_daily_device_round_for_device.return_value = {
+            "overallLabel": "정상",
+            "initialPlan": {"agent": {"shouldUpdate": True}, "box": {"shouldUpdate": False}},
+            "finalPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+            "trashcanCleanup": {"required": False, "executed": False, "status": "disabled"},
+            "agentAction": {"ok": True, "status": "completed"},
+            "boxAction": None,
+        }
+
+        summary = rounder._build_daily_device_round_summary(
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            state={},
+            auto_update_agent=True,
+            auto_update_box_free=True,
+            auto_update_box_paid=False,
+            auto_cleanup_trashcan=True,
+            auto_power_off=True,
+        )
+
+        # 유료병원은 무료병원 플래그가 켜져 있어도 유료 플래그(False)를 적용하고,
+        # 에이전트 업데이트는 병원 구분 없이 실행한다. 휴지통 정리·전원 차단은
+        # 기존 운영 범위인 무료병원에서만 유지한다.
+        self.assertFalse(summary["hospitalFreeBarcode"])
+        self.assertFalse(summary["autoUpdateBox"])
+        self.assertTrue(summary["autoUpdateBoxFree"])
+        self.assertFalse(summary["autoUpdateBoxPaid"])
+        self.assertFalse(summary["autoCleanupTrashCan"])
+        self.assertFalse(summary["autoPowerOff"])
+        mock_run_daily_device_round_for_device.assert_called_once_with(
+            "MB2-C00010",
+            auto_update_agent=True,
+            auto_update_box=False,
+            auto_cleanup_trashcan=False,
+            auto_power_off=False,
+        )
+
+    @patch("boxer_company.daily_device_round._run_daily_device_round_for_device")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_devices")
+    @patch("boxer_company.daily_device_round._load_daily_device_round_hospital_candidates")
+    def test_paid_hospital_runs_box_update_when_paid_flag_enabled(
+        self,
+        mock_load_candidates,
+        mock_load_devices,
+        mock_run_daily_device_round_for_device,
+    ) -> None:
+        mock_load_candidates.return_value = [
+            {
+                "hospitalSeq": 30,
+                "hospitalName": "유료병원",
+                "isPinkBarcode": None,
+                "deviceCount": 1,
+            },
+        ]
+        mock_load_devices.return_value = [
+            {"deviceName": "MB2-C00010", "hospitalSeq": 30, "hospitalName": "유료병원", "roomName": "1진료실"},
+        ]
+        mock_run_daily_device_round_for_device.return_value = {
+            "overallLabel": "정상",
+            "initialPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": True}},
+            "finalPlan": {"agent": {"shouldUpdate": False}, "box": {"shouldUpdate": False}},
+            "trashcanCleanup": {"required": False, "executed": False, "status": "disabled"},
+            "agentAction": None,
+            "boxAction": {"ok": True, "status": "completed"},
+        }
+
+        summary = rounder._build_daily_device_round_summary(
+            now=datetime(2026, 4, 8, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            state={},
+            auto_update_agent=True,
+            auto_update_box_free=False,
+            auto_update_box_paid=True,
+        )
+
+        self.assertFalse(summary["hospitalFreeBarcode"])
+        self.assertTrue(summary["autoUpdateBox"])
+        self.assertEqual(summary["updateCounts"]["boxUpdated"], 1)
+        mock_run_daily_device_round_for_device.assert_called_once_with(
+            "MB2-C00010",
             auto_update_agent=True,
             auto_update_box=True,
             auto_cleanup_trashcan=False,

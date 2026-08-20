@@ -232,6 +232,19 @@ DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT = (
 DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX = (
     os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false").strip().lower() in {"1", "true", "yes", "on"}
 )
+# 마미박스 업데이트는 병원 무료(핑크바코드)/유료 여부로 나눠 켠다. 기존 단일
+# 키는 scope가 무료병원뿐이던 시절 값이라 무료병원 기본값으로만 승계한다.
+DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE = (
+    os.getenv(
+        "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE",
+        os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false"),
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID = (
+    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 DAILY_DEVICE_ROUND_AUTO_POWER_OFF = (
     os.getenv("DAILY_DEVICE_ROUND_AUTO_POWER_OFF", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

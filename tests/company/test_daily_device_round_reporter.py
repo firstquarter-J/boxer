@@ -93,29 +93,63 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
     def test_box_auto_update_override_beats_env_default(self) -> None:
         with (
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", True),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", True),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", True),
         ):
             status = reporter._build_daily_device_round_auto_update_status(
                 {
                     "autoUpdateAgentOverride": False,
-                    "autoUpdateBoxOverride": False,
+                    "autoUpdateBoxFreeOverride": False,
+                    "autoUpdateBoxPaidOverride": False,
                 }
             )
 
         self.assertFalse(status["agent"]["enabled"])
         self.assertTrue(status["agent"]["envDefault"])
         self.assertEqual(status["agent"]["source"], "slack_override")
-        self.assertFalse(status["box"]["enabled"])
-        self.assertTrue(status["box"]["envDefault"])
-        self.assertEqual(status["box"]["source"], "slack_override")
+        self.assertFalse(status["boxFree"]["enabled"])
+        self.assertTrue(status["boxFree"]["envDefault"])
+        self.assertEqual(status["boxFree"]["source"], "slack_override")
+        self.assertFalse(status["boxPaid"]["enabled"])
+        self.assertTrue(status["boxPaid"]["envDefault"])
+        self.assertEqual(status["boxPaid"]["source"], "slack_override")
+
+    def test_legacy_box_override_carries_over_to_free_target_only(self) -> None:
+        # 분리 전 단일 마미박스 override는 무료병원 순회 시절 값이라 무료병원에만 승계된다.
+        with (
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", True),
+        ):
+            status = reporter._build_daily_device_round_auto_update_status(
+                {
+                    "autoUpdateBoxOverride": True,
+                    "autoUpdateBoxUpdatedAt": "2026-08-19T14:36:36+09:00",
+                    "autoUpdateBoxUpdatedBy": "U0629HDSJHG",
+                }
+            )
+
+        self.assertTrue(status["boxFree"]["enabled"])
+        self.assertEqual(status["boxFree"]["source"], "slack_override")
+        self.assertEqual(status["boxFree"]["updatedBy"], "U0629HDSJHG")
+        # 유료병원 값은 legacy override의 영향을 받지 않고 env 기본값을 쓴다.
+        self.assertTrue(status["boxPaid"]["enabled"])
+        self.assertEqual(status["boxPaid"]["source"], "env")
 
     def test_auto_update_status_shows_single_effective_source(self) -> None:
         rendered = reporter._format_daily_device_round_auto_update_status(
             {
-                "box": {
-                    "label": "마미박스",
+                "boxFree": {
+                    "label": "마미박스(무료병원)",
                     "enabled": False,
                     "envDefault": True,
+                    "source": "slack_override",
+                    "updatedAt": "2026-06-30T15:18:44+09:00",
+                    "updatedBy": "U123",
+                },
+                "boxPaid": {
+                    "label": "마미박스(유료병원)",
+                    "enabled": True,
+                    "envDefault": False,
                     "source": "slack_override",
                     "updatedAt": "2026-06-30T15:18:44+09:00",
                     "updatedBy": "U123",
@@ -131,7 +165,8 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("마미박스: *꺼짐* | 기준 `저장 설정`", rendered)
+        self.assertIn("마미박스(무료병원): *꺼짐* | 기준 `저장 설정`", rendered)
+        self.assertIn("마미박스(유료병원): *켜짐* | 기준 `저장 설정`", rendered)
         self.assertIn("에이전트: *켜짐* | 기준 `초기 기본값`", rendered)
         self.assertNotIn(".env `true`", rendered)
         self.assertNotIn(".env `false`", rendered)
@@ -144,10 +179,17 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
             with (
                 patch.object(reporter.cs, "DAILY_DEVICE_ROUND_STATE_PATH", str(state_path)),
                 patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
-                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             ):
                 status = reporter._set_daily_device_round_auto_update(
-                    "box",
+                    "box_free",
+                    True,
+                    user_id="U123",
+                    now=local_now,
+                )
+                status = reporter._set_daily_device_round_auto_update(
+                    "box_paid",
                     True,
                     user_id="U123",
                     now=local_now,
@@ -164,15 +206,21 @@ class DailyDeviceRoundReporterDueTests(unittest.TestCase):
         self.assertFalse(status["agent"]["enabled"])
         self.assertTrue(status["agent"]["envDefault"])
         self.assertEqual(status["agent"]["updatedBy"], "U123")
-        self.assertTrue(status["box"]["enabled"])
-        self.assertFalse(status["box"]["envDefault"])
-        self.assertEqual(status["box"]["updatedBy"], "U123")
+        self.assertTrue(status["boxFree"]["enabled"])
+        self.assertFalse(status["boxFree"]["envDefault"])
+        self.assertEqual(status["boxFree"]["updatedBy"], "U123")
+        self.assertTrue(status["boxPaid"]["enabled"])
+        self.assertFalse(status["boxPaid"]["envDefault"])
+        self.assertEqual(status["boxPaid"]["updatedBy"], "U123")
         self.assertFalse(saved["autoUpdateAgentOverride"])
         self.assertEqual(saved["autoUpdateAgentUpdatedAt"], local_now.isoformat())
         self.assertEqual(saved["autoUpdateAgentUpdatedBy"], "U123")
-        self.assertTrue(saved["autoUpdateBoxOverride"])
-        self.assertEqual(saved["autoUpdateBoxUpdatedAt"], local_now.isoformat())
-        self.assertEqual(saved["autoUpdateBoxUpdatedBy"], "U123")
+        self.assertTrue(saved["autoUpdateBoxFreeOverride"])
+        self.assertEqual(saved["autoUpdateBoxFreeUpdatedAt"], local_now.isoformat())
+        self.assertEqual(saved["autoUpdateBoxFreeUpdatedBy"], "U123")
+        self.assertTrue(saved["autoUpdateBoxPaidOverride"])
+        self.assertEqual(saved["autoUpdateBoxPaidUpdatedAt"], local_now.isoformat())
+        self.assertEqual(saved["autoUpdateBoxPaidUpdatedBy"], "U123")
 
     def test_clears_legacy_fixed_target_self_loop_on_new_window(self) -> None:
         local_tz = ZoneInfo("Asia/Seoul")
@@ -386,7 +434,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
             patch(
@@ -436,7 +485,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "windowThreadChannelId": "",
             },
             auto_update_agent=True,
-            auto_update_box=False,
+            auto_update_box_free=False,
+            auto_update_box_paid=False,
             auto_cleanup_trashcan=True,
             auto_power_off=False,
             progress_callback=ANY,
@@ -563,7 +613,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
@@ -623,7 +674,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch.object(reporter.cs, "DEVICE_HEALTH_MONITOR_ENABLED", True),
@@ -698,7 +750,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 30),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._load_daily_device_round_state",
@@ -829,7 +882,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
@@ -906,7 +960,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", True),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
@@ -993,7 +1048,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
@@ -1104,7 +1160,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", False),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
                 "boxer_company_adapter_slack.daily_device_round_reporter._build_daily_device_round_summary",
@@ -1190,7 +1247,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 5),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", True),
-            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", True),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", True),
+            patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", False),
             patch.object(reporter.cs, "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", False),
             patch(
@@ -1235,7 +1293,8 @@ class DailyDeviceRoundReporterRunTests(unittest.TestCase):
                 "windowThreadChannelId": "",
             },
             auto_update_agent=True,
-            auto_update_box=False,
+            auto_update_box_free=False,
+            auto_update_box_paid=False,
             auto_cleanup_trashcan=False,
             auto_power_off=False,
             progress_callback=ANY,

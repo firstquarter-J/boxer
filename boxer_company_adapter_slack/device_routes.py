@@ -416,6 +416,13 @@ def _extract_daily_device_round_auto_update_control(
     if has_agent_target and not has_box_target:
         return "agent", action
     if has_box_target and not has_agent_target:
+        # 마미박스는 무료/유료 병원 대상을 따로 켜고 끌 수 있고, 한정어가 없으면 둘 다 바꾼다.
+        has_free_qualifier = "무료" in normalized or "free" in normalized
+        has_paid_qualifier = "유료" in normalized or "paid" in normalized
+        if has_free_qualifier and not has_paid_qualifier:
+            return "box_free", action
+        if has_paid_qualifier and not has_free_qualifier:
+            return "box_paid", action
         return "box", action
     if has_agent_target and has_box_target:
         return "all", action
@@ -548,20 +555,30 @@ def _handle_device_routes(
             if auto_update_action == "status":
                 status_payload = _build_daily_device_round_auto_update_status()
             elif auto_update_target == "unknown":
-                context.reply("자동 업데이트 켜고 끄기는 `박스` 또는 `에이전트` 중 대상을 같이 써줘")
+                context.reply(
+                    "자동 업데이트 켜고 끄기는 `박스` 또는 `에이전트` 중 대상을 같이 써줘. "
+                    "마미박스는 `무료`/`유료`를 붙여 병원 대상만 바꿀 수도 있어"
+                )
                 return True
-            elif auto_update_target == "all":
+            elif auto_update_target in {"all", "box"}:
                 enabled = auto_update_action == "enable"
+                # 마미박스는 무료/유료 두 값을 함께 바꾸고, 전체 지정이면 에이전트도 바꾼다.
                 status_payload = _set_daily_device_round_auto_update(
-                    "box",
+                    "box_free",
                     enabled,
                     user_id=context.user_id,
                 )
                 status_payload = _set_daily_device_round_auto_update(
-                    "agent",
+                    "box_paid",
                     enabled,
                     user_id=context.user_id,
                 )
+                if auto_update_target == "all":
+                    status_payload = _set_daily_device_round_auto_update(
+                        "agent",
+                        enabled,
+                        user_id=context.user_id,
+                    )
             else:
                 status_payload = _set_daily_device_round_auto_update(
                     auto_update_target,

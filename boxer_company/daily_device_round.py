@@ -1406,7 +1406,8 @@ def _build_daily_device_round_summary(
     now: datetime | None = None,
     state: dict[str, Any] | None = None,
     auto_update_agent: bool = False,
-    auto_update_box: bool = False,
+    auto_update_box_free: bool = False,
+    auto_update_box_paid: bool = False,
     auto_cleanup_trashcan: bool = False,
     auto_power_off: bool = False,
     progress_callback: _DailyDeviceRoundProgressCallback | None = None,
@@ -1445,7 +1446,9 @@ def _build_daily_device_round_summary(
             "hospitalName": "미선정",
             "deviceCount": 0,
             "autoUpdateAgent": bool(auto_update_agent),
-            "autoUpdateBox": bool(auto_update_box),
+            "autoUpdateBox": bool(auto_update_box_free or auto_update_box_paid),
+            "autoUpdateBoxFree": bool(auto_update_box_free),
+            "autoUpdateBoxPaid": bool(auto_update_box_paid),
             "hospitalScope": hospital_scope,
             "hospitalCandidateScope": hospital_scope_label,
             "hospitalOrder": hospital_order,
@@ -1486,6 +1489,18 @@ def _build_daily_device_round_summary(
             ),
         }
 
+    # 에이전트 업데이트는 병원 유·무료 구분 없이 실행하고, 마미박스 업데이트는
+    # 무료(핑크바코드)/유료 플래그를 병원 단위로 골라 적용한다. 휴지통 정리와
+    # 전원 차단은 기존 운영 범위였던 무료병원에만 유지한다.
+    hospital_is_free_barcode = hospital.get("isPinkBarcode") is not None
+    auto_update_box = bool(
+        auto_update_box_free if hospital_is_free_barcode else auto_update_box_paid
+    )
+    hospital_auto_cleanup_trashcan = bool(
+        auto_cleanup_trashcan and hospital_is_free_barcode
+    )
+    hospital_auto_power_off = bool(auto_power_off and hospital_is_free_barcode)
+
     devices = _load_daily_device_round_devices(int(hospital["hospitalSeq"]))
     if progress_callback is not None:
         # 장비별 원격 점검/업데이트 대기 전에 현재 병원을 먼저 알려서
@@ -1519,8 +1534,8 @@ def _build_daily_device_round_summary(
                     _display_value(device.get("deviceName"), default=""),
                     auto_update_agent=auto_update_agent,
                     auto_update_box=auto_update_box,
-                    auto_cleanup_trashcan=auto_cleanup_trashcan,
-                    auto_power_off=auto_power_off,
+                    auto_cleanup_trashcan=hospital_auto_cleanup_trashcan,
+                    auto_power_off=hospital_auto_power_off,
                 )
             )
         except Exception as exc:
@@ -1610,12 +1625,16 @@ def _build_daily_device_round_summary(
         "deviceCount": len(device_results),
         "scheduledDeviceCount": int(hospital.get("deviceCount") or len(device_results)),
         "autoUpdateAgent": bool(auto_update_agent),
+        # autoUpdateBox는 이번 병원에 실제 적용된 값이고, Free/Paid는 요청된 원본 플래그다.
         "autoUpdateBox": bool(auto_update_box),
+        "autoUpdateBoxFree": bool(auto_update_box_free),
+        "autoUpdateBoxPaid": bool(auto_update_box_paid),
+        "hospitalFreeBarcode": bool(hospital_is_free_barcode),
         "hospitalScope": hospital_scope,
         "hospitalCandidateScope": hospital_scope_label,
         "hospitalOrder": hospital_order,
-        "autoCleanupTrashCan": bool(auto_cleanup_trashcan),
-        "autoPowerOff": bool(auto_power_off),
+        "autoCleanupTrashCan": bool(hospital_auto_cleanup_trashcan),
+        "autoPowerOff": bool(hospital_auto_power_off),
         "statusCounts": status_counts,
         "updateCounts": update_counts,
         "cleanupCounts": cleanup_counts,

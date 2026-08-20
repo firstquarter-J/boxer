@@ -37,9 +37,16 @@ _DAILY_DEVICE_ROUND_MAX_TEXT_CHARS_PER_MESSAGE = 3500
 _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_OVERRIDE_KEY = "autoUpdateAgentOverride"
 _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_AT_KEY = "autoUpdateAgentUpdatedAt"
 _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_BY_KEY = "autoUpdateAgentUpdatedBy"
-_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_OVERRIDE_KEY = "autoUpdateBoxOverride"
-_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_AT_KEY = "autoUpdateBoxUpdatedAt"
-_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_BY_KEY = "autoUpdateBoxUpdatedBy"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_OVERRIDE_KEY = "autoUpdateBoxFreeOverride"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_UPDATED_AT_KEY = "autoUpdateBoxFreeUpdatedAt"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_UPDATED_BY_KEY = "autoUpdateBoxFreeUpdatedBy"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_OVERRIDE_KEY = "autoUpdateBoxPaidOverride"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_AT_KEY = "autoUpdateBoxPaidUpdatedAt"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_BY_KEY = "autoUpdateBoxPaidUpdatedBy"
+# 무료/유료 분리 전 단일 마미박스 override는 무료병원 값으로만 승계해 읽는다.
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_OVERRIDE_KEY = "autoUpdateBoxOverride"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_AT_KEY = "autoUpdateBoxUpdatedAt"
+_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_BY_KEY = "autoUpdateBoxUpdatedBy"
 _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = "device_health_alert_contact_hospital"
 _DEVICE_HEALTH_ALERT_ACTION_VIEW_AUTO_SMS = "device_health_alert_view_auto_sms"
 _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE = "device_health_alert_device_voice_guide"
@@ -207,11 +214,17 @@ def _daily_device_round_auto_update_keys(target: str) -> tuple[str, str, str]:
             _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_AT_KEY,
             _DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT_UPDATED_BY_KEY,
         )
-    if target == "box":
+    if target == "box_free":
         return (
-            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_OVERRIDE_KEY,
-            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_AT_KEY,
-            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_UPDATED_BY_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_OVERRIDE_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_UPDATED_AT_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE_UPDATED_BY_KEY,
+        )
+    if target == "box_paid":
+        return (
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_OVERRIDE_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_AT_KEY,
+            _DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID_UPDATED_BY_KEY,
         )
     raise ValueError(f"지원하지 않는 자동 업데이트 대상이야: {target}")
 
@@ -219,17 +232,29 @@ def _daily_device_round_auto_update_keys(target: str) -> tuple[str, str, str]:
 def _daily_device_round_auto_update_env_default(target: str) -> bool:
     if target == "agent":
         return bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT)
-    if target == "box":
-        return bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX)
+    if target == "box_free":
+        return bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE)
+    if target == "box_paid":
+        return bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID)
     raise ValueError(f"지원하지 않는 자동 업데이트 대상이야: {target}")
 
 
 def _daily_device_round_auto_update_label(target: str) -> str:
     if target == "agent":
         return "에이전트"
-    if target == "box":
-        return "마미박스"
+    if target == "box_free":
+        return "마미박스(무료병원)"
+    if target == "box_paid":
+        return "마미박스(유료병원)"
     return target
+
+
+def _daily_device_round_auto_update_legacy_box_override(
+    state_payload: dict[str, Any],
+) -> bool | None:
+    return _coerce_daily_device_round_optional_bool(
+        state_payload.get(_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_OVERRIDE_KEY)
+    )
 
 
 def _resolve_daily_device_round_auto_update(
@@ -244,6 +269,11 @@ def _resolve_daily_device_round_auto_update(
     # Slack 명령 override가 있으면 env보다 우선하고, 없으면 기존 env 기본값을 그대로 쓴다.
     if override is not None:
         return override
+    if target == "box_free":
+        # 분리 전 단일 마미박스 override는 무료병원 순회 시절 값이라 무료병원에만 승계한다.
+        legacy_override = _daily_device_round_auto_update_legacy_box_override(state_payload)
+        if legacy_override is not None:
+            return legacy_override
     return _daily_device_round_auto_update_env_default(target)
 
 
@@ -253,10 +283,16 @@ def _resolve_daily_device_round_auto_update_agent(
     return _resolve_daily_device_round_auto_update("agent", state)
 
 
-def _resolve_daily_device_round_auto_update_box(
+def _resolve_daily_device_round_auto_update_box_free(
     state: dict[str, Any] | None = None,
 ) -> bool:
-    return _resolve_daily_device_round_auto_update("box", state)
+    return _resolve_daily_device_round_auto_update("box_free", state)
+
+
+def _resolve_daily_device_round_auto_update_box_paid(
+    state: dict[str, Any] | None = None,
+) -> bool:
+    return _resolve_daily_device_round_auto_update("box_paid", state)
 
 
 def _build_daily_device_round_auto_update_target_status(
@@ -268,6 +304,19 @@ def _build_daily_device_round_auto_update_target_status(
     override = _coerce_daily_device_round_optional_bool(
         state_payload.get(override_key)
     )
+    updated_at = str(state_payload.get(updated_at_key) or "").strip()
+    updated_by = str(state_payload.get(updated_by_key) or "").strip()
+    if target == "box_free" and override is None:
+        # 분리 전 단일 마미박스 override가 남아 있으면 무료병원 상태로 이어서 보여준다.
+        legacy_override = _daily_device_round_auto_update_legacy_box_override(state_payload)
+        if legacy_override is not None:
+            override = legacy_override
+            updated_at = str(
+                state_payload.get(_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_AT_KEY) or ""
+            ).strip()
+            updated_by = str(
+                state_payload.get(_DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_LEGACY_UPDATED_BY_KEY) or ""
+            ).strip()
     return {
         "target": target,
         "label": _daily_device_round_auto_update_label(target),
@@ -275,8 +324,8 @@ def _build_daily_device_round_auto_update_target_status(
         "envDefault": _daily_device_round_auto_update_env_default(target),
         "override": override,
         "source": "slack_override" if override is not None else "env",
-        "updatedAt": str(state_payload.get(updated_at_key) or "").strip(),
-        "updatedBy": str(state_payload.get(updated_by_key) or "").strip(),
+        "updatedAt": updated_at,
+        "updatedBy": updated_by,
     }
 
 
@@ -286,14 +335,9 @@ def _build_daily_device_round_auto_update_status(
     state_payload = state if isinstance(state, dict) else _load_daily_device_round_state()
     return {
         "agent": _build_daily_device_round_auto_update_target_status("agent", state_payload),
-        "box": _build_daily_device_round_auto_update_target_status("box", state_payload),
+        "boxFree": _build_daily_device_round_auto_update_target_status("box_free", state_payload),
+        "boxPaid": _build_daily_device_round_auto_update_target_status("box_paid", state_payload),
     }
-
-
-def _build_daily_device_round_auto_update_box_status(
-    state: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return _build_daily_device_round_auto_update_target_status("box", state)
 
 
 def _set_daily_device_round_auto_update(
@@ -319,22 +363,6 @@ def _set_daily_device_round_auto_update(
     return _build_daily_device_round_auto_update_status(persisted_state)
 
 
-def _set_daily_device_round_auto_update_box(
-    enabled: bool,
-    *,
-    user_id: str | None = None,
-    now: datetime | None = None,
-    logger: logging.Logger | None = None,
-) -> dict[str, Any]:
-    return _set_daily_device_round_auto_update(
-        "box",
-        enabled,
-        user_id=user_id,
-        now=now,
-        logger=logger,
-    )["box"]
-
-
 def _format_daily_device_round_auto_update_target_line(status: dict[str, Any]) -> list[str]:
     label = str(status.get("label") or "대상").strip()
     enabled = bool(status.get("enabled"))
@@ -355,21 +383,14 @@ def _format_daily_device_round_auto_update_target_line(status: dict[str, Any]) -
 
 def _format_daily_device_round_auto_update_status(status: dict[str, Any]) -> str:
     agent_status = status.get("agent") if isinstance(status.get("agent"), dict) else {}
-    box_status = status.get("box") if isinstance(status.get("box"), dict) else {}
+    box_free_status = status.get("boxFree") if isinstance(status.get("boxFree"), dict) else {}
+    box_paid_status = status.get("boxPaid") if isinstance(status.get("boxPaid"), dict) else {}
     lines = ["*데일리 자동 업데이트 설정*"]
-    lines.extend(_format_daily_device_round_auto_update_target_line(box_status))
+    lines.extend(_format_daily_device_round_auto_update_target_line(box_free_status))
+    lines.extend(_format_daily_device_round_auto_update_target_line(box_paid_status))
     lines.extend(_format_daily_device_round_auto_update_target_line(agent_status))
     lines.append("• 적용: 다음 데일리 순회부터")
     return "\n".join(lines)
-
-
-def _format_daily_device_round_auto_update_box_status(status: dict[str, Any]) -> str:
-    return _format_daily_device_round_auto_update_status(
-        {
-            "box": status,
-            "agent": _build_daily_device_round_auto_update_target_status("agent"),
-        }
-    )
 
 
 def _clear_daily_device_round_active_progress(
@@ -1499,7 +1520,8 @@ def _run_daily_device_round_if_due(
         now=local_now,
         state=state,
         auto_update_agent=_resolve_daily_device_round_auto_update_agent(state),
-        auto_update_box=_resolve_daily_device_round_auto_update_box(state),
+        auto_update_box_free=_resolve_daily_device_round_auto_update_box_free(state),
+        auto_update_box_paid=_resolve_daily_device_round_auto_update_box_paid(state),
         auto_cleanup_trashcan=bool(cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN),
         auto_power_off=bool(cs.DAILY_DEVICE_ROUND_AUTO_POWER_OFF),
         progress_callback=_handle_daily_device_round_progress,
