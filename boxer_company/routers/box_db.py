@@ -386,6 +386,38 @@ def _baby_ai_context_limit() -> int:
     return max(1, min(5, int(s.DB_QUERY_MAX_ROWS or 20)))
 
 
+_RECORDINGS_BARCODE_UINT_MAX = 4_294_967_295
+
+
+def _build_recordings_barcode_match(
+    barcode: str,
+    *,
+    table_alias: str = "r",
+) -> tuple[str, tuple[Any, ...]]:
+    normalized = str(barcode or "").strip()
+    short_barcode: int | None = None
+    try:
+        numeric_barcode = int(normalized)
+    except (TypeError, ValueError):
+        numeric_barcode = -1
+
+    if (
+        str(numeric_barcode) == normalized
+        and 0 <= numeric_barcode <= _RECORDINGS_BARCODE_UINT_MAX
+    ):
+        short_barcode = numeric_barcode
+
+    # 운영 schema는 fullBarcode(varchar(11))에 인덱스가 있고 barcode는
+    # unsigned int다. 컬럼 CAST를 제거해 fullBarcode 인덱스를 보존하되,
+    # 기존 문자열 비교로 실제 일치할 수 있는 짧은 barcode만 보조한다.
+    # 한 row에서 두 값이 모두 맞아도 단일 OR 조건이라 집계는 한 번이다.
+    return (
+        f"({table_alias}.fullBarcode = %s OR "
+        f"(%s IS NOT NULL AND {table_alias}.barcode = %s))",
+        (normalized, short_barcode, short_barcode),
+    )
+
+
 def _build_baby_magic_cdn_url(s3_file_key: object) -> str:
     base_url = (cs.BABY_MAGIC_CDN_BASE_URL or "").strip().rstrip("/")
     file_key = str(s3_file_key or "").strip().lstrip("/")
@@ -760,11 +792,11 @@ def _load_recordings_timeline_summary_by_barcode(
     if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
         raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
 
-    # 타임라인 질문은 최근 context 제한과 무관해야 하므로 DB 전체에서 read-only aggregate한다.
-    where_clauses = [
-        "(CAST(r.fullBarcode AS CHAR) = %s OR CAST(r.barcode AS CHAR) = %s)"
-    ]
-    params: list[Any] = [barcode, barcode]
+    # 타임라인 질문은 최근 context 제한과 무관해야 하므로 DB 전체에서
+    # read-only aggregate하되 indexed barcode 조건은 그대로 유지한다.
+    barcode_clause, barcode_params = _build_recordings_barcode_match(barcode)
+    where_clauses = [barcode_clause]
+    params: list[Any] = list(barcode_params)
     if utc_start is not None and utc_end is not None:
         where_clauses.extend(
             [
@@ -1206,8 +1238,11 @@ def _query_recordings_by_filters(
     where_clauses: list[str] = []
     params: list[object] = []
     if normalized_barcode:
-        where_clauses.append("(CAST(r.fullBarcode AS CHAR) = %s OR CAST(r.barcode AS CHAR) = %s)")
-        params.extend([normalized_barcode, normalized_barcode])
+        barcode_clause, barcode_params = _build_recordings_barcode_match(
+            normalized_barcode
+        )
+        where_clauses.append(barcode_clause)
+        params.extend(barcode_params)
     if target_date:
         utc_start, utc_end = _local_date_to_utc_range(target_date)
         where_clauses.append("r.recordedAt >= %s")

@@ -246,10 +246,11 @@ class RecordingTimelineAggregateTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("COUNT(*) AS recordingCount", sql)
         self.assertIn("MAX(r.recordedAt) AS lastRecordedAt", sql)
-        self.assertIn("CAST(r.fullBarcode AS CHAR) = %s", sql)
-        self.assertIn("CAST(r.barcode AS CHAR) = %s", sql)
+        self.assertIn("r.fullBarcode = %s", sql)
+        self.assertIn("%s IS NOT NULL AND r.barcode = %s", sql)
+        self.assertNotIn("CAST(", sql)
         self.assertNotIn("LIMIT", sql)
-        self.assertEqual(params, ("13194526492", "13194526492"))
+        self.assertEqual(params, ("13194526492", None, None))
         self.assertIn("recordings row 수: *41개*", rendered)
         self.assertIn("2026-08-04 23:30:00", rendered)
         self.assertNotIn("2026-07-01", rendered)
@@ -295,8 +296,9 @@ class RecordingTimelineAggregateTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("MIN(r.recordedAt) AS firstRecordedAt", sql)
         self.assertIn("MAX(r.recordedAt) AS lastRecordedAt", sql)
-        self.assertIn("CAST(r.fullBarcode AS CHAR) = %s", sql)
-        self.assertIn("CAST(r.barcode AS CHAR) = %s", sql)
+        self.assertIn("r.fullBarcode = %s", sql)
+        self.assertIn("%s IS NOT NULL AND r.barcode = %s", sql)
+        self.assertNotIn("CAST(", sql)
         self.assertIn("r.recordedAt >= %s", sql)
         self.assertIn("r.recordedAt < %s", sql)
         self.assertNotIn("LIMIT", sql)
@@ -304,7 +306,8 @@ class RecordingTimelineAggregateTests(unittest.TestCase):
             params,
             (
                 "13194526492",
-                "13194526492",
+                None,
+                None,
                 datetime(2024, 1, 1, 15, 0, 0),
                 datetime(2024, 1, 2, 15, 0, 0),
             ),
@@ -358,6 +361,95 @@ class RecordingTimelineAggregateTests(unittest.TestCase):
                     "13194526492",
                     recordings_context={"summary": {"recordingCount": 1}},
                 )
+
+    def test_barcode_match_keeps_exact_legacy_short_value_semantics(self) -> None:
+        # int unsigned에 문자열 CAST로 실제 일치하던 canonical short 값만
+        # native 보조 조건으로 보내고 11자리·선행 0 값은 fullBarcode만 본다.
+        sql, params = box_db._build_recordings_barcode_match("1234567890")
+        self.assertEqual(
+            sql,
+            "(r.fullBarcode = %s OR (%s IS NOT NULL AND r.barcode = %s))",
+        )
+        self.assertEqual(params, ("1234567890", 1234567890, 1234567890))
+
+        for full_barcode in ("13194526492", "01234567890"):
+            with self.subTest(full_barcode=full_barcode):
+                _, full_params = box_db._build_recordings_barcode_match(
+                    full_barcode
+                )
+                self.assertEqual(full_params, (full_barcode, None, None))
+
+    def test_structured_recordings_filter_uses_same_native_barcode_match(
+        self,
+    ) -> None:
+        # 이미 remote인 structured barcode 조회도 같은 1,100만-row CAST
+        # full scan을 만들지 않도록 공통 indexed 조건을 사용한다.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"recordingCount": 0}
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.object(box_db.s, "DB_HOST", "db-host"),
+            patch.object(box_db.s, "DB_USERNAME", "db-user"),
+            patch.object(box_db.s, "DB_PASSWORD", "db-pass"),
+            patch.object(box_db.s, "DB_DATABASE", "db-name"),
+            patch(
+                "boxer_company.routers.box_db._create_db_connection",
+                return_value=connection,
+            ),
+        ):
+            rendered = box_db._query_recordings_by_filters(
+                barcode="13194526492",
+                count_only=True,
+            )
+
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("r.fullBarcode = %s", sql)
+        self.assertIn("%s IS NOT NULL AND r.barcode = %s", sql)
+        self.assertNotIn("CAST(", sql)
+        self.assertEqual(params, ("13194526492", None, None))
+        self.assertIn("recordings row 수: *0개*", rendered)
+
+    def test_rows_on_date_keeps_existing_composite_index_shape(self) -> None:
+        # 로그 분석용 row 조회는 이미 fullBarcode + recordedAt 조건이라
+        # timeline 변경과 별개로 CAST/OR 병목이 없음을 계약으로 고정한다.
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.dict("os.environ", {"TZ": "Asia/Seoul"}),
+            patch.object(box_db.s, "DB_HOST", "db-host"),
+            patch.object(box_db.s, "DB_USERNAME", "db-user"),
+            patch.object(box_db.s, "DB_PASSWORD", "db-pass"),
+            patch.object(box_db.s, "DB_DATABASE", "db-name"),
+            patch(
+                "boxer_company.routers.box_db._create_db_connection",
+                return_value=connection,
+            ),
+        ):
+            rows = box_db._load_recordings_rows_on_date_by_barcode(
+                "13194526492",
+                "2024-01-02",
+            )
+
+        sql, params = cursor.execute.call_args.args
+        self.assertEqual(rows, [])
+        self.assertIn("WHERE r.fullBarcode = %s", sql)
+        self.assertIn("r.recordedAt >= %s", sql)
+        self.assertIn("r.recordedAt < %s", sql)
+        self.assertNotIn("CAST(", sql)
+        self.assertNotIn(" OR ", sql)
+        self.assertEqual(
+            params,
+            (
+                "13194526492",
+                datetime(2024, 1, 1, 15, 0, 0),
+                datetime(2024, 1, 2, 15, 0, 0),
+            ),
+        )
 
 
 class LookupDeviceContextsByBarcodeOnDateTests(unittest.TestCase):
