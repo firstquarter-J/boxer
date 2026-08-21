@@ -23,6 +23,12 @@ _DEFAULT_SMS_DELIVERY_OUTBOX_PATH = (
 _DEFAULT_REQUEST_LOG_SQLITE_PATH = (
     "/var/lib/boxer-company-api/request_log.db"
 )
+_DEFAULT_DEVICE_HEALTH_EVENT_LOG_DIR = (
+    "/var/lib/boxer-company-api/device-health-events"
+)
+_DEFAULT_DEVICE_SSH_KNOWN_HOSTS_PATH = (
+    "/etc/boxer-company-api/device_known_hosts"
+)
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _AUTOMATION_FEATURE_FLAGS = (
@@ -165,7 +171,8 @@ def load_company_api_settings(
         live_device_enabled=live_device_enabled,
     )
     enforce_local_readiness = bool(
-        automation_storage_required
+        request_log_enabled
+        or automation_storage_required
         or sms_delivery_storage_required
         or device_health_sheet_enabled
         or strict_ssh_required
@@ -429,99 +436,15 @@ def _load_operations_dependency_settings(
     enabled: bool,
     live_device_enabled: bool,
 ) -> str | None:
-    """operations를 켤 때 숨은 PII·파일 기능 설정을 함께 검증한다."""
+    """operations의 공통 기동 경계와 route별 kill switch를 분리한다."""
 
+    del env, live_device_enabled
     if not enabled:
         return None
-    db_enabled, db_error = _strict_optional_bool(env, "DB_QUERY_ENABLED")
-    s3_enabled, s3_error = _strict_optional_bool(env, "S3_QUERY_ENABLED")
-    if (
-        db_error is not None
-        or s3_error is not None
-        or not db_enabled
-        or not s3_enabled
-        or not _required_env_values(
-            env,
-            {
-                "DB_HOST",
-                "DB_USERNAME",
-                "DB_PASSWORD",
-                "DB_DATABASE",
-                "AWS_REGION",
-                "S3_ULTRASOUND_BUCKET",
-                "S3_LOG_BUCKET",
-            },
-        )
-    ):
-        return "operations_dependency_configuration_invalid"
-    if not _required_env_values(
-        env,
-        {
-            "APP_USER_API_URL",
-            "APP_USER_API_TIMEOUT_SEC",
-            "MDA_GRAPHQL_URL",
-            "MDA_ADMIN_USER_PASSWORD",
-            "THREAD_PLAYBOOK_LEARNING_ENABLED",
-        },
-    ):
-        return "operations_dependency_configuration_invalid"
-    if (
-        not _safe_https_url(env.get("APP_USER_API_URL", ""))
-        or not _safe_https_url(env.get("MDA_GRAPHQL_URL", ""))
-    ):
-        return "operations_dependency_configuration_invalid"
-    try:
-        app_user_timeout = int(str(env.get("APP_USER_API_TIMEOUT_SEC", "8")))
-    except (TypeError, ValueError):
-        return "operations_dependency_configuration_invalid"
-    if not 1 <= app_user_timeout <= 60:
-        return "operations_dependency_configuration_invalid"
-    _learning_enabled, learning_error = _strict_optional_bool(
-        env,
-        "THREAD_PLAYBOOK_LEARNING_ENABLED",
-    )
-    if learning_error is not None:
-        return "operations_dependency_configuration_invalid"
-    if not live_device_enabled:
-        return None
-
-    for key in (
-        "RECORDING_STREAMING_RESTORE_ENABLED",
-        "DEVICE_FILE_RECOVERY_ENABLED",
-    ):
-        _enabled, error = _strict_optional_bool(env, key)
-        if error is not None or not str(env.get(key, "")).strip():
-            return "operations_dependency_configuration_invalid"
-
-    download_bucket = str(
-        env.get("DEVICE_FILE_DOWNLOAD_BUCKET", "")
-    ).strip()
-    download_prefix = str(
-        env.get("DEVICE_FILE_DOWNLOAD_PREFIX", "")
-    ).strip().strip("/")
-    if (
-        not _valid_s3_bucket_name(download_bucket)
-        or not download_prefix
-        or ".." in download_prefix.split("/")
-    ):
-        return "operations_dependency_configuration_invalid"
-
-    recovery_enabled = str(
-        env.get("DEVICE_FILE_RECOVERY_ENABLED", "")
-    ).strip().lower() in _TRUE_VALUES
-    if recovery_enabled and not _required_env_values(
-        env,
-        {
-            "BOX_UPLOADER_BASE_URL",
-            "BOX_UPLOADER_RECORDING_PATH",
-            "UPLOADER_JWT_SECRET",
-        },
-    ):
-        return "operations_dependency_configuration_invalid"
-    if recovery_enabled and not _safe_https_url(
-        env.get("BOX_UPLOADER_BASE_URL", "")
-    ):
-        return "operations_dependency_configuration_invalid"
+    # 기존 Slack은 DB/S3/app-user/MDA/복구 설정 하나가 비어 있거나 기능이
+    # 꺼져 있어도 프로세스를 계속 띄우고 해당 route에서만 전용 안내를
+    # 반환했다. 공통 API도 request-log/caller 검증은 전역에서 유지하되,
+    # 기능별 dependency는 각 domain route가 같은 문구로 판정하게 둔다.
     return None
 
 
@@ -641,7 +564,10 @@ def _load_automation_dependency_settings(
             sheet_enabled=sheet_enabled,
             strict_ssh_required=True,
         )
-    if strict_ssh_required and not Path(known_hosts_path).is_absolute():
+    if (
+        strict_ssh_required
+        and known_hosts_path != _DEFAULT_DEVICE_SSH_KNOWN_HOSTS_PATH
+    ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
             strict_ssh_required=True,
@@ -661,6 +587,13 @@ def _load_automation_dependency_settings(
         )
 
     if health_enabled:
+        if str(
+            env.get("DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR", "")
+        ).strip() != _DEFAULT_DEVICE_HEALTH_EVENT_LOG_DIR:
+            return _automation_dependency_error(
+                sheet_enabled=sheet_enabled,
+                strict_ssh_required=strict_ssh_required,
+            )
         if not _required_env_values(env, {"DEVICE_STATE_REDIS_HOST"}):
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
@@ -971,6 +904,8 @@ def company_api_local_readiness(settings: CompanyApiSettings) -> bool:
     if not settings.enforce_local_readiness:
         return True
     runtime_paths: list[Path] = []
+    if settings.request_log_enabled:
+        runtime_paths.append(Path(settings.request_log_path))
     if settings.automation_storage_required:
         runtime_paths.append(Path(settings.automation_state_path))
     if settings.sms_delivery_storage_required:
@@ -983,6 +918,13 @@ def company_api_local_readiness(settings: CompanyApiSettings) -> bool:
             return False
         state_directory = next(iter(runtime_parents))
         if not _private_writable_directory(state_directory):
+            return False
+        request_log_path = Path(settings.request_log_path)
+        if settings.request_log_enabled and not (
+            request_log_path.exists() or request_log_path.is_symlink()
+        ):
+            # request-log는 startup initializer가 항상 생성·복원한다. 이후
+            # leaf가 사라지면 빈 SQLite를 조용히 재생성하지 않고 readiness를 닫는다.
             return False
         if any(
             not _private_runtime_file(path)

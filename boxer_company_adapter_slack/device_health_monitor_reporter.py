@@ -1,10 +1,8 @@
-import gzip
 import hashlib
 import json
 import logging
 import os
 import re
-import stat
 import tempfile
 import threading
 import time
@@ -17,7 +15,6 @@ import requests
 from boxer.core import settings as s
 from boxer.core.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
-from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_priority,
@@ -69,6 +66,10 @@ from boxer_company.device_health_fingerprint import (
     canonical_device_health_alert_fingerprint,
     canonicalize_device_health_alert_fingerprint_key,
 )
+from boxer_company.device_health_event_log import (
+    append_device_health_monitor_event,
+    archive_device_health_monitor_event_logs,
+)
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     _DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
     _DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
@@ -99,7 +100,7 @@ from boxer_company_adapter_slack.automation_reporter import (
     AutomationSlackDelivery,
     build_automation_request_id,
     flush_automation_deliveries,
-    remember_automation_delivery,
+    remember_automation_deliveries,
 )
 
 _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
@@ -151,9 +152,6 @@ _DEVICE_HEALTH_MONITOR_OPEN_CAPTUREBOARD_SHEET_STATUSES = {
     "처리중",
     "진행중",
 }
-_DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN = re.compile(
-    r"^device_health_monitor_events-(\d{4}-\d{2}-\d{2})\.jsonl$"
-)
 _DEVICE_HEALTH_MONITOR_STANDBY_REDIS_STATUSES = {
     "NOSESS",
     "STANDBY",
@@ -175,134 +173,6 @@ def _device_health_monitor_event_log_path(now: datetime) -> Path:
     )
 
 
-def _device_health_monitor_event_archive_key(source_path: Path) -> str:
-    match = _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN.fullmatch(source_path.name)
-    if match is None:
-        raise ValueError(f"장비 상태 이벤트 로그 파일명이 아니야: {source_path.name}")
-    source_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-    prefix = str(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_PREFIX or "").strip().strip("/")
-    relative_key = f"{source_date:%Y/%m}/{source_path.name}.gz"
-    return f"{prefix}/{relative_key}" if prefix else relative_key
-
-
-def _device_health_monitor_event_archive_metadata(
-    source_path: Path,
-    *,
-    source_size: int,
-    source_sha256: str,
-    compressed_size: int,
-    compressed_sha256: str,
-) -> dict[str, str]:
-    match = _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN.fullmatch(source_path.name)
-    source_date = match.group(1) if match is not None else ""
-    return {
-        "source-date": source_date,
-        "source-filename": source_path.name,
-        "source-sha256": source_sha256,
-        "source-size": str(source_size),
-        "compressed-size": str(compressed_size),
-        "compressed-sha256": compressed_sha256,
-    }
-
-
-def _device_health_monitor_archive_matches(
-    head_response: dict[str, Any],
-    *,
-    metadata: dict[str, str],
-    compressed_size: int,
-) -> bool:
-    remote_metadata = (
-        head_response.get("Metadata")
-        if isinstance(head_response.get("Metadata"), dict)
-        else {}
-    )
-    return (
-        max(0, int(head_response.get("ContentLength") or 0)) == compressed_size
-        and all(str(remote_metadata.get(key) or "") == value for key, value in metadata.items())
-    )
-
-
-def _load_device_health_monitor_archive_head(
-    s3_client: Any,
-    *,
-    bucket: str,
-    key: str,
-) -> dict[str, Any] | None:
-    try:
-        response = s3_client.head_object(Bucket=bucket, Key=key)
-    except Exception as exc:
-        error_payload = getattr(exc, "response", {})
-        error = error_payload.get("Error") if isinstance(error_payload, dict) else {}
-        error_code = str(error.get("Code") or "") if isinstance(error, dict) else ""
-        if error_code in {"404", "NoSuchKey", "NotFound"}:
-            return None
-        raise
-    return response if isinstance(response, dict) else {}
-
-
-def _device_health_monitor_event_source_identity(source_path: Path) -> tuple[int, int, int, int]:
-    source_stat = source_path.lstat()
-    if not stat.S_ISREG(source_stat.st_mode):
-        raise ValueError("일반 파일이 아닌 장비 상태 이벤트 로그는 보관하지 않아")
-    return (
-        source_stat.st_dev,
-        source_stat.st_ino,
-        source_stat.st_size,
-        source_stat.st_mtime_ns,
-    )
-
-
-def _device_health_monitor_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int]:
-    return (
-        file_stat.st_dev,
-        file_stat.st_ino,
-        file_stat.st_size,
-        file_stat.st_mtime_ns,
-    )
-
-
-def _compress_device_health_monitor_event_log(
-    source_path: Path,
-) -> tuple[Any, str, int, str, tuple[int, int, int, int]]:
-    source_identity = _device_health_monitor_event_source_identity(source_path)
-    source_digest = hashlib.sha256()
-    compressed_file = tempfile.SpooledTemporaryFile(
-        mode="w+b",
-        max_size=8 * 1024 * 1024,
-    )
-    try:
-        with source_path.open("rb") as source_file:
-            if _device_health_monitor_file_identity(os.fstat(source_file.fileno())) != source_identity:
-                raise RuntimeError("압축 직전에 장비 상태 이벤트 로그가 변경됐어")
-            # mtime과 원본 경로를 gzip header에서 제거해 같은 원본은 항상 같은 결과가 되게 한다.
-            with gzip.GzipFile(filename="", mode="wb", fileobj=compressed_file, mtime=0) as gzip_file:
-                while chunk := source_file.read(1024 * 1024):
-                    source_digest.update(chunk)
-                    gzip_file.write(chunk)
-            if _device_health_monitor_file_identity(os.fstat(source_file.fileno())) != source_identity:
-                raise RuntimeError("압축하는 동안 장비 상태 이벤트 로그가 변경됐어")
-
-        if _device_health_monitor_event_source_identity(source_path) != source_identity:
-            raise RuntimeError("압축한 뒤 장비 상태 이벤트 로그가 변경됐어")
-
-        compressed_size = compressed_file.tell()
-        compressed_digest = hashlib.sha256()
-        compressed_file.seek(0)
-        while chunk := compressed_file.read(1024 * 1024):
-            compressed_digest.update(chunk)
-        compressed_file.seek(0)
-    except Exception:
-        compressed_file.close()
-        raise
-    return (
-        compressed_file,
-        source_digest.hexdigest(),
-        compressed_size,
-        compressed_digest.hexdigest(),
-        source_identity,
-    )
-
-
 def _archive_device_health_monitor_event_logs(
     *,
     now: datetime | None = None,
@@ -310,132 +180,12 @@ def _archive_device_health_monitor_event_logs(
     s3_client: Any | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    local_now = _coerce_daily_device_round_now(now)
-    actual_log_dir = log_dir or _device_health_monitor_event_log_dir()
-    retention_days = max(1, int(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_RETENTION_DAYS))
-    first_kept_date = local_now.date() - timedelta(days=retention_days - 1)
-    bucket = str(cs.DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_BUCKET or "").strip()
-    result: dict[str, Any] = {
-        "enabled": bool(bucket),
-        "bucket": bucket,
-        "firstKeptDate": first_kept_date.isoformat(),
-        "archivedCount": 0,
-        "archivedSourceBytes": 0,
-        "archivedCompressedBytes": 0,
-        "keptCount": 0,
-        "failedCount": 0,
-        "failures": [],
-    }
-    if not bucket or not actual_log_dir.exists():
-        return result
-
-    archive_candidates: list[Path] = []
-    for source_path in sorted(actual_log_dir.glob("device_health_monitor_events-*.jsonl")):
-        match = _DEVICE_HEALTH_MONITOR_EVENT_LOG_PATTERN.fullmatch(source_path.name)
-        if match is None or source_path.is_symlink():
-            continue
-        try:
-            source_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if source_date >= first_kept_date:
-            result["keptCount"] += 1
-            continue
-        archive_candidates.append(source_path)
-
-    if not archive_candidates:
-        return result
-
-    try:
-        client = s3_client or _build_s3_client()
-    except Exception as exc:
-        result["failedCount"] = len(archive_candidates)
-        result["failures"] = [
-            {"file": source_path.name, "errorType": type(exc).__name__}
-            for source_path in archive_candidates
-        ]
-        if logger is not None:
-            logger.warning("장비 상태 이벤트 로그 S3 client를 만들지 못했어", exc_info=True)
-        return result
-
-    for source_path in archive_candidates:
-        compressed_file: Any | None = None
-        try:
-            (
-                compressed_file,
-                source_sha256,
-                compressed_size,
-                compressed_sha256,
-                source_identity,
-            ) = _compress_device_health_monitor_event_log(source_path)
-            source_size = source_identity[2]
-            metadata = _device_health_monitor_event_archive_metadata(
-                source_path,
-                source_size=source_size,
-                source_sha256=source_sha256,
-                compressed_size=compressed_size,
-                compressed_sha256=compressed_sha256,
-            )
-            key = _device_health_monitor_event_archive_key(source_path)
-            existing_head = _load_device_health_monitor_archive_head(
-                client,
-                bucket=bucket,
-                key=key,
-            )
-            if existing_head is not None:
-                if not _device_health_monitor_archive_matches(
-                    existing_head,
-                    metadata=metadata,
-                    compressed_size=compressed_size,
-                ):
-                    raise RuntimeError("같은 S3 key에 다른 장비 상태 이벤트 로그가 이미 있어")
-            else:
-                # 45MB 안팎의 일별 파일은 gzip 후 단일 PutObject로 보내 멀티파트 권한 없이 보관한다.
-                compressed_file.seek(0)
-                client.put_object(
-                    Bucket=bucket,
-                    Key=key,
-                    Body=compressed_file,
-                    ContentLength=compressed_size,
-                    ContentType="application/x-ndjson",
-                    ContentEncoding="gzip",
-                    ServerSideEncryption="AES256",
-                    Metadata=metadata,
-                )
-                uploaded_head = _load_device_health_monitor_archive_head(
-                    client,
-                    bucket=bucket,
-                    key=key,
-                )
-                if uploaded_head is None or not _device_health_monitor_archive_matches(
-                    uploaded_head,
-                    metadata=metadata,
-                    compressed_size=compressed_size,
-                ):
-                    raise RuntimeError("S3에 보관한 장비 상태 이벤트 로그 검증에 실패했어")
-
-            # S3 객체를 확인한 뒤에도 원본이 그대로일 때만 로컬 파일을 제거한다.
-            if _device_health_monitor_event_source_identity(source_path) != source_identity:
-                raise RuntimeError("S3 보관 후 장비 상태 이벤트 로그가 변경돼 원본을 유지해")
-            source_path.unlink()
-            result["archivedCount"] += 1
-            result["archivedSourceBytes"] += source_size
-            result["archivedCompressedBytes"] += compressed_size
-        except Exception as exc:
-            result["failedCount"] += 1
-            result["failures"].append(
-                {"file": source_path.name, "errorType": type(exc).__name__}
-            )
-            if logger is not None:
-                logger.warning(
-                    "장비 상태 이벤트 로그를 S3에 보관하지 못했어: %s",
-                    source_path,
-                    exc_info=True,
-                )
-        finally:
-            if compressed_file is not None:
-                compressed_file.close()
-    return result
+    return archive_device_health_monitor_event_logs(
+        now=now,
+        log_dir=log_dir,
+        s3_client=s3_client,
+        logger=logger,
+    )
 
 
 def _append_device_health_monitor_event(
@@ -446,24 +196,15 @@ def _append_device_health_monitor_event(
     logger: logging.Logger | None = None,
 ) -> bool:
     local_now = _coerce_daily_device_round_now(now)
-    event_payload = {
-        "eventType": _display_value(event_type, default="unknown"),
-        "createdAt": local_now.isoformat(),
-        **(payload if isinstance(payload, dict) else {}),
-    }
-    path = _device_health_monitor_event_log_path(local_now)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as event_log:
-            event_log.write(
-                json.dumps(event_payload, ensure_ascii=True, sort_keys=True, default=str)
-                + "\n"
-            )
-        return True
-    except Exception:
-        if logger is not None:
-            logger.warning("장비 상태 모니터 이벤트 로그를 저장하지 못했어: %s", path, exc_info=True)
-        return False
+    return append_device_health_monitor_event(
+        event_type,
+        payload,
+        now=local_now,
+        logger=logger,
+        # 테스트와 local state 경로 override가 기존처럼 이 wrapper의
+        # resolver 하나만 바꿔도 적용되게 한다.
+        log_path=_device_health_monitor_event_log_path(local_now),
+    )
 
 
 def _load_device_health_monitor_runtime_state() -> dict[str, Any]:
@@ -2586,25 +2327,63 @@ def _handle_device_health_monitor_contact_modal_action(
             logger.warning("병원 문자 입력 모달을 열지 못했어", exc_info=True)
             result = {"status": "modal_open_failed", "ok": False, "error": type(exc).__name__}
 
-    _append_device_health_monitor_event(
-        "alert_contact_sms_modal_requested",
-        {
-            "actionId": action_id,
-            "mode": normalized_mode,
-            "actorUserId": actor_user_id,
-            "channelId": channel_id,
-            "messageTs": message_ts,
-            "threadTs": thread_ts,
-            "hospital": item["hospital"],
-            "room": item["room"],
-            "device": item["device"],
-            "issue": item["issue"],
-            "mdaUrl": item["mdaUrl"],
-            "result": result,
-        },
-        now=local_now,
-        logger=logger,
-    )
+    if action_api_bridge is None:
+        _append_device_health_monitor_event(
+            "alert_contact_sms_modal_requested",
+            {
+                "actionId": action_id,
+                "mode": normalized_mode,
+                "actorUserId": actor_user_id,
+                "channelId": channel_id,
+                "messageTs": message_ts,
+                "threadTs": thread_ts,
+                "hospital": item["hospital"],
+                "room": item["room"],
+                "device": item["device"],
+                "issue": item["issue"],
+                "mdaUrl": item["mdaUrl"],
+                "result": result,
+            },
+            now=local_now,
+            logger=logger,
+        )
+    else:
+        try:
+            # views_open 전후는 Slack만 알 수 있어 typed receipt 한 건으로
+            # API writer에 돌려주고 remote mode의 로컬 JSONL은 남기지 않는다.
+            target = build_device_health_alert_api_target(item)
+            receipt_request_id = build_device_health_alert_request_id(
+                workspace_id=workspace_id,
+                actor_user_id=actor_user_id,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                interaction_id=interaction_id,
+                action_name="device_health_alert_ui_receipt",
+                phase="receipt",
+            )
+            action_api_bridge.record_modal_receipt(
+                request_id=receipt_request_id,
+                workspace_id=workspace_id,
+                actor_user_id=actor_user_id,
+                channel_id=channel_id,
+                conversation_id=thread_ts or message_ts,
+                target=target,
+                action_id=action_id,
+                mode=normalized_mode,
+                message_ts=message_ts,
+                thread_ts=thread_ts or message_ts,
+                occurred_at=local_now.isoformat(),
+                status=str(result.get("status") or ""),
+                ok=bool(result.get("ok")),
+                error_type=str(result.get("error") or ""),
+            )
+        except Exception as exc:
+            # receipt transport도 자동 재시도하거나 local writer로 되돌리지 않는다.
+            logger.warning(
+                "장비 이상 알림 modal receipt를 API에 기록하지 못했어 "
+                "error_type=%s",
+                type(exc).__name__,
+            )
     if not result.get("ok"):
         _post_device_health_monitor_action_reply(
             client,
@@ -2941,23 +2720,8 @@ def _handle_device_health_monitor_remote_alert_action(
         "ok": outcome == "answered",
         "routeMode": "remote",
     }
-    _append_device_health_monitor_event(
-        "alert_action_requested",
-        {
-            "actionId": action_id,
-            "actorUserId": actor_user_id,
-            "channelId": channel_id,
-            "messageTs": message_ts,
-            "threadTs": thread_ts,
-            "hospital": item["hospital"],
-            "room": item["room"],
-            "device": item["device"],
-            "issue": item["issue"],
-            "result": safe_result,
-        },
-        now=now,
-        logger=logger,
-    )
+    # remote action event는 실행 결과를 아는 API route가 같은 중앙 JSONL에
+    # 기록한다. adapter가 별도 로컬 파일에 중복 기록하지 않는다.
     return {"item": item, "state": {}, "result": safe_result}
 
 
@@ -5545,58 +5309,103 @@ def _run_device_health_monitor_remote_once(
     ):
         raise RuntimeError("장비 상태 모니터 API delivery 계약이 올바르지 않아")
 
-    sent_count = 0
-    for delivery in result.deliveries:
-        report_summary = _build_remote_device_health_alert_summary(
-            delivery.payload
-        )
-        slack_delivery = _post_daily_device_round_abnormal_alert(
-            client,
-            report_summary,
-            channel_id=channel_id,
-            message_ts="",
-            logger=logger,
-            include_blocks=True,
-            include_actions=True,
-            client_msg_id=build_automation_delivery_client_msg_id(
-                cycle="device_health_monitor",
-                cycle_key=cycle_key,
-                delivery_id=delivery.delivery_id,
-                part="alert",
-            ),
-        )
-        if slack_delivery is None:
-            # API pending delivery를 유지하고 local fallback은 실행하지 않는다.
-            break
-        remember_automation_delivery(
+    if not result.deliveries:
+        return False
+
+    # local monitor가 한 poll의 이상 장비를 하나의 알림으로 보내던
+    # payload를 유지한다. API의 장비별 delivery ID는 같은 Slack receipt로
+    # 한 번에 저장해 ack 전 일부 상태만 남지 않게 한다.
+    report_summary = _build_remote_device_health_alert_batch_summary(
+        tuple(delivery.payload for delivery in result.deliveries)
+    )
+    delivery_ids = tuple(
+        sorted(delivery.delivery_id for delivery in result.deliveries)
+    )
+    batch_digest = hashlib.sha256(
+        "\0".join(delivery_ids).encode("utf-8")
+    ).hexdigest()[:32]
+    slack_delivery = _post_daily_device_round_abnormal_alert(
+        client,
+        report_summary,
+        channel_id=channel_id,
+        message_ts="",
+        logger=logger,
+        include_blocks=True,
+        include_actions=True,
+        client_msg_id=build_automation_delivery_client_msg_id(
             cycle="device_health_monitor",
             cycle_key=cycle_key,
-            delivery=AutomationSlackDelivery(
-                delivery_id=delivery.delivery_id,
-                external_message_id=_display_value(
-                    slack_delivery.get("messageTs"),
-                    default="",
-                ),
-                permalink=_display_value(
-                    slack_delivery.get("permalink"),
-                    default="",
-                ),
+            delivery_id=f"device_health_monitor:{batch_digest}",
+            part="alert",
+        ),
+    )
+    if slack_delivery is None:
+        # API pending delivery를 유지하고 local fallback은 실행하지 않는다.
+        return False
+    external_message_id = _display_value(
+        slack_delivery.get("messageTs"),
+        default="",
+    )
+    permalink = _display_value(
+        slack_delivery.get("permalink"),
+        default="",
+    )
+    remember_automation_deliveries(
+        cycle="device_health_monitor",
+        cycle_key=cycle_key,
+        deliveries=tuple(
+            AutomationSlackDelivery(
+                delivery_id=delivery_id,
+                external_message_id=external_message_id,
+                permalink=permalink,
                 delivered_at=local_now,
-            ),
-        )
-        sent_count += 1
+            )
+            for delivery_id in delivery_ids
+        ),
+    )
     logger.info(
         "Completed remote device health poll deliveries=%s sent=%s",
         len(result.deliveries),
-        sent_count,
+        len(result.deliveries),
     )
-    return sent_count > 0
+    return True
 
 
 def _build_remote_device_health_alert_summary(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """API semantic alert를 기존 Slack Block renderer 입력으로만 바꾼다."""
+    """API semantic alert 하나를 기존 Slack renderer 입력으로 바꾼다."""
+
+    return _build_remote_device_health_alert_batch_summary((payload,))
+
+
+def _build_remote_device_health_alert_batch_summary(
+    payloads: tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """기존 monitor와 같이 한 poll의 alert를 하나의 Slack summary로 합친다."""
+
+    device_results: list[dict[str, Any]] = []
+    for payload in payloads:
+        device_results.append(
+            _build_remote_device_health_alert_device_result(payload)
+        )
+    return {
+        "hospitalSeq": None,
+        "hospitalName": "전체 장비",
+        "statusCounts": {
+            "정상": 0,
+            "확인 필요": 0,
+            "이상": len(device_results),
+            "점검 불가": 0,
+        },
+        "deviceResults": device_results,
+    }
+
+
+def _build_remote_device_health_alert_device_result(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """semantic alert 한 건을 기존 알림 카드의 장비 필드로 바꾼다."""
 
     raw_alert = payload.get("alert")
     if not isinstance(raw_alert, Mapping):
@@ -5621,6 +5430,14 @@ def _build_remote_device_health_alert_summary(
     device_result = {
         "hospitalSeq": hospital_seq,
         "hospitalName": hospital_name,
+        "hospitalTelephone": _display_value(
+            raw_alert.get("telephone"),
+            default="",
+        ),
+        "hospitalDeviceAlertPhone": _display_value(
+            raw_alert.get("deviceAlertPhone"),
+            default="",
+        ),
         "roomName": _display_value(
             raw_alert.get("room"),
             default="병실 미확인",
@@ -5664,18 +5481,22 @@ def _build_remote_device_health_alert_summary(
             raw_alert.get("smsAcceptedAt"),
             default="",
         ),
+        # 자동발송 접수 버튼은 legacy와 같이 실제 대상·본문을
+        # 조회 모달에 다시 보여주므로 세 action 필드를 복원한다.
+        "smsPhoneNumber": _display_value(
+            raw_alert.get("smsPhoneNumber"),
+            default="",
+        ),
+        "smsMessage": _display_value(
+            raw_alert.get("smsMessage"),
+            default="",
+        ),
+        "smsTemplateId": _display_value(
+            raw_alert.get("smsTemplateId"),
+            default="",
+        ),
     }
-    return {
-        "hospitalSeq": hospital_seq,
-        "hospitalName": hospital_name,
-        "statusCounts": {
-            "정상": 0,
-            "확인 필요": 0,
-            "이상": 1,
-            "점검 불가": 0,
-        },
-        "deviceResults": [device_result],
-    }
+    return device_result
 
 
 def _archive_device_health_monitor_event_logs_best_effort(logger: logging.Logger) -> None:

@@ -102,6 +102,36 @@ def _render_thread_context_for_learning(
     )
 
 
+def _load_thread_context_entries_for_learning(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    current_ts: str,
+) -> tuple[ContextEntry, ...]:
+    """remote 학습에도 기존 전용 fetch limit과 entry 순서를 그대로 쓴다."""
+
+    if not channel_id or not thread_ts:
+        return ()
+    messages = _fetch_thread_messages_for_learning(
+        client,
+        logger,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+    )
+    normalized_entries = _normalize_slack_context_entries(
+        messages,
+        current_ts=current_ts,
+    )
+    return tuple(
+        _limit_context_entries(
+            normalized_entries,
+            max(1, cs.THREAD_PLAYBOOK_LEARNING_FETCH_LIMIT),
+        )
+    )
+
+
 def _load_thread_context_for_learning(
     client: Any,
     logger: logging.Logger,

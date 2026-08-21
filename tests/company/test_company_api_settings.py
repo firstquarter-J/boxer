@@ -111,6 +111,24 @@ class CompanyApiSettingsTests(unittest.TestCase):
                 ),
             }
         )
+        noncanonical_known_hosts = load_company_api_settings(
+            {
+                **base_env,
+                "MDA_GRAPHQL_URL": "https://mda.example.invalid/graphql",
+                "MDA_ADMIN_USER_PASSWORD": "not-logged",
+                "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
+                "DEVICE_SSH_USER": "device-user",
+                "DEVICE_SSH_PASSWORD": "not-logged",
+                "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": (
+                    "remotes.example.invalid"
+                ),
+                "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": "10.0.0.10",
+                # ProtectHome과 무관한 고정 /etc 정본만 허용한다.
+                "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": (
+                    "/home/ec2-user/device_known_hosts"
+                ),
+            }
+        )
         missing_capabilities = load_company_api_settings(
             {
                 **{
@@ -148,6 +166,10 @@ class CompanyApiSettingsTests(unittest.TestCase):
         self.assertTrue(configured.live_device_enabled)
         self.assertTrue(configured.strict_ssh_required)
         self.assertTrue(configured.enforce_local_readiness)
+        self.assertEqual(
+            noncanonical_known_hosts.configuration_error,
+            "automation_dependency_configuration_invalid",
+        )
         self.assertEqual(
             missing_capabilities.configuration_error,
             "live_device_caller_configuration_invalid",
@@ -191,7 +213,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
         self.assertIsNone(configured.configuration_error)
         self.assertTrue(configured.request_log_enabled)
 
-    def test_operations_requires_audit_caller_and_base_dependencies(
+    def test_operations_requires_audit_and_caller_but_keeps_route_kill_switches(
         self,
     ) -> None:
         base_env = {
@@ -232,11 +254,16 @@ class CompanyApiSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_CALLERS_JSON": self._registry(),
             }
         )
-        missing_data = load_company_api_settings(
+        disabled_s3 = load_company_api_settings(
             {
-                key: value
-                for key, value in base_env.items()
-                if key != "S3_QUERY_ENABLED"
+                **base_env,
+                "S3_QUERY_ENABLED": "false",
+            }
+        )
+        disabled_db = load_company_api_settings(
+            {
+                **base_env,
+                "DB_QUERY_ENABLED": "false",
             }
         )
 
@@ -250,10 +277,12 @@ class CompanyApiSettingsTests(unittest.TestCase):
             missing_scope.configuration_error,
             "operations_caller_configuration_invalid",
         )
-        self.assertEqual(
-            missing_data.configuration_error,
-            "operations_dependency_configuration_invalid",
-        )
+        # 기존 Slack처럼 data-source kill switch는 해당 route만 막고
+        # operations와 나머지 assistant route의 readiness는 유지한다.
+        self.assertIsNone(disabled_s3.configuration_error)
+        self.assertTrue(disabled_s3.operations_enabled)
+        self.assertIsNone(disabled_db.configuration_error)
+        self.assertTrue(disabled_db.operations_enabled)
 
     def test_automation_state_path_is_fixed_to_systemd_state_directory(
         self,
@@ -349,7 +378,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
         )
         self.assertNotIn("not-logged", repr(configured))
 
-    def test_health_automation_requires_redis_mda_and_strict_ssh_config(
+    def test_health_automation_requires_redis_and_strict_mda_ssh_config(
         self,
     ) -> None:
         env = {
@@ -365,6 +394,9 @@ class CompanyApiSettingsTests(unittest.TestCase):
             "DB_PASSWORD": "not-logged",
             "DB_DATABASE": "box",
             "DEVICE_HEALTH_MONITOR_ENABLED": "true",
+            "DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR": (
+                "/var/lib/boxer-company-api/device-health-events"
+            ),
             "MDA_GRAPHQL_URL": "https://mda.example.invalid/graphql",
             "MDA_ADMIN_USER_PASSWORD": "not-logged",
             "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
@@ -391,6 +423,15 @@ class CompanyApiSettingsTests(unittest.TestCase):
             }
         )
         missing_redis = load_company_api_settings(env)
+        unsafe_event_log = load_company_api_settings(
+            {
+                **env,
+                "DEVICE_STATE_REDIS_HOST": "redis.internal",
+                "DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR": (
+                    "/opt/boxer-company-api/app/data"
+                ),
+            }
+        )
         configured = load_company_api_settings(
             {**env, "DEVICE_STATE_REDIS_HOST": "redis.internal"}
         )
@@ -401,6 +442,10 @@ class CompanyApiSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             missing_redis.configuration_error,
+            "automation_dependency_configuration_invalid",
+        )
+        self.assertEqual(
+            unsafe_event_log.configuration_error,
             "automation_dependency_configuration_invalid",
         )
         self.assertIsNone(configured.configuration_error)
@@ -577,6 +622,30 @@ class CompanyApiSettingsTests(unittest.TestCase):
             )
 
             self.assertTrue(company_api_local_readiness(settings))
+
+    def test_request_log_readiness_rejects_deleted_runtime_database(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_directory = Path(temporary_directory)
+            os.chmod(state_directory, 0o700)
+            request_log_path = state_directory / "request_log.db"
+            request_log_path.write_bytes(b"sqlite-state")
+            os.chmod(request_log_path, 0o600)
+            settings = CompanyApiSettings(
+                host="127.0.0.1",
+                port=8010,
+                callers=(),
+                request_log_enabled=True,
+                request_log_path=str(request_log_path),
+                enforce_local_readiness=True,
+            )
+
+            self.assertTrue(company_api_local_readiness(settings))
+            request_log_path.unlink()
+            # startup이 만든 감사 DB가 사라지면 다음 write가 빈 정본을
+            # 재생성하기 전에 readiness부터 닫혀야 한다.
+            self.assertFalse(company_api_local_readiness(settings))
 
     def test_local_readiness_rejects_insecure_google_adc_when_sheet_enabled(
         self,

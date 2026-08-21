@@ -9,11 +9,12 @@ import re
 import stat
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from boxer.core.utils import _display_value
@@ -40,6 +41,10 @@ from boxer_company.sms_delivery import (
 
 _SMS_DELIVERY_OUTBOX_THREAD_LOCK = threading.RLock()
 _SMS_DELIVERY_RECONCILE_THREAD_LOCK = threading.Lock()
+# 자동 alert producer 둘은 legacy Slack reporter와 같은 process-memory
+# claim을 공유한다. durable claim 파일은 cutover/recovery 호환용으로만 남긴다.
+_SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK = threading.Lock()
+_SMS_AUTOMATION_RUNTIME_CLAIMS: dict[str, dict[str, Any]] = {}
 _SMS_DELIVERY_OUTBOX_VERSION = 1
 _SMS_AUTOMATION_CLAIM_VERSION = 2
 _SMS_AUTOMATION_CLAIM_WINDOW_SEC = 60
@@ -86,6 +91,145 @@ _SMS_DELIVERY_SHEET_STATUS_BY_RESULT = {
     _SMS_DELIVERY_CONFIRM_REQUIRED: _SMS_SHEET_CONFIRM_REQUIRED,
 }
 _KST = ZoneInfo("Asia/Seoul")
+
+
+def _automatic_sms_runtime_incident_family(
+    item: Mapping[str, Any],
+) -> str:
+    """legacy health reporter와 같은 장애군으로 두 producer를 묶는다."""
+
+    alert_category = _display_value(
+        item.get("alertCategory"),
+        default="",
+    )
+    issue = _display_value(item.get("issue"), default="").lower()
+    problem_components = {
+        _display_value(component, default="").replace(" ", "")
+        for component in (
+            item.get("problemComponents")
+            if isinstance(item.get("problemComponents"), (list, tuple))
+            else []
+        )
+        if _display_value(component, default="")
+    }
+    if alert_category == "recording_processing" or any(
+        marker in issue for marker in ("병합", "ffmpeg", "merge")
+    ):
+        return "recording_processing"
+    if (
+        alert_category in {"video_signal", "recording"}
+        or "캡처보드" in problem_components
+        or any(
+            marker in issue
+            for marker in (
+                "캡처보드",
+                "캡쳐보드",
+                "비디오 장치",
+                "영상 입력",
+                "녹화 파일 증가 정지",
+            )
+        )
+    ):
+        return "captureboard_recording"
+    if alert_category:
+        return alert_category
+    if problem_components:
+        return "+".join(sorted(problem_components))
+    return issue[:120]
+
+
+def build_automatic_sms_runtime_claim_key(
+    item: Mapping[str, Any],
+) -> str:
+    """병원·장비·장애군을 legacy process claim key로 만든다."""
+
+    device_name = _display_value(item.get("device"), default="")
+    incident_family = _automatic_sms_runtime_incident_family(item)
+    if not device_name or not incident_family:
+        return ""
+    hospital_key = _display_value(
+        item.get("hospitalSeq"),
+        default=_display_value(
+            item.get("hospitalName"),
+            default=_display_value(item.get("hospital"), default=""),
+        ),
+    )
+    return "|".join((hospital_key, device_name, incident_family))
+
+
+def acquire_automatic_sms_runtime_claim(
+    claim_key: str,
+) -> tuple[bool, dict[str, Any]]:
+    """legacy와 같이 monotonic 60초 TTL의 process claim을 잡는다."""
+
+    if not claim_key:
+        return True, {}
+    claimed_at = time.monotonic()
+    with _SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK:
+        expired_keys = [
+            key
+            for key, claim in _SMS_AUTOMATION_RUNTIME_CLAIMS.items()
+            if claimed_at - float(claim.get("claimedAt") or 0.0)
+            >= _SMS_AUTOMATION_CLAIM_WINDOW_SEC
+        ]
+        for key in expired_keys:
+            _SMS_AUTOMATION_RUNTIME_CLAIMS.pop(key, None)
+
+        existing = _SMS_AUTOMATION_RUNTIME_CLAIMS.get(claim_key)
+        if existing is not None:
+            return False, existing
+        claim = {
+            "claimedAt": claimed_at,
+            "done": threading.Event(),
+            "result": None,
+        }
+        _SMS_AUTOMATION_RUNTIME_CLAIMS[claim_key] = claim
+        return True, claim
+
+
+def publish_automatic_sms_runtime_claim_result(
+    claim: dict[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    """owner 결과를 기다리는 같은 프로세스의 중복 cycle에 알린다."""
+
+    if not claim:
+        return
+    with _SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK:
+        claim["result"] = dict(result)
+        done = claim.get("done")
+        if isinstance(done, threading.Event):
+            done.set()
+
+
+def wait_for_automatic_sms_runtime_claim(
+    claim_key: str,
+    claim: Mapping[str, Any],
+    *,
+    logger: logging.Logger,
+) -> None:
+    """동시 중복은 첫 provider 호출 완료까지만 legacy timeout으로 기다린다."""
+
+    done = claim.get("done")
+    if isinstance(done, threading.Event):
+        done.wait(
+            timeout=min(
+                float(_SMS_AUTOMATION_CLAIM_WINDOW_SEC),
+                max(
+                    3.0,
+                    float(
+                        cs.DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC
+                    )
+                    + 2.0,
+                ),
+            )
+        )
+    with _SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK:
+        if isinstance(claim.get("result"), Mapping):
+            logger.info(
+                "Reused device alert auto SMS result claim=%s",
+                claim_key,
+            )
 
 
 def _sms_delivery_outbox_path(

@@ -13,6 +13,9 @@ from boxer.core import settings as core_settings
 from boxer.core.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as company_settings
+from boxer_company.device_health_event_log import (
+    append_device_health_monitor_event,
+)
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantRequest,
@@ -44,10 +47,18 @@ from boxer_company.sms_delivery_cycle import (
 DEVICE_HEALTH_ALERT_SMS_ACTION = "device_health_alert_contact_hospital"
 DEVICE_HEALTH_ALERT_VOICE_ACTION = "device_health_alert_device_voice_guide"
 DEVICE_HEALTH_ALERT_MARK_DONE_ACTION = "device_health_alert_mark_done"
+DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION = "device_health_alert_ui_receipt"
 DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE = "device_health_alert_sms_prepare"
 DEVICE_HEALTH_ALERT_SMS_ROUTE = "device_health_alert_sms"
 DEVICE_HEALTH_ALERT_VOICE_ROUTE = "device_health_alert_voice_guide"
 DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE = "device_health_alert_mark_done"
+DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE = "device_health_alert_ui_receipt"
+
+_DEVICE_HEALTH_ALERT_ACTION_LABELS = {
+    DEVICE_HEALTH_ALERT_SMS_ACTION: "병원 문자 보내기",
+    DEVICE_HEALTH_ALERT_VOICE_ACTION: "장비 음성 안내",
+    DEVICE_HEALTH_ALERT_MARK_DONE_ACTION: "확인 완료",
+}
 
 _DEVICE_HEALTH_ALERT_ACTION_ROUTES = {
     DEVICE_HEALTH_ALERT_VOICE_ACTION: DEVICE_HEALTH_ALERT_VOICE_ROUTE,
@@ -75,6 +86,8 @@ class DeviceHealthAlertActionTarget:
     issue: str
     alert_category: str
     problem_components: tuple[str, ...]
+    hospital_label: str = ""
+    mda_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +99,22 @@ class DeviceHealthAlertAction:
     target: DeviceHealthAlertActionTarget
     sms_phone_number: str = ""
     sms_message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceHealthAlertUiReceipt:
+    """Slack modal transport 결과를 legacy event payload로 재현한다."""
+
+    event_type: str
+    action_id: str
+    mode: str
+    target: DeviceHealthAlertActionTarget
+    message_ts: str
+    thread_ts: str
+    occurred_at: datetime
+    status: str
+    ok: bool
+    error_type: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +145,13 @@ class DeviceHealthAlertActionRouteDeps:
         )
     )
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    write_event: Callable[
+        [str, datetime, Mapping[str, Any]], bool
+    ] = lambda event_type, now, payload: append_device_health_monitor_event(
+        event_type,
+        payload,
+        now=now,
+    )
 
 
 class DeviceHealthAlertActionAssistantRoute:
@@ -139,6 +175,24 @@ class DeviceHealthAlertActionAssistantRoute:
         route = match_device_health_alert_action_route(request)
         if route is None:
             return None
+
+        if route == DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE:
+            receipt = _parse_device_health_alert_ui_receipt(request.metadata)
+            if receipt is None:
+                return _result(
+                    route=route,
+                    outcome="denied",
+                    body="장비 이상 알림 UI receipt가 올바르지 않아 기록하지 않았어",
+                    fallback_reason="invalid_device_health_alert_ui_receipt",
+                )
+            if not str(request.actor_id or "").strip():
+                return _result(
+                    route=route,
+                    outcome="denied",
+                    body="실행 요청자를 확인할 수 없어 기록하지 않았어",
+                    fallback_reason="missing_operation_actor",
+                )
+            return self._record_ui_receipt(request, receipt)
 
         action = _parse_device_health_alert_action(request.metadata)
         if action is None:
@@ -164,37 +218,165 @@ class DeviceHealthAlertActionAssistantRoute:
                 "장비 이상 알림 exact target 조회 실패 error_type=%s",
                 type(exc).__name__,
             )
-            return _result(
-                route=route,
-                outcome="failed",
-                body="장비 이상 알림 대상을 확인하지 못해 실행하지 않았어",
-                fallback_reason="device_health_alert_target_lookup_failed",
+            return self._record_action_result(
+                request,
+                action,
+                _result(
+                    route=route,
+                    outcome="failed",
+                    body=(
+                        "장비 이상 알림 대상을 확인하지 못해 실행하지 않았어"
+                    ),
+                    fallback_reason=(
+                        "device_health_alert_target_lookup_failed"
+                    ),
+                ),
             )
         if exact_target is None:
-            return _result(
-                route=route,
-                outcome="denied",
-                body="현재 DB 정보와 알림 대상이 일치하지 않아 실행하지 않았어",
-                fallback_reason="device_health_alert_target_mismatch",
+            return self._record_action_result(
+                request,
+                action,
+                _result(
+                    route=route,
+                    outcome="denied",
+                    body=(
+                        "현재 DB 정보와 알림 대상이 일치하지 않아 "
+                        "실행하지 않았어"
+                    ),
+                    fallback_reason="device_health_alert_target_mismatch",
+                ),
             )
 
         if action.name == DEVICE_HEALTH_ALERT_SMS_ACTION:
             if action.phase == "prepare":
+                # legacy modal open은 UI receipt 이벤트 하나만 남겼다. DB 기본값
+                # 준비 단계는 action 실행 이벤트로 중복 기록하지 않는다.
                 return self._prepare_sms(action, exact_target)
-            return self._send_sms(request, action, exact_target)
+            return self._record_action_result(
+                request,
+                action,
+                self._send_sms(request, action, exact_target),
+            )
         if action.name == DEVICE_HEALTH_ALERT_VOICE_ACTION:
-            return self._send_voice(request, action)
+            return self._record_action_result(
+                request,
+                action,
+                self._send_voice(request, action),
+            )
         if action.name == DEVICE_HEALTH_ALERT_MARK_DONE_ACTION:
-            return _result(
-                route=route,
-                outcome="answered",
-                body=(
-                    "**장비 이상 알림 처리**\n"
-                    f"• 작업: **확인 완료**\n"
-                    f"• 대상: `{_format_target(action.target)}`"
+            return self._record_action_result(
+                request,
+                action,
+                _result(
+                    route=route,
+                    outcome="answered",
+                    body=(
+                        "**장비 이상 알림 처리**\n"
+                        f"• 작업: **확인 완료**\n"
+                        f"• 대상: `{_format_target(action.target)}`"
+                    ),
                 ),
             )
         return None
+
+    def _record_action_result(
+        self,
+        request: CompanyAssistantRequest,
+        action: DeviceHealthAlertAction,
+        result: CompanyAssistantResult,
+    ) -> CompanyAssistantResult:
+        """API가 실행한 action을 health JSONL 정본에 best-effort로 남긴다."""
+
+        occurred_at = self._deps.now()
+        try:
+            self._deps.write_event(
+                "alert_action_requested",
+                occurred_at,
+                {
+                    "actionId": action.name,
+                    "actionLabel": _DEVICE_HEALTH_ALERT_ACTION_LABELS.get(
+                        action.name,
+                        action.name,
+                    ),
+                    "actorUserId": str(request.actor_id or ""),
+                    "channelId": str(
+                        request.metadata.get("channel_id") or ""
+                    ),
+                    "messageTs": str(request.conversation_id or ""),
+                    "threadTs": str(request.conversation_id or ""),
+                    "hospital": (
+                        action.target.hospital_label
+                        or action.target.hospital_name
+                    ),
+                    "room": action.target.room_name,
+                    "device": action.target.device_name,
+                    "issue": action.target.issue,
+                    "mdaUrl": action.target.mda_url,
+                    "result": {
+                        "status": result.outcome,
+                        "ok": result.outcome == "answered",
+                        "route": result.route,
+                        "fallbackReason": str(
+                            result.fallback_reason or ""
+                        ),
+                    },
+                },
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Device health action event write failed error_type=%s",
+                type(exc).__name__,
+            )
+        return result
+
+    def _record_ui_receipt(
+        self,
+        request: CompanyAssistantRequest,
+        receipt: DeviceHealthAlertUiReceipt,
+    ) -> CompanyAssistantResult:
+        """API가 알 수 없던 Slack modal 결과를 중앙 JSONL에 그대로 쓴다."""
+
+        event_result: dict[str, Any] = {
+            "status": receipt.status,
+            "ok": receipt.ok,
+        }
+        if receipt.error_type:
+            event_result["error"] = receipt.error_type
+        try:
+            self._deps.write_event(
+                receipt.event_type,
+                receipt.occurred_at,
+                {
+                    "actionId": receipt.action_id,
+                    "mode": receipt.mode,
+                    "actorUserId": str(request.actor_id or ""),
+                    "channelId": str(
+                        request.metadata.get("channel_id") or ""
+                    ),
+                    "messageTs": receipt.message_ts,
+                    "threadTs": receipt.thread_ts,
+                    "hospital": (
+                        receipt.target.hospital_label
+                        or receipt.target.hospital_name
+                    ),
+                    "room": receipt.target.room_name,
+                    "device": receipt.target.device_name,
+                    "issue": receipt.target.issue,
+                    "mdaUrl": receipt.target.mda_url,
+                    "result": event_result,
+                },
+            )
+        except Exception as exc:
+            # legacy local writer도 Slack action 성공 여부와 event I/O를 분리했다.
+            self._logger.warning(
+                "Device health UI receipt event write failed error_type=%s",
+                type(exc).__name__,
+            )
+        return _result(
+            route=DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
+            outcome="answered",
+            body="장비 이상 알림 UI 결과를 기록했어",
+        )
 
     def _prepare_sms(
         self,
@@ -508,6 +690,12 @@ def match_device_health_alert_action_route(
     if not isinstance(raw_action, Mapping):
         return None
     action_name = str(raw_action.get("name") or "").strip()
+    if action_name == DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION:
+        return (
+            DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE
+            if str(raw_action.get("phase") or "").strip() == "receipt"
+            else None
+        )
     if action_name == DEVICE_HEALTH_ALERT_SMS_ACTION:
         phase = str(raw_action.get("phase") or "").strip()
         if phase == "prepare":
@@ -585,9 +773,125 @@ def _parse_device_health_alert_action(
             issue=issue,
             alert_category=alert_category,
             problem_components=components,
+            hospital_label=" ".join(
+                str(raw_target.get("hospital_label") or "").split()
+            ),
+            mda_url=str(raw_target.get("mda_url") or "").strip(),
         ),
         sms_phone_number=str(sms.get("phone_number") or "").strip(),
         sms_message=str(sms.get("message") or "").strip(),
+    )
+
+
+def _parse_device_health_alert_ui_receipt(
+    metadata: Mapping[str, Any],
+) -> DeviceHealthAlertUiReceipt | None:
+    """HTTP schema를 우회한 runtime 호출에서도 receipt 필드를 재검증한다."""
+
+    raw_action = metadata.get("operation_action")
+    if not isinstance(raw_action, Mapping):
+        return None
+    if (
+        str(raw_action.get("name") or "").strip()
+        != DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION
+        or str(raw_action.get("phase") or "").strip() != "receipt"
+        or str(raw_action.get("event_type") or "").strip()
+        != "alert_contact_sms_modal_requested"
+    ):
+        return None
+    action_id = str(raw_action.get("action_id") or "").strip()
+    mode = str(raw_action.get("mode") or "").strip()
+    status = str(raw_action.get("status") or "").strip()
+    ok = raw_action.get("ok")
+    error_type = str(raw_action.get("error_type") or "").strip()
+    if (
+        action_id
+        not in {
+            DEVICE_HEALTH_ALERT_SMS_ACTION,
+            "device_health_alert_view_auto_sms",
+        }
+        or mode not in {"send", "view_auto_sent"}
+        or status
+        not in {
+            "missing_trigger_id",
+            "modal_opened",
+            "modal_open_failed",
+        }
+        or not isinstance(ok, bool)
+        or ok != (status == "modal_opened")
+        or (error_type and status != "modal_open_failed")
+        or len(error_type) > 160
+    ):
+        return None
+    raw_target = raw_action.get("target")
+    if not isinstance(raw_target, Mapping):
+        return None
+    try:
+        hospital_seq = int(raw_target.get("hospital_seq") or 0)
+        occurred_at = datetime.fromisoformat(
+            str(raw_action.get("occurred_at") or "")
+            .strip()
+            .replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
+    hospital_name = " ".join(
+        str(raw_target.get("hospital_name") or "").split()
+    )
+    room_name = " ".join(
+        str(raw_target.get("room_name") or "").split()
+    )
+    device_name = str(raw_target.get("device_name") or "").strip()
+    issue = " ".join(str(raw_target.get("issue") or "").split())
+    message_ts = str(raw_action.get("message_ts") or "").strip()
+    thread_ts = str(raw_action.get("thread_ts") or "").strip()
+    timestamp_pattern = r"^\d{1,20}(?:\.\d{1,9})?$"
+    if (
+        occurred_at.tzinfo is None
+        or hospital_seq <= 0
+        or not hospital_name
+        or not room_name
+        or not company_settings.S3_DEVICE_NAME_PATTERN.fullmatch(device_name)
+        or not issue
+        or not re.fullmatch(timestamp_pattern, message_ts)
+        or not re.fullmatch(timestamp_pattern, thread_ts)
+    ):
+        return None
+    raw_components = raw_target.get("problem_components")
+    components = (
+        tuple(
+            " ".join(str(component or "").split())
+            for component in raw_components
+            if " ".join(str(component or "").split())
+        )
+        if isinstance(raw_components, (list, tuple))
+        else ()
+    )
+    return DeviceHealthAlertUiReceipt(
+        event_type="alert_contact_sms_modal_requested",
+        action_id=action_id,
+        mode=mode,
+        target=DeviceHealthAlertActionTarget(
+            hospital_seq=hospital_seq,
+            hospital_name=hospital_name,
+            room_name=room_name,
+            device_name=device_name,
+            issue=issue,
+            alert_category=str(
+                raw_target.get("alert_category") or ""
+            ).strip(),
+            problem_components=components,
+            hospital_label=" ".join(
+                str(raw_target.get("hospital_label") or "").split()
+            ),
+            mda_url=str(raw_target.get("mda_url") or "").strip(),
+        ),
+        message_ts=message_ts,
+        thread_ts=thread_ts,
+        occurred_at=occurred_at,
+        status=status,
+        ok=ok,
+        error_type=error_type,
     )
 
 
@@ -1029,11 +1333,14 @@ __all__ = [
     "DEVICE_HEALTH_ALERT_SMS_ACTION",
     "DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE",
     "DEVICE_HEALTH_ALERT_SMS_ROUTE",
+    "DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION",
+    "DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE",
     "DEVICE_HEALTH_ALERT_VOICE_ACTION",
     "DEVICE_HEALTH_ALERT_VOICE_ROUTE",
     "DeviceHealthAlertAction",
     "DeviceHealthAlertActionAssistantRoute",
     "DeviceHealthAlertActionRouteDeps",
     "DeviceHealthAlertActionTarget",
+    "DeviceHealthAlertUiReceipt",
     "match_device_health_alert_action_route",
 ]

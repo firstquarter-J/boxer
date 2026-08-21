@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
+from datetime import datetime, timedelta, timezone
+import json
 import logging
 import threading
 from typing import Any
@@ -67,6 +69,24 @@ class _FakeSession:
         return result
 
 
+class _FakeStreamResponse:
+    def __init__(
+        self,
+        *lines: bytes,
+        content_type: str = "application/x-ndjson",
+    ) -> None:
+        self.status_code = 200
+        self.headers = {"content-type": content_type}
+        self.lines = list(lines)
+        self.closed = False
+
+    def iter_lines(self, **_kwargs: Any) -> Any:
+        yield from self.lines
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _CollectingHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
@@ -107,6 +127,39 @@ def _request(
         locale="ko",
         context_entries=context_entries,
         metadata=metadata or {"channel_id": "C1"},
+    )
+
+
+def _request_with_audit_context(
+    *,
+    request_id: str = "slack:T1:C01:1785312000.000002",
+) -> CompanyAssistantRequest:
+    message_id = "1785312000.000002"
+    thread_id = "1785312000.000001"
+    return replace(
+        _request(request_id=request_id),
+        conversation_id=thread_id,
+        metadata={
+            "channel_id": "C01",
+            "message_id": message_id,
+            "audit_context": {
+                "event_type": "app_mention",
+                "user_name": "테스트 사용자",
+                "channel_id": "C01",
+                "message_id": message_id,
+                "thread_id": thread_id,
+                "is_thread_root": False,
+                "permalink": (
+                    "https://workspace.slack.com/archives/C01/"
+                    "p1785312000000002"
+                    f"?thread_ts={thread_id}&cid=C01"
+                ),
+                "thread_permalink": (
+                    "https://workspace.slack.com/archives/C01/"
+                    "p1785312000000001"
+                ),
+            },
+        },
     )
 
 
@@ -152,6 +205,65 @@ def _success_response(
         payload=_success_payload(request_id, outcome=outcome),
         content_type="application/json",
     )
+
+
+def _download_delivery_result() -> dict[str, Any]:
+    return {
+        "kind": "device_file_download_delivery",
+        "status": "pending",
+        "failureNotice": (
+            "**장비 영상 다운로드 결과**\n"
+            "• 다운로드 링크: DM 전송 실패. 봇 DM 권한을 확인해줘"
+        ),
+        "linkCount": 1,
+        "links": [
+            {
+                "deviceName": "MB2-C00419",
+                "fileName": "a.motion.mp4",
+            }
+        ],
+        "delivery": {
+            "barcode": "48194663047",
+            "logDate": "2026-03-06",
+            "usedExpandedScope": False,
+            "records": [
+                {
+                    "deviceName": "MB2-C00419",
+                    "deviceSeq": 41,
+                    "hospitalSeq": 5,
+                    "hospitalRoomSeq": 8,
+                    "hospitalName": "테스트병원",
+                    "roomName": "1진료실",
+                    "fileNames": ["a.motion.mp4"],
+                    "downloadFileNames": ["a.motion.mp4"],
+                }
+            ],
+        },
+    }
+
+
+def _device_operation_delivery_result() -> dict[str, Any]:
+    return {
+        "kind": "device_operation_delivery",
+        "status": "pending",
+        "delivery": {
+            "route": "device_box_update",
+            "deviceName": "MB2-C00419",
+            "requestedVersion": "2.4.1",
+            "currentBoxVersion": "2.3.9",
+            "dispatchMessage": "업데이트 요청을 전달했어",
+            "waitStatus": "completed",
+            "waitOk": True,
+        },
+    }
+
+
+def _stream_line(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _problem_response(
@@ -274,7 +386,7 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertEqual(settings.playbook_mode, "local")
         self.assertEqual(settings.weekly_summary_mode, "local")
         self.assertEqual(settings.operations_mode, "local")
-        self.assertEqual(settings.operations_read_timeout_sec, 700.0)
+        self.assertEqual(settings.operations_read_timeout_sec, 1_300.0)
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.base_url, "")
         self.assertEqual(settings.token, "")
@@ -791,6 +903,151 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
 
 
 class CompanyApiClientContractTests(unittest.TestCase):
+    def test_progress_stream_forwards_partial_and_returns_final(self) -> None:
+        request = _request(request_id="req-progress-1")
+        partial = _success_payload(request.request_id)
+        partial["messages"][0]["body"] = "장비 요청 전달 완료"
+        final = _success_payload(request.request_id)
+        final["messages"][0]["body"] = "장비 작업 완료"
+        response = _FakeStreamResponse(
+            _stream_line({"type": "partial", "result": partial}),
+            _stream_line(
+                {"type": "heartbeat", "requestId": request.request_id}
+            ),
+            _stream_line({"type": "final", "result": final}),
+        )
+        session = _FakeSession(response)
+        partial_bodies: list[str] = []
+
+        result = _client(session).answer_with_progress(
+            request,
+            route_group="operations",
+            on_partial_result=lambda item: partial_bodies.append(
+                item.messages[0].body
+            ),
+        )
+
+        self.assertEqual(partial_bodies, ["장비 요청 전달 완료"])
+        self.assertEqual(result.messages[0].body, "장비 작업 완료")
+        self.assertTrue(response.closed)
+        self.assertTrue(session.calls[0]["stream"])
+        self.assertEqual(
+            session.calls[0]["headers"]["Accept"].split(",", 1)[0],
+            "application/x-ndjson",
+        )
+
+    def test_progress_accepts_completed_json_replay(self) -> None:
+        request = _request(request_id="req-progress-replay")
+        session = _FakeSession(_success_response(request.request_id))
+        partials: list[Any] = []
+
+        result = _client(session).answer_with_progress(
+            request,
+            route_group="operations",
+            on_partial_result=partials.append,
+        )
+
+        self.assertEqual(result.route, "company_notion_qa")
+        self.assertEqual(partials, [])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_progress_malformed_error_and_eof_are_ambiguous_no_retry(
+        self,
+    ) -> None:
+        request = _request(request_id="req-progress-ambiguous")
+        valid_result = _success_payload(request.request_id)
+        safe_problem = {
+            "type": "urn:boxer-company-api:problem:internal_error",
+            "title": "Internal server error",
+            "status": 500,
+            "code": "internal_error",
+            "requestId": request.request_id,
+            "retryable": False,
+        }
+        cases = (
+            ("empty", _FakeStreamResponse()),
+            (
+                "partial_eof",
+                _FakeStreamResponse(
+                    _stream_line(
+                        {"type": "partial", "result": valid_result}
+                    )
+                ),
+            ),
+            (
+                "wrong_order",
+                _FakeStreamResponse(
+                    _stream_line(
+                        {"result": valid_result, "type": "final"}
+                    )
+                ),
+            ),
+            (
+                "mismatched_request",
+                _FakeStreamResponse(
+                    _stream_line(
+                        {
+                            "type": "final",
+                            "result": _success_payload("another-request"),
+                        }
+                    )
+                ),
+            ),
+            (
+                "error",
+                _FakeStreamResponse(
+                    _stream_line(
+                        {"type": "error", "problem": safe_problem}
+                    )
+                ),
+            ),
+            ("invalid_utf8", _FakeStreamResponse(b"\xff")),
+        )
+        for label, response in cases:
+            with self.subTest(label=label):
+                session = _FakeSession(
+                    response,
+                    _success_response(request.request_id),
+                )
+                with self.assertRaises(CompanyApiAmbiguousTimeoutError):
+                    _client(
+                        session,
+                        settings=_settings(max_retries=2),
+                    ).answer_with_progress(
+                        request,
+                        route_group="operations",
+                        on_partial_result=lambda _result: None,
+                    )
+                self.assertEqual(len(session.calls), 1)
+                self.assertTrue(response.closed)
+
+    def test_progress_preserves_single_long_context_entry_tail(self) -> None:
+        tail = "TAIL-SENTINEL"
+        context_text = ("가" * 4_500) + tail
+        request = _request(
+            request_id="req-progress-context",
+            context_entries=(
+                {
+                    "kind": "message",
+                    "source": "slack",
+                    "text": context_text,
+                },
+            ),
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="knowledge")
+
+        self.assertEqual(
+            session.calls[0]["json"]["contextEntries"][0]["text"],
+            context_text,
+        )
+        self.assertTrue(
+            session.calls[0]["json"]["contextEntries"][0]["text"].endswith(
+                tail
+            )
+        )
+
     def test_serializes_valid_route_group_and_rejects_unknown_group(
         self,
     ) -> None:
@@ -850,6 +1107,347 @@ class CompanyApiClientContractTests(unittest.TestCase):
 
         self.assertEqual(session.calls[0]["timeout"], (2.0, 701))
 
+    def test_operations_serialize_only_strict_slack_audit_identity(self) -> None:
+        request = _request_with_audit_context()
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="operations")
+
+        audit_context = session.calls[0]["json"]["auditContext"]
+        self.assertEqual(
+            audit_context,
+            {
+                "eventType": "app_mention",
+                "userName": "테스트 사용자",
+                "channelId": "C01",
+                "messageId": "1785312000.000002",
+                "threadId": "1785312000.000001",
+                "isThreadRoot": False,
+                "permalink": (
+                    "https://workspace.slack.com/archives/C01/"
+                    "p1785312000000002"
+                    "?thread_ts=1785312000.000001&cid=C01"
+                ),
+                "threadPermalink": (
+                    "https://workspace.slack.com/archives/C01/"
+                    "p1785312000000001"
+                ),
+            },
+        )
+        # 감사 identity 안에 민감할 수 있는 질문·일반 metadata를 복제하지 않는다.
+        self.assertNotIn(request.question, str(audit_context))
+        self.assertNotIn("question", audit_context)
+
+    def test_operations_reject_invalid_audit_url_and_slack_identity_locally(
+        self,
+    ) -> None:
+        base = _request_with_audit_context()
+        cases = (
+            {
+                **base.metadata,
+                "audit_context": {
+                    **base.metadata["audit_context"],
+                    "channel_id": "C02",
+                },
+            },
+            {
+                **base.metadata,
+                "audit_context": {
+                    **base.metadata["audit_context"],
+                    "message_id": "not-a-slack-ts",
+                },
+            },
+            {
+                **base.metadata,
+                "audit_context": {
+                    **base.metadata["audit_context"],
+                    "user_name": 123,
+                },
+            },
+            {
+                **base.metadata,
+                "audit_context": {
+                    **base.metadata["audit_context"],
+                    "permalink": (
+                        "https://evil.example.com/archives/C01/"
+                        "p1785312000000002"
+                    ),
+                },
+            },
+            {
+                **base.metadata,
+                "audit_context": {
+                    **base.metadata["audit_context"],
+                    "permalink": (
+                        "https://workspace.slack.com/archives/C01/"
+                        "p1785312000000003"
+                    ),
+                },
+            },
+            {
+                **base.metadata,
+                "audit_context": {
+                    **base.metadata["audit_context"],
+                    "question": "원문을 감사 context에 넣지 마",
+                },
+            },
+        )
+        for metadata in cases:
+            with self.subTest(metadata=metadata["audit_context"]):
+                session = _FakeSession()
+                with self.assertRaises(CompanyApiContractError):
+                    _client(session).answer(
+                        replace(base, metadata=metadata),
+                        route_group="operations",
+                    )
+                self.assertEqual(session.calls, [])
+
+    def test_serializes_strict_diagnostic_snapshot_probe_action(self) -> None:
+        request = replace(
+            _request(request_id="diag-probe:0123456789abcdef"),
+            metadata={
+                "channel_id": "C1",
+                "operation_action": {
+                    "name": "device_diagnostic_followup_probe",
+                },
+            },
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="operations")
+
+        self.assertEqual(
+            session.calls[0]["json"]["operationAction"],
+            {"name": "device_diagnostic_followup_probe"},
+        )
+        invalid = replace(
+            request,
+            metadata={
+                **request.metadata,
+                "operation_action": {
+                    "name": "device_diagnostic_followup_probe",
+                    "phase": "probe",
+                },
+            },
+        )
+        with self.assertRaises(CompanyApiContractError):
+            _client(_FakeSession()).answer(
+                invalid,
+                route_group="operations",
+            )
+
+    def test_only_freeform_transport_accepts_blank_question(self) -> None:
+        request = replace(_request(), question="   ")
+        freeform_session = _FakeSession(
+            _success_response(request.request_id)
+        )
+
+        _client(freeform_session).answer(
+            request,
+            route_group="freeform",
+        )
+
+        self.assertEqual(
+            freeform_session.calls[0]["json"]["question"],
+            "",
+        )
+        for route_group in (None, "knowledge", "operations"):
+            with self.subTest(route_group=route_group):
+                session = _FakeSession()
+                with self.assertRaises(CompanyApiContractError):
+                    _client(session).answer(
+                        request,
+                        route_group=route_group,
+                    )
+                self.assertEqual(session.calls, [])
+
+    def test_fun_context_preserves_the_latest_five_k_verbatim(self) -> None:
+        rendered_context = ("오" * 4_000) + "최신핵심" + ("신" * 996)
+        request = replace(
+            _request(),
+            metadata={"team_fun_context": rendered_context},
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="fun")
+
+        self.assertEqual(
+            session.calls[0]["json"]["funContext"],
+            rendered_context,
+        )
+        self.assertEqual(session.calls[0]["json"]["contextEntries"], [])
+        with self.assertRaises(CompanyApiContractError):
+            _client(_FakeSession()).answer(
+                request,
+                route_group="freeform",
+            )
+
+    def test_download_delivery_ack_uses_same_request_id_and_typed_manifest(
+        self,
+    ) -> None:
+        request = _request(
+            request_id="slack:T1:C1:download-1",
+            metadata={
+                "channel_id": "C1",
+                "actor_name": "홍 길동",
+            },
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).acknowledge_device_file_download(
+            request,
+            _download_delivery_result(),
+        )
+
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(
+            call["headers"]["X-Request-ID"],
+            request.request_id,
+        )
+        self.assertEqual(call["json"]["routeGroup"], "operations")
+        self.assertEqual(
+            call["json"]["operationAction"],
+            {
+                "name": "device_file_download_delivery",
+                "phase": "delivered",
+                "delivery": _download_delivery_result()["delivery"],
+            },
+        )
+        # receipt에는 presigned URL을 되돌려 보내지 않는다.
+        self.assertNotIn("https://", str(call["json"]["operationAction"]))
+
+    def test_request_log_delivery_ack_uses_same_id_and_accepts_300_replies(
+        self,
+    ) -> None:
+        request = _request_with_audit_context()
+        session = _FakeSession(_success_response(request.request_id))
+        first_reply = datetime(
+            2026,
+            8,
+            21,
+            10,
+            2,
+            3,
+            123456,
+            tzinfo=timezone(timedelta(hours=9)),
+        )
+
+        _client(session).acknowledge_request_log_delivery(
+            request,
+            delivered=True,
+            reply_count=300,
+            first_replied_at_utc=first_reply,
+        )
+
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(
+            call["headers"]["X-Request-ID"],
+            request.request_id,
+        )
+        self.assertEqual(call["json"]["routeGroup"], "operations")
+        self.assertEqual(
+            call["json"]["operationAction"],
+            {
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": True,
+                "replyCount": 300,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03+00:00",
+                "errorType": None,
+            },
+        )
+        self.assertEqual(
+            call["json"]["auditContext"]["messageId"],
+            "1785312000.000002",
+        )
+
+    def test_request_log_delivery_ack_never_retries_transport(self) -> None:
+        request = _request_with_audit_context()
+        session = _FakeSession(
+            requests.exceptions.ConnectTimeout(),
+            _success_response(request.request_id),
+        )
+
+        with self.assertRaises(CompanyApiAvailabilityError):
+            _client(
+                session,
+                settings=_settings(max_retries=2),
+            ).acknowledge_request_log_delivery(
+                request,
+                delivered=False,
+                reply_count=0,
+                first_replied_at_utc=None,
+                error_type="RuntimeError",
+            )
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_download_delivery_ack_never_retries_transport(self) -> None:
+        request = _request(request_id="slack:T1:C1:download-no-retry")
+        session = _FakeSession(
+            requests.exceptions.ConnectTimeout(),
+            _success_response(request.request_id),
+        )
+
+        with self.assertRaises(CompanyApiAvailabilityError):
+            _client(
+                session,
+                settings=_settings(max_retries=2),
+            ).acknowledge_device_file_download(
+                request,
+                _download_delivery_result(),
+            )
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_device_operation_delivery_ack_is_same_id_and_url_free(
+        self,
+    ) -> None:
+        request = _request(request_id="req-device-delivery-1")
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).acknowledge_device_operation_delivery(
+            request,
+            _device_operation_delivery_result(),
+        )
+
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(
+            call["headers"]["X-Request-ID"],
+            request.request_id,
+        )
+        self.assertEqual(call["json"]["routeGroup"], "operations")
+        self.assertEqual(
+            call["json"]["operationAction"],
+            {
+                "name": "device_operation_delivery",
+                "phase": "delivered",
+                "delivery": _device_operation_delivery_result()["delivery"],
+            },
+        )
+        self.assertNotIn("http", str(call["json"]["operationAction"]))
+
+    def test_device_operation_delivery_ack_never_retries(self) -> None:
+        request = _request(request_id="req-device-delivery-no-retry")
+        session = _FakeSession(
+            requests.exceptions.ConnectTimeout(),
+            _success_response(request.request_id),
+        )
+
+        with self.assertRaises(CompanyApiAvailabilityError):
+            _client(
+                session,
+                settings=_settings(max_retries=2),
+            ).acknowledge_device_operation_delivery(
+                request,
+                _device_operation_delivery_result(),
+            )
+
+        self.assertEqual(len(session.calls), 1)
+
     def test_serializes_typed_device_health_alert_operation(self) -> None:
         request = _request(
             metadata={
@@ -898,6 +1496,50 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_serializes_typed_device_health_alert_ui_receipt(self) -> None:
+        request = _request(
+            metadata={
+                "channel_id": "C1",
+                "device_name": "MB2-C00419",
+                "operation_action": {
+                    "name": "device_health_alert_ui_receipt",
+                    "phase": "receipt",
+                    "event_type": "alert_contact_sms_modal_requested",
+                    "action_id": "device_health_alert_contact_hospital",
+                    "mode": "send",
+                    "target": {
+                        "hospital_seq": 7,
+                        "hospital_name": "테스트병원",
+                        "hospital_label": "#7 테스트병원",
+                        "room_name": "2진료실",
+                        "device_name": "MB2-C00419",
+                        "issue": "캡처보드 연결 확인 필요",
+                        "alert_category": "video_signal",
+                        "mda_url": "https://mda.example/monitoring?focusDevice=MB2-C00419",
+                        "problem_components": ["캡처보드"],
+                    },
+                    "message_ts": "3000.001",
+                    "thread_ts": "3000.001",
+                    "occurred_at": "2026-08-14T09:30:00+09:00",
+                    "status": "modal_opened",
+                    "ok": True,
+                    "error_type": "",
+                },
+            }
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="operations")
+
+        action = session.calls[0]["json"]["operationAction"]
+        self.assertEqual(action["name"], "device_health_alert_ui_receipt")
+        self.assertEqual(action["eventType"], "alert_contact_sms_modal_requested")
+        self.assertEqual(action["actionId"], "device_health_alert_contact_hospital")
+        self.assertEqual(action["target"]["hospitalLabel"], "#7 테스트병원")
+        self.assertEqual(action["messageTs"], "3000.001")
+        self.assertEqual(action["status"], "modal_opened")
+        self.assertTrue(action["ok"])
 
     def test_operation_action_requires_operations_group(self) -> None:
         request = _request(
@@ -992,6 +1634,18 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 "device_name": "MB2-C00419",
                 "channel_id": "C1",
                 "followup_kind": "barcode_log",
+                "actor_name": "테스트 사용자",
+                "thread_permalink": (
+                    "https://workspace.slack.com/archives/C1/"
+                    "p1785312000000001?thread_ts=1785312000.000001&cid=C1"
+                ),
+                "trusted_mda_recovery_scope": {
+                    "barcode": "12345678901",
+                    "logDate": "2026-03-06",
+                    "deviceName": "MB2-C00419",
+                    "hospitalName": "테스트 병원",
+                    "roomName": "검사실",
+                },
                 "role": "must-not-cross",
             }
         )
@@ -1037,6 +1691,18 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 "deviceName": "MB2-C00419",
                 "channelContextId": "C1",
                 "followupKind": "barcode_log",
+                "actorName": "테스트 사용자",
+                "threadPermalink": (
+                    "https://workspace.slack.com/archives/C1/"
+                    "p1785312000000001?thread_ts=1785312000.000001&cid=C1"
+                ),
+                "trustedMdaRecoveryScope": {
+                    "barcode": "12345678901",
+                    "logDate": "2026-03-06",
+                    "deviceName": "MB2-C00419",
+                    "hospitalName": "테스트 병원",
+                    "roomName": "검사실",
+                },
             },
         )
         self.assertNotIn("role", call["json"]["scope"])
@@ -1068,6 +1734,83 @@ class CompanyApiClientContractTests(unittest.TestCase):
         self.assertTrue(serialized[0]["text"].startswith("05-"))
         self.assertEqual(len(serialized[0]["text"]), 200)
         self.assertTrue(serialized[-1]["text"].startswith("13-"))
+
+    def test_operations_preserves_the_legacy_learning_context_budget(self) -> None:
+        entries = tuple(
+            {
+                "kind": "message",
+                "source": "slack",
+                "author_id": "U1",
+                "text": f"{index:02d}-" + ("x" * 597),
+                "created_at": f"17853120{index:02d}.000001",
+            }
+            for index in range(20)
+        )
+        request = _request(context_entries=entries)
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="operations")
+
+        serialized = session.calls[0]["json"]["contextEntries"]
+        self.assertEqual(len(serialized), 20)
+        self.assertEqual(
+            sum(len(entry["text"]) for entry in serialized),
+            12_000,
+        )
+        self.assertTrue(serialized[0]["text"].startswith("00-"))
+        self.assertTrue(serialized[-1]["text"].startswith("19-"))
+
+    def test_operations_preserves_one_five_thousand_char_entry_exactly(
+        self,
+    ) -> None:
+        prefix = "BEGIN\n"
+        suffix = "\nEND"
+        thread_text = (
+            prefix
+            + ("x" * (5_000 - len(prefix) - len(suffix)))
+            + suffix
+        )
+        request = replace(
+            _request(
+                context_entries=(
+                    {
+                        "kind": "message",
+                        "source": "slack",
+                        "author_id": "U1",
+                        "text": thread_text,
+                        "created_at": "1785312000.000001",
+                    },
+                )
+            ),
+            question="이 스레드 학습해줘",
+        )
+        session = _FakeSession(_success_response(request.request_id))
+
+        _client(session).answer(request, route_group="operations")
+
+        serialized_text = session.calls[0]["json"]["contextEntries"][0][
+            "text"
+        ]
+        self.assertEqual(serialized_text.encode(), thread_text.encode())
+
+    def test_question_uses_the_slack_forty_thousand_char_limit(self) -> None:
+        accepted = replace(_request(), question="q" * 40_000)
+        accepted_session = _FakeSession(
+            _success_response(accepted.request_id)
+        )
+
+        _client(accepted_session).answer(accepted)
+
+        self.assertEqual(
+            accepted_session.calls[0]["json"]["question"],
+            accepted.question,
+        )
+        rejected_session = _FakeSession()
+        with self.assertRaises(CompanyApiContractError):
+            _client(rejected_session).answer(
+                replace(_request(), question="q" * 40_001)
+            )
+        self.assertEqual(rejected_session.calls, [])
 
     def test_invalid_request_or_trace_context_never_calls_http(self) -> None:
         invalid_requests = (

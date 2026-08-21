@@ -19,6 +19,8 @@ from boxer_company.assistant.device_health_alert_action_route import (
     DEVICE_HEALTH_ALERT_SMS_ACTION,
     DEVICE_HEALTH_ALERT_SMS_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
     DEVICE_HEALTH_ALERT_VOICE_ACTION,
     DEVICE_HEALTH_ALERT_VOICE_ROUTE,
     DeviceHealthAlertActionAssistantRoute,
@@ -125,10 +127,12 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
     def test_sms_prepare_reads_db_without_sending_and_returns_private_defaults(self) -> None:
         load_target = Mock(return_value=_exact_target())
         send_sms = Mock()
+        write_event = Mock(return_value=True)
         deps = replace(
             DeviceHealthAlertActionRouteDeps(),
             load_exact_target=load_target,
             send_sms=send_sms,
+            write_event=write_event,
         )
 
         result = DeviceHealthAlertActionAssistantRoute(deps).handle(
@@ -150,6 +154,85 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
         self.assertNotIn("01012345678", result.messages[0].body)
         load_target.assert_called_once()
         send_sms.assert_not_called()
+        write_event.assert_not_called()
+
+    def test_ui_receipt_writes_exact_legacy_modal_event_without_db_lookup(self) -> None:
+        occurred_at = datetime(2026, 8, 14, 9, 30, tzinfo=timezone.utc)
+        load_target = Mock()
+        write_event = Mock(return_value=True)
+        request = CompanyAssistantRequest(
+            request_id="REQ-ALERT-UI-1",
+            tenant_id="TENANT-1",
+            actor_id="U-ACTOR",
+            channel="slack",
+            conversation_id="3000.001",
+            question="device health alert action",
+            locale="ko",
+            metadata={
+                "route_group": "operations",
+                "channel_id": "C-HEALTH",
+                "operation_action": {
+                    "name": DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
+                    "phase": "receipt",
+                    "event_type": "alert_contact_sms_modal_requested",
+                    "action_id": DEVICE_HEALTH_ALERT_SMS_ACTION,
+                    "mode": "send",
+                    "target": {
+                        "hospital_seq": 31,
+                        "hospital_name": "분당제일병원",
+                        "hospital_label": "#31 분당제일병원",
+                        "room_name": "2진료실",
+                        "device_name": "MB2-C00419",
+                        "issue": "캡처보드 연결 확인 필요",
+                        "alert_category": "video_signal",
+                        "problem_components": ["캡처보드"],
+                        "mda_url": "https://mda.example/monitoring?device=MB2-C00419",
+                    },
+                    "message_ts": "3000.001",
+                    "thread_ts": "3000.001",
+                    "occurred_at": occurred_at.isoformat(),
+                    "status": "modal_opened",
+                    "ok": True,
+                    "error_type": "",
+                },
+            },
+        )
+        route = DeviceHealthAlertActionAssistantRoute(
+            replace(
+                DeviceHealthAlertActionRouteDeps(),
+                load_exact_target=load_target,
+                write_event=write_event,
+            )
+        )
+
+        result = route.handle(request)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route, DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE)
+        self.assertEqual(result.outcome, "answered")
+        load_target.assert_not_called()
+        write_event.assert_called_once()
+        event_type, event_time, payload = write_event.call_args.args
+        self.assertEqual(event_type, "alert_contact_sms_modal_requested")
+        self.assertEqual(event_time, occurred_at)
+        self.assertEqual(
+            payload,
+            {
+                "actionId": DEVICE_HEALTH_ALERT_SMS_ACTION,
+                "mode": "send",
+                "actorUserId": "U-ACTOR",
+                "channelId": "C-HEALTH",
+                "messageTs": "3000.001",
+                "threadTs": "3000.001",
+                "hospital": "#31 분당제일병원",
+                "room": "2진료실",
+                "device": "MB2-C00419",
+                "issue": "캡처보드 연결 확인 필요",
+                "mdaUrl": "https://mda.example/monitoring?device=MB2-C00419",
+                "result": {"status": "modal_opened", "ok": True},
+            },
+        )
 
     def test_sms_action_calls_exact_target_and_provider_once(self) -> None:
         load_target = Mock(return_value=_exact_target())
@@ -164,12 +247,14 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
             }
         )
         remember_sms_delivery = Mock(return_value=True)
+        write_event = Mock(return_value=True)
         deps = replace(
             DeviceHealthAlertActionRouteDeps(),
             load_exact_target=load_target,
             send_sms=send_sms,
             remember_sms_delivery=remember_sms_delivery,
             now=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+            write_event=write_event,
         )
 
         result = DeviceHealthAlertActionAssistantRoute(deps).handle(
@@ -195,6 +280,16 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
         remembered_item = remember_sms_delivery.call_args.args[0]
         self.assertEqual(remembered_item["smsGroupId"], "GROUP-1")
         self.assertEqual(remembered_item["device"], "MB2-C00419")
+        write_event.assert_called_once()
+        event_type, occurred_at, event = write_event.call_args.args
+        self.assertEqual(event_type, "alert_action_requested")
+        self.assertEqual(
+            occurred_at,
+            datetime(2026, 8, 14, tzinfo=timezone.utc),
+        )
+        self.assertEqual(event["actionId"], DEVICE_HEALTH_ALERT_SMS_ACTION)
+        self.assertEqual(event["device"], "MB2-C00419")
+        self.assertEqual(event["result"]["status"], "answered")
 
     def test_target_mismatch_blocks_every_side_effect(self) -> None:
         load_target = Mock(return_value=None)
@@ -458,6 +553,7 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
                 DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
                 DEVICE_HEALTH_ALERT_VOICE_ROUTE,
                 DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
             }.issubset(company_operation_route_names())
         )
 
@@ -520,6 +616,47 @@ class DeviceHealthAlertActionApiContractTests(unittest.TestCase):
         turn = AssistantTurnInput.model_validate(prepare)
 
         self.assertIsNone(turn.operationAction.sms)
+
+    def test_schema_maps_typed_ui_receipt_to_domain_metadata(self) -> None:
+        payload = self._turn_payload()
+        payload["scope"] = {
+            "deviceName": "MB2-C00419",
+            "channelContextId": "C-HEALTH",
+        }
+        payload["operationAction"] = {
+            "name": DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
+            "phase": "receipt",
+            "eventType": "alert_contact_sms_modal_requested",
+            "actionId": DEVICE_HEALTH_ALERT_SMS_ACTION,
+            "mode": "send",
+            "target": {
+                "hospitalSeq": 31,
+                "hospitalName": "분당제일병원",
+                "hospitalLabel": "#31 분당제일병원",
+                "roomName": "2진료실",
+                "deviceName": "MB2-C00419",
+                "issue": "캡처보드 연결 확인 필요",
+                "alertCategory": "video_signal",
+                "mdaUrl": "https://mda.example/monitoring?focusDevice=MB2-C00419",
+                "problemComponents": ["캡처보드"],
+            },
+            "messageTs": "3000.001",
+            "threadTs": "3000.001",
+            "occurredAt": "2026-08-14T09:30:00+09:00",
+            "status": "modal_opened",
+            "ok": True,
+            "errorType": "",
+        }
+
+        turn = AssistantTurnInput.model_validate(payload)
+        request = turn.to_company_request("REQ-UI-1")
+
+        action = request.metadata["operation_action"]
+        self.assertEqual(action["name"], DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION)
+        self.assertEqual(action["event_type"], "alert_contact_sms_modal_requested")
+        self.assertEqual(action["target"]["hospital_label"], "#31 분당제일병원")
+        self.assertEqual(action["message_ts"], "3000.001")
+        self.assertEqual(request.metadata["channel_id"], "C-HEALTH")
 
     def test_policy_requires_specific_alert_action_capability(self) -> None:
         turn = AssistantTurnInput.model_validate(self._turn_payload())

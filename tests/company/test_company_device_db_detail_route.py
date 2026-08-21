@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.device_db_detail_route import (
@@ -64,6 +64,7 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
         exact_queries = (
             "MB2-C00419 장비 정보",
             "장비명=MB2-C00419 장비 상세",
+            "MB2-C00419와 MB2-C00999 장비 정보",
         )
         filter_queries = (
             "deviceSeq=42 devices",
@@ -71,7 +72,6 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
             "activeFlag=1 장비 목록",
             "병원=아이사랑산부인과 장비 목록",
             "병원=아이사랑산부인과 병실=2진료실 장비 목록",
-            "MB2-C00419와 MB2-C00999 장비 정보",
         )
 
         for question in exact_queries:
@@ -163,8 +163,8 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
                     route,
                 )
 
-    def test_full_route_denies_unsupported_mutation_without_query(self) -> None:
-        query = Mock(return_value="호출되면 안 됨")
+    def test_full_route_keeps_legacy_query_for_unmatched_mutation_text(self) -> None:
+        query = Mock(return_value="*장비 조회 결과*")
         route = DeviceDetailAssistantRoute(query_devices=query)
 
         for question in (
@@ -178,13 +178,43 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
 
                 self.assertIsNotNone(result)
                 assert result is not None
-                self.assertEqual(result.outcome, "denied")
-                self.assertEqual(
-                    result.fallback_reason,
-                    "unsupported_device_mutation",
-                )
+                self.assertEqual(result.outcome, "answered")
 
-        query.assert_not_called()
+        # supported operation이 앞 stage에서 선점하지 않은 문장도 Slack의
+        # structured fallback은 parser 결과로 장비 조회를 실행했다.
+        self.assertEqual(
+            query.call_args_list,
+            [
+                call(
+                    device_name="MB2-C00419",
+                    device_seq=None,
+                    hospital_name=None,
+                    room_name=None,
+                    hospital_seq=None,
+                    hospital_room_seq=None,
+                    status=None,
+                    active_flag=None,
+                    install_flag=None,
+                    count_only=False,
+                    include_live_enrichment=True,
+                    allow_ssh_open_resend=False,
+                ),
+                call(
+                    device_name=None,
+                    device_seq=2410,
+                    hospital_name=None,
+                    room_name=None,
+                    hospital_seq=None,
+                    hospital_room_seq=None,
+                    status=None,
+                    active_flag=None,
+                    install_flag=None,
+                    count_only=False,
+                    include_live_enrichment=True,
+                    allow_ssh_open_resend=False,
+                ),
+            ],
+        )
 
     def test_full_route_requires_explicit_route_group(self) -> None:
         query = Mock(return_value="호출되면 안 됨")
@@ -306,9 +336,9 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
             allow_ssh_open_resend=False,
         )
 
-    def test_full_route_rejects_multiple_devices_before_live_query(self) -> None:
-        # parser가 첫 이름만 선택하더라도 API는 MDA/SSH를 실행하지 않는다.
-        query = Mock(return_value="호출되면 안 됨")
+    def test_full_route_queries_first_device_from_multiple_text(self) -> None:
+        # legacy structured parser는 본문에서 먼저 찾은 장비를 조회했다.
+        query = Mock(return_value="*장비 조회 결과*")
         route = DeviceDetailAssistantRoute(query_devices=query)
 
         result = route.handle(
@@ -320,13 +350,22 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertEqual(result.route, "devices_filter")
-        self.assertEqual(result.outcome, "needs_input")
-        self.assertEqual(
-            result.fallback_reason,
-            "device_scope_ambiguous",
+        self.assertEqual(result.route, "device_detail")
+        self.assertEqual(result.outcome, "answered")
+        query.assert_called_once_with(
+            device_name="MB2-C00419",
+            device_seq=None,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status=None,
+            active_flag=None,
+            install_flag=None,
+            count_only=False,
+            include_live_enrichment=True,
+            allow_ssh_open_resend=False,
         )
-        query.assert_not_called()
 
     def test_full_route_hides_dependency_error_detail(self) -> None:
         query = Mock(side_effect=RuntimeError("secret-mda-token"))

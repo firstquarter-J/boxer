@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from boxer_company import device_notification_cycle as cycle
 from boxer_company.automation import (
     AutomationCycleContractError,
     AutomationCycleRequest,
@@ -55,6 +56,7 @@ def _captureboard_event(notification_id: int = 12) -> dict:
         "occurredAt": "2026-08-14T00:59:00+00:00",
         "hospitalSeq": 69,
         "hospitalName": "뉴서울여성의원(인천)",
+        "hospitalTelephone": "032-123-4567",
         "hospitalDeviceAlertPhone": "010-1234-5678",
         "hospitalRoomSeq": 1,
         "roomName": "1진료실",
@@ -152,6 +154,56 @@ def test_first_cycle_initializes_at_latest_id_without_replaying_history() -> Non
     mocks["send_sms"].assert_not_called()
 
 
+def test_production_cycle_loads_one_fixed_legacy_batch_then_drains_receipts(
+) -> None:
+    first_event = _captureboard_event(12)
+    second_event = {
+        **_captureboard_event(14),
+        "code": "segmented_recordings_merge_error",
+        "message": "녹화 병합 실패",
+        "details": {"voiceType": "n", "segmentCount": 2},
+    }
+    load_batch = Mock(return_value=(14, [first_event, second_event]))
+    base_deps, mocks = _deps(sheet_incidents={}, sheet_rows=1)
+    deps = DeviceNotificationCycleDeps(
+        load_latest_id=base_deps.load_latest_id,
+        # default function identity가 실제 API의 batch 경로를 선택한다.
+        load_next_event=cycle._load_next_device_notification,
+        load_event_batch=load_batch,
+        load_sheet_incidents=base_deps.load_sheet_incidents,
+        append_sheet_alerts=base_deps.append_sheet_alerts,
+        send_sms=base_deps.send_sms,
+        claim_sms_delivery=base_deps.claim_sms_delivery,
+        hold_sms_delivery_claim=base_deps.hold_sms_delivery_claim,
+        clock=base_deps.clock,
+        remember_sms_delivery=base_deps.remember_sms_delivery,
+    )
+    handler = DeviceNotificationAlertCycleHandler(deps)
+
+    first = handler.run(_request(cursor=_initialized_cursor()))
+    assert first.cursor["lastSeenId"] == 14
+    assert [
+        item["notificationId"] for item in first.cursor["pendingEvents"]
+    ] == [12, 14]
+    first_delivery = first.deliveries[0]
+    acknowledged = handler.acknowledge(
+        _request(cursor=dict(first.cursor)),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=first_delivery.delivery_id,
+                status="sent",
+                external_message_id="1710000000.001",
+                delivered_at=_NOW,
+            ),
+        ),
+    )
+
+    second = handler.run(_request(cursor=dict(acknowledged)))
+    assert second.deliveries[0].delivery_id == "device_notification:14"
+    assert load_batch.call_count == 1
+    mocks["next"].assert_not_called()
+
+
 def test_migrated_cursor_processes_cutover_gap_instead_of_skipping_to_latest() -> None:
     observed_at = _NOW.isoformat()
     migrated_cursor = build_device_notification_api_cursor(
@@ -243,7 +295,7 @@ def test_migrated_recording_incident_continues_in_original_thread() -> None:
     mocks["next"].assert_called_once_with(11)
 
 
-def test_captureboard_cycle_sends_sms_once_and_hides_sms_identifiers() -> None:
+def test_captureboard_cycle_preserves_contact_and_hides_sms_identifiers() -> None:
     event = _captureboard_event()
     deps, mocks = _deps(
         next_result=(12, event),
@@ -274,8 +326,14 @@ def test_captureboard_cycle_sends_sms_once_and_hides_sms_identifiers() -> None:
         "templateId": "captureboard_disconnected",
     }
     serialized = json.dumps(delivery.payload, ensure_ascii=False)
-    assert "010-1234-5678" not in serialized
-    assert "초음파 진단기와 캡처보드" not in serialized
+    # 기존 Slack 카드와 자동발송 확인 버튼의 번호·본문은 유지하되
+    # provider 추적 ID는 conversation payload에 포함하지 않는다.
+    assert "010-1234-5678" in serialized
+    assert "032-123-4567" in serialized
+    device_result = delivery.payload["alertSummary"]["deviceResults"][0]
+    assert device_result["smsPhoneNumber"] == "01012345678"
+    assert "초음파 진단기와 캡처보드" in device_result["smsMessage"]
+    assert device_result["smsTemplateId"]
     assert "provider-private-marker" not in serialized
     assert "group-private-marker" not in serialized
     assert "message-private-marker" not in serialized
@@ -285,6 +343,46 @@ def test_captureboard_cycle_sends_sms_once_and_hides_sms_identifiers() -> None:
     assert sms_payload["sms"]["to"] == "01012345678"
     assert "초음파 진단기와 캡처보드" in sms_payload["sms"]["message"]
     assert mocks["append_sheet"].call_count == 0
+
+
+def test_notification_delivery_keeps_legacy_event_message_and_merge_error() -> None:
+    captureboard = _captureboard_event(13)
+    captureboard["message"] = "현장 캡처보드 장애 메시지"
+    captureboard_deps, _ = _deps(
+        next_result=(13, captureboard),
+        sheet_incidents={},
+    )
+    captureboard_result = DeviceNotificationAlertCycleHandler(
+        captureboard_deps
+    ).run(_request(cursor=_initialized_cursor(last_seen_id=12)))
+    captureboard_issue = captureboard_result.deliveries[0].payload[
+        "alertSummary"
+    ]["deviceResults"][0]["priorityReason"]
+    assert "현장 캡처보드 장애 메시지" in captureboard_issue
+
+    merge_event = {
+        **_captureboard_event(14),
+        "code": "segmented_recordings_merge_error",
+        "message": "녹화 병합 실패",
+        "details": {
+            "voiceType": "n",
+            "segmentCount": 3,
+            "error": "ffmpeg exit 17",
+        },
+    }
+    merge_deps, _ = _deps(
+        next_result=(14, merge_event),
+        sheet_incidents={},
+    )
+    merge_result = DeviceNotificationAlertCycleHandler(merge_deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=13))
+    )
+    merge_issue = merge_result.deliveries[0].payload["alertSummary"][
+        "deviceResults"
+    ][0]["priorityReason"]
+    assert "녹화 병합 실패" in merge_issue
+    assert "분할 파일 3개" in merge_issue
+    assert "ffmpeg exit 17" in merge_issue
 
 
 def test_sms_claim_uses_provider_immediate_server_clock() -> None:
@@ -353,8 +451,9 @@ def test_sent_receipt_appends_sheet_then_closes_delivery_context() -> None:
     sheet_item = mocks["append_sheet"].call_args.args[0][0]
     assert sheet_item["smsGroupId"] == "group-private-marker"
     assert sheet_item["smsMessageId"] == "message-private-marker"
-    assert "smsPhoneNumber" not in sheet_item
-    assert "smsMessage" not in sheet_item
+    # legacy pending 이벤트와 Sheet 호출도 자동발송 확인값을 유지했다.
+    assert sheet_item["smsPhoneNumber"] == "01012345678"
+    assert sheet_item["smsMessage"]
     assert mocks["append_sheet"].call_args.kwargs["slack_permalink"] == (
         "https://lifexio.slack.com/archives/C1/p1"
     )

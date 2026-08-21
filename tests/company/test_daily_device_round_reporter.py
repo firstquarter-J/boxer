@@ -115,6 +115,13 @@ class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
                 "powerOffFailed": 0,
             },
             "summaryLine": "확인 필요 1",
+            "messageBlocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "MB2-TEST 기존 block"},
+                }
+            ],
+            "fallbackText": "MB2-TEST 기존 fallback",
             "deviceResults": [
                 {
                     "deviceName": "MB2-TEST",
@@ -164,7 +171,7 @@ class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
         rendered = json.dumps(blocks, ensure_ascii=False)
 
         self.assertIn("MB2-TEST", rendered)
-        self.assertIn("버전 1.0.0 -> 1.1.0", rendered)
+        self.assertIn("기존 block", rendered)
         poisoned = json.loads(json.dumps(payload, ensure_ascii=False))
         poisoned["deviceResults"][0]["statusPayload"] = {
             "ssh": {"host": "synthetic-secret-host"}

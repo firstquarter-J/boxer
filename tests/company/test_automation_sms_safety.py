@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from boxer_company import sms_delivery_cycle as sms_cycle
 from boxer_company.automation import (
     AutomationCycleRequest,
     AutomationDeliveryReceipt,
@@ -24,8 +25,13 @@ from boxer_company.device_notification_cycle import (
     DeviceNotificationCycleDeps,
 )
 from boxer_company.sms_delivery_cycle import (
+    _SMS_AUTOMATION_RUNTIME_CLAIMS,
+    _SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK,
     _load_sms_delivery_outbox_items,
+    acquire_automatic_sms_runtime_claim,
+    build_automatic_sms_runtime_claim_key,
     claim_automatic_sms_delivery,
+    publish_automatic_sms_runtime_claim_result,
     remember_sms_delivery_sheet_record,
 )
 
@@ -33,6 +39,55 @@ from boxer_company.sms_delivery_cycle import (
 _KST = ZoneInfo("Asia/Seoul")
 _NOW = datetime(2026, 8, 14, 10, 0, tzinfo=_KST)
 _DEVICE_NAME = "MB2-SHARED-SMS"
+
+
+@pytest.fixture(autouse=True)
+def _clear_runtime_sms_claims() -> Any:
+    # process 전역 60초 claim이 테스트 case 사이로 새지 않게 격리한다.
+    with _SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK:
+        _SMS_AUTOMATION_RUNTIME_CLAIMS.clear()
+    yield
+    with _SMS_AUTOMATION_RUNTIME_CLAIMS_LOCK:
+        _SMS_AUTOMATION_RUNTIME_CLAIMS.clear()
+
+
+def test_runtime_sms_claim_keeps_legacy_60_second_failure_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    moments = iter((10.0, 69.0, 70.0))
+    monkeypatch.setattr(
+        sms_cycle.time,
+        "monotonic",
+        lambda: next(moments),
+    )
+    claim_key = build_automatic_sms_runtime_claim_key(
+        {
+            "hospitalSeq": "20",
+            "device": _DEVICE_NAME,
+            "alertCategory": "video_signal",
+            "problemComponents": ["캡처보드"],
+            "issue": "캡처보드 연결 장애",
+        }
+    )
+
+    is_owner, claim = acquire_automatic_sms_runtime_claim(claim_key)
+    assert is_owner is True
+    publish_automatic_sms_runtime_claim_result(
+        claim,
+        {"status": "error", "ok": False},
+    )
+
+    # provider 실패도 legacy와 같이 즉시 release하지 않고 60초까지 막는다.
+    second_owner, second_claim = acquire_automatic_sms_runtime_claim(
+        claim_key
+    )
+    assert second_owner is False
+    assert second_claim is claim
+
+    # monotonic 기준 정확히 60초가 지나면 다음 시도를 다시 허용한다.
+    third_owner, third_claim = acquire_automatic_sms_runtime_claim(claim_key)
+    assert third_owner is True
+    assert third_claim is not claim
 
 
 def _notification_request(*, cursor: Mapping[str, Any]) -> AutomationCycleRequest:
@@ -118,6 +173,7 @@ def _health_deps(
             }
         },
         verify_device=verify,
+        ssh_verification_configured=lambda: True,
         load_captureboard_incidents=lambda: {},
         send_sms=send_sms,
         claim_sms_delivery=claim_sms,
@@ -127,7 +183,8 @@ def _health_deps(
         append_sheet_alerts=append_sheet or (
             lambda items, detected_at, permalink: 1
         ),
-        archive_event=lambda request_id, now, payload: True,
+        write_event=lambda event_type, now, payload: True,
+        start_event_archive=lambda now, logger: False,
     )
 
 
@@ -179,19 +236,6 @@ def test_health_and_notification_share_one_provider_claim(
             "smsDeliveryStatus": "accepted",
         }
 
-    def claim_sms(
-        device_name: str,
-        alert_category: str,
-        *,
-        claimed_at: datetime,
-    ) -> bool:
-        return claim_automatic_sms_delivery(
-            device_name,
-            alert_category,
-            claimed_at=claimed_at,
-            outbox_path=outbox_path,
-        )
-
     def remember_sms(alert_item: dict[str, Any], **kwargs: Any) -> bool:
         return remember_sms_delivery_sheet_record(
             alert_item,
@@ -201,7 +245,9 @@ def test_health_and_notification_share_one_provider_claim(
 
     health_deps = _health_deps(
         send_sms=send_sms,
-        claim_sms=claim_sms,
+        # default production function identity는 durable 파일이 아니라
+        # 두 cycle이 공유하는 legacy process-memory claim 경로를 선택한다.
+        claim_sms=claim_automatic_sms_delivery,
         remember_sms=remember_sms,
     )
     # hardware 경보의 두 번 확인 규칙은 provider claim 전에 미리 통과시킨다.
@@ -219,7 +265,7 @@ def test_health_and_notification_share_one_provider_claim(
     )
     notification_handler = _notification_handler(
         send_sms=send_sms,
-        claim_sms=claim_sms,
+        claim_sms=claim_automatic_sms_delivery,
         remember_sms=remember_sms,
     )
 
@@ -262,12 +308,10 @@ def test_health_and_notification_share_one_provider_claim(
         ],
         ensure_ascii=False,
     )
-    for private_value in (
-        "01012345678",
-        "group-shared",
-        "message-shared",
-        "solapi",
-    ):
+    # legacy Slack 자동발송 확인 action은 대상·본문을 유지한다.
+    assert "01012345678" in serialized_deliveries
+    assert "초음파 진단기와 캡처보드" in serialized_deliveries
+    for private_value in ("group-shared", "message-shared", "solapi"):
         assert private_value not in serialized_deliveries
     assert len(_load_sms_delivery_outbox_items(outbox_path=outbox_path)) == 1
 

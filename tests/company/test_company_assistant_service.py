@@ -560,14 +560,15 @@ class StructuredAssistantRouteTests(unittest.TestCase):
             include_live_enrichment=True,
         )
 
-    def test_multiple_device_names_require_one_target_before_query(self) -> None:
-        # local fallback에서도 첫 장비만 선택해 MDA/SSH를 실행하지 않는다.
+    def test_multiple_device_names_keep_legacy_first_device_query(self) -> None:
+        # 기존 parser가 선택한 첫 장비로 그대로 조회한다.
         route = StructuredAssistantRoute(
             is_weekly_report_request=lambda *args, **kwargs: False,
         )
         with patch(
             "boxer_company.assistant.structured_route."
             "_query_devices_by_filters",
+            return_value="*장비 조회 결과*\n• MB2-C00419",
         ) as query:
             result = route.handle(
                 _request("MB2-C00419와 MB2-C00999 장비 정보")
@@ -576,12 +577,20 @@ class StructuredAssistantRouteTests(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.route, "devices_filter")
-        self.assertEqual(result.outcome, "needs_input")
-        self.assertEqual(
-            result.fallback_reason,
-            "device_scope_ambiguous",
+        self.assertEqual(result.outcome, "answered")
+        query.assert_called_once_with(
+            device_name="MB2-C00419",
+            device_seq=None,
+            hospital_name=None,
+            room_name=None,
+            hospital_seq=None,
+            hospital_room_seq=None,
+            status=None,
+            active_flag=None,
+            install_flag=None,
+            count_only=False,
+            include_live_enrichment=True,
         )
-        query.assert_not_called()
 
     def test_weekly_report_and_restore_stay_in_slack_adapter(self) -> None:
         weekly = StructuredAssistantRoute(
@@ -730,21 +739,22 @@ class BarcodeQueryAssistantRouteTests(unittest.TestCase):
         self.assertEqual(result.fallback_reason, "barcode_scope_mismatch")
         self.assertEqual(load_calls, [])
 
-    def test_multiple_question_barcodes_are_denied_before_query(self) -> None:
+    def test_multiple_question_barcodes_keep_legacy_first_barcode_query(self) -> None:
         route, load_calls, _ = self._route()
         with patch(
             "boxer_company.assistant.barcode_query_route."
             "_query_recordings_count_by_barcode",
+            return_value="*영상 개수*\n• 총 0개",
         ) as query:
             result = route.handle(
                 _request("12345678910 10987654321 영상 개수")
             )
 
-        self.assertEqual(result.route, "barcode_scope_guard")
-        self.assertEqual(result.outcome, "denied")
-        self.assertEqual(result.fallback_reason, "barcode_scope_mismatch")
-        self.assertEqual(load_calls, [])
-        query.assert_not_called()
+        self.assertEqual(result.route, "barcode_video_count")
+        self.assertEqual(result.outcome, "answered")
+        self.assertEqual(load_calls, ["12345678910"])
+        query.assert_called_once()
+        self.assertEqual(query.call_args.args[0], "12345678910")
 
     def test_video_count_converts_slack_link_to_commonmark(self) -> None:
         route, _, _ = self._route()

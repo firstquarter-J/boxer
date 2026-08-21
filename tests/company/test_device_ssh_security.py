@@ -72,16 +72,19 @@ class DeviceSshSecurityTests(unittest.TestCase):
                 company_settings,
                 "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS",
                 ("remotes.example",),
+                create=True,
             ),
             patch.object(
                 company_settings,
                 "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST",
                 "10.40.21.27",
+                create=True,
             ),
             patch.object(
                 company_settings,
                 "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH",
                 "/etc/boxer-company-api/device_known_hosts",
+                create=True,
             ),
             patch.object(security, "_validate_known_hosts_path"),
             patch.object(
@@ -114,6 +117,42 @@ class DeviceSshSecurityTests(unittest.TestCase):
         client.set_missing_host_key_policy.assert_called_once_with(
             "reject-policy"
         )
+
+    def test_api_rejects_second_ssh_open_before_transport(self) -> None:
+        with security.company_api_device_ssh_context() as state:
+            security._mark_company_api_device_ssh_open_attempted()
+            with self.assertRaisesRegex(
+                security.DeviceSshSecurityError,
+                "device_ssh_open_budget_exhausted",
+            ):
+                security._mark_company_api_device_ssh_open_attempted()
+
+        self.assertTrue(state.mutation_attempted)
+        self.assertTrue(state.open_attempted)
+
+    def test_api_automation_allows_one_open_for_each_device(self) -> None:
+        with security.company_api_device_ssh_context(
+            per_device_open_budget=True,
+        ) as state:
+            security._mark_company_api_device_ssh_open_attempted(
+                "MB2-C00419"
+            )
+            security._mark_company_api_device_ssh_open_attempted(
+                "MB2-C00420"
+            )
+            with self.assertRaisesRegex(
+                security.DeviceSshSecurityError,
+                "device_ssh_open_budget_exhausted",
+            ):
+                security._mark_company_api_device_ssh_open_attempted(
+                    "mb2-c00419"
+                )
+
+        self.assertEqual(
+            state.opened_device_names,
+            {"mb2-c00419", "mb2-c00420"},
+        )
+        self.assertTrue(state.mutation_attempted)
 
     def test_mda_endpoint_registry_keeps_device_identity(self) -> None:
         security._register_mda_ssh_endpoint_device(

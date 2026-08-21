@@ -19,7 +19,6 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from boxer_company import settings as company_settings
 from boxer_company.automation import (
     AutomationCycleContractError,
     AutomationCycleName,
@@ -42,7 +41,6 @@ _STATE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 _MISSING_STATE_DIGEST = hashlib.sha256(
     b"boxer.automation-state.missing.v1"
 ).hexdigest()
-_AUTOMATION_SCHEDULE_SKEW = timedelta(minutes=2)
 _CONTINUOUS_CYCLES = frozenset(
     {
         "device_health_monitor",
@@ -603,35 +601,18 @@ class DurableAutomationCycleCoordinator:
         *,
         logger: logging.Logger | None = None,
         clock: Callable[[], datetime] | None = None,
-        daily_options_provider: (
-            Callable[[], Mapping[str, bool]] | None
-        ) = None,
-        schedule_skew: timedelta = _AUTOMATION_SCHEDULE_SKEW,
     ) -> None:
         self._service = service
         self._state_store = state_store
         self._logger = logger or logging.getLogger(__name__)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._daily_options_provider = (
-            daily_options_provider or _canonical_daily_options
-        )
-        if schedule_skew <= timedelta(0):
-            raise AutomationCycleContractError(
-                "automation schedule skew must be positive"
-            )
-        self._schedule_skew = schedule_skew
         self._lock = threading.RLock()
 
     def run(self, trigger: AutomationCycleTrigger) -> AutomationCycleResult:
-        # cycle identity와 mutation 설정을 서버 시각·서버 env로 먼저
-        # 승인한 뒤에만 durable state를 읽거나 in-flight를 기록한다.
+        # Slack scheduler가 확정한 기존 실행 시각·옵션을 domain 입력으로
+        # 유지하고, API는 형식과 cycle 논리만 먼저 검증한다.
         admission_now = self._clock()
-        validate_automation_trigger_admission(
-            trigger,
-            now=admission_now,
-            daily_options=self._daily_options_provider(),
-            schedule_skew=self._schedule_skew,
-        )
+        validate_automation_trigger_admission(trigger)
         if trigger.cycle not in self._service.cycle_names:
             raise AutomationCycleContractError(
                 "automation cycle handler is not configured"
@@ -654,7 +635,7 @@ class DurableAutomationCycleCoordinator:
                         request_id=trigger.request_id,
                         tenant_id=trigger.tenant_id,
                         cycle=trigger.cycle,
-                        scheduled_at=admission_now,
+                        scheduled_at=trigger.scheduled_at,
                         cursor=raw_health_cursor,
                         options=dict(trigger.options),
                     )
@@ -676,9 +657,9 @@ class DurableAutomationCycleCoordinator:
                     request_id=trigger.request_id,
                     tenant_id=trigger.tenant_id,
                     cycle=trigger.cycle,
-                    # Slack 시각은 admission 비교에만 사용한다. SMS claim과
-                    # window mutation의 정본 시각은 한 번 캡처한 API clock이다.
-                    scheduled_at=admission_now,
+                    # 기존 local reporter가 사용하던 poll 시각을 그대로
+                    # 후속 Sheet/provider 처리에도 전달한다.
+                    scheduled_at=trigger.scheduled_at,
                     cursor=dict(state.get("cursor") or {}),
                     options=dict(trigger.options),
                 )
@@ -752,9 +733,20 @@ class DurableAutomationCycleCoordinator:
                 request_id=trigger.request_id,
                 tenant_id=trigger.tenant_id,
                 cycle=trigger.cycle,
-                scheduled_at=admission_now,
+                scheduled_at=trigger.scheduled_at,
                 cursor=domain_cursor,
                 options=dict(trigger.options),
+                progress_callback=(
+                    (
+                        lambda progress_cursor: self._checkpoint_progress(
+                            state_key=state_key,
+                            request_id=trigger.request_id,
+                            cursor=progress_cursor,
+                        )
+                    )
+                    if trigger.cycle == "daily_device_round"
+                    else None
+                ),
             )
             self._service.validate(domain_request)
             # 외부 조회·mutation 전에 durable in-flight를 먼저 기록한다.
@@ -804,6 +796,38 @@ class DurableAutomationCycleCoordinator:
         )
         return result
 
+    def _checkpoint_progress(
+        self,
+        *,
+        state_key: str,
+        request_id: str,
+        cursor: Mapping[str, Any],
+    ) -> None:
+        """현재 in-flight와 같은 실행의 active cursor만 원자 저장한다."""
+
+        def _update(
+            exists: bool,
+            current: dict[str, Any],
+        ) -> tuple[Mapping[str, Any], None]:
+            in_flight = current.get("inFlight")
+            if (
+                not exists
+                or not isinstance(in_flight, Mapping)
+                or in_flight.get("requestId") != request_id
+            ):
+                raise AutomationCycleUncertainError(
+                    "automation cycle state changed during progress"
+                )
+            return {
+                **current,
+                # hospital_started와 각 device_started마다 기존 local
+                # reporter와 같은 active 필드 snapshot을 교체한다.
+                "cursor": dict(cursor),
+            }, None
+
+        with self._lock:
+            self._state_store.mutate_cycle(state_key, _update)
+
 
 def serialize_automation_cycle_result(
     result: AutomationCycleResult,
@@ -829,26 +853,12 @@ def serialize_automation_cycle_result(
 
 def validate_automation_trigger_admission(
     trigger: AutomationCycleTrigger,
-    *,
-    now: datetime,
-    daily_options: Mapping[str, bool],
-    schedule_skew: timedelta = _AUTOMATION_SCHEDULE_SKEW,
 ) -> None:
-    """서버 정본 시각·옵션으로 외부 automation trigger를 승인한다."""
+    """기존 Slack scheduler의 cycle identity와 option 형식만 검증한다."""
 
-    if now.tzinfo is None or trigger.scheduled_at.tzinfo is None:
+    if trigger.scheduled_at.tzinfo is None:
         raise AutomationCycleContractError(
             "automation schedule must be timezone-aware"
-        )
-    delta = abs(
-        (
-            trigger.scheduled_at.astimezone(timezone.utc)
-            - now.astimezone(timezone.utc)
-        ).total_seconds()
-    )
-    if delta > schedule_skew.total_seconds():
-        raise AutomationCycleContractError(
-            "automation scheduled_at is outside the allowed skew"
         )
 
     if trigger.ack_only:
@@ -859,20 +869,20 @@ def validate_automation_trigger_admission(
         return
 
     if trigger.cycle in _CONTINUOUS_CYCLES:
-        if trigger.cycle_key != "continuous":
+        if trigger.cycle_key != "continuous" or trigger.options:
             raise AutomationCycleContractError(
                 "continuous automation cycle key is invalid"
             )
         return
 
-    local_now = now.astimezone(_KST)
+    local_scheduled_at = trigger.scheduled_at.astimezone(_KST)
     if trigger.cycle == "weekly_recordings":
-        current_week_start = local_now.date() - timedelta(
-            days=local_now.weekday()
+        current_week_start = local_scheduled_at.date() - timedelta(
+            days=local_scheduled_at.weekday()
         )
         target_week_start = current_week_start - timedelta(days=7)
         expected_key = f"weekly:{target_week_start.isoformat()}"
-        if trigger.cycle_key != expected_key:
+        if trigger.cycle_key != expected_key or trigger.options:
             raise AutomationCycleContractError(
                 "weekly automation cycle key is invalid"
             )
@@ -882,28 +892,31 @@ def validate_automation_trigger_admission(
         raise AutomationCycleContractError(
             "unsupported automation cycle"
         )
-    window_key = _server_daily_window_key(local_now)
-    if window_key is None:
-        raise AutomationCycleContractError(
-            "daily automation is outside the configured KST window"
+    try:
+        window_date = date.fromisoformat(
+            trigger.cycle_key.removeprefix("daily:")
         )
-    if trigger.cycle_key != f"daily:{window_key}":
+    except ValueError as exc:
+        raise AutomationCycleContractError(
+            "daily automation cycle key is invalid"
+        ) from exc
+    # 기존 overnight window는 자정 뒤 poll도 전날 cycle key를 쓴다.
+    current_date = local_scheduled_at.date()
+    previous_window_after_midnight = bool(
+        window_date == current_date - timedelta(days=1)
+        and local_scheduled_at.hour < 12
+    )
+    if window_date != current_date and not previous_window_after_midnight:
         raise AutomationCycleContractError(
             "daily automation cycle key is invalid"
         )
-    canonical_options = {
-        key: value for key, value in daily_options.items()
-        if key in _DAILY_OPTION_KEYS and isinstance(value, bool)
-    }
     trigger_options = dict(trigger.options)
     if (
-        set(canonical_options) != set(_DAILY_OPTION_KEYS)
-        or set(trigger_options) != set(_DAILY_OPTION_KEYS)
+        set(trigger_options) != set(_DAILY_OPTION_KEYS)
         or any(type(value) is not bool for value in trigger_options.values())
-        or trigger_options != canonical_options
     ):
         raise AutomationCycleContractError(
-            "daily automation options do not match server settings"
+            "daily automation options are invalid"
         )
 
 
@@ -938,65 +951,6 @@ def _validate_ack_cycle_key(
         raise AutomationCycleContractError(
             "weekly automation cycle key is invalid"
         )
-
-
-def _canonical_daily_options() -> dict[str, bool]:
-    """API EC2가 로드한 company settings 네 값을 정본으로 사용한다."""
-
-    return {
-        "autoUpdateAgent": bool(
-            company_settings.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT
-        ),
-        "autoUpdateBoxFree": bool(
-            company_settings.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE
-        ),
-        "autoUpdateBoxPaid": bool(
-            company_settings.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID
-        ),
-        "autoCleanupTrashCan": bool(
-            company_settings.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN
-        ),
-        "autoPowerOff": bool(
-            company_settings.DAILY_DEVICE_ROUND_AUTO_POWER_OFF
-        ),
-    }
-
-
-def _server_daily_window_key(local_now: datetime) -> str | None:
-    start_minutes = (
-        _bounded_hour(company_settings.DAILY_DEVICE_ROUND_HOUR_KST) * 60
-        + _bounded_minute(company_settings.DAILY_DEVICE_ROUND_MINUTE_KST)
-    )
-    end_minutes = (
-        _bounded_hour(company_settings.DAILY_DEVICE_ROUND_END_HOUR_KST) * 60
-        + _bounded_minute(company_settings.DAILY_DEVICE_ROUND_END_MINUTE_KST)
-    )
-    current_minutes = local_now.hour * 60 + local_now.minute
-    if start_minutes == end_minutes:
-        return local_now.date().isoformat()
-    if start_minutes < end_minutes:
-        if start_minutes <= current_minutes < end_minutes:
-            return local_now.date().isoformat()
-        return None
-    if current_minutes >= start_minutes:
-        return local_now.date().isoformat()
-    if current_minutes < end_minutes:
-        return (local_now.date() - timedelta(days=1)).isoformat()
-    return None
-
-
-def _bounded_hour(value: Any) -> int:
-    try:
-        return max(0, min(23, int(value)))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _bounded_minute(value: Any) -> int:
-    try:
-        return max(0, min(59, int(value)))
-    except (TypeError, ValueError):
-        return 0
 
 
 def _build_state_key(trigger: AutomationCycleTrigger) -> str:

@@ -19,7 +19,10 @@ def _request(
     *,
     route_group: str,
     context_entries: tuple[dict[str, str], ...] = (),
+    metadata: dict[str, str] | None = None,
 ) -> CompanyAssistantRequest:
+    request_metadata = {"route_group": route_group}
+    request_metadata.update(metadata or {})
     return CompanyAssistantRequest(
         request_id="slack:T1:C1:1.1",
         tenant_id="T1",
@@ -29,7 +32,7 @@ def _request(
         question=question,
         locale="ko",
         context_entries=context_entries,
-        metadata={"route_group": route_group},
+        metadata=request_metadata,
     )
 
 
@@ -94,8 +97,36 @@ def test_team_fun_route_generates_and_sanitizes_one_api_owned_sentence() -> None
     assert result.messages[0].body == "배포가 또 삐끗했네 모대?"
     prompt, context, system_prompt = answerer.call_args.args
     assert "DD가 방금 배포를 시작했어" in prompt
+    assert "추출 토픽: 배포도 쉽" in prompt
+    assert "기본 템플릿:" in prompt
     assert context == ""
     assert "모대?" in system_prompt
+
+
+def test_team_fun_typed_context_preserves_latest_five_k_without_prefix() -> None:
+    answerer = Mock(return_value="마지막 핵심도 놓치지 않모대?")
+    route = CompanyTeamFunAssistantRoute(
+        answerer,
+        provider_ready=lambda: True,
+        context_max_chars=5_000,
+    )
+    old_context = "오" * 4_000
+    latest_context = "최신핵심" + ("신" * 992)
+    rendered_context = old_context + latest_context
+
+    result = route.handle(
+        _request(
+            "배포도 쉽지 모대",
+            route_group="fun",
+            metadata={"team_fun_context": rendered_context},
+        )
+    )
+
+    assert result is not None
+    prompt = answerer.call_args.args[0]
+    assert rendered_context in prompt
+    assert latest_context in prompt
+    assert "slack/message:" not in prompt
 
 
 def test_team_fun_route_blocks_prompt_exfiltration_before_provider() -> None:
@@ -114,6 +145,32 @@ def test_team_fun_route_blocks_prompt_exfiltration_before_provider() -> None:
     assert result.outcome == "denied"
     assert result.fallback_reason == "prompt_security"
     answerer.assert_not_called()
+
+
+def test_team_fun_route_keeps_local_template_fallback_semantics() -> None:
+    unavailable_answerer = Mock()
+    unavailable = CompanyTeamFunAssistantRoute(
+        unavailable_answerer,
+        provider_ready=lambda: False,
+        context_max_chars=500,
+    ).handle(_request("배포도 쉽지 모대", route_group="fun"))
+
+    invalid = CompanyTeamFunAssistantRoute(
+        Mock(return_value="I think the user wants an explanation"),
+        provider_ready=lambda: True,
+        context_max_chars=500,
+    ).handle(_request("배포도 쉽지 모대", route_group="fun"))
+
+    assert unavailable is not None
+    assert invalid is not None
+    assert unavailable.outcome == "answered"
+    assert unavailable.used_llm is False
+    assert unavailable.fallback_reason == "provider_unavailable"
+    assert unavailable.messages[0].body.endswith("모대?")
+    assert invalid.outcome == "answered"
+    assert invalid.used_llm is True
+    assert invalid.messages[0].body == unavailable.messages[0].body
+    unavailable_answerer.assert_not_called()
 
 
 def test_team_fun_route_does_not_absorb_general_freeform() -> None:

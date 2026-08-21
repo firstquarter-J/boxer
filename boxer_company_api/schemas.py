@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import math
 import re
@@ -23,14 +23,19 @@ _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$"
 _LOCALE_PATTERN = r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"
 _MAX_CONTEXT_ENTRIES = 12
 _MAX_CONTEXT_CHARS = 5_000
-_MAX_QUESTION_CHARS = 4_000
+_MAX_OPERATION_CONTEXT_ENTRIES = 100
+_MAX_OPERATION_CONTEXT_CHARS = 12_000
+_MAX_CONTEXT_ENTRY_CHARS = _MAX_CONTEXT_CHARS
+_MAX_QUESTION_CHARS = 40_000
 _MAX_RESPONSE_MESSAGES = 8
 _MAX_RESPONSE_SOURCES = 20
-_MAX_PRIVATE_LINKS = 20
 _MAX_PRIVATE_LINK_URI_CHARS = 16_384
 _MAX_MESSAGE_CHARS = 30_000
 _MAX_RESPONSE_BYTES = 1_048_576
 _TRUNCATED_MARKER = "...(truncated)"
+_SLACK_CHANNEL_ID_PATTERN = r"^[CDG][A-Z0-9]{1,20}$"
+_SLACK_MESSAGE_TS_PATTERN = r"^\d{1,20}(?:\.\d{1,9})?$"
+_SAFE_ERROR_TYPE_PATTERN = r"^[A-Za-z][A-Za-z0-9_.]{0,159}$"
 _SENSITIVE_SOURCE_PARAMETER_EXACT_NAMES = frozenset(
     {
         "auth",
@@ -62,7 +67,13 @@ class ContextEntryInput(_StrictInputModel):
         max_length=256,
         pattern=_IDENTIFIER_PATTERN,
     )
-    text: str = Field(min_length=1, max_length=4_000)
+    # operations의 thread learning은 기존 단일 5k+ 메시지를
+    # 잘라서는 안 된다. routeGroup별 실제 상한은 turn validator가
+    # 아래에서 전체 budget과 함께 검증한다.
+    text: str = Field(
+        min_length=1,
+        max_length=_MAX_OPERATION_CONTEXT_CHARS,
+    )
     createdAt: str | None = Field(
         default=None,
         min_length=1,
@@ -109,6 +120,46 @@ class ContextEntryInput(_StrictInputModel):
         return entry
 
 
+class TrustedMdaRecoveryScopeInput(_StrictInputModel):
+    """Slack adapter가 현재 bot의 복구 알림 root에서 검증한 exact scope다."""
+
+    barcode: str = Field(pattern=r"^\d{11}$")
+    logDate: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    deviceName: str = Field(
+        min_length=3,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{2,}$",
+    )
+    hospitalName: str = Field(min_length=1, max_length=200)
+    roomName: str = Field(min_length=1, max_length=200)
+
+    @field_validator("logDate")
+    @classmethod
+    def _validate_log_date(cls, value: str) -> str:
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("logDate must be a valid date") from exc
+        return value
+
+    @field_validator("hospitalName", "roomName")
+    @classmethod
+    def _normalize_display_scope(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized or not normalized.isprintable():
+            raise ValueError("display scope must be printable")
+        return normalized
+
+    def to_metadata(self) -> dict[str, str]:
+        return {
+            "barcode": self.barcode,
+            "logDate": self.logDate,
+            "deviceName": self.deviceName,
+            "hospitalName": self.hospitalName,
+            "roomName": self.roomName,
+        }
+
+
 class AssistantTurnScopeInput(_StrictInputModel):
     barcode: str | None = Field(
         default=None,
@@ -139,11 +190,23 @@ class AssistantTurnScopeInput(_StrictInputModel):
         "recording_failure",
         "barcode_log",
     ] | None = None
+    actorName: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+    )
+    threadPermalink: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=2_048,
+    )
+    trustedMdaRecoveryScope: TrustedMdaRecoveryScopeInput | None = None
 
     @field_validator(
         "hospitalName",
         "roomName",
         "deviceName",
+        "actorName",
     )
     @classmethod
     def _normalize_scope_text(
@@ -155,6 +218,28 @@ class AssistantTurnScopeInput(_StrictInputModel):
         normalized = " ".join(value.split())
         if not normalized:
             raise ValueError("scope text must not be blank")
+        return normalized
+
+    @field_validator("threadPermalink")
+    @classmethod
+    def _validate_thread_permalink(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        hostname = str(parsed.hostname or "").casefold()
+        if (
+            parsed.scheme != "https"
+            or not hostname.endswith(".slack.com")
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.path.startswith("/archives/")
+            or parsed.fragment
+        ):
+            raise ValueError("threadPermalink must be a Slack HTTPS permalink")
         return normalized
 
     @model_validator(mode="after")
@@ -176,10 +261,326 @@ class AssistantTurnScopeInput(_StrictInputModel):
             ("device_name", self.deviceName),
             ("channel_id", self.channelContextId),
             ("followup_kind", self.followupKind),
+            ("actor_name", self.actorName),
+            ("thread_permalink", self.threadPermalink),
         ):
             if value is not None:
                 metadata[key] = value
+        if self.trustedMdaRecoveryScope is not None:
+            metadata["trusted_mda_recovery_scope"] = (
+                self.trustedMdaRecoveryScope.to_metadata()
+            )
         return metadata
+
+
+def _validate_slack_permalink(
+    value: str,
+    *,
+    channel_id: str,
+    message_ts: str,
+    thread_ts: str,
+) -> str:
+    """Slack permalink가 exact channel/message/thread 범위를 가리키는지 본다."""
+
+    normalized = value.strip()
+    try:
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Slack permalink is invalid") from exc
+    hostname = str(parsed.hostname or "").casefold()
+    matched_path = re.fullmatch(
+        rf"/archives/({re.escape(channel_id)})/p(\d+)/?",
+        parsed.path,
+    )
+    if (
+        parsed.scheme != "https"
+        or not hostname.endswith(".slack.com")
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or matched_path is None
+        or matched_path.group(2) != message_ts.replace(".", "")
+        or parsed.fragment
+    ):
+        raise ValueError("Slack permalink is invalid")
+
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query_keys = [key for key, _item in query_pairs]
+    if (
+        len(query_keys) != len(set(query_keys))
+        or any(key not in {"thread_ts", "cid"} for key in query_keys)
+    ):
+        raise ValueError("Slack permalink query is invalid")
+    query = dict(query_pairs)
+    if query.get("cid", channel_id) != channel_id:
+        raise ValueError("Slack permalink channel is invalid")
+    if query.get("thread_ts", thread_ts) != thread_ts:
+        raise ValueError("Slack permalink thread is invalid")
+    return normalized
+
+
+class AssistantTurnAuditContextInput(_StrictInputModel):
+    """Slack만 확정할 수 있는 request-log identity와 permalink다."""
+
+    eventType: Literal["app_mention"]
+    userName: str | None = Field(default=None, min_length=1, max_length=160)
+    channelId: str = Field(pattern=_SLACK_CHANNEL_ID_PATTERN)
+    messageId: str = Field(pattern=_SLACK_MESSAGE_TS_PATTERN)
+    threadId: str = Field(pattern=_SLACK_MESSAGE_TS_PATTERN)
+    isThreadRoot: bool = Field(strict=True)
+    permalink: str | None = Field(default=None, min_length=1, max_length=2_048)
+    threadPermalink: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=2_048,
+    )
+
+    @field_validator("userName")
+    @classmethod
+    def _validate_user_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or not normalized.isprintable():
+            raise ValueError("audit userName is invalid")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_slack_scope(self) -> "AssistantTurnAuditContextInput":
+        if self.isThreadRoot != (self.messageId == self.threadId):
+            raise ValueError("audit root scope is inconsistent")
+        if self.permalink is not None:
+            self.permalink = _validate_slack_permalink(
+                self.permalink,
+                channel_id=self.channelId,
+                message_ts=self.messageId,
+                thread_ts=self.threadId,
+            )
+        if self.threadPermalink is not None:
+            self.threadPermalink = _validate_slack_permalink(
+                self.threadPermalink,
+                channel_id=self.channelId,
+                message_ts=self.threadId,
+                thread_ts=self.threadId,
+            )
+        return self
+
+
+class RequestLogDeliveryActionInput(_StrictInputModel):
+    """Slack 최종 전달 결과로 중앙 request-log row를 마감한다."""
+
+    name: Literal["request_log_delivery"]
+    phase: Literal["receipt"]
+    delivered: bool = Field(strict=True)
+    replyCount: int = Field(strict=True, ge=0, le=10_000)
+    firstRepliedAtUtc: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+    )
+    errorType: str | None = Field(
+        default=None,
+        pattern=_SAFE_ERROR_TYPE_PATTERN,
+    )
+
+    @model_validator(mode="after")
+    def _validate_delivery(self) -> "RequestLogDeliveryActionInput":
+        parsed_first_reply: datetime | None = None
+        if self.firstRepliedAtUtc is not None:
+            try:
+                parsed_first_reply = datetime.fromisoformat(
+                    self.firstRepliedAtUtc.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "firstRepliedAtUtc must be ISO-8601"
+                ) from exc
+            if (
+                parsed_first_reply.tzinfo is None
+                or parsed_first_reply.utcoffset()
+                != timezone.utc.utcoffset(parsed_first_reply)
+            ):
+                raise ValueError("firstRepliedAtUtc must be UTC")
+        if (self.replyCount > 0) != (parsed_first_reply is not None):
+            raise ValueError("reply count and first reply must match")
+        if self.delivered == (self.errorType is not None):
+            raise ValueError("delivery status and errorType must match")
+        return self
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "phase": self.phase,
+            "delivered": self.delivered,
+            "reply_count": self.replyCount,
+            "first_replied_at_utc": self.firstRepliedAtUtc,
+            "error_type": self.errorType,
+        }
+
+
+class DeviceFileDownloadDeliveryRecordInput(_StrictInputModel):
+    deviceName: str = Field(min_length=1, max_length=160)
+    deviceSeq: int | None = Field(default=None, ge=1)
+    hospitalSeq: int | None = Field(default=None, ge=1)
+    hospitalRoomSeq: int | None = Field(default=None, ge=1)
+    hospitalName: str = Field(min_length=1, max_length=200)
+    roomName: str = Field(min_length=1, max_length=200)
+    fileNames: list[str]
+    downloadFileNames: list[str] = Field(min_length=1)
+
+    @field_validator("deviceName", "hospitalName", "roomName")
+    @classmethod
+    def _normalize_display_text(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized or not normalized.isprintable():
+            raise ValueError("download delivery display text is invalid")
+        return normalized
+
+    @field_validator("fileNames", "downloadFileNames")
+    @classmethod
+    def _validate_file_names(cls, value: list[str]) -> list[str]:
+        normalized = [str(item).strip() for item in value]
+        if any(
+            not item
+            or len(item) > 255
+            or not item.isprintable()
+            or "/" in item
+            or "\\" in item
+            for item in normalized
+        ):
+            raise ValueError("download delivery file name is invalid")
+        return normalized
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "device_name": self.deviceName,
+            "device_seq": self.deviceSeq,
+            "hospital_seq": self.hospitalSeq,
+            "hospital_room_seq": self.hospitalRoomSeq,
+            "hospital_name": self.hospitalName,
+            "room_name": self.roomName,
+            "file_names": list(self.fileNames),
+            "download_file_names": list(self.downloadFileNames),
+        }
+
+
+class DeviceFileDownloadDeliveryManifestInput(_StrictInputModel):
+    barcode: str = Field(pattern=r"^\d{11}$")
+    logDate: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    usedExpandedScope: bool
+    records: list[DeviceFileDownloadDeliveryRecordInput] = Field(
+        min_length=1
+    )
+
+    @field_validator("logDate")
+    @classmethod
+    def _validate_log_date(cls, value: str) -> str:
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("logDate must be a valid date") from exc
+        return value
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "barcode": self.barcode,
+            "log_date": self.logDate,
+            "used_expanded_scope": self.usedExpandedScope,
+            "records": [record.to_metadata() for record in self.records],
+        }
+
+
+class DeviceFileDownloadDeliveryActionInput(_StrictInputModel):
+    """Slack이 모든 다운로드 DM을 보낸 뒤 보내는 성공 receipt다."""
+
+    name: Literal["device_file_download_delivery"]
+    phase: Literal["delivered"]
+    delivery: DeviceFileDownloadDeliveryManifestInput
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "phase": self.phase,
+            "delivery": self.delivery.to_metadata(),
+        }
+
+
+class DeviceOperationDeliveryManifestInput(_StrictInputModel):
+    """Slack 최종 응답 성공 뒤 activity에 필요한 최소 장비 작업 manifest다."""
+
+    route: Literal[
+        "device_box_update",
+        "device_agent_update",
+        "device_power_off",
+    ]
+    deviceName: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$",
+    )
+    requestedVersion: str = Field(max_length=80)
+    currentBoxVersion: str = Field(max_length=80)
+    dispatchMessage: str = Field(max_length=300)
+    waitStatus: Literal["completed", "timed_out"]
+    waitOk: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def _validate_route_payload(self) -> "DeviceOperationDeliveryManifestInput":
+        version_pattern = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,79}$"
+        if self.route == "device_box_update":
+            requested_version_valid = bool(
+                re.fullmatch(version_pattern, self.requestedVersion)
+            )
+        elif self.route == "device_agent_update":
+            requested_version_valid = self.requestedVersion == "latest"
+        else:
+            requested_version_valid = self.requestedVersion == ""
+        if (
+            not requested_version_valid
+            or (
+                self.currentBoxVersion
+                and re.fullmatch(
+                    version_pattern,
+                    self.currentBoxVersion,
+                )
+                is None
+            )
+            or self.dispatchMessage != self.dispatchMessage.strip()
+            or (
+                self.dispatchMessage
+                and not self.dispatchMessage.isprintable()
+            )
+            or ((self.waitStatus == "completed") is not self.waitOk)
+        ):
+            raise ValueError("device operation delivery is invalid")
+        return self
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "route": self.route,
+            "device_name": self.deviceName,
+            "requested_version": self.requestedVersion,
+            "current_box_version": self.currentBoxVersion,
+            "dispatch_message": self.dispatchMessage,
+            "wait_status": self.waitStatus,
+            "wait_ok": self.waitOk,
+        }
+
+
+class DeviceOperationDeliveryActionInput(_StrictInputModel):
+    """Slack이 최종 장비 작업 메시지를 보낸 뒤 보내는 activity receipt다."""
+
+    name: Literal["device_operation_delivery"]
+    phase: Literal["delivered"]
+    delivery: DeviceOperationDeliveryManifestInput
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "phase": self.phase,
+            "delivery": self.delivery.to_metadata(),
+        }
 
 
 class DeviceHealthAlertTargetInput(_StrictInputModel):
@@ -187,6 +588,7 @@ class DeviceHealthAlertTargetInput(_StrictInputModel):
 
     hospitalSeq: int = Field(ge=1)
     hospitalName: str = Field(min_length=1, max_length=160)
+    hospitalLabel: str = Field(default="", max_length=320)
     roomName: str = Field(min_length=1, max_length=160)
     deviceName: str = Field(
         min_length=1,
@@ -195,6 +597,7 @@ class DeviceHealthAlertTargetInput(_StrictInputModel):
     )
     issue: str = Field(min_length=1, max_length=1_000)
     alertCategory: str = Field(default="", max_length=80)
+    mdaUrl: str = Field(default="", max_length=2_048)
     problemComponents: list[str] = Field(
         default_factory=list,
         max_length=16,
@@ -202,6 +605,7 @@ class DeviceHealthAlertTargetInput(_StrictInputModel):
 
     @field_validator(
         "hospitalName",
+        "hospitalLabel",
         "roomName",
         "issue",
         "alertCategory",
@@ -224,10 +628,12 @@ class DeviceHealthAlertTargetInput(_StrictInputModel):
         return {
             "hospital_seq": self.hospitalSeq,
             "hospital_name": self.hospitalName,
+            "hospital_label": self.hospitalLabel,
             "room_name": self.roomName,
             "device_name": self.deviceName,
             "issue": self.issue,
             "alert_category": self.alertCategory,
+            "mda_url": self.mdaUrl.strip(),
             "problem_components": list(self.problemComponents),
         }
 
@@ -289,6 +695,68 @@ class DeviceHealthAlertActionInput(_StrictInputModel):
         if self.sms is not None:
             metadata["sms"] = self.sms.to_metadata()
         return metadata
+
+
+class DeviceHealthAlertUiReceiptInput(_StrictInputModel):
+    """Slack만 아는 modal open 결과를 API event writer로 돌려보낸다."""
+
+    name: Literal["device_health_alert_ui_receipt"]
+    phase: Literal["receipt"]
+    eventType: Literal["alert_contact_sms_modal_requested"]
+    actionId: Literal[
+        "device_health_alert_contact_hospital",
+        "device_health_alert_view_auto_sms",
+    ]
+    mode: Literal["send", "view_auto_sent"]
+    target: DeviceHealthAlertTargetInput
+    messageTs: str = Field(pattern=r"^\d{1,20}(?:\.\d{1,9})?$")
+    threadTs: str = Field(pattern=r"^\d{1,20}(?:\.\d{1,9})?$")
+    occurredAt: str = Field(min_length=1, max_length=64)
+    status: Literal[
+        "missing_trigger_id",
+        "modal_opened",
+        "modal_open_failed",
+    ]
+    ok: bool
+    errorType: str = Field(default="", max_length=160)
+
+    @field_validator("occurredAt")
+    @classmethod
+    def _validate_occurred_at(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            parsed = datetime.fromisoformat(
+                normalized.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("occurredAt must be an ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("occurredAt must include timezone")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_result(self) -> "DeviceHealthAlertUiReceiptInput":
+        if self.ok != (self.status == "modal_opened"):
+            raise ValueError("modal receipt status and ok must match")
+        if self.errorType and self.status != "modal_open_failed":
+            raise ValueError("errorType is only valid for modal_open_failed")
+        return self
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "phase": self.phase,
+            "event_type": self.eventType,
+            "action_id": self.actionId,
+            "mode": self.mode,
+            "target": self.target.to_metadata(),
+            "message_ts": self.messageTs,
+            "thread_ts": self.threadTs,
+            "occurred_at": self.occurredAt,
+            "status": self.status,
+            "ok": self.ok,
+            "error_type": self.errorType,
+        }
 
 
 class SecurityReviewTargetInput(_StrictInputModel):
@@ -362,6 +830,15 @@ class SecurityReviewActionInput(_StrictInputModel):
         return metadata
 
 
+class DeviceDiagnosticFollowupProbeActionInput(_StrictInputModel):
+    """API process가 소유한 현재 thread의 진단 snapshot만 확인한다."""
+
+    name: Literal["device_diagnostic_followup_probe"]
+
+    def to_metadata(self) -> dict[str, str]:
+        return {"name": self.name}
+
+
 class AssistantTurnInput(_StrictInputModel):
     tenantId: str = Field(
         min_length=1,
@@ -380,10 +857,7 @@ class AssistantTurnInput(_StrictInputModel):
         max_length=256,
         pattern=_IDENTIFIER_PATTERN,
     )
-    question: str = Field(
-        min_length=1,
-        max_length=_MAX_QUESTION_CHARS,
-    )
+    question: str = Field(max_length=_MAX_QUESTION_CHARS)
     locale: str = Field(
         min_length=2,
         max_length=35,
@@ -391,9 +865,10 @@ class AssistantTurnInput(_StrictInputModel):
     )
     contextEntries: list[ContextEntryInput] = Field(
         default_factory=list,
-        max_length=_MAX_CONTEXT_ENTRIES,
+        max_length=_MAX_OPERATION_CONTEXT_ENTRIES,
     )
     scope: AssistantTurnScopeInput | None = None
+    auditContext: AssistantTurnAuditContextInput | None = None
     routeGroup: Literal[
         "notion",
         "device",
@@ -409,24 +884,55 @@ class AssistantTurnInput(_StrictInputModel):
         "operations",
     ] | None = None
     operationAction: (
-        DeviceHealthAlertActionInput
+        DeviceFileDownloadDeliveryActionInput
+        | DeviceOperationDeliveryActionInput
+        | RequestLogDeliveryActionInput
+        | DeviceHealthAlertActionInput
+        | DeviceHealthAlertUiReceiptInput
         | SecurityReviewActionInput
+        | DeviceDiagnosticFollowupProbeActionInput
         | None
     ) = None
+    # 사람 team-fun은 Slack이 이미 최신 5k window로 렌더한 문자열을
+    # 그대로 넘긴다. 일반 context entry와 별도의 typed 필드로 유지한다.
+    funContext: str | None = Field(default=None, max_length=_MAX_CONTEXT_CHARS)
 
     @field_validator("question")
     @classmethod
     def _normalize_question(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _validate_question_scope(self) -> "AssistantTurnInput":
+        # bot만 멘션한 turn은 기존 freeform의 missing_question 안내가
+        # 처리한다. 다른 stage는 빈 요청으로 matcher를 우회하지 못하게 한다.
+        if not self.question and self.routeGroup != "freeform":
             raise ValueError("question must not be blank")
-        return normalized
+        return self
 
     @model_validator(mode="after")
     def _validate_context_budget(self) -> "AssistantTurnInput":
+        max_entries = (
+            _MAX_OPERATION_CONTEXT_ENTRIES
+            if self.routeGroup == "operations"
+            else _MAX_CONTEXT_ENTRIES
+        )
+        max_chars = (
+            _MAX_OPERATION_CONTEXT_CHARS
+            if self.routeGroup == "operations"
+            else _MAX_CONTEXT_CHARS
+        )
         if (
-            sum(len(entry.text) for entry in self.contextEntries)
-            > _MAX_CONTEXT_CHARS
+            len(self.contextEntries) > max_entries
+            or sum(len(entry.text) for entry in self.contextEntries)
+            > max_chars
+            or (
+                self.routeGroup != "operations"
+                and any(
+                    len(entry.text) > _MAX_CONTEXT_ENTRY_CHARS
+                    for entry in self.contextEntries
+                )
+            )
         ):
             raise ValueError("contextEntries exceed the text budget")
         return self
@@ -435,10 +941,34 @@ class AssistantTurnInput(_StrictInputModel):
     def _validate_operation_action_scope(self) -> "AssistantTurnInput":
         if self.operationAction is not None and self.routeGroup != "operations":
             raise ValueError("operationAction requires routeGroup=operations")
+        if self.auditContext is not None:
+            if self.routeGroup != "operations" or self.channel != "slack":
+                raise ValueError(
+                    "auditContext requires Slack routeGroup=operations"
+                )
+            if (
+                self.conversationId != self.auditContext.threadId
+                or self.scope is None
+                or self.scope.channelContextId
+                != self.auditContext.channelId
+            ):
+                # tenant/actor는 top-level caller 경계가 정본이고, 채널과
+                # thread만 auditContext의 Slack identity와 교차 검증한다.
+                raise ValueError("auditContext scope is inconsistent")
+        if (
+            isinstance(self.operationAction, RequestLogDeliveryActionInput)
+            and self.auditContext is None
+        ):
+            raise ValueError("request-log delivery requires auditContext")
+        if self.funContext is not None and self.routeGroup != "fun":
+            raise ValueError("funContext requires routeGroup=fun")
         if (
             isinstance(
                 self.operationAction,
-                DeviceHealthAlertActionInput,
+                (
+                    DeviceHealthAlertActionInput,
+                    DeviceHealthAlertUiReceiptInput,
+                ),
             )
             and self.scope is not None
             and self.scope.deviceName is not None
@@ -466,6 +996,10 @@ class AssistantTurnInput(_StrictInputModel):
         if self.operationAction is not None:
             # 질문 원문과 분리된 typed action만 operation route가 읽는다.
             metadata["operation_action"] = self.operationAction.to_metadata()
+        if self.funContext is not None:
+            # fun 전용 typed context는 일반 ContextEntry 렌더 접두사 없이
+            # 기존 Slack prompt에 쓰던 최신-window 문자열을 보존한다.
+            metadata["team_fun_context"] = self.funContext
         return CompanyAssistantRequest(
             request_id=request_id,
             tenant_id=self.tenantId,
@@ -497,7 +1031,6 @@ class AssistantMessageOutput(BaseModel):
     format: Literal["commonmark"]
     privateLinks: list[AssistantLinkOutput] = Field(
         default_factory=list,
-        max_length=_MAX_PRIVATE_LINKS,
     )
 
 
@@ -615,6 +1148,38 @@ class SecurityReviewStepOutput(_StrictInputModel):
         return self
 
 
+class DeviceFileDownloadLinkContextOutput(_StrictInputModel):
+    """presigned URL과 분리해 Slack 링크 DM 표시에만 쓰는 문맥이다."""
+
+    deviceName: str = Field(min_length=1, max_length=160)
+    fileName: str = Field(min_length=1, max_length=255)
+
+
+class DeviceFileDownloadDeliveryOutput(_StrictInputModel):
+    """Slack이 모든 requester-only 링크를 전달하기 전의 typed 결과다."""
+
+    kind: Literal["device_file_download_delivery"]
+    status: Literal["pending"]
+    failureNotice: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
+    linkCount: int = Field(ge=1)
+    links: list[DeviceFileDownloadLinkContextOutput]
+    delivery: DeviceFileDownloadDeliveryManifestInput
+
+    @model_validator(mode="after")
+    def _validate_link_count(self) -> "DeviceFileDownloadDeliveryOutput":
+        if self.linkCount != len(self.links):
+            raise ValueError("download delivery link count is invalid")
+        return self
+
+
+class DeviceOperationDeliveryOutput(_StrictInputModel):
+    """Slack 최종 응답 전까지 activity receipt를 보류하는 typed 결과다."""
+
+    kind: Literal["device_operation_delivery"]
+    status: Literal["pending"]
+    delivery: DeviceOperationDeliveryManifestInput
+
+
 class AssistantTurnOutput(BaseModel):
     requestId: str = Field(min_length=1, max_length=128)
     route: str = Field(min_length=1, max_length=256)
@@ -637,7 +1202,9 @@ class AssistantTurnOutput(BaseModel):
     suggestedAction: None = None
     asyncJob: None = None
     operationResult: (
-        SmsDeliveryOperationResultOutput
+        DeviceFileDownloadDeliveryOutput
+        | DeviceOperationDeliveryOutput
+        | SmsDeliveryOperationResultOutput
         | SmsContactPreparationOutput
         | SecurityReviewStepOutput
         | None
@@ -646,8 +1213,10 @@ class AssistantTurnOutput(BaseModel):
 
 def _serialize_operation_result(
     value: Any,
-) -> (
-    SmsDeliveryOperationResultOutput
+    ) -> (
+    DeviceFileDownloadDeliveryOutput
+    | DeviceOperationDeliveryOutput
+    | SmsDeliveryOperationResultOutput
     | SmsContactPreparationOutput
     | SecurityReviewStepOutput
     | None
@@ -656,6 +1225,10 @@ def _serialize_operation_result(
         return None
     # route가 만든 allowlisted receipt만 직렬화해 전화번호·문자본문 같은
     # provider 요청 원문이 HTTP 응답에 섞이지 않게 한다.
+    if value.get("kind") == "device_file_download_delivery":
+        return DeviceFileDownloadDeliveryOutput.model_validate(value)
+    if value.get("kind") == "device_operation_delivery":
+        return DeviceOperationDeliveryOutput.model_validate(value)
     if value.get("kind") == "sms_delivery":
         return SmsDeliveryOperationResultOutput.model_validate(value)
     if value.get("kind") == "sms_contact_preparation":
@@ -804,15 +1377,11 @@ def _serialize_private_links(message: Any) -> list[AssistantLinkOutput]:
     if getattr(message, "delivery_scope", None) != "requester":
         return []
     serialized: list[AssistantLinkOutput] = []
-    seen_uris: set[str] = set()
     for link in tuple(getattr(message, "private_links", ()) or ()):
-        if len(serialized) >= _MAX_PRIVATE_LINKS:
-            break
         label = _safe_private_link_label(getattr(link, "label", None))
         uri = _safe_private_link_uri(getattr(link, "uri", None))
-        if label is None or uri is None or uri in seen_uris:
+        if label is None or uri is None:
             continue
-        seen_uris.add(uri)
         serialized.append(AssistantLinkOutput(label=label, uri=uri))
     return serialized
 

@@ -19,7 +19,7 @@ def _turn(*, question: str, route_group: str = "operations") -> AssistantTurnInp
     )
 
 
-def test_same_target_different_request_is_busy_while_first_runs() -> None:
+def test_different_request_ids_keep_legacy_concurrent_execution() -> None:
     guard = MutationRequestGuard()
     first = guard.reserve(
         caller_id="slack-prod",
@@ -38,7 +38,7 @@ def test_same_target_different_request_is_busy_while_first_runs() -> None:
     )
 
     assert first.status == "reserved"
-    assert second.status == "busy"
+    assert second.status == "reserved"
 
 
 def test_completed_target_is_released_but_request_id_is_replayed() -> None:
@@ -94,7 +94,7 @@ def test_released_precheck_reservation_allows_same_request_and_target() -> None:
     )
     assert first.reservation is not None
 
-    # 실제 외부 전송 전에 실패한 요청은 request ID와 global target을 모두 푼다.
+    # 실제 외부 전송 전에 실패한 동일 request ID reservation을 푼다.
     guard.release(first.reservation)
     same_request = guard.reserve(
         caller_id="slack-prod",
@@ -142,5 +142,5 @@ def test_uncertain_mutation_never_expires_during_process_lifetime() -> None:
     )
 
     assert same_request.status == "busy"
-    assert new_request.status == "busy"
+    assert new_request.status == "reserved"
     assert read_only_request.status == "bypass"

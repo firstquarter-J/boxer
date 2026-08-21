@@ -32,11 +32,11 @@ class _Entry:
 
 
 class MutationRequestGuard:
-    """단일 API 프로세스 안에서 mutation-capable turn 중복만 억제한다.
+    """단일 API 프로세스 안에서 같은 mutation turn의 재실행만 억제한다.
 
-    이 guard는 기존 단일 worker 운영의 Slack redelivery와 동시 요청을
-    막는 최소 경계다. 프로세스 재시작이나 다중 인스턴스 exactly-once를
-    약속하지 않으며, 그런 확장이 생기면 공유 저장소로 교체해야 한다.
+    Slack redelivery처럼 request ID가 같은 전송은 재실행하지 않는다.
+    서로 다른 정상 요청까지 직렬화하는 것은 기존 Slack 동작이 아니므로
+    target 단위 lease를 두지 않는다.
     """
 
     def __init__(
@@ -53,7 +53,6 @@ class MutationRequestGuard:
         del uncertain_ttl_sec
         self._lock = threading.Lock()
         self._entries: dict[tuple[str, str, str], _Entry] = {}
-        self._targets: dict[str, tuple[str, str, str]] = {}
 
     def reserve(
         self,
@@ -88,11 +87,6 @@ class MutationRequestGuard:
                     )
                 return MutationRequestDecision(status="busy")
 
-            target_owner = self._targets.get(target_key)
-            if target_owner is not None and target_owner != key:
-                # 같은 장비/바코드 mutation이 겹치면 두 번째 요청은 실행하지 않는다.
-                return MutationRequestDecision(status="busy")
-
             reservation = MutationRequestReservation(
                 key=key,
                 fingerprint=fingerprint,
@@ -105,7 +99,6 @@ class MutationRequestGuard:
                 # 실행 중 entry는 정상 완료/불확실 전이 전까지 지우지 않는다.
                 expires_at=float("inf"),
             )
-            self._targets[target_key] = key
             return MutationRequestDecision(
                 status="reserved",
                 reservation=reservation,
@@ -124,7 +117,6 @@ class MutationRequestGuard:
             entry.state = "completed"
             entry.payload = dict(payload)
             entry.expires_at = now + self._completed_ttl_sec
-            self._release_target(reservation)
 
     def mark_uncertain(
         self,
@@ -137,7 +129,7 @@ class MutationRequestGuard:
             entry.state = "uncertain"
             entry.payload = None
             entry.expires_at = float("inf")
-            # 처리 여부를 모르는 동안 같은 target을 다른 request ID가 재실행하지 않는다.
+            # 처리 여부를 모르는 동일 request ID만 재실행하지 않는다.
 
     def release(
         self,
@@ -150,7 +142,6 @@ class MutationRequestGuard:
             if entry is None:
                 return
             self._entries.pop(reservation.key, None)
-            self._release_target(reservation)
 
     def _matching_entry(
         self,
@@ -161,13 +152,6 @@ class MutationRequestGuard:
             return None
         return entry
 
-    def _release_target(
-        self,
-        reservation: MutationRequestReservation,
-    ) -> None:
-        if self._targets.get(reservation.target_key) == reservation.key:
-            self._targets.pop(reservation.target_key, None)
-
     def _remove_expired(self, now: float) -> None:
         expired = [
             key
@@ -175,9 +159,7 @@ class MutationRequestGuard:
             if entry.expires_at <= now
         ]
         for key in expired:
-            entry = self._entries.pop(key)
-            if self._targets.get(entry.target_key) == key:
-                self._targets.pop(entry.target_key, None)
+            self._entries.pop(key)
 
 
 def _turn_fingerprint(turn: Any) -> str:
@@ -196,11 +178,9 @@ def _turn_fingerprint(turn: Any) -> str:
 
 def _turn_target_key(turn: Any, *, route_group: str) -> str:
     tenant_id = str(getattr(turn, "tenantId", "") or "").strip()
-    del route_group
-    # 바코드는 DB에서 장비로 해석되므로 HTTP 입력만으로 canonical target을
-    # 안전하게 맞출 수 없다. 단일 worker의 mutation-capable turn 전체를
-    # 직렬화해 서로 다른 route가 같은 장비 tunnel을 동시에 여는 일을 막는다.
-    return f"{tenant_id}:mutation"
+    # reservation payload 호환용 식별자다. 서로 다른 request ID 사이의
+    # 실행 소유권에는 사용하지 않는다.
+    return f"{tenant_id}:{route_group or 'mutation'}"
 
 
 __all__ = [

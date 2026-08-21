@@ -25,11 +25,20 @@ class _SlackClient:
         return {"ts": f"1723000000.{len(self.messages):06d}"}
 
 
-def _api_result(delivery: AutomationDelivery | None) -> SimpleNamespace:
+def _api_result(
+    delivery: AutomationDelivery | tuple[AutomationDelivery, ...] | None,
+) -> SimpleNamespace:
+    deliveries = (
+        delivery
+        if isinstance(delivery, tuple)
+        else (delivery,)
+        if delivery is not None
+        else ()
+    )
     return SimpleNamespace(
-        deliveries=(delivery,) if delivery is not None else (),
+        deliveries=deliveries,
         metrics={},
-        outcome="completed" if delivery is not None else "no_change",
+        outcome="completed" if deliveries else "no_change",
     )
 
 
@@ -115,6 +124,8 @@ def test_daily_remote_renders_api_delivery_without_local_mda_or_db() -> None:
                     "powerOffFailed": 0,
                 },
                 "summaryLine": "정상 1",
+                "messageBlocks": [],
+                "fallbackText": "테스트병원",
                 "deviceResults": [],
             },
         )
@@ -134,7 +145,15 @@ def test_daily_remote_renders_api_delivery_without_local_mda_or_db() -> None:
             DAILY_DEVICE_ROUND_AUTO_POWER_OFF=False,
         ),
         patch.object(daily.s, "DB_QUERY_ENABLED", False),
-        patch.object(daily, "_load_daily_device_round_state", return_value={}),
+        patch.object(
+            daily,
+            "_load_daily_device_round_state",
+            return_value={
+                "autoUpdateAgentOverride": False,
+                "autoUpdateBoxFreeOverride": True,
+                "autoUpdateBoxPaidOverride": True,
+            },
+        ),
         patch.object(daily, "_normalize_daily_device_round_state", side_effect=lambda state, **_: state),
         patch.object(daily, "_daily_device_round_window_key", return_value="2026-08-10"),
         patch.object(daily, "_is_daily_device_round_due", return_value=True),
@@ -159,9 +178,10 @@ def test_daily_remote_renders_api_delivery_without_local_mda_or_db() -> None:
     local_round.assert_not_called()
     api.run.assert_called_once()
     assert api.run.call_args.kwargs["options"] == {
-        "autoUpdateAgent": True,
-        "autoUpdateBoxFree": False,
-        "autoUpdateBoxPaid": False,
+        # remote에서도 기존 Slack 제어 override가 env 기본값을 덮어쓴다.
+        "autoUpdateAgent": False,
+        "autoUpdateBoxFree": True,
+        "autoUpdateBoxPaid": True,
         "autoCleanupTrashCan": True,
         "autoPowerOff": False,
     }
@@ -171,20 +191,29 @@ def test_daily_remote_renders_api_delivery_without_local_mda_or_db() -> None:
 def test_health_remote_posts_semantic_alert_without_local_probe() -> None:
     api = Mock()
     api.run.return_value = _api_result(
-        AutomationDelivery(
-            delivery_id="device_health_monitor:abc",
-            kind="device_health_alert",
-            payload={
-                "alert": {
-                    "hospitalSeq": "1",
-                    "hospitalName": "테스트병원",
-                    "room": "2진료실",
-                    "device": "MB2-TEST",
-                    "issue": "캡처보드 확인 필요",
-                    "problemComponents": ["캡처보드"],
-                    "alertCategory": "video_signal",
-                }
-            },
+        tuple(
+            AutomationDelivery(
+                delivery_id=f"device_health_monitor:{suffix}",
+                kind="device_health_alert",
+                payload={
+                    "alert": {
+                        "hospitalSeq": str(index),
+                        "hospitalName": f"테스트병원{index}",
+                        "telephone": f"02-0000-000{index}",
+                        "deviceAlertPhone": f"010-0000-000{index}",
+                        "room": f"{index}진료실",
+                        "device": f"MB2-TEST{index}",
+                        "issue": "캡처보드 확인 필요",
+                        "problemComponents": ["캡처보드"],
+                        "alertCategory": "video_signal",
+                        "smsStatusText": "문자 발송 접수",
+                        "smsPhoneNumber": "01012345678",
+                        "smsMessage": "캡처보드 연결 상태를 확인해 주세요.",
+                        "smsTemplateId": "captureboard_disconnected",
+                    }
+                },
+            )
+            for index, suffix in ((1, "abc"), (2, "def"))
         )
     )
     logger = logging.getLogger("test.automation.health")
@@ -198,8 +227,12 @@ def test_health_remote_posts_semantic_alert_without_local_probe() -> None:
         patch.object(health, "_resolve_device_health_monitor_alert_delivery_status") as resolve_status,
         patch.object(health, "_device_health_monitor_channel_id", return_value="C1"),
         patch.object(health, "flush_automation_deliveries", return_value=False) as flush,
-        patch.object(health, "remember_automation_delivery") as remember,
-        patch.object(health, "_post_daily_device_round_abnormal_alert", return_value=posted),
+        patch.object(health, "remember_automation_deliveries") as remember,
+        patch.object(
+            health,
+            "_post_daily_device_round_abnormal_alert",
+            return_value=posted,
+        ) as post_alert,
         patch.object(health, "_build_device_health_monitor_summary") as local_probe,
     ):
         sent = health._run_device_health_monitor_once(
@@ -218,6 +251,18 @@ def test_health_remote_posts_semantic_alert_without_local_probe() -> None:
     assert "options" not in api.run.call_args.kwargs
     assert "options" not in flush.call_args.kwargs
     remember.assert_called_once()
+    remembered = remember.call_args.kwargs["deliveries"]
+    assert len(remembered) == 2
+    # local monitor처럼 한 poll의 장비 알림은 Slack 메시지 하나로 집계한다.
+    assert len(
+        post_alert.call_args.args[1]["deviceResults"]
+    ) == 2
+    first_result = post_alert.call_args.args[1]["deviceResults"][0]
+    assert first_result["smsPhoneNumber"] == "01012345678"
+    assert first_result["smsMessage"] == (
+        "캡처보드 연결 상태를 확인해 주세요."
+    )
+    assert first_result["smsTemplateId"] == "captureboard_disconnected"
 
 
 def test_notification_remote_posts_api_alert_without_local_db_or_sms() -> None:
@@ -257,3 +302,61 @@ def test_notification_remote_posts_api_alert_without_local_db_or_sms() -> None:
     local_db.assert_not_called()
     api.run.assert_called_once()
     remember.assert_called_once()
+
+
+def test_notification_remote_drains_legacy_batch_after_each_receipt() -> None:
+    def _delivery(notification_id: int) -> AutomationDelivery:
+        return AutomationDelivery(
+            delivery_id=f"device_notification:{notification_id}",
+            kind="device_notification_alert",
+            payload={
+                "alertSummary": {"deviceResults": [{}]},
+                "render": {
+                    "includeActions": True,
+                    "includeDeviceVoiceAction": True,
+                },
+            },
+        )
+
+    api = Mock()
+    api.run.side_effect = (
+        _api_result(_delivery(10)),
+        _api_result(_delivery(11)),
+        _api_result(None),
+    )
+    logger = logging.getLogger("test.automation.notification.batch")
+
+    with (
+        patch.object(notification.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", True),
+        patch.object(notification.cs, "DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", "C1"),
+        patch.object(notification.s, "DB_QUERY_ENABLED", False),
+        patch.object(
+            notification,
+            "flush_automation_deliveries",
+            side_effect=(False, True, True),
+        ) as flush,
+        patch.object(notification, "remember_automation_delivery") as remember,
+        patch.object(
+            notification,
+            "_post_daily_device_round_abnormal_alert",
+            side_effect=(
+                {"messageTs": "1723000000.000010", "permalink": ""},
+                {"messageTs": "1723000000.000011", "permalink": ""},
+            ),
+        ) as post_alert,
+    ):
+        sent = notification._run_device_notification_alert_once(
+            object(),
+            logger,
+            now=_NOW,
+            automation_client=api,
+        )
+
+    assert sent is True
+    assert api.run.call_count == 3
+    assert flush.call_count == 3
+    assert post_alert.call_count == 2
+    assert remember.call_count == 2
+    assert len(
+        {call.kwargs["request_id"] for call in api.run.call_args_list}
+    ) == 3

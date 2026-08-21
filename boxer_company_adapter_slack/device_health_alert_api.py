@@ -15,6 +15,8 @@ from boxer_company.assistant.device_health_alert_action_route import (
     DEVICE_HEALTH_ALERT_SMS_ACTION,
     DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_ROUTE,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
     DEVICE_HEALTH_ALERT_VOICE_ACTION,
     DEVICE_HEALTH_ALERT_VOICE_ROUTE,
 )
@@ -39,6 +41,9 @@ _ACTION_ROUTES = {
     (DEVICE_HEALTH_ALERT_MARK_DONE_ACTION, "execute"): (
         DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE
     ),
+    (DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION, "receipt"): (
+        DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE
+    ),
 }
 
 
@@ -60,6 +65,8 @@ class DeviceHealthAlertApiTarget:
     issue: str
     alert_category: str = ""
     problem_components: tuple[str, ...] = ()
+    hospital_label: str = ""
+    mda_url: str = ""
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -70,6 +77,8 @@ class DeviceHealthAlertApiTarget:
             "issue": self.issue,
             "alert_category": self.alert_category,
             "problem_components": list(self.problem_components),
+            "hospital_label": self.hospital_label,
+            "mda_url": self.mda_url,
         }
 
 
@@ -117,6 +126,8 @@ def build_device_health_alert_api_target(
         issue=issue,
         alert_category=alert_category,
         problem_components=components,
+        hospital_label=_normalized_text(raw_item.get("hospital")),
+        mda_url=str(raw_item.get("mdaUrl") or "").strip(),
     )
 
 
@@ -262,6 +273,48 @@ class DeviceHealthAlertApiBridge:
             target=target,
         )
 
+    def record_modal_receipt(
+        self,
+        *,
+        request_id: str,
+        workspace_id: str,
+        actor_user_id: str,
+        channel_id: str,
+        conversation_id: str,
+        target: DeviceHealthAlertApiTarget,
+        action_id: str,
+        mode: str,
+        message_ts: str,
+        thread_ts: str,
+        occurred_at: str,
+        status: str,
+        ok: bool,
+        error_type: str = "",
+    ) -> DeviceHealthAlertApiResult:
+        """Slack views_open 결과만 별도 typed receipt로 한 번 전달한다."""
+
+        return self._execute(
+            request_id=request_id,
+            workspace_id=workspace_id,
+            actor_user_id=actor_user_id,
+            channel_id=channel_id,
+            conversation_id=conversation_id,
+            action_name=DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
+            phase="receipt",
+            target=target,
+            ui_receipt={
+                "event_type": "alert_contact_sms_modal_requested",
+                "action_id": str(action_id or "").strip(),
+                "mode": str(mode or "").strip(),
+                "message_ts": str(message_ts or "").strip(),
+                "thread_ts": str(thread_ts or "").strip(),
+                "occurred_at": str(occurred_at or "").strip(),
+                "status": str(status or "").strip(),
+                "ok": bool(ok),
+                "error_type": str(error_type or "").strip(),
+            },
+        )
+
     def _execute(
         self,
         *,
@@ -274,6 +327,7 @@ class DeviceHealthAlertApiBridge:
         phase: str,
         target: DeviceHealthAlertApiTarget,
         sms: Mapping[str, str] | None = None,
+        ui_receipt: Mapping[str, Any] | None = None,
     ) -> DeviceHealthAlertApiResult:
         expected_route = _ACTION_ROUTES.get((action_name, phase))
         if expected_route is None:
@@ -292,6 +346,8 @@ class DeviceHealthAlertApiBridge:
         }
         if sms is not None:
             metadata["operation_action"]["sms"] = dict(sms)
+        if ui_receipt is not None:
+            metadata["operation_action"].update(dict(ui_receipt))
         request = CompanyAssistantRequest(
             request_id=request_id,
             tenant_id=workspace_id,

@@ -14,6 +14,10 @@ from boxer_adapter_slack.context import _load_slack_thread_context
 from boxer_company import settings as cs
 from boxer_company.assistant.team_fun_route import (
     build_daily_fortune_reply as _build_daily_fortune_reply,
+    build_team_fun_prompt,
+    build_team_fun_template,
+    extract_team_fun_topic,
+    finalize_team_fun_reply,
     is_daily_fortune_content,
 )
 from boxer_company.prompt_security import (
@@ -202,29 +206,8 @@ def _clean_fun_fragment(text: str) -> str:
 
 
 def _extract_fun_topic(text: str) -> str | None:
-    normalized = _normalize_fun_text(text)
-    if "모대" not in normalized:
-        return None
-
-    clauses = [segment.strip() for segment in CLAUSE_SPLIT_RE.split(normalized) if segment.strip()]
-    clause = next((segment for segment in clauses if "모대" in segment), normalized)
-    before, _, after = clause.partition("모대")
-    before = _clean_fun_fragment(before)
-    after = _clean_fun_fragment(after)
-
-    topic = before or after
-    if not topic:
-        topic = _clean_fun_fragment(clause.replace("모대", " "))
-
-    if not topic:
-        return None
-
-    words = topic.split()
-    if len(words) > 4:
-        topic = " ".join(words[-4:])
-    if len(topic) > 24:
-        topic = topic[-24:].strip()
-    return topic or None
+    # local rollback과 API가 같은 domain parser를 사용해 전환 중 drift를 막는다.
+    return extract_team_fun_topic(text)
 
 
 def _ensure_topic_suffix(topic: str, suffix: str = "도") -> str:
@@ -244,17 +227,7 @@ def _pick_fun_template(seed_text: str, templates: tuple[str, ...]) -> str:
 
 
 def _build_fun_template(text: str) -> str:
-    topic = _extract_fun_topic(text) or "그거"
-    compact_topic = topic.replace(" ", "")
-    for keywords, templates in FUN_TEMPLATE_RULES:
-        if any(keyword in compact_topic for keyword in keywords):
-            return _pick_fun_template(compact_topic, templates)
-
-    topic_with_do = _ensure_topic_suffix(topic, "도")
-    if not topic_with_do:
-        return "그거도 쉽지 모대?"
-    template = _pick_fun_template(compact_topic or topic_with_do, FUN_GENERIC_TEMPLATES)
-    return template.format(topic_with_do=topic_with_do)
+    return build_team_fun_template(text)
 
 
 def _sanitize_fun_reply(text: str) -> str:
@@ -267,29 +240,11 @@ def _sanitize_fun_reply(text: str) -> str:
 
 
 def _finalize_fun_reply(source_text: str, generated_text: str, fallback_text: str) -> str:
-    cleaned = _sanitize_fun_reply(generated_text)
-    if not cleaned:
-        return fallback_text
-    if FUN_BAD_REPLY_RE.search(cleaned):
-        return fallback_text
-
-    cleaned = re.sub(r"^.*(?:->|=>|:)\s*", "", cleaned).strip()
-    cleaned = re.split(r"(?:,|\.|!|;|:| 그런데 | 근데 | 하지만 | 그래서 )", cleaned, maxsplit=1)[0].strip()
-    cleaned = cleaned.replace("모대", " ").replace("?", " ").strip()
-    cleaned = cleaned.rstrip("!~. ")
-
-    topic = _extract_fun_topic(source_text) or ""
-    compact_topic = topic.replace(" ", "")
-    compact_cleaned = cleaned.replace(" ", "")
-    fallback_compact = fallback_text.replace(" ", "")
-    should_prefix_topic = bool(topic) and compact_topic in fallback_compact
-    if should_prefix_topic and compact_topic not in compact_cleaned:
-        cleaned = f"{topic} {cleaned}".strip()
-
-    cleaned = FUN_REPLY_SANITIZE_RE.sub(" ", cleaned).strip()
-    if len(cleaned) < 2 or len(cleaned) > 18:
-        return fallback_text
-    return f"{cleaned} 모대?"
+    return finalize_team_fun_reply(
+        source_text,
+        generated_text,
+        fallback_text,
+    )
 
 
 def _build_fun_llm_prompt(
@@ -298,30 +253,15 @@ def _build_fun_llm_prompt(
     *,
     speaker_user_id: str = "",
 ) -> str:
-    topic = _extract_fun_topic(text) or "없음"
-    template = _build_fun_template(text)
-    team_context = build_team_chat_context(
+    return build_team_fun_prompt(
         text,
         thread_context,
-        speaker_user_id=speaker_user_id,
-        required_names=("DD",),
-    )
-    context_block = ""
-    if thread_context:
-        context_block = f"최근 대화 맥락:\n{thread_context}\n\n"
-    return (
-        f"{context_block}"
-        f"{team_context}\n\n"
-        f"원문: {text.strip()}\n"
-        f"추출 토픽: {topic}\n"
-        f"기본 템플릿: {template}\n"
-        "출력 규칙:\n"
-        "- DD를 살짝 놀리는 톤\n"
-        "- 최근 맥락이 있으면 그걸 재료로 짧게 받아칠 것\n"
-        "- 기본 템플릿 의미 유지\n"
-        "- 끝은 반드시 모대?\n"
-        "- 영어/설명/자기소개 금지\n"
-        "출력:"
+        build_team_chat_context(
+            text,
+            thread_context,
+            speaker_user_id=speaker_user_id,
+            required_names=("DD",),
+        ),
     )
 
 
@@ -498,7 +438,12 @@ def handle_fun_message(
         payload.get("current_ts"),
     )
 
-    if is_prompt_exfiltration_attempt(raw_text, thread_context):
+    if (
+        remote_reply_generator is None
+        and is_prompt_exfiltration_attempt(raw_text, thread_context)
+    ):
+        # local rollback에서만 기존 parser를 실행한다. remote에서는 같은
+        # 판정과 거절문 생성을 공통 API route가 소유한다.
         _set_request_log_skip_persist(payload, True)
         reply(build_prompt_security_refusal(), thread=True)
         logger.warning(

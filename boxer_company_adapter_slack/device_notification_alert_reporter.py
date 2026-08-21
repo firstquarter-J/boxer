@@ -1735,88 +1735,114 @@ def _run_device_notification_alert_remote_once(
     """DB cursor·SMS·Sheets는 API에 두고 Slack delivery만 처리한다."""
 
     cycle_key = "continuous"
-    if flush_automation_deliveries(
+    # 이전 poll에서 Slack 성공 후 남은 receipt를 먼저 닫는다.
+    flush_automation_deliveries(
         automation_client,
         cycle="device_notification_alert",
         cycle_key=cycle_key,
         scheduled_at=local_now,
         logger=logger,
-    ):
-        return False
-    result = automation_client.run(
-        request_id=build_automation_request_id(
+    )
+    sent_count = 0
+    run_identity: list[str] = []
+    for _ in range(_DEVICE_NOTIFICATION_ALERT_BATCH_SIZE):
+        result = automation_client.run(
+            request_id=build_automation_request_id(
+                cycle="device_notification_alert",
+                cycle_key=cycle_key,
+                scheduled_at=local_now,
+                # 같은 local poll에서 순차 처리하는 이벤트도
+                # coordinator에서 서로 다른 domain run으로 식별한다.
+                receipt_ids=tuple(run_identity),
+            ),
             cycle="device_notification_alert",
             cycle_key=cycle_key,
             scheduled_at=local_now,
-        ),
-        cycle="device_notification_alert",
-        cycle_key=cycle_key,
-        scheduled_at=local_now,
-    )
-    if len(result.deliveries) > 1:
-        raise RuntimeError("장비 이벤트 API delivery 계약이 올바르지 않아")
-    if not result.deliveries:
-        return False
+        )
+        if len(result.deliveries) > 1:
+            raise RuntimeError("장비 이벤트 API delivery 계약이 올바르지 않아")
+        if not result.deliveries:
+            if max(0, int(result.metrics.get("processedCount") or 0)) == 0:
+                break
+            run_identity.append(
+                f"processed:{max(0, int(result.metrics.get('lastSeenId') or 0))}"
+            )
+            continue
 
-    delivery = result.deliveries[0]
-    payload = dict(delivery.payload)
-    if delivery.kind == "device_notification_alert":
-        alert_summary = payload.get("alertSummary")
-        render = payload.get("render")
-        if not isinstance(alert_summary, dict) or not isinstance(render, dict):
-            raise RuntimeError("장비 이벤트 API alert payload가 올바르지 않아")
-        posted = _post_daily_device_round_abnormal_alert(
-            client,
-            alert_summary,
-            channel_id=channel_id,
-            message_ts="",
-            logger=logger,
-            include_blocks=True,
-            include_actions=bool(render.get("includeActions")),
-            include_device_voice_action=bool(
-                render.get("includeDeviceVoiceAction")
-            ),
-            client_msg_id=build_automation_delivery_client_msg_id(
-                cycle="device_notification_alert",
-                cycle_key=cycle_key,
+        delivery = result.deliveries[0]
+        payload = dict(delivery.payload)
+        if delivery.kind == "device_notification_alert":
+            alert_summary = payload.get("alertSummary")
+            render = payload.get("render")
+            if not isinstance(alert_summary, dict) or not isinstance(
+                render,
+                dict,
+            ):
+                raise RuntimeError("장비 이벤트 API alert payload가 올바르지 않아")
+            posted = _post_daily_device_round_abnormal_alert(
+                client,
+                alert_summary,
+                channel_id=channel_id,
+                message_ts="",
+                logger=logger,
+                include_blocks=True,
+                include_actions=bool(render.get("includeActions")),
+                include_device_voice_action=bool(
+                    render.get("includeDeviceVoiceAction")
+                ),
+                client_msg_id=build_automation_delivery_client_msg_id(
+                    cycle="device_notification_alert",
+                    cycle_key=cycle_key,
+                    delivery_id=delivery.delivery_id,
+                    part="alert",
+                ),
+            )
+        elif delivery.kind == "device_notification_thread_reply":
+            posted = _post_remote_recording_stall_thread_reply(
+                client,
+                payload,
+                channel_id=channel_id,
+                logger=logger,
+                client_msg_id=build_automation_delivery_client_msg_id(
+                    cycle="device_notification_alert",
+                    cycle_key=cycle_key,
+                    delivery_id=delivery.delivery_id,
+                    part="thread-reply",
+                ),
+            )
+        else:
+            raise RuntimeError("장비 이벤트 API delivery 종류가 올바르지 않아")
+        if posted is None:
+            break
+
+        remember_automation_delivery(
+            cycle="device_notification_alert",
+            cycle_key=cycle_key,
+            delivery=AutomationSlackDelivery(
                 delivery_id=delivery.delivery_id,
-                part="alert",
+                external_message_id=str(posted.get("messageTs") or "").strip(),
+                permalink=str(posted.get("permalink") or "").strip(),
+                delivered_at=local_now,
             ),
         )
-    elif delivery.kind == "device_notification_thread_reply":
-        posted = _post_remote_recording_stall_thread_reply(
-            client,
-            payload,
-            channel_id=channel_id,
-            logger=logger,
-            client_msg_id=build_automation_delivery_client_msg_id(
-                cycle="device_notification_alert",
-                cycle_key=cycle_key,
-                delivery_id=delivery.delivery_id,
-                part="thread-reply",
-            ),
+        sent_count += 1
+        run_identity.append(delivery.delivery_id)
+        logger.info(
+            "Posted remote device notification delivery channel=%s kind=%s",
+            channel_id,
+            delivery.kind,
         )
-    else:
-        raise RuntimeError("장비 이벤트 API delivery 종류가 올바르지 않아")
-    if posted is None:
-        return False
-
-    remember_automation_delivery(
-        cycle="device_notification_alert",
-        cycle_key=cycle_key,
-        delivery=AutomationSlackDelivery(
-            delivery_id=delivery.delivery_id,
-            external_message_id=str(posted.get("messageTs") or "").strip(),
-            permalink=str(posted.get("permalink") or "").strip(),
-            delivered_at=local_now,
-        ),
-    )
-    logger.info(
-        "Posted remote device notification delivery channel=%s kind=%s",
-        channel_id,
-        delivery.kind,
-    )
-    return True
+        # local batch가 Slack 성공 후 바로 다음 이벤트를 처리했듯이,
+        # API cursor도 receipt를 즉시 적용한 후 같은 poll을 계속한다.
+        if not flush_automation_deliveries(
+            automation_client,
+            cycle="device_notification_alert",
+            cycle_key=cycle_key,
+            scheduled_at=local_now,
+            logger=logger,
+        ):
+            break
+    return sent_count > 0
 
 
 def _post_remote_recording_stall_thread_reply(

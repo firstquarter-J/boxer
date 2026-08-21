@@ -1,8 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
+from boxer_company.routers.device_ssh_security import (
+    DeviceSshSecurityError,
+    company_api_device_ssh_context,
+)
 from boxer_company.routers.mda_graphql import (
     _get_mda_latest_device_version,
     _open_mda_device_ssh,
@@ -20,21 +24,103 @@ class MdaSshOpenTests(unittest.TestCase):
         "boxer_company.routers.mda_graphql._get_mda_access_token",
         return_value="cached-token",
     )
-    def test_ssh_open_does_not_retry_unauthorized_mutation(
+    def test_ssh_open_keeps_existing_auth_refresh_retry(
+        self,
+        get_access_token,
+        execute_request,
+    ) -> None:
+        execute_request.side_effect = [
+            RuntimeError("Unauthorized"),
+            {
+                "sshOrder": {
+                    "affected": 1,
+                    "status": "open",
+                    "message": "ok",
+                }
+            },
+        ]
+
+        result = _open_mda_device_ssh(
+            "MB2-C00419",
+            host="tunnel.internal",
+        )
+
+        self.assertEqual(result["status"], "open")
+        self.assertEqual(
+            get_access_token.call_args_list,
+            [call(), call(force_refresh=True)],
+        )
+        self.assertEqual(execute_request.call_count, 2)
+
+    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql_request")
+    @patch(
+        "boxer_company.routers.mda_graphql._get_mda_access_token",
+        return_value="cached-token",
+    )
+    def test_api_ssh_open_does_not_retry_unauthorized_mutation(
         self,
         get_access_token,
         execute_request,
     ) -> None:
         execute_request.side_effect = RuntimeError("Unauthorized")
 
-        with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
-            _open_mda_device_ssh(
-                "MB2-C00419",
-                host="tunnel.internal",
-            )
+        with company_api_device_ssh_context():
+            with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
+                _open_mda_device_ssh(
+                    "MB2-C00419",
+                    host="tunnel.internal",
+                )
 
         get_access_token.assert_called_once_with()
         execute_request.assert_called_once()
+
+    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql_request")
+    @patch(
+        "boxer_company.routers.mda_graphql._get_mda_access_token",
+        return_value="cached-token",
+    )
+    def test_api_automation_open_budget_is_independent_per_device(
+        self,
+        get_access_token,
+        execute_request,
+    ) -> None:
+        execute_request.side_effect = [
+            RuntimeError("Unauthorized"),
+            {
+                "sshOrder": {
+                    "affected": 1,
+                    "status": "open",
+                    "message": "ok",
+                }
+            },
+        ]
+
+        with company_api_device_ssh_context(
+            per_device_open_budget=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
+                _open_mda_device_ssh(
+                    "MB2-C00419",
+                    host="tunnel.internal",
+                )
+            result = _open_mda_device_ssh(
+                "MB2-C00420",
+                host="tunnel.internal",
+            )
+            with self.assertRaises(DeviceSshSecurityError):
+                _open_mda_device_ssh(
+                    " mb2-c00419 ",
+                    host="tunnel.internal",
+                )
+
+        self.assertEqual(result["status"], "open")
+        # 세 번째 호출은 local cached token까지만 읽고 transport 직전 예산
+        # guard에서 차단된다.
+        self.assertEqual(
+            get_access_token.call_args_list,
+            [call(), call(), call()],
+        )
+        self.assertEqual(execute_request.call_count, 2)
 
 
 class MdaLatestDeviceVersionTests(unittest.TestCase):
@@ -99,7 +185,7 @@ class MdaDeviceDetailNormalizationTests(unittest.TestCase):
 
 
 class MdaDeviceCommandTests(unittest.TestCase):
-    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql_once")
+    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql")
     def test_sends_optional_acme_payload_for_scan_simulation(
         self,
         mock_execute_mda_graphql,
@@ -132,19 +218,54 @@ class MdaDeviceCommandTests(unittest.TestCase):
         "boxer_company.routers.mda_graphql._get_mda_access_token",
         return_value="cached-token",
     )
-    def test_device_command_does_not_retry_unauthorized_mutation(
+    def test_device_command_keeps_existing_auth_refresh_retry(
+        self,
+        get_access_token,
+        execute_request,
+    ) -> None:
+        execute_request.side_effect = [
+            RuntimeError("Unauthorized"),
+            {
+                "sendCommand": {
+                    "affected": 1,
+                    "status": True,
+                    "message": "sent",
+                }
+            },
+        ]
+
+        result = _send_mda_device_command(
+            "MB2-C00419",
+            command="scansim",
+            acme="S_VOICE1",
+        )
+
+        self.assertTrue(result["status"])
+        self.assertEqual(
+            get_access_token.call_args_list,
+            [call(), call(force_refresh=True)],
+        )
+        self.assertEqual(execute_request.call_count, 2)
+
+    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql_request")
+    @patch(
+        "boxer_company.routers.mda_graphql._get_mda_access_token",
+        return_value="cached-token",
+    )
+    def test_api_device_command_does_not_retry_unauthorized_mutation(
         self,
         get_access_token,
         execute_request,
     ) -> None:
         execute_request.side_effect = RuntimeError("Unauthorized")
 
-        with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
-            _send_mda_device_command(
-                "MB2-C00419",
-                command="scansim",
-                acme="S_VOICE1",
-            )
+        with company_api_device_ssh_context():
+            with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
+                _send_mda_device_command(
+                    "MB2-C00419",
+                    command="scansim",
+                    acme="S_VOICE1",
+                )
 
         get_access_token.assert_called_once_with()
         execute_request.assert_called_once()
@@ -252,15 +373,15 @@ class MdaDeviceCommandTests(unittest.TestCase):
                 side_effect=[missing, missing, missing, ready],
             ) as get_device_ssh,
         ):
-            result = _wait_for_mda_device_agent_ssh(
-                "MB2-C00419",
-                host="remotes.example",
-                poll_timeout_sec=5,
-                poll_interval_sec=1,
-                # resend 주기가 1이어도 API 경로는 최초 open만 허용한다.
-                resend_every=1,
-                resend_enabled=False,
-            )
+            with company_api_device_ssh_context():
+                result = _wait_for_mda_device_agent_ssh(
+                    "MB2-C00419",
+                    host="remotes.example",
+                    poll_timeout_sec=5,
+                    poll_interval_sec=1,
+                    # API context는 caller가 기본값을 써도 poll 재전송을 막는다.
+                    resend_every=1,
+                )
 
         open_device_ssh.assert_called_once_with(
             "MB2-C00419",
@@ -271,8 +392,7 @@ class MdaDeviceCommandTests(unittest.TestCase):
         self.assertEqual(get_device_ssh.call_count, 4)
 
     def test_same_device_concurrent_waits_send_open_once(self) -> None:
-        # 두 요청이 동시에 endpoint 부재를 봐도 첫 요청의 open/poll 전체가
-        # 끝난 뒤 두 번째 요청이 endpoint를 재조회해 기존 tunnel을 재사용한다.
+        # 첫 request가 endpoint를 연 뒤 두 번째 request는 lock 안에서 재조회한다.
         state_lock = threading.Lock()
         start = threading.Barrier(2)
         state = {"ready": False, "open_count": 0}
@@ -283,7 +403,11 @@ class MdaDeviceCommandTests(unittest.TestCase):
             return {
                 "deviceName": "MB2-C00419",
                 "agentSsh": (
-                    {"host": "remotes.example", "port": 61001}
+                    {
+                        "host": "remotes.example",
+                        "port": 61001,
+                        "status": "open",
+                    }
                     if ready
                     else None
                 ),
@@ -321,7 +445,9 @@ class MdaDeviceCommandTests(unittest.TestCase):
             ),
             ThreadPoolExecutor(max_workers=2) as executor,
         ):
-            results = list(executor.map(lambda _index: wait_for_endpoint(), range(2)))
+            results = list(
+                executor.map(lambda _index: wait_for_endpoint(), range(2))
+            )
 
         self.assertEqual(state["open_count"], 1)
         self.assertTrue(all(result["ready"] for result in results))
@@ -329,6 +455,31 @@ class MdaDeviceCommandTests(unittest.TestCase):
             sorted(result["reusedExisting"] for result in results),
             [False, True],
         )
+
+    @patch("boxer_company.routers.mda_graphql._open_mda_device_ssh")
+    @patch("boxer_company.routers.mda_graphql._get_mda_device_agent_ssh")
+    def test_api_context_never_force_reopens_stale_endpoint(
+        self,
+        get_device_ssh,
+        open_device_ssh,
+    ) -> None:
+        get_device_ssh.return_value = {
+            "deviceName": "MB2-C00419",
+            "agentSsh": {
+                "host": "remotes.example",
+                "port": 61001,
+                "status": "open",
+            },
+        }
+
+        with company_api_device_ssh_context():
+            result = _wait_for_mda_device_agent_ssh(
+                "MB2-C00419",
+                force_reopen=True,
+            )
+
+        self.assertFalse(result["ready"])
+        open_device_ssh.assert_not_called()
 
     @patch("boxer_company.routers.mda_graphql.time.sleep", return_value=None)
     @patch("boxer_company.routers.mda_graphql._open_mda_device_ssh")
@@ -444,7 +595,7 @@ class MdaStoppedRecordingRestoreTests(unittest.TestCase):
         self.assertTrue(result[0]["restorable"])
         self.assertEqual(result[0]["expectedS3FileKey"], "35033165423/abc.mp4")
 
-    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql_once")
+    @patch("boxer_company.routers.mda_graphql._execute_mda_graphql")
     def test_restore_stopped_recordings_uses_mda_mutation_input(
         self,
         mock_execute_mda_graphql,

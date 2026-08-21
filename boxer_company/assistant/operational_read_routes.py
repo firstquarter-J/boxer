@@ -22,6 +22,7 @@ from boxer_company.routers.barcode_log import (
 )
 from boxer_company.weekly_recordings_report import (
     _build_weekly_recordings_report_summary,
+    _coerce_weekly_recordings_report_now,
     _format_weekly_recordings_report,
     _is_weekly_recordings_report_request,
     _resolve_weekly_recordings_report_question_target_date,
@@ -95,12 +96,18 @@ class WeeklyRecordingsSummaryAssistantRoute:
             return None
 
         try:
-            # 기존 집계/formatter를 재사용하되 최종 본문은 CommonMark로 정규화한다.
+            # 기존 Slack helper처럼 한 시각을 집계와 formatter에 함께 넘겨
+            # 주간 경계와 표시 시각이 요청 도중 갈리지 않게 한다.
+            local_now = _coerce_weekly_recordings_report_now()
             summary = _build_weekly_recordings_report_summary(
                 target_date=target_date,
+                now=local_now,
             )
             body = slack_mrkdwn_to_commonmark(
-                _format_weekly_recordings_report(summary)
+                _format_weekly_recordings_report(
+                    summary,
+                    now=local_now,
+                )
             )
         except (pymysql.MySQLError, RuntimeError) as exc:
             self._logger.warning(

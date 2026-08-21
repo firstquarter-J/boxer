@@ -8,6 +8,8 @@ from urllib import error, request
 from boxer_company import settings as cs
 from boxer.core.utils import _display_value
 from boxer_company.routers.device_ssh_security import (
+    _company_api_device_ssh_open_attempted,
+    _is_company_api_device_ssh_context,
     _mark_company_api_device_ssh_open_attempted,
     _mark_company_api_mutation_attempted,
     _register_mda_ssh_endpoint_device,
@@ -289,9 +291,14 @@ def _execute_mda_graphql(
     variables: dict[str, Any],
     *,
     timeout_sec: int | None = None,
+    before_request: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     token = _get_mda_access_token()
     try:
+        if before_request is not None:
+            # 기존 auth-refresh retry를 유지하되 API request guard가
+            # 실제 외부 write 시도를 놓치지 않게 전송 직전에 표시한다.
+            before_request()
         return _execute_mda_graphql_request(
             query,
             variables,
@@ -302,6 +309,8 @@ def _execute_mda_graphql(
         if "Unauthorized" not in str(exc):
             raise
         token = _get_mda_access_token(force_refresh=True)
+        if before_request is not None:
+            before_request()
         return _execute_mda_graphql_request(
             query,
             variables,
@@ -316,17 +325,38 @@ def _execute_mda_graphql_once(
     *,
     before_request: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """외부 mutation용 GraphQL 요청은 인증 오류에도 자동 재전송하지 않는다."""
+    """API mutation은 인증 오류에도 결과 불명 request를 재전송하지 않는다."""
 
     token = _get_mda_access_token()
-    # adminUser token 발급은 대상 mutation이 아니므로 완료된 뒤에만 caller가
-    # 실제 mutation 전송 시점을 표시하게 한다.
+    # token 확보가 끝난 뒤 실제 mutation transport 직전에만 side-effect
+    # marker를 세워 preflight 실패와 결과 불명 실패를 구분한다.
     marker = before_request or _mark_company_api_mutation_attempted
     marker()
     return _execute_mda_graphql_request(
         query,
         variables,
         auth_token=token,
+    )
+
+
+def _execute_mda_graphql_mutation(
+    query: str,
+    variables: dict[str, Any],
+    *,
+    before_request: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Slack local auth-refresh는 보존하고 API write만 at-most-once로 보낸다."""
+
+    if _is_company_api_device_ssh_context():
+        return _execute_mda_graphql_once(
+            query,
+            variables,
+            before_request=before_request,
+        )
+    return _execute_mda_graphql(
+        query,
+        variables,
+        before_request=before_request,
     )
 
 
@@ -470,15 +500,15 @@ def _send_mda_device_command(
     command: str,
     acme: Any | None = None,
 ) -> dict[str, Any]:
-    # MDA의 범용 명령 mutation 형식을 그대로 사용하되, 장비가 실제 작업을
-    # 시작할 수 있으므로 인증 오류에도 같은 요청을 자동 재전송하지 않는다.
-    data = _execute_mda_graphql_once(
+    # Slack local은 기존 auth-refresh를 유지하고 API mutation은 재전송하지 않는다.
+    data = _execute_mda_graphql_mutation(
         _SEND_COMMAND_MUTATION,
         {
             "deviceName": device_name,
             "command": command,
             "acme": acme,
         },
+        before_request=_mark_company_api_mutation_attempted,
     )
     result = data.get("sendCommand")
     if not isinstance(result, dict):
@@ -615,7 +645,7 @@ def _restore_mda_stopped_recordings(
     if not normalized_reason:
         raise RuntimeError("스트리밍 종료 영상 복원 사유가 필요해")
 
-    data = _execute_mda_graphql_once(
+    data = _execute_mda_graphql_mutation(
         _RESTORE_STOPPED_RECORDINGS_MUTATION,
         {
             "input": {
@@ -625,6 +655,7 @@ def _restore_mda_stopped_recordings(
                 "reason": normalized_reason,
             }
         },
+        before_request=_mark_company_api_mutation_attempted,
     )
     result = data.get("restoreStoppedRecordings")
     if not isinstance(result, dict):
@@ -661,17 +692,17 @@ def _open_mda_device_ssh(
     if not actual_host:
         raise RuntimeError("MDA_SSH_OPEN_HOST가 비어 있어")
 
-    # sshOrder는 기존 reverse tunnel을 끊고 다시 열 수 있는 mutation이다.
-    # Unauthorized 응답도 처리 여부가 모호하므로 공용 auth-refresh retry를 쓰지 않는다.
-    data = _execute_mda_graphql_once(
+    # reverse tunnel을 끊을 수 있어 API에서는 Unauthorized도 재전송하지 않는다.
+    data = _execute_mda_graphql_mutation(
         _SSH_ORDER_MUTATION,
         {
             "deviceName": device_name,
             "action": "open",
             "host": actual_host,
         },
-        # adminUser token 확보 뒤 sshOrder request를 보내기 직전에만 표시한다.
-        before_request=_mark_company_api_device_ssh_open_attempted,
+        before_request=lambda: _mark_company_api_device_ssh_open_attempted(
+            device_name
+        ),
     )
     result = data.get("sshOrder")
     if not isinstance(result, dict):
@@ -693,13 +724,14 @@ def _close_mda_device_ssh(
     if not actual_host:
         raise RuntimeError("MDA_SSH_OPEN_HOST가 비어 있어")
 
-    data = _execute_mda_graphql_once(
+    data = _execute_mda_graphql_mutation(
         _SSH_ORDER_MUTATION,
         {
             "deviceName": device_name,
             "action": "close",
             "host": actual_host,
         },
+        before_request=_mark_company_api_mutation_attempted,
     )
     result = data.get("sshOrder")
     if not isinstance(result, dict):
@@ -718,13 +750,14 @@ def _update_mda_device_box(
     version: str,
     silent: bool = False,
 ) -> dict[str, Any]:
-    data = _execute_mda_graphql_once(
+    data = _execute_mda_graphql_mutation(
         _UPDATE_BOX_MUTATION,
         {
             "deviceName": device_name,
             "version": version,
             "silent": bool(silent),
         },
+        before_request=_mark_company_api_mutation_attempted,
     )
     result = data.get("updateBox")
     if not isinstance(result, dict):
@@ -741,12 +774,13 @@ def _update_mda_device_agent(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
-    data = _execute_mda_graphql_once(
+    data = _execute_mda_graphql_mutation(
         _UPDATE_AGENT_MUTATION,
         {
             "deviceName": device_name,
             "force": bool(force),
         },
+        before_request=_mark_company_api_mutation_attempted,
     )
     result = data.get("updateAgent")
     if not isinstance(result, dict):
@@ -816,12 +850,12 @@ def _create_mda_activity_log(input_payload: dict[str, Any]) -> dict[str, Any]:
     if not normalized_input:
         raise RuntimeError("activity log 입력이 비어 있어")
 
-    # 감사 로그 생성도 외부 write라 한 HTTP 요청 이상 보내지 않는다.
-    data = _execute_mda_graphql_once(
+    data = _execute_mda_graphql_mutation(
         _CREATE_ACTIVITY_LOG_MUTATION,
         {
             "input": normalized_input,
         },
+        before_request=_mark_company_api_mutation_attempted,
     )
     result = data.get("createActivityLog")
     if not isinstance(result, dict):
@@ -837,8 +871,8 @@ def _create_mda_activity_log(input_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _device_ssh_lock(device_name: str) -> Any:
-    """고정 크기 stripe에서 같은 장비의 tunnel lifecycle lock을 고른다."""
+def _device_ssh_lock(device_name: str) -> threading.Lock:
+    """고정 stripe에서 같은 장비의 endpoint lifecycle lock을 고른다."""
 
     normalized = str(device_name or "").strip().casefold()
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
@@ -869,9 +903,9 @@ def _wait_for_mda_device_agent_ssh(
     force_reopen: bool = False,
     resend_enabled: bool = True,
 ) -> dict[str, Any]:
-    # 한 process 안에서 같은 장비의 동시 요청은 첫 endpoint 재조회부터
-    # open과 poll 종료까지 직렬화한다. 고정 stripe라 장비 수만큼 상태가 늘지
-    # 않고, 서로 다른 stripe의 장비 요청은 병렬로 진행된다.
+    """동일 장비 lifecycle을 직렬화하고 API의 단일-open 예산을 강제한다."""
+
+    api_context = _is_company_api_device_ssh_context()
     with _device_ssh_lock(device_name):
         result = _wait_for_mda_device_agent_ssh_locked(
             device_name,
@@ -879,12 +913,23 @@ def _wait_for_mda_device_agent_ssh(
             poll_timeout_sec=poll_timeout_sec,
             poll_interval_sec=poll_interval_sec,
             resend_every=resend_every,
-            force_reopen=force_reopen,
-            resend_enabled=resend_enabled,
+            # API는 stale endpoint를 이유로 기존 tunnel을 끊지 않는다.
+            force_reopen=force_reopen and not api_context,
+            # Slack local 기본 재전송은 유지하되 API poll은 조회만 한다.
+            resend_enabled=resend_enabled and not api_context,
+            api_force_reopen_blocked=api_context and force_reopen,
         )
     if result.get("ready"):
-        device = result.get("device") if isinstance(result.get("device"), dict) else {}
-        agent_ssh = device.get("agentSsh") if isinstance(device.get("agentSsh"), dict) else {}
+        device = (
+            result.get("device")
+            if isinstance(result.get("device"), dict)
+            else {}
+        )
+        agent_ssh = (
+            device.get("agentSsh")
+            if isinstance(device.get("agentSsh"), dict)
+            else {}
+        )
         _register_mda_ssh_endpoint_device(
             device_name,
             agent_ssh.get("host"),
@@ -902,6 +947,7 @@ def _wait_for_mda_device_agent_ssh_locked(
     resend_every: int | None = None,
     force_reopen: bool = False,
     resend_enabled: bool = True,
+    api_force_reopen_blocked: bool = False,
 ) -> dict[str, Any]:
     actual_poll_timeout = max(
         1,
@@ -934,6 +980,7 @@ def _wait_for_mda_device_agent_ssh_locked(
     )
     if (
         not force_reopen
+        and not api_force_reopen_blocked
         and _has_usable_agent_ssh_endpoint(current_agent_ssh)
     ):
         return {
@@ -942,6 +989,20 @@ def _wait_for_mda_device_agent_ssh_locked(
             "pollCount": 0,
             "ready": True,
             "reusedExisting": True,
+        }
+
+    if api_force_reopen_blocked or (
+        _is_company_api_device_ssh_context()
+        and _company_api_device_ssh_open_attempted(device_name)
+    ):
+        # 같은 API turn의 stale refresh나 두 번째 target은 상태만 반환하고
+        # 기존 tunnel을 끊거나 두 번째 sshOrder를 보내지 않는다.
+        return {
+            "opened": None,
+            "device": current_state,
+            "pollCount": 0,
+            "ready": False,
+            "reusedExisting": False,
         }
 
     host_to_use = (

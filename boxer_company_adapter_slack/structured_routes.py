@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date
 
@@ -440,8 +441,19 @@ def _reply_weekly_summary_result(
         if str(message.body or "").strip()
     )
     slack_text = _commonmark_to_slack(body)
+    legacy_blocks = _build_legacy_weekly_summary_blocks(slack_text)
+    if legacy_blocks is not None:
+        # API 본문은 기존 formatter의 완전한 fallback text다. 같은 본문에서
+        # Slack 전용 표현만 복원해 DB를 다시 조회하지 않고 legacy Block을 유지한다.
+        context.reply(
+            slack_text,
+            mention_user=False,
+            blocks=legacy_blocks,
+        )
+        return
+
     # section text 상한보다 여유 있게 줄 단위로 나눠 긴 병원 목록도
-    # Block 계약 안에서 보낸다. fallback text는 전체 내용을 유지한다.
+    # 알 수 없는 이전/이후 API 본문도 Block 계약 안에서 안전하게 보낸다.
     blocks: list[dict[str, object]] = []
     chunk_lines: list[str] = []
     chunk_chars = 0
@@ -478,3 +490,220 @@ def _reply_weekly_summary_result(
         mention_user=False,
         blocks=blocks,
     )
+
+
+def _build_legacy_weekly_summary_blocks(
+    slack_text: str,
+) -> list[dict[str, object]] | None:
+    """공유 formatter 본문을 기존 주간 요약 Slack Block으로 되돌린다."""
+
+    lines = str(slack_text or "").strip().splitlines()
+    if len(lines) < 7 or lines[0] != "*주간 초음파 촬영 요약*":
+        return None
+
+    range_match = re.fullmatch(
+        r"• 기준 주간: (?P<current>`[^`]+`) \| "
+        r"비교 주간: (?P<previous>`[^`]+`)",
+        lines[1],
+    )
+    sent_match = re.fullmatch(r"• 발송: (?P<sent>`[^`]+`)", lines[2])
+    total_match = re.fullmatch(
+        r"• 전체 row: (?P<total>`[^`]+`) \| "
+        r"병원: (?P<hospitals>`[^`]+`)",
+        lines[3],
+    )
+    previous_match = re.fullmatch(
+        r"• 전주 대비: (?P<counts>`[^`]+`) "
+        r"\((?P<delta>`[^`]+`), (?P<rate>`[^`]+`)\)",
+        lines[4],
+    )
+    changes_match = re.fullmatch(
+        r"• 변화 병원: 급증 (?P<surge>`[^`]+`) \| "
+        r"급감 (?P<drop>`[^`]+`)",
+        lines[5],
+    )
+    if not all(
+        (
+            range_match,
+            sent_match,
+            total_match,
+            previous_match,
+            changes_match,
+        )
+    ):
+        return None
+    assert range_match is not None
+    assert sent_match is not None
+    assert total_match is not None
+    assert previous_match is not None
+    assert changes_match is not None
+
+    blocks: list[dict[str, object]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "주간 초음파 촬영 요약",
+            },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"기준 주간 {range_match.group('current')} | "
+                        f"비교 주간 {range_match.group('previous')} | "
+                        f"발송 {sent_match.group('sent')}"
+                    ),
+                }
+            ],
+        },
+        {
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*전체 row*\n{total_match.group('total')}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*집계 병원*\n{total_match.group('hospitals')}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*전주 대비*\n"
+                        f"{previous_match.group('counts')}\n"
+                        f"{previous_match.group('delta')} "
+                        f"({previous_match.group('rate')})"
+                    ),
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*변화 병원*\n"
+                        f"급증 {changes_match.group('surge')} | "
+                        f"급감 {changes_match.group('drop')}"
+                    ),
+                },
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "기준 주간은 `월요일 ~ 일요일`이고, 변화 기준은 "
+                        "증감 `20개 이상` + 급증 `2배 이상` / 급감 `50% 이하`야"
+                    ),
+                }
+            ],
+        },
+    ]
+
+    tail = _trim_blank_weekly_lines(lines[6:])
+    if len(tail) == 1 and tail[0].startswith("• 결과: "):
+        blocks.extend(
+            (
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "*결과*\n" + tail[0].removeprefix("• 결과: "),
+                    },
+                },
+            )
+        )
+        return blocks
+
+    top_index = _find_weekly_heading(tail, r"\*상위 병원 Top \d+\*")
+    surge_index = _find_weekly_heading(tail, r"\*급증\*")
+    drop_index = _find_weekly_heading(tail, r"\*급감\*")
+    if not (0 <= top_index < surge_index < drop_index):
+        return None
+
+    _append_legacy_weekly_section(
+        blocks,
+        tail[top_index],
+        tail[top_index + 1 : surge_index],
+    )
+    _append_legacy_weekly_section(
+        blocks,
+        tail[surge_index],
+        tail[surge_index + 1 : drop_index],
+    )
+    _append_legacy_weekly_section(
+        blocks,
+        tail[drop_index],
+        tail[drop_index + 1 :],
+    )
+    return blocks
+
+
+def _find_weekly_heading(lines: list[str], pattern: str) -> int:
+    return next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(pattern, line)
+        ),
+        -1,
+    )
+
+
+def _trim_blank_weekly_lines(lines: list[str]) -> list[str]:
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return lines[start:end]
+
+
+def _append_legacy_weekly_section(
+    blocks: list[dict[str, object]],
+    heading: str,
+    raw_lines: list[str],
+) -> None:
+    content_lines = _trim_blank_weekly_lines(raw_lines)
+    reference = next(
+        (
+            line.removeprefix("• 참고: ")
+            for line in content_lines
+            if line.startswith("• 참고: ")
+        ),
+        "",
+    )
+    visible_lines = [
+        ("없어" if line == "• 없어" else line)
+        for line in content_lines
+        if line and not line.startswith("• 참고: ")
+    ]
+    blocks.extend(
+        (
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "\n".join((heading, *visible_lines)),
+                },
+            },
+        )
+    )
+    if reference:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": reference,
+                    }
+                ],
+            }
+        )

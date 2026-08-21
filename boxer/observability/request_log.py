@@ -722,7 +722,11 @@ def _backup_request_log_to_s3(
     key_prefix: str | None = None,
     s3_client: Any | None = None,
 ) -> dict[str, Any]:
-    actual_path = _ensure_request_log_schema(db_path)
+    actual_path = _request_log_db_path(db_path)
+    # 백업 작업은 startup restore보다 먼저 빈 DB를 만들면 안 된다. 스키마
+    # 초기화는 API startup 소유로 두고, 아직 DB가 없으면 백업을 중단한다.
+    if not actual_path.exists() or not actual_path.is_file():
+        raise FileNotFoundError("request log SQLite 파일이 없어")
     actual_bucket = str(bucket or s.REQUEST_LOG_SQLITE_S3_BACKUP_BUCKET).strip()
     if not actual_bucket:
         raise RuntimeError("REQUEST_LOG_SQLITE_S3_BACKUP_BUCKET이 비어 있어")
@@ -810,6 +814,10 @@ def _initialize_request_log_storage(
     if not s.REQUEST_LOG_SQLITE_ENABLED:
         return None
 
+    actual_path = _request_log_db_path(db_path)
+    local_database_existed = bool(
+        actual_path.exists() and actual_path.stat().st_size > 0
+    )
     restore_result: dict[str, Any] | None = None
     if s.REQUEST_LOG_SQLITE_S3_RESTORE_ON_STARTUP:
         restore_result = _restore_request_log_from_configured_s3(
@@ -817,8 +825,16 @@ def _initialize_request_log_storage(
             s3_client=s3_client,
             only_if_missing=True,
         )
+        # restore를 명시한 새 호스트에서 404/403/timeout을 모두 "빈 DB로
+        # 시작"으로 축약하면 과거 감사 trail을 잃고 다음 backup이 원본까지
+        # 덮을 수 있다. 기존 local DB가 없었다면 실제 복구 성공만 허용한다.
+        if (
+            not local_database_existed
+            and not bool((restore_result or {}).get("restored"))
+        ):
+            raise RuntimeError("request log SQLite restore가 완료되지 않았어")
 
-    actual_path = _ensure_request_log_schema(db_path)
+    actual_path = _ensure_request_log_schema(actual_path)
     return {
         "dbPath": str(actual_path),
         "restored": restore_result,

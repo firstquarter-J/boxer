@@ -10,6 +10,7 @@ from boxer_company.assistant.device_health_alert_action_route import (
     DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_ROUTE,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
     DEVICE_HEALTH_ALERT_VOICE_ROUTE,
 )
 from boxer_company_adapter_slack.company_api_client import (
@@ -33,6 +34,7 @@ def _raw_item() -> dict[str, object]:
         "issue": "캡처보드 연결 확인 필요",
         "alertCategory": "video_signal",
         "problemComponents": ["캡처보드"],
+        "mdaUrl": "https://mda.example/monitoring?focusDevice=MB2-C00419",
     }
 
 
@@ -164,6 +166,48 @@ class DeviceHealthAlertApiBridgeTests(unittest.TestCase):
                 "phone_number": "01012345678",
                 "message": "직접 작성한 안내 문자",
             },
+        )
+
+    def test_modal_result_is_sent_as_typed_ui_receipt_once(self) -> None:
+        client = _FakeClient(
+            result=CompanyAssistantResult(
+                route=DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
+                outcome="answered",
+                messages=(AssistantMessage(body="UI 결과를 기록했어"),),
+            )
+        )
+
+        recorded = DeviceHealthAlertApiBridge(client).record_modal_receipt(
+            **self._kwargs(),
+            action_id="device_health_alert_contact_hospital",
+            mode="send",
+            message_ts="171.0001",
+            thread_ts="171.0001",
+            occurred_at="2026-08-14T09:30:00+09:00",
+            status="modal_opened",
+            ok=True,
+        )
+
+        self.assertEqual(recorded.route, DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE)
+        self.assertEqual(len(client.calls), 1)
+        request, route_group = client.calls[0]
+        self.assertEqual(route_group, "operations")
+        action = request.metadata["operation_action"]
+        self.assertEqual(action["name"], "device_health_alert_ui_receipt")
+        self.assertEqual(action["phase"], "receipt")
+        self.assertEqual(
+            action["event_type"],
+            "alert_contact_sms_modal_requested",
+        )
+        self.assertEqual(action["status"], "modal_opened")
+        self.assertTrue(action["ok"])
+        self.assertEqual(
+            action["target"]["hospital_label"],
+            "분당제일병원 (#31)",
+        )
+        self.assertEqual(
+            action["target"]["mda_url"],
+            "https://mda.example/monitoring?focusDevice=MB2-C00419",
         )
 
     def test_transport_error_propagates_after_one_call_without_fallback(self) -> None:

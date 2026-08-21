@@ -38,9 +38,13 @@ from boxer_company.sms_delivery import (
     _SMS_DELIVERY_REQUEST_FAILED,
 )
 from boxer_company.sms_delivery_cycle import (
+    acquire_automatic_sms_runtime_claim,
+    build_automatic_sms_runtime_claim_key,
     claim_automatic_sms_delivery,
     hold_automatic_sms_delivery_claim,
+    publish_automatic_sms_runtime_claim_result,
     remember_sms_delivery_sheet_record,
+    wait_for_automatic_sms_runtime_claim,
 )
 
 
@@ -60,6 +64,7 @@ _CAPTUREBOARD_INCIDENT_OPEN_STATUSES = {"대기", "처리중", "진행중"}
 _KST = ZoneInfo("Asia/Seoul")
 _RECORDING_STALL_MIN_DURATION_SECONDS = 120
 _RECORDING_STALL_MAX_EVENT_GAP_SECONDS = 300
+_DEVICE_NOTIFICATION_BATCH_SIZE = 200
 _AUTO_SMS_DEDUPE_WINDOW_SECONDS = 60
 _AUTO_SMS_ACCEPTED_TEXT = "문자 발송 접수"
 _AUTO_SMS_CONFIRM_REQUIRED_TEXT = "문자 발송 여부 확인 필요"
@@ -117,12 +122,16 @@ def _load_next_device_notification(
                 "n.deviceSeq AS deviceSeq, "
                 "n.deviceName AS deviceName, "
                 "n.code AS code, "
+                "n.message AS message, "
+                "n.barcode AS barcode, "
+                "n.fileId AS fileId, "
                 "n.details AS details, "
                 "n.occurredAt AS occurredAt, "
                 "d.hospitalSeq AS hospitalSeq, "
                 "d.hospitalRoomSeq AS hospitalRoomSeq, "
                 "d.version AS deviceVersion, "
                 "h.hospitalName AS hospitalName, "
+                "h.telephone AS hospitalTelephone, "
                 "h.deviceAlertPhone AS hospitalDeviceAlertPhone, "
                 "hr.roomName AS roomName "
                 "FROM device_notification n "
@@ -154,6 +163,76 @@ def _load_next_device_notification(
     return int(event["notificationId"]), event
 
 
+def _load_device_notification_batch(
+    last_seen_id: int,
+    *,
+    batch_size: int = _DEVICE_NOTIFICATION_BATCH_SIZE,
+) -> tuple[int, list[dict[str, Any]]]:
+    """legacy reporter와 같이 한 poll의 DB 상한과 최대 200건을 고정한다."""
+
+    normalized_last_seen_id = max(0, _coerce_int(last_seen_id))
+    normalized_batch_size = max(1, min(500, _coerce_int(batch_size)))
+    connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COALESCE(MAX(id), 0) AS latestId "
+                "FROM device_notification"
+            )
+            latest_row = cursor.fetchone() or {}
+            latest_id = max(0, _coerce_int(latest_row.get("latestId")))
+            if latest_id <= normalized_last_seen_id:
+                return normalized_last_seen_id, []
+            cursor.execute(
+                "SELECT "
+                "n.id AS notificationId, "
+                "n.deviceSeq AS deviceSeq, "
+                "n.deviceName AS deviceName, "
+                "n.code AS code, "
+                "n.message AS message, "
+                "n.barcode AS barcode, "
+                "n.fileId AS fileId, "
+                "n.details AS details, "
+                "n.occurredAt AS occurredAt, "
+                "d.hospitalSeq AS hospitalSeq, "
+                "d.hospitalRoomSeq AS hospitalRoomSeq, "
+                "d.version AS deviceVersion, "
+                "h.hospitalName AS hospitalName, "
+                "h.telephone AS hospitalTelephone, "
+                "h.deviceAlertPhone AS hospitalDeviceAlertPhone, "
+                "hr.roomName AS roomName "
+                "FROM device_notification n "
+                "LEFT JOIN devices d ON n.deviceSeq = d.seq "
+                "LEFT JOIN hospitals h ON d.hospitalSeq = h.seq "
+                "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
+                "WHERE n.id > %s "
+                "AND n.id <= %s "
+                "AND n.code IN (%s, %s, %s) "
+                "ORDER BY n.id ASC "
+                "LIMIT %s",
+                (
+                    normalized_last_seen_id,
+                    latest_id,
+                    _CAPTUREBOARD_CONNECTION_ERROR,
+                    _RECORDING_CRITICALLY_STALLED,
+                    _SEGMENTED_RECORDINGS_MERGE_ERROR,
+                    normalized_batch_size,
+                ),
+            )
+            rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    events = [
+        event
+        for row in rows
+        if (event := _normalize_event(row)) is not None
+    ]
+    if len(rows) >= normalized_batch_size and events:
+        return int(events[-1]["notificationId"]), events
+    return latest_id, events
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceNotificationCycleDeps:
     """DB, Sheets, SMS mutation을 주입해 cycle 계약을 단위 검증한다."""
@@ -162,6 +241,9 @@ class DeviceNotificationCycleDeps:
     load_next_event: Callable[
         [int], tuple[int, dict[str, Any] | None]
     ] = _load_next_device_notification
+    load_event_batch: Callable[..., tuple[int, list[dict[str, Any]]]] = (
+        _load_device_notification_batch
+    )
     load_sheet_incidents: Callable[[], dict[str, dict[str, Any]] | None] = (
         _load_device_health_sheet_captureboard_incidents
     )
@@ -222,14 +304,36 @@ class DeviceNotificationAlertCycleHandler:
             )
             return _cycle_result(state, deliveries=(), processed_count=0)
 
-        next_cursor, raw_event = self._deps.load_next_event(
-            int(state["lastSeenId"])
-        )
-        state["lastSeenId"] = max(
-            int(state["lastSeenId"]),
-            int(next_cursor),
-        )
-        state["lastPolledAt"] = request.scheduled_at.isoformat()
+        if self._deps.load_next_event is _load_next_device_notification:
+            # production은 legacy처럼 한 번 읽은 최대 200건을 cursor queue에
+            # 보존하고, Slack receipt마다 앞에서 한 건씩 확정한다.
+            if not state["pendingEvents"]:
+                next_cursor, events = self._deps.load_event_batch(
+                    int(state["lastSeenId"]),
+                    batch_size=_DEVICE_NOTIFICATION_BATCH_SIZE,
+                )
+                state["lastSeenId"] = max(
+                    int(state["lastSeenId"]),
+                    int(next_cursor),
+                )
+                state["pendingEvents"] = list(events)
+                state["lastPolledAt"] = request.scheduled_at.isoformat()
+            raw_event = (
+                state["pendingEvents"][0]
+                if state["pendingEvents"]
+                else None
+            )
+        else:
+            # 주입형 단위 테스트와 이전 custom port는 기존 단건 계약을
+            # 유지해 별도 DB batch dependency를 요구하지 않는다.
+            next_cursor, raw_event = self._deps.load_next_event(
+                int(state["lastSeenId"])
+            )
+            state["lastSeenId"] = max(
+                int(state["lastSeenId"]),
+                int(next_cursor),
+            )
+            state["lastPolledAt"] = request.scheduled_at.isoformat()
         event = _normalize_event(raw_event)
         if event is None:
             return _cycle_result(state, deliveries=(), processed_count=0)
@@ -246,6 +350,7 @@ class DeviceNotificationAlertCycleHandler:
                 event,
                 now=request.scheduled_at,
             )
+            _consume_pending_event(state, event["notificationId"])
             return _cycle_result(state, deliveries=(), processed_count=1)
 
         delivery, context = self._build_delivery(
@@ -254,6 +359,7 @@ class DeviceNotificationAlertCycleHandler:
             event,
         )
         if delivery is None or context is None:
+            _consume_pending_event(state, event["notificationId"])
             return _cycle_result(state, deliveries=(), processed_count=1)
         state["pendingDeliveryContexts"][delivery.delivery_id] = context
         return _cycle_result(
@@ -300,6 +406,10 @@ class DeviceNotificationAlertCycleHandler:
                     _receipt_value(receipt, "delivered_at", "deliveredAt")
                     or request.scheduled_at
                 ),
+            )
+            _consume_pending_event(
+                state,
+                _coerce_int(context.get("notificationId")),
             )
             contexts.pop(delivery_id, None)
         state["pendingDeliveryContexts"] = contexts
@@ -473,9 +583,8 @@ class DeviceNotificationAlertCycleHandler:
                     "includeActions": True,
                     "includeDeviceVoiceAction": True,
                 },
-                # Slack 표시에는 상태와 수동 action 활성 여부만 필요하다.
-                # 전화번호·본문뿐 아니라 provider/group/message 식별값도 API
-                # delivery에서 제거하고 Sheets ack용 cursor에만 보존한다.
+                # alertSummary에는 legacy 자동발송 확인 action의 번호·본문을
+                # 유지하고, 별도 receipt에는 provider 식별값을 싣지 않는다.
                 "smsReceipt": _public_sms_receipt(sms_receipt),
             },
         )
@@ -527,67 +636,110 @@ class DeviceNotificationAlertCycleHandler:
             )
             return _apply_sms_receipt(alert_summary, alert_item, receipt)
 
-        claim_key = _auto_sms_claim_key(alert_item)
-        claims = state["autoSmsClaims"]
-        if claim_key and claim_key in claims:
-            receipt = {
-                "attempted": False,
-                "status": "duplicate_suppressed",
-                "ok": False,
-                "statusText": _AUTO_SMS_DUPLICATE_TEXT,
-                "contactActionEnabled": False,
-                "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
-                "templateId": str(guide.get("templateId") or ""),
-                "deduplicated": True,
-            }
-            return _apply_sms_receipt(alert_summary, alert_item, receipt)
-        # Client scheduledAt이나 handler 시작 시각이 아니라 provider 직전 API
-        # 시각으로 공통 claim을 잡아 긴 선행 조회가 dedupe 창을 소모하지 않는다.
-        claim_now = self._deps.clock()
-        try:
-            claimed = self._deps.claim_sms_delivery(
-                target.device_name,
-                target.alert_category,
-                claimed_at=claim_now,
+        uses_runtime_claim = (
+            self._deps.claim_sms_delivery
+            is claim_automatic_sms_delivery
+        )
+        runtime_claim: dict[str, Any] = {}
+        if uses_runtime_claim:
+            # health와 notification은 legacy Slack에서 같은 sender의
+            # process-memory claim을 공유했다. API에서도 같은 60초 key를 쓴다.
+            runtime_claim_key = build_automatic_sms_runtime_claim_key(
+                alert_item
             )
-        except Exception as exc:
-            # claim의 read-check-write를 확인하지 못하면 provider 호출 전에
-            # fail-closed해 재시작/동시 cycle의 중복 발송을 막는다.
-            self._logger.warning(
-                "Device notification automatic SMS claim failed "
-                "notification_id=%s error_type=%s",
-                event["notificationId"],
-                type(exc).__name__,
+            claimed, runtime_claim = acquire_automatic_sms_runtime_claim(
+                runtime_claim_key
             )
-            receipt = {
-                "attempted": False,
-                "status": "claim_unavailable",
-                "ok": False,
-                "statusText": _AUTO_SMS_CONFIRM_REQUIRED_TEXT,
-                "contactActionEnabled": False,
-                "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
-                "templateId": str(guide.get("templateId") or ""),
-            }
-            return _apply_sms_receipt(alert_summary, alert_item, receipt)
-        if not claimed:
-            receipt = {
-                "attempted": False,
-                "status": "duplicate_suppressed",
-                "ok": False,
-                "statusText": _AUTO_SMS_DUPLICATE_TEXT,
-                "contactActionEnabled": False,
-                "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
-                "templateId": str(guide.get("templateId") or ""),
-                "deduplicated": True,
-            }
-            return _apply_sms_receipt(alert_summary, alert_item, receipt)
-        if claim_key:
-            # Provider 직전 claim은 결과 cursor에 들어가며, 이 사이 crash는 API
-            # coordinator의 in-flight uncertain 상태가 재호출을 막는다.
-            claims[claim_key] = {
-                "claimedAt": claim_now.isoformat(),
-                "notificationId": event["notificationId"],
-            }
+            if not claimed:
+                wait_for_automatic_sms_runtime_claim(
+                    runtime_claim_key,
+                    runtime_claim,
+                    logger=self._logger,
+                )
+                receipt = {
+                    "attempted": False,
+                    "status": "duplicate_suppressed",
+                    "ok": False,
+                    "statusText": _AUTO_SMS_DUPLICATE_TEXT,
+                    "contactActionEnabled": False,
+                    "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                    "templateId": str(guide.get("templateId") or ""),
+                    "deduplicated": True,
+                }
+                return _apply_sms_receipt(
+                    alert_summary,
+                    alert_item,
+                    receipt,
+                )
+        else:
+            # 주입된 port는 기존 recovery/단위 테스트 호환 경로로 유지한다.
+            claim_key = _auto_sms_claim_key(alert_item)
+            claims = state["autoSmsClaims"]
+            if claim_key and claim_key in claims:
+                receipt = {
+                    "attempted": False,
+                    "status": "duplicate_suppressed",
+                    "ok": False,
+                    "statusText": _AUTO_SMS_DUPLICATE_TEXT,
+                    "contactActionEnabled": False,
+                    "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                    "templateId": str(guide.get("templateId") or ""),
+                    "deduplicated": True,
+                }
+                return _apply_sms_receipt(
+                    alert_summary,
+                    alert_item,
+                    receipt,
+                )
+            claim_now = self._deps.clock()
+            try:
+                claimed = self._deps.claim_sms_delivery(
+                    target.device_name,
+                    target.alert_category,
+                    claimed_at=claim_now,
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "Device notification automatic SMS claim failed "
+                    "notification_id=%s error_type=%s",
+                    event["notificationId"],
+                    type(exc).__name__,
+                )
+                receipt = {
+                    "attempted": False,
+                    "status": "claim_unavailable",
+                    "ok": False,
+                    "statusText": _AUTO_SMS_CONFIRM_REQUIRED_TEXT,
+                    "contactActionEnabled": False,
+                    "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                    "templateId": str(guide.get("templateId") or ""),
+                }
+                return _apply_sms_receipt(
+                    alert_summary,
+                    alert_item,
+                    receipt,
+                )
+            if not claimed:
+                receipt = {
+                    "attempted": False,
+                    "status": "duplicate_suppressed",
+                    "ok": False,
+                    "statusText": _AUTO_SMS_DUPLICATE_TEXT,
+                    "contactActionEnabled": False,
+                    "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                    "templateId": str(guide.get("templateId") or ""),
+                    "deduplicated": True,
+                }
+                return _apply_sms_receipt(
+                    alert_summary,
+                    alert_item,
+                    receipt,
+                )
+            if claim_key:
+                claims[claim_key] = {
+                    "claimedAt": claim_now.isoformat(),
+                    "notificationId": event["notificationId"],
+                }
 
         payload = {
             "actionId": "device_health_alert_contact_hospital",
@@ -640,6 +792,13 @@ class DeviceNotificationAlertCycleHandler:
             template_id=str(guide.get("templateId") or ""),
             accepted_at=request.scheduled_at,
         )
+        receipt.update(
+            {
+                # legacy 자동발송 상태 버튼이 실제 발송값을 다시 보여준다.
+                "phoneNumber": phone_number,
+                "message": message,
+            }
+        )
         next_summary, next_alert_item, next_receipt = _apply_sms_receipt(
             alert_summary,
             alert_item,
@@ -686,47 +845,55 @@ class DeviceNotificationAlertCycleHandler:
                     alert_item,
                     next_receipt,
                 )
-        claim_state = (
-            "settled"
-            if delivery_status in {
-                _SMS_DELIVERY_REQUEST_FAILED,
-                _SMS_DELIVERY_FAILED,
-            }
-            else (
-                "accepted"
-                if remembered and group_id
-                else "uncertain"
-            )
-        )
-        try:
-            self._deps.hold_sms_delivery_claim(
-                target.device_name,
-                target.alert_category,
-                held_at=self._deps.clock(),
-                state=claim_state,
-                group_id=group_id if claim_state == "accepted" else None,
-            )
-        except Exception as exc:
-            # 최초 pending claim은 이미 sticky다. 상태 승격 실패도 중복 발송을
-            # 열지 않고 공개 결과만 확인 필요로 축소한다.
-            self._logger.warning(
-                "Device notification SMS claim hold failed "
-                "notification_id=%s error_type=%s",
-                event["notificationId"],
-                type(exc).__name__,
-            )
-            next_receipt = {
-                **next_receipt,
-                "status": "claim_hold_failed",
-                "statusText": _AUTO_SMS_CONFIRM_REQUIRED_TEXT,
-                "contactActionEnabled": False,
-                "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
-            }
-            next_summary, next_alert_item, next_receipt = _apply_sms_receipt(
-                alert_summary,
-                alert_item,
+        if uses_runtime_claim:
+            publish_automatic_sms_runtime_claim_result(
+                runtime_claim,
                 next_receipt,
             )
+        else:
+            claim_state = (
+                "settled"
+                if delivery_status in {
+                    _SMS_DELIVERY_REQUEST_FAILED,
+                    _SMS_DELIVERY_FAILED,
+                }
+                else (
+                    "accepted"
+                    if remembered and group_id
+                    else "uncertain"
+                )
+            )
+            try:
+                self._deps.hold_sms_delivery_claim(
+                    target.device_name,
+                    target.alert_category,
+                    held_at=self._deps.clock(),
+                    state=claim_state,
+                    group_id=(
+                        group_id if claim_state == "accepted" else None
+                    ),
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "Device notification SMS claim hold failed "
+                    "notification_id=%s error_type=%s",
+                    event["notificationId"],
+                    type(exc).__name__,
+                )
+                next_receipt = {
+                    **next_receipt,
+                    "status": "claim_hold_failed",
+                    "statusText": _AUTO_SMS_CONFIRM_REQUIRED_TEXT,
+                    "contactActionEnabled": False,
+                    "deliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                }
+                next_summary, next_alert_item, next_receipt = (
+                    _apply_sms_receipt(
+                        alert_summary,
+                        alert_item,
+                        next_receipt,
+                    )
+                )
         return next_summary, next_alert_item, next_receipt
 
     def _acknowledge_context(
@@ -820,8 +987,8 @@ class DeviceNotificationAlertCycleHandler:
                     "queuedAt": actual_acknowledged_at.isoformat(),
                     "detectedAt": detected_at.isoformat(),
                     "permalink": permalink,
-                    # 전화번호·본문은 원래 alert item에 없으며 여기서 다시
-                    # allowlist해 coordinator cursor에도 넣지 않는다.
+                    # direct Sheet 복구에는 연락처·본문이 필요 없으므로
+                    # 별도 allowlist item으로 좁혀 보존한다.
                     "item": _sheet_repair_item(sheet_alert_item),
                     "repairKey": repair_key,
                     "status": (
@@ -924,6 +1091,15 @@ def _normalize_cursor(
         for key, item in (source.get("captureboardIncidents") or {}).items()
         if str(key or "").strip() and isinstance(item, Mapping)
     } if isinstance(source.get("captureboardIncidents"), Mapping) else {}
+    pending_events = [
+        event
+        for item in (
+            source.get("pendingEvents")
+            if isinstance(source.get("pendingEvents"), (list, tuple))
+            else []
+        )
+        if (event := _normalize_event(item)) is not None
+    ][:_DEVICE_NOTIFICATION_BATCH_SIZE]
     recent_alerts = {
         str(key): dict(item)
         for key, item in (source.get("recentCaptureboardAlerts") or {}).items()
@@ -989,6 +1165,7 @@ def _normalize_cursor(
         "pendingDeliveryContexts": pending_contexts,
         "recordingStallIncidents": recording_incidents,
         "captureboardIncidents": captureboard_incidents,
+        "pendingEvents": pending_events,
         "recentCaptureboardAlerts": recent_alerts,
         # 이 표식은 delivery 재발송을 막지 않고 durable outbox repair가 진행
         # 중임을 cursor에서 확인할 수 있게 최대 72시간만 유지한다.
@@ -1010,8 +1187,13 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
     if notification_id <= 0 or code not in _SUPPORTED_CODES or not device_name:
         return None
     details = _normalize_json_object(value.get("details"))
-    # 원문 error/path/barcode는 API cursor나 delivery에 보존하지 않고 판단에
-    # 필요한 숫자·상태·음성 타입만 allowlist로 추린다.
+    error_detail = str(
+        details.get("errorDetail") or details.get("error") or ""
+    ).strip()
+    if len(error_detail) > 300:
+        error_detail = f"{error_detail[:297]}..."
+    # path/barcode 원문은 cursor에 보존하지 않고, 기존 Slack
+    # 병합 실패 카드가 보여주던 오류 요약만 300자로 유지한다.
     safe_details = {
         "voiceType": _normalize_voice_type(details.get("voiceType")),
         "segmentCount": _coerce_optional_int(details.get("segmentCount")),
@@ -1023,6 +1205,7 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
         ),
         "currentSize": _coerce_optional_int(details.get("currentSize")),
         "fileType": str(details.get("fileType") or "").strip().lower(),
+        "errorDetail": error_detail,
     }
     return {
         "notificationId": notification_id,
@@ -1030,28 +1213,70 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
         "deviceName": device_name,
         "deviceVersion": str(value.get("deviceVersion") or "").strip(),
         "code": code,
+        "message": str(value.get("message") or "").strip(),
         "details": safe_details,
         "occurredAt": _serialize_datetime(value.get("occurredAt")),
         "hospitalSeq": _coerce_optional_int(value.get("hospitalSeq")),
         "hospitalName": str(value.get("hospitalName") or "").strip(),
-        # 자동발송 호출 중에만 사용하고 cursor/delivery context에는 복사하지 않는다.
+        "hospitalTelephone": str(
+            value.get("hospitalTelephone") or ""
+        ).strip(),
+        # 자동발송과 기존 Slack 연락처 표시에 같이 사용한다.
         "hospitalDeviceAlertPhone": str(
             value.get("hospitalDeviceAlertPhone") or ""
         ).strip(),
         "hospitalRoomSeq": _coerce_optional_int(value.get("hospitalRoomSeq")),
         "roomName": str(value.get("roomName") or "").strip(),
         # 녹화 단위 dedupe key는 원문 대신 해시로만 cursor에 남긴다.
-        "incidentDiscriminator": hashlib.sha256(
-            "\0".join(
-                (
-                    device_name,
-                    str(value.get("fileId") or details.get("fileId") or "-"),
-                    str(value.get("barcode") or details.get("barcode") or "-"),
-                    str(details.get("fileType") or "recording"),
-                )
-            ).encode("utf-8")
-        ).hexdigest(),
+        "incidentDiscriminator": (
+            str(value.get("incidentDiscriminator"))
+            if re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("incidentDiscriminator") or ""),
+            )
+            else hashlib.sha256(
+                "\0".join(
+                    (
+                        device_name,
+                        str(
+                            value.get("fileId")
+                            or details.get("fileId")
+                            or "-"
+                        ),
+                        str(
+                            value.get("barcode")
+                            or details.get("barcode")
+                            or "-"
+                        ),
+                        str(details.get("fileType") or "recording"),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+        ),
     }
+
+
+def _consume_pending_event(
+    state: dict[str, Any],
+    notification_id: int,
+) -> None:
+    """Slack 성공·domain 억제 뒤 legacy queue의 해당 앞 이벤트를 제거한다."""
+
+    if notification_id <= 0:
+        return
+    pending = [
+        item
+        for item in (state.get("pendingEvents") or [])
+        if isinstance(item, Mapping)
+    ]
+    if pending and _coerce_int(pending[0].get("notificationId")) == notification_id:
+        state["pendingEvents"] = pending[1:]
+        return
+    state["pendingEvents"] = [
+        item
+        for item in pending
+        if _coerce_int(item.get("notificationId")) != notification_id
+    ]
 
 
 def _build_root_alert(
@@ -1068,7 +1293,8 @@ def _build_root_alert(
 
     if code == _CAPTUREBOARD_CONNECTION_ERROR:
         issue = _format_issue(
-            "녹화 중 캡처보드 연결 문제가 발생해 녹화가 중단됐어",
+            str(event.get("message") or "").strip()
+            or "캡처보드 연결 장애가 발생했어",
             event.get("occurredAt"),
         )
         alert_category = "video_signal"
@@ -1087,8 +1313,17 @@ def _build_root_alert(
             if segment_count is not None and segment_count > 0
             else ""
         )
+        issue_parts = [
+            str(event.get("message") or "").strip()
+            or "분할된 녹화 파일 병합에 실패했어"
+        ]
+        if segment_text:
+            issue_parts.append(segment_text.removeprefix(" / "))
+        error_detail = str(details.get("errorDetail") or "").strip()
+        if error_detail:
+            issue_parts.append(f"오류: {error_detail}")
         issue = _format_issue(
-            f"분할된 녹화 파일 병합에 실패했어{segment_text}",
+            " / ".join(issue_parts),
             event.get("occurredAt"),
         )
         alert_category = "recording_processing"
@@ -1135,6 +1370,12 @@ def _build_root_alert(
     device_result = {
         "hospitalSeq": hospital_seq,
         "hospitalName": hospital_name,
+        "hospitalTelephone": str(
+            event.get("hospitalTelephone") or ""
+        ).strip(),
+        "hospitalDeviceAlertPhone": str(
+            event.get("hospitalDeviceAlertPhone") or ""
+        ).strip(),
         "hospitalRoomSeq": _coerce_optional_int(event.get("hospitalRoomSeq")),
         "roomName": room_name,
         "deviceName": device_name,
@@ -1169,6 +1410,10 @@ def _build_root_alert(
     alert_item = {
         "hospitalSeq": str(hospital_seq or ""),
         "hospitalName": hospital_name,
+        "telephone": str(event.get("hospitalTelephone") or "").strip(),
+        "deviceAlertPhone": str(
+            event.get("hospitalDeviceAlertPhone") or ""
+        ).strip(),
         "room": room_name,
         "device": device_name,
         "deviceVersion": str(event.get("deviceVersion") or ""),
@@ -1262,6 +1507,8 @@ def _apply_sms_receipt(
     # Slack renderer가 쓰는 표시값에는 provider 추적 ID를 싣지 않는다.
     public_receipt_to_result = {
         "statusText": "smsStatusText",
+        "phoneNumber": "smsPhoneNumber",
+        "message": "smsMessage",
         "templateId": "smsTemplateId",
         "deliveryStatus": "smsDeliveryStatus",
     }

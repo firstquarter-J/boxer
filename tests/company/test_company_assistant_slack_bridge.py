@@ -7,6 +7,9 @@ from boxer_company.assistant import (
     CompanyAssistantResult,
     SourceReference,
 )
+from boxer_company.assistant.request_log_contract import (
+    legacy_company_request_log_route_name,
+)
 from boxer_company_adapter_slack.assistant_bridge import (
     assistant_slack_route_name,
     build_company_assistant_request,
@@ -15,6 +18,22 @@ from boxer_company_adapter_slack.assistant_bridge import (
 
 
 class CompanyAssistantSlackBridgeTests(unittest.TestCase):
+    def test_slack_route_name_delegates_to_company_contract(self) -> None:
+        routes = (
+            "device_voice_change",
+            "device_file_download",
+            "admin_readonly_sql",
+            "security_review",
+            "company_freeform",
+        )
+
+        for route in routes:
+            with self.subTest(route=route):
+                self.assertEqual(
+                    assistant_slack_route_name(route),
+                    legacy_company_request_log_route_name(route),
+                )
+
     def test_company_freeform_keeps_legacy_request_log_name(self) -> None:
         self.assertEqual(
             assistant_slack_route_name("company_freeform"),

@@ -11,7 +11,6 @@ from typing import Any, Callable, Mapping, Sequence
 from boxer.core import settings as core_settings
 from boxer.core.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
-from boxer.retrieval.connectors.s3 import _load_boto3_components
 from boxer_company import settings as company_settings
 from boxer_company.assistant.device_health_alert_action_route import (
     DeviceHealthAlertActionTarget,
@@ -36,6 +35,10 @@ from boxer_company.device_health_fingerprint import (
     canonicalize_device_health_alert_fingerprint_key,
     validate_and_canonicalize_device_health_alert_fingerprint_key,
 )
+from boxer_company.device_health_event_log import (
+    append_device_health_monitor_event,
+    start_device_health_monitor_event_archive_once,
+)
 from boxer_company.redis_device_state import DeviceStateRedisClient
 from boxer_company.routers.device_status_probe import (
     _build_trashcan_storage_summary_from_checks,
@@ -58,9 +61,13 @@ from boxer_company.sms_delivery import (
     _SMS_DELIVERY_REQUEST_FAILED,
 )
 from boxer_company.sms_delivery_cycle import (
+    acquire_automatic_sms_runtime_claim,
+    build_automatic_sms_runtime_claim_key,
     claim_automatic_sms_delivery,
     hold_automatic_sms_delivery_claim,
+    publish_automatic_sms_runtime_claim_result,
     remember_sms_delivery_sheet_record,
+    wait_for_automatic_sms_runtime_claim,
 )
 
 
@@ -123,6 +130,11 @@ class DeviceHealthMonitorCycleDeps:
     verify_device: Callable[
         [Mapping[str, Any], datetime], Mapping[str, Any]
     ] = lambda device, now: _verify_device_health_runtime(device, now=now)
+    ssh_verification_configured: Callable[[], bool] = lambda: bool(
+        company_settings.MDA_GRAPHQL_URL
+        and company_settings.MDA_ADMIN_USER_PASSWORD
+        and company_settings.DEVICE_SSH_PASSWORD
+    )
     load_captureboard_incidents: Callable[
         [], Mapping[str, Mapping[str, Any]] | None
     ] = lambda: _load_device_health_sheet_captureboard_incidents()
@@ -147,12 +159,18 @@ class DeviceHealthMonitorCycleDeps:
         detected_at=detected_at,
         slack_permalink=permalink,
     )
-    archive_event: Callable[
+    write_event: Callable[
         [str, datetime, Mapping[str, Any]], bool
-    ] = lambda request_id, now, payload: _archive_device_health_cycle_event(
-        request_id=request_id,
+    ] = lambda event_type, now, payload: append_device_health_monitor_event(
+        event_type,
+        payload,
         now=now,
-        payload=payload,
+    )
+    start_event_archive: Callable[
+        [datetime, logging.Logger], bool
+    ] = lambda now, logger: start_device_health_monitor_event_archive_once(
+        now=now,
+        logger=logger,
     )
 
 
@@ -303,6 +321,15 @@ def run_device_health_monitor_cycle(
         state,
         options,
     )
+    try:
+        # legacy reporter loop와 같이 health poll 시작 시 KST 날짜당 한 번
+        # 별도 worker에서 retention 밖 JSONL archive를 시도한다.
+        actual_deps.start_event_archive(local_now, actual_logger)
+    except Exception as exc:
+        actual_logger.warning(
+            "Device health event archive start failed error_type=%s",
+            type(exc).__name__,
+        )
     _flush_device_health_sheet_repairs(
         state,
         deps=actual_deps,
@@ -310,17 +337,29 @@ def run_device_health_monitor_cycle(
     )
 
     try:
-        devices = actual_deps.load_devices()
+        # legacy monitor와 같이 장비 목록은 TTL 동안 DB를 다시
+        # 읽지 않고, 갱신 실패 시 기존 cache로 순회를 계속한다.
+        devices, cache_state = _load_device_candidates_cached(
+            state,
+            now=local_now,
+            load_devices=actual_deps.load_devices,
+        )
     except Exception as exc:
         return _unavailable_cycle_run(
             request_id=request_id,
             now=local_now,
             state=state,
-            reason="device_query_unavailable",
+            reason="device_cache_unavailable",
             error_type=type(exc).__name__,
+            error_detail=f"{type(exc).__name__}: {exc}",
             deps=actual_deps,
             logger=actual_logger,
         )
+    state = {
+        **state,
+        "deviceCandidateCache": devices,
+        "deviceCandidateCachedAt": cache_state["cachedAt"],
+    }
 
     device_names = [
         _text(device.get("deviceName"))
@@ -336,9 +375,11 @@ def run_device_health_monitor_cycle(
             state=state,
             reason="redis_unavailable",
             error_type=type(exc).__name__,
+            error_detail=f"{type(exc).__name__}: {exc}",
             deps=actual_deps,
             logger=actual_logger,
-            checked_device_count=len(devices),
+            # legacy monitor는 Redis 전체 장애를 장비 점검 0건으로 남겼다.
+            checked_device_count=0,
         )
 
     device_results: list[dict[str, Any]] = []
@@ -353,10 +394,22 @@ def run_device_health_monitor_cycle(
             redis_snapshot.get(device_name, {}),
             now=local_now,
         )
+        if requires_ssh and not actual_deps.ssh_verification_configured():
+            # legacy는 SSH 설정이 없으면 Redis 후보를 확인 필요로 남기고
+            # 실제 장비 연결을 시도하지 않았다.
+            redis_result["statusText"] = (
+                "Redis 이상 후보지만 SSH 검증 설정이 없어 "
+                "알림 대상에서 제외했어"
+            )
+            event_payload = redis_result.get("_eventPayload")
+            if isinstance(event_payload, dict):
+                event_payload["statusText"] = redis_result["statusText"]
+            requires_ssh = False
         if requires_ssh:
             abnormal_candidate_count += 1
             try:
-                # strict API runtime은 sshOrder를 스스로 재전송하거나 force reopen하지 않는다.
+                # legacy monitor와 같은 기본 SSH lifecycle로 Redis 후보를
+                # 실제 장비에서 한 번 더 확인한다.
                 verified = dict(actual_deps.verify_device(device, local_now))
                 ssh_verified_count += 1
                 device_results.append(verified)
@@ -367,12 +420,26 @@ def run_device_health_monitor_cycle(
                 }
             except Exception as exc:
                 verification_error_count += 1
+                failed_result = {
+                    **redis_result,
+                    # legacy는 Redis 후보를 보존하고 SSH 검증 오류만
+                    # 덧붙인다. 후보를 점검 불가로 다시 분류하지 않는다.
+                    "statusText": (
+                        "Redis 이상 후보 SSH 검증 실패: "
+                        f"{type(exc).__name__}"
+                    ),
+                    "errorType": type(exc).__name__,
+                }
+                event_payload = failed_result.get("_eventPayload")
+                if isinstance(event_payload, dict):
+                    event_payload.update(
+                        {
+                            "statusText": failed_result["statusText"],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
                 device_results.append(
-                    {
-                        **redis_result,
-                        "overallLabel": "점검 불가",
-                        "errorType": type(exc).__name__,
-                    }
+                    failed_result
                 )
                 ssh_records[device_name] = {
                     "lastVerifiedAt": local_now.isoformat(),
@@ -405,6 +472,7 @@ def run_device_health_monitor_cycle(
         try:
             incidents = actual_deps.load_captureboard_incidents()
             sheet_read_status = "disabled" if incidents is None else "completed"
+            pre_sheet_alertable = set(alertable)
             alertable, next_alerts, next_pending = _suppress_open_sheet_incidents(
                 alert_items,
                 alertable,
@@ -414,6 +482,34 @@ def run_device_health_monitor_cycle(
                 incidents=incidents or {},
                 now=local_now,
             )
+            suppressed_fingerprints = pre_sheet_alertable - alertable
+            if suppressed_fingerprints:
+                _write_health_event_best_effort(
+                    "captureboard_sheet_alert_suppressed",
+                    local_now,
+                    {
+                        "suppressedCount": len(suppressed_fingerprints),
+                        "incidents": [
+                            {
+                                "device": _text(item.get("device")),
+                                "status": _text(
+                                    (
+                                        incidents.get(
+                                            _text(item.get("device")),
+                                            {},
+                                        )
+                                        or {}
+                                    ).get("status")
+                                ),
+                            }
+                            for item in alert_items
+                            if _alert_fingerprint(item)
+                            in suppressed_fingerprints
+                        ],
+                    },
+                    deps=actual_deps,
+                    logger=actual_logger,
+                )
         except Exception as exc:
             # 운영 시트 장애는 실제 장비 이상을 숨기지 않는 기존 fail-open 정책을 유지한다.
             sheet_read_status = "failed"
@@ -421,15 +517,42 @@ def run_device_health_monitor_cycle(
                 "Device health sheet read failed error_type=%s",
                 type(exc).__name__,
             )
+            _write_health_event_best_effort(
+                "captureboard_sheet_status_read_failed",
+                local_now,
+                {
+                    "candidateCount": sum(
+                        1
+                        for item in alert_items
+                        if _alert_fingerprint(item) in alertable
+                        and _suppressible_captureboard(item)
+                    ),
+                    "errorType": type(exc).__name__,
+                },
+                deps=actual_deps,
+                logger=actual_logger,
+            )
 
-    alert_items_by_fingerprint = {
-        _alert_fingerprint(item): item for item in alert_items
-    }
+    unavailable_event_state = _record_health_run_events(
+        device_results=device_results,
+        status_counts=status_counts,
+        state=state,
+        now=local_now,
+        checked_device_count=len(devices),
+        abnormal_candidate_count=abnormal_candidate_count,
+        ssh_verified_candidate_count=ssh_verified_count,
+        alertable_fingerprints=alertable,
+        cache_source=_text(cache_state.get("source")),
+        deps=actual_deps,
+        logger=actual_logger,
+    )
+
     delivered_items: list[dict[str, Any]] = []
-    for fingerprint in sorted(alertable):
-        raw_item = alert_items_by_fingerprint.get(fingerprint)
-        if raw_item is None:
+    for raw_item in alert_items:
+        if _alert_fingerprint(raw_item) not in alertable:
             continue
+        # legacy monitor가 DB 장비 순서로 카드와 자동문자를
+        # 처리하던 순서를 remote cycle에서도 그대로 유지한다.
         delivered_items.append(
             _apply_automatic_sms_once(
                 raw_item,
@@ -458,10 +581,11 @@ def run_device_health_monitor_cycle(
         "statusCounts": status_counts,
         "alertFingerprints": next_alerts,
         "pendingAlertFingerprints": next_pending,
+        "deviceUnavailableEventState": unavailable_event_state,
         "sshTunnelRecords": ssh_records,
-        # 연락처를 durable cursor에 넣지 않고 식별·표시용 최소 캐시만 보존한다.
+        # legacy DB TTL cache와 같이 식별값과 병원 연락처를 함께 보존한다.
         "deviceCandidateCache": [_safe_device_cache_item(item) for item in devices],
-        "deviceCandidateCachedAt": local_now.isoformat(),
+        "deviceCandidateCachedAt": cache_state["cachedAt"],
         "pendingSheetAlerts": pending_sheet_alerts,
         "pendingSheetRepairs": dict(state.get("pendingSheetRepairs") or {}),
         "lastSheetWriteStatus": _text(state.get("lastSheetWriteStatus")),
@@ -485,24 +609,6 @@ def run_device_health_monitor_cycle(
         )
         for item in delivered_items
     )
-    archive_status = _archive_event_best_effort(
-        request_id=request_id,
-        now=local_now,
-        payload={
-            "eventType": "device_health_monitor_cycle",
-            "checkedDeviceCount": len(devices),
-            "abnormalCandidateCount": abnormal_candidate_count,
-            "sshVerifiedCandidateCount": ssh_verified_count,
-            "deliveryCount": len(deliveries),
-            "statusCounts": status_counts,
-            "alertHashes": [
-                hashlib.sha256(_alert_fingerprint(item).encode("utf-8")).hexdigest()[:24]
-                for item in delivered_items
-            ],
-        },
-        deps=actual_deps,
-        logger=actual_logger,
-    )
     return DeviceHealthMonitorCycleRun(
         cursor=next_cursor,
         deliveries=deliveries,
@@ -515,7 +621,7 @@ def run_device_health_monitor_cycle(
             "sheetReadStatus": sheet_read_status,
             "sheetWriteStatus": "pending" if delivered_items else "not_needed",
             "sheetRowCount": 0,
-            "archiveStatus": archive_status,
+            "archiveStatus": "scheduled",
         },
     )
 
@@ -535,6 +641,10 @@ def acknowledge_device_health_monitor_deliveries(
     pending = dict(next_cursor.get("pendingSheetAlerts") or {})
     total_rows = 0
     last_write_at = ""
+    sent_groups: dict[
+        tuple[str, str, str],
+        list[tuple[str, Any, Mapping[str, Any], datetime, Mapping[str, Any]]],
+    ] = {}
     for receipt in receipts:
         delivery_id = _text(getattr(receipt, "delivery_id", ""))
         pending_record = pending.get(delivery_id)
@@ -547,39 +657,130 @@ def acknowledge_device_health_monitor_deliveries(
             if detected_at is None or not isinstance(item, Mapping):
                 raise ValueError("device health sheet outbox is invalid")
             permalink = _text(getattr(receipt, "permalink", ""))
-            # Sheet append가 실제 반영 뒤 timeout 나도 다음 poll이 같은 T열
-            # delivery hash를 읽어 duplicate row를 만들지 않게 한다.
-            sheet_item = {**dict(item), "sheetDeliveryId": delivery_id}
-            outbox_ready = False
-            if _text(item.get("smsGroupId")):
-                try:
-                    # 최초 receipt outbox에 Slack permalink를 병합해 direct Sheet
-                    # append가 실패해도 reconciliation cycle이 같은 행을 복구한다.
-                    outbox_ready = actual_deps.remember_sms_delivery(
-                        dict(item),
-                        detected_at=detected_at,
-                        sms_accepted_at=item.get("smsAcceptedAt") or detected_at,
-                        permalink=permalink,
-                    )
-                except Exception as exc:
-                    actual_logger.warning(
-                        "Device health SMS outbox permalink update failed "
-                        "error_type=%s",
-                        type(exc).__name__,
-                    )
+            group_key = (
+                detected_at.isoformat(),
+                permalink,
+                _text(getattr(receipt, "external_message_id", "")),
+            )
+            sent_groups.setdefault(group_key, []).append(
+                (delivery_id, receipt, pending_record, detected_at, item)
+            )
+        else:
+            # failed receipt도 같은 Slack delivery를 자동 재실행하지 않게 닫는다.
+            pending.pop(delivery_id, None)
+
+    for (
+        detected_at_text,
+        permalink,
+        external_message_id,
+    ), records in sent_groups.items():
+        detected_at = _parse_datetime(detected_at_text)
+        if detected_at is None:
+            raise ValueError("device health sheet group is invalid")
+        _write_health_event_best_effort(
+            "slack_alert_sent",
+            detected_at,
+            {
+                "channelId": _text(
+                    company_settings.DEVICE_HEALTH_MONITOR_CHANNEL_ID
+                    or company_settings.DAILY_DEVICE_ROUND_CHANNEL_ID
+                ),
+                "messageTs": external_message_id,
+                "permalink": permalink,
+                "alertableCount": len(records),
+                "alertFingerprints": sorted(
+                    _alert_fingerprint(item)
+                    for _, _, _, _, item in records
+                ),
+                "checkedDeviceCount": max(
+                    0,
+                    int(next_cursor.get("checkedDeviceCount") or 0),
+                ),
+                "abnormalCandidateCount": max(
+                    0,
+                    int(next_cursor.get("abnormalCandidateCount") or 0),
+                ),
+            },
+            deps=actual_deps,
+            logger=actual_logger,
+        )
+        sheet_items: list[dict[str, Any]] = []
+        outbox_ready: dict[str, bool] = {}
+        for delivery_id, _, _, _, item in records:
+            sheet_items.append(
+                {**dict(item), "sheetDeliveryId": delivery_id}
+            )
+            outbox_ready[delivery_id] = False
+            if not _text(item.get("smsGroupId")):
+                continue
             try:
-                written = actual_deps.append_sheet_alerts(
-                    (sheet_item,),
-                    detected_at,
-                    permalink,
+                outbox_ready[delivery_id] = actual_deps.remember_sms_delivery(
+                    dict(item),
+                    detected_at=detected_at,
+                    sms_accepted_at=item.get("smsAcceptedAt") or detected_at,
+                    permalink=permalink,
                 )
             except Exception as exc:
-                # Slack delivery는 이미 성공했다. durable SMS outbox가 있는 경우
-                # repair cycle에 넘기고 cursor는 닫아 monitor 전체를 막지 않는다.
                 actual_logger.warning(
-                    "Device health delivery acknowledgement failed error_type=%s",
+                    "Device health SMS outbox permalink update failed "
+                    "error_type=%s",
                     type(exc).__name__,
                 )
+        try:
+            # local monitor가 한 Slack alert의 모든 장비를 한 번에 append한
+            # 것처럼 같은 receipt group을 Sheets 한 호출로 기록한다.
+            written = actual_deps.append_sheet_alerts(
+                tuple(sheet_items),
+                detected_at,
+                permalink,
+            )
+        except Exception as exc:
+            actual_logger.warning(
+                "Device health delivery acknowledgement failed error_type=%s",
+                type(exc).__name__,
+            )
+            _write_health_event_best_effort(
+                "sheet_alert_write_failed",
+                detected_at,
+                {
+                    "spreadsheetId": _text(
+                        company_settings.DEVICE_HEALTH_SHEET_SPREADSHEET_ID
+                    ),
+                    "sheetName": _text(
+                        company_settings.DEVICE_HEALTH_SHEET_TAB_NAME
+                    ),
+                    "errorType": type(exc).__name__,
+                },
+                deps=actual_deps,
+                logger=actual_logger,
+            )
+            written = 0
+            write_failed = True
+        else:
+            write_failed = False
+            if written is not None:
+                _write_health_event_best_effort(
+                    "sheet_alert_rows_written",
+                    detected_at,
+                    {
+                        "spreadsheetId": _text(
+                            company_settings.DEVICE_HEALTH_SHEET_SPREADSHEET_ID
+                        ),
+                        "sheetName": _text(
+                            company_settings.DEVICE_HEALTH_SHEET_TAB_NAME
+                        ),
+                        "rowCount": max(0, int(written or 0)),
+                    },
+                    deps=actual_deps,
+                    logger=actual_logger,
+                )
+
+        for sheet_item, record in zip(sheet_items, records):
+            delivery_id, receipt, _, _, item = record
+            needs_repair = write_failed or (
+                written == 0 and outbox_ready.get(delivery_id, False)
+            )
+            if needs_repair:
                 next_cursor["lastSheetWriteStatus"] = "repair_pending"
                 next_cursor["lastSheetRepairDeliveryId"] = delivery_id
                 next_cursor["pendingSheetRepairs"][delivery_id] = {
@@ -588,8 +789,6 @@ def acknowledge_device_health_monitor_deliveries(
                     ).isoformat(),
                     "detectedAt": detected_at.isoformat(),
                     "permalink": permalink,
-                    # provider group이 없을 때도 다음 poll이 Sheets만 직접
-                    # 재시도할 수 있도록 non-PII allowlist item을 보존한다.
                     "item": _sheet_alert_item(sheet_item),
                     "status": (
                         "outbox_pending"
@@ -597,33 +796,17 @@ def acknowledge_device_health_monitor_deliveries(
                         else "sheet_pending"
                     ),
                 }
-                written = 0
             else:
-                if written == 0 and outbox_ready:
-                    next_cursor["lastSheetWriteStatus"] = "repair_pending"
-                    next_cursor["lastSheetRepairDeliveryId"] = delivery_id
-                    next_cursor["pendingSheetRepairs"][delivery_id] = {
-                        "queuedAt": (
-                            getattr(receipt, "delivered_at", None)
-                            or detected_at
-                        ).isoformat(),
-                        "detectedAt": detected_at.isoformat(),
-                        "permalink": permalink,
-                        "item": _sheet_alert_item(sheet_item),
-                        "status": "outbox_pending",
-                    }
-                else:
-                    next_cursor["lastSheetWriteStatus"] = (
-                        "disabled" if written is None else "completed"
-                    )
-                    next_cursor["lastSheetRepairDeliveryId"] = ""
-                    next_cursor["pendingSheetRepairs"].pop(delivery_id, None)
-            total_rows += max(0, int(written or 0))
+                next_cursor["lastSheetWriteStatus"] = (
+                    "disabled" if written is None else "completed"
+                )
+                next_cursor["lastSheetRepairDeliveryId"] = ""
+                next_cursor["pendingSheetRepairs"].pop(delivery_id, None)
+            pending.pop(delivery_id, None)
             last_write_at = (
                 getattr(receipt, "delivered_at", None) or detected_at
             ).isoformat()
-        # failed receipt도 같은 Slack delivery를 자동 재실행하지 않게 outbox에서 닫는다.
-        pending.pop(delivery_id, None)
+        total_rows += max(0, int(written or 0))
     next_cursor["pendingSheetAlerts"] = pending
     if last_write_at:
         next_cursor["lastSheetWriteAt"] = last_write_at
@@ -784,6 +967,67 @@ def _load_device_health_monitor_devices() -> list[dict[str, Any]]:
     return result
 
 
+def _load_device_candidates_cached(
+    state: Mapping[str, Any],
+    *,
+    now: datetime,
+    load_devices: Callable[[], list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """legacy 상태 파일과 같은 TTL·stale cache 의미를 API cursor에서 유지한다."""
+
+    raw_cache = state.get("deviceCandidateCache")
+    cached_devices = [
+        _safe_device_cache_item(item)
+        for item in (raw_cache or [])
+        if isinstance(item, Mapping) and _text(item.get("deviceName"))
+    ]
+    cached_at = _parse_datetime(state.get("deviceCandidateCachedAt"))
+    cache_has_contacts = isinstance(raw_cache, (list, tuple)) and all(
+        isinstance(item, Mapping)
+        and "hospitalTelephone" in item
+        and "hospitalDeviceAlertPhone" in item
+        for item in raw_cache
+    )
+    ttl = timedelta(
+        seconds=max(
+            60,
+            int(company_settings.DEVICE_HEALTH_MONITOR_DEVICE_CACHE_TTL_SEC),
+        )
+    )
+    if (
+        cached_devices
+        and cache_has_contacts
+        and cached_at is not None
+        and now - cached_at < ttl
+    ):
+        return cached_devices, {
+            "cachedAt": cached_at.isoformat(),
+            "source": "state_cache",
+        }
+
+    try:
+        fresh_devices = [
+            _safe_device_cache_item(item)
+            for item in load_devices()
+            if isinstance(item, Mapping) and _text(item.get("deviceName"))
+        ]
+    except Exception:
+        if cached_devices:
+            return cached_devices, {
+                "cachedAt": (
+                    cached_at.isoformat()
+                    if cached_at is not None
+                    else _text(state.get("deviceCandidateCachedAt"))
+                ),
+                "source": "stale_state_cache",
+            }
+        raise
+    return fresh_devices, {
+        "cachedAt": now.isoformat(),
+        "source": "db",
+    }
+
+
 def _load_device_health_monitor_redis_snapshot(
     device_names: Sequence[str],
 ) -> Mapping[str, Mapping[str, Any]]:
@@ -802,13 +1046,46 @@ def _result_from_redis(
     agent_state = snapshot.get("agentState")
     device_state = device_state if isinstance(device_state, Mapping) else None
     agent_state = agent_state if isinstance(agent_state, Mapping) else None
-    if _redis_unavailable_reasons(device_state, agent_state, now=now):
-        return _base_device_result(device, overall_label="점검 불가"), False
+    availability_reasons = _redis_unavailable_reasons(
+        device_state,
+        agent_state,
+        now=now,
+        device_name=_text(device.get("deviceName")),
+    )
+    if availability_reasons:
+        result = _base_device_result(device, overall_label="점검 불가")
+        result["statusText"] = (
+            "장비가 오프라인이거나 상태 미갱신이라 이상 판단을 건너뛰었어"
+        )
+        result["_eventPayload"] = _redis_device_event_payload(
+            result,
+            device_state=device_state,
+            agent_state=agent_state,
+            availability_reasons=availability_reasons,
+            now=now,
+        )
+        return result, False
 
     requires_ssh = _redis_requires_ssh_verification(device_state)
     if requires_ssh:
-        return _base_device_result(device, overall_label="확인 필요"), True
-    return _base_device_result(device, overall_label="정상"), False
+        result = _base_device_result(device, overall_label="확인 필요")
+        result["_eventPayload"] = _redis_device_event_payload(
+            result,
+            device_state=device_state,
+            agent_state=agent_state,
+            availability_reasons=(),
+            now=now,
+        )
+        return result, True
+    result = _base_device_result(device, overall_label="정상")
+    result["_eventPayload"] = _redis_device_event_payload(
+        result,
+        device_state=device_state,
+        agent_state=agent_state,
+        availability_reasons=(),
+        now=now,
+    )
+    return result, False
 
 
 def _redis_unavailable_reasons(
@@ -816,17 +1093,29 @@ def _redis_unavailable_reasons(
     agent_state: Mapping[str, Any] | None,
     *,
     now: datetime,
+    device_name: str = "",
 ) -> list[str]:
     reasons: list[str] = []
-    if device_state is None or _is_redis_state_stale(device_state, now=now):
-        reasons.append("device_state_unavailable")
+    display_name = device_name or "장비명 미확인"
+    if device_state is None:
+        reasons.append(f"{display_name} 장비 상태 정보가 Redis에 없어")
+    elif _is_redis_state_stale(device_state, now=now):
+        reasons.append(
+            f"{display_name} 장비 상태 정보가 Redis에서 갱신되지 않고 있어"
+        )
+    elif device_state.get("isConnected") is False:
+        reasons.append("장비 socket 연결이 끊겼어")
     elif device_state.get("isConnected") is not True:
-        reasons.append("device_disconnected")
-    if agent_state is None or agent_state.get("isConnected") is not True:
-        reasons.append("agent_disconnected")
+        reasons.append("장비 socket 연결 상태를 확인할 수 없어")
+    if agent_state is None:
+        reasons.append(f"{display_name} agent 상태 정보가 Redis에 없어")
+    elif agent_state.get("isConnected") is False:
+        reasons.append("장비 agent 연결이 끊겼어")
+    elif agent_state.get("isConnected") is not True:
+        reasons.append("장비 agent 연결 상태를 확인할 수 없어")
     status = _text((device_state or {}).get("status")).upper()
     if any(marker in status for marker in ("EXIT", "DISCONNECT", "OFFLINE")):
-        reasons.append("device_offline_status")
+        reasons.append(f"장비 상태가 {status}로 보고됐어")
     return reasons
 
 
@@ -896,6 +1185,76 @@ def _redis_disk_percent(state: Mapping[str, Any]) -> float | None:
     return None
 
 
+def _redis_device_event_payload(
+    result: Mapping[str, Any],
+    *,
+    device_state: Mapping[str, Any] | None,
+    agent_state: Mapping[str, Any] | None,
+    availability_reasons: Sequence[str],
+    now: datetime,
+) -> dict[str, Any]:
+    """legacy JSONL이 남기던 Redis/SSH 요약 필드만 선별한다."""
+
+    capture_status = _text((device_state or {}).get("captureBoardStatus"))
+    return {
+        "hospitalSeq": _positive_int(result.get("hospitalSeq")),
+        "hospitalName": _text(result.get("hospitalName")) or "미확인",
+        "roomName": _text(result.get("roomName")) or "미확인",
+        "deviceName": _text(result.get("deviceName")) or "미확인",
+        "overallLabel": _text(result.get("overallLabel")),
+        "priorityReason": _text(result.get("priorityReason")),
+        "statusText": _text(result.get("statusText")),
+        "error": "",
+        "source": "redis_device_state",
+        "component": "availability" if availability_reasons else "all",
+        "componentLabels": dict(result.get("componentLabels") or {}),
+        "redis": {
+            "checkedAt": now.isoformat(),
+            "availabilityReasons": list(availability_reasons),
+            "deviceUpdatedAt": _text((device_state or {}).get("updatedAt")),
+            "agentUpdatedAt": _text((agent_state or {}).get("updatedAt")),
+            "deviceIsConnected": (device_state or {}).get("isConnected"),
+            "agentIsConnected": (agent_state or {}).get("isConnected"),
+            "deviceStatus": _text((device_state or {}).get("status")),
+            "captureBoardStatus": capture_status,
+        },
+        "ssh": {
+            "ready": not bool(availability_reasons),
+            "verified": False,
+            "reason": (
+                "device_offline_or_state_stale"
+                if availability_reasons
+                else "redis_snapshot"
+            ),
+            "openedThisRun": False,
+            "reusedExisting": False,
+            "openWaitTimeoutSec": 0,
+            "closeStatus": "",
+        },
+        "probe": {
+            "captureboard": {
+                "status": "warning" if capture_status else "",
+                "label": (
+                    "확인 필요"
+                    if _text(
+                        (result.get("componentLabels") or {}).get(
+                            "captureboard"
+                        )
+                    )
+                    == "확인 필요"
+                    else ""
+                ),
+                "summary": "",
+                "evidence": "",
+                "overviewDetail": "",
+            },
+            "lsusbOutput": "",
+            "videoDevicesOutput": "",
+            "v4l2DevicesOutput": "",
+        },
+    }
+
+
 def _verify_device_health_runtime(
     device: Mapping[str, Any],
     *,
@@ -907,16 +1266,25 @@ def _verify_device_health_runtime(
     evidence, device_info, checks = _collect_runtime_checks(
         device_name,
         "all",
+        # 자동 cycle도 API request 경계 안에서는 poll 재전송과 stale
+        # tunnel 강제 재개방 없이 최초 상태/open 한 흐름만 사용한다.
         resend_ssh_open=False,
         allow_force_reopen=False,
     )
     ssh = evidence.get("ssh") if isinstance(evidence.get("ssh"), dict) else {}
     if not ssh.get("ready"):
-        return {
+        result = {
             **_base_device_result(device, overall_label="점검 불가"),
             "sshReady": False,
             "sshReason": _text(ssh.get("reason")) or "agent_ssh_not_ready",
         }
+        result["_eventPayload"] = _runtime_device_event_payload(
+            result,
+            evidence=evidence,
+            checks=checks,
+            overview={},
+        )
+        return result
 
     overview = {
         "audio": _summarize_audio_path_probe(checks),
@@ -987,8 +1355,88 @@ def _verify_device_health_runtime(
         "sshReason": "ready",
     }
     result["issue"] = _build_daily_device_round_issue_summary(result)
+    result["_eventPayload"] = _runtime_device_event_payload(
+        result,
+        evidence=evidence,
+        checks=checks,
+        overview=overview,
+    )
     result.pop("statusPayload", None)
     return result
+
+
+def _runtime_device_event_payload(
+    result: Mapping[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+    checks: Mapping[str, Any],
+    overview: Mapping[str, Any],
+) -> dict[str, Any]:
+    """legacy SSH verified event의 bounded probe 요약을 만든다."""
+
+    ssh = evidence.get("ssh") if isinstance(evidence.get("ssh"), Mapping) else {}
+    close = ssh.get("close") if isinstance(ssh.get("close"), Mapping) else {}
+    capture = (
+        overview.get("captureboard")
+        if isinstance(overview.get("captureboard"), Mapping)
+        else {}
+    )
+    return {
+        "hospitalSeq": _positive_int(result.get("hospitalSeq")),
+        "hospitalName": _text(result.get("hospitalName")) or "미확인",
+        "roomName": _text(result.get("roomName")) or "미확인",
+        "deviceName": _text(result.get("deviceName")) or "미확인",
+        "overallLabel": _text(result.get("overallLabel")),
+        "priorityReason": _text(result.get("priorityReason")),
+        "statusText": _text(result.get("statusText")),
+        "error": "",
+        "source": "mda_graphql+ssh_linux_commands",
+        "component": "all",
+        "componentLabels": dict(result.get("componentLabels") or {}),
+        "redis": {
+            "checkedAt": "",
+            "availabilityReasons": [],
+            "deviceUpdatedAt": "",
+            "agentUpdatedAt": "",
+            "deviceIsConnected": None,
+            "agentIsConnected": None,
+            "deviceStatus": "",
+            "captureBoardStatus": "",
+        },
+        "ssh": {
+            "ready": bool(ssh.get("ready")),
+            "verified": bool(ssh.get("verified")),
+            "reason": _text(ssh.get("reason")),
+            "openedThisRun": bool(ssh.get("openedThisRun")),
+            "reusedExisting": bool(ssh.get("reusedExisting")),
+            "openWaitTimeoutSec": max(
+                0,
+                int(ssh.get("openWaitTimeoutSec") or 0),
+            ),
+            "closeStatus": _text(close.get("status")),
+        },
+        "probe": {
+            "captureboard": {
+                key: _text(capture.get(key))
+                for key in (
+                    "status",
+                    "label",
+                    "summary",
+                    "evidence",
+                    "overviewDetail",
+                )
+            },
+            "lsusbOutput": _text(
+                (checks.get("lsusb") or {}).get("output")
+            )[:1000],
+            "videoDevicesOutput": _text(
+                (checks.get("video_devices") or {}).get("output")
+            )[:500],
+            "v4l2DevicesOutput": _text(
+                (checks.get("v4l2_devices") or {}).get("output")
+            )[:1000],
+        },
+    }
 
 
 def _base_device_result(
@@ -1202,39 +1650,67 @@ def _apply_automatic_sms_once(
             "smsDeliveryStatus": _SMS_DELIVERY_NOT_SENT,
         }
 
-    # 긴 장비 순회 시작 시각이 아니라 실제 provider 호출 직전 API 시각으로
-    # 공통 claim을 잡아 health/notification 사이 60초 창을 왜곡하지 않는다.
-    claim_now = deps.clock()
-    try:
-        claimed = deps.claim_sms_delivery(
-            target.device_name,
-            target.alert_category,
-            claimed_at=claim_now,
+    # 기본 API runtime은 legacy Slack과 같은 process-memory 60초 claim을
+    # notification cycle과 공유한다. 주입된 claim port는 기존 단위 테스트와
+    # recovery 호환 경로에서만 그대로 사용한다.
+    uses_runtime_claim = (
+        deps.claim_sms_delivery is claim_automatic_sms_delivery
+    )
+    runtime_claim: dict[str, Any] = {}
+    if uses_runtime_claim:
+        runtime_claim_key = build_automatic_sms_runtime_claim_key(item)
+        claimed, runtime_claim = acquire_automatic_sms_runtime_claim(
+            runtime_claim_key
         )
-    except Exception as exc:
-        # claim 저장을 확인하지 못하면 provider를 호출하지 않는 쪽으로 닫아
-        # crash/restart 경계에서도 중복 발송 가능성을 만들지 않는다.
-        logger.warning(
-            "Device health automatic SMS claim failed error_type=%s",
-            type(exc).__name__,
-        )
-        return {
-            **result,
-            "smsStatusText": "문자 발송 여부 확인 필요",
-            "smsContactActionEnabled": False,
-            "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
-        }
-    if not claimed:
-        return {
-            **result,
-            "smsStatusText": (
-                "동일 장애 문자 중복 발송 생략 - 기존 알림에서 발송 여부 확인 필요"
-            ),
-            "smsContactActionEnabled": False,
-            "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
-        }
+        if not claimed:
+            wait_for_automatic_sms_runtime_claim(
+                runtime_claim_key,
+                runtime_claim,
+                logger=logger,
+            )
+            return {
+                **result,
+                "smsStatusText": (
+                    "동일 장애 문자 중복 발송 생략 - 기존 알림에서 "
+                    "발송 여부 확인 필요"
+                ),
+                "smsContactActionEnabled": False,
+                "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+            }
+    else:
+        # custom port도 provider 호출 직전 API 시각을 받아 테스트·호환
+        # 구현이 이전 호출 순서를 그대로 검증할 수 있게 한다.
+        claim_now = deps.clock()
+        try:
+            claimed = deps.claim_sms_delivery(
+                target.device_name,
+                target.alert_category,
+                claimed_at=claim_now,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Device health automatic SMS claim failed error_type=%s",
+                type(exc).__name__,
+            )
+            return {
+                **result,
+                "smsStatusText": "문자 발송 여부 확인 필요",
+                "smsContactActionEnabled": False,
+                "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+            }
+        if not claimed:
+            return {
+                **result,
+                "smsStatusText": (
+                    "동일 장애 문자 중복 발송 생략 - 기존 알림에서 "
+                    "발송 여부 확인 필요"
+                ),
+                "smsContactActionEnabled": False,
+                "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+            }
 
-    # 전화번호와 본문은 provider 호출 payload 안에서만 사용하고 반환 item에서는 제거한다.
+    # provider payload를 기존 형식 그대로 만들고, 아래 결과에는 Slack의
+    # 자동발송 확인 버튼이 쓰던 번호·본문·템플릿만 다시 선별한다.
     payload = {
         "actionId": "device_health_alert_contact_hospital",
         "requestType": "sms",
@@ -1299,7 +1775,46 @@ def _apply_automatic_sms_once(
         "smsMessageId": _text(sent.get("messageId")),
         "smsDeliveryStatus": delivery_status,
         "smsAcceptedAt": now.isoformat() if accepted else "",
+        # legacy 자동발송 확인 버튼이 실제 대상·본문을 다시 보여주므로
+        # trusted Slack delivery까지 같은 세 표시값을 유지한다.
+        "smsPhoneNumber": phone_number,
+        "smsMessage": sms_message,
+        "smsTemplateId": _text(guide.get("templateId")),
     }
+    _write_health_event_best_effort(
+        (
+            "alert_sms_auto_confirm_required"
+            if delivery_status == _SMS_DELIVERY_CONFIRM_REQUIRED
+            else (
+                "alert_sms_auto_accepted"
+                if accepted
+                else "alert_sms_auto_failed"
+            )
+        ),
+        now,
+        {
+            "actionId": "device_health_alert_contact_hospital",
+            "channelId": _text(
+                company_settings.DEVICE_HEALTH_MONITOR_CHANNEL_ID
+                or company_settings.DAILY_DEVICE_ROUND_CHANNEL_ID
+            ),
+            "hospital": _text(item.get("hospital")),
+            "room": target.room_name,
+            "device": target.device_name,
+            "issue": target.issue,
+            "templateId": _text(guide.get("templateId")),
+            "provider": _text(sent.get("provider")),
+            "status": _text(sent.get("status")),
+            "smsGroupId": _text(sent.get("groupId")),
+            "smsMessageId": _text(sent.get("messageId")),
+            "providerStatusCode": _text(sent.get("providerStatusCode")),
+            "smsDeliveryStatus": delivery_status,
+            "smsAcceptedAt": sms_result["smsAcceptedAt"],
+            "phoneLast4": _text(sent.get("phoneLast4")),
+        },
+        deps=deps,
+        logger=logger,
+    )
     group_id = _text(sms_result.get("smsGroupId"))
     remembered = False
     if delivery_status in {
@@ -1331,42 +1846,46 @@ def _apply_automatic_sms_once(
                     "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
                 }
             )
-    claim_state = (
-        "settled"
-        if delivery_status in {
-            _SMS_DELIVERY_REQUEST_FAILED,
-            _SMS_DELIVERY_FAILED,
-        }
-        else (
-            "accepted"
-            if remembered and group_id
-            else "uncertain"
-        )
-    )
-    try:
-        # accepted는 outbox 최종 reconcile까지, uncertain은 운영 확인까지
-        # sticky하게 유지해 timeout·저장 실패 뒤 자동 재발송을 막는다.
-        deps.hold_sms_delivery_claim(
-            target.device_name,
-            target.alert_category,
-            held_at=deps.clock(),
-            state=claim_state,
-            group_id=group_id if claim_state == "accepted" else None,
-        )
-    except Exception as exc:
-        # 최초 pending claim 자체가 이미 sticky라 hold 갱신 실패도 재발송을
-        # 열지는 않는다. 응답에는 비민감한 확인 필요 상태만 남긴다.
-        logger.warning(
-            "Device health automatic SMS claim hold failed error_type=%s",
-            type(exc).__name__,
-        )
-        sms_result.update(
-            {
-                "smsStatusText": "문자 발송 여부 확인 필요",
-                "smsContactActionEnabled": False,
-                "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+    if uses_runtime_claim:
+        # legacy claim은 결과를 기다리는 thread만 깨우고 60초 TTL까지
+        # process memory에 남는다. provider 결과에 따른 sticky 상태는 없다.
+        publish_automatic_sms_runtime_claim_result(runtime_claim, sms_result)
+    else:
+        claim_state = (
+            "settled"
+            if delivery_status in {
+                _SMS_DELIVERY_REQUEST_FAILED,
+                _SMS_DELIVERY_FAILED,
             }
+            else (
+                "accepted"
+                if remembered and group_id
+                else "uncertain"
+            )
         )
+        try:
+            deps.hold_sms_delivery_claim(
+                target.device_name,
+                target.alert_category,
+                held_at=deps.clock(),
+                state=claim_state,
+                group_id=(
+                    group_id if claim_state == "accepted" else None
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Device health automatic SMS claim hold failed "
+                "error_type=%s",
+                type(exc).__name__,
+            )
+            sms_result.update(
+                {
+                    "smsStatusText": "문자 발송 여부 확인 필요",
+                    "smsContactActionEnabled": False,
+                    "smsDeliveryStatus": _SMS_DELIVERY_CONFIRM_REQUIRED,
+                }
+            )
     return sms_result
 
 
@@ -1377,7 +1896,8 @@ def _delivery_payload(
     checked_device_count: int,
     abnormal_candidate_count: int,
 ) -> dict[str, Any]:
-    # conversation delivery에는 연락처, SMS 본문, provider payload를 절대 포함하지 않는다.
+    # 기존 Slack 카드와 자동발송 확인 action의 연락처·본문은 유지하되,
+    # provider 응답 식별자는 delivery에 포함하지 않는다.
     return {
         "detectedAt": now.isoformat(),
         "checkedDeviceCount": checked_device_count,
@@ -1386,6 +1906,8 @@ def _delivery_payload(
             "hospitalSeq": _text(item.get("hospitalSeq")),
             "hospitalName": _text(item.get("hospitalName")),
             "hospital": _text(item.get("hospital")),
+            "telephone": _text(item.get("telephone")),
+            "deviceAlertPhone": _text(item.get("deviceAlertPhone")),
             "room": _text(item.get("room")),
             "device": _text(item.get("device")),
             "deviceVersion": _text(item.get("deviceVersion")),
@@ -1397,6 +1919,9 @@ def _delivery_payload(
             "smsContactActionEnabled": bool(item.get("smsContactActionEnabled", True)),
             "smsDeliveryStatus": _text(item.get("smsDeliveryStatus")),
             "smsAcceptedAt": _text(item.get("smsAcceptedAt")),
+            "smsPhoneNumber": _text(item.get("smsPhoneNumber")),
+            "smsMessage": _text(item.get("smsMessage")),
+            "smsTemplateId": _text(item.get("smsTemplateId")),
         },
     }
 
@@ -1408,6 +1933,7 @@ def _unavailable_cycle_run(
     state: Mapping[str, Any],
     reason: str,
     error_type: str,
+    error_detail: str,
     deps: DeviceHealthMonitorCycleDeps,
     logger: logging.Logger,
     checked_device_count: int = 0,
@@ -1420,14 +1946,28 @@ def _unavailable_cycle_run(
         "monitorUnavailableReason": reason,
         "monitorUnavailableErrorType": error_type,
     }
-    archive_status = _archive_event_best_effort(
-        request_id=request_id,
-        now=now,
-        payload={
-            "eventType": "device_health_monitor_unavailable",
-            "reasonCode": reason,
-            "errorType": error_type,
+    del request_id
+    archive_status = _write_health_event_best_effort(
+        "monitor_unavailable",
+        now,
+        {
+            "runDate": now.date().isoformat(),
+            "startedAt": now.isoformat(),
+            "finishedAt": now.isoformat(),
             "checkedDeviceCount": checked_device_count,
+            "scheduledDeviceCount": checked_device_count,
+            "deviceCount": 0,
+            "statusCounts": _status_counts(()),
+            "abnormalCandidateCount": 0,
+            "sshVerifiedCandidateCount": 0,
+            "alertableCount": 0,
+            "channelId": "",
+            "channelMissing": False,
+            "deviceCacheSource": "unavailable",
+            "deviceCacheRefreshed": False,
+            "deviceCacheRefreshError": error_detail,
+            "monitorUnavailableReason": reason,
+            "monitorUnavailableDetail": error_detail,
         },
         deps=deps,
         logger=logger,
@@ -1445,68 +1985,277 @@ def _unavailable_cycle_run(
     )
 
 
-def _archive_event_best_effort(
-    *,
-    request_id: str,
+def _write_health_event_best_effort(
+    event_type: str,
     now: datetime,
     payload: Mapping[str, Any],
+    *,
     deps: DeviceHealthMonitorCycleDeps,
     logger: logging.Logger,
 ) -> str:
     try:
-        return "completed" if deps.archive_event(request_id, now, payload) else "disabled"
+        return "completed" if deps.write_event(event_type, now, payload) else "failed"
     except Exception as exc:
-        # 감사 보관 실패는 장비 alert 전달을 되돌리지 않고 자동 재시도하지 않는다.
+        # JSONL 장애는 기존 monitor처럼 장비 alert 전달을 되돌리지 않는다.
         logger.warning(
-            "Device health event archive failed error_type=%s",
+            "Device health event write failed error_type=%s",
             type(exc).__name__,
         )
         return "failed"
 
 
-def _archive_device_health_cycle_event(
+def _record_health_run_events(
     *,
-    request_id: str,
+    device_results: Sequence[Mapping[str, Any]],
+    status_counts: Mapping[str, Any],
+    state: Mapping[str, Any],
     now: datetime,
-    payload: Mapping[str, Any],
-) -> bool:
-    bucket = _text(company_settings.DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_BUCKET)
-    if not bucket:
-        return False
-    prefix = _text(
-        company_settings.DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_PREFIX
-    ).strip("/")
-    request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
-    key = f"{now:%Y/%m/%d}/{request_hash}.json"
-    if prefix:
-        key = f"{prefix}/{key}"
-    boto3, boto_config = _load_boto3_components()
-    # put_object 자체는 한 번만 호출하고 SDK 재시도도 0회로 고정한다.
-    timeout_sec = max(1, int(core_settings.S3_QUERY_TIMEOUT_SEC))
-    client = boto3.client(
-        "s3",
-        region_name=core_settings.AWS_REGION,
-        config=boto_config(
-            region_name=core_settings.AWS_REGION,
-            connect_timeout=timeout_sec,
-            read_timeout=timeout_sec,
-            retries={"total_max_attempts": 1, "mode": "standard"},
+    checked_device_count: int,
+    abnormal_candidate_count: int,
+    ssh_verified_candidate_count: int,
+    alertable_fingerprints: set[str],
+    cache_source: str,
+    deps: DeviceHealthMonitorCycleDeps,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    """legacy run/device event 종류와 unavailable 요약 주기를 유지한다."""
+
+    channel_id = _text(
+        company_settings.DEVICE_HEALTH_MONITOR_CHANNEL_ID
+        or company_settings.DAILY_DEVICE_ROUND_CHANNEL_ID
+    )
+    _write_health_event_best_effort(
+        "run_summary",
+        now,
+        {
+            "runDate": now.date().isoformat(),
+            "startedAt": now.isoformat(),
+            "finishedAt": now.isoformat(),
+            "checkedDeviceCount": checked_device_count,
+            "scheduledDeviceCount": checked_device_count,
+            "deviceCount": len(device_results),
+            "statusCounts": {
+                label: max(0, int(status_counts.get(label) or 0))
+                for label in ("정상", "확인 필요", "이상", "점검 불가")
+            },
+            "abnormalCandidateCount": abnormal_candidate_count,
+            "sshVerifiedCandidateCount": ssh_verified_candidate_count,
+            "alertableCount": len(alertable_fingerprints),
+            "channelId": channel_id,
+            "channelMissing": not bool(channel_id),
+            "deviceCacheSource": cache_source,
+            "deviceCacheRefreshed": cache_source == "db",
+            "deviceCacheRefreshError": "",
+            "monitorUnavailableReason": "",
+            "monitorUnavailableDetail": "",
+        },
+        deps=deps,
+        logger=logger,
+    )
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    unavailable_payloads: list[dict[str, Any]] = []
+    for result in device_results:
+        payload = _device_event_payload(result)
+        label = _text(result.get("overallLabel"))
+        source = _text(payload.get("source"))
+        if label == "점검 불가":
+            unavailable_payloads.append(payload)
+        elif source == "redis_device_state" and label in {"확인 필요", "이상"}:
+            events.append(("redis_candidate", payload))
+        elif source == "mda_graphql+ssh_linux_commands" and label == "이상":
+            events.append(("ssh_verified_abnormal", payload))
+
+    unavailable_payload: dict[str, Any] | None = None
+    if unavailable_payloads:
+        sample_limit = 20
+        unavailable_payload = {
+            "count": len(unavailable_payloads),
+            "sampleLimit": sample_limit,
+            "omittedCount": max(
+                0,
+                len(unavailable_payloads) - sample_limit,
+            ),
+            "sampleDevices": unavailable_payloads[:sample_limit],
+            "stateSignature": _unavailable_event_signature(
+                unavailable_payloads
+            ),
+        }
+        events.insert(0, ("device_unavailable", unavailable_payload))
+
+    previous = _normalize_unavailable_event_state(
+        state.get("deviceUnavailableEventState")
+    )
+    should_log, next_unavailable = _resolve_unavailable_event_state(
+        unavailable_payload,
+        previous=previous,
+        now=now,
+    )
+    emission_reason = _text(next_unavailable.pop("emissionReason", ""))
+    for event_type, payload in events:
+        if event_type == "device_unavailable" and not should_log:
+            continue
+        actual_payload = (
+            {**payload, "emissionReason": emission_reason}
+            if event_type == "device_unavailable"
+            else payload
+        )
+        status = _write_health_event_best_effort(
+            event_type,
+            now,
+            actual_payload,
+            deps=deps,
+            logger=logger,
+        )
+        if event_type == "device_unavailable" and status != "completed":
+            return previous
+    return next_unavailable
+
+
+def _device_event_payload(result: Mapping[str, Any]) -> dict[str, Any]:
+    payload = result.get("_eventPayload")
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    # 주입 verifier 테스트와 오래된 custom port도 같은 event schema로 남긴다.
+    return {
+        "hospitalSeq": _positive_int(result.get("hospitalSeq")),
+        "hospitalName": _text(result.get("hospitalName")) or "미확인",
+        "roomName": _text(result.get("roomName")) or "미확인",
+        "deviceName": _text(result.get("deviceName")) or "미확인",
+        "overallLabel": _text(result.get("overallLabel")),
+        "priorityReason": _text(result.get("priorityReason")),
+        "statusText": _text(result.get("statusText")),
+        "error": "",
+        "source": (
+            "mda_graphql+ssh_linux_commands"
+            if result.get("sshReady")
+            else "redis_device_state"
         ),
+        "component": "all",
+        "componentLabels": dict(result.get("componentLabels") or {}),
+        "redis": {"availabilityReasons": []},
+        "ssh": {
+            "ready": bool(result.get("sshReady")),
+            "verified": bool(result.get("sshReady")),
+            "reason": _text(result.get("sshReason")),
+        },
+        "probe": {},
+    }
+
+
+def _unavailable_event_signature(
+    payloads: Sequence[Mapping[str, Any]],
+) -> str:
+    stable: list[dict[str, Any]] = []
+    for payload in payloads:
+        redis = payload.get("redis") if isinstance(payload.get("redis"), Mapping) else {}
+        ssh = payload.get("ssh") if isinstance(payload.get("ssh"), Mapping) else {}
+        stable.append(
+            {
+                "hospitalSeq": _positive_int(payload.get("hospitalSeq")),
+                "deviceName": _text(payload.get("deviceName")),
+                "source": _text(payload.get("source")),
+                "availabilityReasons": sorted(
+                    {
+                        _text(reason)
+                        for reason in redis.get("availabilityReasons") or []
+                        if _text(reason)
+                    }
+                ),
+                "sshReason": _text(ssh.get("reason")),
+            }
+        )
+    stable.sort(
+        key=lambda item: (
+            item["hospitalSeq"] or -1,
+            item["deviceName"],
+            item["source"],
+            item["availabilityReasons"],
+            item["sshReason"],
+        )
     )
-    body = json.dumps(
-        {"recordedAt": now.isoformat(), **dict(payload)},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    client.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=body,
-        ContentType="application/json",
-        ServerSideEncryption="AES256",
+    return hashlib.sha256(
+        json.dumps(
+            stable,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _normalize_unavailable_event_state(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, Mapping) else {}
+    return {
+        "signatureVersion": 1,
+        "signature": _text(raw.get("signature")),
+        "lastLoggedAt": _text(raw.get("lastLoggedAt")),
+        "changedAt": _text(raw.get("changedAt")),
+        "unavailableCount": max(
+            0,
+            int(raw.get("unavailableCount") or 0),
+        ),
+    }
+
+
+def _resolve_unavailable_event_state(
+    payload: Mapping[str, Any] | None,
+    *,
+    previous: Mapping[str, Any],
+    now: datetime,
+) -> tuple[bool, dict[str, Any]]:
+    unavailable_count = max(0, int((payload or {}).get("count") or 0))
+    previous_count = max(0, int(previous.get("unavailableCount") or 0))
+    if unavailable_count == 0:
+        return False, {
+            "signatureVersion": 1,
+            "signature": "",
+            "lastLoggedAt": "",
+            "changedAt": (
+                now.isoformat()
+                if previous_count > 0
+                else _text(previous.get("changedAt"))
+            ),
+            "unavailableCount": 0,
+            "emissionReason": "",
+        }
+    signature = _text((payload or {}).get("stateSignature"))
+    last_logged = _parse_datetime(previous.get("lastLoggedAt"))
+    if last_logged is not None and last_logged > now:
+        last_logged = None
+    summary_delta = timedelta(
+        hours=max(
+            1,
+            int(
+                company_settings.DEVICE_HEALTH_MONITOR_UNAVAILABLE_EVENT_SUMMARY_HOURS
+            ),
+        )
     )
-    return True
+    initial = previous_count == 0 or last_logged is None
+    periodic = bool(last_logged and now - last_logged >= summary_delta)
+    should_log = initial or periodic
+    return should_log, {
+        "signatureVersion": 1,
+        "signature": signature,
+        "lastLoggedAt": (
+            now.isoformat()
+            if should_log
+            else _text(previous.get("lastLoggedAt"))
+        ),
+        "changedAt": (
+            now.isoformat()
+            if signature != _text(previous.get("signature"))
+            else _text(previous.get("changedAt"))
+        ),
+        "unavailableCount": unavailable_count,
+        "emissionReason": (
+            "initial_snapshot"
+            if initial
+            else "periodic_summary"
+            if periodic
+            else ""
+        ),
+    }
 
 
 def _normalize_monitor_cursor(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1554,6 +2303,9 @@ def _normalize_monitor_cursor(value: Mapping[str, Any] | None) -> dict[str, Any]
         "sshVerifiedCandidateCount": max(0, int(state.get("sshVerifiedCandidateCount") or 0)),
         "monitorUnavailableReason": _text(state.get("monitorUnavailableReason")),
         "monitorUnavailableErrorType": _text(state.get("monitorUnavailableErrorType")),
+        "deviceUnavailableEventState": _normalize_unavailable_event_state(
+            state.get("deviceUnavailableEventState")
+        ),
         "statusCounts": dict(state.get("statusCounts") or {}),
         "alertFingerprints": _normalize_fingerprint_state(state.get("alertFingerprints")),
         "pendingAlertFingerprints": _normalize_fingerprint_state(
@@ -1825,6 +2577,12 @@ def _safe_device_cache_item(item: Mapping[str, Any]) -> dict[str, Any]:
         "hospitalSeq": _positive_int(item.get("hospitalSeq")),
         "hospitalRoomSeq": _positive_int(item.get("hospitalRoomSeq")),
         "hospitalName": _text(item.get("hospitalName")),
+        # legacy monitor의 DB TTL cache가 장애 중에도 동일한 알림
+        # 연락처를 보여줄 수 있게 두 필드를 함께 보존한다.
+        "hospitalTelephone": _text(item.get("hospitalTelephone")),
+        "hospitalDeviceAlertPhone": _text(
+            item.get("hospitalDeviceAlertPhone")
+        ),
         "roomName": _text(item.get("roomName")),
     }
 

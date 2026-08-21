@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import ipaddress
 import json
 import logging
@@ -45,14 +45,25 @@ _TRACEPARENT_PATTERN = re.compile(
 _TURN_PATH = "/internal/v1/assistant/turns"
 _MAX_CONTEXT_ENTRIES = 12
 _MAX_CONTEXT_CHARS = 5_000
-_MAX_CONTEXT_ENTRY_CHARS = 4_000
-_MAX_QUESTION_CHARS = 4_000
+_MAX_OPERATION_CONTEXT_ENTRIES = 100
+_MAX_OPERATION_CONTEXT_CHARS = 12_000
+_MAX_QUESTION_CHARS = 40_000
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_RESPONSE_MESSAGES = 8
 _MAX_RESPONSE_SOURCES = 20
-_MAX_PRIVATE_LINKS = 20
 _MAX_PRIVATE_LINK_URI_CHARS = 16_384
 _MAX_MESSAGE_CHARS = 30_000
+_NDJSON_MEDIA_TYPE = "application/x-ndjson"
+_SLACK_CHANNEL_ID_PATTERN = re.compile(r"^[CDG][A-Z0-9]{1,20}$")
+_SLACK_MESSAGE_TS_PATTERN = re.compile(
+    r"^\d{1,20}(?:\.\d{1,9})?$"
+)
+_SAFE_ERROR_TYPE_PATTERN = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_.]{0,159}$"
+)
+_STREAM_RESULT_KEYS = ("type", "result")
+_STREAM_HEARTBEAT_KEYS = ("type", "requestId")
+_STREAM_ERROR_KEYS = ("type", "problem")
 _OUTCOMES = frozenset(
     {
         "answered",
@@ -145,6 +156,48 @@ _SECURITY_REVIEW_RESULT_KEYS = frozenset(
         "probeTitle",
         "probePrompt",
         "report",
+    }
+)
+_DEVICE_FILE_DOWNLOAD_DELIVERY_RESULT_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "failureNotice",
+        "linkCount",
+        "links",
+        "delivery",
+    }
+)
+_DEVICE_FILE_DOWNLOAD_LINK_CONTEXT_KEYS = frozenset(
+    {"deviceName", "fileName"}
+)
+_DEVICE_FILE_DOWNLOAD_DELIVERY_KEYS = frozenset(
+    {"barcode", "logDate", "usedExpandedScope", "records"}
+)
+_DEVICE_FILE_DOWNLOAD_DELIVERY_RECORD_KEYS = frozenset(
+    {
+        "deviceName",
+        "deviceSeq",
+        "hospitalSeq",
+        "hospitalRoomSeq",
+        "hospitalName",
+        "roomName",
+        "fileNames",
+        "downloadFileNames",
+    }
+)
+_DEVICE_OPERATION_DELIVERY_RESULT_KEYS = frozenset(
+    {"kind", "status", "delivery"}
+)
+_DEVICE_OPERATION_DELIVERY_KEYS = frozenset(
+    {
+        "route",
+        "deviceName",
+        "requestedVersion",
+        "currentBoxVersion",
+        "dispatchMessage",
+        "waitStatus",
+        "waitOk",
     }
 )
 _SOURCE_KEYS = frozenset({"sourceId", "title", "uri", "score"})
@@ -244,8 +297,9 @@ class CompanyApiClientSettings:
     token: str = field(repr=False)
     connect_timeout_sec: float = 2.0
     read_timeout_sec: float = 90.0
-    # 기존 동기 Agent update 완료 확인(최대 10분)을 한 HTTP 응답으로 보존한다.
-    operations_read_timeout_sec: float = 700.0
+    # 기존 동기 Agent install과 완료 poll이 각각 최대 10분 이어질 수 있어
+    # 두 구간과 응답 여유를 한 HTTP 요청 안에서 그대로 보존한다.
+    operations_read_timeout_sec: float = 1_300.0
     # 일일 순회는 병원 단위 동기 실행이라 별도 긴 timeout을 쓰되 재시도하지 않는다.
     automation_read_timeout_sec: float = 1_800.0
     max_retries: int = 1
@@ -547,7 +601,7 @@ def load_company_api_client_settings(
     operations_read_timeout_sec = _positive_float_setting(
         source,
         "BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC",
-        700.0,
+        1_300.0,
     )
     automation_read_timeout_sec = _positive_float_setting(
         source,
@@ -856,7 +910,10 @@ class CompanyAssistantApiClient:
                 request_id=request.request_id,
             )
 
-        request_id = _validate_request(request)
+        request_id = _validate_request(
+            request,
+            route_group=route_group,
+        )
         traceparent = self._traceparent_factory()
         if not _is_valid_traceparent(traceparent):
             raise CompanyApiContractError(
@@ -999,6 +1056,270 @@ class CompanyAssistantApiClient:
         raise CompanyApiAvailabilityError(
             "company_api_unavailable",
             request_id=request_id,
+        )
+
+    def answer_with_progress(
+        self,
+        request: CompanyAssistantRequest,
+        *,
+        route_group: _RouteGroup | None = None,
+        on_partial_result: Callable[[CompanyAssistantResult], None],
+    ) -> CompanyAssistantResult:
+        """부분 결과를 즉시 소비하고 terminal final 하나만 반환한다."""
+
+        if not self._settings.enabled:
+            raise CompanyApiContractError(
+                "company_api_client_disabled",
+                request_id=request.request_id,
+            )
+        if not callable(on_partial_result):
+            raise CompanyApiContractError(
+                "company_api_progress_callback_invalid",
+                request_id=request.request_id,
+            )
+
+        request_id = _validate_request(
+            request,
+            route_group=route_group,
+        )
+        traceparent = self._traceparent_factory()
+        if not _is_valid_traceparent(traceparent):
+            raise CompanyApiContractError(
+                "company_api_traceparent_invalid",
+                request_id=request_id,
+            )
+        headers = {
+            "Authorization": f"Bearer {self._settings.token}",
+            "X-Request-ID": request_id,
+            "traceparent": traceparent,
+            "Accept": (
+                f"{_NDJSON_MEDIA_TYPE}, application/json, "
+                "application/problem+json"
+            ),
+            "Content-Type": "application/json",
+        }
+        response: Any | None = None
+        try:
+            # 부분 응답을 받은 뒤에는 처리 완료 여부를 알 수 없다. 따라서
+            # route 종류와 무관하게 이 호출은 항상 단 한 번만 전송한다.
+            response = self._session_for_call().post(
+                f"{self._base_url}{_TURN_PATH}",
+                headers=headers,
+                json=_serialize_request(
+                    request,
+                    route_group=route_group,
+                ),
+                timeout=(
+                    self._settings.connect_timeout_sec,
+                    (
+                        self._settings.operations_read_timeout_sec
+                        if route_group == "operations"
+                        else self._settings.read_timeout_sec
+                    ),
+                ),
+                allow_redirects=False,
+                stream=True,
+            )
+        except requests.exceptions.ReadTimeout as exc:
+            raise CompanyApiAmbiguousTimeoutError(
+                "company_api_progress_read_timeout",
+                code="read_timeout",
+                request_id=request_id,
+            ) from exc
+        except requests.exceptions.SSLError as exc:
+            raise CompanyApiContractError(
+                "company_api_tls_error",
+                code="tls_error",
+                request_id=request_id,
+            ) from exc
+        except requests.exceptions.ConnectTimeout as exc:
+            raise CompanyApiAvailabilityError(
+                "company_api_connection_failed",
+                code="connection_failed",
+                request_id=request_id,
+            ) from exc
+        except requests.exceptions.ConnectionError as exc:
+            # 연결이 성립한 뒤 끊겼는지 판별할 수 없으므로 호출자는 이
+            # progress 경로에서 local fallback이나 재전송을 하면 안 된다.
+            raise CompanyApiAmbiguousTimeoutError(
+                "company_api_progress_connection_lost",
+                code="connection_lost",
+                request_id=request_id,
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise CompanyApiContractError(
+                "company_api_transport_error",
+                code="transport_error",
+                request_id=request_id,
+            ) from exc
+
+        try:
+            status = _response_status(response)
+            if status != 200:
+                problem = _deserialize_problem(response, request_id)
+                self._raise_problem(problem, status, request_id)
+
+            media_type = _response_media_type(response)
+            if media_type == "application/json":
+                # 완료된 mutation guard replay는 NDJSON 요청에도 기존 JSON
+                # 200을 반환한다. 이미 완료된 최종 결과로 안전하게 수용한다.
+                return _deserialize_result(response, request_id)
+            if media_type != _NDJSON_MEDIA_TYPE:
+                raise _progress_ambiguous_error(
+                    request_id,
+                    code="stream_content_type_invalid",
+                )
+            return _deserialize_progress_stream(
+                response,
+                request_id=request_id,
+                on_partial_result=on_partial_result,
+            )
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
+    def acknowledge_device_file_download(
+        self,
+        request: CompanyAssistantRequest,
+        delivery_result: Mapping[str, Any],
+    ) -> CompanyAssistantResult:
+        """같은 request ID로 DM 전달 성공 receipt를 한 번만 보낸다."""
+
+        try:
+            normalized_result = json.loads(
+                json.dumps(dict(delivery_result), ensure_ascii=False)
+            )
+            _validate_device_file_download_delivery_result(
+                normalized_result,
+                request.request_id,
+            )
+        except (TypeError, ValueError, CompanyApiContractError) as exc:
+            raise CompanyApiContractError(
+                "company_api_operation_result_invalid",
+                request_id=request.request_id,
+            ) from exc
+        delivery = normalized_result["delivery"]
+        metadata = dict(request.metadata)
+        metadata["operation_action"] = {
+            "name": "device_file_download_delivery",
+            "phase": "delivered",
+            # URL은 되돌려 보내지 않고 API가 만든 strict activity manifest만
+            # 같은 request ID의 receipt에 실어 재시작 사이에도 보존한다.
+            "delivery": json.loads(
+                json.dumps(delivery, ensure_ascii=False)
+            ),
+        }
+        # operations transport는 answer()의 retry_limit=0을 그대로 적용해
+        # activity 처리 여부가 불명일 때 HTTP를 자동 재전송하지 않는다.
+        return self.answer(
+            replace(request, metadata=metadata),
+            route_group="operations",
+        )
+
+    def acknowledge_device_operation_delivery(
+        self,
+        request: CompanyAssistantRequest,
+        delivery_result: Mapping[str, Any],
+    ) -> CompanyAssistantResult:
+        """최종 Slack 응답 성공 뒤 같은 request ID로 activity receipt를 보낸다."""
+
+        try:
+            normalized_result = json.loads(
+                json.dumps(dict(delivery_result), ensure_ascii=False)
+            )
+            _validate_device_operation_delivery_result(
+                normalized_result,
+                request.request_id,
+            )
+        except (TypeError, ValueError, CompanyApiContractError) as exc:
+            raise CompanyApiContractError(
+                "company_api_operation_result_invalid",
+                request_id=request.request_id,
+            ) from exc
+        metadata = dict(request.metadata)
+        metadata["operation_action"] = {
+            "name": "device_operation_delivery",
+            "phase": "delivered",
+            "delivery": json.loads(
+                json.dumps(
+                    normalized_result["delivery"],
+                    ensure_ascii=False,
+                )
+            ),
+        }
+        # receipt 자체도 외부 activity write를 포함하므로 자동 재시도 없는
+        # operations JSON transport를 그대로 사용한다.
+        return self.answer(
+            replace(request, metadata=metadata),
+            route_group="operations",
+        )
+
+    def acknowledge_request_log_delivery(
+        self,
+        request: CompanyAssistantRequest,
+        *,
+        delivered: bool,
+        reply_count: int,
+        first_replied_at_utc: datetime | str | None,
+        error_type: str | None = None,
+    ) -> CompanyAssistantResult:
+        """같은 request ID로 Slack 최종 전달 상태를 0-retry 회신한다."""
+
+        if type(delivered) is not bool or type(reply_count) is not int:
+            raise CompanyApiContractError(
+                "company_api_request_log_delivery_invalid",
+                request_id=request.request_id,
+            )
+        normalized_first_reply = _normalize_first_replied_at_utc(
+            first_replied_at_utc,
+            request_id=request.request_id,
+        )
+        if error_type is not None and (
+            not isinstance(error_type, str) or not error_type.strip()
+        ):
+            raise CompanyApiContractError(
+                "company_api_request_log_delivery_invalid",
+                request_id=request.request_id,
+            )
+        normalized_error_type = (
+            error_type.strip() if error_type is not None else None
+        )
+        if (
+            not 0 <= reply_count <= 10_000
+            or (reply_count > 0) != (normalized_first_reply is not None)
+            or delivered == (normalized_error_type is not None)
+            or (
+                normalized_error_type is not None
+                and _SAFE_ERROR_TYPE_PATTERN.fullmatch(
+                    normalized_error_type
+                )
+                is None
+            )
+        ):
+            raise CompanyApiContractError(
+                "company_api_request_log_delivery_invalid",
+                request_id=request.request_id,
+            )
+        metadata = dict(request.metadata)
+        if not isinstance(metadata.get("audit_context"), Mapping):
+            raise CompanyApiContractError(
+                "company_api_audit_context_missing",
+                request_id=request.request_id,
+            )
+        metadata["operation_action"] = {
+            "name": "request_log_delivery",
+            "phase": "receipt",
+            "delivered": delivered,
+            "reply_count": reply_count,
+            "first_replied_at_utc": normalized_first_reply,
+            "error_type": normalized_error_type,
+        }
+        # operations answer()는 retry_limit=0이라 전달 상태가 불명일 때도
+        # 같은 receipt를 transport가 자동 재전송하지 않는다.
+        return self.answer(
+            replace(request, metadata=metadata),
+            route_group="operations",
         )
 
     def _session_for_call(self) -> Any:
@@ -1364,7 +1685,11 @@ def _boolean_setting(
     raise CompanyApiContractError("company_api_boolean_invalid")
 
 
-def _validate_request(request: CompanyAssistantRequest) -> str:
+def _validate_request(
+    request: CompanyAssistantRequest,
+    *,
+    route_group: _RouteGroup | None,
+) -> str:
     request_id = str(request.request_id or "").strip()
     if (
         not _REQUEST_ID_PATTERN.fullmatch(request_id)
@@ -1388,7 +1713,10 @@ def _validate_request(request: CompanyAssistantRequest) -> str:
             request_id=request_id or None,
         )
     question = str(request.question or "").strip()
-    if not question or len(question) > _MAX_QUESTION_CHARS:
+    if (
+        len(question) > _MAX_QUESTION_CHARS
+        or (not question and route_group != "freeform")
+    ):
         raise CompanyApiContractError(
             "company_api_request_invalid",
             request_id=request_id,
@@ -1414,7 +1742,24 @@ def _serialize_request(
         "question": str(request.question).strip(),
         "locale": str(request.locale).strip(),
         "contextEntries": _serialize_context_entries(
-            request.context_entries
+            request.context_entries,
+            max_entries=(
+                _MAX_OPERATION_CONTEXT_ENTRIES
+                if route_group == "operations"
+                else _MAX_CONTEXT_ENTRIES
+            ),
+            max_chars=(
+                _MAX_OPERATION_CONTEXT_CHARS
+                if route_group == "operations"
+                else _MAX_CONTEXT_CHARS
+            ),
+            max_entry_chars=(
+                _MAX_OPERATION_CONTEXT_CHARS
+                if route_group == "operations"
+                # Slack loader가 이미 최신 전체 5k window를 만들었다. 단일
+                # entry를 다시 4k로 잘라 tail 문맥을 잃지 않는다.
+                else _MAX_CONTEXT_CHARS
+            ),
         ),
     }
     scope = _serialize_scope(request.metadata)
@@ -1423,6 +1768,32 @@ def _serialize_request(
     if route_group is not None:
         # routeGroup은 권한이 아니라 실행 범위를 더 좁히는 transport hint다.
         payload["routeGroup"] = route_group
+    raw_audit_context = request.metadata.get("audit_context")
+    if raw_audit_context is not None:
+        if route_group != "operations":
+            raise CompanyApiContractError(
+                "company_api_audit_context_scope_invalid",
+                request_id=request.request_id,
+            )
+        # request-log identity는 Slack event adapter가 확정한 고정 필드만
+        # 전달하고 질문 원문이나 임의 metadata는 auditContext에 넣지 않는다.
+        payload["auditContext"] = _serialize_audit_context(
+            raw_audit_context,
+            request=request,
+        )
+    raw_fun_context = request.metadata.get("team_fun_context")
+    if raw_fun_context is not None:
+        if (
+            route_group != "fun"
+            or not isinstance(raw_fun_context, str)
+            or len(raw_fun_context) > _MAX_CONTEXT_CHARS
+        ):
+            raise CompanyApiContractError(
+                "company_api_fun_context_invalid",
+                request_id=request.request_id,
+            )
+        # Slack fun loader가 만든 최신 5k 문자열을 앞/뒤 절단 없이 보낸다.
+        payload["funContext"] = raw_fun_context
     raw_operation_action = request.metadata.get("operation_action")
     if raw_operation_action is not None:
         if route_group != "operations":
@@ -1451,10 +1822,117 @@ def _serialize_operation_action(
         )
     name = str(value.get("name") or "").strip()
     phase = str(value.get("phase") or "").strip()
+    if name == "device_diagnostic_followup_probe":
+        # snapshot probe는 질문/문맥의 힌트를 권한처럼 쓰지 않고 고정된
+        # action name 하나만 API로 보낸다.
+        if frozenset(value) != {"name"}:
+            raise CompanyApiContractError(
+                "company_api_operation_action_invalid",
+                request_id=request_id,
+            )
+        return {"name": name}
+    if name == "request_log_delivery":
+        expected_keys = {
+            "name",
+            "phase",
+            "delivered",
+            "reply_count",
+            "first_replied_at_utc",
+            "error_type",
+        }
+        delivered = value.get("delivered")
+        reply_count = value.get("reply_count")
+        first_replied_at_utc = value.get("first_replied_at_utc")
+        error_type = value.get("error_type")
+        try:
+            normalized_first_reply = _normalize_first_replied_at_utc(
+                first_replied_at_utc,
+                request_id=request_id,
+            )
+        except CompanyApiContractError as exc:
+            raise CompanyApiContractError(
+                "company_api_operation_action_invalid",
+                request_id=request_id,
+            ) from exc
+        if (
+            frozenset(value) != expected_keys
+            or phase != "receipt"
+            or type(delivered) is not bool
+            or type(reply_count) is not int
+            or not 0 <= reply_count <= 10_000
+            or (reply_count > 0) != (normalized_first_reply is not None)
+            or delivered == (error_type is not None)
+            or (
+                error_type is not None
+                and (
+                    not isinstance(error_type, str)
+                    or _SAFE_ERROR_TYPE_PATTERN.fullmatch(error_type)
+                    is None
+                )
+            )
+        ):
+            raise CompanyApiContractError(
+                "company_api_operation_action_invalid",
+                request_id=request_id,
+            )
+        return {
+            "name": name,
+            "phase": "receipt",
+            "delivered": delivered,
+            "replyCount": reply_count,
+            "firstRepliedAtUtc": normalized_first_reply,
+            "errorType": error_type,
+        }
+    if name == "device_file_download_delivery":
+        if (
+            frozenset(value) != {"name", "phase", "delivery"}
+            or phase != "delivered"
+            or not isinstance(value.get("delivery"), Mapping)
+        ):
+            raise CompanyApiContractError(
+                "company_api_operation_action_invalid",
+                request_id=request_id,
+            )
+        return {
+            "name": name,
+            "phase": phase,
+            "delivery": _serialize_download_delivery_manifest(
+                value["delivery"],
+                request_id=request_id,
+            ),
+        }
+    if name == "device_operation_delivery":
+        if (
+            frozenset(value) != {"name", "phase", "delivery"}
+            or phase != "delivered"
+            or not isinstance(value.get("delivery"), Mapping)
+        ):
+            raise CompanyApiContractError(
+                "company_api_operation_action_invalid",
+                request_id=request_id,
+            )
+        delivery = dict(value["delivery"])
+        _validate_device_operation_delivery_manifest(
+            delivery,
+            request_id,
+        )
+        return {
+            "name": name,
+            "phase": phase,
+            "delivery": json.loads(
+                json.dumps(delivery, ensure_ascii=False)
+            ),
+        }
     if name == "security_review":
         # 보안검토 응답 원문은 question/context가 아니라 typed operations
         # action 하나로만 보내 API 감사 로그의 원문 마스킹 경계를 유지한다.
         return _serialize_security_review_action(
+            value,
+            phase=phase,
+            request_id=request_id,
+        )
+    if name == "device_health_alert_ui_receipt":
+        return _serialize_device_health_alert_ui_receipt(
             value,
             phase=phase,
             request_id=request_id,
@@ -1483,6 +1961,10 @@ def _serialize_operation_action(
             request_id=request_id,
         ) from exc
     hospital = _required_operation_text(target.get("hospital_name"), 160)
+    hospital_label = _optional_operation_text(
+        target.get("hospital_label"),
+        320,
+    )
     room = _required_operation_text(target.get("room_name"), 160)
     device = _required_operation_text(target.get("device_name"), 160)
     issue = _required_operation_text(target.get("issue"), 1_000)
@@ -1490,6 +1972,7 @@ def _serialize_operation_action(
         target.get("alert_category"),
         80,
     )
+    mda_url = str(target.get("mda_url") or "").strip()
     raw_components = target.get("problem_components")
     components = (
         [
@@ -1502,10 +1985,12 @@ def _serialize_operation_action(
     if (
         hospital_seq <= 0
         or hospital is None
+        or hospital_label is None
         or room is None
         or device is None
         or issue is None
         or alert_category is None
+        or len(mda_url) > 2_048
         or len(components) > 16
         or any(component is None for component in components)
         or len(set(components)) != len(components)
@@ -1524,18 +2009,25 @@ def _serialize_operation_action(
             "company_api_operation_action_invalid",
             request_id=request_id,
         )
+    serialized_target: dict[str, Any] = {
+        "hospitalSeq": hospital_seq,
+        "hospitalName": hospital,
+        "roomName": room,
+        "deviceName": device,
+        "issue": issue,
+        "alertCategory": alert_category,
+        "problemComponents": components,
+    }
+    # 새 중앙 event writer에 필요한 표시 필드만 실제 값이 있을 때 더해
+    # 기존 typed action wire payload와의 호환성을 유지한다.
+    if hospital_label:
+        serialized_target["hospitalLabel"] = hospital_label
+    if mda_url:
+        serialized_target["mdaUrl"] = mda_url
     serialized: dict[str, Any] = {
         "name": name,
         "phase": phase,
-        "target": {
-            "hospitalSeq": hospital_seq,
-            "hospitalName": hospital,
-            "roomName": room,
-            "deviceName": device,
-            "issue": issue,
-            "alertCategory": alert_category,
-            "problemComponents": components,
-        },
+        "target": serialized_target,
     }
     if is_sms and phase == "execute":
         if not isinstance(sms, Mapping):
@@ -1559,6 +2051,222 @@ def _serialize_operation_action(
             "message": message,
         }
     return serialized
+
+
+def _serialize_device_health_alert_ui_receipt(
+    value: Mapping[str, Any],
+    *,
+    phase: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Slack modal 결과를 고정 event/상태만 가진 typed receipt로 직렬화한다."""
+
+    raw_target = value.get("target")
+    action_id = str(value.get("action_id") or "").strip()
+    mode = str(value.get("mode") or "").strip()
+    event_type = str(value.get("event_type") or "").strip()
+    message_ts = str(value.get("message_ts") or "").strip()
+    thread_ts = str(value.get("thread_ts") or "").strip()
+    occurred_at = str(value.get("occurred_at") or "").strip()
+    status = str(value.get("status") or "").strip()
+    ok = value.get("ok")
+    error_type = str(value.get("error_type") or "").strip()
+    try:
+        parsed_occurred_at = datetime.fromisoformat(
+            occurred_at.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise CompanyApiContractError(
+            "company_api_operation_action_invalid",
+            request_id=request_id,
+        ) from exc
+    if (
+        phase != "receipt"
+        or event_type != "alert_contact_sms_modal_requested"
+        or action_id
+        not in {
+            "device_health_alert_contact_hospital",
+            "device_health_alert_view_auto_sms",
+        }
+        or mode not in {"send", "view_auto_sent"}
+        or status
+        not in {
+            "missing_trigger_id",
+            "modal_opened",
+            "modal_open_failed",
+        }
+        or not isinstance(ok, bool)
+        or ok != (status == "modal_opened")
+        or (error_type and status != "modal_open_failed")
+        or len(error_type) > 160
+        or not re.fullmatch(r"\d{1,20}(?:\.\d{1,9})?", message_ts)
+        or not re.fullmatch(r"\d{1,20}(?:\.\d{1,9})?", thread_ts)
+        or parsed_occurred_at.tzinfo is None
+        or not isinstance(raw_target, Mapping)
+    ):
+        raise CompanyApiContractError(
+            "company_api_operation_action_invalid",
+            request_id=request_id,
+        )
+    try:
+        hospital_seq = int(raw_target.get("hospital_seq") or 0)
+    except (TypeError, ValueError) as exc:
+        raise CompanyApiContractError(
+            "company_api_operation_action_invalid",
+            request_id=request_id,
+        ) from exc
+    hospital_name = _required_operation_text(
+        raw_target.get("hospital_name"),
+        160,
+    )
+    hospital_label = _optional_operation_text(
+        raw_target.get("hospital_label"),
+        320,
+    )
+    room = _required_operation_text(raw_target.get("room_name"), 160)
+    device = _required_operation_text(raw_target.get("device_name"), 160)
+    issue = _required_operation_text(raw_target.get("issue"), 1_000)
+    alert_category = _optional_operation_text(
+        raw_target.get("alert_category"),
+        80,
+    )
+    mda_url = str(raw_target.get("mda_url") or "").strip()
+    raw_components = raw_target.get("problem_components")
+    components = (
+        [
+            _required_operation_text(component, 80)
+            for component in raw_components
+        ]
+        if isinstance(raw_components, (list, tuple))
+        else []
+    )
+    if (
+        hospital_seq <= 0
+        or hospital_name is None
+        or hospital_label is None
+        or room is None
+        or device is None
+        or issue is None
+        or alert_category is None
+        or len(mda_url) > 2_048
+        or len(components) > 16
+        or any(component is None for component in components)
+        or len(set(components)) != len(components)
+        or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}",
+            device,
+        )
+    ):
+        raise CompanyApiContractError(
+            "company_api_operation_action_invalid",
+            request_id=request_id,
+        )
+    return {
+        "name": "device_health_alert_ui_receipt",
+        "phase": "receipt",
+        "eventType": event_type,
+        "actionId": action_id,
+        "mode": mode,
+        "target": {
+            "hospitalSeq": hospital_seq,
+            "hospitalName": hospital_name,
+            "hospitalLabel": hospital_label,
+            "roomName": room,
+            "deviceName": device,
+            "issue": issue,
+            "alertCategory": alert_category,
+            "mdaUrl": mda_url,
+            "problemComponents": components,
+        },
+        "messageTs": message_ts,
+        "threadTs": thread_ts,
+        "occurredAt": occurred_at,
+        "status": status,
+        "ok": ok,
+        "errorType": error_type,
+    }
+
+
+def _serialize_download_delivery_manifest(
+    value: Mapping[str, Any],
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    _validate_download_delivery_manifest(value, request_id)
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _validate_download_delivery_manifest(
+    value: Any,
+    request_id: str,
+) -> None:
+    raw_records = value.get("records") if isinstance(value, Mapping) else None
+    valid = bool(
+        isinstance(value, Mapping)
+        and frozenset(value) == _DEVICE_FILE_DOWNLOAD_DELIVERY_KEYS
+        and isinstance(value.get("barcode"), str)
+        and re.fullmatch(r"\d{11}", value["barcode"])
+        and isinstance(value.get("logDate"), str)
+        and _is_valid_log_date(value["logDate"])
+        and type(value.get("usedExpandedScope")) is bool
+        and isinstance(raw_records, list)
+        and bool(raw_records)
+    )
+    if valid:
+        valid = all(
+            _valid_download_delivery_record(record)
+            for record in raw_records
+        )
+    if not valid:
+        raise CompanyApiContractError(
+            "company_api_operation_result_invalid",
+            request_id=request_id,
+        )
+
+
+def _valid_download_delivery_record(value: Any) -> bool:
+    if (
+        not isinstance(value, Mapping)
+        or frozenset(value)
+        != _DEVICE_FILE_DOWNLOAD_DELIVERY_RECORD_KEYS
+        or not _safe_text(value.get("deviceName"), maximum=160)
+        or not _safe_text(value.get("hospitalName"), maximum=200)
+        or not _safe_text(value.get("roomName"), maximum=200)
+    ):
+        return False
+    for key in ("deviceSeq", "hospitalSeq", "hospitalRoomSeq"):
+        item = value.get(key)
+        if item is not None and (type(item) is not int or item < 1):
+            return False
+    file_names = value.get("fileNames")
+    download_file_names = value.get("downloadFileNames")
+    return bool(
+        isinstance(file_names, list)
+        and isinstance(download_file_names, list)
+        and download_file_names
+        and all(_safe_download_file_name(item) for item in file_names)
+        and all(
+            _safe_download_file_name(item)
+            for item in download_file_names
+        )
+    )
+
+
+def _safe_download_file_name(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and _safe_text(value, maximum=255)
+        and "/" not in value
+        and "\\" not in value
+    )
+
+
+def _is_valid_log_date(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
 
 
 def _serialize_security_review_action(
@@ -1639,11 +2347,15 @@ def _optional_operation_text(value: Any, maximum: int) -> str | None:
 
 def _serialize_context_entries(
     entries: tuple[Mapping[str, Any], ...],
+    *,
+    max_entries: int,
+    max_chars: int,
+    max_entry_chars: int,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
-    remaining_chars = _MAX_CONTEXT_CHARS
+    remaining_chars = max_chars
     for entry in reversed(entries):
-        if len(selected) >= _MAX_CONTEXT_ENTRIES or remaining_chars <= 0:
+        if len(selected) >= max_entries or remaining_chars <= 0:
             break
         if (
             str(entry.get("kind") or "message").strip() != "message"
@@ -1653,7 +2365,9 @@ def _serialize_context_entries(
         text = str(entry.get("text") or "").strip()
         if not text:
             continue
-        text = text[: min(_MAX_CONTEXT_ENTRY_CHARS, remaining_chars)]
+        # operations는 개별 메시지를 4k에서 잘라 학습 원문을
+        # 훼손하지 않고, 최신 문맥 전체 12k budget만 적용한다.
+        text = text[: min(max_entry_chars, remaining_chars)]
         serialized: dict[str, Any] = {
             "kind": "message",
             "source": "slack",
@@ -1681,6 +2395,210 @@ def _is_valid_created_at(value: str) -> bool:
     return True
 
 
+def _normalize_first_replied_at_utc(
+    value: datetime | str | None,
+    *,
+    request_id: str,
+) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = (
+            value
+            if isinstance(value, datetime)
+            else datetime.fromisoformat(
+                str(value).strip().replace("Z", "+00:00")
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise CompanyApiContractError(
+            "company_api_request_log_delivery_invalid",
+            request_id=request_id,
+        ) from exc
+    if parsed.tzinfo is None:
+        raise CompanyApiContractError(
+            "company_api_request_log_delivery_invalid",
+            request_id=request_id,
+        )
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _validated_slack_audit_permalink(
+    value: Any,
+    *,
+    channel_id: str,
+    message_ts: str,
+    thread_ts: str,
+    request_id: str,
+) -> str:
+    normalized = str(value or "").strip()
+    try:
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise CompanyApiContractError(
+            "company_api_audit_context_invalid",
+            request_id=request_id,
+        ) from exc
+    hostname = str(parsed.hostname or "").casefold()
+    matched_path = re.fullmatch(
+        rf"/archives/({re.escape(channel_id)})/p(\d+)/?",
+        parsed.path,
+    )
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query_keys = [key for key, _item in query_pairs]
+    query = dict(query_pairs)
+    if (
+        not normalized
+        or len(normalized) > 2_048
+        or parsed.scheme != "https"
+        or not hostname.endswith(".slack.com")
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or matched_path is None
+        or matched_path.group(2) != message_ts.replace(".", "")
+        or parsed.fragment
+        or len(query_keys) != len(set(query_keys))
+        or any(key not in {"thread_ts", "cid"} for key in query_keys)
+        or query.get("cid", channel_id) != channel_id
+        or query.get("thread_ts", thread_ts) != thread_ts
+    ):
+        raise CompanyApiContractError(
+            "company_api_audit_context_invalid",
+            request_id=request_id,
+        )
+    return normalized
+
+
+def _serialize_audit_context(
+    value: Any,
+    *,
+    request: CompanyAssistantRequest,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise CompanyApiContractError(
+            "company_api_audit_context_invalid",
+            request_id=request.request_id,
+        )
+    required_keys = {
+        "event_type",
+        "channel_id",
+        "message_id",
+        "thread_id",
+        "is_thread_root",
+    }
+    allowed_keys = {
+        *required_keys,
+        "user_name",
+        "permalink",
+        "thread_permalink",
+    }
+    raw_channel_id = value.get("channel_id")
+    raw_message_id = value.get("message_id")
+    raw_thread_id = value.get("thread_id")
+    channel_id = (
+        raw_channel_id.strip()
+        if isinstance(raw_channel_id, str)
+        else ""
+    )
+    message_id = (
+        raw_message_id.strip()
+        if isinstance(raw_message_id, str)
+        else ""
+    )
+    thread_id = (
+        raw_thread_id.strip()
+        if isinstance(raw_thread_id, str)
+        else ""
+    )
+    is_thread_root = value.get("is_thread_root")
+    request_channel_id = str(
+        request.metadata.get("channel_id") or ""
+    ).strip()
+    request_message_id = str(
+        request.metadata.get("message_id") or ""
+    ).strip()
+    if (
+        not required_keys.issubset(value)
+        or any(key not in allowed_keys for key in value)
+        or value.get("event_type") != "app_mention"
+        or _SLACK_CHANNEL_ID_PATTERN.fullmatch(channel_id) is None
+        or _SLACK_MESSAGE_TS_PATTERN.fullmatch(message_id) is None
+        or _SLACK_MESSAGE_TS_PATTERN.fullmatch(thread_id) is None
+        or type(is_thread_root) is not bool
+        or is_thread_root != (message_id == thread_id)
+        or request_channel_id != channel_id
+        or request_message_id != message_id
+        or str(request.conversation_id or "").strip() != thread_id
+    ):
+        raise CompanyApiContractError(
+            "company_api_audit_context_invalid",
+            request_id=request.request_id,
+        )
+
+    user_name_value = value.get("user_name")
+    user_name = (
+        user_name_value.strip()
+        if isinstance(user_name_value, str)
+        else None
+    )
+    if (
+        (user_name_value is not None and not isinstance(user_name_value, str))
+        or (
+            user_name is not None
+            and (
+                not user_name
+                or len(user_name) > 160
+                or not user_name.isprintable()
+            )
+        )
+    ):
+        raise CompanyApiContractError(
+            "company_api_audit_context_invalid",
+            request_id=request.request_id,
+        )
+
+    payload: dict[str, Any] = {
+        "eventType": "app_mention",
+        "channelId": channel_id,
+        "messageId": message_id,
+        "threadId": thread_id,
+        "isThreadRoot": is_thread_root,
+    }
+    if user_name is not None:
+        payload["userName"] = user_name
+    permalink = value.get("permalink")
+    if permalink is not None:
+        if not isinstance(permalink, str):
+            raise CompanyApiContractError(
+                "company_api_audit_context_invalid",
+                request_id=request.request_id,
+            )
+        payload["permalink"] = _validated_slack_audit_permalink(
+            permalink,
+            channel_id=channel_id,
+            message_ts=message_id,
+            thread_ts=thread_id,
+            request_id=request.request_id,
+        )
+    thread_permalink = value.get("thread_permalink")
+    if thread_permalink is not None:
+        if not isinstance(thread_permalink, str):
+            raise CompanyApiContractError(
+                "company_api_audit_context_invalid",
+                request_id=request.request_id,
+            )
+        payload["threadPermalink"] = _validated_slack_audit_permalink(
+            thread_permalink,
+            channel_id=channel_id,
+            message_ts=thread_id,
+            thread_ts=thread_id,
+            request_id=request.request_id,
+        )
+    return payload
+
+
 def _serialize_scope(metadata: Mapping[str, Any]) -> dict[str, Any]:
     scope: dict[str, Any] = {}
     barcode = str(metadata.get("barcode") or "").strip()
@@ -1706,12 +2624,76 @@ def _serialize_scope(metadata: Mapping[str, Any]) -> dict[str, Any]:
     if followup_kind in {"recording_failure", "barcode_log"}:
         # 임의 metadata는 버리고 API schema가 허용한 두 후속 유형만 전달한다.
         scope["followupKind"] = followup_kind
+
+    actor_name = _normalized_scope_text(metadata.get("actor_name"))
+    if actor_name:
+        # operation 이력과 학습 페이지의 표시 이름만 전달하며 actor 권한은
+        # 계속 top-level actorId와 service caller 검증으로 결정한다.
+        scope["actorName"] = actor_name
+
+    thread_permalink = str(
+        metadata.get("thread_permalink") or ""
+    ).strip()
+    if thread_permalink:
+        parsed_permalink = urlsplit(thread_permalink)
+        hostname = str(parsed_permalink.hostname or "").casefold()
+        if (
+            len(thread_permalink) <= 2_048
+            and parsed_permalink.scheme == "https"
+            and hostname.endswith(".slack.com")
+            and parsed_permalink.username is None
+            and parsed_permalink.password is None
+            and parsed_permalink.path.startswith("/archives/")
+            and not parsed_permalink.fragment
+        ):
+            scope["threadPermalink"] = thread_permalink
+
+    trusted_scope = metadata.get("trusted_mda_recovery_scope")
+    if isinstance(trusted_scope, Mapping):
+        barcode_value = str(trusted_scope.get("barcode") or "").strip()
+        log_date = str(trusted_scope.get("logDate") or "").strip()
+        device_name = str(trusted_scope.get("deviceName") or "").strip()
+        hospital_name = _normalized_scope_text(
+            trusted_scope.get("hospitalName"),
+            maximum=200,
+        )
+        room_name = _normalized_scope_text(
+            trusted_scope.get("roomName"),
+            maximum=200,
+        )
+        valid_log_date = False
+        try:
+            datetime.strptime(log_date, "%Y-%m-%d")
+            valid_log_date = True
+        except ValueError:
+            pass
+        if (
+            re.fullmatch(r"\d{11}", barcode_value)
+            and valid_log_date
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_-]{2,63}",
+                device_name,
+            )
+            and hospital_name
+            and room_name
+        ):
+            scope["trustedMdaRecoveryScope"] = {
+                "barcode": barcode_value,
+                "logDate": log_date,
+                "deviceName": device_name,
+                "hospitalName": hospital_name,
+                "roomName": room_name,
+            }
     return scope
 
 
-def _normalized_scope_text(value: Any) -> str | None:
+def _normalized_scope_text(
+    value: Any,
+    *,
+    maximum: int = 160,
+) -> str | None:
     normalized = " ".join(str(value or "").split())
-    if not normalized or len(normalized) > 160:
+    if not normalized or len(normalized) > maximum or not normalized.isprintable():
         return None
     return normalized
 
@@ -1745,15 +2727,207 @@ def _response_status(response: Any) -> int:
         ) from exc
 
 
+def _response_media_type(response: Any) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    return str(headers.get("content-type") or "").split(
+        ";", 1
+    )[0].strip().lower()
+
+
+def _progress_ambiguous_error(
+    request_id: str,
+    *,
+    code: str,
+) -> CompanyApiAmbiguousTimeoutError:
+    return CompanyApiAmbiguousTimeoutError(
+        "company_api_progress_incomplete",
+        code=code,
+        request_id=request_id,
+    )
+
+
+def _strict_json_object(raw_line: bytes) -> dict[str, Any]:
+    try:
+        decoded = raw_line.decode("utf-8", errors="strict")
+
+        def build_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            keys = [key for key, _value in pairs]
+            if len(keys) != len(set(keys)):
+                raise ValueError("duplicate JSON key")
+            return dict(pairs)
+
+        payload = json.loads(decoded, object_pairs_hook=build_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CompanyApiContractError(
+            "company_api_progress_frame_invalid"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CompanyApiContractError(
+            "company_api_progress_frame_invalid"
+        )
+    return payload
+
+
+def _deserialize_progress_stream(
+    response: Any,
+    *,
+    request_id: str,
+    on_partial_result: Callable[[CompanyAssistantResult], None],
+) -> CompanyAssistantResult:
+    """엄격한 NDJSON 순서를 읽고 final 직후 transport를 닫게 반환한다."""
+
+    try:
+        iterator = iter(
+            response.iter_lines(
+                # update dispatch·barcode 근거 frame은 대부분 작다.
+                # 읽기 buffer가 차거나 final이 올 때까지 밀리지
+                # 않게 newline을 받는 즉시 frame을 완성한다.
+                chunk_size=1,
+                decode_unicode=False,
+            )
+        )
+    except Exception as exc:
+        raise _progress_ambiguous_error(
+            request_id,
+            code="stream_unreadable",
+        ) from exc
+
+    total_bytes = 0
+    stream_route: str | None = None
+    while True:
+        try:
+            raw_line = next(iterator)
+        except StopIteration as exc:
+            # terminal final 없이 정상 EOF가 와도 작업 완료 여부는 불명이다.
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_incomplete",
+            ) from exc
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.RequestException,
+        ) as exc:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_interrupted",
+            ) from exc
+        except Exception as exc:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_unreadable",
+            ) from exc
+
+        if not isinstance(raw_line, (bytes, bytearray)) or not raw_line:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_frame_invalid",
+            )
+        total_bytes += len(raw_line) + 1
+        if total_bytes > _MAX_RESPONSE_BYTES:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_too_large",
+            )
+        try:
+            frame = _strict_json_object(bytes(raw_line))
+        except CompanyApiContractError as exc:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_frame_invalid",
+            ) from exc
+
+        frame_type = frame.get("type")
+        if frame_type == "heartbeat":
+            if (
+                tuple(frame) != _STREAM_HEARTBEAT_KEYS
+                or frame.get("requestId") != request_id
+            ):
+                raise _progress_ambiguous_error(
+                    request_id,
+                    code="stream_frame_invalid",
+                )
+            continue
+        if frame_type == "error":
+            if (
+                tuple(frame) != _STREAM_ERROR_KEYS
+                or not isinstance(frame.get("problem"), dict)
+                or not _valid_stream_problem(
+                    frame["problem"],
+                    request_id=request_id,
+                )
+            ):
+                raise _progress_ambiguous_error(
+                    request_id,
+                    code="stream_frame_invalid",
+                )
+            raise _progress_ambiguous_error(
+                request_id,
+                code=str(frame["problem"]["code"]),
+            )
+        if frame_type not in {"partial", "final"}:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_frame_invalid",
+            )
+        if (
+            tuple(frame) != _STREAM_RESULT_KEYS
+            or not isinstance(frame.get("result"), dict)
+        ):
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_frame_invalid",
+            )
+        try:
+            result = _deserialize_result_payload(
+                frame["result"],
+                request_id,
+            )
+        except CompanyApiContractError as exc:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_result_invalid",
+            ) from exc
+        route = result.route
+        if stream_route is not None and stream_route != route:
+            raise _progress_ambiguous_error(
+                request_id,
+                code="stream_route_mismatch",
+            )
+        stream_route = route
+        if frame_type == "final":
+            return result
+        # parsing/transport 예외와 local Slack renderer 예외를 구분하기 위해
+        # callback은 위의 frame 검증 블록 밖에서 그대로 호출한다.
+        on_partial_result(result)
+
+
+def _valid_stream_problem(
+    value: dict[str, Any],
+    *,
+    request_id: str,
+) -> bool:
+    return bool(
+        tuple(value)
+        == ("type", "title", "status", "code", "requestId", "retryable")
+        and type(value.get("status")) is int
+        and 500 <= value["status"] <= 599
+        and value.get("code") in _PROBLEM_CODES
+        and value.get("requestId") == request_id
+        and type(value.get("retryable")) is bool
+        and _safe_text(value.get("title"), maximum=256)
+        and value.get("type")
+        == f"urn:boxer-company-api:problem:{value.get('code')}"
+    )
+
+
 def _load_json_object(
     response: Any,
     *,
     expected_media_type: str,
 ) -> dict[str, Any]:
-    headers = getattr(response, "headers", {}) or {}
-    content_type = str(headers.get("content-type") or "").split(
-        ";", 1
-    )[0].strip().lower()
+    content_type = _response_media_type(response)
     if content_type != expected_media_type:
         raise CompanyApiContractError(
             "company_api_response_content_type_invalid"
@@ -1812,6 +2986,13 @@ def _deserialize_result(
         response,
         expected_media_type="application/json",
     )
+    return _deserialize_result_payload(payload, request_id)
+
+
+def _deserialize_result_payload(
+    payload: dict[str, Any],
+    request_id: str,
+) -> CompanyAssistantResult:
     if (
         frozenset(payload)
         not in {_TURN_KEYS, _TURN_WITH_OPERATION_RESULT_KEYS}
@@ -1875,6 +3056,15 @@ def _deserialize_operation_result(
             request_id=request_id,
         )
     kind = value.get("kind")
+    if kind == "device_file_download_delivery":
+        _validate_device_file_download_delivery_result(
+            value,
+            request_id,
+        )
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    if kind == "device_operation_delivery":
+        _validate_device_operation_delivery_result(value, request_id)
+        return json.loads(json.dumps(value, ensure_ascii=False))
     if kind == "sms_delivery":
         if (
             frozenset(value) != _SMS_DELIVERY_RESULT_KEYS
@@ -1921,6 +3111,138 @@ def _deserialize_operation_result(
     _validate_sms_operation_target(value.get("target"), request_id)
     # 검증된 새 dict만 반환해 response 객체의 mutation이나 aliasing을 막는다.
     return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _validate_device_file_download_delivery_result(
+    value: dict[str, Any],
+    request_id: str,
+) -> None:
+    raw_links = value.get("links")
+    failure_notice = value.get("failureNotice")
+    valid = bool(
+        frozenset(value) == _DEVICE_FILE_DOWNLOAD_DELIVERY_RESULT_KEYS
+        and value.get("kind") == "device_file_download_delivery"
+        and value.get("status") == "pending"
+        # legacy 실패 안내는 여러 줄이므로 일반 source text의
+        # 개행 금지 검증을 적용하지 않는다.
+        and isinstance(failure_notice, str)
+        and bool(failure_notice.strip())
+        and len(failure_notice) <= _MAX_MESSAGE_CHARS
+        and type(value.get("linkCount")) is int
+        and value["linkCount"] >= 1
+        and isinstance(raw_links, list)
+        and len(raw_links) == value["linkCount"]
+    )
+    if valid:
+        valid = all(
+            isinstance(item, dict)
+            and frozenset(item)
+            == _DEVICE_FILE_DOWNLOAD_LINK_CONTEXT_KEYS
+            and _safe_text(item.get("deviceName"), maximum=160)
+            and _safe_text(item.get("fileName"), maximum=255)
+            for item in raw_links
+        )
+    if valid:
+        try:
+            _validate_download_delivery_manifest(
+                value.get("delivery"),
+                request_id,
+            )
+        except CompanyApiContractError:
+            valid = False
+    if not valid:
+        raise CompanyApiContractError(
+            "company_api_operation_result_invalid",
+            request_id=request_id,
+        )
+
+
+def _validate_device_operation_delivery_result(
+    value: dict[str, Any],
+    request_id: str,
+) -> None:
+    if (
+        frozenset(value) != _DEVICE_OPERATION_DELIVERY_RESULT_KEYS
+        or value.get("kind") != "device_operation_delivery"
+        or value.get("status") != "pending"
+        or not isinstance(value.get("delivery"), Mapping)
+    ):
+        raise CompanyApiContractError(
+            "company_api_operation_result_invalid",
+            request_id=request_id,
+        )
+    _validate_device_operation_delivery_manifest(
+        value["delivery"],
+        request_id,
+    )
+
+
+def _validate_device_operation_delivery_manifest(
+    value: Mapping[str, Any],
+    request_id: str,
+) -> None:
+    route = value.get("route")
+    device_name = value.get("deviceName")
+    requested_version = value.get("requestedVersion")
+    current_box_version = value.get("currentBoxVersion")
+    dispatch_message = value.get("dispatchMessage")
+    wait_status = value.get("waitStatus")
+    wait_ok = value.get("waitOk")
+    version_pattern = r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}"
+    valid_requested_version = bool(
+        isinstance(requested_version, str)
+        and (
+            (
+                route == "device_box_update"
+                and re.fullmatch(version_pattern, requested_version)
+            )
+            or (
+                route == "device_agent_update"
+                and requested_version == "latest"
+            )
+            or (
+                route == "device_power_off"
+                and requested_version == ""
+            )
+        )
+    )
+    valid = bool(
+        frozenset(value) == _DEVICE_OPERATION_DELIVERY_KEYS
+        and route
+        in {
+            "device_box_update",
+            "device_agent_update",
+            "device_power_off",
+        }
+        and isinstance(device_name, str)
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}",
+            device_name,
+        )
+        and valid_requested_version
+        and isinstance(current_box_version, str)
+        and (
+            not current_box_version
+            or re.fullmatch(version_pattern, current_box_version)
+        )
+        and isinstance(dispatch_message, str)
+        and len(dispatch_message) <= 300
+        and (
+            not dispatch_message
+            or (
+                dispatch_message == dispatch_message.strip()
+                and dispatch_message.isprintable()
+            )
+        )
+        and wait_status in {"completed", "timed_out"}
+        and type(wait_ok) is bool
+        and ((wait_status == "completed") is wait_ok)
+    )
+    if not valid:
+        raise CompanyApiContractError(
+            "company_api_operation_result_invalid",
+            request_id=request_id,
+        )
 
 
 def _validate_security_review_operation_result(
@@ -2031,7 +3353,6 @@ def _deserialize_message(
     private_links_value = value.get("privateLinks", [])
     if (
         not isinstance(private_links_value, list)
-        or len(private_links_value) > _MAX_PRIVATE_LINKS
         or (
             private_links_value
             and value["deliveryScope"] != "requester"

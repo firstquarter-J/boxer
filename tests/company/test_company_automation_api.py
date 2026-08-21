@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
+import json
 from pathlib import Path
 import stat
 from typing import Any
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -296,7 +298,7 @@ def test_invalid_request_is_rejected_before_inflight_is_persisted(
     assert "must-not-be-stored" not in state_path.read_text(encoding="utf-8")
 
 
-def test_admission_rejects_stale_schedule_before_state_is_persisted(
+def test_admission_keeps_slack_schedule_when_api_clock_differs(
     tmp_path: Path,
 ) -> None:
     handler = _WeeklyHandler()
@@ -307,14 +309,14 @@ def test_admission_rejects_stale_schedule_before_state_is_persisted(
         clock=lambda: _NOW + timedelta(minutes=3),
     )
 
-    with pytest.raises(AutomationCycleContractError):
-        coordinator.run(_trigger("cycle:stale"))
+    result = coordinator.run(_trigger("cycle:stale"))
 
-    assert handler.calls == 0
-    assert not state_path.exists()
+    assert result.outcome == "completed"
+    assert handler.calls == 1
+    assert state_path.exists()
 
 
-def test_coordinator_canonicalizes_accepted_client_time_to_server_clock(
+def test_coordinator_preserves_slack_scheduled_at_for_domain_execution(
     tmp_path: Path,
 ) -> None:
     handler = _DailyHandler()
@@ -339,7 +341,6 @@ def test_coordinator_canonicalizes_accepted_client_time_to_server_clock(
         AutomationCycleService((handler,)),  # type: ignore[arg-type]
         JsonAutomationCycleStateStore(state_path),
         clock=lambda: server_now,
-        daily_options_provider=lambda: canonical,
     )
 
     coordinator.run(
@@ -353,8 +354,72 @@ def test_coordinator_canonicalizes_accepted_client_time_to_server_clock(
         )
     )
 
-    assert handler.requests[0].scheduled_at == server_now
-    assert client_time != handler.requests[0].scheduled_at
+    assert handler.requests[0].scheduled_at == client_time
+    assert client_time != server_now
+
+
+def test_daily_progress_is_cas_persisted_before_failed_run_returns(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class _FailingProgressHandler:
+        name: str = "daily_device_round"
+
+        def run(
+            self,
+            request: AutomationCycleRequest,
+        ) -> AutomationCycleResult:
+            assert request.progress_callback is not None
+            request.progress_callback(
+                {
+                    **dict(request.cursor),
+                    "activeHospitalSeq": 22,
+                    "activeHospitalName": "테스트병원",
+                    "activeHospitalStartedAt": _NOW.isoformat(),
+                    "activeHospitalDeviceCount": 2,
+                    "activeDeviceIndex": 1,
+                    "activeDeviceName": "MB2-TEST",
+                    "activeDeviceUpdatedAt": _NOW.isoformat(),
+                }
+            )
+            raise RuntimeError("synthetic device failure")
+
+    state_path = tmp_path / "daily-progress.json"
+    coordinator = DurableAutomationCycleCoordinator(
+        AutomationCycleService((_FailingProgressHandler(),)),  # type: ignore[arg-type]
+        JsonAutomationCycleStateStore(state_path),
+        clock=lambda: _NOW,
+    )
+    options = {
+        "autoUpdateAgent": False,
+        "autoUpdateBoxFree": False,
+        "autoUpdateBoxPaid": False,
+        "autoCleanupTrashCan": False,
+        "autoPowerOff": False,
+    }
+
+    with pytest.raises(RuntimeError, match="synthetic device failure"):
+        coordinator.run(
+            AutomationCycleTrigger(
+                request_id="cycle:daily:progress-failed",
+                tenant_id="T1",
+                cycle="daily_device_round",
+                cycle_key="daily:2026-08-10",
+                scheduled_at=_NOW,
+                options=options,
+            )
+        )
+
+    document = json.loads(state_path.read_text(encoding="utf-8"))
+    state = next(iter(document["cycles"].values()))
+    # handler 완료를 기다리지 않고 device_started 시점의 active cursor와
+    # 같은 request in-flight가 한 revision에 함께 남는다.
+    assert state["cursor"]["activeHospitalSeq"] == 22
+    assert state["cursor"]["activeDeviceIndex"] == 1
+    assert state["cursor"]["activeDeviceName"] == "MB2-TEST"
+    assert state["inFlight"]["requestId"] == (
+        "cycle:daily:progress-failed"
+    )
 
 
 @pytest.mark.parametrize(
@@ -379,17 +444,7 @@ def test_admission_rejects_noncanonical_cycle_keys(
     )
 
     with pytest.raises(AutomationCycleContractError):
-        validate_automation_trigger_admission(
-            trigger,
-            now=_NOW,
-            daily_options={
-                "autoUpdateAgent": False,
-                "autoUpdateBoxFree": False,
-                "autoUpdateBoxPaid": False,
-                "autoCleanupTrashCan": False,
-                "autoPowerOff": False,
-            },
-        )
+        validate_automation_trigger_admission(trigger)
 
 
 def test_health_input_rejects_slack_owned_alert_delivery_option() -> None:
@@ -486,51 +541,34 @@ def test_health_seed_schema_is_validated_before_pending_delivery_replay(
     assert store.load(state_key)["pendingDeliveries"] == [pending]
 
 
-def test_daily_admission_uses_server_window_key_and_exact_mutation_options(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from boxer_company_api import automation as automation_api
-
+def test_daily_admission_uses_slack_window_key_and_runtime_options() -> None:
     daily_now = datetime(2026, 8, 10, 23, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-    canonical_options = {
+    runtime_options = {
         "autoUpdateAgent": True,
-        "autoUpdateBoxFree": False,
-        "autoUpdateBoxPaid": False,
+        "autoUpdateBoxFree": True,
+        "autoUpdateBoxPaid": True,
         "autoCleanupTrashCan": True,
         "autoPowerOff": False,
     }
-    monkeypatch.setattr(
-        automation_api.company_settings,
-        "DAILY_DEVICE_ROUND_HOUR_KST",
-        22,
-    )
-    monkeypatch.setattr(
-        automation_api.company_settings,
-        "DAILY_DEVICE_ROUND_MINUTE_KST",
-        0,
-    )
-    monkeypatch.setattr(
-        automation_api.company_settings,
-        "DAILY_DEVICE_ROUND_END_HOUR_KST",
-        6,
-    )
-    monkeypatch.setattr(
-        automation_api.company_settings,
-        "DAILY_DEVICE_ROUND_END_MINUTE_KST",
-        0,
-    )
     valid = AutomationCycleTrigger(
         request_id="cycle:daily:valid",
         tenant_id="T1",
         cycle="daily_device_round",
         cycle_key="daily:2026-08-10",
         scheduled_at=daily_now,
-        options=canonical_options,
+        options=runtime_options,
     )
+    validate_automation_trigger_admission(valid)
+    # API 서버의 별도 window 재판정 없이 Slack이 due로 확정한 같은 날짜를 받는다.
     validate_automation_trigger_admission(
-        valid,
-        now=daily_now,
-        daily_options=canonical_options,
+        AutomationCycleTrigger(
+            request_id="cycle:daily:slack-midday",
+            tenant_id="T1",
+            cycle="daily_device_round",
+            cycle_key="daily:2026-08-10",
+            scheduled_at=daily_now.replace(hour=12),
+            options=runtime_options,
+        )
     )
 
     for invalid in (
@@ -540,31 +578,31 @@ def test_daily_admission_uses_server_window_key_and_exact_mutation_options(
             cycle="daily_device_round",
             cycle_key="daily:2026-08-09",
             scheduled_at=daily_now,
-            options=canonical_options,
+            options=runtime_options,
         ),
         AutomationCycleTrigger(
-            request_id="cycle:daily:wrong-option",
+            request_id="cycle:daily:missing-option",
             tenant_id="T1",
             cycle="daily_device_round",
             cycle_key="daily:2026-08-10",
             scheduled_at=daily_now,
-            options={**canonical_options, "autoPowerOff": True},
+            options={
+                key: value
+                for key, value in runtime_options.items()
+                if key != "autoPowerOff"
+            },
         ),
         AutomationCycleTrigger(
-            request_id="cycle:daily:outside-window",
+            request_id="cycle:daily:non-bool-option",
             tenant_id="T1",
             cycle="daily_device_round",
             cycle_key="daily:2026-08-10",
-            scheduled_at=daily_now.replace(hour=12),
-            options=canonical_options,
+            scheduled_at=daily_now,
+            options={**runtime_options, "autoPowerOff": 1},
         ),
     ):
         with pytest.raises(AutomationCycleContractError):
-            validate_automation_trigger_admission(
-                invalid,
-                now=invalid.scheduled_at,
-                daily_options=canonical_options,
-            )
+            validate_automation_trigger_admission(invalid)
 
 
 @pytest.mark.parametrize(
@@ -589,17 +627,7 @@ def test_ack_only_accepts_exact_historical_key_without_domain_admission(
         ack_only=True,
     )
 
-    validate_automation_trigger_admission(
-        trigger,
-        now=_NOW,
-        daily_options={
-            "autoUpdateAgent": False,
-            "autoUpdateBoxFree": False,
-            "autoUpdateBoxPaid": False,
-            "autoCleanupTrashCan": False,
-            "autoPowerOff": False,
-        },
-    )
+    validate_automation_trigger_admission(trigger)
 
 
 @pytest.mark.parametrize(
@@ -624,31 +652,17 @@ def test_ack_only_still_rejects_malformed_or_cross_cycle_key(
     )
 
     with pytest.raises(AutomationCycleContractError):
-        validate_automation_trigger_admission(
-            trigger,
-            now=_NOW,
-            daily_options={},
-        )
+        validate_automation_trigger_admission(trigger)
 
 
-def test_daily_coordinator_rejects_env_mismatch_before_inflight_and_seeds_window(
+def test_daily_coordinator_accepts_runtime_override_and_seeds_window(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from boxer_company_api import automation as automation_api
-
-    for key, value in (
-        ("DAILY_DEVICE_ROUND_HOUR_KST", 22),
-        ("DAILY_DEVICE_ROUND_MINUTE_KST", 0),
-        ("DAILY_DEVICE_ROUND_END_HOUR_KST", 6),
-        ("DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
-    ):
-        monkeypatch.setattr(automation_api.company_settings, key, value)
     now = datetime(2026, 8, 11, 1, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-    canonical = {
-        "autoUpdateAgent": False,
-        "autoUpdateBoxFree": False,
-        "autoUpdateBoxPaid": False,
+    runtime_options = {
+        "autoUpdateAgent": True,
+        "autoUpdateBoxFree": True,
+        "autoUpdateBoxPaid": True,
         "autoCleanupTrashCan": True,
         "autoPowerOff": False,
     }
@@ -658,7 +672,6 @@ def test_daily_coordinator_rejects_env_mismatch_before_inflight_and_seeds_window
         AutomationCycleService((handler,)),  # type: ignore[arg-type]
         JsonAutomationCycleStateStore(state_path),
         clock=lambda: now,
-        daily_options_provider=lambda: canonical,
     )
 
     with pytest.raises(AutomationCycleContractError):
@@ -669,7 +682,7 @@ def test_daily_coordinator_rejects_env_mismatch_before_inflight_and_seeds_window
                 cycle="daily_device_round",
                 cycle_key="daily:2026-08-10",
                 scheduled_at=now,
-                options={**canonical, "autoPowerOff": True},
+                options={"autoPowerOff": True},
             )
         )
     assert not state_path.exists()
@@ -682,7 +695,7 @@ def test_daily_coordinator_rejects_env_mismatch_before_inflight_and_seeds_window
             cycle="daily_device_round",
             cycle_key="daily:2026-08-10",
             scheduled_at=now,
-            options=canonical,
+            options=runtime_options,
         )
     )
 
@@ -833,6 +846,39 @@ def test_api_cycle_uses_machine_capability_without_human_actor(
     assert "cursor" not in response.json()
     assert len(coordinator.triggers) == 1
     assert coordinator.triggers[0].tenant_id == "T1"
+
+
+def test_api_cycle_uses_per_device_ssh_open_budget(
+    tmp_path: Path,
+) -> None:
+    coordinator = _CapturingCoordinator()
+    app = create_company_api_app(
+        settings=_api_settings(
+            tmp_path,
+            capabilities=frozenset(
+                {
+                    "assistant.turn.read",
+                    "assistant.automation.execute",
+                }
+            ),
+        ),
+        assistant_runtime=object(),  # type: ignore[arg-type]
+        readiness_probe=lambda: True,
+        automation_coordinator=coordinator,
+    )
+
+    with patch(
+        "boxer_company_api.app.company_api_device_ssh_context"
+    ) as ssh_context:
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/automation/cycles",
+                headers=_cycle_headers(),
+                json=_cycle_payload(),
+            )
+
+    assert response.status_code == 200
+    ssh_context.assert_called_once_with(per_device_open_budget=True)
 
 
 def test_api_cycle_rejects_caller_without_automation_capability(

@@ -302,7 +302,14 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
             )
 
         self.assertTrue(handled)
+        # Slack local rollback은 이전과 같이 helper 기본값을 사용해
+        # 필요하면 기존 SSH-open 재전송 흐름까지 그대로 유지한다.
         build_evidence.assert_called_once()
+        self.assertEqual(
+            build_evidence.call_args.args[0],
+            "왜 반복 재시작해?",
+        )
+        self.assertEqual(build_evidence.call_args.kwargs, {})
         self.assertEqual(len(synth_calls), 1)
         self.assertEqual(synth_calls[0][2], "device diagnostic followup")
         self.assertEqual(synth_calls[0][3], 500)

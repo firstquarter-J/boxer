@@ -323,6 +323,79 @@ def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
         assert forbidden not in serialized
 
 
+def test_daily_cycle_checkpoints_each_legacy_progress_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoints: list[dict[str, Any]] = []
+
+    def _fake_summary(**kwargs: Any) -> dict[str, Any]:
+        progress = kwargs["progress_callback"]
+        progress(
+            "hospital_started",
+            {
+                "hospitalSeq": 22,
+                "hospitalName": "테스트병원",
+                "deviceCount": 2,
+                "startedAt": "2026-08-10T09:00:00+09:00",
+            },
+        )
+        progress(
+            "device_started",
+            {
+                "hospitalSeq": 22,
+                "hospitalName": "테스트병원",
+                "deviceCount": 2,
+                "deviceIndex": 1,
+                "deviceName": "MB2-TEST",
+                "updatedAt": "2026-08-10T09:01:00+09:00",
+            },
+        )
+        return {
+            "hospitalSeq": 22,
+            "hospitalName": "테스트병원",
+            "deviceCount": 1,
+            "candidateHospitalCount": 1,
+            "hospitalScope": "all",
+            "hospitalOrder": "hospital_seq_asc",
+            "statusCounts": {"정상": 1},
+            "deviceResults": [],
+        }
+
+    monkeypatch.setattr(
+        automation,
+        "_build_daily_device_round_summary",
+        _fake_summary,
+    )
+    request = AutomationCycleRequest(
+        request_id="cycle:progress:1",
+        tenant_id="lifex",
+        cycle="daily_device_round",
+        scheduled_at=datetime(2026, 8, 10, 9, 0, tzinfo=_KST),
+        cursor={"windowKey": "2026-08-10"},
+        options={
+            "autoUpdateAgent": False,
+            "autoUpdateBoxFree": False,
+            "autoUpdateBoxPaid": False,
+            "autoCleanupTrashCan": False,
+            "autoPowerOff": False,
+        },
+        progress_callback=lambda cursor: checkpoints.append(dict(cursor)),
+    )
+
+    result = DailyDeviceRoundCycleHandler().run(request)
+
+    assert len(checkpoints) == 2
+    assert checkpoints[0]["activeHospitalSeq"] == 22
+    assert "activeDeviceIndex" not in checkpoints[0]
+    assert checkpoints[1]["activeHospitalStartedAt"] == (
+        "2026-08-10T09:00:00+09:00"
+    )
+    assert checkpoints[1]["activeDeviceIndex"] == 1
+    assert checkpoints[1]["activeDeviceName"] == "MB2-TEST"
+    # 병원 실행 완료 cursor는 local reporter처럼 active progress를 닫는다.
+    assert "activeHospitalSeq" not in result.cursor
+
+
 def test_daily_cycle_rejects_non_boolean_mutation_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

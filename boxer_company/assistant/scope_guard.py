@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from typing import Any
 
 from boxer.context.entries import ContextEntry
@@ -17,9 +16,6 @@ from boxer_company.routers.barcode_log import (
     _extract_hospital_room_scope,
 )
 from boxer_company.utils import _extract_barcode
-
-
-_BARCODE_PATTERN = re.compile(r"(?<!\d)(\d{11})(?!\d)")
 
 
 class AssistantRequestScopeMismatch(ValueError):
@@ -40,10 +36,6 @@ def resolve_assistant_request_scope(
     request: CompanyAssistantRequest,
 ) -> AssistantRequestScope:
     """질문과 adapter scope가 함께 있으면 일치할 때만 조회 범위로 확정한다."""
-    if len(set(_BARCODE_PATTERN.findall(request.question))) > 1:
-        # 기존 extractor는 첫 바코드만 고른다. 복수 대상 질문을 한 건으로
-        # 축소하면 다른 사용자·장비 근거를 조용히 조회할 수 있어 차단한다.
-        raise AssistantRequestScopeMismatch("barcode")
     question_barcode = _extract_barcode(request.question)
     question_hospital, question_room = _extract_hospital_room_scope(
         request.question

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import tempfile
+import threading
 import unittest
 from typing import Any
 from unittest.mock import patch
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from boxer_company.assistant.contracts import (
+    AssistantLink,
     AssistantMessage,
     CompanyAssistantResult,
     SourceReference,
@@ -15,7 +25,12 @@ from boxer_company.assistant.contracts import (
 from boxer_company_adapter_slack.company_api_client import (
     _deserialize_result,
 )
-from boxer_company_api.app import create_company_api_app
+from boxer_company_api.app import (
+    _initialize_request_log_readiness,
+    _secure_request_log_leaf,
+    create_company_api_app,
+)
+from boxer_company_api.schemas import AssistantTurnInput
 from boxer_company_api.settings import (
     CompanyApiCallerSettings,
     CompanyApiSettings,
@@ -48,7 +63,10 @@ class _FakeRuntime:
         self,
         request: Any,
         stage: str,
+        *,
+        on_partial_result: Any = None,
     ) -> CompanyAssistantResult | None:
+        del on_partial_result
         self.requests.append(request)
         self.stages.append(stage)
         if self.error is not None:
@@ -67,6 +85,7 @@ def _settings(
     live_device_enabled: bool = True,
     operations_enabled: bool = True,
     request_log_enabled: bool = False,
+    request_log_path: str = "/var/lib/boxer-company-api/request_log.db",
 ) -> CompanyApiSettings:
     callers = ()
     if configuration_error is None:
@@ -89,6 +108,7 @@ def _settings(
         live_device_enabled=live_device_enabled,
         operations_enabled=operations_enabled,
         request_log_enabled=request_log_enabled,
+        request_log_path=request_log_path,
     )
 
 
@@ -129,7 +149,289 @@ def _payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def _audit_context(
+    *,
+    message_id: str = "1784800000.000002",
+    user_name: str = "테스트 사용자",
+) -> dict[str, Any]:
+    """실제 Slack reply가 가진 thread/permalink identity를 고정한다."""
+
+    thread_id = "1784800000.000001"
+    return {
+        "eventType": "app_mention",
+        "userName": user_name,
+        "channelId": "C01",
+        "messageId": message_id,
+        "threadId": thread_id,
+        "isThreadRoot": False,
+        "permalink": (
+            "https://workspace.slack.com/archives/C01/"
+            f"p{message_id.replace('.', '')}"
+            f"?thread_ts={thread_id}&cid=C01"
+        ),
+        "threadPermalink": (
+            "https://workspace.slack.com/archives/C01/"
+            "p1784800000000001"
+        ),
+    }
+
+
+def _operations_audit_payload(
+    *,
+    message_id: str = "1784800000.000002",
+    operation_action: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    audit_context = _audit_context(message_id=message_id)
+    overrides: dict[str, Any] = {
+        "question": "MB2-C00419 박스 2.4.1 업데이트",
+        "conversationId": audit_context["threadId"],
+        "routeGroup": "operations",
+        "scope": {"channelContextId": audit_context["channelId"]},
+        "auditContext": audit_context,
+        "contextEntries": [],
+    }
+    if operation_action is not None:
+        overrides["operationAction"] = operation_action
+    return _payload(**overrides)
+
+
+def _read_request_log_rows(db_path: str) -> list[dict[str, Any]]:
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM request_log ORDER BY seq"
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
+
+
+def _direct_turn_request(
+    *,
+    request_id: str,
+    accept_ndjson: bool,
+) -> Request:
+    """TestClient body buffering 없이 endpoint 연결 수명만 분리해 검증한다."""
+
+    headers = [
+        (b"authorization", f"Bearer {_TOKEN}".encode("ascii")),
+        (b"x-request-id", request_id.encode("ascii")),
+    ]
+    if accept_ndjson:
+        headers.append((b"accept", b"application/x-ndjson"))
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/internal/v1/assistant/turns",
+            "raw_path": b"/internal/v1/assistant/turns",
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+        }
+    )
+
+
 class CompanyApiContractTests(unittest.TestCase):
+    def test_audit_context_and_request_log_receipt_reject_loose_wire_types(
+        self,
+    ) -> None:
+        valid_receipt = _operations_audit_payload(
+            operation_action={
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": True,
+                "replyCount": 1,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                "errorType": None,
+            }
+        )
+        invalid_payloads = (
+            {
+                **valid_receipt,
+                "operationAction": {
+                    **valid_receipt["operationAction"],
+                    "replyCount": "1",
+                },
+            },
+            {
+                **valid_receipt,
+                "auditContext": {
+                    **valid_receipt["auditContext"],
+                    "permalink": (
+                        "https://evil.example.com/archives/C01/"
+                        "p1784800000000002"
+                    ),
+                },
+            },
+            {
+                **valid_receipt,
+                "auditContext": {
+                    **valid_receipt["auditContext"],
+                    "messageId": 1784800000000002,
+                },
+            },
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload["auditContext"]):
+                with self.assertRaises(ValueError):
+                    AssistantTurnInput.model_validate(payload)
+
+    def test_typed_diagnostic_probe_is_strict_and_reaches_operations(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_diagnostic_followup",
+                outcome="no_evidence",
+                messages=(AssistantMessage(body="진단 상태 없음"),),
+                fallback_reason="diagnostic_snapshot_missing",
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="최근 종료 원인 알려줘",
+            routeGroup="operations",
+            contextEntries=[],
+            operationAction={
+                "name": "device_diagnostic_followup_probe",
+            },
+        )
+
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="diag-probe:accepted"),
+                json=payload,
+            )
+            rejected = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="diag-probe:rejected"),
+                json={
+                    **payload,
+                    "operationAction": {
+                        "name": "device_diagnostic_followup_probe",
+                        "phase": "probe",
+                    },
+                },
+            )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(rejected.json()["code"], "validation_failed")
+        self.assertEqual(runtime.stages, ["operations"])
+        self.assertEqual(
+            runtime.requests[0].metadata["operation_action"],
+            {"name": "device_diagnostic_followup_probe"},
+        )
+        self.assertEqual(runtime.requests[0].context_entries, ())
+
+    def test_only_freeform_schema_accepts_blank_question(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="company_freeform",
+                outcome="needs_input",
+                messages=(AssistantMessage(body="질문 내용을 같이 보내줘"),),
+                fallback_reason="missing_question",
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-empty-freeform"),
+                json=_payload(
+                    question="   ",
+                    routeGroup="freeform",
+                    contextEntries=[],
+                ),
+            )
+            rejected = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-empty-knowledge"),
+                json=_payload(
+                    question="   ",
+                    routeGroup="knowledge",
+                    contextEntries=[],
+                ),
+            )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["fallbackReason"], "missing_question")
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(rejected.json()["code"], "validation_failed")
+        self.assertEqual(runtime.stages, ["freeform"])
+        self.assertEqual(runtime.requests[0].question, "")
+
+    def test_fun_context_is_typed_and_keeps_five_k_verbatim(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="company_team_fun",
+                outcome="answered",
+                messages=(AssistantMessage(body="배포도 쉽지 않모대?"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        rendered_context = ("오" * 4_000) + "최신핵심" + ("신" * 996)
+
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-fun-context"),
+                json=_payload(
+                    question="배포도 쉽지 모대",
+                    routeGroup="fun",
+                    contextEntries=[],
+                    funContext=rendered_context,
+                ),
+            )
+            rejected = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-fun-context-wrong-stage"),
+                json=_payload(
+                    question="일반 질문",
+                    routeGroup="freeform",
+                    contextEntries=[],
+                    funContext=rendered_context,
+                ),
+            )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(
+            runtime.requests[0].metadata["team_fun_context"],
+            rendered_context,
+        )
+
     def test_live_device_feature_off_blocks_only_live_routes(self) -> None:
         runtime = _FakeRuntime(
             CompanyAssistantResult(
@@ -263,6 +565,720 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(replay.json(), first.json())
         self.assertEqual(len(runtime.requests), 1)
 
+    def test_download_delivery_ack_reuses_request_id_after_initial_turn(
+        self,
+    ) -> None:
+        download_uri = "https://download.example/a.motion.mp4?token=opaque"
+        delivery = {
+            "barcode": "48194663047",
+            "logDate": "2026-03-06",
+            "usedExpandedScope": False,
+            "records": [
+                {
+                    "deviceName": "MB2-C00419",
+                    "deviceSeq": 41,
+                    "hospitalSeq": 5,
+                    "hospitalRoomSeq": 8,
+                    "hospitalName": "테스트병원",
+                    "roomName": "1진료실",
+                    "fileNames": ["a.motion.mp4"],
+                    "downloadFileNames": ["a.motion.mp4"],
+                }
+            ],
+        }
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_file_download",
+                outcome="answered",
+                messages=(
+                    AssistantMessage(
+                        body="**장비 영상 다운로드 결과**",
+                        delivery_scope="requester",
+                        mention_actor=False,
+                        private_links=(
+                            AssistantLink(
+                                label="a.motion.mp4",
+                                uri=download_uri,
+                            ),
+                        ),
+                    ),
+                ),
+                operation_result={
+                    "kind": "device_file_download_delivery",
+                    "status": "pending",
+                    "failureNotice": "DM 전송 실패",
+                    "linkCount": 1,
+                    "links": [
+                        {
+                            "deviceName": "MB2-C00419",
+                            "fileName": "a.motion.mp4",
+                        }
+                    ],
+                    "delivery": delivery,
+                },
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-download-delivery-same-id"
+        initial_payload = _payload(
+            question="48194663047 2026-03-06 영상 다운로드",
+            routeGroup="operations",
+            scope={"channelContextId": "C01"},
+        )
+
+        with patch(
+            "boxer_company_api.app._persist_turn_request_log",
+            return_value=True,
+        ) as persist_request_log:
+            with TestClient(app) as client:
+                initial = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id=request_id),
+                    json=initial_payload,
+                )
+                runtime.result = CompanyAssistantResult(
+                    route="device_file_download",
+                    outcome="answered",
+                    messages=(AssistantMessage(body="DM으로 보냈어"),),
+                )
+                receipt = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id=request_id),
+                    json={
+                        **initial_payload,
+                        "operationAction": {
+                            "name": "device_file_download_delivery",
+                            "phase": "delivered",
+                            "delivery": initial.json()["operationResult"][
+                                "delivery"
+                            ],
+                        },
+                    },
+                )
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(receipt.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertEqual(runtime.stages, ["operations", "operations"])
+        self.assertEqual(
+            runtime.requests[1].metadata["operation_action"],
+            {
+                "name": "device_file_download_delivery",
+                "phase": "delivered",
+                "delivery": {
+                    "barcode": "48194663047",
+                    "log_date": "2026-03-06",
+                    "used_expanded_scope": False,
+                    "records": [
+                        {
+                            "device_name": "MB2-C00419",
+                            "device_seq": 41,
+                            "hospital_seq": 5,
+                            "hospital_room_seq": 8,
+                            "hospital_name": "테스트병원",
+                            "room_name": "1진료실",
+                            "file_names": ["a.motion.mp4"],
+                            "download_file_names": ["a.motion.mp4"],
+                        }
+                    ],
+                },
+            },
+        )
+        persist_request_log.assert_called_once()
+
+    def test_device_operation_delivery_ack_reuses_request_id_and_guard(
+        self,
+    ) -> None:
+        delivery = {
+            "route": "device_box_update",
+            "deviceName": "MB2-C00419",
+            "requestedVersion": "2.11.300",
+            "currentBoxVersion": "2.11.299",
+            "dispatchMessage": "dispatch accepted",
+            "waitStatus": "completed",
+            "waitOk": True,
+        }
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_box_update",
+                outcome="answered",
+                messages=(AssistantMessage(body="장비 업데이트 완료"),),
+                operation_result={
+                    "kind": "device_operation_delivery",
+                    "status": "pending",
+                    "delivery": delivery,
+                },
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-device-operation-delivery-same-id"
+        initial_payload = _payload(
+            question="MB2-C00419 박스 2.11.300 버전으로 업데이트해줘",
+            routeGroup="operations",
+            scope={
+                "deviceName": "MB2-C00419",
+                "channelContextId": "C01",
+            },
+        )
+
+        with patch(
+            "boxer_company_api.app._persist_turn_request_log",
+            return_value=True,
+        ) as persist_request_log:
+            with TestClient(app) as client:
+                initial = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id=request_id),
+                    json=initial_payload,
+                )
+                runtime.result = CompanyAssistantResult(
+                    route="device_operation_delivery",
+                    outcome="answered",
+                    messages=(
+                        AssistantMessage(
+                            body="장비 작업 전달 결과를 확인했어",
+                            mention_actor=False,
+                        ),
+                    ),
+                )
+                receipt = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id=request_id),
+                    json={
+                        **initial_payload,
+                        "operationAction": {
+                            "name": "device_operation_delivery",
+                            "phase": "delivered",
+                            "delivery": initial.json()["operationResult"][
+                                "delivery"
+                            ],
+                        },
+                    },
+                )
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(
+            initial.json()["operationResult"],
+            {
+                "kind": "device_operation_delivery",
+                "status": "pending",
+                "delivery": delivery,
+            },
+        )
+        self.assertEqual(receipt.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertEqual(runtime.stages, ["operations", "operations"])
+        self.assertEqual(
+            runtime.requests[1].metadata["operation_action"],
+            {
+                "name": "device_operation_delivery",
+                "phase": "delivered",
+                "delivery": {
+                    "route": "device_box_update",
+                    "device_name": "MB2-C00419",
+                    "requested_version": "2.11.300",
+                    "current_box_version": "2.11.299",
+                    "dispatch_message": "dispatch accepted",
+                    "wait_status": "completed",
+                    "wait_ok": True,
+                },
+            },
+        )
+        # initial operation만 중앙 감사 로그를 남기고 같은 ID receipt는
+        # route 자체 멱등 guard만 사용한다.
+        persist_request_log.assert_called_once()
+
+    def test_device_operation_delivery_schema_rejects_invalid_manifest(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        valid_delivery = {
+            "route": "device_box_update",
+            "deviceName": "MB2-C00419",
+            "requestedVersion": "2.11.300",
+            "currentBoxVersion": "2.11.299",
+            "dispatchMessage": "dispatch accepted",
+            "waitStatus": "completed",
+            "waitOk": True,
+        }
+        invalid_deliveries = (
+            {
+                key: value
+                for key, value in valid_delivery.items()
+                if key != "currentBoxVersion"
+            },
+            {**valid_delivery, "waitStatus": "timed_out"},
+            {**valid_delivery, "requestedVersion": ""},
+            {**valid_delivery, "unexpected": "field"},
+        )
+
+        with TestClient(app) as client:
+            for index, delivery in enumerate(invalid_deliveries):
+                with self.subTest(index=index):
+                    response = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(
+                            request_id=f"req-invalid-device-receipt-{index}"
+                        ),
+                        json=_payload(
+                            question=(
+                                "MB2-C00419 박스 2.11.300 버전으로 업데이트해줘"
+                            ),
+                            routeGroup="operations",
+                            operationAction={
+                                "name": "device_operation_delivery",
+                                "phase": "delivered",
+                                "delivery": delivery,
+                            },
+                        ),
+                    )
+                    self.assertEqual(response.status_code, 422)
+                    self.assertEqual(
+                        response.json()["code"],
+                        "validation_failed",
+                    )
+
+        self.assertEqual(runtime.requests, [])
+
+    def test_ndjson_stream_emits_partial_then_final_with_strict_frames(
+        self,
+    ) -> None:
+        partial = CompanyAssistantResult(
+            route="barcode_log_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="DB/S3 분석 결과"),),
+        )
+        final = CompanyAssistantResult(
+            route="barcode_log_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="오류 요약"),),
+        )
+
+        class _ProgressRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+                *,
+                on_partial_result: Any = None,
+            ) -> CompanyAssistantResult:
+                self.requests.append(request)
+                self.stages.append(stage)
+                self.assert_callback_order.append("runtime_started")
+                assert callable(on_partial_result)
+                on_partial_result(partial)
+                self.assert_callback_order.append("partial_returned")
+                return final
+
+        runtime = _ProgressRuntime()
+        runtime.assert_callback_order = []
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-ndjson-partial-final"
+        headers = {
+            **_headers(request_id=request_id),
+            "Accept": "application/x-ndjson",
+        }
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=headers,
+                json=_payload(
+                    question="12345678910 로그 분석해줘",
+                    routeGroup="log",
+                ),
+            )
+
+        frames = [
+            json.loads(line)
+            for line in response.content.decode("utf-8").splitlines()
+        ]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["content-type"],
+            "application/x-ndjson",
+        )
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
+        self.assertEqual([frame["type"] for frame in frames], ["partial", "final"])
+        self.assertEqual(set(frames[0]), {"type", "result"})
+        self.assertEqual(set(frames[1]), {"type", "result"})
+        self.assertEqual(frames[0]["result"]["requestId"], request_id)
+        self.assertEqual(frames[0]["result"]["route"], "barcode_log_analysis")
+        self.assertEqual(frames[1]["result"]["requestId"], request_id)
+        self.assertEqual(frames[1]["result"]["messages"][0]["body"], "오류 요약")
+        self.assertEqual(
+            runtime.assert_callback_order,
+            ["runtime_started", "partial_returned"],
+        )
+
+    def test_ndjson_stream_emits_heartbeat_while_runtime_is_blocked(
+        self,
+    ) -> None:
+        final = CompanyAssistantResult(
+            route="barcode_log_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="완료"),),
+        )
+        release = threading.Event()
+
+        class _BlockingRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+                *,
+                on_partial_result: Any = None,
+            ) -> CompanyAssistantResult:
+                del on_partial_result
+                self.requests.append(request)
+                self.stages.append(stage)
+                release.wait(0.04)
+                return final
+
+        runtime = _BlockingRuntime()
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-ndjson-heartbeat"
+
+        with patch("boxer_company_api.app._STREAM_HEARTBEAT_SEC", 0.005):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers={
+                        **_headers(request_id=request_id),
+                        "Accept": "application/x-ndjson",
+                    },
+                    json=_payload(
+                        question="12345678910 로그 분석해줘",
+                        routeGroup="log",
+                    ),
+                )
+
+        frames = [
+            json.loads(line)
+            for line in response.content.decode("utf-8").splitlines()
+        ]
+        self.assertEqual(frames[-1]["type"], "final")
+        heartbeat_frames = [
+            frame for frame in frames if frame["type"] == "heartbeat"
+        ]
+        self.assertGreaterEqual(len(heartbeat_frames), 1)
+        self.assertTrue(
+            all(
+                frame == {"type": "heartbeat", "requestId": request_id}
+                for frame in heartbeat_frames
+            )
+        )
+
+    def test_ndjson_runtime_failure_uses_only_safe_problem_frame(self) -> None:
+        runtime = _FakeRuntime(error=RuntimeError("secret runtime detail"))
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-ndjson-safe-error"
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers={
+                    **_headers(request_id=request_id),
+                    "Accept": "application/x-ndjson",
+                },
+                json=_payload(
+                    question="12345678910 로그 분석해줘",
+                    routeGroup="log",
+                ),
+            )
+
+        frames = [
+            json.loads(line)
+            for line in response.content.decode("utf-8").splitlines()
+        ]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(set(frames[0]), {"type", "problem"})
+        self.assertEqual(frames[0]["type"], "error")
+        self.assertEqual(
+            set(frames[0]["problem"]),
+            {
+                "type",
+                "title",
+                "status",
+                "code",
+                "requestId",
+                "retryable",
+            },
+        )
+        self.assertEqual(frames[0]["problem"]["code"], "internal_error")
+        self.assertEqual(frames[0]["problem"]["requestId"], request_id)
+        self.assertNotIn("secret runtime detail", response.text)
+
+    def test_ndjson_stream_enforces_one_total_byte_budget(self) -> None:
+        partial = CompanyAssistantResult(
+            route="barcode_log_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="p" * 600),),
+        )
+        final = CompanyAssistantResult(
+            route="barcode_log_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="f" * 600),),
+        )
+
+        class _LargeProgressRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+                *,
+                on_partial_result: Any = None,
+            ) -> CompanyAssistantResult:
+                self.requests.append(request)
+                self.stages.append(stage)
+                assert callable(on_partial_result)
+                on_partial_result(partial)
+                return final
+
+        runtime = _LargeProgressRuntime()
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-ndjson-byte-budget"
+
+        # 작은 동일 비율 budget으로 검증해 실제 1 MiB 경계가 부분 결과의
+        # 단순 합으로 뚫리지 않고 safe terminal error 공간을 남기는지 확인한다.
+        with patch("boxer_company_api.app._MAX_STREAM_BYTES", 1_024):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers={
+                        **_headers(request_id=request_id),
+                        "Accept": "application/x-ndjson",
+                    },
+                    json=_payload(
+                        question="12345678910 로그 분석해줘",
+                        routeGroup="log",
+                    ),
+                )
+
+        frames = [
+            json.loads(line)
+            for line in response.content.decode("utf-8").splitlines()
+        ]
+        self.assertLessEqual(len(response.content), 1_024)
+        self.assertEqual(frames[-1]["type"], "error")
+        self.assertEqual(frames[-1]["problem"]["code"], "internal_error")
+        self.assertFalse(any(frame["type"] == "final" for frame in frames))
+
+    def test_disconnected_ndjson_consumer_does_not_cancel_worker_finalization(
+        self,
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finalized = threading.Event()
+        final = CompanyAssistantResult(
+            route="device_box_update",
+            outcome="answered",
+            messages=(AssistantMessage(body="업데이트 완료"),),
+        )
+
+        class _BlockingMutationRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+                *,
+                on_partial_result: Any = None,
+            ) -> CompanyAssistantResult:
+                self.requests.append(request)
+                self.stages.append(stage)
+                assert callable(on_partial_result)
+                on_partial_result(
+                    CompanyAssistantResult(
+                        route="device_box_update",
+                        outcome="answered",
+                        messages=(AssistantMessage(body="업데이트 진행 중"),),
+                    )
+                )
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test release timeout")
+                return final
+
+        runtime = _BlockingMutationRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        endpoint = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", None)
+            == "/internal/v1/assistant/turns"
+        )
+        request_id = "req-ndjson-disconnect"
+        turn = AssistantTurnInput.model_validate(
+            _payload(
+                question="MB2-C00419 박스 2.11.300 버전으로 업데이트해줘",
+                routeGroup="operations",
+                scope={
+                    "deviceName": "MB2-C00419",
+                    "channelContextId": "C01",
+                },
+            )
+        )
+
+        def observe_event(event: str, **_fields: Any) -> None:
+            if event == "company_api_turn_completed":
+                finalized.set()
+
+        with patch(
+            "boxer_company_api.app.emit_api_event",
+            side_effect=observe_event,
+        ):
+            response = endpoint(
+                _direct_turn_request(
+                    request_id=request_id,
+                    accept_ndjson=True,
+                ),
+                turn,
+            )
+            try:
+                self.assertTrue(started.wait(1))
+                # body iterator를 읽지 않고 닫아 client disconnect를 모사해도
+                # 별도 daemon worker는 요청 소유권과 마감을 유지한다.
+                asyncio.run(response.body_iterator.aclose())
+            finally:
+                release.set()
+            self.assertTrue(finalized.wait(1))
+            replay = endpoint(
+                _direct_turn_request(
+                    request_id=request_id,
+                    accept_ndjson=False,
+                ),
+                turn,
+            )
+
+        self.assertEqual(replay.status_code, 200)
+        replay_payload = json.loads(bytes(replay.body).decode("utf-8"))
+        self.assertEqual(replay_payload["route"], "device_box_update")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_ndjson_marks_uncertain_mutation_before_final_frame(self) -> None:
+        uncertain = CompanyAssistantResult(
+            route="device_power_off",
+            outcome="failed",
+            messages=(AssistantMessage(body="종료 결과를 확인하지 못했어"),),
+            fallback_reason="operation_error",
+        )
+
+        class _UncertainMutationRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+                *,
+                on_partial_result: Any = None,
+            ) -> CompanyAssistantResult:
+                from boxer_company.routers.device_ssh_security import (
+                    _mark_company_api_mutation_attempted,
+                )
+
+                del on_partial_result
+                self.requests.append(request)
+                self.stages.append(stage)
+                _mark_company_api_mutation_attempted()
+                return uncertain
+
+        runtime = _UncertainMutationRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        request_id = "req-ndjson-uncertain-final"
+        payload = _payload(
+            question="MB2-C00419 장비 종료해줘",
+            routeGroup="operations",
+        )
+
+        with TestClient(app) as client:
+            streamed = client.post(
+                "/internal/v1/assistant/turns",
+                headers={
+                    **_headers(request_id=request_id),
+                    "Accept": "application/x-ndjson",
+                },
+                json=payload,
+            )
+            replay = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id=request_id),
+                json=payload,
+            )
+
+        frames = [
+            json.loads(line)
+            for line in streamed.content.decode("utf-8").splitlines()
+        ]
+        self.assertEqual(frames[-1]["type"], "final")
+        self.assertEqual(frames[-1]["result"]["outcome"], "failed")
+        # final 관찰 시점에는 이미 uncertain marker가 고정돼 같은 ID를
+        # 다시 실행할 수 없어야 한다.
+        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.json()["code"], "operation_in_progress")
+        self.assertEqual(len(runtime.requests), 1)
+
     def test_operation_request_id_conflict_fails_before_second_runtime(self) -> None:
         runtime = _FakeRuntime(
             CompanyAssistantResult(
@@ -389,7 +1405,7 @@ class CompanyApiContractTests(unittest.TestCase):
 
     def test_read_only_operation_failure_does_not_lock_later_mutation(self) -> None:
         # app-user/S3/admin 조회 예외는 mutation registry를 만들지 않고,
-        # 뒤이은 실제 mutation 실패만 tenant-wide uncertain 상태로 남긴다.
+        # 서로 다른 실제 mutation도 기존 Slack처럼 각각 실행한다.
         read_only_questions = (
             "12345678910 유저 조회",
             "s3 영상 12345678910",
@@ -447,7 +1463,7 @@ class CompanyApiContractTests(unittest.TestCase):
                             routeGroup="operations",
                         ),
                     )
-                    blocked_mutation = client.post(
+                    next_mutation = client.post(
                         "/internal/v1/assistant/turns",
                         headers=_headers(request_id=f"req-next-{index}"),
                         json=_payload(
@@ -460,16 +1476,13 @@ class CompanyApiContractTests(unittest.TestCase):
                 self.assertTrue(read_failure.json()["retryable"])
                 self.assertEqual(mutation_failure.status_code, 500)
                 self.assertFalse(mutation_failure.json()["retryable"])
-                self.assertEqual(blocked_mutation.status_code, 409)
-                self.assertEqual(
-                    blocked_mutation.json()["code"],
-                    "operation_in_progress",
-                )
-                self.assertEqual(len(runtime.requests), 2)
+                self.assertEqual(next_mutation.status_code, 500)
+                self.assertFalse(next_mutation.json()["retryable"])
+                self.assertEqual(len(runtime.requests), 3)
 
-    def test_failed_mutation_result_with_unknown_status_stays_sticky(self) -> None:
+    def test_failed_mutation_result_blocks_only_the_same_request_id(self) -> None:
         # route 내부 catch가 HTTP 예외 대신 failed 결과를 반환해도 실제
-        # mutation 처리 여부가 불명이면 다른 request ID로 재실행하지 않는다.
+        # mutation 처리 여부가 불명인 동일 request ID만 재실행하지 않는다.
         result = CompanyAssistantResult(
             route="device_power_off",
             outcome="failed",
@@ -527,7 +1540,7 @@ class CompanyApiContractTests(unittest.TestCase):
                     headers=_headers(request_id="req-uncertain-result-1"),
                     json=payload,
                 )
-                blocked = client.post(
+                second = client.post(
                     "/internal/v1/assistant/turns",
                     headers=_headers(request_id="req-uncertain-result-2"),
                     json=payload,
@@ -535,9 +1548,9 @@ class CompanyApiContractTests(unittest.TestCase):
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["outcome"], "failed")
-        self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(blocked.json()["code"], "operation_in_progress")
-        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["outcome"], "failed")
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_precheck_operation_error_releases_mutation_target(self) -> None:
         runtime = _FakeRuntime(
@@ -660,7 +1673,7 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(len(runtime.requests), 2)
 
-    def test_device_detail_failure_after_ssh_open_attempt_stays_sticky(
+    def test_device_detail_unknown_failure_blocks_only_same_request_id(
         self,
     ) -> None:
         result = CompanyAssistantResult(
@@ -721,16 +1734,15 @@ class CompanyApiContractTests(unittest.TestCase):
                     headers=_headers(request_id="req-detail-open-1"),
                     json=payload,
                 )
-                blocked = client.post(
+                second = client.post(
                     "/internal/v1/assistant/turns",
                     headers=_headers(request_id="req-detail-open-2"),
                     json=payload,
                 )
 
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(blocked.json()["code"], "operation_in_progress")
-        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_device_detail_auth_failure_before_ssh_open_releases_target(
         self,
@@ -1084,6 +2096,12 @@ class CompanyApiContractTests(unittest.TestCase):
             )
         )
         with patch(
+            "boxer_company_api.app._initialize_request_log_readiness",
+            return_value=True,
+        ), patch(
+            "boxer_company_api.app._secure_request_log_leaf",
+            return_value=True,
+        ), patch(
             "boxer_company_api.app._ensure_request_log_schema"
         ), patch(
             "boxer_company_api.app._save_request_log_record"
@@ -1122,6 +2140,12 @@ class CompanyApiContractTests(unittest.TestCase):
             )
         )
         with patch(
+            "boxer_company_api.app._initialize_request_log_readiness",
+            return_value=True,
+        ), patch(
+            "boxer_company_api.app._secure_request_log_leaf",
+            return_value=True,
+        ), patch(
             "boxer_company_api.app._ensure_request_log_schema"
         ), patch(
             "boxer_company_api.app._save_request_log_record",
@@ -1151,17 +2175,29 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(failed_events[0].kwargs["error_type"], "RuntimeError")
 
     def test_request_log_schema_failure_blocks_startup_readiness(self) -> None:
-        with patch(
-            "boxer_company_api.app._ensure_request_log_schema",
-            side_effect=OSError("raw-path-must-not-leak"),
-        ), patch("boxer_company_api.app.emit_api_event") as emit_api_event:
-            app = create_company_api_app(
-                settings=_settings(request_log_enabled=True),
-                assistant_runtime=_FakeRuntime(),
-                readiness_probe=lambda: True,
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request_log_path = str(
+                Path(temp_dir).resolve() / "request-log.db"
             )
-            with TestClient(app) as client:
-                readiness = client.get("/health/ready")
+            with patch(
+                "boxer_company_api.app._initialize_request_log_storage",
+                return_value=None,
+            ), patch(
+                "boxer_company_api.app._ensure_request_log_schema",
+                side_effect=OSError("raw-path-must-not-leak"),
+            ), patch(
+                "boxer_company_api.app.emit_api_event"
+            ) as emit_api_event:
+                app = create_company_api_app(
+                    settings=_settings(
+                        request_log_enabled=True,
+                        request_log_path=request_log_path,
+                    ),
+                    assistant_runtime=_FakeRuntime(),
+                    readiness_probe=lambda: True,
+                )
+                with TestClient(app) as client:
+                    readiness = client.get("/health/ready")
 
         self.assertEqual(readiness.status_code, 503)
         startup_events = [
@@ -1188,6 +2224,12 @@ class CompanyApiContractTests(unittest.TestCase):
         question = "12345678910 유저 전화번호 조회"
 
         with patch(
+            "boxer_company_api.app._initialize_request_log_readiness",
+            return_value=True,
+        ), patch(
+            "boxer_company_api.app._secure_request_log_leaf",
+            return_value=True,
+        ), patch(
             "boxer_company_api.app._ensure_request_log_schema"
         ), patch(
             "boxer_company_api.app._save_request_log_record"
@@ -1217,6 +2259,875 @@ class CompanyApiContractTests(unittest.TestCase):
         record = save_request_log.call_args.args[0]
         self.assertEqual(record["requestText"], "[민감 operations 요청]")
         self.assertNotIn(question, str(record))
+
+    def test_remote_operation_request_log_is_finalized_by_same_id_receipt(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_box_update",
+                outcome="answered",
+                messages=(AssistantMessage(body="장비 업데이트 완료"),),
+            )
+        )
+        audit_context = _audit_context()
+        initial_payload = _operations_audit_payload()
+        receipt_payload = _operations_audit_payload(
+            operation_action={
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": True,
+                # 다운로드처럼 256개를 넘는 실제 Slack 전달도 중앙 row에
+                # 그대로 기록돼야 한다.
+                "replyCount": 300,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03+00:00",
+                "errorType": None,
+            }
+        )
+        capabilities = (
+            "assistant.turn.read",
+            "assistant.operation.execute",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                initial = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=initial_payload,
+                )
+                pending_rows = _read_request_log_rows(db_path)
+
+                # 다른 X-Request-ID는 같은 Slack message row를 마감하지 못한다.
+                different_id = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-company-api-other"),
+                    json=receipt_payload,
+                )
+                still_pending_rows = _read_request_log_rows(db_path)
+
+                delivered = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=receipt_payload,
+                )
+                finalized_rows = _read_request_log_rows(db_path)
+
+                # exact duplicate만 idempotent replay되고, altered receipt는
+                # 이미 마감된 row를 다시 쓰지 못한다.
+                replay = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=receipt_payload,
+                )
+                altered = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json={
+                        **receipt_payload,
+                        "operationAction": {
+                            **receipt_payload["operationAction"],
+                            "replyCount": 301,
+                        },
+                    },
+                )
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(len(pending_rows), 1)
+        pending = pending_rows[0]
+        self.assertEqual(pending["sourcePlatform"], "slack")
+        self.assertEqual(pending["workspaceId"], "TENANT-1")
+        self.assertEqual(pending["eventType"], "app_mention")
+        self.assertEqual(pending["routeName"], "device box update")
+        self.assertEqual(pending["routeMode"], "remote")
+        self.assertEqual(pending["handlerType"], "company_api")
+        self.assertEqual(pending["status"], "pending_delivery")
+        self.assertEqual(pending["userId"], "ACTOR-1")
+        self.assertEqual(pending["userName"], "테스트 사용자")
+        self.assertEqual(pending["channelId"], "C01")
+        self.assertEqual(pending["threadId"], audit_context["threadId"])
+        self.assertEqual(pending["messageId"], audit_context["messageId"])
+        self.assertEqual(pending["isThreadRoot"], 0)
+        self.assertEqual(pending["permalink"], audit_context["permalink"])
+        self.assertEqual(
+            pending["threadPermalink"],
+            audit_context["threadPermalink"],
+        )
+        self.assertEqual(pending["requestKey"], _REQUEST_ID)
+        self.assertEqual(pending["requestText"], "[민감 operations 요청]")
+        self.assertEqual(
+            pending["normalizedQuestion"],
+            "[민감 operations 요청]",
+        )
+        self.assertNotIn(initial_payload["question"], str(pending))
+        self.assertEqual(pending["replyCount"], 0)
+        self.assertIsNone(pending["firstRepliedAtUtc"])
+
+        self.assertEqual(different_id.status_code, 409)
+        self.assertEqual(different_id.json()["code"], "request_id_conflict")
+        self.assertEqual(still_pending_rows[0]["status"], "pending_delivery")
+        self.assertEqual(still_pending_rows[0]["requestKey"], _REQUEST_ID)
+        self.assertEqual(delivered.status_code, 200)
+        self.assertEqual(delivered.json()["route"], "request_log_delivery")
+        self.assertEqual(len(finalized_rows), 1)
+        finalized = finalized_rows[0]
+        self.assertEqual(finalized["status"], "answered")
+        self.assertEqual(finalized["replyCount"], 300)
+        self.assertEqual(
+            finalized["firstRepliedAtUtc"],
+            "2026-08-21T01:02:03+00:00",
+        )
+        self.assertIsNone(finalized["errorType"])
+        metadata = json.loads(finalized["metadataJson"])
+        self.assertEqual(metadata["domainOutcome"], "answered")
+        self.assertEqual(metadata["deliveryRequestId"], _REQUEST_ID)
+        self.assertTrue(metadata["deliveryReceiptFingerprint"])
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(altered.status_code, 409)
+        # receipt endpoint는 domain operation을 절대 다시 실행하지 않는다.
+        self.assertEqual(runtime.stages, ["operations"])
+
+    def test_request_log_receipt_rejects_missing_or_changed_identity(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="app_user_lookup",
+                outcome="answered",
+                messages=(AssistantMessage(body="조회 완료"),),
+            )
+        )
+        action = {
+            "name": "request_log_delivery",
+            "phase": "receipt",
+            "delivered": False,
+            "replyCount": 0,
+            "firstRepliedAtUtc": None,
+            "errorType": "RuntimeError",
+        }
+        capabilities = (
+            "assistant.turn.read",
+            "assistant.operation.execute",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                missing = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(
+                        message_id="1784800000.000003",
+                        operation_action=action,
+                    ),
+                )
+                initial = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(),
+                )
+                changed_identity_payload = _operations_audit_payload(
+                    operation_action=action,
+                )
+                changed_identity_payload["auditContext"] = {
+                    **changed_identity_payload["auditContext"],
+                    "userName": "다른 사용자",
+                }
+                changed_identity = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=changed_identity_payload,
+                )
+                rows = _read_request_log_rows(db_path)
+
+        self.assertEqual(missing.status_code, 409)
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(changed_identity.status_code, 409)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "pending_delivery")
+        self.assertEqual(rows[0]["userName"], "테스트 사용자")
+
+    def test_attempted_mutation_exception_remains_in_central_request_log(
+        self,
+    ) -> None:
+        class _AttemptedMutationRuntime(_FakeRuntime):
+            def answer_stage(
+                self,
+                request: Any,
+                stage: str,
+            ) -> CompanyAssistantResult:
+                from boxer_company.routers.device_ssh_security import (
+                    _mark_company_api_mutation_attempted,
+                )
+
+                self.requests.append(request)
+                self.stages.append(stage)
+                _mark_company_api_mutation_attempted()
+                raise RuntimeError("secret-must-not-reach-audit")
+
+        runtime = _AttemptedMutationRuntime()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=(
+                        "assistant.turn.read",
+                        "assistant.operation.execute",
+                    ),
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app, raise_server_exceptions=False) as client:
+                failed = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(),
+                )
+                replay = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(),
+                )
+                receipt_payload = _operations_audit_payload(
+                    operation_action={
+                        "name": "request_log_delivery",
+                        "phase": "receipt",
+                        "delivered": True,
+                        "replyCount": 1,
+                        "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                        "errorType": None,
+                    }
+                )
+                receipt = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=receipt_payload,
+                )
+                altered_receipt = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json={
+                        **receipt_payload,
+                        "operationAction": {
+                            **receipt_payload["operationAction"],
+                            "replyCount": 2,
+                        },
+                    },
+                )
+                rows = _read_request_log_rows(db_path)
+
+        self.assertEqual(failed.status_code, 500)
+        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.json()["code"], "operation_in_progress")
+        self.assertEqual(receipt.status_code, 200)
+        self.assertEqual(altered_receipt.status_code, 409)
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["errorType"], "RuntimeError")
+        self.assertEqual(row["requestText"], "[민감 operations 요청]")
+        self.assertNotIn("secret-must-not-reach-audit", str(row))
+        metadata = json.loads(row["metadataJson"])
+        self.assertEqual(metadata["domainOutcome"], "uncertain")
+        self.assertTrue(metadata["deliveryReceiptFingerprint"])
+        self.assertEqual(row["replyCount"], 1)
+
+    def test_delivery_receipt_preserves_failed_or_denied_domain_status(
+        self,
+    ) -> None:
+        for outcome in ("failed", "denied"):
+            with (
+                self.subTest(outcome=outcome),
+                tempfile.TemporaryDirectory() as temp_dir,
+                patch(
+                    "boxer_company_api.app._initialize_request_log_storage",
+                    return_value=None,
+                ),
+            ):
+                runtime = _FakeRuntime(
+                    CompanyAssistantResult(
+                        route="device_box_update",
+                        outcome=outcome,
+                        messages=(AssistantMessage(body="처리 결과"),),
+                    )
+                )
+                db_path = str(Path(temp_dir).resolve() / "request-log.db")
+                app = create_company_api_app(
+                    settings=_settings(
+                        capabilities=(
+                            "assistant.turn.read",
+                            "assistant.operation.execute",
+                        ),
+                        request_log_enabled=True,
+                        request_log_path=db_path,
+                    ),
+                    assistant_runtime=runtime,
+                    readiness_probe=lambda: True,
+                )
+                receipt_payload = _operations_audit_payload(
+                    operation_action={
+                        "name": "request_log_delivery",
+                        "phase": "receipt",
+                        "delivered": True,
+                        "replyCount": 1,
+                        "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                        "errorType": None,
+                    }
+                )
+                with TestClient(app) as client:
+                    initial = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(),
+                        json=_operations_audit_payload(),
+                    )
+                    receipt = client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(),
+                        json=receipt_payload,
+                    )
+                    rows = _read_request_log_rows(db_path)
+
+                self.assertEqual(initial.status_code, 200)
+                self.assertEqual(receipt.status_code, 200)
+                self.assertEqual(rows[0]["status"], outcome)
+                metadata = json.loads(rows[0]["metadataJson"])
+                self.assertEqual(metadata["domainOutcome"], outcome)
+
+    def test_mutation_replay_waits_until_pending_delivery_is_persisted(
+        self,
+    ) -> None:
+        from boxer_company_api import app as app_module
+
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_box_update",
+                outcome="answered",
+                messages=(AssistantMessage(body="업데이트 완료"),),
+            )
+        )
+        final_row_persisted = threading.Event()
+        release_final_persist = threading.Event()
+        original_persist = app_module._persist_turn_request_log
+
+        def persist_with_barrier(**kwargs: Any) -> bool:
+            persisted = original_persist(**kwargs)
+            if (
+                kwargs.get("status_override") is None
+                and kwargs.get("outcome") == "answered"
+            ):
+                final_row_persisted.set()
+                if not release_final_persist.wait(2):
+                    raise RuntimeError("test release timeout")
+            return persisted
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=(
+                        "assistant.turn.read",
+                        "assistant.operation.execute",
+                    ),
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            first_result: dict[str, Any] = {}
+            with patch(
+                "boxer_company_api.app._persist_turn_request_log",
+                side_effect=persist_with_barrier,
+            ), TestClient(app) as first_client, TestClient(app) as replay_client:
+                worker = threading.Thread(
+                    target=lambda: first_result.setdefault(
+                        "response",
+                        first_client.post(
+                            "/internal/v1/assistant/turns",
+                            headers=_headers(),
+                            json=_operations_audit_payload(),
+                        ),
+                    )
+                )
+                worker.start()
+                try:
+                    self.assertTrue(final_row_persisted.wait(1))
+                    busy = replay_client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(),
+                        json=_operations_audit_payload(),
+                    )
+                finally:
+                    release_final_persist.set()
+                    worker.join(2)
+                replay = replay_client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(),
+                )
+                receipt = replay_client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(
+                        operation_action={
+                            "name": "request_log_delivery",
+                            "phase": "receipt",
+                            "delivered": True,
+                            "replyCount": 1,
+                            "firstRepliedAtUtc": (
+                                "2026-08-21T01:02:03Z"
+                            ),
+                            "errorType": None,
+                        }
+                    ),
+                )
+                rows = _read_request_log_rows(db_path)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(first_result["response"].status_code, 200)
+        self.assertEqual(busy.status_code, 409)
+        self.assertEqual(busy.json()["code"], "operation_in_progress")
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(receipt.status_code, 200)
+        self.assertEqual(rows[0]["status"], "answered")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_renderer_failure_receipt_preserves_partial_reply_count(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_box_update",
+                outcome="answered",
+                messages=(AssistantMessage(body="최종 응답"),),
+            )
+        )
+        capabilities = (
+            "assistant.turn.read",
+            "assistant.operation.execute",
+        )
+        failure_receipt = _operations_audit_payload(
+            operation_action={
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": False,
+                "replyCount": 1,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                "errorType": "SlackApiError",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                initial = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(),
+                )
+                failed = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=failure_receipt,
+                )
+                rows = _read_request_log_rows(db_path)
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(failed.status_code, 200)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "error")
+        self.assertEqual(rows[0]["replyCount"], 1)
+        self.assertEqual(
+            rows[0]["firstRepliedAtUtc"],
+            "2026-08-21T01:02:03+00:00",
+        )
+        self.assertEqual(rows[0]["errorType"], "SlackApiError")
+
+    def test_diagnostic_probe_miss_creates_no_central_request_log_row(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_diagnostic_followup",
+                outcome="no_evidence",
+                messages=(AssistantMessage(body="진단 상태 없음"),),
+                fallback_reason="diagnostic_snapshot_missing",
+            )
+        )
+        capabilities = (
+            "assistant.turn.read",
+            "assistant.operation.execute",
+        )
+        probe_action = {"name": "device_diagnostic_followup_probe"}
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                missed = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="diag-probe:missing"),
+                    json=_operations_audit_payload(
+                        operation_action=probe_action,
+                    ),
+                )
+                missed_rows = _read_request_log_rows(db_path)
+
+                runtime.result = CompanyAssistantResult(
+                    route="device_diagnostic_followup",
+                    outcome="answered",
+                    messages=(AssistantMessage(body="진단 결과"),),
+                )
+                answered = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="diag-probe:answered"),
+                    json=_operations_audit_payload(
+                        message_id="1784800000.000003",
+                        operation_action=probe_action,
+                    ),
+                )
+                answered_rows = _read_request_log_rows(db_path)
+
+        self.assertEqual(missed.status_code, 200)
+        self.assertEqual(missed_rows, [])
+        self.assertEqual(answered.status_code, 200)
+        self.assertEqual(len(answered_rows), 1)
+        self.assertEqual(answered_rows[0]["status"], "pending_delivery")
+        self.assertEqual(
+            answered_rows[0]["routeName"],
+            "device diagnostic followup",
+        )
+
+    def test_request_log_receipt_storage_failure_is_not_reported_as_success(
+        self,
+    ) -> None:
+        receipt_payload = _operations_audit_payload(
+            operation_action={
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": True,
+                "replyCount": 1,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                "errorType": None,
+            }
+        )
+        capabilities = (
+            "assistant.turn.read",
+            "assistant.operation.execute",
+        )
+        with patch(
+            "boxer_company_api.app._initialize_request_log_readiness",
+            return_value=True,
+        ), patch(
+            "boxer_company_api.app._persist_turn_request_log_delivery",
+            return_value="failed",
+        ):
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    request_log_enabled=True,
+                ),
+                assistant_runtime=_FakeRuntime(),
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=receipt_payload,
+                )
+                readiness = client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["code"], "internal_error")
+        self.assertFalse(response.json()["retryable"])
+        self.assertEqual(readiness.status_code, 503)
+
+    def test_request_log_receipt_requires_enabled_storage(self) -> None:
+        receipt_payload = _operations_audit_payload(
+            operation_action={
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": True,
+                "replyCount": 1,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                "errorType": None,
+            }
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+                request_log_enabled=False,
+            ),
+            assistant_runtime=_FakeRuntime(),
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=receipt_payload,
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "service_not_ready")
+        self.assertFalse(response.json()["retryable"])
+
+    def test_request_log_receipt_finalizes_when_domain_features_are_off(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_box_update",
+                outcome="answered",
+                messages=(AssistantMessage(body="최종 응답"),),
+            )
+        )
+        receipt_payload = _operations_audit_payload(
+            operation_action={
+                "name": "request_log_delivery",
+                "phase": "receipt",
+                "delivered": True,
+                "replyCount": 1,
+                "firstRepliedAtUtc": "2026-08-21T01:02:03Z",
+                "errorType": None,
+            }
+        )
+        capabilities = (
+            "assistant.turn.read",
+            "assistant.operation.execute",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            enabled_app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(enabled_app) as client:
+                initial = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=_operations_audit_payload(),
+                )
+
+            feature_off_app = create_company_api_app(
+                settings=_settings(
+                    capabilities=capabilities,
+                    operations_enabled=False,
+                    live_device_enabled=False,
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(feature_off_app) as client:
+                receipt = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(),
+                    json=receipt_payload,
+                )
+                rows = _read_request_log_rows(db_path)
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(receipt.status_code, 200)
+        self.assertEqual(receipt.json()["route"], "request_log_delivery")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "answered")
+        # feature-off receipt도 기존 domain operation을 재실행하지 않는다.
+        self.assertEqual(runtime.stages, ["operations"])
+
+    def test_request_log_startup_prepares_private_leaf_after_restore(self) -> None:
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir).resolve() / "request-log.db"
+
+            def initialize(*, db_path: Path) -> None:
+                self.assertEqual(
+                    db_path,
+                    Path(temp_dir).resolve() / "request-log.db",
+                )
+                events.append("restore")
+
+            def ensure(db_path: Path) -> Path:
+                events.append("schema")
+                db_path.touch(mode=0o644)
+                return db_path
+
+            with patch(
+                "boxer_company_api.app._initialize_request_log_storage",
+                side_effect=initialize,
+            ), patch(
+                "boxer_company_api.app._ensure_request_log_schema",
+                side_effect=ensure,
+            ):
+                ready = _initialize_request_log_readiness(
+                    enabled=True,
+                    db_path=str(db_path),
+                )
+
+            self.assertTrue(ready)
+            self.assertEqual(events, ["restore", "schema"])
+            self.assertEqual(stat.S_IMODE(db_path.stat().st_mode), 0o600)
+
+    def test_request_log_startup_fails_when_required_restore_did_not_finish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir).resolve() / "request-log.db"
+            with patch(
+                "boxer_company_api.app._initialize_request_log_storage",
+                side_effect=RuntimeError("configured restore failed"),
+            ), patch(
+                "boxer_company_api.app._ensure_request_log_schema"
+            ) as ensure:
+                ready = _initialize_request_log_readiness(
+                    enabled=True,
+                    db_path=str(db_path),
+                )
+
+            self.assertFalse(ready)
+            self.assertFalse(db_path.exists())
+            ensure.assert_not_called()
+
+    def test_request_log_startup_rejects_unsafe_local_paths_without_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            unsafe_mode = root / "unsafe-mode.db"
+            unsafe_mode.touch(mode=0o600)
+            unsafe_mode.chmod(0o644)
+            with patch(
+                "boxer_company_api.app._initialize_request_log_storage"
+            ) as initialize:
+                mode_ready = _initialize_request_log_readiness(
+                    enabled=True,
+                    db_path=str(unsafe_mode),
+                )
+            self.assertFalse(mode_ready)
+            initialize.assert_not_called()
+            self.assertEqual(
+                stat.S_IMODE(unsafe_mode.stat().st_mode),
+                0o644,
+            )
+
+            target = root / "target.db"
+            target.touch(mode=0o600)
+            symlink = root / "request-log-link.db"
+            symlink.symlink_to(target)
+            with patch(
+                "boxer_company_api.app._initialize_request_log_storage"
+            ) as initialize:
+                symlink_ready = _initialize_request_log_readiness(
+                    enabled=True,
+                    db_path=str(symlink),
+                )
+            self.assertFalse(symlink_ready)
+            initialize.assert_not_called()
+            self.assertTrue(symlink.is_symlink())
+
+            owned = root / "owner.db"
+            owned.touch(mode=0o600)
+            with patch(
+                "boxer_company_api.app.os.geteuid",
+                return_value=os.geteuid() + 1,
+            ), patch(
+                "boxer_company_api.app._initialize_request_log_storage"
+            ) as initialize:
+                self.assertFalse(_secure_request_log_leaf(owned))
+                owner_ready = _initialize_request_log_readiness(
+                    enabled=True,
+                    db_path=str(owned),
+                )
+            self.assertFalse(owner_ready)
+            initialize.assert_not_called()
+
+    def test_request_log_startup_rejects_public_parent_before_creation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir).resolve()
+            parent.chmod(0o755)
+            db_path = parent / "request-log.db"
+            with patch(
+                "boxer_company_api.app._initialize_request_log_storage"
+            ) as initialize:
+                ready = _initialize_request_log_readiness(
+                    enabled=True,
+                    db_path=str(db_path),
+                )
+
+            self.assertFalse(ready)
+            self.assertFalse(db_path.exists())
+            initialize.assert_not_called()
 
     def test_long_message_is_windowed_at_client_contract_boundary(
         self,
@@ -1612,6 +3523,165 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(response.json()["code"], "validation_failed")
         self.assertEqual(runtime.requests, [])
 
+    def test_question_uses_the_slack_forty_thousand_char_limit(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="company_freeform",
+                outcome="answered",
+                messages=(AssistantMessage(body="답변"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-question-40000"),
+                json=_payload(question="q" * 40_000),
+            )
+            rejected = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-question-40001"),
+                json=_payload(question="q" * 40_001),
+            )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(rejected.json()["code"], "validation_failed")
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(runtime.requests[0].question, "q" * 40_000)
+
+    def test_operations_accepts_the_legacy_learning_context_budget(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="thread_playbook_learning",
+                outcome="answered",
+                messages=(AssistantMessage(body="학습 완료"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        context_entries = [
+            {
+                "kind": "message",
+                "source": "slack",
+                "authorId": "ACTOR-1",
+                "text": f"{index:02d}-" + ("x" * 597),
+            }
+            for index in range(20)
+        ]
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(),
+                json=_payload(
+                    routeGroup="operations",
+                    question="이 스레드 학습해줘",
+                    contextEntries=context_entries,
+                ),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(runtime.requests[0].context_entries), 20)
+        self.assertEqual(
+            sum(
+                len(str(entry["text"]))
+                for entry in runtime.requests[0].context_entries
+            ),
+            12_000,
+        )
+
+    def test_all_routes_keep_one_five_thousand_char_entry_byte_for_byte(
+        self,
+    ) -> None:
+        prefix = "BEGIN\n"
+        suffix = "\nEND"
+        thread_text = (
+            prefix
+            + ("x" * (5_000 - len(prefix) - len(suffix)))
+            + suffix
+        )
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="thread_playbook_learning",
+                outcome="answered",
+                messages=(AssistantMessage(body="학습 완료"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        entry = {
+            "kind": "message",
+            "source": "slack",
+            "authorId": "ACTOR-1",
+            "text": thread_text,
+        }
+
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-learning-entry-5000"),
+                json=_payload(
+                    routeGroup="operations",
+                    question="이 스레드 학습해줘",
+                    contextEntries=[entry],
+                ),
+            )
+            non_operation = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-read-entry-5000"),
+                json=_payload(
+                    routeGroup="barcode",
+                    contextEntries=[entry],
+                ),
+            )
+            oversized = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-read-entry-5001"),
+                json=_payload(
+                    routeGroup="barcode",
+                    contextEntries=[
+                        {
+                            **entry,
+                            "text": thread_text + "x",
+                        }
+                    ],
+                ),
+            )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(non_operation.status_code, 200)
+        self.assertEqual(oversized.status_code, 422)
+        self.assertEqual(
+            runtime.requests[0].context_entries[0]["text"].encode(),
+            thread_text.encode(),
+        )
+        self.assertEqual(
+            runtime.requests[1].context_entries[0]["text"].encode(),
+            thread_text.encode(),
+        )
+
     def test_success_converts_transport_to_neutral_request_and_exact_dto(self) -> None:
         result = CompanyAssistantResult(
             route="barcode_query",
@@ -1644,6 +3714,18 @@ class CompanyApiContractTests(unittest.TestCase):
         headers["traceparent"] = traceparent
         payload = _payload()
         payload["scope"]["followupKind"] = "barcode_log"
+        payload["scope"]["actorName"] = "테스트 사용자"
+        payload["scope"]["threadPermalink"] = (
+            "https://workspace.slack.com/archives/C01/"
+            "p1785312000000001?thread_ts=1785312000.000001&cid=C01"
+        )
+        payload["scope"]["trustedMdaRecoveryScope"] = {
+            "barcode": "12345678910",
+            "logDate": "2026-03-06",
+            "deviceName": "MB2-C00419",
+            "hospitalName": "테스트 병원",
+            "roomName": "검사실",
+        }
 
         with self.assertLogs(
             "boxer.company_api",
@@ -1699,6 +3781,18 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(
             request.metadata["followup_kind"],
             "barcode_log",
+        )
+        self.assertEqual(
+            request.metadata["actor_name"],
+            "테스트 사용자",
+        )
+        self.assertEqual(
+            request.metadata["thread_permalink"],
+            payload["scope"]["threadPermalink"],
+        )
+        self.assertEqual(
+            request.metadata["trusted_mda_recovery_scope"],
+            payload["scope"]["trustedMdaRecoveryScope"],
         )
         self.assertNotIn("role", request.metadata)
         self.assertNotIn("capabilities", request.metadata)

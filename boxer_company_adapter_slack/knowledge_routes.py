@@ -21,9 +21,6 @@ from boxer_company.prompt_security import (
     is_prompt_exfiltration_attempt,
 )
 from boxer_company.assistant import CompanyAssistantService
-from boxer_company.assistant.device_operations_route import (
-    _explicit_device_names,
-)
 from boxer_company_adapter_slack.assistant_bridge import (
     assistant_slack_route_name,
     build_company_assistant_request,
@@ -204,33 +201,9 @@ def _handle_knowledge_routes(
         thread_ts=context.thread_ts,
     )
     if diagnostic_snapshot is not None and question:
-        snapshot_request = (
-            diagnostic_snapshot.get("request")
-            if isinstance(diagnostic_snapshot.get("request"), dict)
-            else {}
-        )
-        snapshot_actor = str(snapshot_request.get("requestedBy") or "").strip()
-        snapshot_device = str(snapshot_request.get("deviceName") or "").strip()
-        current_actor = str(context.user_id or "").strip()
-        explicit_devices = _explicit_device_names(question)
-        actor_matches = bool(current_actor) and snapshot_actor == current_actor
-        device_matches = not explicit_devices or (
-            len(explicit_devices) == 1
-            and bool(snapshot_device)
-            and next(iter(explicit_devices.values())).casefold()
-            == snapshot_device.casefold()
-        )
-        if not actor_matches or not device_matches:
-            # Slack local rollback에서도 thread key만 믿지 않고 요청자와 명시
-            # 장비를 재검증해 다른 참여자의 live snapshot을 재사용하지 않는다.
-            diagnostic_snapshot = None
-
-    if diagnostic_snapshot is not None and question:
         diagnostic_evidence = _build_device_diagnostic_followup_evidence(
             question,
             diagnostic_snapshot,
-            # 후속 질문 한 건이 poll 중 sshOrder를 반복하지 않게 한다.
-            resend_ssh_open=False,
         )
         fallback_text = _build_device_diagnostic_followup_fallback(question, diagnostic_evidence)
         deps.reply_with_retrieval_synthesis(

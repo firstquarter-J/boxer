@@ -14,25 +14,15 @@ from boxer_company.assistant import (
     SourceReference,
 )
 from boxer_company.assistant.commonmark import transform_outside_code
+from boxer_company.assistant.request_log_contract import (
+    legacy_company_request_log_route_name,
+)
 
 _COMMONMARK_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _COMMONMARK_BOLD_PATTERN = re.compile(r"\*\*([^*\n]+)\*\*")
 _HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]|]+")
 _HANGUL_PATTERN = re.compile(r"[가-힣ㄱ-ㅎㅏ-ㅣ]")
 _MAX_PRIVATE_LINK_URI_CHARS = 16_384
-_LEGACY_SLACK_ROUTE_NAMES = {
-    "device_led_log_analysis": "device led log analysis",
-    "device_led_pattern_guide": "device led pattern guide",
-    "barcode_log_analysis": "barcode log analysis",
-    "recording_failure_analysis": "recording failure analysis",
-    "device_diagnostic_followup": "device diagnostic followup",
-    "notion_playbook_qa": "notion playbook qa",
-    "barcode_evidence_freeform": "llm_freeform",
-    "company_freeform": "llm_freeform",
-    "device_db_detail": "devices_filter",
-    "device_detail": "devices_filter",
-    "weekly_recordings_summary": "weekly recordings report",
-}
 
 
 def build_company_assistant_request(
@@ -132,10 +122,82 @@ def render_company_assistant_result(
     return sent_count
 
 
+def render_device_file_download_delivery(
+    result: CompanyAssistantResult,
+    *,
+    reply: SlackReplyFn,
+    actor_id: str | None,
+    client: Any | None,
+    logger: logging.Logger,
+) -> bool:
+    """요약과 모든 링크 DM이 성공했을 때만 receipt 가능 상태를 돌려준다."""
+
+    operation_result = result.operation_result
+    if (
+        not isinstance(operation_result, Mapping)
+        or operation_result.get("kind")
+        != "device_file_download_delivery"
+        or operation_result.get("status") != "pending"
+    ):
+        raise ValueError("device download delivery result is invalid")
+    link_contexts = operation_result.get("links")
+    private_messages = tuple(
+        message
+        for message in result.messages
+        if message.delivery_scope == "requester"
+    )
+    private_links = tuple(
+        link
+        for message in private_messages
+        for link in message.private_links
+    )
+    if (
+        not isinstance(link_contexts, list)
+        or not private_messages
+        or not private_links
+        or operation_result.get("linkCount") != len(private_links)
+        or len(link_contexts) != len(private_links)
+    ):
+        raise ValueError("device download delivery manifest is invalid")
+
+    dm_sent = True
+    for message in private_messages:
+        summary = _commonmark_to_slack(message.body)
+        if not _send_requester_dm(
+            client=client,
+            actor_id=actor_id,
+            text=summary,
+            logger=logger,
+        ):
+            dm_sent = False
+            break
+
+    if dm_sent:
+        for link, context in zip(private_links, link_contexts, strict=True):
+            link_text = _render_device_file_download_link(link, context)
+            if link_text is None or not _send_requester_dm(
+                client=client,
+                actor_id=actor_id,
+                text=link_text,
+                logger=logger,
+            ):
+                # 기존 Slack처럼 첫 실패에서 멈추고 activity receipt를 보내지 않는다.
+                dm_sent = False
+                break
+
+    if not dm_sent:
+        failure_notice = _commonmark_to_slack(
+            str(operation_result.get("failureNotice") or "")
+        )
+        if not failure_notice:
+            raise ValueError("device download failure notice is invalid")
+        reply(failure_notice)
+    return dm_sent
+
+
 def assistant_slack_route_name(route: str) -> str:
     """채널 중립 route를 기존 Slack request-log 계약 이름으로 바꾼다."""
-    normalized = str(route or "").strip()
-    return _LEGACY_SLACK_ROUTE_NAMES.get(normalized, normalized)
+    return legacy_company_request_log_route_name(route)
 
 
 def _commonmark_to_slack(
@@ -299,6 +361,35 @@ def _render_private_link(link: AssistantLink) -> str | None:
     return f"<{uri}|{_escape_slack_link_label(label)}>"
 
 
+def _render_device_file_download_link(
+    link: AssistantLink,
+    context: Any,
+) -> str | None:
+    if not isinstance(context, Mapping):
+        return None
+    device_name = str(context.get("deviceName") or "").strip()
+    file_name = str(context.get("fileName") or "").strip()
+    rendered_link = _render_private_link(link)
+    if (
+        not device_name
+        or not file_name
+        or file_name != str(link.label or "").strip()
+        or rendered_link is None
+    ):
+        return None
+    # 파일 하나당 한 메시지라는 legacy 규격을 유지해 긴 presigned URL이
+    # Slack 자동 분할로 잘리지 않게 한다.
+    return "\n".join(
+        (
+            "*장비 영상 다운로드 링크*",
+            f"• 장비: `{device_name}`",
+            f"• 파일: `{file_name}`",
+            "• 만료: `1시간`",
+            f"🎣 {rendered_link}",
+        )
+    )
+
+
 def _is_safe_private_link_uri(uri: str) -> bool:
     normalized = (uri or "").strip()
     if (
@@ -343,5 +434,6 @@ def _is_safe_http_uri(uri: str) -> bool:
 __all__ = [
     "assistant_slack_route_name",
     "build_company_assistant_request",
+    "render_device_file_download_delivery",
     "render_company_assistant_result",
 ]

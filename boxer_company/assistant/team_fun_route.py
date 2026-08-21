@@ -19,20 +19,142 @@ from boxer_company.team_chat_context import build_team_chat_context
 
 
 LlmHealthProbe = Callable[[], bool | None]
+TEAM_FUN_OLLAMA_MODEL = "qwen2.5:1.5b"
+TEAM_FUN_LLM_MAX_TOKENS = 48
+TEAM_FUN_LLM_TIMEOUT_SEC = 60
 
 _MENTION_RE = re.compile(r"<@[^>]+>")
+_URL_RE = re.compile(r"https?://\S+")
 _WHITESPACE_RE = re.compile(r"\s+")
+_CLAUSE_SPLIT_RE = re.compile(r"[\n\r,.!?~]+")
+_EDGE_FILLER_RE = re.compile(
+    r"^(또|진짜|완전|아니|근데|그럼|와|헐)\s+|"
+    r"\s+(또|진짜|완전|아니|근데|그럼|와|헐)$"
+)
+_TRAILING_ENDING_RE = re.compile(
+    r"(이네|이야|인가요|인가|인데|네요|네요|이냐|이군)$"
+)
+_TRAILING_PARTICLE_RE = re.compile(
+    r"(은|는|이|가|을|를|도|만|이나|나|랑|과|와|임|야|냐|네|군|지)$"
+)
 _BAD_REPLY_RE = re.compile(
     r"(okay|let'?s|the user|i think|저는|나는|제가|설명|해설|"
     r"안녕하세요|반갑|도와|죄송|미안|예시|출력 규칙)",
     re.IGNORECASE,
 )
+_FUN_TEMPLATE_RULES: tuple[
+    tuple[tuple[str, ...], tuple[str, ...]], ...
+] = (
+    (
+        ("욕", "화내", "짜증", "분노"),
+        (
+            "말 좀 곱게 하지 모대?",
+            "입이 너무 매운 거 모대?",
+            "말로 좀 풀면 안 되모대?",
+        ),
+    ),
+    (
+        ("다이어트", "살빼", "식단", "헬스", "운동", "체중"),
+        (
+            "다이어트도 쉽지 모대?",
+            "식단도 작심삼일 모대?",
+            "살 빼는 게 말뿐 모대?",
+        ),
+    ),
+    (
+        ("연애", "썸", "소개팅", "고백", "플러팅", "뽀뽀"),
+        (
+            "연애도 쉽지 모대?",
+            "썸도 뜻대로 안 되모대?",
+            "마음대로 되는 게 모대?",
+        ),
+    ),
+    (
+        (
+            "로그인",
+            "로그아웃",
+            "비번",
+            "비밀번호",
+            "아이디",
+            "인증",
+            "otp",
+            "패스워드",
+        ),
+        (
+            "로그인도 버벅이지 모대?",
+            "비번도 매번 헷갈리모대?",
+            "인증도 한 번에 안 되모대?",
+        ),
+    ),
+    (
+        ("밥", "먹", "점심", "저녁", "야식", "치킨", "피자", "햄버거"),
+        (
+            "밥도 잘 먹지 모대?",
+            "먹는 건 또 진심이모대?",
+            "야식도 못 참지 모대?",
+        ),
+    ),
+    (
+        ("잠", "졸", "수면", "밤샘", "기절"),
+        (
+            "잠도 참기 힘들지 모대?",
+            "눈꺼풀도 파업 모대?",
+            "잠 앞에서는 장사 없모대?",
+        ),
+    ),
+    (
+        ("커피", "카페인", "아아", "라떼"),
+        (
+            "커피 없인 안 되모대?",
+            "카페인도 생명수 모대?",
+            "아아로 연명하모대?",
+        ),
+    ),
+    (
+        ("출근", "퇴근", "야근", "월급", "회의", "업무", "일", "보고"),
+        (
+            "일도 사람 뜻대로 안 되모대?",
+            "회의도 끝이 없지 모대?",
+            "출근부터 쉽지 않모대?",
+        ),
+    ),
+    (
+        (
+            "배포",
+            "버그",
+            "에러",
+            "장애",
+            "코드",
+            "리뷰",
+            "리팩터링",
+            "테스트",
+            "커밋",
+            "푸시",
+        ),
+        (
+            "배포도 한 번에 안 되모대?",
+            "버그도 눈치 없이 뜨모대?",
+            "코드도 말 안 듣지 모대?",
+        ),
+    ),
+)
+_FUN_GENERIC_TEMPLATES: tuple[str, ...] = (
+    "{topic_with_do} 쉽지 모대?",
+    "{topic_with_do} 생각보다 빡세지 모대?",
+    "{topic_with_do} 또 말처럼 되나 모대?",
+    "{topic_with_do} 그냥 되는 줄 알았모대?",
+)
 _TEAM_FUN_SYSTEM_PROMPT = (
-    "너는 회사 팀 채팅에서 DD를 향한 가벼운 한방 드립을 만드는 "
-    "한국어 답글 보정기야. 반드시 한국어 한 문장만 출력하고 마지막은 "
-    "'모대?'로 끝내. 영어, 설명, 해설, 자기소개, 따옴표, 이모지, 멘션은 "
-    "쓰지 마. 욕설, 비하, 성적 표현, 외모 조롱, 따돌림, 집요한 모욕도 "
-    "금지야. 8~22자 정도로 가볍게 치고 빠져."
+    "너는 슬랙에서 DD를 향한 가벼운 한방 드립을 짧게 다듬는 "
+    "한국어 답글 보정기야. 기본 템플릿을 더 자연스럽고 유쾌하게 "
+    "다듬되, 최근 맥락과 인물 성향을 참고해. 출력 규칙: "
+    "1) 반드시 한국어 한 문장만 출력. "
+    "2) 마지막은 반드시 '모대?'로 끝낼 것. "
+    "3) 길이 8~22자 정도. "
+    "4) 영어, 설명, 해설, 자기소개, 따옴표, 이모지, 멘션 금지. "
+    "5) 욕설, 비하, 성적 표현, 외모 조롱, 따돌림, 집요한 모욕 금지. "
+    "6) 가볍게 치고 빠지는 수준으로만 놀릴 것. "
+    "7) 기본 템플릿보다 이상하면 기본 템플릿 그대로 출력."
 )
 _FORTUNE_DATE_RE = re.compile(
     r"(?P<year>20\d{2})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일"
@@ -326,9 +448,14 @@ class CompanyTeamFunAssistantRoute:
         if match_company_team_fun_route(request) is None:
             return None
 
-        context_text = _render_context_text(
-            list(request.context_entries),
-            max_chars=self._context_max_chars,
+        typed_fun_context = request.metadata.get("team_fun_context")
+        context_text = (
+            typed_fun_context[-self._context_max_chars :]
+            if isinstance(typed_fun_context, str)
+            else _render_context_text(
+                list(request.context_entries),
+                max_chars=self._context_max_chars,
+            )
         )
         if is_prompt_exfiltration_attempt(request.question, context_text):
             return CompanyAssistantResult(
@@ -337,11 +464,22 @@ class CompanyTeamFunAssistantRoute:
                 messages=(AssistantMessage(body=build_prompt_security_refusal()),),
                 fallback_reason="prompt_security",
             )
-        if not self._provider_ready():
+        fallback = build_team_fun_template(request.question)
+        try:
+            provider_ready = self._provider_ready()
+        except Exception as exc:
+            self._logger.warning(
+                "Company team fun provider check failed request_id=%s "
+                "error_type=%s",
+                request.request_id,
+                type(exc).__name__,
+            )
+            provider_ready = False
+        if not provider_ready:
             return CompanyAssistantResult(
                 route=self.name,
-                outcome="failed",
-                messages=(AssistantMessage(body="fun provider unavailable"),),
+                outcome="answered",
+                messages=(AssistantMessage(body=fallback),),
                 fallback_reason="provider_unavailable",
             )
 
@@ -351,7 +489,7 @@ class CompanyTeamFunAssistantRoute:
             speaker_user_id=str(request.actor_id or ""),
             required_names=("DD",),
         )
-        prompt = _build_team_fun_prompt(
+        prompt = build_team_fun_prompt(
             request.question,
             context_text,
             team_context,
@@ -365,8 +503,8 @@ class CompanyTeamFunAssistantRoute:
         except TimeoutError:
             return CompanyAssistantResult(
                 route=self.name,
-                outcome="failed",
-                messages=(AssistantMessage(body="fun provider timeout"),),
+                outcome="answered",
+                messages=(AssistantMessage(body=fallback),),
                 fallback_reason="timeout",
             )
         except Exception as exc:
@@ -377,19 +515,16 @@ class CompanyTeamFunAssistantRoute:
             )
             return CompanyAssistantResult(
                 route=self.name,
-                outcome="failed",
-                messages=(AssistantMessage(body="fun provider error"),),
+                outcome="answered",
+                messages=(AssistantMessage(body=fallback),),
                 fallback_reason="provider_error",
             )
 
-        answer = _sanitize_team_fun_answer(generated)
-        if not answer:
-            return CompanyAssistantResult(
-                route=self.name,
-                outcome="failed",
-                messages=(AssistantMessage(body="fun response invalid"),),
-                fallback_reason="invalid_response",
-            )
+        answer = finalize_team_fun_reply(
+            request.question,
+            generated,
+            fallback,
+        )
         return CompanyAssistantResult(
             route=self.name,
             outcome="answered",
@@ -398,11 +533,13 @@ class CompanyTeamFunAssistantRoute:
         )
 
 
-def _build_team_fun_prompt(
+def build_team_fun_prompt(
     question: str,
     context_text: str,
     team_context: str,
 ) -> str:
+    topic = extract_team_fun_topic(question) or "없음"
+    fallback = build_team_fun_template(question)
     context_block = (
         f"최근 대화 맥락:\n{context_text}\n\n"
         if context_text
@@ -411,9 +548,129 @@ def _build_team_fun_prompt(
     return (
         f"{context_block}{team_context}\n\n"
         f"원문: {str(question or '').strip()}\n"
-        "DD를 살짝 놀리는 짧은 한 문장으로 받아쳐. "
-        "끝은 반드시 모대? 로 끝내.\n출력:"
+        f"추출 토픽: {topic}\n"
+        f"기본 템플릿: {fallback}\n"
+        "출력 규칙:\n"
+        "- DD를 살짝 놀리는 톤\n"
+        "- 최근 맥락이 있으면 그걸 재료로 짧게 받아칠 것\n"
+        "- 기본 템플릿 의미 유지\n"
+        "- 끝은 반드시 모대?\n"
+        "- 영어/설명/자기소개 금지\n"
+        "출력:"
     )
+
+
+def _normalize_team_fun_text(text: str) -> str:
+    normalized = _MENTION_RE.sub(" ", str(text or ""))
+    normalized = _URL_RE.sub(" ", normalized)
+    return _WHITESPACE_RE.sub(" ", normalized).strip()
+
+
+def _clean_team_fun_fragment(text: str) -> str:
+    cleaned = str(text or "").strip(" \"'[]()")
+    cleaned = _EDGE_FILLER_RE.sub("", cleaned).strip()
+    cleaned = _TRAILING_ENDING_RE.sub("", cleaned).strip()
+    cleaned = _TRAILING_PARTICLE_RE.sub("", cleaned).strip()
+    return _EDGE_FILLER_RE.sub("", cleaned).strip()
+
+
+def extract_team_fun_topic(text: str) -> str | None:
+    """기존 Slack fun parser와 같은 규칙으로 결정적인 토픽을 고른다."""
+
+    normalized = _normalize_team_fun_text(text)
+    if "모대" not in normalized:
+        return None
+    clauses = [
+        segment.strip()
+        for segment in _CLAUSE_SPLIT_RE.split(normalized)
+        if segment.strip()
+    ]
+    clause = next(
+        (segment for segment in clauses if "모대" in segment),
+        normalized,
+    )
+    before, _, after = clause.partition("모대")
+    before = _clean_team_fun_fragment(before)
+    after = _clean_team_fun_fragment(after)
+    topic = before or after
+    if not topic:
+        topic = _clean_team_fun_fragment(clause.replace("모대", " "))
+    if not topic:
+        return None
+    words = topic.split()
+    if len(words) > 4:
+        topic = " ".join(words[-4:])
+    if len(topic) > 24:
+        topic = topic[-24:].strip()
+    return topic or None
+
+
+def _pick_team_fun_template(
+    seed_text: str,
+    templates: tuple[str, ...],
+) -> str:
+    if not templates:
+        return ""
+    return templates[sum(ord(char) for char in seed_text) % len(templates)]
+
+
+def build_team_fun_template(text: str) -> str:
+    """provider 장애 때도 기존과 같은 안전한 결정적 답변을 만든다."""
+
+    topic = extract_team_fun_topic(text) or "그거"
+    compact_topic = topic.replace(" ", "")
+    for keywords, templates in _FUN_TEMPLATE_RULES:
+        if any(keyword in compact_topic for keyword in keywords):
+            return _pick_team_fun_template(compact_topic, templates)
+    topic_with_do = topic if topic.endswith("도") else f"{topic}도"
+    template = _pick_team_fun_template(
+        compact_topic or topic_with_do,
+        _FUN_GENERIC_TEMPLATES,
+    )
+    return template.format(topic_with_do=topic_with_do)
+
+
+def _sanitize_team_fun_answer(text: str) -> str:
+    cleaned = _MENTION_RE.sub(" ", str(text or ""))
+    cleaned = cleaned.replace("\n", " ").replace("\r", " ")
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip(" \"'[]()")
+    if len(cleaned) > 48:
+        cleaned = cleaned[:48].rstrip()
+    return cleaned
+
+
+def finalize_team_fun_reply(
+    source_text: str,
+    generated_text: str,
+    fallback_text: str | None = None,
+) -> str:
+    """LLM 출력이 기존 계약을 벗어나면 local과 같은 template로 되돌린다."""
+
+    fallback = fallback_text or build_team_fun_template(source_text)
+    cleaned = _sanitize_team_fun_answer(generated_text)
+    if not cleaned or _BAD_REPLY_RE.search(cleaned):
+        return fallback
+    cleaned = re.sub(r"^.*(?:->|=>|:)\s*", "", cleaned).strip()
+    cleaned = re.split(
+        r"(?:,|\.|!|;|:| 그런데 | 근데 | 하지만 | 그래서 )",
+        cleaned,
+        maxsplit=1,
+    )[0].strip()
+    cleaned = cleaned.replace("모대", " ").replace("?", " ").strip()
+    cleaned = cleaned.rstrip("!~. ")
+
+    topic = extract_team_fun_topic(source_text) or ""
+    compact_topic = topic.replace(" ", "")
+    if (
+        topic
+        and compact_topic in fallback.replace(" ", "")
+        and compact_topic not in cleaned.replace(" ", "")
+    ):
+        cleaned = f"{topic} {cleaned}".strip()
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
+    if len(cleaned) < 2 or len(cleaned) > 18:
+        return fallback
+    return f"{cleaned} 모대?"
 
 
 def is_daily_fortune_content(text: str, thread_root_text: str) -> bool:
@@ -593,27 +850,19 @@ def _build_fortune_target_text(years: list[str]) -> str:
     return f"{years[0]} 외 {len(years) - 1}개 년생 기준으론"
 
 
-def _sanitize_team_fun_answer(text: str) -> str:
-    """API 경계에서 설명·멘션·장문을 버리고 한 문장 계약만 반환한다."""
-
-    cleaned = _MENTION_RE.sub(" ", str(text or ""))
-    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip(" \"'[]()")
-    if not cleaned or _BAD_REPLY_RE.search(cleaned) or len(cleaned) > 48:
-        return ""
-    cleaned = re.split(r"(?:\n|,|\.|!|;|:)", cleaned, maxsplit=1)[0].strip()
-    cleaned = cleaned.replace("모대", " ").replace("?", " ").strip(" !~. ")
-    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
-    if len(cleaned) < 2 or len(cleaned) > 18:
-        return ""
-    return f"{cleaned} 모대?"
-
-
 __all__ = [
     "CompanyDailyFortuneAssistantRoute",
     "CompanyLlmHealthAssistantRoute",
     "CompanyTeamFunAssistantRoute",
     "LlmHealthProbe",
+    "TEAM_FUN_LLM_MAX_TOKENS",
+    "TEAM_FUN_LLM_TIMEOUT_SEC",
+    "TEAM_FUN_OLLAMA_MODEL",
     "build_daily_fortune_reply",
+    "build_team_fun_prompt",
+    "build_team_fun_template",
+    "extract_team_fun_topic",
+    "finalize_team_fun_reply",
     "is_daily_fortune_content",
     "match_company_daily_fortune_route",
     "match_company_llm_health_route",

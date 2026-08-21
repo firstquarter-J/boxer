@@ -2459,7 +2459,10 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         with (
             # remote prepare는 Slack DB를 읽지 않고 API typed requester 결과만 모달에 채운다.
             patch.object(reporter, "_lookup_device_health_monitor_hospital_contact") as lookup_mock,
-            patch.object(reporter, "_append_device_health_monitor_event"),
+            patch.object(
+                reporter,
+                "_append_device_health_monitor_event",
+            ) as append_event_mock,
         ):
             handler(ack, body, client)
 
@@ -2467,6 +2470,16 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         checker.assert_called_once_with("T_TEST", "U123")
         lookup_mock.assert_not_called()
         bridge.prepare_sms.assert_called_once()
+        bridge.record_modal_receipt.assert_called_once()
+        receipt_kwargs = bridge.record_modal_receipt.call_args.kwargs
+        self.assertEqual(
+            receipt_kwargs["action_id"],
+            reporter._DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+        )
+        self.assertEqual(receipt_kwargs["status"], "modal_opened")
+        self.assertTrue(receipt_kwargs["ok"])
+        self.assertEqual(receipt_kwargs["message_ts"], "3000.010")
+        append_event_mock.assert_not_called()
         prepare_kwargs = bridge.prepare_sms.call_args.kwargs
         self.assertEqual(prepare_kwargs["workspace_id"], "T_TEST")
         self.assertEqual(prepare_kwargs["actor_user_id"], "U123")
@@ -2497,6 +2510,67 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             message_block["element"]["initial_value"],
             "API가 준비한 병원 안내 문자",
         )
+
+    def test_remote_modal_failure_is_reported_to_api_without_local_event(self) -> None:
+        client = _FakeSlackClient()
+        client.views_open = Mock(side_effect=RuntimeError("view failed"))
+        bridge = Mock()
+        bridge.prepare_sms.return_value = Mock(
+            operation_result={
+                "kind": "sms_contact_preparation",
+                "deliveryScope": "requester",
+                "phoneNumber": "01098765432",
+                "message": "API 안내 문자",
+                "templateId": "captureboard_disconnected",
+                "target": {},
+            }
+        )
+        item = {
+            "hospitalSeq": "69",
+            "hospitalName": "수지미래산부인과의원(용인)",
+            "hospital": "#69 수지미래산부인과의원(용인)",
+            "room": "1진료실",
+            "device": "MB2-C00043",
+            "alertCategory": "video_signal",
+            "problemComponents": ["캡처보드"],
+            "issue": "캡처보드 연결 오류",
+            "mdaUrl": "https://mda.example/device",
+        }
+
+        with patch.object(
+            reporter,
+            "_append_device_health_monitor_event",
+        ) as append_event_mock:
+            result = reporter._handle_device_health_monitor_contact_modal_action(
+                raw_item=item,
+                actor_user_id="U123",
+                channel_id="C_HEALTH",
+                message_ts="3000.010",
+                thread_ts="3000.010",
+                trigger_id="TRIGGER_REMOTE",
+                client=client,
+                logger=logging.getLogger("test.remote.modal.failure"),
+                now=datetime(
+                    2026,
+                    8,
+                    14,
+                    9,
+                    30,
+                    tzinfo=ZoneInfo("Asia/Seoul"),
+                ),
+                workspace_id="T_TEST",
+                interaction_id="3000.011",
+                action_api_bridge=bridge,
+            )
+
+        self.assertEqual(result["result"]["status"], "modal_open_failed")
+        bridge.record_modal_receipt.assert_called_once()
+        receipt = bridge.record_modal_receipt.call_args.kwargs
+        self.assertEqual(receipt["status"], "modal_open_failed")
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["error_type"], "RuntimeError")
+        append_event_mock.assert_not_called()
+        self.assertEqual(len(client.messages), 1)
 
     def test_remote_voice_action_uses_bridge_once_without_local_mda(self) -> None:
         client = _FakeSlackClient()

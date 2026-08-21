@@ -152,8 +152,8 @@ def _lookup_device_ssh_status(
         wait_result = _wait_for_mda_device_agent_ssh(
             normalized_name,
             poll_timeout_sec=min(10, max(1, cs.MDA_SSH_POLL_TIMEOUT_SEC)),
-            # API로 이전한 generic 장비 상세는 요청 하나에서 open을 한 번만
-            # 보낸다. 기존 Slack local 호출은 기본값으로 기존 재전송 동작을 유지한다.
+            # Slack local 기본값은 기존 주기 재전송을 유지하고, API route는
+            # 이 인자를 false로 넘겨 한 turn의 open을 한 번으로 제한한다.
             resend_enabled=allow_ssh_open_resend,
         )
     except Exception:

@@ -327,26 +327,49 @@ def _lookup_device_file_scope_from_mda_recovery_root(
     requested_barcode: str,
     requested_date: str,
 ) -> list[dict[str, Any]]:
+    """기존 local route용 wrapper다."""
+
+    return _lookup_device_file_scope_from_mda_recovery_thread(
+        client=context.client,
+        logger=context.logger,
+        channel_id=context.channel_id,
+        thread_ts=context.thread_ts,
+        requested_barcode=requested_barcode,
+        requested_date=requested_date,
+    )
+
+
+def _lookup_device_file_scope_from_mda_recovery_thread(
+    *,
+    client: Any,
+    logger: logging.Logger,
+    channel_id: str,
+    thread_ts: str,
+    requested_barcode: str,
+    requested_date: str,
+) -> list[dict[str, Any]]:
+    """현재 bot이 쓴 MDA 복구 root의 장비 scope만 검증해 반환한다."""
+
     trusted_channel_id = str(cs.DEVICE_NOTIFICATION_ALERT_CHANNEL_ID or "").strip()
     if (
-        not context.client
+        not client
         or not trusted_channel_id
-        or context.channel_id != trusted_channel_id
-        or not context.thread_ts
+        or channel_id != trusted_channel_id
+        or not thread_ts
     ):
         return []
 
     try:
-        response = context.client.conversations_replies(
-            channel=context.channel_id,
-            ts=context.thread_ts,
+        response = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
             limit=1,
             inclusive=True,
         )
         messages = response.get("messages") or []
     except Exception as exc:
         # 실패 시 일반 2차 입력으로 되돌리고 Slack 응답 본문은 로그에 남기지 않는다.
-        context.logger.warning(
+        logger.warning(
             "Failed to load MDA recovery alert root error_type=%s",
             type(exc).__name__,
         )
@@ -358,14 +381,14 @@ def _lookup_device_file_scope_from_mda_recovery_root(
             message
             for message in messages
             if isinstance(message, dict)
-            and str(message.get("ts") or "") == str(context.thread_ts)
+            and str(message.get("ts") or "") == str(thread_ts)
         ),
         None,
     )
     if not root_message or not _is_mda_recovery_alert_from_current_bot(
-        context.client,
+        client,
         root_message,
-        context.logger,
+        logger,
     ):
         return []
 

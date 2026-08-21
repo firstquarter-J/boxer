@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
 import os
 from pathlib import Path
@@ -23,7 +23,7 @@ _MAX_KNOWN_HOSTS_BYTES = 4 * 1024 * 1024
 
 
 class DeviceSshSecurityError(RuntimeError):
-    """SSH credential을 보내기 전에 fail-closed한 안전한 오류 코드다."""
+    """SSH credential이나 중복 side effect 전 fail-closed한 오류다."""
 
 
 @dataclass(slots=True)
@@ -32,6 +32,8 @@ class CompanyApiDeviceSshRequestState:
 
     mutation_attempted: bool = False
     open_attempted: bool = False
+    per_device_open_budget: bool = False
+    opened_device_names: set[str] = field(default_factory=set)
 
 
 _API_DEVICE_SSH_REQUEST_STATE: ContextVar[
@@ -44,17 +46,44 @@ _API_DEVICE_SSH_REQUEST_STATE: ContextVar[
 
 @contextmanager
 def company_api_device_ssh_context(
+    *,
+    per_device_open_budget: bool = False,
 ) -> Iterator[CompanyApiDeviceSshRequestState]:
-    """공통 API runtime에서만 strict host identity 검증을 강제한다."""
+    """API request의 strict SSH identity와 open 예산을 강제한다."""
 
     strict_token = _API_DEVICE_SSH_STRICT.set(True)
-    state = CompanyApiDeviceSshRequestState()
+    state = CompanyApiDeviceSshRequestState(
+        per_device_open_budget=per_device_open_budget,
+    )
     state_token = _API_DEVICE_SSH_REQUEST_STATE.set(state)
     try:
         yield state
     finally:
         _API_DEVICE_SSH_REQUEST_STATE.reset(state_token)
         _API_DEVICE_SSH_STRICT.reset(strict_token)
+
+
+def _is_company_api_device_ssh_context() -> bool:
+    """공통 API request 안에서만 강화 정책을 적용하도록 경계를 노출한다."""
+
+    return _API_DEVICE_SSH_STRICT.get()
+
+
+def _company_api_device_ssh_open_attempted(
+    device_name: str | None = None,
+) -> bool:
+    """현재 turn 또는 automation의 해당 장비 open 사용 여부를 확인한다."""
+
+    state = _API_DEVICE_SSH_REQUEST_STATE.get()
+    if state is None:
+        return False
+    if not state.per_device_open_budget:
+        return state.open_attempted
+    normalized_device = str(device_name or "").strip().casefold()
+    return bool(
+        normalized_device
+        and normalized_device in state.opened_device_names
+    )
 
 
 def _mark_company_api_mutation_attempted() -> None:
@@ -65,11 +94,26 @@ def _mark_company_api_mutation_attempted() -> None:
         state.mutation_attempted = True
 
 
-def _mark_company_api_device_ssh_open_attempted() -> None:
-    """실제 GraphQL 전송 직전에 현재 API request의 mutation 시도를 남긴다."""
+def _mark_company_api_device_ssh_open_attempted(
+    device_name: str | None = None,
+) -> None:
+    """API turn의 허용된 첫 sshOrder를 외부 전송 직전에 표시한다."""
 
     state = _API_DEVICE_SSH_REQUEST_STATE.get()
     if state is not None:
+        if state.per_device_open_budget:
+            normalized_device = str(device_name or "").strip().casefold()
+            if not normalized_device:
+                raise DeviceSshSecurityError(
+                    "device_ssh_open_identity_missing"
+                )
+            if normalized_device in state.opened_device_names:
+                raise DeviceSshSecurityError(
+                    "device_ssh_open_budget_exhausted"
+                )
+            state.opened_device_names.add(normalized_device)
+        elif state.open_attempted:
+            raise DeviceSshSecurityError("device_ssh_open_budget_exhausted")
         state.mutation_attempted = True
         state.open_attempted = True
 
@@ -122,14 +166,26 @@ def _prepare_device_ssh_client(
     normalized_reported_host = str(reported_host or "").strip().casefold()
     allowed_hosts = {
         item.strip().casefold()
-        for item in cs.BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS
+        for item in getattr(
+            cs,
+            "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS",
+            (),
+        )
         if item.strip()
     }
     connect_host = str(
-        cs.BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST or ""
+        getattr(cs, "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST", "")
+        or ""
     ).strip()
     known_hosts_path = Path(
-        str(cs.BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH or "").strip()
+        str(
+            getattr(
+                cs,
+                "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH",
+                "",
+            )
+            or ""
+        ).strip()
     )
     if (
         not normalized_device
@@ -158,8 +214,8 @@ def _prepare_device_ssh_client(
         or target_entries[0][1] != "ssh-ed25519"
     ):
         raise DeviceSshSecurityError("device_ssh_host_key_missing")
-    # 서로 다른 장비가 같은 골든이미지 host key를 복제한 경우 endpoint가
-    # 바뀌어도 검증을 통과하므로 전체 정본에서 public key 중복도 거부한다.
+    # 서로 다른 장비가 같은 골든이미지 host key를 복제한 경우에도
+    # 동적 endpoint 검증을 우회할 수 있으므로 전체 정본에서 거부한다.
     public_keys = [entry[2] for entry in entries]
     if len(public_keys) != len(set(public_keys)):
         raise DeviceSshSecurityError("device_ssh_host_key_duplicate")
@@ -183,10 +239,14 @@ def _prepare_device_ssh_client(
 
 
 def _validate_known_hosts_path(path: Path) -> None:
+    """root 정본 파일과 모든 parent가 교체 불가능한지 확인한다."""
+
     try:
         path_stat = os.lstat(path)
     except OSError as exc:
-        raise DeviceSshSecurityError("device_ssh_known_hosts_unavailable") from exc
+        raise DeviceSshSecurityError(
+            "device_ssh_known_hosts_unavailable"
+        ) from exc
     if (
         stat.S_ISLNK(path_stat.st_mode)
         or not stat.S_ISREG(path_stat.st_mode)
@@ -197,13 +257,13 @@ def _validate_known_hosts_path(path: Path) -> None:
     ):
         raise DeviceSshSecurityError("device_ssh_known_hosts_unsafe")
 
-    # leaf 교체를 막기 위해 루트까지 모든 parent가 root 소유이고
-    # group/other writable이 아닌지 같은 syscall 기준으로 검사한다.
     for parent in path.parents:
         try:
             parent_stat = os.lstat(parent)
         except OSError as exc:
-            raise DeviceSshSecurityError("device_ssh_known_hosts_unsafe") from exc
+            raise DeviceSshSecurityError(
+                "device_ssh_known_hosts_unsafe"
+            ) from exc
         if (
             stat.S_ISLNK(parent_stat.st_mode)
             or not stat.S_ISDIR(parent_stat.st_mode)
@@ -214,10 +274,14 @@ def _validate_known_hosts_path(path: Path) -> None:
 
 
 def _load_known_hosts_entries(path: Path) -> list[tuple[str, str, str]]:
+    """장비명 하나와 ed25519 key 하나만 허용하는 정본을 읽는다."""
+
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        raise DeviceSshSecurityError("device_ssh_known_hosts_invalid") from exc
+        raise DeviceSshSecurityError(
+            "device_ssh_known_hosts_invalid"
+        ) from exc
     entries: list[tuple[str, str, str]] = []
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
@@ -241,6 +305,8 @@ def _load_known_hosts_entries(path: Path) -> list[tuple[str, str, str]]:
 __all__ = [
     "CompanyApiDeviceSshRequestState",
     "DeviceSshSecurityError",
+    "_company_api_device_ssh_open_attempted",
+    "_is_company_api_device_ssh_context",
     "_mark_company_api_device_ssh_open_attempted",
     "_mark_company_api_mutation_attempted",
     "_prepare_device_ssh_client",

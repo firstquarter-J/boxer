@@ -2,20 +2,23 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
+from boxer_company.assistant.answer_composer import (
+    CompanyEvidenceAnswerComposer,
+)
 from boxer_company.assistant.device_file_operations_route import (
+    DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE,
     DEVICE_FILE_DOWNLOAD_ROUTE,
     DEVICE_FILE_LOOKUP_ROUTE,
     DEVICE_FILE_RECOVERY_ROUTE,
     DEVICE_LOG_UPLOAD_ROUTE,
     DeviceFileOperationsAssistantRoute,
-    has_ambiguous_device_file_operation_scope,
     match_device_file_operation_route,
     needs_device_file_operation_context,
 )
@@ -23,26 +26,33 @@ from boxer_company.assistant.device_health_alert_action_route import (
     DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
     DEVICE_HEALTH_ALERT_VOICE_ROUTE,
     DeviceHealthAlertActionAssistantRoute,
     match_device_health_alert_action_route,
 )
+from boxer_company.assistant.device_led_routes import (
+    match_device_read_route,
+)
 from boxer_company.assistant.device_operations_route import (
+    DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
+    DEVICE_OPERATION_DELIVERY_ACTION,
     DeviceOperationsAssistantRoute,
-    has_ambiguous_device_mutation_target,
     has_device_diagnostic_followup_query,
-    match_device_mutation_guard_candidate_route,
     match_device_operation_route,
 )
 from boxer_company.assistant.knowledge_write_route import (
     ThreadPlaybookLearningAssistantRoute,
-    match_thread_playbook_learning_candidate_route,
     match_thread_playbook_learning_route,
 )
-from boxer_company.assistant.operation_intent import (
-    is_explicit_operation_execution,
+from boxer_company.assistant.knowledge_routes import (
+    match_notion_playbook_route,
 )
 from boxer_company.assistant.private_admin_routes import (
+    ADMIN_READONLY_SQL_ROUTE,
+    ADMIN_REQUEST_LOG_ROUTE,
+    ADMIN_S3_DEVICE_LOG_ROUTE,
+    ADMIN_S3_ULTRASOUND_ROUTE,
     build_private_operations_routes,
     match_private_operations_route,
 )
@@ -54,14 +64,11 @@ from boxer_company.assistant.security_review_route import (
 from boxer_company.routers.device_file_probe import (
     _should_probe_device_files,
 )
+from boxer_company.routers.recording_streaming_restore import (
+    _extract_recording_streaming_restore_month,
+)
 
 
-OPERATION_CONFIRMATION_REQUIRED_ROUTE = (
-    "operation_confirmation_required"
-)
-OPERATION_SINGLE_TARGET_REQUIRED_ROUTE = (
-    "operation_single_target_required"
-)
 _MUTATING_OPERATION_ROUTES = frozenset(
     {
         "thread_playbook_learning",
@@ -76,8 +83,57 @@ _MUTATING_OPERATION_ROUTES = frozenset(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_OPERATION_DELIVERY_ACTION,
         "device_memory_patch",
     }
+)
+_LEGACY_PRE_DEVICE_PRIVATE_ROUTES = frozenset(
+    {
+        ADMIN_S3_ULTRASOUND_ROUTE,
+        ADMIN_S3_DEVICE_LOG_ROUTE,
+        ADMIN_READONLY_SQL_ROUTE,
+        ADMIN_REQUEST_LOG_ROUTE,
+    }
+)
+_LEGACY_EARLY_DEVICE_OPERATION_ROUTES = frozenset(
+    {
+        "device_voice_catalog",
+        "device_voice_change",
+        "device_diagnostic_snapshot",
+    }
+)
+_DEVICE_FILE_OPERATION_ROUTES = frozenset(
+    {
+        DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE,
+        DEVICE_LOG_UPLOAD_ROUTE,
+        DEVICE_FILE_LOOKUP_ROUTE,
+        DEVICE_FILE_DOWNLOAD_ROUTE,
+        DEVICE_FILE_RECOVERY_ROUTE,
+    }
+)
+_DEVICE_OPERATION_ROUTES = frozenset(
+    {
+        "device_voice_catalog",
+        "device_voice_change",
+        "device_diagnostic_snapshot",
+        "device_diagnostic_analysis",
+        "device_diagnostic_followup",
+        "device_update_status",
+        "device_box_update",
+        "device_agent_update",
+        "device_power_off",
+        DEVICE_OPERATION_DELIVERY_ACTION,
+        "device_audio_probe",
+        "device_remote_access_probe",
+        "device_memory_patch",
+        "device_pm2_probe",
+        "device_captureboard_probe",
+        "device_led_probe",
+        "device_status_probe",
+    }
+)
+_LEGACY_LATE_DEVICE_OPERATION_ROUTES = (
+    _DEVICE_OPERATION_ROUTES - _LEGACY_EARLY_DEVICE_OPERATION_ROUTES
 )
 _MUTATION_CAPABLE_OPERATION_ROUTES = _MUTATING_OPERATION_ROUTES | frozenset(
     {
@@ -86,6 +142,8 @@ _MUTATION_CAPABLE_OPERATION_ROUTES = _MUTATING_OPERATION_ROUTES | frozenset(
         SECURITY_REVIEW_ROUTE,
         DEVICE_HEALTH_ALERT_SMS_ROUTE,
         DEVICE_HEALTH_ALERT_VOICE_ROUTE,
+        # Slack UI POST 결과도 같은 request-id guard 아래 한 번만 JSONL에 쓴다.
+        DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
         # 조회 응답 자체는 read-only여도 endpoint가 없으면 sshOrder(open)으로
         # tunnel lifecycle을 바꿀 수 있어 같은 mutation guard가 필요하다.
         "device_diagnostic_followup",
@@ -116,6 +174,7 @@ _LIVE_DEVICE_OPERATION_ROUTES = frozenset(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_OPERATION_DELIVERY_ACTION,
         "device_audio_probe",
         "device_remote_access_probe",
         "device_memory_patch",
@@ -130,6 +189,7 @@ _UNCERTAIN_MUTATION_FALLBACK_REASONS = frozenset(
         "sms_delivery_receipt_persist_failed",
         "sms_delivery_confirmation_required",
         "voice_guide_dispatch_uncertain",
+        "device_operation_delivery_receipt_in_progress",
     }
 )
 _ATTEMPT_REQUIRED_UNCERTAIN_FALLBACK_REASONS = frozenset(
@@ -142,70 +202,6 @@ _UNCERTAIN_MUTATION_FALLBACK_REASONS_BY_ROUTE = {
         {"dependency_error", "empty_result"}
     ),
 }
-
-
-class OperationConfirmationAssistantRoute:
-    """질문·설명·부정형 mutation 후보를 실행 없이 결정적으로 종결한다."""
-
-    name = OPERATION_CONFIRMATION_REQUIRED_ROUTE
-
-    def handle(
-        self,
-        request: CompanyAssistantRequest,
-    ) -> CompanyAssistantResult | None:
-        if match_operation_execution_guard_route(request) is None:
-            return None
-        return build_operation_confirmation_required_result()
-
-
-class OperationSingleTargetAssistantRoute:
-    """복수·교차 actor target 요청을 외부 호출 없이 종결한다."""
-
-    name = OPERATION_SINGLE_TARGET_REQUIRED_ROUTE
-
-    def handle(
-        self,
-        request: CompanyAssistantRequest,
-    ) -> CompanyAssistantResult | None:
-        if match_operation_target_guard_route(request) is None:
-            return None
-        return build_operation_single_target_required_result()
-
-
-def build_operation_confirmation_required_result() -> CompanyAssistantResult:
-    """local/remote gateway가 공유하는 mutation 미실행 안내다."""
-
-    return CompanyAssistantResult(
-        route=OPERATION_CONFIRMATION_REQUIRED_ROUTE,
-        outcome="needs_input",
-        messages=(
-            AssistantMessage(
-                body=(
-                    "방법·가능 여부 질문으로는 작업을 실행하지 않아. "
-                    "실제 실행 요청이면 질문형 없이 작업을 명시해서 다시 요청해줘"
-                )
-            ),
-        ),
-        fallback_reason="explicit_execution_required",
-    )
-
-
-def build_operation_single_target_required_result() -> CompanyAssistantResult:
-    """장비·바코드·같은 actor thread scope를 하나로 다시 받는다."""
-
-    return CompanyAssistantResult(
-        route=OPERATION_SINGLE_TARGET_REQUIRED_ROUTE,
-        outcome="needs_input",
-        messages=(
-            AssistantMessage(
-                body=(
-                    "작업 대상을 하나로 확정할 수 없어 실행하지 않았어. "
-                    "장비명 또는 바코드 하나를 현재 요청에 직접 적어서 다시 요청해줘"
-                )
-            ),
-        ),
-        fallback_reason="single_operation_target_required",
-    )
 
 
 def as_operations_request(
@@ -236,24 +232,187 @@ def match_company_operation_route(
     alert_action = match_device_health_alert_action_route(scoped)
     if alert_action is not None:
         return alert_action
-    target_guarded = match_operation_target_guard_route(scoped)
-    if target_guarded is not None:
-        return target_guarded
-    guarded = match_operation_execution_guard_route(scoped)
-    if guarded is not None:
-        return guarded
-    for matcher in (
-        match_thread_playbook_learning_route,
-        # 일자 단위 파일 복구를 먼저 분류하고, 월 단위 recordings 복원은
-        # file matcher가 넘긴 뒤 private operation이 소유한다.
-        match_device_file_operation_route,
-        match_private_operations_route,
-        match_device_operation_route,
+    device_action_route = match_device_operation_route(scoped)
+    if device_action_route == DEVICE_OPERATION_DELIVERY_ACTION:
+        # Slack 최종 메시지 성공 뒤 온 typed receipt는 질문 속 학습/admin/file
+        # 표현보다 먼저 잡아 원 장비 명령을 다시 실행하지 않는다.
+        return device_action_route
+    raw_operation_action = scoped.metadata.get("operation_action")
+    if (
+        isinstance(raw_operation_action, dict)
+        and raw_operation_action
+        == {"name": DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION}
     ):
-        matched = matcher(scoped)
-        if matched is not None:
-            return matched
-    return None
+        # knowledge 위치에서 adapter가 보낸 typed snapshot probe는 질문에
+        # 섞인 다른 자연어 matcher보다 정확한 route를 먼저 확정한다.
+        return "device_diagnostic_followup"
+    learning_route = match_thread_playbook_learning_route(scoped)
+    if learning_route is not None:
+        return learning_route
+
+    private_route = match_private_operations_route(scoped)
+    if private_route in _LEGACY_PRE_DEVICE_PRIVATE_ROUTES:
+        # 기존 Slack의 admin route는 Notion·장비 route보다 먼저 실행됐다.
+        return private_route
+    if private_route == "recording_streaming_restore":
+        try:
+            _extract_recording_streaming_restore_month(scoped.question)
+        except ValueError:
+            pass
+        else:
+            # 기존 device handler는 유효한 월 단위 streaming 복원 문구를 첫
+            # guard에서 바로 barcode handler로 넘겼다. 음성·업데이트·전원 표현이
+            # 함께 있어도 장비 mutation이 복원을 선점하지 않게 이 위치를 지킨다.
+            return private_route
+
+    file_route = match_device_file_operation_route(scoped)
+    if file_route == DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE:
+        # 바코드 없는 다운로드 안내는 기존 device handler의 첫 guard였다.
+        return file_route
+
+    device_route = match_device_operation_route(scoped)
+    if device_route in _LEGACY_EARLY_DEVICE_OPERATION_ROUTES:
+        # 음성 변경과 진단 시작은 기존 device handler에서 LED/file보다 앞이다.
+        return device_route
+    if match_device_read_route(scoped) is not None:
+        # LED S3 분석·패턴 안내는 operation이 아니며 기존에는 file보다 먼저
+        # 처리됐다. operation gateway가 이 조회를 선점하지 않게 넘긴다.
+        return None
+    if file_route is not None:
+        return file_route
+    if device_route in {
+        "device_diagnostic_followup",
+        "device_diagnostic_analysis",
+    }:
+        # app-user·barcode 판정·streaming restore는 모두 knowledge 진단보다
+        # 앞이었다. 이 요청은 API barcode stage가 먼저 소유한다.
+        if private_route is not None:
+            return private_route
+        if (
+            device_route == "device_diagnostic_analysis"
+            and match_notion_playbook_route(scoped) is not None
+        ):
+            # Notion playbook도 freeform live 진단보다 먼저 답했다.
+            return None
+        return device_route
+    if device_route is not None:
+        return device_route
+    return private_route
+
+
+CompanyOperationLegacyStage = Literal[
+    "pre_notion",
+    "device",
+    "barcode",
+    "knowledge",
+]
+
+
+class _ExactCompanyOperationRoute:
+    """공통 matcher가 확정한 route 묶음만 실제 handler에 진입시킨다."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        route: Any,
+        accepted_routes: frozenset[str],
+    ) -> None:
+        self.name = name
+        self._route = route
+        self._accepted_routes = accepted_routes
+
+    def handle(
+        self,
+        request: CompanyAssistantRequest,
+    ) -> CompanyAssistantResult | None:
+        matched = match_company_operation_route(request)
+        if matched not in self._accepted_routes:
+            return None
+        result = self._route.handle(request)
+        return self._validate_result(matched, result)
+
+    def handle_with_progress(
+        self,
+        request: CompanyAssistantRequest,
+        on_partial_result: Any,
+    ) -> CompanyAssistantResult | None:
+        matched = match_company_operation_route(request)
+        if matched not in self._accepted_routes:
+            return None
+        progressive_handler = getattr(
+            self._route,
+            "handle_with_progress",
+            None,
+        )
+        result = (
+            progressive_handler(request, on_partial_result)
+            if callable(progressive_handler)
+            else self._route.handle(request)
+        )
+        return self._validate_result(matched, result)
+
+    @staticmethod
+    def _validate_result(
+        matched: str,
+        result: CompanyAssistantResult | None,
+    ) -> CompanyAssistantResult:
+        if result is not None and result.route == matched:
+            return result
+        # matcher와 executor가 다시 어긋나도 뒤 route나 mutation으로 계속
+        # 내려가지 않고, 확정 route 이름만 담은 안전한 실패로 끝낸다.
+        return CompanyAssistantResult(
+            route=matched,
+            outcome="failed",
+            messages=(
+                AssistantMessage(
+                    body="요청 경로를 실행할 수 없어. 잠시 후 다시 시도해줘"
+                ),
+            ),
+            fallback_reason="operation_dispatch_mismatch",
+        )
+
+
+def company_operation_legacy_stage(
+    request: CompanyAssistantRequest,
+) -> CompanyOperationLegacyStage | None:
+    """기존 Slack handler 순서에서 operation이 실행되던 위치를 반환한다."""
+
+    scoped = as_operations_request(request)
+    matched = match_company_operation_route(scoped)
+    if matched is None:
+        return None
+    if matched in (
+        {
+            SECURITY_REVIEW_ROUTE,
+            "thread_playbook_learning",
+        }
+        | set(_LEGACY_PRE_DEVICE_PRIVATE_ROUTES)
+        | {
+            DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
+            DEVICE_HEALTH_ALERT_SMS_ROUTE,
+            DEVICE_HEALTH_ALERT_VOICE_ROUTE,
+            DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+            DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
+        }
+    ):
+        # 학습·보안·admin은 기존 Notion matcher보다 앞이었다.
+        return "pre_notion"
+    if matched in {
+        "device_diagnostic_followup",
+        "device_diagnostic_analysis",
+    }:
+        # 저장 snapshot 후속과 자유 진단은 기존 모든 barcode route 뒤의
+        # knowledge 위치에서만 실행됐다.
+        return "knowledge"
+    if (
+        match_device_file_operation_route(scoped) == matched
+        or match_device_operation_route(scoped) == matched
+    ):
+        # 장비와 일자 파일 작업은 Notion 다음, 분석 route들보다 앞이었다.
+        return "device"
+    # app-user·streaming restore·barcode 판정은 기존 barcode handler 위치다.
+    return "barcode"
 
 
 def is_mutation_capable_company_operation(
@@ -316,58 +475,89 @@ def is_uncertain_company_mutation_result(
     )
 
 
-def match_operation_target_guard_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """복수 target과 actor-safe thread scope 실패를 mode와 무관하게 막는다."""
-
-    scoped = as_operations_request(request)
-    if has_ambiguous_device_mutation_target(
-        scoped
-    ) or has_ambiguous_device_file_operation_scope(scoped):
-        return OPERATION_SINGLE_TARGET_REQUIRED_ROUTE
-    return None
-
-
-def match_operation_execution_guard_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """mutation 후보의 비실행 의도를 외부 호출 없이 먼저 분류한다."""
-
-    scoped = as_operations_request(request)
-    for matcher in (
-        match_thread_playbook_learning_candidate_route,
-        match_device_file_operation_route,
-        match_private_operations_route,
-        match_device_mutation_guard_candidate_route,
-    ):
-        candidate = matcher(scoped)
-        if candidate not in _MUTATING_OPERATION_ROUTES:
-            continue
-        if not is_explicit_operation_execution(scoped.question):
-            return OPERATION_CONFIRMATION_REQUIRED_ROUTE
-        return None
-    return None
-
-
 def build_company_operation_routes(
     *,
     context_max_chars: int,
+    claude_client: Any = None,
+    answer_composer: CompanyEvidenceAnswerComposer | None = None,
+    timeout_message: str | None = None,
     logger: logging.Logger | None = None,
 ) -> tuple[Any, ...]:
     """공통 API 프로세스에서만 operation 구현을 고정 순서로 조립한다."""
 
+    private_routes = build_private_operations_routes(
+        answer_composer=answer_composer,
+        timeout_message=timeout_message,
+        logger=logger,
+    )
+    pre_device_private_routes = tuple(
+        route
+        for route in private_routes
+        if route.name in _LEGACY_PRE_DEVICE_PRIVATE_ROUTES
+    )
+    post_device_private_routes = tuple(
+        route
+        for route in private_routes
+        if route.name not in _LEGACY_PRE_DEVICE_PRIVATE_ROUTES
+    )
+    security_route = SecurityReviewAssistantRoute()
+    alert_route = DeviceHealthAlertActionAssistantRoute(logger=logger)
+    learning_route = ThreadPlaybookLearningAssistantRoute(
+        context_max_chars=context_max_chars,
+        claude_client=claude_client,
+        logger=logger,
+    )
+    file_route = DeviceFileOperationsAssistantRoute(logger=logger)
+    device_route = DeviceOperationsAssistantRoute(
+        answer_composer=answer_composer,
+        timeout_message=(
+            timeout_message
+            or "AI 답변 생성 시간이 초과됐어. 잠시 후 다시 시도해줘"
+        ),
+        logger=logger,
+    )
+
+    def exact(
+        route: Any,
+        accepted: frozenset[str],
+        *,
+        name: str | None = None,
+    ) -> Any:
+        return _ExactCompanyOperationRoute(
+            name=name or route.name,
+            route=route,
+            accepted_routes=accepted,
+        )
+
     return (
-        OperationSingleTargetAssistantRoute(),
-        OperationConfirmationAssistantRoute(),
-        SecurityReviewAssistantRoute(),
-        DeviceHealthAlertActionAssistantRoute(logger=logger),
-        DeviceFileOperationsAssistantRoute(logger=logger),
-        *build_private_operations_routes(logger=logger),
-        DeviceOperationsAssistantRoute(logger=logger),
-        ThreadPlaybookLearningAssistantRoute(
-            context_max_chars=context_max_chars,
-            logger=logger,
+        exact(security_route, frozenset({SECURITY_REVIEW_ROUTE})),
+        exact(
+            alert_route,
+            frozenset(
+                {
+                    DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
+                    DEVICE_HEALTH_ALERT_SMS_ROUTE,
+                    DEVICE_HEALTH_ALERT_VOICE_ROUTE,
+                    DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                    DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
+                }
+            ),
+        ),
+        exact(learning_route, frozenset({"thread_playbook_learning"})),
+        *(
+            exact(route, frozenset({route.name}))
+            for route in pre_device_private_routes
+        ),
+        exact(
+            device_route,
+            _LEGACY_EARLY_DEVICE_OPERATION_ROUTES,
+            name="device_operations_early",
+        ),
+        exact(file_route, _DEVICE_FILE_OPERATION_ROUTES),
+        exact(device_route, _LEGACY_LATE_DEVICE_OPERATION_ROUTES),
+        *(
+            exact(route, frozenset({route.name}))
+            for route in post_device_private_routes
         ),
     )
 
@@ -379,13 +569,12 @@ def company_operation_route_names() -> frozenset[str]:
     # 얻기 위해 설정 의존 객체를 조립할 필요도 없도록 상수 집합으로 둔다.
     return frozenset(
         {
-            OPERATION_CONFIRMATION_REQUIRED_ROUTE,
-            OPERATION_SINGLE_TARGET_REQUIRED_ROUTE,
             SECURITY_REVIEW_ROUTE,
             DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
             DEVICE_HEALTH_ALERT_SMS_ROUTE,
             DEVICE_HEALTH_ALERT_VOICE_ROUTE,
             DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+            DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
             "thread_playbook_learning",
             "app_user_baby_selection_analysis",
             "app_user_lookup",
@@ -397,6 +586,7 @@ def company_operation_route_names() -> frozenset[str]:
             "admin_request_log",
             "admin_readonly_sql",
             DEVICE_LOG_UPLOAD_ROUTE,
+            DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE,
             DEVICE_FILE_LOOKUP_ROUTE,
             DEVICE_FILE_DOWNLOAD_ROUTE,
             DEVICE_FILE_RECOVERY_ROUTE,
@@ -409,6 +599,7 @@ def company_operation_route_names() -> frozenset[str]:
             "device_box_update",
             "device_agent_update",
             "device_power_off",
+            DEVICE_OPERATION_DELIVERY_ACTION,
             "device_audio_probe",
             "device_remote_access_probe",
             "device_memory_patch",
@@ -421,14 +612,9 @@ def company_operation_route_names() -> frozenset[str]:
 
 
 __all__ = [
-    "OPERATION_CONFIRMATION_REQUIRED_ROUTE",
-    "OPERATION_SINGLE_TARGET_REQUIRED_ROUTE",
-    "OperationConfirmationAssistantRoute",
-    "OperationSingleTargetAssistantRoute",
     "as_operations_request",
-    "build_operation_confirmation_required_result",
-    "build_operation_single_target_required_result",
     "build_company_operation_routes",
+    "company_operation_legacy_stage",
     "company_operation_route_names",
     "has_device_diagnostic_followup_query",
     "is_mutation_capable_company_operation",
@@ -436,7 +622,5 @@ __all__ = [
     "match_company_operation_route",
     "match_live_device_company_operation_route",
     "match_mutation_capable_company_operation_route",
-    "match_operation_execution_guard_route",
-    "match_operation_target_guard_route",
     "needs_device_file_operation_context",
 ]

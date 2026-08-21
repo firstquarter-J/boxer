@@ -3108,8 +3108,8 @@ def _build_runtime_probe_payload(
     force_reopen: bool = False,
     resend_ssh_open: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    # local 호출은 기존 기본값과 호출 형태를 유지하고, API가 명시적으로
-    # 끈 경우에만 poll 중 sshOrder 재전송을 비활성화한다.
+    # 기본값은 기존 poll 중 sshOrder 재전송이며, 호환 호출이 명시적으로
+    # 끈 경우에만 재전송을 비활성화한다.
     wait_options: dict[str, Any] = {}
     if force_reopen:
         wait_options["force_reopen"] = True
@@ -3263,8 +3263,8 @@ def _collect_runtime_checks(
                         ),
                     )
                 elif not allow_force_reopen:
-                    # API operations는 stale endpoint를 근거로 기존 tunnel을
-                    # 끊지 않고 최초 연결 실패를 그대로 반환한다.
+                    # 호출자가 force reopen을 명시적으로 끈 경우에는 stale
+                    # endpoint의 최초 연결 실패를 그대로 반환한다.
                     refresh_skipped_force_reopen_disabled = True
                     logger.info(
                         "Skipping device SSH tunnel force reopen by caller policy "
@@ -3592,7 +3592,7 @@ def _patch_device_pm2_memory(
     evidence_payload, device_info = _build_runtime_probe_payload(
         device_name=normalized_device_name,
         component="pm2_memory_patch",
-        # API operation은 endpoint poll 중 sshOrder를 재전송하지 않는다.
+        # 기본값은 기존 Slack과 같은 sshOrder 재전송 동작이다.
         resend_ssh_open=resend_ssh_open,
     )
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}

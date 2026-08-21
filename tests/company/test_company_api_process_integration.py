@@ -10,6 +10,8 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from typing import Iterator
 import unittest
@@ -42,6 +44,7 @@ _SALES_BODY = (
     "**회사 Notion 문서 답변**\n"
     "- 영업 운영 기준을 확인했어"
 )
+_PROGRESS_QUESTION = "12345678910 로그 분석해줘"
 
 
 @dataclass
@@ -79,7 +82,12 @@ def _unused_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _child_environment(*, token: str, port: int) -> dict[str, str]:
+def _child_environment(
+    *,
+    token: str,
+    port: int,
+    progress_release_path: Path | None = None,
+) -> dict[str, str]:
     # 실제 로컬 .env와 회사 credential을 자식 프로세스에 넘기지 않고
     # fixture 실행에 필요한 최소 환경만 구성한다.
     child_env: dict[str, str] = {
@@ -89,6 +97,10 @@ def _child_environment(*, token: str, port: int) -> dict[str, str]:
         "PYTHONPATH": str(_PROJECT_ROOT),
         "PYTHONUNBUFFERED": "1",
     }
+    if progress_release_path is not None:
+        child_env["BOXER_TEST_COMPANY_API_PROGRESS_RELEASE_PATH"] = str(
+            progress_release_path
+        )
     for key in ("PATH", "LANG", "LC_ALL", "TMPDIR"):
         value = str(os.environ.get(key) or "").strip()
         if value:
@@ -117,6 +129,7 @@ def _wait_until_ready(server: _CompanyApiProcess) -> None:
 def _running_company_api(
     *,
     token: str,
+    progress_release_path: Path | None = None,
 ) -> Iterator[_CompanyApiProcess]:
     port = _unused_loopback_port()
     process = subprocess.Popen(
@@ -135,7 +148,11 @@ def _running_company_api(
             "--no-access-log",
         ],
         cwd=_PROJECT_ROOT,
-        env=_child_environment(token=token, port=port),
+        env=_child_environment(
+            token=token,
+            port=port,
+            progress_release_path=progress_release_path,
+        ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -195,6 +212,75 @@ def _digest(value: str) -> str:
 
 
 class CompanyApiProcessIntegrationTests(unittest.TestCase):
+    def test_progress_partial_crosses_process_before_final_release(
+        self,
+    ) -> None:
+        token = secrets.token_urlsafe(48)
+        partial_seen = threading.Event()
+        final_returned = threading.Event()
+        partials: list[CompanyAssistantResult] = []
+        finals: list[CompanyAssistantResult] = []
+        worker_errors: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_path = Path(temp_dir) / "release-final"
+            with _running_company_api(
+                token=token,
+                progress_release_path=release_path,
+            ) as server:
+                client = CompanyAssistantApiClient(
+                    _settings(
+                        base_url=server.base_url,
+                        token=token,
+                    )
+                )
+
+                def on_partial(result: CompanyAssistantResult) -> None:
+                    partials.append(result)
+                    partial_seen.set()
+
+                def request_progress() -> None:
+                    try:
+                        finals.append(
+                            client.answer_with_progress(
+                                _request(
+                                    question=_PROGRESS_QUESTION,
+                                    request_id="REQ-PROCESS-PROGRESS",
+                                ),
+                                route_group="log",
+                                on_partial_result=on_partial,
+                            )
+                        )
+                    except BaseException as exc:
+                        worker_errors.append(exc)
+                    finally:
+                        final_returned.set()
+
+                worker = threading.Thread(
+                    target=request_progress,
+                    name="company-api-progress-integration",
+                    daemon=True,
+                )
+                worker.start()
+                try:
+                    # 실제 Uvicorn chunked response의 작은 partial이
+                    # final 생성 해제 전에 client callback까지 도착해야 한다.
+                    self.assertTrue(partial_seen.wait(3))
+                    self.assertFalse(final_returned.is_set())
+                finally:
+                    release_path.touch(exist_ok=True)
+                    worker.join(timeout=5)
+
+                self.assertFalse(worker.is_alive())
+
+        if worker_errors:
+            raise worker_errors[0]
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(partials[0].route, "barcode_log_analysis")
+        self.assertEqual(partials[0].messages[0].body, "로그 근거 수집 완료")
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0].messages[0].body, "로그 분석 완료")
+
     def test_client_crosses_real_uvicorn_process_boundary(
         self,
     ) -> None:

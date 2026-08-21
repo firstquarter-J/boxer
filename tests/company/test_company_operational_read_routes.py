@@ -70,12 +70,18 @@ class WeeklyRecordingsSummaryAssistantRouteTests(unittest.TestCase):
         )
 
     def test_returns_commonmark_summary_from_shared_db_report(self) -> None:
+        local_now = datetime(2026, 4, 3, 13, 55, 0)
         summary = {
             "weekStartDate": "2026-03-23",
             "weekEndDate": "2026-03-29",
             "totalCount": 42,
         }
         with (
+            patch(
+                "boxer_company.assistant.operational_read_routes."
+                "_coerce_weekly_recordings_report_now",
+                return_value=local_now,
+            ),
             patch(
                 "boxer_company.assistant.operational_read_routes._build_weekly_recordings_report_summary",
                 return_value=summary,
@@ -96,7 +102,11 @@ class WeeklyRecordingsSummaryAssistantRouteTests(unittest.TestCase):
             summary_builder.call_args.kwargs["target_date"].isoformat(),
             "2026-03-23",
         )
-        formatter.assert_called_once_with(summary)
+        self.assertEqual(
+            summary_builder.call_args.kwargs["now"],
+            local_now,
+        )
+        formatter.assert_called_once_with(summary, now=local_now)
         self.assertEqual(result.route, WEEKLY_RECORDINGS_SUMMARY_ROUTE)
         self.assertEqual(result.outcome, "answered")
         self.assertEqual(

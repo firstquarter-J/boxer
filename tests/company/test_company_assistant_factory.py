@@ -80,22 +80,21 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 "company_daily_fortune",
                 "company_team_fun",
                 "company_freeform",
-                "operation_single_target_required",
-                "operation_confirmation_required",
                 "security_review",
                 "device_health_alert_action",
-                "device_file_operations",
-                "app_user_baby_selection_analysis",
-                "app_user_lookup",
-                "recording_streaming_restore",
-                "barcode_pink_classification_reason",
-                "barcode_validation_status",
+                "thread_playbook_learning",
                 "admin_s3_ultrasound",
                 "admin_s3_device_log",
                 "admin_request_log",
                 "admin_readonly_sql",
+                "device_operations_early",
+                "device_file_operations",
                 "device_operations",
-                "thread_playbook_learning",
+                "app_user_baby_selection_analysis",
+                "app_user_lookup",
+                "barcode_pink_classification_reason",
+                "barcode_validation_status",
+                "recording_streaming_restore",
             ),
         )
 
@@ -115,22 +114,21 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(
             turn.service_for_stage("operations").route_names,
             (
-                "operation_single_target_required",
-                "operation_confirmation_required",
                 "security_review",
                 "device_health_alert_action",
-                "device_file_operations",
-                "app_user_baby_selection_analysis",
-                "app_user_lookup",
-                "recording_streaming_restore",
-                "barcode_pink_classification_reason",
-                "barcode_validation_status",
+                "thread_playbook_learning",
                 "admin_s3_ultrasound",
                 "admin_s3_device_log",
                 "admin_request_log",
                 "admin_readonly_sql",
+                "device_operations_early",
+                "device_file_operations",
                 "device_operations",
-                "thread_playbook_learning",
+                "app_user_baby_selection_analysis",
+                "app_user_lookup",
+                "barcode_pink_classification_reason",
+                "barcode_validation_status",
+                "recording_streaming_restore",
             ),
         )
         self.assertIsNone(_guard_read_only_request(turn.request))
@@ -431,8 +429,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 )
             )
 
-        # full route가 기존 Slack 보강 흐름을 쓰되 poll 중 open을
-        # 재전송하지 않는지와 CommonMark 계약을 함께 고정한다.
+        # full route는 기존 보강 결과를 유지하되 API poll 재전송은 끈다.
         device_query = Mock(
             return_value=(
                 "*장비 조회 결과*\n"
@@ -468,8 +465,8 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 _request(f"{_BARCODE} 2026-08-04 로그 분석")
             )
 
-        # 날짜 없는 요청은 route의 고정 phase1 window로 허용하되 API에서
-        # MDA sshOrder·장비 SSH를 열 수 없는 설정을 조립 경계에 고정한다.
+        # 날짜 없는 요청은 route의 고정 phase1 window로 허용하되,
+        # read-only API route가 MDA/SSH side effect를 열지는 않는다.
         failure_route = turn.routes_for_stage("failure")[0]
         barcode_log_route = turn.routes_for_stage("log")[0]
         self.assertFalse(failure_route._live_enrichment_enabled)
@@ -492,9 +489,42 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
         ):
             runtime = create_company_assistant_runtime()
 
+            ping = runtime.answer_stage(
+                _request("ping", route_group="health"),
+                "freeform",
+            )
+            self.assertIsNotNone(ping)
             self.assertTrue(runtime._deps.provider_ready())
             self.assertTrue(runtime._deps.provider_ready())
 
+        # 기존 Slack의 ping과 일반 provider gate가 한 TTL cache를 공유한다.
+        check_health.assert_called_once_with()
+
+    def test_ollama_freeform_uses_cached_health_summary(self) -> None:
+        with (
+            patch(
+                "boxer_company.assistant.factory."
+                "core_settings.LLM_PROVIDER",
+                "ollama",
+            ),
+            patch(
+                "boxer_company.assistant.factory."
+                "_check_ollama_health",
+                return_value={"ok": False, "summary": "연결 거부"},
+            ) as check_health,
+        ):
+            runtime = create_company_assistant_runtime()
+            request = _request("오늘 기분 어때?", route_group="freeform")
+            result = runtime.answer_stage(request, "freeform")
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result.messages[0].body,
+            "LLM 서버가 응답하지 않아 지금은 AI 답변을 생성할 수 없어\n"
+            "• 상태: 연결 거부",
+        )
+        # readiness와 사용자 상세 문구가 같은 cached probe 한 번을 쓴다.
         check_health.assert_called_once_with()
 
     def test_freeform_prompt_keeps_channel_neutral_response_mode(

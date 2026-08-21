@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
+import time
 
 from boxer_company.assistant.contracts import (
     AssistantMessage,
@@ -18,11 +20,15 @@ from boxer_company_api.settings import (
 
 _TOKEN_ENV_KEY = "BOXER_TEST_COMPANY_API_TOKEN"
 _PORT_ENV_KEY = "BOXER_TEST_COMPANY_API_PORT"
+_PROGRESS_RELEASE_PATH_ENV_KEY = (
+    "BOXER_TEST_COMPANY_API_PROGRESS_RELEASE_PATH"
+)
 _EXPECTED_TENANT_ID = "T-PROCESS"
 _EXPECTED_ACTOR_ID = "U-PROCESS"
 _EXPECTED_CONVERSATION_ID = "THREAD-PROCESS"
 _COMMERCE_QUESTION = "회사 노션에서 커머스 운영 기준 찾아줘"
 _SALES_QUESTION = "회사 노션에서 영업 운영 기준 찾아줘"
+_PROGRESS_QUESTION = "12345678910 로그 분석해줘"
 
 
 class _DeterministicCompanyAssistantRuntime:
@@ -91,6 +97,53 @@ class _DeterministicCompanyAssistantRuntime:
                 ),
             ),
             fallback_reason="no_search_results",
+        )
+
+    def answer_stage(
+        self,
+        request: CompanyAssistantRequest,
+        stage: str,
+        *,
+        on_partial_result=None,
+    ) -> CompanyAssistantResult:
+        """실제 HTTP stream에서 partial과 final을 분리해 발행한다."""
+
+        if request.question != _PROGRESS_QUESTION:
+            return self.answer(request)
+        if (
+            stage != "log"
+            or not self._has_expected_transport_scope(request)
+            or not callable(on_partial_result)
+        ):
+            raise RuntimeError("fixture_progress_scope_invalid")
+
+        on_partial_result(
+            CompanyAssistantResult(
+                route="barcode_log_analysis",
+                outcome="answered",
+                messages=(
+                    AssistantMessage(
+                        body="로그 근거 수집 완료",
+                        mention_actor=False,
+                    ),
+                ),
+            )
+        )
+        release_path = Path(
+            str(
+                os.environ.get(_PROGRESS_RELEASE_PATH_ENV_KEY)
+                or ""
+            ).strip()
+        )
+        deadline = time.monotonic() + 5
+        while not release_path.is_file():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("fixture_progress_release_timeout")
+            time.sleep(0.005)
+        return CompanyAssistantResult(
+            route="barcode_log_analysis",
+            outcome="answered",
+            messages=(AssistantMessage(body="로그 분석 완료"),),
         )
 
     @staticmethod

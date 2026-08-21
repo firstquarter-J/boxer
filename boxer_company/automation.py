@@ -5,10 +5,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import re
-from typing import Any, Literal, Mapping, Protocol, Sequence
+from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
 from boxer_company.daily_device_round import (
+    _build_daily_device_round_blocks,
     _build_daily_device_round_summary,
+    _format_daily_device_round_report,
 )
 from boxer_company.device_health_monitor_cycle import (
     DeviceHealthMonitorCycleDeps,
@@ -32,6 +34,7 @@ AutomationCycleName = Literal[
 ]
 AutomationCycleOutcome = Literal["completed", "no_change"]
 AutomationDeliveryStatus = Literal["sent", "failed"]
+AutomationProgressCallback = Callable[[Mapping[str, Any]], None]
 
 _AUTOMATION_CYCLE_NAMES = frozenset(
     {
@@ -99,6 +102,17 @@ _DAILY_COUNT_KEYS = {
         "powerOffFailed",
     ),
 }
+_DAILY_ACTIVE_PROGRESS_KEYS = frozenset(
+    {
+        "activeHospitalSeq",
+        "activeHospitalName",
+        "activeHospitalStartedAt",
+        "activeHospitalDeviceCount",
+        "activeDeviceIndex",
+        "activeDeviceName",
+        "activeDeviceUpdatedAt",
+    }
+)
 
 
 class AutomationCycleContractError(ValueError):
@@ -116,6 +130,13 @@ class AutomationCycleRequest:
     # cursor와 options는 연락처나 장비 식별자를 포함할 수 있어 repr에서 숨긴다.
     cursor: Mapping[str, Any] = field(default_factory=dict, repr=False)
     options: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    # API coordinator가 긴 domain 실행 중 같은 durable cursor에 기존
+    # active hospital/device progress를 checkpoint하는 process-local port다.
+    progress_callback: AutomationProgressCallback | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not _REQUEST_ID_PATTERN.fullmatch(str(self.request_id or "")):
@@ -127,6 +148,12 @@ class AutomationCycleRequest:
         if self.scheduled_at.tzinfo is None:
             raise AutomationCycleContractError(
                 "automation scheduled_at must be timezone-aware"
+            )
+        if self.progress_callback is not None and not callable(
+            self.progress_callback
+        ):
+            raise AutomationCycleContractError(
+                "automation progress callback is invalid"
             )
         _validate_cycle_mapping(self.cursor, path="cursor")
         _validate_cycle_mapping(self.options, path="options")
@@ -385,6 +412,23 @@ class DailyDeviceRoundCycleHandler:
         }
         # 기존 동기 구현을 그대로 한 번 실행한다. SSH open, update, cleanup,
         # power-off의 HTTP transport 재시도는 이 경계에서 추가하지 않는다.
+        progress_cursor = dict(request.cursor)
+
+        def _checkpoint_progress(
+            event: str,
+            payload: dict[str, Any],
+        ) -> None:
+            nonlocal progress_cursor
+            progress_cursor = _merge_daily_device_round_progress(
+                progress_cursor,
+                event=event,
+                payload=payload,
+            )
+            if request.progress_callback is not None:
+                # domain helper가 내보내던 두 event마다 한 번씩 저장해
+                # 기존 local state의 쓰기 빈도도 그대로 유지한다.
+                request.progress_callback(progress_cursor)
+
         summary = _build_daily_device_round_summary(
             now=request.scheduled_at,
             state=dict(request.cursor),
@@ -393,6 +437,11 @@ class DailyDeviceRoundCycleHandler:
             auto_update_box_paid=options["autoUpdateBoxPaid"],
             auto_cleanup_trashcan=options["autoCleanupTrashCan"],
             auto_power_off=options["autoPowerOff"],
+            progress_callback=(
+                _checkpoint_progress
+                if request.progress_callback is not None
+                else None
+            ),
         )
         # 장비 실행 결과 전체에는 SSH endpoint, command, provider 응답이
         # 포함된다. Slack wire에는 renderer가 쓰는 의미 값만 새 DTO로 만든다.
@@ -705,6 +754,61 @@ def _require_bool_option(options: Mapping[str, Any], key: str) -> bool:
     return value
 
 
+def _merge_daily_device_round_progress(
+    cursor: Mapping[str, Any],
+    *,
+    event: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """기존 local reporter와 같은 active progress 필드로 event를 합친다."""
+
+    if event not in {"hospital_started", "device_started"}:
+        raise AutomationCycleContractError(
+            "daily device round progress event is invalid"
+        )
+    next_cursor = {
+        key: deepcopy(value)
+        for key, value in cursor.items()
+        if key not in _DAILY_ACTIVE_PROGRESS_KEYS
+    }
+    hospital_seq = _coerce_positive_int(payload.get("hospitalSeq"))
+    if hospital_seq is None:
+        raise AutomationCycleContractError(
+            "daily device round progress hospital is invalid"
+        )
+    next_cursor["activeHospitalSeq"] = hospital_seq
+    next_cursor["activeHospitalName"] = str(
+        payload.get("hospitalName") or ""
+    ).strip()
+    next_cursor["activeHospitalStartedAt"] = str(
+        (
+            cursor.get("activeHospitalStartedAt")
+            if event == "device_started"
+            else payload.get("startedAt")
+        )
+        or payload.get("updatedAt")
+        or ""
+    ).strip()
+    device_count = _coerce_nonnegative_int(payload.get("deviceCount"))
+    next_cursor["activeHospitalDeviceCount"] = device_count
+    if event == "device_started":
+        device_index = _coerce_positive_int(payload.get("deviceIndex"))
+        if device_index is None:
+            raise AutomationCycleContractError(
+                "daily device round progress device index is invalid"
+            )
+        next_cursor["activeDeviceIndex"] = device_index
+        device_name = str(payload.get("deviceName") or "").strip()
+        if device_name:
+            next_cursor["activeDeviceName"] = device_name
+        updated_at = str(payload.get("updatedAt") or "").strip()
+        if updated_at:
+            next_cursor["activeDeviceUpdatedAt"] = updated_at
+    _validate_cycle_mapping(next_cursor, path="progress.cursor")
+    _assert_safe_cycle_output(next_cursor, path="progress.cursor")
+    return next_cursor
+
+
 def _project_daily_device_round_presentation(
     summary: Mapping[str, Any],
     *,
@@ -732,6 +836,22 @@ def _project_daily_device_round_presentation(
         "summaryLine": _build_daily_presentation_summary_line(
             hospital_seq,
             status_counts,
+        ),
+        # 기존 Slack 본문을 같은 공용 formatter로 API 실행 결과에서
+        # 한 번만 만들어 remote 전환 전후 Block Kit payload를 동일하게 한다.
+        "messageBlocks": _redact_cycle_payload(
+            _build_daily_device_round_blocks(
+                dict(summary),
+                now=scheduled_at,
+                include_header=False,
+            )
+        ),
+        "fallbackText": _redact_cycle_payload(
+            _format_daily_device_round_report(
+                dict(summary),
+                now=scheduled_at,
+                include_title=False,
+            )
         ),
         "deviceResults": [],
     }
@@ -1160,6 +1280,7 @@ __all__ = [
     "AutomationDelivery",
     "AutomationDeliveryReceipt",
     "AutomationDeliveryStatus",
+    "AutomationProgressCallback",
     "DailyDeviceRoundCycleHandler",
     "DeviceHealthMonitorCycleHandler",
     "SmsDeliveryCycleHandler",

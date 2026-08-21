@@ -1,6 +1,9 @@
+from dataclasses import replace
+import hashlib
 import logging
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import pymysql
 from botocore.exceptions import BotoCoreError, ClientError
@@ -9,6 +12,7 @@ from slack_bolt import App
 from boxer_adapter_slack.common import (
     MentionPayload,
     SlackReplyFn,
+    _load_slack_permalink,
     _load_slack_user_name,
     _merge_request_log_metadata,
     _set_request_log_route,
@@ -33,6 +37,7 @@ from boxer_company_adapter_slack.assistant_bridge import (
     assistant_slack_route_name,
     build_company_assistant_request,
     render_company_assistant_result,
+    render_device_file_download_delivery,
 )
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiContractError,
@@ -88,6 +93,7 @@ from boxer_company_adapter_slack.device_routes import (
     DeviceRoutesContext,
     DeviceRoutesDeps,
     _handle_device_routes,
+    _lookup_device_file_scope_from_mda_recovery_thread,
 )
 from boxer_company_adapter_slack.fun import handle_fun_message, is_human_fun_trigger
 from boxer_company_adapter_slack.health import (
@@ -146,6 +152,7 @@ from boxer_company_adapter_slack.structured_routes import (
 from boxer_company_adapter_slack.thread_learning_routes import (
     ThreadLearningRoutesContext,
     _handle_thread_learning_routes,
+    _load_thread_context_entries_for_learning,
 )
 from boxer_company_adapter_slack.daily_device_round_reporter import attach_daily_device_round_reporter
 from boxer_company_adapter_slack.device_health_monitor_reporter import (
@@ -195,15 +202,22 @@ from boxer_company.assistant import (
 from boxer_company.assistant.knowledge_routes import (
     match_barcode_evidence_freeform_route,
 )
+from boxer_company.assistant.device_file_operations_route import (
+    DEVICE_FILE_DOWNLOAD_ROUTE,
+    DEVICE_FILE_LOOKUP_ROUTE,
+    DEVICE_FILE_RECOVERY_ROUTE,
+    build_trusted_mda_recovery_scope_metadata,
+    resolve_device_file_operation_scope,
+)
 from boxer_company.assistant.operations import (
-    OPERATION_CONFIRMATION_REQUIRED_ROUTE,
-    OPERATION_SINGLE_TARGET_REQUIRED_ROUTE,
-    build_operation_confirmation_required_result,
-    build_operation_single_target_required_result,
+    company_operation_legacy_stage,
     company_operation_route_names,
-    has_device_diagnostic_followup_query,
     match_company_operation_route,
     needs_device_file_operation_context,
+)
+from boxer_company.assistant.device_operations_route import (
+    DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
+    DEVICE_OPERATION_DELIVERY_ACTION,
 )
 from boxer_company import settings as cs
 # 기존 characterization test와 외부 patch 지점만 유지하고 실제 추출은 runtime이 맡는다.
@@ -549,36 +563,34 @@ def create_app() -> App:
             raise CompanyApiContractError("company_api_fun_actor_invalid")
         request_payload = dict(payload)
         request_payload["question"] = raw_text
-        context_entries: tuple[ContextEntry, ...] = (
-            (
-                {
-                    "kind": "message",
-                    "source": "slack",
-                    "text": thread_context,
-                },
-            )
-            if thread_context
-            else ()
-        )
         request = build_company_assistant_request(
             request_payload,
-            context_entries=context_entries,
+            metadata={"team_fun_context": thread_context},
         )
         result = company_api_client.answer(request, route_group="fun")
-        if (
-            result.route != "company_team_fun"
-            or result.outcome != "answered"
-            or not result.used_llm
-            or len(result.messages) != 1
-            or result.sources
-            or result.messages[0].delivery_scope != "conversation"
-            or result.messages[0].private_links
-        ):
+        valid_message = bool(
+            len(result.messages) == 1
+            and not result.sources
+            and result.messages[0].delivery_scope == "conversation"
+            and not result.messages[0].private_links
+            and str(result.messages[0].body or "").strip()
+        )
+        if result.route != "company_team_fun" or not valid_message:
             raise CompanyApiContractError("company_api_fun_result_invalid")
         body = str(result.messages[0].body or "").strip()
-        if not body:
-            raise CompanyApiContractError("company_api_fun_result_invalid")
-        return body, "company_api", True
+        if result.outcome == "answered" and isinstance(result.used_llm, bool):
+            # 기존 fun은 provider 장애의 template fallback도 정상 답변으로
+            # 취급하고 디디 mention 여부를 유지한다.
+            return body, "company_api", True
+        if (
+            result.outcome == "denied"
+            and result.fallback_reason == "prompt_security"
+            and result.used_llm is False
+        ):
+            # prompt 판정도 API가 소유하되 기존 거절문은 디디 mention 없이
+            # Slack adapter가 그대로 전달한다.
+            return body, "company_api_prompt_security", False
+        raise CompanyApiContractError("company_api_fun_result_invalid")
 
     def _remote_fortune_reply(
         payload: Any,
@@ -1056,6 +1068,19 @@ def create_app() -> App:
                 return False
             return _is_answer_provider_ready()
 
+        def _should_load_route_synthesis_context(
+            route_mode: str,
+        ) -> bool:
+            # remote provider가 합성하는 route는 Slack-local provider 상태와
+            # 무관하게 설정된 bounded context를 전달한다. local rollback은
+            # 기존 provider-ready 조건을 그대로 유지한다.
+            if str(route_mode or "").strip() != "local":
+                return bool(
+                    s.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT
+                    and s.LLM_SYNTHESIS_ENABLED
+                )
+            return _should_load_llm_context()
+
         def _needs_recording_failure_analysis_fallback(
             synthesized: str,
             fallback_text: str,
@@ -1345,16 +1370,15 @@ def create_app() -> App:
                 logger.exception("Retrieval synthesis failed for route=%s", route_name)
                 reply(fallback_with_references)
 
-        # remote operations에서는 Slack이 실행하지 않고 질문·thread 문맥만
-        # 공통 API로 넘긴다. API 실패나 timeout 뒤에는 같은 작업을 local로
-        # 다시 실행하지 않아 장비 명령·복원·학습의 중복 실행을 막는다.
+        # operation 후보 판정은 한 번만 하되 실제 API 호출 위치는 기존
+        # Slack handler 순서(pre-Notion -> device -> barcode)를 그대로 따른다.
+        # 그래야 `노션에서 ... 복구 방법 찾아줘` 같은 조회를 뒤의 장비
+        # mutation matcher가 선점하지 않는다.
         operation_context_entries: tuple[ContextEntry, ...] = ()
-        if (
-            has_device_diagnostic_followup_query(question)
-            or needs_device_file_operation_context(question)
-        ):
-            # 후속 질문 후보일 때만 bounded thread context를 읽고, 앞선
-            # 진단 시작 힌트가 없으면 matcher가 operations로 보내지 않는다.
+        if needs_device_file_operation_context(question):
+            # 파일 후속 범위에만 bounded thread context를 쓴다. 진단 snapshot
+            # 존재 여부는 아래 typed probe가 API process의 실제 저장소에서
+            # 확인하므로 `진단 시작` 문구를 권한이나 존재 근거로 쓰지 않는다.
             operation_context_entries = _get_assistant_context_entries()
         operation_probe_request = build_company_assistant_request(
             payload,
@@ -1363,42 +1387,29 @@ def create_app() -> App:
         operation_route = match_company_operation_route(
             operation_probe_request
         )
-        if operation_route in {
-            OPERATION_CONFIRMATION_REQUIRED_ROUTE,
-            OPERATION_SINGLE_TARGET_REQUIRED_ROUTE,
-        }:
-            # mode와 무관하게 질문형 mutation과 불명확한 target을 여기서
-            # 종결해 API와 기존 Slack local handler 어느 쪽도 실행하지 않는다.
-            guarded_result = (
-                build_operation_single_target_required_result()
-                if operation_route == OPERATION_SINGLE_TARGET_REQUIRED_ROUTE
-                else build_operation_confirmation_required_result()
-            )
-            _set_request_log_route(
-                payload,
-                guarded_result.route,
-                handler_type="router",
-            )
-            _set_request_log_status(payload, guarded_result.outcome)
-            render_company_assistant_result(
-                guarded_result,
-                reply=reply,
-                actor_id=user_id,
-                client=client,
-                logger=logger,
-            )
-            return
+        operation_execution_context_entries = operation_context_entries
         if (
-            operation_route is not None
-            and company_api_settings.operations_mode == "remote"
-        ):
-            if operation_route == "thread_playbook_learning":
-                operation_context_entries = _get_assistant_context_entries()
-            operation_request = build_company_assistant_request(
-                payload,
-                context_entries=operation_context_entries,
+            operation_route
+            in {
+                "admin_s3_ultrasound",
+                "admin_s3_device_log",
+                "admin_readonly_sql",
+                "device_audio_probe",
+                "device_diagnostic_analysis",
+            }
+            and _should_load_route_synthesis_context(
+                company_api_settings.operations_mode
             )
-            operation_service = wrap_company_operations_service(
+        ):
+            # 기존 합성 route는 Slack thread 최신 window를 LLM 근거로 함께
+            # 썼다. matcher에는 주입하지 않고 실제 API 실행에만 전달해
+            # `진단 시작` 문구가 snapshot 존재 판정을 대신하지 않게 한다.
+            operation_execution_context_entries = (
+                _get_assistant_context_entries()
+            )
+
+        def _remote_operation_service() -> Any:
+            return wrap_company_operations_service(
                 CompanyAssistantService(()),
                 company_api_settings,
                 company_api_client,
@@ -1407,11 +1418,410 @@ def create_app() -> App:
                 company_operation_route_names(),
                 shadow_runner=company_api_shadow_runner,
             )
-            operation_result = operation_service.answer(operation_request)
+
+        operation_audit_context: dict[str, Any] | None = None
+
+        def _safe_loaded_slack_permalink(
+            value: str | None,
+        ) -> str | None:
+            normalized = str(value or "").strip()
+            try:
+                parsed = urlsplit(normalized)
+            except ValueError:
+                return None
+            if (
+                parsed.scheme != "https"
+                or not str(parsed.hostname or "").casefold().endswith(
+                    ".slack.com"
+                )
+                or parsed.username is not None
+                or parsed.password is not None
+                or not parsed.path.startswith(
+                    f"/archives/{channel_id}/p"
+                )
+                or parsed.fragment
+            ):
+                return None
+            return normalized
+
+        def _get_remote_operation_audit_context() -> dict[str, Any]:
+            nonlocal operation_audit_context
+            if operation_audit_context is not None:
+                return dict(operation_audit_context)
+
+            request_log = payload.get("request_log")
+            request_log_context = (
+                request_log if isinstance(request_log, dict) else {}
+            )
+            user_name = str(
+                request_log_context.get("user_name") or ""
+            ).strip() or _load_slack_user_name(
+                client,
+                workspace_id,
+                str(user_id or "").strip(),
+                logger,
+            )
+            if user_name:
+                request_log_context["user_name"] = user_name
+
+            permalink = _safe_loaded_slack_permalink(
+                str(request_log_context.get("permalink") or "").strip()
+                or _load_slack_permalink(
+                    client,
+                    channel_id,
+                    current_ts,
+                    logger,
+                )
+            )
+            if permalink:
+                request_log_context["permalink"] = permalink
+
+            thread_permalink: str | None = None
+            if thread_ts != current_ts:
+                thread_permalink = _safe_loaded_slack_permalink(
+                    str(
+                        request_log_context.get("thread_permalink") or ""
+                    ).strip()
+                    or _load_slack_permalink(
+                        client,
+                        channel_id,
+                        thread_ts,
+                        logger,
+                    )
+                )
+                if thread_permalink:
+                    request_log_context["thread_permalink"] = (
+                        thread_permalink
+                    )
+
+            operation_audit_context = {
+                "event_type": "app_mention",
+                "channel_id": channel_id,
+                "message_id": current_ts,
+                "thread_id": thread_ts,
+                "is_thread_root": current_ts == thread_ts,
+            }
+            if user_name:
+                operation_audit_context["user_name"] = user_name
+            if permalink:
+                operation_audit_context["permalink"] = permalink
+            if thread_permalink:
+                operation_audit_context["thread_permalink"] = (
+                    thread_permalink
+                )
+            return dict(operation_audit_context)
+
+        def _acknowledge_remote_request_log_delivery(
+            operation_request: Any,
+            *,
+            delivered: bool,
+            error_type: str | None = None,
+        ) -> None:
+            request_log = payload.get("request_log")
+            request_log_context = (
+                request_log if isinstance(request_log, dict) else {}
+            )
+            reply_count = max(
+                0,
+                int(request_log_context.get("reply_count") or 0),
+            )
+            first_replied_at_utc = (
+                request_log_context.get("first_replied_at_utc")
+                if reply_count > 0
+                else None
+            )
+            try:
+                if company_api_client is None:
+                    raise CompanyApiContractError(
+                        "company_api_client_disabled",
+                        request_id=operation_request.request_id,
+                    )
+                receipt_result = (
+                    company_api_client.acknowledge_request_log_delivery(
+                        operation_request,
+                        delivered=delivered,
+                        reply_count=reply_count,
+                        first_replied_at_utc=first_replied_at_utc,
+                        error_type=error_type,
+                    )
+                )
+                if (
+                    receipt_result.route != "request_log_delivery"
+                    or receipt_result.outcome != "answered"
+                ):
+                    logger.warning(
+                        "Company API request-log delivery receipt rejected "
+                        "request_id=%s",
+                        operation_request.request_id,
+                    )
+            except Exception as exc:
+                # Slack 결과는 이미 확정됐다. 감사 receipt 장애 때문에
+                # 메시지를 더 보내거나 local 실행/저장으로 되돌리지 않는다.
+                logger.warning(
+                    "Company API request-log delivery receipt failed "
+                    "request_id=%s error_type=%s",
+                    operation_request.request_id,
+                    type(exc).__name__,
+                )
+            _set_request_log_status(
+                payload,
+                "handled" if delivered else "error",
+                error_type=error_type,
+            )
+
+        def _handle_remote_diagnostic_probe() -> bool:
+            if (
+                not question
+                or company_api_settings.operations_mode != "remote"
+            ):
+                return False
+
+            # 같은 Slack event에서 snapshot miss 뒤 explicit live analysis가
+            # 이어질 수 있다. stable 파생 ID로 probe guard와 원 operation
+            # guard를 분리하면서 redelivery에는 같은 ID를 재사용한다.
+            request_id_digest = hashlib.sha256(
+                operation_probe_request.request_id.encode("utf-8")
+            ).hexdigest()[:32]
+            diagnostic_probe_request = replace(
+                build_company_assistant_request(
+                    payload,
+                    context_entries=(
+                        _get_assistant_context_entries()
+                        if _should_load_route_synthesis_context(
+                            company_api_settings.operations_mode
+                        )
+                        else ()
+                    ),
+                    metadata={
+                        "audit_context": (
+                            _get_remote_operation_audit_context()
+                        ),
+                        "operation_action": {
+                            "name": (
+                                DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION
+                            ),
+                        },
+                    },
+                ),
+                request_id=f"diag-probe:{request_id_digest}",
+            )
+            request_log = payload.get("request_log")
+            request_log_context = (
+                request_log if isinstance(request_log, dict) else {}
+            )
+            had_skip_persist = "skip_persist" in request_log_context
+            previous_skip_persist = request_log_context.get("skip_persist")
+            # API가 answered를 반환하거나 transport가 실패한 remote probe는
+            # Slack local request-log로 중복 저장하지 않는다. typed miss만
+            # 아래에서 기존 상태를 복원해 다음 route의 legacy 로그를 허용한다.
+            _set_request_log_skip_persist(payload, True)
+            probe_result = _remote_operation_service().answer(
+                diagnostic_probe_request
+            )
+            if probe_result is None:
+                raise CompanyApiContractError(
+                    "company_api_diagnostic_probe_result_invalid",
+                    request_id=diagnostic_probe_request.request_id,
+                )
+            if (
+                probe_result.route == "device_diagnostic_followup"
+                and probe_result.outcome == "no_evidence"
+                and probe_result.fallback_reason
+                == "diagnostic_snapshot_missing"
+            ):
+                # API snapshot이 없다는 typed no-match만 기존 knowledge의
+                # 다음 route로 넘기고 안내 본문은 Slack에 노출하지 않는다.
+                if had_skip_persist:
+                    request_log_context["skip_persist"] = bool(
+                        previous_skip_persist
+                    )
+                else:
+                    request_log_context.pop("skip_persist", None)
+                return False
+            _set_request_log_route(
+                payload,
+                assistant_slack_route_name(probe_result.route),
+                handler_type="company_api",
+                route_mode="remote",
+            )
+            _set_request_log_status(payload, probe_result.outcome)
+            try:
+                render_company_assistant_result(
+                    probe_result,
+                    reply=reply,
+                    actor_id=user_id,
+                    client=client,
+                    logger=logger,
+                )
+            except Exception as exc:
+                _acknowledge_remote_request_log_delivery(
+                    diagnostic_probe_request,
+                    delivered=False,
+                    error_type=type(exc).__name__,
+                )
+                raise
+            _acknowledge_remote_request_log_delivery(
+                diagnostic_probe_request,
+                delivered=True,
+            )
+            return True
+
+        def _handle_remote_operation_stage(
+            expected_stage: str,
+        ) -> bool:
+            if (
+                operation_route is None
+                or company_api_settings.operations_mode != "remote"
+                or company_operation_legacy_stage(
+                    operation_probe_request
+                )
+                != expected_stage
+                or (
+                    expected_stage == "knowledge"
+                    and operation_route == "device_diagnostic_followup"
+                )
+            ):
+                return False
+
+            # remote로 소유권이 확정된 순간부터 Slack local request-log를
+            # 닫는다. thread/permalink/actor 보강 자체가 실패해도 민감 원문을
+            # local SQLite에 되돌려 쓰지 않는다.
+            _set_request_log_skip_persist(payload, True)
+            request_context_entries = operation_execution_context_entries
+            operation_metadata: dict[str, Any] = {}
+            if operation_route == "thread_playbook_learning":
+                # 학습은 일반 답변보다 긴 기존 fetch/문맥 한도를 그대로 쓰고,
+                # Notion 원문 링크도 기존 local learner와 같은 값으로 전달한다.
+                request_context_entries = (
+                    _load_thread_context_entries_for_learning(
+                        client,
+                        logger,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        current_ts=current_ts,
+                    )
+                )
+                operation_metadata["thread_permalink"] = (
+                    _load_slack_permalink(
+                        client,
+                        channel_id,
+                        thread_ts,
+                        logger,
+                    )
+                )
+            if operation_route in {
+                "recording_streaming_restore",
+                "device_box_update",
+                "device_agent_update",
+                "device_power_off",
+                "device_file_download",
+            }:
+                # 복원·업데이트·전원·다운로드 이력의 requester 표시는 기존
+                # Slack 경로처럼 이름을 우선하고 실패 시 actor ID로 fallback한다.
+                operation_metadata["actor_name"] = _load_slack_user_name(
+                    client,
+                    str(payload.get("workspace_id") or "").strip(),
+                    str(user_id or "").strip(),
+                    logger,
+                )
+            if operation_route in {
+                DEVICE_FILE_LOOKUP_ROUTE,
+                DEVICE_FILE_DOWNLOAD_ROUTE,
+                DEVICE_FILE_RECOVERY_ROUTE,
+            }:
+                # recordings 매핑이 비어 있던 기존 MDA 복구 알림 thread에서는
+                # Slack bot/root 검증만 adapter가 하고 exact scope를 API로 넘긴다.
+                operation_barcode, operation_log_date = (
+                    resolve_device_file_operation_scope(
+                        operation_probe_request
+                    )
+                )
+                if operation_barcode and operation_log_date:
+                    trusted_contexts = (
+                        _lookup_device_file_scope_from_mda_recovery_thread(
+                            client=client,
+                            logger=logger,
+                            channel_id=channel_id,
+                            thread_ts=thread_ts,
+                            requested_barcode=operation_barcode,
+                            requested_date=operation_log_date,
+                        )
+                    )
+                    if len(trusted_contexts) == 1:
+                        operation_metadata.update(
+                            build_trusted_mda_recovery_scope_metadata(
+                                barcode=operation_barcode,
+                                log_date=operation_log_date,
+                                device_context=trusted_contexts[0],
+                            )
+                        )
+            operation_metadata["audit_context"] = (
+                _get_remote_operation_audit_context()
+            )
+            operation_request = build_company_assistant_request(
+                payload,
+                context_entries=request_context_entries,
+                metadata=operation_metadata,
+            )
+            operation_service = _remote_operation_service()
+
+            # remote operations의 원문은 API 중앙 저장소만 소유한다.
+            _set_request_log_route(
+                payload,
+                assistant_slack_route_name(operation_route),
+                handler_type="company_api",
+                route_mode="remote",
+            )
+
+            def render_operation_partial(partial_result: Any) -> None:
+                try:
+                    # 기존 update helper의 dispatch callback 시점 그대로
+                    # 완료 poll보다 먼저 비멘션 진행 메시지를 보낸다.
+                    render_company_assistant_result(
+                        partial_result,
+                        reply=reply,
+                        actor_id=user_id,
+                        client=client,
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    # 중간 Slack 발송 실패가 이미 실행 중인 장비 poll을
+                    # 중단시키거나 최종 결과·activity receipt를 막지 않는다.
+                    logger.warning(
+                        "Remote device operation progress delivery failed "
+                        "request_id=%s error_type=%s",
+                        operation_request.request_id,
+                        type(exc).__name__,
+                    )
+
+            if operation_route in {
+                "device_box_update",
+                "device_agent_update",
+                "device_power_off",
+            }:
+                operation_result = operation_service.answer_with_progress(
+                    operation_request,
+                    render_operation_partial,
+                )
+            else:
+                operation_result = operation_service.answer(
+                    operation_request
+                )
             if operation_result is not None:
+                if (
+                    operation_result.route == "device_diagnostic_followup"
+                    and operation_result.outcome == "no_evidence"
+                    and operation_result.fallback_reason
+                    == "diagnostic_snapshot_missing"
+                ):
+                    # API 재시작 등으로 실제 snapshot이 없으면 기존 Slack처럼
+                    # 이 후보를 소비하지 않고 Notion/device/freeform 순서를 잇는다.
+                    request_log = payload.get("request_log")
+                    if isinstance(request_log, dict):
+                        request_log.pop("skip_persist", None)
+                    return False
                 # PII·SQL·복구·장비 변경 원문은 API 감사 DB가 마스킹해
                 # 소유하므로 Slack 로컬 request-log에 중복 저장하지 않는다.
-                _set_request_log_skip_persist(payload, True)
                 _set_request_log_route(
                     payload,
                     assistant_slack_route_name(operation_result.route),
@@ -1419,14 +1829,186 @@ def create_app() -> App:
                     route_mode="remote",
                 )
                 _set_request_log_status(payload, operation_result.outcome)
-                render_company_assistant_result(
-                    operation_result,
-                    reply=reply,
-                    actor_id=user_id,
-                    client=client,
-                    logger=logger,
+                operation_receipt = operation_result.operation_result
+                if (
+                    operation_result.route == DEVICE_FILE_DOWNLOAD_ROUTE
+                    and isinstance(operation_receipt, dict)
+                    and operation_receipt.get("kind")
+                    == "device_file_download_delivery"
+                ):
+                    try:
+                        dm_sent = render_device_file_download_delivery(
+                            operation_result,
+                            reply=reply,
+                            actor_id=user_id,
+                            client=client,
+                            logger=logger,
+                        )
+                    except Exception as exc:
+                        _acknowledge_remote_request_log_delivery(
+                            operation_request,
+                            delivered=False,
+                            error_type=type(exc).__name__,
+                        )
+                        raise
+                    if not dm_sent:
+                        # 기존 Slack처럼 DM 실패 시 공개 실패 안내만 남기고
+                        # activity를 실행하는 API receipt는 보내지 않는다.
+                        _acknowledge_remote_request_log_delivery(
+                            operation_request,
+                            delivered=True,
+                        )
+                        return True
+                    try:
+                        if company_api_client is None:
+                            raise CompanyApiContractError(
+                                "company_api_client_disabled",
+                                request_id=operation_request.request_id,
+                            )
+                        delivered_result = (
+                            company_api_client
+                            .acknowledge_device_file_download(
+                                operation_request,
+                                operation_receipt,
+                            )
+                        )
+                    except Exception as exc:
+                        # receipt는 operations transport 정책상 자동 재시도나
+                        # Slack-local activity fallback 없이 한 번만 보낸다.
+                        logger.warning(
+                            "Company API download delivery receipt failed "
+                            "request_id=%s error_type=%s",
+                            operation_request.request_id,
+                            type(exc).__name__,
+                        )
+                        try:
+                            reply(
+                                "다운로드 링크는 DM으로 보냈지만 완료 내역을 "
+                                "기록하지 못했어. 잠시 후 관리자에게 확인해줘"
+                            )
+                        except Exception as render_exc:
+                            _acknowledge_remote_request_log_delivery(
+                                operation_request,
+                                delivered=False,
+                                error_type=type(render_exc).__name__,
+                            )
+                            raise
+                        _acknowledge_remote_request_log_delivery(
+                            operation_request,
+                            delivered=True,
+                        )
+                        return True
+                    try:
+                        render_company_assistant_result(
+                            delivered_result,
+                            reply=reply,
+                            actor_id=user_id,
+                            client=client,
+                            logger=logger,
+                        )
+                    except Exception as exc:
+                        _acknowledge_remote_request_log_delivery(
+                            operation_request,
+                            delivered=False,
+                            error_type=type(exc).__name__,
+                        )
+                        raise
+                    _acknowledge_remote_request_log_delivery(
+                        operation_request,
+                        delivered=True,
+                    )
+                    return True
+                if (
+                    operation_result.route
+                    in {
+                        "device_box_update",
+                        "device_agent_update",
+                        "device_power_off",
+                    }
+                    and isinstance(operation_receipt, dict)
+                    and operation_receipt.get("kind")
+                    == DEVICE_OPERATION_DELIVERY_ACTION
+                    and operation_receipt.get("status") == "pending"
+                ):
+                    # 최종 대화 응답이 성공한 뒤에만 기존 MDA activity를
+                    # 복원하는 same-ID receipt를 전송한다.
+                    try:
+                        sent_count = render_company_assistant_result(
+                            operation_result,
+                            reply=reply,
+                            actor_id=user_id,
+                            client=client,
+                            logger=logger,
+                        )
+                    except Exception as exc:
+                        _acknowledge_remote_request_log_delivery(
+                            operation_request,
+                            delivered=False,
+                            error_type=type(exc).__name__,
+                        )
+                        raise
+                    if sent_count > 0:
+                        try:
+                            if company_api_client is None:
+                                raise CompanyApiContractError(
+                                    "company_api_client_disabled",
+                                    request_id=operation_request.request_id,
+                                )
+                            delivery_ack = (
+                                company_api_client
+                                .acknowledge_device_operation_delivery(
+                                    operation_request,
+                                    operation_receipt,
+                                )
+                            )
+                            if (
+                                delivery_ack.route
+                                != DEVICE_OPERATION_DELIVERY_ACTION
+                                or delivery_ack.outcome != "answered"
+                            ):
+                                logger.warning(
+                                    "Company API device operation delivery "
+                                    "receipt rejected request_id=%s",
+                                    operation_request.request_id,
+                                )
+                        except Exception as exc:
+                            # 최종 Slack 응답은 이미 전달됐다. activity receipt
+                            # 실패를 추가 Slack 메시지나 local write로 보상하지 않는다.
+                            logger.warning(
+                                "Company API device operation delivery "
+                                "receipt failed request_id=%s error_type=%s",
+                                operation_request.request_id,
+                                type(exc).__name__,
+                            )
+                    _acknowledge_remote_request_log_delivery(
+                        operation_request,
+                        delivered=True,
+                    )
+                    return True
+                try:
+                    render_company_assistant_result(
+                        operation_result,
+                        reply=reply,
+                        actor_id=user_id,
+                        client=client,
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    _acknowledge_remote_request_log_delivery(
+                        operation_request,
+                        delivered=False,
+                        error_type=type(exc).__name__,
+                    )
+                    raise
+                _acknowledge_remote_request_log_delivery(
+                    operation_request,
+                    delivered=True,
                 )
-                return
+                return True
+            return False
+
+        if _handle_remote_operation_stage("pre_notion"):
+            return
 
         if _handle_thread_learning_routes(
             ThreadLearningRoutesContext(
@@ -1507,6 +2089,9 @@ def create_app() -> App:
         ):
             return
 
+        if _handle_remote_operation_stage("device"):
+            return
+
         scope_context_entries = (
             _get_assistant_context_entries()
             if company_assistant_runtime.needs_scope_context(question)
@@ -1573,7 +2158,9 @@ def create_app() -> App:
                     _get_assistant_context_entries()
                     if (
                         _is_device_led_pattern_help_request(question)
-                        and _should_load_llm_context()
+                        and _should_load_route_synthesis_context(
+                            company_api_settings.device_mode
+                        )
                     )
                     else ()
                 ),
@@ -1676,7 +2263,9 @@ def create_app() -> App:
                                 question,
                                 barcode,
                             )
-                            and _should_load_llm_context()
+                            and _should_load_route_synthesis_context(
+                                company_api_settings.barcode_log_mode
+                            )
                         )
                     )
                     else ()
@@ -1741,6 +2330,9 @@ def create_app() -> App:
         ):
             return
 
+        if _handle_remote_operation_stage("barcode"):
+            return
+
         barcode_assistant_service = wrap_company_barcode_service(
             assistant_turn.service_for_stage("barcode"),
             company_api_settings,
@@ -1790,7 +2382,9 @@ def create_app() -> App:
                                 barcode,
                             )
                         )
-                        and _should_load_llm_context()
+                        and _should_load_route_synthesis_context(
+                            company_api_settings.barcode_timeline_mode
+                        )
                     )
                     else ()
                 ),
@@ -1807,6 +2401,12 @@ def create_app() -> App:
                 ),
             ),
         ):
+            return
+
+        if _handle_remote_diagnostic_probe():
+            return
+
+        if _handle_remote_operation_stage("knowledge"):
             return
 
         knowledge_context_entries = _get_assistant_context_entries()

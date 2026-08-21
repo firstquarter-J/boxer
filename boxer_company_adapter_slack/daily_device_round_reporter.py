@@ -16,7 +16,6 @@ from boxer_company import settings as cs
 from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
     _build_daily_device_round_issue_summary,
-    _build_daily_device_round_summary_lines,
     _build_daily_device_round_summary,
     _coerce_daily_device_round_hospital_seqs,
     _coerce_daily_device_round_now,
@@ -1799,14 +1798,18 @@ def _run_daily_device_round_remote(
     if window_key is None:
         return False
     cycle_key = f"daily:{window_key}"
-    # remote mutation 옵션은 Slack 저장 override가 아니라 API EC2와 같은
-    # company env 네 값을 전송하고 API가 다시 exact-match 검증한다.
+    # local 실행과 동일하게 Slack 제어 상태가 env 기본값을 덮어쓴
+    # 최종 옵션을 API에 넘겨 remote 전환 후에도 운영 제어를 유지한다.
     options = {
-        "autoUpdateAgent": bool(
-            cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT
+        "autoUpdateAgent": _resolve_daily_device_round_auto_update_agent(
+            state
         ),
-        "autoUpdateBoxFree": bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE),
-        "autoUpdateBoxPaid": bool(cs.DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID),
+        "autoUpdateBoxFree": (
+            _resolve_daily_device_round_auto_update_box_free(state)
+        ),
+        "autoUpdateBoxPaid": (
+            _resolve_daily_device_round_auto_update_box_paid(state)
+        ),
         "autoCleanupTrashCan": bool(
             cs.DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN
         ),
@@ -1933,12 +1936,40 @@ def _run_daily_device_round_remote(
             )
     except Exception:
         logger.warning(
-            "Remote daily device round block delivery failed; pending "
-            "delivery will resume with stable client_msg_id channel=%s",
+            "Remote daily device round block delivery failed; sending the "
+            "same plain-text fallback channel=%s",
             channel_id,
             exc_info=True,
         )
-        raise
+        fallback_text_chunks = _split_daily_device_round_text(
+            str(report_summary.get("fallbackText") or "").strip()
+        )
+        if not fallback_text_chunks:
+            raise RuntimeError("일일 장비 순회 API fallback 계약이 비어 있어")
+        for index, text_chunk in enumerate(fallback_text_chunks):
+            text_body = text_chunk
+            if len(fallback_text_chunks) > 1:
+                text_body = (
+                    f"(계속 {index + 1}/{len(fallback_text_chunks)})\n"
+                    f"{text_chunk}"
+                )
+            response = client.chat_postMessage(
+                channel=channel_id,
+                text=text_body,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+                client_msg_id=build_automation_delivery_client_msg_id(
+                    cycle="daily_device_round",
+                    cycle_key=cycle_key,
+                    delivery_id=delivery.delivery_id,
+                    part=f"fallback:{index}",
+                ),
+            )
+            last_message_ts = (
+                _extract_daily_device_round_thread_ts(response)
+                or last_message_ts
+            )
 
     remember_automation_delivery(
         cycle="daily_device_round",
@@ -1994,12 +2025,20 @@ def _validate_remote_daily_device_round_presentation(
         "cleanupCounts",
         "powerCounts",
         "summaryLine",
+        "messageBlocks",
+        "fallbackText",
         "deviceResults",
     }
     if set(payload) != allowed_top_level:
         raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
     devices = payload.get("deviceResults")
-    if not isinstance(devices, list):
+    message_blocks = payload.get("messageBlocks")
+    if (
+        not isinstance(devices, list)
+        or not isinstance(message_blocks, list)
+        or any(not isinstance(block, dict) for block in message_blocks)
+        or not isinstance(payload.get("fallbackText"), str)
+    ):
         raise RuntimeError("일일 장비 순회 API presentation 계약이 올바르지 않아")
     allowed_device_fields = {
         "deviceName",
@@ -2048,242 +2087,20 @@ def _validate_remote_daily_device_round_presentation(
     return dict(payload)
 
 
-def _format_remote_daily_device_round_report(
-    report_summary: dict[str, Any],
-    *,
-    now: datetime,
-) -> str:
-    """명시적 presentation DTO만 사용해 text fallback을 만든다."""
-
-    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
-    hospital_label = _format_daily_device_round_hospital_label(
-        report_summary.get("hospitalName"),
-        hospital_seq,
-    )
-    lines = [
-        f"*{hospital_label}*",
-        f"• 실행: `{now:%Y-%m-%d %H:%M:%S} KST`",
-        f"• 장비: `{int(report_summary.get('deviceCount') or 0)}대`",
-    ]
-    if hospital_seq is None:
-        lines.append(
-            f"• 결과: {_display_value(report_summary.get('summaryLine'), default='점검 대상 병원이 없어')}"
-        )
-        return "\n".join(lines)
-    lines.extend(_build_daily_device_round_summary_lines(report_summary))
-    devices = [
-        item
-        for item in report_summary.get("deviceResults", [])
-        if isinstance(item, dict)
-        and _is_remote_daily_device_actionable(item)
-    ]
-    if not devices:
-        lines.append("• 결과: 확인하거나 작업한 장비가 없어")
-        return "\n".join(lines)
-    lines.extend(("", "*확인/작업 장비*"))
-    for item in devices:
-        lines.extend(("", _build_remote_daily_device_line(item)))
-    return "\n".join(lines)
-
-
 def _build_remote_daily_device_round_blocks(
     report_summary: dict[str, Any],
     *,
     now: datetime,
 ) -> list[dict[str, Any]]:
-    """raw SSH/action 구조를 모르는 Slack presentation renderer다."""
+    """API가 공용 formatter로 만든 기존 Slack blocks를 그대로 쓴다."""
 
-    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
-    hospital_label = _format_daily_device_round_hospital_label(
-        report_summary.get("hospitalName"),
-        hospital_seq,
-    )
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": hospital_label,
-            },
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"발송 `{now:%Y-%m-%d %H:%M:%S} KST` | "
-                        f"장비 `{int(report_summary.get('deviceCount') or 0)}대`"
-                    ),
-                }
-            ],
-        },
-    ]
-    if hospital_seq is None:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*결과*\n"
-                        + _display_value(
-                            report_summary.get("summaryLine"),
-                            default="점검 대상 병원이 없어",
-                        )
-                    ),
-                },
-            }
-        )
-        return blocks
-    blocks.append(_build_daily_device_round_summary_rich_text_block_safe(report_summary))
-    devices = [
-        item
-        for item in report_summary.get("deviceResults", [])
-        if isinstance(item, dict)
-        and _is_remote_daily_device_actionable(item)
-    ]
-    if not devices:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*결과*\n확인하거나 작업한 장비가 없어",
-                },
-            }
-        )
-        return blocks
-    blocks.append({"type": "divider"})
-    blocks.extend(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": _build_remote_daily_device_line(item),
-            },
-        }
-        for item in devices
-    )
-    return blocks
-
-
-def _build_daily_device_round_summary_rich_text_block_safe(
-    report_summary: dict[str, Any],
-) -> dict[str, Any]:
-    items = []
-    for line in _build_daily_device_round_summary_lines(report_summary):
-        items.append(
-            {
-                "type": "rich_text_section",
-                "elements": [
-                    {
-                        "type": "text",
-                        "text": line[2:] if line.startswith("• ") else line,
-                    }
-                ],
-            }
-        )
-    return {
-        "type": "rich_text",
-        "elements": [
-            {
-                "type": "rich_text_list",
-                "style": "bullet",
-                "elements": items,
-            }
-        ],
-    }
-
-
-def _is_remote_daily_device_actionable(item: dict[str, Any]) -> bool:
-    if _display_value(item.get("overallLabel"), default="점검 불가") != "정상":
-        return True
-    return any(
-        bool((item.get(key) or {}).get(flag))
-        for key, flag in (
-            ("cleanup", "visible"),
-            ("agentUpdate", "actionable"),
-            ("boxUpdate", "actionable"),
-            ("power", "visible"),
-        )
-        if isinstance(item.get(key), dict)
-    )
-
-
-def _build_remote_daily_device_line(item: dict[str, Any]) -> str:
-    room_name = _display_value(item.get("roomName"), default="")
-    device_name = _display_value(item.get("deviceName"), default="미확인")
-    overall_label = _display_value(item.get("overallLabel"), default="점검 불가")
-    icon = {
-        "정상": "🟢",
-        "확인 필요": "🟠",
-        "이상": "🔴",
-        "점검 불가": "⚫",
-    }.get(overall_label, "⚫")
-    headings = []
-    if room_name and room_name != "미확인":
-        headings.append(f"*{room_name}*")
-    headings.extend((f"*{device_name}*", f"{icon} *{overall_label}*"))
-    lines = [f"• {'  |  '.join(headings)}"]
-    issue = _display_value(item.get("issueSummary"), default="")
-    if issue:
-        lines.append(f"  *확인*  {issue}")
-    storage_summary = _build_remote_daily_storage_summary(item.get("storage"))
-    if storage_summary:
-        lines.append(f"  *용량*  {storage_summary}")
-    for title, key, flag in (
-        ("디스크 정리", "cleanup", "visible"),
-        ("에이전트 업데이트", "agentUpdate", "actionable"),
-        ("박스 업데이트", "boxUpdate", "actionable"),
-        ("장비 종료", "power", "visible"),
+    del now
+    message_blocks = report_summary.get("messageBlocks")
+    if isinstance(message_blocks, list) and all(
+        isinstance(block, dict) for block in message_blocks
     ):
-        presentation = item.get(key)
-        if not isinstance(presentation, dict) or not presentation.get(flag):
-            continue
-        lines.append(
-            f"  *{title}*  {_format_remote_daily_action(presentation)}"
-        )
-    return "\n".join(lines)
-
-
-def _build_remote_daily_storage_summary(value: Any) -> str:
-    storage = value if isinstance(value, dict) else {}
-    parts: list[str] = []
-    used_percent = storage.get("filesystemUsedPercent")
-    if isinstance(used_percent, (int, float)):
-        parts.append(f"사용량 `{used_percent:g}%`")
-    available_bytes = storage.get("filesystemAvailableBytes")
-    if isinstance(available_bytes, (int, float)) and available_bytes > 0:
-        parts.append(f"여유 `{_format_remote_daily_bytes(available_bytes)}`")
-    expired_count = storage.get("expiredFileCount")
-    if isinstance(expired_count, (int, float)) and expired_count > 0:
-        age_days = int(storage.get("cleanupAgeDays") or 30)
-        parts.append(f"{age_days}일 초과 `{int(expired_count):,}개`")
-    return " / ".join(parts)
-
-
-def _format_remote_daily_action(value: dict[str, Any]) -> str:
-    status_kind = _display_value(value.get("statusKind"), default="check")
-    icon = {
-        "success": "🟢",
-        "latest": "⚪",
-        "pending": "🟠",
-        "failed": "🔴",
-        "check": "🟡",
-    }.get(status_kind, "🟡")
-    label = _display_value(value.get("label"), default="확인 필요")
-    summary = _display_value(value.get("summary"), default="재확인 필요")
-    return f"{icon} *{label}* | {summary}"
-
-
-def _format_remote_daily_bytes(value: int | float) -> str:
-    size = max(0.0, float(value))
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
-        size /= 1024
-    return "0B"
+        return [dict(block) for block in message_blocks]
+    raise RuntimeError("일일 장비 순회 API blocks 계약이 올바르지 않아")
 
 
 def _build_daily_device_round_report_text(

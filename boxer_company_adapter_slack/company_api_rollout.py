@@ -269,7 +269,7 @@ class _CompanyApiRolloutService:
         request: CompanyAssistantRequest,
         on_partial_result: Callable[[CompanyAssistantResult], None],
     ) -> CompanyAssistantResult | None:
-        """barcode log의 부분 응답 계약을 local/shadow 전환 중에도 보존한다."""
+        """route의 부분 응답 계약을 local/shadow/remote에서 보존한다."""
 
         local_answer = lambda: self._answer_local_with_progress(
             request,
@@ -278,11 +278,12 @@ class _CompanyApiRolloutService:
         if not self._profile.matches_request(request):
             return local_answer()
         if self._mode == "remote":
-            # API는 한 번의 HTTP 응답에 전체 메시지를 반환하므로 최종
-            # 결과로 전달하고 Slack renderer가 같은 순서로 출력한다.
-            return self._answer_remote(
+            # remote progress는 중간 결과를 받는 즉시 Slack callback으로
+            # 넘기고 terminal final만 반환한다. stream 중단 뒤에는 처리
+            # 여부가 불명하므로 local fallback을 절대 실행하지 않는다.
+            return self._answer_remote_with_progress(
                 request,
-                local_answer=local_answer,
+                on_partial_result,
             )
         if self._mode != "shadow":
             return local_answer()
@@ -485,6 +486,51 @@ class _CompanyApiRolloutService:
             validation.reason or "contract",
         )
 
+    def _answer_remote_with_progress(
+        self,
+        request: CompanyAssistantRequest,
+        on_partial_result: Callable[[CompanyAssistantResult], None],
+    ) -> CompanyAssistantResult:
+        def validate_and_forward(
+            partial_result: CompanyAssistantResult,
+        ) -> None:
+            validation = self._validate_remote_result(
+                request,
+                partial_result,
+            )
+            if not validation.accepted:
+                raise CompanyApiContractError(
+                    "company_api_progress_result_invalid",
+                    request_id=request.request_id,
+                )
+            on_partial_result(partial_result)
+
+        try:
+            result = self._call_api_with_progress(
+                request,
+                validate_and_forward,
+            )
+        except CompanyApiAmbiguousTimeoutError:
+            return self._fail_closed(request, "ambiguous_timeout")
+        except CompanyApiAvailabilityError:
+            return self._fail_closed(request, "availability")
+        except CompanyApiPolicyError:
+            return self._fail_closed(request, "policy")
+        except CompanyApiContractError:
+            return self._fail_closed(request, "contract")
+        except CompanyApiClientError:
+            return self._fail_closed(request, "client")
+        except Exception:
+            return self._fail_closed(request, "unexpected")
+
+        validation = self._validate_remote_result(request, result)
+        if validation.accepted:
+            return result
+        return self._fail_closed(
+            request,
+            validation.reason or "contract",
+        )
+
     def _answer_local_with_progress(
         self,
         request: CompanyAssistantRequest,
@@ -531,6 +577,19 @@ class _CompanyApiRolloutService:
         return self._api_client.answer(
             request,
             route_group=self._profile.route_group,
+        )
+
+    def _call_api_with_progress(
+        self,
+        request: CompanyAssistantRequest,
+        on_partial_result: Callable[[CompanyAssistantResult], None],
+    ) -> CompanyAssistantResult:
+        if self._api_client is None:
+            raise CompanyApiAvailabilityError("client_not_configured")
+        return self._api_client.answer_with_progress(
+            request,
+            route_group=self._profile.route_group,
+            on_partial_result=on_partial_result,
         )
 
     def _log_shadow_error(

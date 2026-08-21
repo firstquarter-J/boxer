@@ -10,11 +10,90 @@ from boxer_company_adapter_slack.company import (
 )
 from boxer_company_adapter_slack.structured_routes import (
     StructuredRoutesContext,
+    _build_legacy_weekly_summary_blocks,
     _handle_structured_routes,
+)
+from boxer_company.weekly_recordings_report import (
+    _build_weekly_recordings_report_blocks,
+    _format_weekly_recordings_report,
 )
 
 
 class WeeklyRecordingsReportMentionTests(unittest.TestCase):
+    def test_remote_text_rebuilds_exact_legacy_slack_blocks(self) -> None:
+        local_now = datetime(
+            2026,
+            4,
+            3,
+            13,
+            55,
+            tzinfo=ZoneInfo("Asia/Seoul"),
+        )
+        summaries = (
+            {
+                "weekStartDate": "2026-03-23",
+                "weekEndDate": "2026-03-29",
+                "previousWeekStartDate": "2026-03-16",
+                "previousWeekEndDate": "2026-03-22",
+                "hospitalCount": 12,
+                "totalCount": 150,
+                "previousTotalCount": 70,
+                "totalDelta": 80,
+                "totalChangeRate": (80 / 70) * 100,
+                "topRows": [
+                    {
+                        "hospitalSeq": 297,
+                        "hospitalName": "다온미래산부인과의원(아산)",
+                        "rowCount": 120,
+                    }
+                ],
+                "topRowsLimit": 10,
+                "surgeRows": [
+                    {
+                        "hospitalSeq": 297,
+                        "hospitalName": "다온미래산부인과의원(아산)",
+                        "previousCount": 20,
+                        "currentCount": 120,
+                        "delta": 100,
+                        "changeRate": 500.0,
+                    }
+                ],
+                "surgeCount": 12,
+                "dropRows": [],
+                "dropCount": 0,
+            },
+            {
+                "weekStartDate": "2026-03-23",
+                "weekEndDate": "2026-03-29",
+                "previousWeekStartDate": "2026-03-16",
+                "previousWeekEndDate": "2026-03-22",
+                "hospitalCount": 0,
+                "totalCount": 0,
+                "previousTotalCount": 40,
+                "totalDelta": -40,
+                "totalChangeRate": -100.0,
+                "topRows": [],
+                "surgeRows": [],
+                "surgeCount": 0,
+                "dropRows": [],
+                "dropCount": 0,
+            },
+        )
+
+        for summary in summaries:
+            with self.subTest(total_count=summary["totalCount"]):
+                text = _format_weekly_recordings_report(
+                    summary,
+                    now=local_now,
+                )
+                self.assertEqual(
+                    _build_legacy_weekly_summary_blocks(text),
+                    _build_weekly_recordings_report_blocks(
+                        summary,
+                        now=local_now,
+                    ),
+                )
+
     def test_detects_weekly_recordings_report_request(self) -> None:
         self.assertTrue(
             _is_weekly_recordings_report_request(

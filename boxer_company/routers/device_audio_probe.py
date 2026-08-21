@@ -550,7 +550,8 @@ def _probe_device_audio_output(
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 장비 소리 출력 점검`")
 
-    # local 기본 재전송은 보존하고 API가 끈 경우에는 initial open 뒤 poll만 한다.
+    # 기본값은 기존 재전송이며, 호환 호출이 명시적으로 끈 경우에만
+    # initial open 뒤 poll만 수행한다.
     wait_options: dict[str, Any] = {}
     if not resend_ssh_open:
         wait_options["resend_enabled"] = False

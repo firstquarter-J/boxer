@@ -15,6 +15,7 @@ from boxer_company_adapter_slack.automation_reporter import (
     build_automation_request_id,
     flush_automation_deliveries,
     remember_automation_delivery,
+    remember_automation_deliveries,
 )
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiAvailabilityError,
@@ -120,6 +121,50 @@ def test_flush_sends_receipt_once_then_clears_state(tmp_path: Path) -> None:
         state_path=path,
     ) is False
     assert len(client.calls) == 1
+
+
+def test_aggregated_slack_receipts_are_stored_and_flushed_together(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery.json"
+    deliveries = tuple(
+        AutomationSlackDelivery(
+            delivery_id=f"device_health_monitor:{suffix}",
+            external_message_id="1723600000.000300",
+            permalink="https://lifex.slack.com/archives/C1/p3",
+            delivered_at=_NOW,
+        )
+        for suffix in ("abc", "def")
+    )
+
+    # 한 Slack 집계 메시지에 속한 domain receipt를 하나의
+    # replace로 남겨 일부만 ack되는 상태를 만들지 않는다.
+    remember_automation_deliveries(
+        cycle="device_health_monitor",
+        cycle_key="continuous",
+        deliveries=deliveries,
+        state_path=path,
+    )
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert len(
+        stored["cycles"]["device_health_monitor"]["receipts"]
+    ) == 2
+
+    client = _ApiClient()
+    assert flush_automation_deliveries(
+        client,  # type: ignore[arg-type]
+        cycle="device_health_monitor",
+        cycle_key="continuous",
+        scheduled_at=_NOW,
+        state_path=path,
+    )
+    assert {
+        receipt.delivery_id
+        for receipt in client.calls[0]["receipts"]  # type: ignore[union-attr]
+    } == {
+        "device_health_monitor:abc",
+        "device_health_monitor:def",
+    }
 
 
 def test_flush_failure_preserves_receipt_without_local_fallback(

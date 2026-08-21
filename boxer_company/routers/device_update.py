@@ -148,7 +148,7 @@ _DeviceUpdateDispatchNoticeFn = Callable[[str], None]
 
 @dataclass
 class _DeviceSshOpenBudget:
-    """API operation 하나가 신규 reverse SSH를 한 번만 열게 한다."""
+    """명시적으로 제한한 operation의 신규 reverse SSH 횟수를 추적한다."""
 
     initial_open_used: bool = False
 
@@ -356,7 +356,7 @@ def _wait_for_device_update_ssh(
     resend_ssh_open: bool = True,
     ssh_open_budget: _DeviceSshOpenBudget | None = None,
 ) -> dict[str, Any]:
-    """로컬 재전송은 유지하고 API operation의 최초 open만 한 번 허용한다."""
+    """기본 재전송을 유지하고 명시적인 제한 호출만 단일 open을 쓴다."""
 
     if resend_ssh_open:
         return _wait_for_mda_device_agent_ssh(device_name)
@@ -375,8 +375,8 @@ def _wait_for_device_update_ssh(
             ssh_open_budget.initial_open_used = True
         return result
 
-    # operation 안에서 open 예산을 쓴 뒤에는 MDA 상태만 읽는다. 늦게 열린
-    # endpoint는 strict SSH identity map에 등록하되 sshOrder는 다시 보내지 않는다.
+    # 호출자가 명시적으로 단일 open 예산을 고른 경우에는 그 예산을 쓴 뒤
+    # MDA 상태만 읽고, 늦게 열린 endpoint의 장비 매핑만 기록한다.
     current_state = _get_mda_device_agent_ssh(device_name)
     device_info = current_state if isinstance(current_state, dict) else {}
     agent_ssh = (
@@ -1077,7 +1077,7 @@ def _request_device_box_update(
     latest_device_version = _get_mda_latest_device_version()
     latest_version = _display_value(latest_device_version.get("versionName"), default="")
     snapshot = _build_device_snapshot(normalized_device_name, device_info)
-    # API 요청은 precheck와 완료 poll이 같은 initial-open 예산을 공유한다.
+    # 명시적으로 재전송을 끈 호출만 precheck와 완료 poll이 예산을 공유한다.
     ssh_open_budget = (
         None if resend_ssh_open else _DeviceSshOpenBudget()
     )
@@ -1207,7 +1207,7 @@ def _request_device_agent_update(
 
     device_info = _get_mda_device_detail(normalized_device_name)
     snapshot = _build_device_snapshot(normalized_device_name, device_info)
-    # precheck·install dispatch·completion poll을 operation 하나의 open 예산으로 묶는다.
+    # 재전송 제한 호출만 precheck·dispatch·poll을 한 open 예산으로 묶는다.
     ssh_open_budget = (
         None if resend_ssh_open else _DeviceSshOpenBudget()
     )
@@ -1461,7 +1461,7 @@ def _query_device_update_status(
     device_info = _get_mda_device_detail(normalized_device_name)
     latest_device_version = _get_mda_latest_device_version()
     latest_version = _display_value(latest_device_version.get("versionName"), default="")
-    # 두 runtime 조회가 endpoint를 못 찾아도 API turn에서는 open을 한 번만 보낸다.
+    # 재전송 제한 호출만 두 runtime 조회가 한 open 예산을 공유한다.
     ssh_open_budget = (
         None if resend_ssh_open else _DeviceSshOpenBudget()
     )

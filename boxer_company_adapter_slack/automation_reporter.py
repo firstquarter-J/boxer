@@ -139,6 +139,64 @@ def remember_automation_delivery(
         _write_document(path, {"version": _STATE_VERSION, "cycles": cycles})
 
 
+def remember_automation_deliveries(
+    *,
+    cycle: str,
+    cycle_key: str,
+    deliveries: tuple[AutomationSlackDelivery, ...],
+    state_path: str | Path | None = None,
+) -> None:
+    """한 Slack 메시지가 대표하는 여러 domain delivery를 원자 저장한다."""
+
+    _validate_cycle_identity(cycle, cycle_key)
+    if not deliveries:
+        return
+    for delivery in deliveries:
+        _validate_delivery(delivery)
+    delivery_ids = [delivery.delivery_id for delivery in deliveries]
+    if len(delivery_ids) != len(set(delivery_ids)):
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_identity_invalid"
+        )
+
+    path = _delivery_state_path(state_path)
+    with _STATE_LOCK:
+        document = _load_document(path)
+        cycles = dict(document["cycles"])
+        raw_cycle = cycles.get(cycle)
+        cycle_state = dict(raw_cycle) if isinstance(raw_cycle, dict) else {}
+        stored_cycle_key = str(cycle_state.get("cycleKey") or "").strip()
+        receipts = [
+            dict(item)
+            for item in (cycle_state.get("receipts") or [])
+            if isinstance(item, dict)
+        ]
+        if stored_cycle_key and stored_cycle_key != cycle_key and receipts:
+            raise CompanyApiContractError(
+                "company_api_automation_delivery_state_conflict"
+            )
+        by_id = {
+            str(item.get("deliveryId") or ""): item
+            for item in receipts
+            if str(item.get("deliveryId") or "").strip()
+        }
+        for delivery in deliveries:
+            serialized = _serialize_delivery(delivery)
+            previous = by_id.get(delivery.delivery_id)
+            if previous is not None and previous != serialized:
+                raise CompanyApiContractError(
+                    "company_api_automation_delivery_state_conflict"
+                )
+            by_id[delivery.delivery_id] = serialized
+        cycles[cycle] = {
+            "cycleKey": cycle_key,
+            "receipts": list(by_id.values()),
+        }
+        # 집계 메시지 성공 후 일부 receipt만 남는 crash window가
+        # 생기지 않게 한 번의 replace로 전체를 저장한다.
+        _write_document(path, {"version": _STATE_VERSION, "cycles": cycles})
+
+
 def flush_automation_deliveries(
     api_client: CompanyAutomationApiClient,
     *,

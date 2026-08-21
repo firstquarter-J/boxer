@@ -311,7 +311,7 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(device_query.call_args.kwargs["status"], "ACTIVE")
 
-        # 같은 turn이 재전달돼도 poll 중 open 재전송은 허용하지 않는다.
+        # 별도 HTTP turn도 독립된 최초 open 예산을 하나씩 받는다.
         device_query.reset_mock()
         with TestClient(app) as client:
             repeated = client.post(
@@ -1021,6 +1021,7 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
             response.json()["route"],
             "barcode_log_analysis",
         )
+        # read-only log capability로 MDA/SSH 보강이 열리지 않는다.
         self.assertFalse(
             analyzer.call_args.kwargs["include_live_enrichment"]
         )
@@ -1170,6 +1171,7 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
             response.json()["route"],
             "recording_failure_analysis",
         )
+        # typed follow-up도 같은 DB/S3 전용 보안 경계를 유지한다.
         self.assertFalse(
             analyzer.call_args.kwargs["include_live_enrichment"]
         )

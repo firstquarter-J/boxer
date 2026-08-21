@@ -1,5 +1,6 @@
 import copy
 import gzip
+import io
 import json
 import logging
 import tempfile
@@ -10,6 +11,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+import boto3
+
+from boxer_company import device_health_event_log
 from boxer_company_adapter_slack import device_health_monitor_reporter as reporter
 
 
@@ -20,6 +24,12 @@ class _MissingS3Object(Exception):
     def __init__(self) -> None:
         super().__init__("missing")
         self.response = {"Error": {"Code": "404"}}
+
+
+class _PreconditionFailed(Exception):
+    def __init__(self) -> None:
+        super().__init__("precondition failed")
+        self.response = {"Error": {"Code": "412"}}
 
 
 class _FakeS3Client:
@@ -53,6 +63,8 @@ class _FakeS3Client:
     def put_object(self, **kwargs) -> dict[str, str]:
         if self.fail_put:
             raise RuntimeError("put failed")
+        if kwargs.get("IfNoneMatch") == "*" and str(kwargs["Key"]) in self.objects:
+            raise _PreconditionFailed()
         body_source = kwargs["Body"]
         body = body_source.read() if hasattr(body_source, "read") else bytes(body_source)
         if len(body) != kwargs["ContentLength"]:
@@ -195,8 +207,50 @@ class DeviceHealthEventStorageTests(unittest.TestCase):
             self.assertEqual(gzip.decompress(upload["Body"]), source_content)
             self.assertEqual(upload["ContentEncoding"], "gzip")
             self.assertEqual(upload["ServerSideEncryption"], "AES256")
-            # 업로드 전 부재 확인과 업로드 후 검증 HEAD가 모두 수행돼야 한다.
-            self.assertEqual(len(s3_client.head_calls), 2)
+            # 신규 key는 조건부 PUT 뒤 검증 HEAD 한 번만 수행해야 한다.
+            self.assertEqual(upload["IfNoneMatch"], "*")
+            self.assertEqual(len(s3_client.head_calls), 1)
+
+    def test_create_only_put_uses_raw_header_with_botocore_model(self) -> None:
+        client = boto3.client(
+            "s3",
+            region_name="ap-northeast-2",
+            aws_access_key_id="test-access-key",
+            aws_secret_access_key="test-secret-key",
+        )
+        body = io.BytesIO(b"archive-body")
+        request_headers: list[dict[str, object]] = []
+
+        class _SuccessfulHttpResponse:
+            status_code = 200
+
+        def capture_request(operation_model, request_dict, request_context):
+            del operation_model, request_context
+            request_headers.append(dict(request_dict["headers"]))
+            return _SuccessfulHttpResponse(), {"ETag": '"test-etag"'}
+
+        # 설치된 botocore service model의 허용 인자와 무관하게 실제
+        # client validation을 통과하고 서명 직전 조건부 헤더가 들어간다.
+        with patch.object(client, "_make_request", side_effect=capture_request):
+            device_health_event_log._put_archive_object_create_only(
+                client,
+                body=body,
+                put_parameters={
+                    "Bucket": "boxer-kr",
+                    "Key": "device-health-monitor/events/test.jsonl.gz",
+                    "Body": body,
+                    "ContentLength": len(b"archive-body"),
+                    "Metadata": {"source-sha256": "test-digest"},
+                },
+            )
+            client.put_object(
+                Bucket="boxer-kr",
+                Key="unrelated-object",
+                Body=b"other",
+            )
+
+        self.assertEqual(request_headers[0]["If-None-Match"], "*")
+        self.assertNotIn("If-None-Match", request_headers[1])
 
     def test_archive_gzip_is_deterministic(self) -> None:
         now = datetime(2026, 7, 23, 9, 0, tzinfo=_KST)

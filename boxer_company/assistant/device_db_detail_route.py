@@ -22,9 +22,7 @@ from boxer_company.assistant.scope_guard import (
 )
 from boxer_company.assistant.structured_route import (
     _StructuredQueryMatch,
-    _ambiguous_device_scope_result,
     _build_structured_query_match,
-    _has_multiple_explicit_device_names,
 )
 from boxer_company.routers.box_db import _query_devices_by_filters
 from boxer_company.weekly_recordings_report import (
@@ -124,20 +122,6 @@ _LIVE_STATUS_PROBE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"(?:살아\s*있|alive|responding)", re.IGNORECASE),
-)
-_DEVICE_MUTATION_INTENT_TOKENS = (
-    "삭제",
-    "수정",
-    "변경",
-    "업데이트",
-    "바꿔",
-    "재부팅",
-    "재시작",
-    "종료",
-    "전원",
-    "초기화",
-    "등록",
-    "해제",
 )
 _UNSAFE_DETAIL_LABELS = (
     "버전:",
@@ -270,32 +254,14 @@ class DeviceDetailAssistantRoute:
             # operations 경계가 처리하므로 이 mutation-capable stage가 넘긴다.
             return None
 
-        if _has_multiple_explicit_device_names(request.question):
-            # structured parser가 첫 장비만 선택해 live 보강하는 것을 막는다.
-            return _ambiguous_device_scope_result()
-
         result_route = (
             _DEVICE_DETAIL_ROUTE_GROUP
             if _is_exact_device_detail_request(request, matched)
             else "devices_filter"
         )
-        if _has_device_mutation_intent(request.question):
-            # 미지원 변경 명령이 legacy structured 조회로 내려가 DB/MDA/SSH를
-            # 실행하지 않게 API가 결정적으로 종결한다. 실제 지원 operation은
-            # Slack gateway의 operations matcher가 이 stage보다 먼저 처리한다.
-            return _result(
-                route=result_route,
-                outcome="denied",
-                body=(
-                    "이 장비 변경 요청은 지원하는 작업으로 분류되지 않았어. "
-                    "장비명과 실행할 작업을 하나씩 명확히 적어줘"
-                ),
-                fallback_reason="unsupported_device_mutation",
-            )
-
         try:
-            # 기존 Slack 장비 필터와 같은 DB/MDA/SSH 흐름을 쓰되, 결과가
-            # 한 대라 endpoint를 열더라도 sshOrder는 한 번만 보내고 poll은 조회만 한다.
+            # 채널만 API로 옮겨도 기존 Slack 장비 필터와 같은
+            # DB/MDA/SSH 기본 lifecycle을 그대로 쓴다.
             raw = self._query_devices(
                 device_name=matched.device_name,
                 device_seq=matched.device_seq,
@@ -308,6 +274,7 @@ class DeviceDetailAssistantRoute:
                 install_flag=matched.install_flag,
                 count_only=False,
                 include_live_enrichment=True,
+                # API turn은 최초 open 한 번 뒤 poll 조회만 허용한다.
                 allow_ssh_open_resend=False,
             )
         except ValueError as exc:
@@ -382,9 +349,6 @@ class DeviceDbDetailAssistantRoute:
             return build_scope_mismatch_result(mismatch)
         if matched is None:
             return None
-
-        if _has_multiple_explicit_device_names(request.question):
-            return _ambiguous_device_scope_result()
 
         try:
             # API 경로는 devices 테이블만 읽는다. 이 두 고정값이 MDA
@@ -464,17 +428,14 @@ def _build_device_detail_match(
     if matched is not None:
         return matched
 
-    # 기존 structured parser가 `오프라인인지` 같은 표현을 놓쳐도 질문에
-    # 명시된 장비가 정확히 하나면 Slack local probe로 빠지지 않게 한다.
-    explicit_names = {
-        token.casefold(): token
-        for token in _DEVICE_NAME_TOKEN_PATTERN.findall(request.question)
-    }
-    if len(explicit_names) != 1 or not _has_live_device_intent(
+    # 기존 structured parser가 `오프라인인지` 같은 표현을 놓쳐도 Slack의
+    # search parser처럼 본문에서 첫 번째 장비명을 골라 live 조회한다.
+    explicit_name_match = _DEVICE_NAME_TOKEN_PATTERN.search(request.question)
+    if explicit_name_match is None or not _has_live_device_intent(
         request.question
     ):
         return None
-    device_name = next(iter(explicit_names.values()))
+    device_name = explicit_name_match.group(1)
     return _DeviceDbDetailMatch(
         device_name=device_name,
         device_seq=None,
@@ -544,19 +505,14 @@ def _is_exact_device_detail_request(
     request: CompanyAssistantRequest,
     matched: _DeviceDbDetailMatch,
 ) -> bool:
-    """질문에 명시된 target 하나와 parser 결과가 정확히 같은지 확인한다."""
+    """Slack parser가 확정한 첫 장비명 상세 여부를 그대로 사용한다."""
 
-    if not _is_exact_device_detail_match(matched) or not matched.device_name:
-        # live 상세은 canonical MDA deviceName만 사용한다. deviceSeq 단독
-        # 요청과 metadata/context로만 복원된 target은 기존 local/DB-only다.
-        return False
-    explicit_names = {
-        token.casefold()
-        for token in _DEVICE_NAME_TOKEN_PATTERN.findall(
-            str(request.question or "")
-        )
-    }
-    return explicit_names == {matched.device_name.casefold()}
+    del request
+    # deviceSeq 단독 요청은 MDA canonical name을 추측하지 않고 목록 route를
+    # 유지하되, 복수 장비 표현은 parser가 먼저 고른 deviceName으로 조회한다.
+    return bool(
+        matched.device_name and _is_exact_device_detail_match(matched)
+    )
 
 
 def _has_live_device_intent(question: str) -> bool:
@@ -565,11 +521,6 @@ def _has_live_device_intent(question: str) -> bool:
     if any(token in lowered for token in _LIVE_DEVICE_INTENT_TOKENS):
         return True
     return any(pattern.search(normalized) for pattern in _LIVE_STATUS_PROBE_PATTERNS)
-
-
-def _has_device_mutation_intent(question: str) -> bool:
-    lowered = " ".join(str(question or "").split()).lower()
-    return any(token in lowered for token in _DEVICE_MUTATION_INTENT_TOKENS)
 
 
 def _format_db_only_device_result(raw: str) -> str:

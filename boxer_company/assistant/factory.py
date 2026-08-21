@@ -16,6 +16,10 @@ from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.assistant.barcode_log_route import (
     match_barcode_log_route,
 )
+from boxer_company.assistant.answer_composer import (
+    CompanyEvidenceAnswerComposer,
+    CompanyEvidenceAnswerComposerDeps,
+)
 from boxer_company.assistant.barcode_query_route import (
     match_barcode_query_route,
 )
@@ -36,7 +40,7 @@ from boxer_company.assistant.freeform_prompt import (
 )
 from boxer_company.assistant.freeform_runtime import (
     build_company_freeform_route,
-    build_company_provider_answerer,
+    build_company_team_fun_route,
 )
 from boxer_company.assistant.knowledge_routes import (
     CompanyReadOnlyKnowledgeRouteDeps,
@@ -62,8 +66,8 @@ from boxer_company.assistant.runtime import (
 from boxer_company.assistant.team_fun_route import (
     CompanyDailyFortuneAssistantRoute,
     CompanyLlmHealthAssistantRoute,
-    CompanyTeamFunAssistantRoute,
 )
+from boxer_company import settings as company_settings
 from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.box_db import (
     _load_recordings_context_by_barcode,
@@ -203,37 +207,50 @@ def _create_lazy_s3_provider() -> Callable[[], Any]:
     return get_s3_client
 
 
-def _create_provider_ready(
-    *,
-    provider: str,
-    claude_client: Any | None,
-) -> Callable[[], bool]:
+def _create_cached_ollama_health_loader() -> Callable[[], dict[str, Any]]:
+    """기존 Slack처럼 readiness와 장애 상세가 같은 health 결과를 공유한다."""
+
     ollama_health_cache: tuple[
         float,
         dict[str, Any],
     ] | None = None
     lock = threading.Lock()
 
-    def provider_ready() -> bool:
+    def get_ollama_health() -> dict[str, Any]:
         nonlocal ollama_health_cache
-        if provider == "claude":
-            return claude_client is not None
-        if provider != "ollama":
-            return False
-
         now = time.monotonic()
         with lock:
             if ollama_health_cache is not None:
                 cached_at, cached_health = ollama_health_cache
                 ttl_sec = 30.0 if cached_health.get("ok") else 2.0
                 if now - cached_at < ttl_sec:
-                    return bool(cached_health.get("ok"))
+                    return cached_health
 
             # FastAPI worker 안에서 동시 요청이 와도 health timeout을
-            # 한 번만 기다리도록 짧은 TTL 결과를 공유한다.
+            # 한 번만 기다리도록 짧은 TTL 결과 전체를 공유한다.
             health = _check_ollama_health()
             ollama_health_cache = (now, health)
-            return bool(health.get("ok"))
+            return health
+
+    return get_ollama_health
+
+
+def _create_provider_ready(
+    *,
+    provider: str,
+    claude_client: Any | None,
+    ollama_health_loader: Callable[[], dict[str, Any]] | None = None,
+) -> Callable[[], bool]:
+    get_ollama_health = (
+        ollama_health_loader or _create_cached_ollama_health_loader()
+    )
+
+    def provider_ready() -> bool:
+        if provider == "claude":
+            return claude_client is not None
+        if provider != "ollama":
+            return False
+        return bool(get_ollama_health().get("ok"))
 
     return provider_ready
 
@@ -261,15 +278,12 @@ def create_company_assistant_runtime(
                 type(exc).__name__,
             )
 
+    get_ollama_health = _create_cached_ollama_health_loader()
     provider_ready = _create_provider_ready(
         provider=provider,
         claude_client=claude_client,
+        ollama_health_loader=get_ollama_health,
     )
-    provider_answerer = build_company_provider_answerer(
-        provider=provider,
-        claude_client=claude_client,
-    )
-
     def probe_llm_health() -> bool | None:
         # ping provider probe도 Slack credential이나 client를 사용하지 않고
         # 공통 API 프로세스가 가진 provider 설정으로만 실행한다.
@@ -278,13 +292,23 @@ def create_company_assistant_runtime(
                 return False
             return bool(_check_claude_health(claude_client).get("ok"))
         if provider == "ollama":
-            return bool(_check_ollama_health().get("ok"))
+            # 기존 Slack처럼 ping과 provider readiness도 같은 TTL health
+            # 결과를 공유해 한 상태 확인이 중복 네트워크 호출이 되지 않게 한다.
+            return bool(get_ollama_health().get("ok"))
         return None
     get_s3_client = _create_lazy_s3_provider()
     timeout_message = _answer_timeout_message(provider)
     answer_engine = AnswerEngine(
         provider=provider,
         provider_client=claude_client,
+        logger=app_logger,
+    )
+    operation_answer_composer = CompanyEvidenceAnswerComposer(
+        CompanyEvidenceAnswerComposerDeps(
+            answer_engine=answer_engine,
+            synthesis_enabled=core_settings.LLM_SYNTHESIS_ENABLED,
+            provider_ready=provider_ready,
+        ),
         logger=app_logger,
     )
 
@@ -404,8 +428,11 @@ def create_company_assistant_runtime(
             operation_routes=(
                 *build_company_operation_routes(
                     context_max_chars=(
-                        core_settings.THREAD_CONTEXT_MAX_CHARS
+                        company_settings.THREAD_PLAYBOOK_LEARNING_MAX_THREAD_CHARS
                     ),
+                    claude_client=claude_client,
+                    answer_composer=operation_answer_composer,
+                    timeout_message=timeout_message,
                     logger=app_logger,
                 ),
             ),
@@ -417,9 +444,9 @@ def create_company_assistant_runtime(
                 # bot event의 thread root와 본문 의미 판정까지 API가 맡아
                 # remote Slack adapter에는 운세 parser가 남지 않게 한다.
                 CompanyDailyFortuneAssistantRoute(),
-                CompanyTeamFunAssistantRoute(
-                    provider_answerer,
-                    provider_ready=provider_ready,
+                build_company_team_fun_route(
+                    provider=provider,
+                    claude_client=claude_client,
                     context_max_chars=max(
                         1,
                         core_settings.THREAD_CONTEXT_MAX_CHARS,
@@ -430,6 +457,16 @@ def create_company_assistant_runtime(
                     provider=provider,
                     claude_client=claude_client,
                     provider_ready=provider_ready,
+                    provider_unavailable_summary=(
+                        lambda: (
+                            str(
+                                get_ollama_health().get("summary") or ""
+                            ).strip()
+                            or None
+                        )
+                        if provider == "ollama"
+                        else None
+                    ),
                     timeout_message=timeout_message,
                     logger=app_logger,
                 ),
@@ -438,8 +475,9 @@ def create_company_assistant_runtime(
             # 보강은 위의 명시적인 device_detail route에서만 실행된다.
             structured_device_filter_enabled=True,
             structured_device_live_enrichment_enabled=False,
-            # 로그 분석은 S3/DB까지만 허용하고 MDA sshOrder와 실제
-            # 장비 SSH lifecycle 보강은 Slack local runtime에 남긴다.
+            # 사용자-visible DB/S3 근거는 동일하게 이전하되 read capability
+            # 경로가 sshOrder나 장비 SSH를 열지 않도록 API에서는 live 보강을
+            # 금지한다. 장비 live 진단은 operations 경계에서만 실행한다.
             log_analysis_live_enrichment_enabled=False,
             # 날짜가 없으면 domain route가 서버 고정 LOG_PHASE1_MAX_DAYS
             # 범위까지만 탐색한다. 추가 범위는 needs_input으로 끝낸다.

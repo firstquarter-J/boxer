@@ -205,11 +205,14 @@ class _FakeApiClient:
         result: CompanyAssistantResult | None = None,
         *,
         error: Exception | None = None,
+        partial: CompanyAssistantResult | None = None,
     ) -> None:
         self.result = result
         self.error = error
+        self.partial = partial
         self.requests: list[CompanyAssistantRequest] = []
         self.route_groups: list[str | None] = []
+        self.progress_requests: list[CompanyAssistantRequest] = []
 
     def answer(
         self,
@@ -221,6 +224,23 @@ class _FakeApiClient:
         self.route_groups.append(route_group)
         if self.error is not None:
             raise self.error
+        return self.result
+
+    def answer_with_progress(
+        self,
+        request: CompanyAssistantRequest,
+        *,
+        route_group: str | None = None,
+        on_partial_result: Callable[[CompanyAssistantResult], None],
+    ) -> CompanyAssistantResult:
+        self.requests.append(request)
+        self.progress_requests.append(request)
+        self.route_groups.append(route_group)
+        if self.error is not None:
+            raise self.error
+        if self.partial is not None:
+            on_partial_result(self.partial)
+        assert self.result is not None
         return self.result
 
 
@@ -2035,6 +2055,75 @@ class CompanyRemainingReadApiRolloutTests(unittest.TestCase):
         self.assertEqual(api.requests, [request])
         self.assertIn("message_body_match=True", "\n".join(captured.output))
 
+    def test_barcode_log_remote_streams_partial_before_final(self) -> None:
+        partial = _result(
+            route="barcode_log_analysis",
+            body="확정 DB/S3 본문",
+        )
+        final = _result(
+            route="barcode_log_analysis",
+            body="후속 LLM 요약",
+            used_llm=True,
+        )
+        api = _FakeApiClient(final, partial=partial)
+        local = _FakeProgressLocalService(partial, final)
+        service = CompanyBarcodeLogApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=_settings(
+                "local",
+                barcode_log_mode="remote",
+                barcode_log_fallback_enabled=True,
+            ),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+        partials: list[CompanyAssistantResult] = []
+        request = _request("12345678910 2026-07-01 로그 분석")
+
+        returned = service.answer_with_progress(request, partials.append)
+
+        self.assertIs(returned, final)
+        self.assertEqual(partials, [partial])
+        self.assertEqual(api.progress_requests, [request])
+        self.assertEqual(api.route_groups, ["log"])
+        self.assertEqual(local.requests, [])
+
+    def test_barcode_log_broken_progress_never_uses_local_fallback(
+        self,
+    ) -> None:
+        local_result = _result(
+            route="barcode_log_analysis",
+            body="로컬 재실행 결과",
+        )
+        local = _FakeProgressLocalService(local_result, local_result)
+        api = _FakeApiClient(
+            error=CompanyApiAmbiguousTimeoutError("stream incomplete")
+        )
+        service = CompanyBarcodeLogApiRolloutService(
+            local,  # type: ignore[arg-type]
+            settings=_settings(
+                "local",
+                barcode_log_mode="remote",
+                barcode_log_fallback_enabled=True,
+            ),  # type: ignore[arg-type]
+            api_client=api,  # type: ignore[arg-type]
+            logger=self.logger,
+            shadow_runner=_CapturingShadowRunner(),
+        )
+
+        result = service.answer_with_progress(
+            _request("12345678910 2026-07-01 로그 분석"),
+            lambda _partial: None,
+        )
+
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(
+            result.fallback_reason,
+            "company_api_ambiguous_timeout",
+        )
+        self.assertEqual(local.requests, [])
+
 
 class CompanyOperationalReadApiRolloutTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -2894,6 +2983,55 @@ class CompanyOperationsApiRolloutTests(unittest.TestCase):
         self.assertEqual(api.requests, [request])
         self.assertEqual(api.route_groups, ["operations"])
         self.assertEqual(local.requests, [])
+
+    def test_remote_progress_forwards_partial_without_local_execution(
+        self,
+    ) -> None:
+        request = _request("장비 업데이트")
+        partial = _result(
+            route="device_update_operation",
+            body="장비에 업데이트 요청 전달",
+        )
+        final = _result(
+            route="device_update_operation",
+            body="장비 업데이트 완료",
+        )
+        local = _FakeProgressLocalService(partial, final)
+        api = _FakeApiClient(final, partial=partial)
+        wrapped = self._wrap(local, api)
+        partials: list[CompanyAssistantResult] = []
+
+        result = wrapped.answer_with_progress(request, partials.append)
+
+        self.assertIs(result, final)
+        self.assertEqual(partials, [partial])
+        self.assertEqual(api.progress_requests, [request])
+        self.assertEqual(api.route_groups, ["operations"])
+        self.assertEqual(local.requests, [])
+
+    def test_remote_progress_error_never_replays_local_operation(
+        self,
+    ) -> None:
+        request = _request("장비 업데이트")
+        local_result = _result(route="device_update_operation")
+        local = _FakeProgressLocalService(local_result, local_result)
+        api = _FakeApiClient(
+            error=CompanyApiAmbiguousTimeoutError("stream incomplete")
+        )
+        wrapped = self._wrap(local, api)
+
+        result = wrapped.answer_with_progress(
+            request,
+            lambda _partial: None,
+        )
+
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(
+            result.fallback_reason,
+            "company_api_ambiguous_timeout",
+        )
+        self.assertEqual(local.requests, [])
+        self.assertEqual(api.progress_requests, [request])
 
     def test_non_matching_request_stays_local_without_api(self) -> None:
         request = _request("장비 정보 보여줘")

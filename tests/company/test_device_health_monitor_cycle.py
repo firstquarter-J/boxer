@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import json
 from typing import Any, Mapping, Sequence
@@ -182,6 +182,7 @@ def _deps(
             calls.setdefault("verify", []).append((dict(device), now))
             or _verified_abnormal(device, now)
         ),
+        ssh_verification_configured=lambda: True,
         load_captureboard_incidents=lambda: {},
         send_sms=_send_sms,
         # 일반 cycle 테스트는 공통 claim/outbox의 파일 I/O와 분리하고,
@@ -192,11 +193,53 @@ def _deps(
         remember_sms_delivery=remember_sms
         or (lambda *args, **kwargs: True),
         append_sheet_alerts=append_sheet or _append_sheet,
-        archive_event=_archive,
+        write_event=_archive,
+        start_event_archive=lambda now, logger: False,
     )
 
 
-def test_cycle_confirms_hardware_twice_then_sends_once_without_pii() -> None:
+def test_device_candidate_cache_reuses_fresh_legacy_contacts() -> None:
+    calls = 0
+
+    def _unexpected_db_query() -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    devices, cache_state = cycle._load_device_candidates_cached(
+        {
+            "deviceCandidateCache": [_device()],
+            "deviceCandidateCachedAt": (_NOW - timedelta(minutes=1)).isoformat(),
+        },
+        now=_NOW,
+        load_devices=_unexpected_db_query,
+    )
+
+    assert calls == 0
+    assert devices[0]["hospitalTelephone"] == "0212345678"
+    assert devices[0]["hospitalDeviceAlertPhone"] == "01012345678"
+    assert cache_state["source"] == "state_cache"
+
+
+def test_device_candidate_cache_falls_back_to_stale_state_on_db_failure() -> None:
+    def _failed_db_query() -> list[dict[str, Any]]:
+        raise TimeoutError("db unavailable")
+
+    devices, cache_state = cycle._load_device_candidates_cached(
+        {
+            "deviceCandidateCache": [_device()],
+            "deviceCandidateCachedAt": (_NOW - timedelta(days=2)).isoformat(),
+        },
+        now=_NOW,
+        load_devices=_failed_db_query,
+    )
+
+    # legacy monitor처럼 TTL 갱신이 실패해도 기존 목록으로 계속한다.
+    assert devices[0]["deviceName"] == "MB2-CYCLE"
+    assert cache_state["source"] == "stale_state_cache"
+
+
+def test_cycle_confirms_hardware_twice_then_preserves_legacy_contact_card() -> None:
     calls: dict[str, Any] = {}
     deps = _deps(calls=calls)
 
@@ -229,20 +272,28 @@ def test_cycle_confirms_hardware_twice_then_sends_once_without_pii() -> None:
     assert provider_payload["sms"]["to"] == "01012345678"
     assert provider_payload["sms"]["message"]
 
-    # 전화번호와 문자 본문은 provider 호출을 벗어나 delivery/cursor에 남지 않는다.
+    # 기존 Slack 카드와 자동발송 확인 버튼의 연락처·본문은 유지하고,
+    # provider 추적 식별자는 conversation delivery에 남기지 않는다.
     serialized_delivery = json.dumps(
         second.deliveries[0].payload,
         ensure_ascii=False,
     )
     serialized_cursor = json.dumps(second.cursor, ensure_ascii=False)
-    assert "01012345678" not in serialized_delivery
-    assert "01012345678" not in serialized_cursor
-    assert "phone" not in serialized_delivery.lower()
-    assert "telephone" not in serialized_delivery.lower()
+    assert "01012345678" in serialized_delivery
+    assert "01012345678" in serialized_cursor
+    assert "0212345678" in serialized_delivery
+    alert_payload = second.deliveries[0].payload["alert"]
+    assert alert_payload["smsPhoneNumber"] == "01012345678"
+    assert alert_payload["smsMessage"]
+    assert alert_payload["smsTemplateId"]
     assert "smsGroupId" not in second.deliveries[0].payload["alert"]
     assert "smsMessageId" not in second.deliveries[0].payload["alert"]
     pending_sheet = next(iter(second.cursor["pendingSheetAlerts"].values()))
     assert pending_sheet["item"]["smsGroupId"] == "group-1"
+    event_types = [event_type for event_type, _, _ in calls["archive"]]
+    assert "run_summary" in event_types
+    assert "ssh_verified_abnormal" in event_types
+    assert "alert_sms_auto_accepted" in event_types
 
     third = run_device_health_monitor_cycle(
         request_id="health:cycle:3",
@@ -352,6 +403,9 @@ def test_acknowledge_writes_sheet_once_with_slack_permalink(
     assert calls["sheet"][0][2] == receipt.permalink
     assert delivery.delivery_id not in cursor["pendingSheetAlerts"]
     assert cursor["lastSheetRowCount"] == 1
+    event_types = [event_type for event_type, _, _ in calls["archive"]]
+    assert "slack_alert_sent" in event_types
+    assert "sheet_alert_rows_written" in event_types
 
     reminder = run_device_health_monitor_cycle(
         request_id="health:ack:3",
@@ -362,6 +416,66 @@ def test_acknowledge_writes_sheet_once_with_slack_permalink(
     assert len(reminder.deliveries) == 1
     # coordinator가 과거 ack로 reminder를 삼키지 않게 발생 시각까지 ID에 넣는다.
     assert reminder.deliveries[0].delivery_id != delivery.delivery_id
+
+
+def test_acknowledge_batches_one_legacy_slack_card_into_one_sheet_call() -> None:
+    calls: dict[str, Any] = {}
+    deps = _deps(calls=calls)
+    first = run_device_health_monitor_cycle(
+        request_id="health:batch-ack:1",
+        now=_NOW,
+        cursor=_seed_cursor(),
+        deps=deps,
+    )
+    second = run_device_health_monitor_cycle(
+        request_id="health:batch-ack:2",
+        now=_NOW + timedelta(minutes=1),
+        cursor=first.cursor,
+        deps=deps,
+    )
+    first_delivery = second.deliveries[0]
+    cursor = dict(second.cursor)
+    pending = dict(cursor["pendingSheetAlerts"])
+    first_record = dict(pending[first_delivery.delivery_id])
+    second_delivery_id = "device_health_monitor:synthetic-second"
+    pending[second_delivery_id] = {
+        **first_record,
+        "item": {
+            **dict(first_record["item"]),
+            "device": "MB2-CYCLE-2",
+        },
+    }
+    cursor["pendingSheetAlerts"] = pending
+    shared_permalink = "https://example.slack.com/archives/C1/p-batch"
+    receipts = tuple(
+        _Receipt(
+            delivery_id=delivery_id,
+            status="sent",
+            permalink=shared_permalink,
+            delivered_at=_NOW + timedelta(minutes=2),
+        )
+        for delivery_id in (
+            first_delivery.delivery_id,
+            second_delivery_id,
+        )
+    )
+
+    acknowledged = acknowledge_device_health_monitor_deliveries(
+        cursor=cursor,
+        receipts=receipts,
+        deps=deps,
+    )
+
+    assert len(calls["sheet"]) == 1
+    assert len(calls["sheet"][0][0]) == 2
+    assert acknowledged["pendingSheetAlerts"] == {}
+    slack_events = [
+        payload
+        for event_type, _, payload in calls["archive"]
+        if event_type == "slack_alert_sent"
+    ]
+    assert len(slack_events) == 1
+    assert slack_events[0]["alertableCount"] == 2
 
 
 def test_sheet_append_failure_moves_to_non_blocking_outbox_repair() -> None:
@@ -707,6 +821,7 @@ def test_redis_failure_does_not_fallback_to_mda_or_ssh() -> None:
         load_devices=deps.load_devices,
         load_redis_snapshot=_redis_failure,
         verify_device=deps.verify_device,
+        ssh_verification_configured=deps.ssh_verification_configured,
         load_captureboard_incidents=deps.load_captureboard_incidents,
         send_sms=deps.send_sms,
         claim_sms_delivery=deps.claim_sms_delivery,
@@ -714,7 +829,8 @@ def test_redis_failure_does_not_fallback_to_mda_or_ssh() -> None:
         clock=deps.clock,
         remember_sms_delivery=deps.remember_sms_delivery,
         append_sheet_alerts=deps.append_sheet_alerts,
-        archive_event=deps.archive_event,
+        write_event=deps.write_event,
+        start_event_archive=deps.start_event_archive,
     )
     result = run_device_health_monitor_cycle(
         request_id="health:redis:1",
@@ -730,7 +846,33 @@ def test_redis_failure_does_not_fallback_to_mda_or_ssh() -> None:
     assert calls.get("sms", []) == []
 
 
-def test_runtime_verification_disables_ssh_open_resend_and_force_reopen(
+def test_ssh_verification_failure_preserves_legacy_redis_candidate() -> None:
+    calls: dict[str, Any] = {}
+    base_deps = _deps(calls=calls)
+
+    def _verification_failure(
+        device: Mapping[str, Any],
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        del device, now
+        raise TimeoutError("private ssh detail")
+
+    result = run_device_health_monitor_cycle(
+        request_id="health:ssh-failed:1",
+        now=_NOW,
+        cursor=_seed_cursor(),
+        deps=replace(base_deps, verify_device=_verification_failure),
+    )
+
+    # local monitor는 Redis의 확인 필요 후보를 그대로 두고 검증 오류만
+    # 덧붙였으므로 API도 점검 불가로 재분류하지 않는다.
+    assert result.metrics["verificationErrorCount"] == 1
+    assert result.cursor["statusCounts"]["확인 필요"] == 1
+    assert result.cursor["statusCounts"]["점검 불가"] == 0
+    assert "private ssh detail" not in repr(result)
+
+
+def test_runtime_verification_disables_api_ssh_reopen_and_resend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -752,6 +894,7 @@ def test_runtime_verification_disables_ssh_open_resend_and_force_reopen(
     monkeypatch.setattr(cycle, "_collect_runtime_checks", _fake_collect)
     result = cycle._verify_device_health_runtime(_device(), now=_NOW)
 
+    # 한 automation request에서도 poll 재전송·stale tunnel 재개방은 막는다.
     assert captured == {
         "deviceName": "MB2-CYCLE",
         "component": "all",
@@ -761,51 +904,24 @@ def test_runtime_verification_disables_ssh_open_resend_and_force_reopen(
     assert result["sshReady"] is False
 
 
-def test_s3_archive_uses_one_total_attempt_and_one_put(
+def test_default_event_writer_appends_legacy_daily_jsonl(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
 ) -> None:
-    calls: dict[str, Any] = {"configs": [], "puts": []}
-
-    class _Client:
-        def put_object(self, **kwargs: Any) -> None:
-            calls["puts"].append(kwargs)
-
-    class _Boto3:
-        @staticmethod
-        def client(*args: Any, **kwargs: Any) -> _Client:
-            calls["client"] = (args, kwargs)
-            return _Client()
-
-    def _config(**kwargs: Any) -> dict[str, Any]:
-        calls["configs"].append(kwargs)
-        return kwargs
-
     monkeypatch.setattr(
         cycle.company_settings,
-        "DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_BUCKET",
-        "health-events",
-    )
-    monkeypatch.setattr(
-        cycle.company_settings,
-        "DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_PREFIX",
-        "health",
-    )
-    monkeypatch.setattr(
-        cycle,
-        "_load_boto3_components",
-        lambda: (_Boto3(), _config),
+        "DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR",
+        str(tmp_path),
     )
 
-    archived = cycle._archive_device_health_cycle_event(
-        request_id="health:s3:1",
-        now=_NOW,
-        payload={"deliveryCount": 1},
+    written = DeviceHealthMonitorCycleDeps().write_event(
+        "run_summary",
+        _NOW,
+        {"checkedDeviceCount": 1},
     )
 
-    assert archived is True
-    assert calls["configs"][0]["retries"] == {
-        "total_max_attempts": 1,
-        "mode": "standard",
-    }
-    assert len(calls["puts"]) == 1
-    assert json.loads(calls["puts"][0]["Body"])["deliveryCount"] == 1
+    assert written is True
+    event_path = tmp_path / "device_health_monitor_events-2026-08-14.jsonl"
+    event = json.loads(event_path.read_text(encoding="utf-8"))
+    assert event["eventType"] == "run_summary"
+    assert event["checkedDeviceCount"] == 1
