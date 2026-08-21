@@ -678,6 +678,13 @@ class CompanyRouteContractTests(unittest.TestCase):
                         "_load_slack_user_name",
                         return_value="테스트 사용자",
                     ),
+                    # 라우팅 계약은 운영 credential 유무와 분리해 기존 local
+                    # executor가 실제 선택되는지까지 고정한다.
+                    patch(
+                        "boxer_company_adapter_slack.device_routes."
+                        "_is_device_runtime_configured",
+                        return_value=True,
+                    ),
                     patch(
                         "boxer_company_adapter_slack.device_routes."
                         "_request_device_box_update",
@@ -1170,6 +1177,13 @@ class CompanyRouteContractTests(unittest.TestCase):
                             company,
                             "CompanyAssistantApiClient",
                             return_value=api_client,
+                        ),
+                        # CI의 빈 env에서도 legacy 첫 장비 선택 계약만 독립적으로
+                        # 검증하고 운영 runtime의 fail-closed 가드는 바꾸지 않는다.
+                        patch(
+                            "boxer_company_adapter_slack.device_routes."
+                            "_is_device_runtime_configured",
+                            return_value=True,
                         ),
                         patch(
                             "boxer_company_adapter_slack.device_routes."
