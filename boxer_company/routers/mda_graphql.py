@@ -12,7 +12,6 @@ from boxer_company.routers.device_ssh_security import (
     _is_company_api_device_ssh_context,
     _mark_company_api_device_ssh_open_attempted,
     _mark_company_api_mutation_attempted,
-    _register_mda_ssh_endpoint_device,
 )
 
 _mda_access_token_cache: str | None = None
@@ -918,22 +917,6 @@ def _wait_for_mda_device_agent_ssh(
             # Slack local 기본 재전송은 유지하되 API poll은 조회만 한다.
             resend_enabled=resend_enabled and not api_context,
             api_force_reopen_blocked=api_context and force_reopen,
-        )
-    if result.get("ready"):
-        device = (
-            result.get("device")
-            if isinstance(result.get("device"), dict)
-            else {}
-        )
-        agent_ssh = (
-            device.get("agentSsh")
-            if isinstance(device.get("agentSsh"), dict)
-            else {}
-        )
-        _register_mda_ssh_endpoint_device(
-            device_name,
-            agent_ssh.get("host"),
-            agent_ssh.get("port"),
         )
     return result
 

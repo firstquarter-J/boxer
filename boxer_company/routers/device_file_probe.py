@@ -50,7 +50,6 @@ from boxer_company.routers.device_ssh_security import (
     DeviceSshSecurityError,
     _mark_company_api_mutation_attempted,
     _prepare_device_ssh_client,
-    _resolve_mda_ssh_endpoint_device,
 )
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
@@ -356,7 +355,6 @@ def _connect_device_ssh_client(host: str, port: int) -> Any:
     try:
         connect_host = _prepare_device_ssh_client(
             client,
-            device_name=_resolve_mda_ssh_endpoint_device(host, port),
             reported_host=host,
             port=int(port),
             paramiko_module=paramiko,

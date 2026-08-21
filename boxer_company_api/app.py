@@ -313,7 +313,7 @@ def create_company_api_app(
         )
         if live_device_route is not None and not api_settings.live_device_enabled:
             # 코드 우선 배포 상태에서는 read-only operations를 유지하되,
-            # strict MDA/SSH 정본이 준비되지 않은 live 장비 경로만 닫는다.
+            # MDA/SSH 설정을 검증하지 않은 live 장비 경로만 닫는다.
             raise CompanyApiProblem(
                 status=503,
                 code="service_not_ready",
@@ -482,8 +482,8 @@ def create_company_api_app(
             device_ssh_state = None
             try:
                 typed_runtime = cast(_AssistantRuntime, runtime)
-                # API context는 side-effect marker와 strict host-key 경계를 함께
-                # 활성화하고, Slack local rollback만 기존 SSH 정책을 유지한다.
+                # API context는 host 선택을 바꾸지 않고 side-effect marker와
+                # 요청당 mutation/open 횟수 제한만 활성화한다.
                 with company_api_device_ssh_context() as device_ssh_state:
                     if turn.routeGroup is None:
                         result = (
@@ -802,8 +802,8 @@ def create_company_api_app(
 
         started_at = time.monotonic()
         try:
-            # daily/health는 한 cycle에서 여러 장비를 순회한다. strict pinned
-            # host는 유지하되 sshOrder 예산은 장비별 한 번으로 분리한다.
+            # daily/health는 한 cycle에서 여러 장비를 순회하므로 sshOrder
+            # 예산을 장비별 한 번으로 분리한다.
             with company_api_device_ssh_context(
                 per_device_open_budget=True,
             ):

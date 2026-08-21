@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -25,9 +24,6 @@ _DEFAULT_REQUEST_LOG_SQLITE_PATH = (
 )
 _DEFAULT_DEVICE_HEALTH_EVENT_LOG_DIR = (
     "/var/lib/boxer-company-api/device-health-events"
-)
-_DEFAULT_DEVICE_SSH_KNOWN_HOSTS_PATH = (
-    "/etc/boxer-company-api/device_known_hosts"
 )
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -112,8 +108,6 @@ class CompanyApiSettings:
     sms_delivery_storage_required: bool = False
     device_health_sheet_enabled: bool = False
     google_application_credentials_path: str = ""
-    strict_ssh_required: bool = False
-    device_ssh_known_hosts_path: str = ""
     # 직접 주입하는 계약 테스트는 기존 live route를 유지한다. 운영 env loader는
     # 명시적으로 true를 받기 전까지 이 경계를 false로 덮어쓴다.
     live_device_enabled: bool = True
@@ -163,8 +157,6 @@ def load_company_api_settings(
         sms_delivery_outbox_path,
         device_health_sheet_enabled,
         google_application_credentials_path,
-        strict_ssh_required,
-        device_ssh_known_hosts_path,
         automation_dependency_error,
     ) = _load_automation_dependency_settings(
         source,
@@ -175,7 +167,6 @@ def load_company_api_settings(
         or automation_storage_required
         or sms_delivery_storage_required
         or device_health_sheet_enabled
-        or strict_ssh_required
     )
     raw_registry = str(
         source.get("BOXER_COMPANY_API_CALLERS_JSON", "")
@@ -204,8 +195,6 @@ def load_company_api_settings(
             google_application_credentials_path=(
                 google_application_credentials_path
             ),
-            strict_ssh_required=strict_ssh_required,
-            device_ssh_known_hosts_path=device_ssh_known_hosts_path,
             live_device_enabled=live_device_enabled,
             operations_enabled=operations_enabled,
             request_log_enabled=request_log_enabled,
@@ -240,8 +229,6 @@ def load_company_api_settings(
             google_application_credentials_path=(
                 google_application_credentials_path
             ),
-            strict_ssh_required=strict_ssh_required,
-            device_ssh_known_hosts_path=device_ssh_known_hosts_path,
             live_device_enabled=live_device_enabled,
             operations_enabled=operations_enabled,
             request_log_enabled=request_log_enabled,
@@ -302,8 +289,6 @@ def load_company_api_settings(
             google_application_credentials_path=(
                 google_application_credentials_path
             ),
-            strict_ssh_required=strict_ssh_required,
-            device_ssh_known_hosts_path=device_ssh_known_hosts_path,
             live_device_enabled=live_device_enabled,
             operations_enabled=operations_enabled,
             request_log_enabled=request_log_enabled,
@@ -323,8 +308,6 @@ def load_company_api_settings(
         google_application_credentials_path=(
             google_application_credentials_path
         ),
-        strict_ssh_required=strict_ssh_required,
-        device_ssh_known_hosts_path=device_ssh_known_hosts_path,
         live_device_enabled=live_device_enabled,
         operations_enabled=operations_enabled,
         request_log_enabled=request_log_enabled,
@@ -452,7 +435,7 @@ def _load_automation_dependency_settings(
     env: Mapping[str, str],
     *,
     live_device_enabled: bool,
-) -> tuple[str, bool, str, bool, str, str | None]:
+) -> tuple[str, bool, str, str | None]:
     """활성 cycle과 live 장비의 로컬 의존성만 값 노출 없이 선검증한다."""
 
     feature_flags: dict[str, bool] = {}
@@ -465,8 +448,6 @@ def _load_automation_dependency_settings(
         if error is not None:
             return (
                 _DEFAULT_SMS_DELIVERY_OUTBOX_PATH,
-                False,
-                "",
                 False,
                 "",
                 error,
@@ -509,8 +490,6 @@ def _load_automation_dependency_settings(
             _DEFAULT_SMS_DELIVERY_OUTBOX_PATH,
             False,
             "",
-            False,
-            "",
             None,
         )
 
@@ -528,7 +507,6 @@ def _load_automation_dependency_settings(
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=daily_enabled or health_enabled,
         )
     if data_cycle_enabled:
         db_enabled, db_flag_error = _strict_optional_bool(
@@ -538,16 +516,14 @@ def _load_automation_dependency_settings(
         if db_flag_error is not None or not db_enabled:
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
-                strict_ssh_required=daily_enabled or health_enabled,
             )
 
-    strict_ssh_required = (
-        live_device_enabled or daily_enabled or health_enabled
+    ssh_runtime_enabled = (
+        live_device_enabled
+        or daily_enabled
+        or health_enabled
     )
-    known_hosts_path = str(
-        env.get("BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH", "")
-    ).strip()
-    if strict_ssh_required and not _required_env_values(
+    if ssh_runtime_enabled and not _required_env_values(
         env,
         {
             "MDA_GRAPHQL_URL",
@@ -555,35 +531,16 @@ def _load_automation_dependency_settings(
             "MDA_SSH_OPEN_HOST",
             "DEVICE_SSH_USER",
             "DEVICE_SSH_PASSWORD",
-            "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS",
-            "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST",
-            "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH",
         },
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=True,
         )
-    if (
-        strict_ssh_required
-        and known_hosts_path != _DEFAULT_DEVICE_SSH_KNOWN_HOSTS_PATH
+    if ssh_runtime_enabled and not _safe_https_url(
+        env.get("MDA_GRAPHQL_URL", "")
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=True,
-        )
-    if strict_ssh_required and (
-        not _safe_https_url(env.get("MDA_GRAPHQL_URL", ""))
-        or not _valid_host_list(
-            env.get("BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS", "")
-        )
-        or not _private_ip_address(
-            env.get("BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST", "")
-        )
-    ):
-        return _automation_dependency_error(
-            sheet_enabled=sheet_enabled,
-            strict_ssh_required=True,
         )
 
     if health_enabled:
@@ -592,17 +549,14 @@ def _load_automation_dependency_settings(
         ).strip() != _DEFAULT_DEVICE_HEALTH_EVENT_LOG_DIR:
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
-                strict_ssh_required=strict_ssh_required,
             )
         if not _required_env_values(env, {"DEVICE_STATE_REDIS_HOST"}):
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
-                strict_ssh_required=strict_ssh_required,
             )
         if not _valid_port(env.get("DEVICE_STATE_REDIS_PORT", "6379")):
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
-                strict_ssh_required=strict_ssh_required,
             )
         _redis_tls, redis_tls_error = _strict_optional_bool(
             env,
@@ -611,7 +565,6 @@ def _load_automation_dependency_settings(
         if redis_tls_error is not None:
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
-                strict_ssh_required=strict_ssh_required,
             )
 
     sms_domain_enabled = any(
@@ -628,12 +581,10 @@ def _load_automation_dependency_settings(
     if sms_domain_enabled and provider not in {"none", "webhook", "solapi"}:
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if sms_domain_enabled and alerts_enabled and provider == "none":
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if sms_domain_enabled and provider == "webhook" and not _required_env_values(
         env,
@@ -641,14 +592,12 @@ def _load_automation_dependency_settings(
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if sms_domain_enabled and provider == "webhook" and not _safe_https_url(
         env.get("DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL", "")
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if sms_domain_enabled and provider == "solapi" and not _required_env_values(
         env,
@@ -661,14 +610,12 @@ def _load_automation_dependency_settings(
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if sms_delivery_enabled and (
         provider != "solapi" or not sheet_enabled
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if (
         (health_enabled or notification_enabled or alerts_enabled)
@@ -679,14 +626,12 @@ def _load_automation_dependency_settings(
         # receipt를 고립시키지 않는다.
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     if sms_domain_enabled and provider == "solapi" and not _safe_https_url(
         env.get("SOLAPI_BASE_URL", "")
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
 
     # health/notification은 provider가 none 또는 webhook이어도 공통 claim
@@ -703,8 +648,6 @@ def _load_automation_dependency_settings(
         return (
             _DEFAULT_SMS_DELIVERY_OUTBOX_PATH,
             sheet_enabled,
-            "",
-            strict_ssh_required,
             "",
             "automation_storage_configuration_invalid",
         )
@@ -729,7 +672,6 @@ def _load_automation_dependency_settings(
     ):
         return _automation_dependency_error(
             sheet_enabled=True,
-            strict_ssh_required=strict_ssh_required,
         )
 
     archive_bucket = str(
@@ -744,7 +686,6 @@ def _load_automation_dependency_settings(
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
     archive_prefix = str(
         env.get("DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_PREFIX", "")
@@ -756,15 +697,12 @@ def _load_automation_dependency_settings(
     ):
         return _automation_dependency_error(
             sheet_enabled=sheet_enabled,
-            strict_ssh_required=strict_ssh_required,
         )
 
     return (
         str(outbox_path),
         sheet_enabled,
         credentials_path,
-        strict_ssh_required,
-        known_hosts_path,
         None,
     )
 
@@ -772,13 +710,10 @@ def _load_automation_dependency_settings(
 def _automation_dependency_error(
     *,
     sheet_enabled: bool,
-    strict_ssh_required: bool,
-) -> tuple[str, bool, str, bool, str, str]:
+) -> tuple[str, bool, str, str]:
     return (
         _DEFAULT_SMS_DELIVERY_OUTBOX_PATH,
         sheet_enabled,
-        "",
-        strict_ssh_required,
         "",
         "automation_dependency_configuration_invalid",
     )
@@ -867,27 +802,6 @@ def _safe_https_url(value: Any) -> bool:
     )
 
 
-def _private_ip_address(value: Any) -> bool:
-    try:
-        address = ipaddress.ip_address(str(value or "").strip())
-    except ValueError:
-        return False
-    return bool(address.is_private)
-
-
-def _valid_host_list(value: Any) -> bool:
-    hosts = [item.strip() for item in str(value or "").split(",")]
-    return bool(
-        hosts
-        and all(
-            host
-            and len(host) <= 253
-            and re.fullmatch(r"[A-Za-z0-9.-]+", host)
-            for host in hosts
-        )
-    )
-
-
 def _valid_s3_bucket_name(value: str) -> bool:
     return bool(
         3 <= len(value) <= 63
@@ -932,10 +846,6 @@ def company_api_local_readiness(settings: CompanyApiSettings) -> bool:
             if path.exists() or path.is_symlink()
         ):
             return False
-    if settings.strict_ssh_required and not _secure_known_hosts_file(
-        Path(settings.device_ssh_known_hosts_path)
-    ):
-        return False
     if settings.device_health_sheet_enabled and not _secure_json_object_file(
         Path(settings.google_application_credentials_path)
     ):
@@ -1021,37 +931,6 @@ def _secure_json_object_file(path: Path) -> bool:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     return isinstance(payload, dict) and bool(payload)
-
-
-def _secure_known_hosts_file(path: Path) -> bool:
-    if not _secure_root_owned_file(path):
-        return False
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return False
-    entries: list[tuple[str, str]] = []
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split()
-        if (
-            len(fields) != 3
-            or not fields[0]
-            or "," in fields[0]
-            or fields[1] != "ssh-ed25519"
-            or not fields[2]
-        ):
-            return False
-        entries.append((fields[0], fields[2]))
-    aliases = [item[0] for item in entries]
-    public_keys = [item[1] for item in entries]
-    return bool(
-        entries
-        and len(aliases) == len(set(aliases))
-        and len(public_keys) == len(set(public_keys))
-    )
 
 
 def _parse_caller_registry(

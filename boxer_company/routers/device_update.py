@@ -12,7 +12,6 @@ from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.device_ssh_security import (
     _mark_company_api_mutation_attempted,
-    _register_mda_ssh_endpoint_device,
 )
 from boxer_company.routers.device_status_probe import _parse_pm2_processes
 from boxer_company.routers.mda_graphql import (
@@ -376,7 +375,7 @@ def _wait_for_device_update_ssh(
         return result
 
     # 호출자가 명시적으로 단일 open 예산을 고른 경우에는 그 예산을 쓴 뒤
-    # MDA 상태만 읽고, 늦게 열린 endpoint의 장비 매핑만 기록한다.
+    # MDA 상태만 읽는다.
     current_state = _get_mda_device_agent_ssh(device_name)
     device_info = current_state if isinstance(current_state, dict) else {}
     agent_ssh = (
@@ -385,12 +384,6 @@ def _wait_for_device_update_ssh(
         else {}
     )
     ready = bool(agent_ssh.get("host")) and bool(agent_ssh.get("port"))
-    if ready:
-        _register_mda_ssh_endpoint_device(
-            device_name,
-            agent_ssh.get("host"),
-            agent_ssh.get("port"),
-        )
     return {
         "opened": None,
         "device": current_state,

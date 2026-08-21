@@ -177,7 +177,6 @@ def _lookup_device_ssh_status(
     try:
         connect_host = _prepare_device_ssh_client(
             client,
-            device_name=normalized_name,
             reported_host=host,
             port=port,
             paramiko_module=paramiko,

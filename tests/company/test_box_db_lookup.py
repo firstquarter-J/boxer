@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from boxer_company.routers import box_db
@@ -104,6 +105,55 @@ class DeviceDetailRenderingTests(unittest.TestCase):
 
 
 class DeviceReadOnlyQueryTests(unittest.TestCase):
+    def test_ssh_status_connects_only_to_endpoint_returned_by_mda(self) -> None:
+        # 질문에서 추출된 장비명은 MDA 조회 key로만 쓰고, 실제 hostname과
+        # port는 MDA agentSsh 응답에서 가져온 값만 전달한다.
+        client = MagicMock()
+        fake_paramiko = SimpleNamespace(
+            SSHClient=MagicMock(return_value=client),
+            AutoAddPolicy=MagicMock(return_value="auto-policy"),
+        )
+
+        with (
+            patch.object(box_db, "paramiko", fake_paramiko),
+            patch.object(box_db.cs, "DEVICE_SSH_PASSWORD", "test-password"),
+            patch(
+                "boxer_company.routers.box_db._is_mda_graphql_configured",
+                return_value=True,
+            ),
+            patch(
+                "boxer_company.routers.box_db._wait_for_mda_device_agent_ssh",
+                return_value={
+                    "ready": True,
+                    "device": {
+                        "agentSsh": {
+                            "host": "mda-reported.example",
+                            "port": 43123,
+                        }
+                    },
+                },
+            ) as wait_for_ssh,
+        ):
+            result = box_db._lookup_device_ssh_status(
+                "user-input.example",
+                allow_ssh_open_resend=False,
+            )
+
+        self.assertEqual(result, "연결 가능")
+        wait_for_ssh.assert_called_once_with(
+            "user-input.example",
+            poll_timeout_sec=10,
+            resend_enabled=False,
+        )
+        self.assertEqual(
+            client.connect.call_args.kwargs["hostname"],
+            "mda-reported.example",
+        )
+        self.assertEqual(client.connect.call_args.kwargs["port"], 43123)
+        client.set_missing_host_key_policy.assert_called_once_with(
+            "auto-policy"
+        )
+
     def test_db_only_device_detail_skips_mda_and_ssh_enrichment(self) -> None:
         # 공통 API용 조회는 장비 기본 row만 읽고 MDA mutation이나 SSH를 열지 않는다.
         cursor = MagicMock()

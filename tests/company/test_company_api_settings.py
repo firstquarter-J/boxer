@@ -80,7 +80,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
         self.assertFalse(settings.enforce_local_readiness)
         self.assertTrue(company_api_local_readiness(settings))
 
-    def test_live_device_requires_strict_dependencies_and_caller_scope(
+    def test_live_device_requires_mda_ssh_dependencies_and_caller_scope(
         self,
     ) -> None:
         base_env = {
@@ -93,67 +93,32 @@ class CompanyApiSettingsTests(unittest.TestCase):
                 "/var/lib/boxer-company-api/request_log.db"
             ),
         }
+        device_dependencies = {
+            "MDA_GRAPHQL_URL": "https://mda.example.invalid/graphql",
+            "MDA_ADMIN_USER_PASSWORD": "not-logged",
+            "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
+            "DEVICE_SSH_USER": "device-user",
+            "DEVICE_SSH_PASSWORD": "not-logged",
+        }
         missing_dependencies = load_company_api_settings(base_env)
         configured = load_company_api_settings(
-            {
-                **base_env,
-                "MDA_GRAPHQL_URL": "https://mda.example.invalid/graphql",
-                "MDA_ADMIN_USER_PASSWORD": "not-logged",
-                "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
-                "DEVICE_SSH_USER": "device-user",
-                "DEVICE_SSH_PASSWORD": "not-logged",
-                "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": (
-                    "remotes.example.invalid"
-                ),
-                "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": "10.0.0.10",
-                "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": (
-                    "/etc/boxer-company-api/device_known_hosts"
-                ),
-            }
+            {**base_env, **device_dependencies}
         )
-        noncanonical_known_hosts = load_company_api_settings(
+        stale_strict_ssh_keys = load_company_api_settings(
             {
                 **base_env,
-                "MDA_GRAPHQL_URL": "https://mda.example.invalid/graphql",
-                "MDA_ADMIN_USER_PASSWORD": "not-logged",
-                "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
-                "DEVICE_SSH_USER": "device-user",
-                "DEVICE_SSH_PASSWORD": "not-logged",
-                "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": (
-                    "remotes.example.invalid"
-                ),
-                "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": "10.0.0.10",
-                # ProtectHome과 무관한 고정 /etc 정본만 허용한다.
-                "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": (
-                    "/home/ec2-user/device_known_hosts"
-                ),
+                **device_dependencies,
+                # 이전 secret에 남은 strict SSH 키는 더 이상 runtime 설정이나
+                # readiness를 바꾸지 않고 무시한다.
+                "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": "not a host",
+                "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": "8.8.8.8",
+                "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": "relative",
             }
         )
         missing_capabilities = load_company_api_settings(
             {
-                **{
-                    key: value
-                    for key, value in {
-                        **base_env,
-                        "MDA_GRAPHQL_URL": (
-                            "https://mda.example.invalid/graphql"
-                        ),
-                        "MDA_ADMIN_USER_PASSWORD": "not-logged",
-                        "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
-                        "DEVICE_SSH_USER": "device-user",
-                        "DEVICE_SSH_PASSWORD": "not-logged",
-                        "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": (
-                            "remotes.example.invalid"
-                        ),
-                        "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": (
-                            "10.0.0.10"
-                        ),
-                        "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": (
-                            "/etc/boxer-company-api/device_known_hosts"
-                        ),
-                    }.items()
-                    if key != "BOXER_COMPANY_API_CALLERS_JSON"
-                },
+                **base_env,
+                **device_dependencies,
                 "BOXER_COMPANY_API_CALLERS_JSON": self._registry(),
             }
         )
@@ -164,12 +129,8 @@ class CompanyApiSettingsTests(unittest.TestCase):
         )
         self.assertIsNone(configured.configuration_error)
         self.assertTrue(configured.live_device_enabled)
-        self.assertTrue(configured.strict_ssh_required)
         self.assertTrue(configured.enforce_local_readiness)
-        self.assertEqual(
-            noncanonical_known_hosts.configuration_error,
-            "automation_dependency_configuration_invalid",
-        )
+        self.assertIsNone(stale_strict_ssh_keys.configuration_error)
         self.assertEqual(
             missing_capabilities.configuration_error,
             "live_device_caller_configuration_invalid",
@@ -378,7 +339,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
         )
         self.assertNotIn("not-logged", repr(configured))
 
-    def test_health_automation_requires_redis_and_strict_mda_ssh_config(
+    def test_health_automation_requires_redis_and_mda_ssh_config(
         self,
     ) -> None:
         env = {
@@ -402,13 +363,6 @@ class CompanyApiSettingsTests(unittest.TestCase):
             "MDA_SSH_OPEN_HOST": "remotes.example.invalid",
             "DEVICE_SSH_USER": "device-user",
             "DEVICE_SSH_PASSWORD": "not-logged",
-            "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": (
-                "remotes.example.invalid"
-            ),
-            "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": "10.0.0.10",
-            "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": (
-                "/etc/boxer-company-api/device_known_hosts"
-            ),
             "DEVICE_STATE_REDIS_PORT": "6379",
             "DEVICE_STATE_REDIS_TLS": "true",
         }
@@ -449,19 +403,17 @@ class CompanyApiSettingsTests(unittest.TestCase):
             "automation_dependency_configuration_invalid",
         )
         self.assertIsNone(configured.configuration_error)
-        self.assertTrue(configured.strict_ssh_required)
 
-        unsafe_connect_host = load_company_api_settings(
+        stale_strict_ssh_keys = load_company_api_settings(
             {
                 **env,
                 "DEVICE_STATE_REDIS_HOST": "redis.internal",
+                "BOXER_COMPANY_API_DEVICE_SSH_ALLOWED_HOSTS": "not a host",
                 "BOXER_COMPANY_API_DEVICE_SSH_CONNECT_HOST": "8.8.8.8",
+                "BOXER_COMPANY_API_DEVICE_SSH_KNOWN_HOSTS_PATH": "relative",
             }
         )
-        self.assertEqual(
-            unsafe_connect_host.configuration_error,
-            "automation_dependency_configuration_invalid",
-        )
+        self.assertIsNone(stale_strict_ssh_keys.configuration_error)
 
     def test_enabled_automation_requires_exact_slack_caller_capabilities(
         self,
