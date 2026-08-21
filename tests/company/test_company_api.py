@@ -2128,6 +2128,70 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(record["routeName"], "barcode_query")
         self.assertEqual(record["status"], "answered")
         self.assertEqual(record["replyCount"], 1)
+        self.assertEqual(
+            record["requestText"],
+            "12345678910 최근 촬영 영상 몇 개야?",
+        )
+        self.assertEqual(
+            record["normalizedQuestion"],
+            "12345678910 최근 촬영 영상 몇 개야?",
+        )
+
+    def test_blank_freeform_persists_bot_only_mention_request_log(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="company_freeform",
+                outcome="needs_input",
+                messages=(AssistantMessage(body="질문 내용을 같이 보내줘"),),
+                fallback_reason="missing_question",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "boxer_company_api.app._initialize_request_log_storage",
+            return_value=None,
+        ):
+            db_path = str(Path(temp_dir).resolve() / "request-log.db")
+            app = create_company_api_app(
+                settings=_settings(
+                    request_log_enabled=True,
+                    request_log_path=db_path,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-empty-freeform-log"),
+                    json=_payload(
+                        question="   ",
+                        routeGroup="freeform",
+                        contextEntries=[],
+                    ),
+                )
+                rows = _read_request_log_rows(db_path)
+                readiness = client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["route"], "company_freeform")
+        self.assertEqual(response.json()["outcome"], "needs_input")
+        self.assertEqual(readiness.status_code, 200)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        # legacy Slack bot-only mention은 질문 정규화 결과가 없었으므로,
+        # 원문 대신 비민감 marker만 남기고 normalizedQuestion은 비워 둔다.
+        self.assertEqual(row["requestText"], "[Boxer만 멘션한 요청]")
+        self.assertIsNone(row["normalizedQuestion"])
+        self.assertEqual(row["routeName"], "llm_freeform")
+        self.assertEqual(row["status"], "needs_input")
+        self.assertEqual(row["replyCount"], 1)
+        self.assertEqual(
+            json.loads(row["metadataJson"])["domainOutcome"],
+            "needs_input",
+        )
 
     def test_request_log_failure_latches_readiness_after_success_response(
         self,
@@ -2258,6 +2322,10 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         record = save_request_log.call_args.args[0]
         self.assertEqual(record["requestText"], "[민감 operations 요청]")
+        self.assertEqual(
+            record["normalizedQuestion"],
+            "[민감 operations 요청]",
+        )
         self.assertNotIn(question, str(record))
 
     def test_remote_operation_request_log_is_finalized_by_same_id_receipt(

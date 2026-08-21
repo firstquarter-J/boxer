@@ -117,6 +117,7 @@ _REQUEST_ID_PATTERN = re.compile(
 _NDJSON_MEDIA_TYPE = "application/x-ndjson"
 _STREAM_HEARTBEAT_SEC = 15.0
 _MAX_STREAM_BYTES = 1_048_576
+_BOT_ONLY_MENTION_REQUEST_TEXT = "[Boxer만 멘션한 요청]"
 
 
 def create_company_api_app(
@@ -997,12 +998,17 @@ def _persist_turn_request_log(
         else turn.conversationId
     )
     # PII·SQL·mutation이 섞일 수 있는 operations 원문은 중앙 감사 DB에도
-    # 복제하지 않고 route/outcome/correlation만 남긴다.
-    request_text = (
-        "[민감 operations 요청]"
-        if turn.routeGroup == "operations"
-        else turn.question
-    )
+    # 복제하지 않고 route/outcome/correlation만 남긴다. 질문이 비어 있는
+    # freeform은 legacy Slack의 bot-only mention 감사 의미만 안전하게 남긴다.
+    if turn.routeGroup == "operations":
+        request_text = "[민감 operations 요청]"
+        normalized_question: str | None = request_text
+    elif turn.question:
+        request_text = turn.question
+        normalized_question = request_text
+    else:
+        request_text = _BOT_ONLY_MENTION_REQUEST_TEXT
+        normalized_question = None
     # Slack renderer가 최종 전달 receipt를 보내기 전에는 답변 성공으로
     # 확정하지 않는다. auditContext 없는 기존 direct 호출 계약은 유지한다.
     pending_delivery = (
@@ -1059,7 +1065,7 @@ def _persist_turn_request_log(
                     else None
                 ),
                 "requestText": request_text,
-                "normalizedQuestion": request_text,
+                "normalizedQuestion": normalized_question,
                 "requestKey": request_id,
                 "replyCount": (
                     0
