@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from boxer.core import settings as core_settings
 from boxer.retrieval.connectors.db import _create_db_connection
+from boxer_company import settings as cs
 from boxer_company.assistant.device_health_alert_action_route import (
     DeviceHealthAlertActionTarget,
     _build_device_health_alert_sms_guide,
@@ -60,7 +61,6 @@ _CAPTUREBOARD_INCIDENT_CODES = {
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
 }
-_CAPTUREBOARD_INCIDENT_OPEN_STATUSES = {"대기", "처리중", "진행중"}
 _KST = ZoneInfo("Asia/Seoul")
 _RECORDING_STALL_MIN_DURATION_SECONDS = 120
 _RECORDING_STALL_MAX_EVENT_GAP_SECONDS = 300
@@ -244,6 +244,8 @@ class DeviceNotificationCycleDeps:
     load_event_batch: Callable[..., tuple[int, list[dict[str, Any]]]] = (
         _load_device_notification_batch
     )
+    # 이전 주입형 port 생성 호환만 유지한다. 캡처보드 incident 판단은 이
+    # Sheet snapshot을 호출하지 않고 automation cursor만 정본으로 사용한다.
     load_sheet_incidents: Callable[[], dict[str, dict[str, Any]] | None] = (
         _load_device_health_sheet_captureboard_incidents
     )
@@ -338,13 +340,11 @@ class DeviceNotificationAlertCycleHandler:
         if event is None:
             return _cycle_result(state, deliveries=(), processed_count=0)
 
-        if event["code"] in _CAPTUREBOARD_INCIDENT_CODES:
-            state = self._refresh_captureboard_incident(
-                state,
-                event,
-                now=request.scheduled_at,
-            )
-        if _should_suppress_open_captureboard_event(state, event):
+        if _should_suppress_open_captureboard_event(
+            state,
+            event,
+            now=request.scheduled_at,
+        ):
             _mark_suppressed_captureboard_event(
                 state,
                 event,
@@ -413,52 +413,6 @@ class DeviceNotificationAlertCycleHandler:
             )
             contexts.pop(delivery_id, None)
         state["pendingDeliveryContexts"] = contexts
-        return state
-
-    def _refresh_captureboard_incident(
-        self,
-        state: dict[str, Any],
-        event: Mapping[str, Any],
-        *,
-        now: datetime,
-    ) -> dict[str, Any]:
-        device_name = str(event.get("deviceName") or "").strip()
-        if not device_name:
-            return state
-        incidents = dict(state["captureboardIncidents"])
-        try:
-            loaded = self._deps.load_sheet_incidents()
-        except Exception as exc:
-            # Sheet 상태를 모르면 오래된 open 값으로 영구 억제하지 않고 다시
-            # 알리되 예외 원문은 기록하지 않는다.
-            incidents.pop(device_name, None)
-            self._logger.warning(
-                "Device notification Sheet snapshot failed error_type=%s",
-                type(exc).__name__,
-            )
-            state["captureboardIncidents"] = incidents
-            return state
-
-        raw_incident = (
-            loaded.get(device_name)
-            if isinstance(loaded, dict)
-            else None
-        )
-        normalized = _normalize_sheet_incident(
-            raw_incident,
-            device_name=device_name,
-        )
-        if normalized is None:
-            incidents.pop(device_name, None)
-        else:
-            previous = incidents.get(device_name, {})
-            incidents[device_name] = {
-                **previous,
-                **normalized,
-                "lastSheetCheckedAt": now.isoformat(),
-            }
-        state["captureboardIncidents"] = incidents
-        state["captureboardIncidentsLastSheetCheckedAt"] = now.isoformat()
         return state
 
     def _flush_pending_sheet_repairs(self, state: dict[str, Any]) -> None:
@@ -592,6 +546,7 @@ class DeviceNotificationAlertCycleHandler:
             "kind": "root_alert",
             "notificationId": event["notificationId"],
             "code": event["code"],
+            "deviceSeq": event.get("deviceSeq"),
             "deviceName": event["deviceName"],
             "occurredAt": event["occurredAt"],
             "sheetAlertItem": alert_item,
@@ -1023,9 +978,13 @@ class DeviceNotificationAlertCycleHandler:
                 }
             )
             state["recordingStallIncidents"][incident_key] = incident
-        if row_count is not None and row_count > 0 and device_name:
+        if code in _CAPTUREBOARD_INCIDENT_CODES and device_name:
+            # Slack 루트가 실제 전송된 시점부터 API cursor가 incident 정본을
+            # 소유한다. Sheet append 결과는 업무 현황 복구에만 쓰고 중복 억제
+            # 여부에는 영향을 주지 않는다.
             state["captureboardIncidents"][device_name] = {
                 "deviceName": device_name,
+                "deviceSeq": _coerce_optional_int(context.get("deviceSeq")),
                 "status": "대기",
                 "openedNotificationId": _coerce_int(
                     context.get("notificationId")
@@ -1034,6 +993,11 @@ class DeviceNotificationAlertCycleHandler:
                 "openedAt": actual_acknowledged_at.isoformat(),
                 "rootExternalMessageId": external_message_id,
                 "rootPermalink": permalink,
+                "rowNumber": None,
+                "lastSheetCheckedAt": "",
+                "lastSuppressedAt": "",
+                "lastSuppressedNotificationId": None,
+                "lastSuppressedCode": "",
                 "suppressedCount": 0,
             }
         state.update(
@@ -1667,14 +1631,30 @@ def _auto_sms_claim_key(alert_item: Mapping[str, Any]) -> str:
 def _should_suppress_open_captureboard_event(
     state: Mapping[str, Any],
     event: Mapping[str, Any],
+    *,
+    now: datetime,
 ) -> bool:
     if event.get("code") != _CAPTUREBOARD_CONNECTION_ERROR:
         return False
     device_name = str(event.get("deviceName") or "").strip()
     incident = (state.get("captureboardIncidents") or {}).get(device_name)
-    return isinstance(incident, Mapping) and str(
-        incident.get("status") or ""
-    ) in _CAPTUREBOARD_INCIDENT_OPEN_STATUSES
+    if not isinstance(incident, Mapping):
+        return False
+
+    # 반복 이벤트마다 lastSuppressedAt을 전진시키는 sliding quiet window다.
+    # 오래됐거나 손상되거나 미래인 cursor 시각은 새 루트를 허용해
+    # 실제 장애를 영구히 가리지 않는다.
+    activity_value = incident.get("lastSuppressedAt") or incident.get("openedAt")
+    activity_at = _parse_event_datetime(activity_value)
+    current_at = _parse_event_datetime(now)
+    if activity_at is None or current_at is None:
+        return False
+    age = current_at - activity_at
+    quiet_seconds = max(
+        1,
+        int(cs.DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC),
+    )
+    return timedelta(0) <= age < timedelta(seconds=quiet_seconds)
 
 
 def _mark_suppressed_captureboard_event(
@@ -1700,24 +1680,6 @@ def _mark_suppressed_captureboard_event(
         }
     )
     state["captureboardIncidents"][device_name] = incident
-
-
-def _normalize_sheet_incident(
-    value: Any,
-    *,
-    device_name: str,
-) -> dict[str, Any] | None:
-    if not isinstance(value, Mapping):
-        return None
-    status = "".join(str(value.get("status") or "").split())
-    if status not in _CAPTUREBOARD_INCIDENT_OPEN_STATUSES:
-        return None
-    return {
-        "deviceName": device_name,
-        "status": status,
-        "rootPermalink": str(value.get("slackPermalink") or "").strip(),
-        "rowNumber": _coerce_optional_int(value.get("rowNumber")),
-    }
 
 
 def _receipt_value(receipt: Any, *names: str) -> Any:

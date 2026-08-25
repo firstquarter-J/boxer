@@ -16,7 +16,6 @@ from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as cs
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
-    _load_device_health_sheet_captureboard_incidents,
 )
 from boxer_company.sms_delivery import (
     _SMS_DELIVERY_CONFIRM_REQUIRED,
@@ -543,112 +542,6 @@ def _append_pending_events(
     return {**state, "pendingEvents": pending}
 
 
-def _captureboard_incident_pending_device_names(
-    state: dict[str, Any],
-) -> set[str]:
-    return {
-        str(event.get("deviceName") or "").strip()
-        for event in state.get("pendingEvents") or []
-        if isinstance(event, dict)
-        and str(event.get("code") or "").strip() in _CAPTUREBOARD_INCIDENT_CODES
-        and str(event.get("deviceName") or "").strip()
-    }
-
-
-def _normalize_sheet_captureboard_incident(
-    value: Any,
-    *,
-    fallback_device_name: str,
-) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    device_name = str(
-        value.get("deviceName") or fallback_device_name or ""
-    ).strip()
-    if not device_name:
-        return None
-    row_number = _coerce_optional_int(value.get("rowNumber"))
-    return {
-        "deviceName": device_name,
-        "status": _normalize_captureboard_incident_status(value.get("status")),
-        "slackPermalink": str(value.get("slackPermalink") or "").strip(),
-        "rowNumber": row_number if row_number is not None and row_number > 0 else None,
-    }
-
-
-def _refresh_captureboard_incidents_from_sheet(
-    state: dict[str, Any],
-    *,
-    now: datetime,
-    logger: logging.Logger,
-) -> dict[str, Any]:
-    current_incidents = dict(state.get("captureboardIncidents") or {})
-    pending_device_names = _captureboard_incident_pending_device_names(state)
-    # 완료 여부는 다음 관련 이벤트를 판단할 때만 필요하므로 빈 poll이나 merge 이벤트에서
-    # 전체 Sheet를 반복 조회하지 않는다.
-    if not pending_device_names:
-        return state
-
-    try:
-        loaded = _load_device_health_sheet_captureboard_incidents()
-    except Exception:
-        # Sheet 조회 실패는 처리 현황만 초기화하고 Slack 녹화 스레드는 독립적으로 유지한다.
-        reset_device_names = set(current_incidents)
-        logger.warning(
-            "캡처보드 장애 처리 상태를 Google Sheets에서 읽지 못했어. "
-            "후속 이벤트를 다시 알릴게 devices=%s",
-            ",".join(sorted(reset_device_names)) or "없음",
-            exc_info=True,
-        )
-        return {**state, "captureboardIncidents": {}}
-
-    if loaded is None:
-        # 비활성 Sheet의 처리 현황만 해제하고 기존 녹화 스레드 동작은 보존한다.
-        return {**state, "captureboardIncidents": {}}
-
-    sheet_incidents: dict[str, dict[str, Any]] = {}
-    if isinstance(loaded, dict):
-        for raw_device_name, raw_incident in loaded.items():
-            incident = _normalize_sheet_captureboard_incident(
-                raw_incident,
-                fallback_device_name=str(raw_device_name or "").strip(),
-            )
-            if incident is not None:
-                sheet_incidents[incident["deviceName"]] = incident
-
-    checked_at = now.isoformat()
-    next_incidents: dict[str, dict[str, Any]] = {}
-    tracked_device_names = set(current_incidents) | pending_device_names
-    for device_name in tracked_device_names:
-        sheet_incident = sheet_incidents.get(device_name)
-        sheet_status = (
-            str(sheet_incident.get("status") or "").strip()
-            if isinstance(sheet_incident, dict)
-            else ""
-        )
-        if sheet_status in _CAPTUREBOARD_INCIDENT_OPEN_STATUSES:
-            previous = current_incidents.get(device_name, {})
-            next_incidents[device_name] = {
-                **previous,
-                "deviceName": device_name,
-                "status": sheet_status,
-                "slackPermalink": str(
-                    sheet_incident.get("slackPermalink")
-                    or previous.get("slackPermalink")
-                    or ""
-                ).strip(),
-                "rowNumber": sheet_incident.get("rowNumber"),
-                "openedAt": str(previous.get("openedAt") or checked_at),
-                "lastSheetCheckedAt": checked_at,
-            }
-            # Sheet 처리 상태는 캡처보드 중복 억제에만 쓰고 녹화 Slack 스레드는 건드리지 않는다.
-    return {
-        **state,
-        "captureboardIncidents": next_incidents,
-        "captureboardIncidentsLastSheetCheckedAt": checked_at,
-    }
-
-
 def _mark_captureboard_incident_open(
     state: dict[str, Any],
     event: dict[str, Any],
@@ -676,8 +569,34 @@ def _mark_captureboard_incident_open(
         "lastSuppressedCode": "",
         "suppressedCount": 0,
     }
-    # Sheet 처리 상태와 Slack 녹화 스레드 상태를 함께 보존해 후속 정지 이벤트를 댓글로 잇는다.
+    # Slack 성공을 incident 시작 정본으로 남기고 Sheet는 별도 운영
+    # projection으로만 쓴다.
     return {**state, "captureboardIncidents": incidents}
+
+
+def _captureboard_incident_is_within_quiet_window(
+    incident: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    # 반복 이벤트마다 lastSuppressedAt을 갱신해 마지막 이상 이후 설정된
+    # quiet window를 새 incident 경계로 쓴다.
+    last_activity_at = _parse_device_notification_datetime(
+        incident.get("lastSuppressedAt") or incident.get("openedAt")
+    )
+    if last_activity_at is None:
+        # 이전 상태에 기준 시각이 없으면 영구 억제하지 않고
+        # 새 루트 알림을 허용한다.
+        return False
+    quiet_seconds = max(
+        1,
+        int(cs.DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC),
+    )
+    actual_now = _coerce_device_notification_alert_now(now).astimezone(
+        timezone.utc
+    )
+    age = actual_now - last_activity_at
+    return timedelta(0) <= age < timedelta(seconds=quiet_seconds)
 
 
 def _suppress_open_captureboard_incident_event(
@@ -695,7 +614,13 @@ def _suppress_open_captureboard_incident_event(
         return None
     incidents = dict(state.get("captureboardIncidents") or {})
     incident = incidents.get(device_name)
-    if not isinstance(incident, dict):
+    if (
+        not isinstance(incident, dict)
+        or not _captureboard_incident_is_within_quiet_window(
+            incident,
+            now=now,
+        )
+    ):
         return None
     incidents[device_name] = {
         **incident,
@@ -1416,7 +1341,7 @@ def _process_recording_stall_event(
         )
         return None
 
-    sheet_recorded = _record_device_notification_sheet_alert_best_effort(
+    _record_device_notification_sheet_alert_best_effort(
         alert_summary,
         event,
         fallback_detected_at=now,
@@ -1439,14 +1364,14 @@ def _process_recording_stall_event(
         "slackPermalink": str(delivery.get("permalink") or "").strip(),
     }
     next_state = {**state, "recordingStallIncidents": incidents}
-    if sheet_recorded:
-        # Sheet 처리 행을 추적하되 후속 녹화 이벤트의 Slack thread_ts는 별도로 보존한다.
-        next_state = _mark_captureboard_incident_open(
-            next_state,
-            event,
-            delivery,
-            now=now,
-        )
+    # Sheet 기록 성공과 무관하게 전송된 Slack 루트를 local 롤백 incident
+    # 정본으로 보존한다.
+    next_state = _mark_captureboard_incident_open(
+        next_state,
+        event,
+        delivery,
+        now=now,
+    )
     return next_state, True, delivery
 
 
@@ -1461,11 +1386,6 @@ def _deliver_pending_device_notification_alerts(
     auto_sms_sender: _DeviceNotificationAutoSmsSender | None = None,
 ) -> tuple[dict[str, Any], int]:
     next_state = _normalize_device_notification_alert_state(state)
-    next_state = _refresh_captureboard_incidents_from_sheet(
-        next_state,
-        now=now,
-        logger=logger,
-    )
     sent_count = 0
 
     while next_state["pendingEvents"]:
@@ -1524,7 +1444,7 @@ def _deliver_pending_device_notification_alerts(
                     code,
                 )
                 break
-            sheet_recorded = _record_device_notification_sheet_alert_best_effort(
+            _record_device_notification_sheet_alert_best_effort(
                 alert_summary,
                 event,
                 fallback_detected_at=now,
@@ -1545,14 +1465,14 @@ def _deliver_pending_device_notification_alerts(
                 **next_state,
                 "recentCaptureboardAlerts": recent_captureboard_alerts,
             }
-            if sheet_recorded:
-                # append 직후에는 다시 Sheet를 읽지 않고도 같은 batch 후속 이벤트를 억제한다.
-                next_state = _mark_captureboard_incident_open(
-                    next_state,
-                    event,
-                    delivery,
-                    now=now,
-                )
+            # Slack 전송 성공만 incident를 열며 Sheet blank/오류가 중복
+            # 억제를 해제하지 않는다.
+            next_state = _mark_captureboard_incident_open(
+                next_state,
+                event,
+                delivery,
+                now=now,
+            )
         elif code == _RECORDING_CRITICALLY_STALLED:
             processed = _process_recording_stall_event(
                 client,

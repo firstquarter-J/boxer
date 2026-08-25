@@ -335,6 +335,19 @@ DEVICE_NOTIFICATION_ALERT_CHANNEL_ID = (
 DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC = int(
     os.getenv("DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC", "30")
 )
+# 캡처보드 반복 이벤트는 Sheet 처리 상태와 분리된 incident로 묶고,
+# 마지막 이벤트 뒤 이 시간 동안만 같은 장애로 판단한다.
+DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC = int(
+    os.getenv(
+        "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC",
+        "600",
+    )
+)
+if not 60 <= DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC <= 86_400:
+    raise ValueError(
+        "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC must be "
+        "between 60 and 86400"
+    )
 DEVICE_NOTIFICATION_ALERT_STATE_PATH = os.getenv(
     "DEVICE_NOTIFICATION_ALERT_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "device_notification_alert_state.json"),

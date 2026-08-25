@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from typing import Callable
@@ -385,6 +385,32 @@ def test_notification_delivery_keeps_legacy_event_message_and_merge_error() -> N
     assert "ffmpeg exit 17" in merge_issue
 
 
+def test_merge_error_ack_does_not_open_captureboard_incident() -> None:
+    event = {
+        **_captureboard_event(15),
+        "code": "segmented_recordings_merge_error",
+        "message": "녹화 병합 실패",
+        "details": {"voiceType": "n", "segmentCount": 3},
+    }
+    deps, _ = _deps(next_result=(15, event), sheet_rows=1)
+    handler = DeviceNotificationAlertCycleHandler(deps)
+    result = handler.run(_request(cursor=_initialized_cursor(last_seen_id=14)))
+
+    acknowledged = handler.acknowledge(
+        _request(cursor=dict(result.cursor)),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=result.deliveries[0].delivery_id,
+                status="sent",
+                external_message_id="1710000000.015",
+                delivered_at=_NOW,
+            ),
+        ),
+    )
+
+    assert acknowledged["captureboardIncidents"] == {}
+
+
 def test_sms_claim_uses_provider_immediate_server_clock() -> None:
     provider_now = _NOW + timedelta(minutes=5)
     deps, mocks = _deps(
@@ -424,6 +450,7 @@ def test_sent_receipt_appends_sheet_then_closes_delivery_context() -> None:
         ),
     )
     assert delivery_id in failed_cursor["pendingDeliveryContexts"]
+    assert failed_cursor["captureboardIncidents"] == {}
     mocks["append_sheet"].assert_not_called()
 
     acknowledged = handler.acknowledge(
@@ -447,7 +474,14 @@ def test_sent_receipt_appends_sheet_then_closes_delivery_context() -> None:
     assert acknowledged["captureboardIncidents"]["MB2-C00992"][
         "status"
     ] == "대기"
+    incident = acknowledged["captureboardIncidents"]["MB2-C00992"]
+    assert incident["deviceSeq"] == 992
+    assert incident["openedAt"] == (
+        _NOW + timedelta(seconds=2)
+    ).astimezone(timezone.utc).isoformat()
+    assert incident["lastSuppressedAt"] == ""
     mocks["append_sheet"].assert_called_once()
+    mocks["load_sheet"].assert_not_called()
     sheet_item = mocks["append_sheet"].call_args.args[0][0]
     assert sheet_item["smsGroupId"] == "group-private-marker"
     assert sheet_item["smsMessageId"] == "message-private-marker"
@@ -484,6 +518,9 @@ def test_recording_stall_followup_becomes_channel_neutral_thread_delivery() -> N
             ),
         ),
     )
+    assert first_cursor["captureboardIncidents"]["MB2-C00992"][
+        "openedCode"
+    ] == "recording_critically_stalled"
 
     second_event = _recording_stall_event(
         32,
@@ -515,7 +552,7 @@ def test_recording_stall_followup_becomes_channel_neutral_thread_delivery() -> N
     second_mocks["send_sms"].assert_not_called()
 
 
-def test_open_sheet_incident_suppresses_duplicate_without_sms() -> None:
+def test_sheet_snapshot_alone_does_not_suppress_captureboard_event() -> None:
     event = _captureboard_event(40)
     deps, mocks = _deps(
         next_result=(40, event),
@@ -534,12 +571,227 @@ def test_open_sheet_incident_suppresses_duplicate_without_sms() -> None:
         _request(cursor=_initialized_cursor(last_seen_id=39))
     )
 
-    assert result.outcome == "no_change"
-    assert result.deliveries == ()
-    assert result.cursor["captureboardIncidents"]["MB2-C00992"][
-        "suppressedCount"
-    ] == 1
-    mocks["send_sms"].assert_not_called()
+    assert result.outcome == "completed"
+    assert len(result.deliveries) == 1
+    mocks["send_sms"].assert_called_once()
+    mocks["load_sheet"].assert_not_called()
+
+
+def test_sent_incident_suppresses_repeat_after_cursor_restart_without_sheet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC",
+        600,
+    )
+    first_deps, first_mocks = _deps(
+        next_result=(40, _captureboard_event(40)),
+        sheet_incidents={},
+        sheet_rows=None,
+    )
+    first_handler = DeviceNotificationAlertCycleHandler(first_deps)
+    first_result = first_handler.run(
+        _request(cursor=_initialized_cursor(last_seen_id=39))
+    )
+    first_delivery = first_result.deliveries[0]
+    acknowledged = first_handler.acknowledge(
+        _request(cursor=dict(first_result.cursor)),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=first_delivery.delivery_id,
+                status="sent",
+                external_message_id="1710000000.040",
+                permalink="https://lifexio.slack.com/archives/C1/p40",
+                delivered_at=_NOW,
+            ),
+        ),
+    )
+
+    # API 재시작 때와 같은 JSON round-trip 뒤에도 ACK로 연 incident가 정본이다.
+    restarted_cursor = json.loads(json.dumps(acknowledged))
+    second_deps, second_mocks = _deps(
+        next_result=(41, _captureboard_event(41)),
+        sheet_incidents={},
+    )
+    second_mocks["load_sheet"].side_effect = RuntimeError("Sheets down")
+    second_result = DeviceNotificationAlertCycleHandler(second_deps).run(
+        _request(
+            cursor=restarted_cursor,
+            scheduled_at=_NOW + timedelta(seconds=30),
+        )
+    )
+
+    assert acknowledged["captureboardIncidents"]["MB2-C00992"][
+        "openedNotificationId"
+    ] == 40
+    assert first_mocks["append_sheet"].called
+    assert second_result.outcome == "no_change"
+    assert second_result.deliveries == ()
+    assert second_result.cursor["lastSeenId"] == 41
+    incident = second_result.cursor["captureboardIncidents"]["MB2-C00992"]
+    assert incident["suppressedCount"] == 1
+    assert incident["lastSuppressedNotificationId"] == 41
+    assert incident["lastSuppressedAt"] == (
+        _NOW + timedelta(seconds=30)
+    ).isoformat()
+    second_mocks["send_sms"].assert_not_called()
+    second_mocks["load_sheet"].assert_not_called()
+
+
+def test_captureboard_flapping_sequence_stays_in_one_sliding_incident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC",
+        600,
+    )
+    event_times = (
+        datetime(2026, 8, 25, 15, 55, 18, tzinfo=_KST),
+        datetime(2026, 8, 25, 15, 55, 48, tzinfo=_KST),
+        datetime(2026, 8, 25, 16, 0, 46, tzinfo=_KST),
+        datetime(2026, 8, 25, 16, 2, 16, tzinfo=_KST),
+    )
+    deps, mocks = _deps(sheet_rows=None)
+    mocks["next"].side_effect = [
+        (notification_id, _captureboard_event(notification_id))
+        for notification_id in range(40, 44)
+    ]
+    handler = DeviceNotificationAlertCycleHandler(deps)
+
+    first = handler.run(
+        _request(
+            cursor=_initialized_cursor(last_seen_id=39),
+            scheduled_at=event_times[0],
+        )
+    )
+    cursor = handler.acknowledge(
+        _request(cursor=dict(first.cursor), scheduled_at=event_times[0]),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=first.deliveries[0].delivery_id,
+                status="sent",
+                external_message_id="1710000000.040",
+                delivered_at=event_times[0],
+            ),
+        ),
+    )
+
+    # 30초, 4분 58초, 1분 30초 간격의 물리 재끊김은 마지막 발생 기준
+    # 10분 window를 계속 전진시키며 같은 incident 하나로 묶는다.
+    for event_time in event_times[1:]:
+        repeated = handler.run(
+            _request(cursor=dict(cursor), scheduled_at=event_time)
+        )
+        assert repeated.deliveries == ()
+        cursor = dict(repeated.cursor)
+
+    incident = cursor["captureboardIncidents"]["MB2-C00992"]
+    assert incident["openedNotificationId"] == 40
+    assert incident["lastSuppressedNotificationId"] == 43
+    assert incident["lastSuppressedAt"] == event_times[-1].isoformat()
+    assert incident["suppressedCount"] == 3
+    assert mocks["send_sms"].call_count == 1
+    assert mocks["append_sheet"].call_count == 1
+    mocks["load_sheet"].assert_not_called()
+
+
+def test_captureboard_quiet_window_slides_and_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC",
+        600,
+    )
+    cursor = {
+        **_initialized_cursor(last_seen_id=49),
+        "captureboardIncidents": {
+            "MB2-C00992": {
+                "deviceName": "MB2-C00992",
+                "status": "대기",
+                "openedNotificationId": 40,
+                "openedCode": "captureboard_connection_error",
+                "openedAt": (_NOW - timedelta(minutes=30)).isoformat(),
+                "lastSuppressedAt": (_NOW - timedelta(minutes=9)).isoformat(),
+                "suppressedCount": 2,
+            }
+        },
+    }
+    active_deps, active_mocks = _deps(
+        next_result=(50, _captureboard_event(50)),
+    )
+
+    active_result = DeviceNotificationAlertCycleHandler(active_deps).run(
+        _request(cursor=cursor, scheduled_at=_NOW)
+    )
+
+    assert active_result.deliveries == ()
+    active_incident = active_result.cursor["captureboardIncidents"][
+        "MB2-C00992"
+    ]
+    assert active_incident["suppressedCount"] == 3
+    assert active_incident["lastSuppressedAt"] == _NOW.isoformat()
+    active_mocks["send_sms"].assert_not_called()
+
+    expired_deps, expired_mocks = _deps(
+        next_result=(51, _captureboard_event(51)),
+    )
+    expired_result = DeviceNotificationAlertCycleHandler(expired_deps).run(
+        _request(
+            cursor=dict(active_result.cursor),
+            scheduled_at=_NOW + timedelta(minutes=10),
+        )
+    )
+
+    # 마지막 반복 뒤 10분 동안 조용했으면 같은 장비라도 새 루트를 만든다.
+    assert len(expired_result.deliveries) == 1
+    expired_mocks["send_sms"].assert_called_once()
+    expired_mocks["load_sheet"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("opened_at", "last_suppressed_at"),
+    (
+        ("not-a-timestamp", ""),
+        (_NOW.isoformat(), "not-a-timestamp"),
+        ((_NOW + timedelta(seconds=1)).isoformat(), ""),
+    ),
+)
+def test_invalid_or_future_incident_timestamp_allows_new_root(
+    monkeypatch: pytest.MonkeyPatch,
+    opened_at: str,
+    last_suppressed_at: str,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC",
+        600,
+    )
+    cursor = {
+        **_initialized_cursor(last_seen_id=59),
+        "captureboardIncidents": {
+            "MB2-C00992": {
+                "deviceName": "MB2-C00992",
+                "status": "대기",
+                "openedNotificationId": 40,
+                "openedCode": "captureboard_connection_error",
+                "openedAt": opened_at,
+                "lastSuppressedAt": last_suppressed_at,
+                "suppressedCount": 1,
+            }
+        },
+    }
+    deps, mocks = _deps(next_result=(60, _captureboard_event(60)))
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=cursor, scheduled_at=_NOW)
+    )
+
+    assert len(result.deliveries) == 1
+    mocks["send_sms"].assert_called_once()
+    mocks["load_sheet"].assert_not_called()
 
 
 def test_provider_exception_is_not_retried_and_is_marked_uncertain() -> None:
@@ -654,6 +906,9 @@ def test_sheet_append_failure_moves_to_non_blocking_outbox_repair_marker() -> No
         "outbox_pending"
     )
     assert acknowledged["lastSheetWriteStatus"] == "repair_pending"
+    assert acknowledged["captureboardIncidents"]["MB2-C00992"][
+        "openedNotificationId"
+    ] == 52
     assert mocks["remember_sms"].call_count == 2
 
     mocks["next"].return_value = (52, None)

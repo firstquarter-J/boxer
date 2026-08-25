@@ -16,6 +16,7 @@ from boxer_company.device_health_monitor_cycle import (
 )
 from boxer_company.device_health_state_bundle import (
     build_device_notification_api_cursor,
+    build_device_notification_legacy_state,
     build_device_health_rollback_bundle,
     create_protected_json_file,
     DeviceHealthStateBundleError,
@@ -152,6 +153,42 @@ def _notification_export_args(tmp_path: Path) -> dict[str, object]:
 
 def _rollback_notification_cursor() -> dict[str, object]:
     return build_device_notification_api_cursor(_legacy_notification_state())
+
+
+def test_captureboard_quiet_incident_roundtrip_preserves_activity_state() -> None:
+    legacy_state = _legacy_notification_state()
+    legacy_state["lastSeenId"] = 15
+    incident = legacy_state["captureboardIncidents"]["MB2-C1"]
+    # quiet window의 재시작 정본이 forward/rollback 중 초기값으로
+    # 되돌아가지 않게 한다.
+    incident.update(
+        {
+            "slackMessageTs": "1710000000.000150",
+            "slackPermalink": "https://example.slack.com/archives/C1/p150",
+            "lastSuppressedAt": "2026-08-20T09:05:00+09:00",
+            "lastSuppressedNotificationId": 15,
+            "lastSuppressedCode": "captureboard_connection_error",
+            "suppressedCount": 3,
+        }
+    )
+
+    api_cursor = build_device_notification_api_cursor(legacy_state)
+    api_incident = api_cursor["captureboardIncidents"]["MB2-C1"]
+    rollback_state = build_device_notification_legacy_state(api_cursor)
+    rollback_incident = rollback_state["captureboardIncidents"]["MB2-C1"]
+
+    assert api_incident["rootExternalMessageId"] == incident["slackMessageTs"]
+    assert api_incident["rootPermalink"] == incident["slackPermalink"]
+    for field in (
+        "lastSuppressedAt",
+        "lastSuppressedNotificationId",
+        "lastSuppressedCode",
+        "suppressedCount",
+    ):
+        assert api_incident[field] == incident[field]
+        assert rollback_incident[field] == incident[field]
+    assert rollback_incident["slackMessageTs"] == incident["slackMessageTs"]
+    assert rollback_incident["slackPermalink"] == incident["slackPermalink"]
 
 
 def _initialize_sms_recovery_state(
