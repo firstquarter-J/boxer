@@ -147,12 +147,12 @@ def _health_deps(
                 "audio": "정상",
                 "pm2": "정상",
                 "storage": "정상",
-                "captureboard": "이상",
-                "led": "정상",
+                "captureboard": "정상",
+                "led": "이상",
             },
             "deviceVersion": "2.11.308",
-            "voiceType": "n",
-            "issue": "캡처보드 USB 연결을 확인할 수 없어",
+            "voiceType": "",
+            "issue": "LED USB 장치를 찾지 못했어",
             "sshReady": True,
             "sshReason": "ready",
         }
@@ -167,7 +167,14 @@ def _health_deps(
                     "status": "RUNNING",
                     "captureBoardStatus": "missing",
                     "captureBoardType": "YUH01",
-                    "acme": {"usbList": [{"name": "MMTLED"}]},
+                    "acme": {
+                        "usbList": [
+                            {
+                                "type": "CAPTUREBOARD",
+                                "deviceId": "1164:f57a",
+                            }
+                        ]
+                    },
                 },
                 "agentState": {"isConnected": True},
             }
@@ -215,7 +222,7 @@ def _notification_handler(
 
 
 @pytest.mark.parametrize("concurrent", [False, True])
-def test_health_and_notification_share_one_provider_claim(
+def test_led_health_and_captureboard_notification_use_independent_provider_claims(
     tmp_path: Any,
     concurrent: bool,
 ) -> None:
@@ -227,12 +234,13 @@ def test_health_and_notification_share_one_provider_claim(
         del logger
         with provider_lock:
             provider_calls.append(dict(payload))
+            call_number = len(provider_calls)
         return {
             "status": "sent",
             "ok": True,
             "provider": "solapi",
-            "groupId": "group-shared",
-            "messageId": "message-shared",
+            "groupId": f"group-{call_number}",
+            "messageId": f"message-{call_number}",
             "smsDeliveryStatus": "accepted",
         }
 
@@ -298,7 +306,9 @@ def test_health_and_notification_share_one_provider_claim(
         health_result = run_health()
         notification_result = run_notification()
 
-    assert len(provider_calls) == 1
+    # LED와 장비 캡처보드 이벤트는 서로 다른 장애 family라 각각 한 번만
+    # provider claim을 잡고 독립적으로 발송한다.
+    assert len(provider_calls) == 2
     assert len(health_result.deliveries) == 1
     assert len(notification_result.deliveries) == 1
     serialized_deliveries = json.dumps(
@@ -311,9 +321,10 @@ def test_health_and_notification_share_one_provider_claim(
     # legacy Slack 자동발송 확인 action은 대상·본문을 유지한다.
     assert "01012345678" in serialized_deliveries
     assert "초음파 진단기와 캡처보드" in serialized_deliveries
-    for private_value in ("group-shared", "message-shared", "solapi"):
+    assert "LED USB 케이블" in serialized_deliveries
+    for private_value in ("group-1", "group-2", "message-1", "message-2", "solapi"):
         assert private_value not in serialized_deliveries
-    assert len(_load_sms_delivery_outbox_items(outbox_path=outbox_path)) == 1
+    assert len(_load_sms_delivery_outbox_items(outbox_path=outbox_path)) == 2
 
 
 def test_notification_sheet_timeout_keeps_durable_receipt_for_repair(

@@ -97,6 +97,23 @@ def _exact_target() -> dict[str, object]:
 
 
 class DeviceHealthAlertActionRouteTests(unittest.TestCase):
+    def test_sms_guide_uses_led_category_without_issue_keyword(self) -> None:
+        guide = action_route._build_device_health_alert_sms_guide(
+            action_route.DeviceHealthAlertActionTarget(
+                hospital_seq=31,
+                hospital_name="분당제일병원",
+                room_name="2진료실",
+                device_name="MB2-C00419",
+                issue="연결 확인 필요",
+                alert_category="led",
+                problem_components=(),
+            )
+        )
+
+        # 자유 문구가 바뀌어도 semantic category가 LED 템플릿 정본이다.
+        self.assertTrue(guide["supported"])
+        self.assertEqual(guide["templateId"], "led_disconnected")
+
     def test_matcher_uses_typed_action_instead_of_question(self) -> None:
         for action_name, expected_route in (
             (DEVICE_HEALTH_ALERT_SMS_ACTION, DEVICE_HEALTH_ALERT_SMS_ROUTE),

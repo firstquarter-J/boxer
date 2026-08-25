@@ -39,18 +39,13 @@ from boxer_company.device_health_event_log import (
     append_device_health_monitor_event,
     start_device_health_monitor_event_archive_once,
 )
+from boxer_company.device_led_health import redis_device_led_usb_presence
 from boxer_company.redis_device_state import DeviceStateRedisClient
 from boxer_company.routers.device_status_probe import (
-    _build_trashcan_storage_summary_from_checks,
     _collect_runtime_checks,
     _parse_device_path_list,
-    _parse_pm2_processes,
-    _parse_usb_devices,
-    _parse_voice_config,
-    _summarize_audio_path_probe,
-    _summarize_captureboard_probe,
+    _parse_usb_devices_from_check,
     _summarize_led_probe,
-    _summarize_pm2_probe,
 )
 from boxer_company.sms_delivery import (
     _SMS_DELIVERY_ACCEPTED,
@@ -93,7 +88,6 @@ _COMPONENT_CATEGORIES = {
 }
 _CAPTUREBOARD_OPEN_STATUSES = frozenset({"대기", "처리중", "진행중"})
 _STANDBY_REDIS_STATUSES = frozenset({"NOSESS", "STANDBY"})
-_SUPPORTED_VOICE_TYPES = frozenset({"n", "s", "ln", "ls"})
 
 
 def _utc_now() -> datetime:
@@ -1069,6 +1063,12 @@ def _result_from_redis(
     requires_ssh = _redis_requires_ssh_verification(device_state)
     if requires_ssh:
         result = _base_device_result(device, overall_label="확인 필요")
+        # 기존 5개 component shape는 Slack/Sheets/SMS 계약을 위해 유지하되
+        # Redis 후보는 LED 하나에만 표시한다.
+        result["componentLabels"] = {
+            key: "확인 필요" if key == "led" else "정상"
+            for key in _COMPONENT_KEYS
+        }
         result["_eventPayload"] = _redis_device_event_payload(
             result,
             device_state=device_state,
@@ -1135,54 +1135,9 @@ def _is_redis_state_stale(state: Mapping[str, Any], *, now: datetime) -> bool:
 def _redis_requires_ssh_verification(
     device_state: Mapping[str, Any] | None,
 ) -> bool:
-    payload = device_state or {}
-    usb_items = _redis_usb_items(payload)
-    usb_text = " ".join(
-        " ".join(_text(item.get(key)) for key in ("name", "alias", "type", "deviceId"))
-        for item in usb_items
-    ).lower()
-    capture_status = _text(payload.get("captureBoardStatus")).lower()
-    capture_type = _text(payload.get("captureBoardType"))
-    capture_missing = bool(
-        capture_status in {"false", "none", "missing"}
-        or "disconnect" in capture_status
-        or "offline" in capture_status
-        or (
-            usb_items
-            and capture_type
-            and not any(
-                marker in usb_text
-                for marker in ("captureboard", "capture", "ls_hdmi", "easycap")
-            )
-        )
-    )
-    led_missing = bool(
-        usb_items
-        and not any(marker in usb_text for marker in ("led", "mmtled"))
-    )
-    disk_percent = _redis_disk_percent(payload)
-    return capture_missing or led_missing or (
-        disk_percent is not None and disk_percent >= 90.0
-    )
-
-
-def _redis_usb_items(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    acme = state.get("acme") if isinstance(state.get("acme"), Mapping) else {}
-    values = acme.get("usbList") if isinstance(acme, Mapping) else []
-    return [item for item in values if isinstance(item, Mapping)] if isinstance(values, list) else []
-
-
-def _redis_disk_percent(state: Mapping[str, Any]) -> float | None:
-    candidates = [state.get("diskUsage")]
-    acme = state.get("acme") if isinstance(state.get("acme"), Mapping) else {}
-    system = acme.get("systemInfo") if isinstance(acme, Mapping) and isinstance(acme.get("systemInfo"), Mapping) else {}
-    candidates.append(system.get("hddUsage") if isinstance(system, Mapping) else None)
-    for value in candidates:
-        try:
-            return float(str(value).strip().replace("%", ""))
-        except (TypeError, ValueError):
-            continue
-    return None
+    # 장비가 자체 발행하는 캡처보드/녹화 이벤트와 중복되지 않게 주기
+    # 감시는 자체 이벤트가 없는 LED 연결 누락만 SSH 2차 확인 대상으로 삼는다.
+    return redis_device_led_usb_presence(device_state) is False
 
 
 def _redis_device_event_payload(
@@ -1206,7 +1161,7 @@ def _redis_device_event_payload(
         "statusText": _text(result.get("statusText")),
         "error": "",
         "source": "redis_device_state",
-        "component": "availability" if availability_reasons else "all",
+        "component": "availability" if availability_reasons else "led",
         "componentLabels": dict(result.get("componentLabels") or {}),
         "redis": {
             "checkedAt": now.isoformat(),
@@ -1233,20 +1188,16 @@ def _redis_device_event_payload(
         },
         "probe": {
             "captureboard": {
-                "status": "warning" if capture_status else "",
-                "label": (
-                    "확인 필요"
-                    if _text(
-                        (result.get("componentLabels") or {}).get(
-                            "captureboard"
-                        )
-                    )
-                    == "확인 필요"
-                    else ""
-                ),
-                "summary": "",
-                "evidence": "",
-                "overviewDetail": "",
+                # legacy event schema는 유지하지만 LED cycle에서 캡처보드
+                # probe 상태를 새 이상 신호처럼 기록하지 않는다.
+                key: ""
+                for key in (
+                    "status",
+                    "label",
+                    "summary",
+                    "evidence",
+                    "overviewDetail",
+                )
             },
             "lsusbOutput": "",
             "videoDevicesOutput": "",
@@ -1265,7 +1216,7 @@ def _verify_device_health_runtime(
         raise ValueError("device name is missing")
     evidence, device_info, checks = _collect_runtime_checks(
         device_name,
-        "all",
+        "led",
         # 자동 cycle도 API request 경계 안에서는 poll 재전송과 stale
         # tunnel 강제 재개방 없이 최초 상태/open 한 흐름만 사용한다.
         resend_ssh_open=False,
@@ -1286,51 +1237,38 @@ def _verify_device_health_runtime(
         )
         return result
 
+    # 기존 delivery/status 계약의 5개 component shape는 보존하지만 실제
+    # SSH 명령과 이상 판정은 LED에만 한정한다.
     overview = {
-        "audio": _summarize_audio_path_probe(checks),
-        "pm2": _summarize_pm2_probe(
-            _parse_pm2_processes(
-                _text((checks.get("pm2_jlist") or {}).get("output"))
-            )
-        ),
-        "storage": _build_trashcan_storage_summary_from_checks(
-            checks,
-            cleanup_threshold_percent=(
-                company_settings.DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT
-            ),
-            cleanup_age_days=company_settings.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS,
-        ),
+        key: {
+            "status": "pass",
+            "label": "정상",
+            "summary": "LED 전용 주기 감시 범위에서 제외했어",
+            "monitored": False,
+        }
+        for key in _COMPONENT_KEYS
+        if key != "led"
     }
-    usb_devices = _parse_usb_devices(
-        _text((checks.get("lsusb") or {}).get("output"))
+    usb_devices = _parse_usb_devices_from_check(
+        checks.get("lsusb") if isinstance(checks.get("lsusb"), dict) else None
     )
-    overview["captureboard"] = _summarize_captureboard_probe(
-        device_info=dict(device_info),
-        usb_devices=usb_devices,
-        video_devices=_parse_device_path_list(
-            _text((checks.get("video_devices") or {}).get("output")),
-            missing_token="no_video_device",
+    overview["led"] = {
+        **_summarize_led_probe(
+            usb_devices=usb_devices,
+            serial_devices=_parse_device_path_list(
+                _text((checks.get("serial_devices") or {}).get("output")),
+                missing_token="no_serial_device",
+            ),
         ),
-        v4l2_devices=_text((checks.get("v4l2_devices") or {}).get("output")),
-    )
-    overview["led"] = _summarize_led_probe(
-        usb_devices=usb_devices,
-        serial_devices=_parse_device_path_list(
-            _text((checks.get("serial_devices") or {}).get("output")),
-            missing_token="no_serial_device",
-        ),
-    )
-    voice_config = _parse_voice_config(
-        _text((checks.get("voice_config") or {}).get("output"))
-    )
-    voice_type = _text(voice_config.get("voiceType")).lower()
+        "monitored": True,
+    }
     status_payload = {
         "route": "device_health_monitor",
         "source": "mda_graphql+ssh_linux_commands",
         "device": {
             "deviceName": _text(device_info.get("deviceName")) or device_name,
             "version": _text(device_info.get("version")),
-            "voiceType": voice_type if voice_type in _SUPPORTED_VOICE_TYPES else "",
+            "voiceType": "",
         },
         "ssh": {"ready": True, "reason": "ready"},
         "overview": overview,
@@ -1376,11 +1314,6 @@ def _runtime_device_event_payload(
 
     ssh = evidence.get("ssh") if isinstance(evidence.get("ssh"), Mapping) else {}
     close = ssh.get("close") if isinstance(ssh.get("close"), Mapping) else {}
-    capture = (
-        overview.get("captureboard")
-        if isinstance(overview.get("captureboard"), Mapping)
-        else {}
-    )
     return {
         "hospitalSeq": _positive_int(result.get("hospitalSeq")),
         "hospitalName": _text(result.get("hospitalName")) or "미확인",
@@ -1391,7 +1324,7 @@ def _runtime_device_event_payload(
         "statusText": _text(result.get("statusText")),
         "error": "",
         "source": "mda_graphql+ssh_linux_commands",
-        "component": "all",
+        "component": "led",
         "componentLabels": dict(result.get("componentLabels") or {}),
         "redis": {
             "checkedAt": "",
@@ -1417,7 +1350,7 @@ def _runtime_device_event_payload(
         },
         "probe": {
             "captureboard": {
-                key: _text(capture.get(key))
+                key: ""
                 for key in (
                     "status",
                     "label",
@@ -1435,6 +1368,9 @@ def _runtime_device_event_payload(
             "v4l2DevicesOutput": _text(
                 (checks.get("v4l2_devices") or {}).get("output")
             )[:1000],
+            "serialDevicesOutput": _text(
+                (checks.get("serial_devices") or {}).get("output")
+            )[:500],
         },
     }
 
@@ -1477,10 +1413,12 @@ def _collect_alert_items(
             if isinstance(result.get("componentLabels"), Mapping)
             else {}
         )
+        # verifier나 이전 state가 비정상 shape를 돌려도 이 주기 cycle에서
+        # 장비 자체 이벤트 영역의 알림을 다시 만들지 않는다.
+        if _text(component_labels.get("led")) != "이상":
+            continue
         components = [
-            _COMPONENT_LABELS[key]
-            for key in _COMPONENT_KEYS
-            if _text(component_labels.get(key)) == "이상"
+            _COMPONENT_LABELS["led"]
         ]
         issue = _text(result.get("issue")) or _text(result.get("priorityReason"))
         if not issue:
@@ -2131,7 +2069,7 @@ def _device_event_payload(result: Mapping[str, Any]) -> dict[str, Any]:
             if result.get("sshReady")
             else "redis_device_state"
         ),
-        "component": "all",
+        "component": "led",
         "componentLabels": dict(result.get("componentLabels") or {}),
         "redis": {"availabilityReasons": []},
         "ssh": {
@@ -2622,14 +2560,10 @@ def _alert_fingerprint(item: Mapping[str, Any]) -> str:
 
 
 def _required_confirmation_polls(item: Mapping[str, Any]) -> int:
-    components = set(item.get("problemComponents") or [])
-    issue = _text(item.get("issue"))
-    if components & {"캡처보드", "LED"}:
-        return 2
-    lowered = issue.lower()
-    if "캡처보드" in issue or "비디오 장치" in issue or "led" in lowered:
-        return 2
-    return 1
+    del item
+    # LED USB의 순간 재인식으로 알림이 생기지 않게 SSH에서도 두 poll
+    # 연속 실패했을 때만 신규 delivery를 만든다.
+    return 2
 
 
 def _suppressible_captureboard(item: Mapping[str, Any]) -> bool:

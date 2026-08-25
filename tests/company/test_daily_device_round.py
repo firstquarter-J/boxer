@@ -328,7 +328,7 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertEqual(payload["overview"]["storage"]["label"], "정상")
         self.assertEqual(
             payload["overview"]["led"]["summary"],
-            "이상 감지는 24시간 모니터가 별도로 담당해",
+            "장비 자체 이벤트와 LED 전용 감시가 이상 알림을 담당해",
         )
         self.assertEqual(priority["reason"], "업데이트/용량 정리 대상 없음")
 

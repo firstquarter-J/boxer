@@ -459,7 +459,7 @@ def _build_daily_device_round_skipped_component_summary() -> dict[str, str]:
     return {
         "status": "pass",
         "label": "정상",
-        "summary": "이상 감지는 24시간 모니터가 별도로 담당해",
+        "summary": "장비 자체 이벤트와 LED 전용 감시가 이상 알림을 담당해",
     }
 
 

@@ -24,6 +24,7 @@ from boxer_company.daily_device_round import (
     _coerce_int,
     _daily_device_round_status_label,
 )
+from boxer_company.device_led_health import redis_device_led_usb_presence
 from boxer_company.redis_device_state import DeviceStateRedisClient, DeviceStateRedisUnavailable
 from boxer_company.routers.device_voice_control import _dispatch_device_voice_guide
 from boxer_company.sms_delivery import (
@@ -41,16 +42,10 @@ from boxer_company.routers.device_file_probe import (
 )
 from boxer_company.routers.device_status_probe import (
     _PROBE_COMPONENT_COMMAND_KEYS,
-    _build_trashcan_storage_summary_from_checks,
     _parse_device_path_list,
-    _parse_pm2_processes,
-    _parse_usb_devices,
-    _parse_voice_config,
+    _parse_usb_devices_from_check,
     _run_status_probe_command,
-    _summarize_audio_path_probe,
-    _summarize_captureboard_probe,
     _summarize_led_probe,
-    _summarize_pm2_probe,
 )
 from boxer_company.routers.mda_graphql import (
     _close_mda_device_ssh,
@@ -954,7 +949,12 @@ def _build_device_health_monitor_sms_guide(item: dict[str, Any]) -> dict[str, An
             "message": message,
         }
 
-    if "led" in lowered or "엘이디" in issue:
+    if (
+        alert_category == "led"
+        or "LED" in problem_components
+        or "led" in lowered
+        or "엘이디" in issue
+    ):
         message = (
             f"{_DEVICE_HEALTH_MONITOR_SMS_GREETING}\n\n"
             f"{room} {device}에서 장비 상태 표시등 연결 확인이 필요합니다.\n\n"
@@ -1780,7 +1780,7 @@ def _device_health_monitor_auto_sms_incident_family(item: dict[str, Any]) -> str
             )
         )
     ):
-        # 실시간 녹화 정지와 상태 모니터의 캡처보드 이상을 같은 장애군으로 묶는다.
+        # 장비 캡처보드 이벤트와 실시간 녹화 정지를 같은 장애군으로 묶는다.
         return "captureboard_recording"
     if alert_category:
         return alert_category
@@ -3362,20 +3362,6 @@ def _build_device_health_monitor_redis_client() -> DeviceStateRedisClient:
     return DeviceStateRedisClient.from_settings()
 
 
-def _parse_device_health_monitor_percent(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value or "").strip().replace("%", "")
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
 def _parse_device_health_monitor_state_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -3455,54 +3441,8 @@ def _trim_device_health_monitor_redis_state(state_payload: dict[str, Any] | None
     return trimmed
 
 
-def _extract_device_health_monitor_usb_items(device_state: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not isinstance(device_state, dict):
-        return []
-    acme = device_state.get("acme") if isinstance(device_state.get("acme"), dict) else {}
-    usb_list = acme.get("usbList") if isinstance(acme.get("usbList"), list) else []
-    return [item for item in usb_list if isinstance(item, dict)]
-
-
-def _device_health_monitor_usb_text(item: dict[str, Any]) -> str:
-    return " ".join(
-        _display_value(item.get(key), default="")
-        for key in ("name", "alias", "type", "deviceId")
-    ).lower()
-
-
 def _device_health_monitor_has_led_usb(device_state: dict[str, Any] | None) -> bool | None:
-    usb_items = _extract_device_health_monitor_usb_items(device_state)
-    if not usb_items:
-        return None
-    return any(
-        "led" in _device_health_monitor_usb_text(item)
-        or "mmtled" in _device_health_monitor_usb_text(item)
-        for item in usb_items
-    )
-
-
-def _device_health_monitor_has_captureboard_usb(device_state: dict[str, Any] | None) -> bool | None:
-    usb_items = _extract_device_health_monitor_usb_items(device_state)
-    if not usb_items:
-        return None
-    return any(
-        "captureboard" in _device_health_monitor_usb_text(item)
-        or "capture" in _device_health_monitor_usb_text(item)
-        or "ls_hdmi" in _device_health_monitor_usb_text(item)
-        or "easycap" in _device_health_monitor_usb_text(item)
-        for item in usb_items
-    )
-
-
-def _extract_device_health_monitor_disk_percent(device_state: dict[str, Any] | None) -> float | None:
-    if not isinstance(device_state, dict):
-        return None
-    direct_percent = _parse_device_health_monitor_percent(device_state.get("diskUsage"))
-    if direct_percent is not None:
-        return direct_percent
-    acme = device_state.get("acme") if isinstance(device_state.get("acme"), dict) else {}
-    system_info = acme.get("systemInfo") if isinstance(acme.get("systemInfo"), dict) else {}
-    return _parse_device_health_monitor_percent(system_info.get("hddUsage"))
+    return redis_device_led_usb_presence(device_state)
 
 
 def _collect_device_health_monitor_redis_availability_reasons(
@@ -3551,40 +3491,11 @@ def _collect_device_health_monitor_redis_issues(
     agent_state: dict[str, Any] | None,
     now: datetime,
 ) -> list[dict[str, Any]]:
+    del device_context, agent_state, now
     issues: list[dict[str, Any]] = []
 
-    has_captureboard = _device_health_monitor_has_captureboard_usb(device_state)
-    capture_board_type = _display_value((device_state or {}).get("captureBoardType"), default="")
-    capture_status = _display_value((device_state or {}).get("captureBoardStatus"), default="").strip().lower()
-    if (
-        has_captureboard is not True
-        and (
-            capture_status in {"false", "none", "missing"}
-            or "disconnect" in capture_status
-            or "offline" in capture_status
-        )
-    ):
-        issues.append(
-            {
-                "component": "captureboard",
-                "status": "warning",
-                "label": "확인 필요",
-                "summary": "Redis 상태에서 캡처보드 연결 이상 후보가 감지됐어",
-                "requiresSshVerification": True,
-            }
-        )
-
-    if has_captureboard is False and capture_board_type:
-        issues.append(
-            {
-                "component": "captureboard",
-                "status": "warning",
-                "label": "확인 필요",
-                "summary": "Redis USB 목록에서 캡처보드를 찾지 못했어",
-                "requiresSshVerification": True,
-            }
-        )
-
+    # 캡처보드/녹화 이상은 장비 notification 이벤트가 정본이다. 주기
+    # monitor는 장비가 자체 발행하지 않는 LED 연결 누락만 선별한다.
     has_led = _device_health_monitor_has_led_usb(device_state)
     if has_led is False:
         issues.append(
@@ -3593,18 +3504,6 @@ def _collect_device_health_monitor_redis_issues(
                 "status": "warning",
                 "label": "확인 필요",
                 "summary": "Redis USB 목록에서 LED 장치를 찾지 못했어",
-                "requiresSshVerification": True,
-            }
-        )
-
-    disk_percent = _extract_device_health_monitor_disk_percent(device_state)
-    if disk_percent is not None and disk_percent >= 90:
-        issues.append(
-            {
-                "component": "storage",
-                "status": "warning",
-                "label": "확인 필요",
-                "summary": f"Redis 상태에서 디스크 사용량이 {disk_percent:.0f}%로 보고됐어",
                 "requiresSshVerification": True,
             }
         )
@@ -3622,10 +3521,10 @@ def _build_device_health_monitor_redis_status_payload(
 ) -> dict[str, Any]:
     device_name = _display_value(device_context.get("deviceName"), default="미확인")
     overview: dict[str, Any] = {
-        "audio": _build_device_health_monitor_pass_component(),
-        "pm2": _build_device_health_monitor_pass_component(),
-        "storage": _build_device_health_monitor_pass_component(),
-        "captureboard": _build_device_health_monitor_pass_component(),
+        "audio": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
+        "pm2": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
+        "storage": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
+        "captureboard": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
         "led": _build_device_health_monitor_pass_component(),
     }
     issues_by_component: dict[str, list[dict[str, Any]]] = {}
@@ -3668,7 +3567,7 @@ def _build_device_health_monitor_redis_status_payload(
         "source": "redis_device_state",
         "request": {
             "deviceName": device_name,
-            "component": "all",
+            "component": "led",
         },
         "device": device_payload,
         # Redis snapshot 자체가 판정 근거인 경우에는 SSH 불가를 점검 불가로 해석하지 않게 ready로 둔다.
@@ -4131,10 +4030,10 @@ def _build_device_health_monitor_status_payload(
 ) -> dict[str, Any]:
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     overview: dict[str, Any] = {
-        "audio": None,
-        "pm2": None,
-        "storage": None,
-        "captureboard": None,
+        "audio": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
+        "pm2": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
+        "storage": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
+        "captureboard": _build_device_health_monitor_pass_component("LED 전용 주기 감시 범위에서 제외했어"),
         "led": None,
     }
     device_payload = (
@@ -4144,27 +4043,10 @@ def _build_device_health_monitor_status_payload(
     )
 
     if ssh.get("ready"):
-        # 24시간 모니터는 앱 업데이트 상태 대신 장비 안의 Linux 명령 결과만 근거로 이상을 판단해.
-        overview["audio"] = _summarize_audio_path_probe(checks)
-        overview["pm2"] = _summarize_pm2_probe(
-            _parse_pm2_processes(_display_value((checks.get("pm2_jlist") or {}).get("output"), default=""))
-        )
-        overview["storage"] = _build_trashcan_storage_summary_from_checks(
-            checks,
-            cleanup_threshold_percent=cs.DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT,
-            cleanup_age_days=cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS,
-        )
-        usb_devices = _parse_usb_devices(
-            _display_value((checks.get("lsusb") or {}).get("output"), default="")
-        )
-        overview["captureboard"] = _summarize_captureboard_probe(
-            device_info=device_info,
-            usb_devices=usb_devices,
-            video_devices=_parse_device_path_list(
-                _display_value((checks.get("video_devices") or {}).get("output"), default=""),
-                missing_token="no_video_device",
-            ),
-            v4l2_devices=_display_value((checks.get("v4l2_devices") or {}).get("output"), default=""),
+        # local rollback도 remote와 같은 최소 lsusb/serial 근거만 사용해
+        # 캡처보드·오디오·PM2·저장공간 감지가 다시 살아나지 않게 한다.
+        usb_devices = _parse_usb_devices_from_check(
+            checks.get("lsusb")
         )
         overview["led"] = _summarize_led_probe(
             usb_devices=usb_devices,
@@ -4173,24 +4055,13 @@ def _build_device_health_monitor_status_payload(
                 missing_token="no_serial_device",
             ),
         )
-        # all 점검에서 이미 실행한 voice_config 결과를 재사용한다. 별도 SSH나
-        # MDA 호출 없이 네 지원 음성 타입만 Slack 알림 데이터에 전달한다.
-        voice_config = _parse_voice_config(
-            _display_value((checks.get("voice_config") or {}).get("output"), default="")
-        )
-        voice_type = _normalize_device_health_alert_voice_type(
-            voice_config.get("voiceType")
-        )
-        if voice_type:
-            device_payload["voiceType"] = voice_type
-
     return {
         **evidence_payload,
         "route": "device_health_monitor",
         "source": "mda_graphql+ssh_linux_commands",
         "request": {
             "deviceName": device_name,
-            "component": "all",
+            "component": "led",
         },
         "device": device_payload,
         "checks": checks,
@@ -4240,7 +4111,7 @@ def _build_device_health_monitor_result(
         "trashcanCleanup": {
             "status": "skipped",
             "label": "미실행",
-            "detail": "24시간 상태 모니터에서는 정리 작업을 실행하지 않아",
+            "detail": "LED 전용 주기 감시에서는 정리 작업을 실행하지 않아",
             "required": False,
             "executed": False,
         },
@@ -4270,7 +4141,7 @@ def _build_device_health_monitor_error_result(
         "source": "mda_graphql+ssh_linux_commands",
         "request": {
             "deviceName": _display_value(device_context.get("deviceName"), default=""),
-            "component": "all",
+            "component": "led",
         },
         "device": {
             "deviceName": _display_value(device_context.get("deviceName"), default="미확인"),
@@ -4316,7 +4187,7 @@ def _run_device_health_monitor_for_device(
 
     evidence_payload, device_info, checks = _collect_device_health_monitor_runtime_checks_once(
         device_name,
-        "all",
+        "led",
         now=now,
         ssh_tunnel_records=ssh_tunnel_records,
     )

@@ -70,11 +70,17 @@ def _redis_snapshot() -> dict[str, dict[str, Any]]:
                 "isConnected": True,
                 "updatedAt": _NOW.isoformat(),
                 "status": "RUNNING",
+                # 캡처보드 상태와 디스크 사용량은 더 이상 주기 SSH 후보가
+                # 아니며, LED가 없는 usbList만 후보를 만든다.
                 "captureBoardStatus": "missing",
                 "captureBoardType": "YUH01",
+                "diskUsage": "95%",
                 "acme": {
                     "usbList": [
-                        {"name": "MMTLED", "type": "serial"},
+                        {
+                            "ID": "1164:f57a",
+                            "Name": "YUH01 captureboard",
+                        },
                     ]
                 },
             },
@@ -95,12 +101,12 @@ def _verified_abnormal(
             "audio": "정상",
             "pm2": "정상",
             "storage": "정상",
-            "captureboard": "이상",
-            "led": "정상",
+            "captureboard": "정상",
+            "led": "이상",
         },
         "deviceVersion": "2.11.308",
-        "voiceType": "n",
-        "issue": "캡처보드 USB 연결을 확인할 수 없어",
+        "voiceType": "",
+        "issue": "LED USB 장치를 찾지 못했어",
         "sshReady": True,
         "sshReason": "ready",
     }
@@ -126,6 +132,91 @@ def test_api_and_legacy_collectors_share_canonical_hospital_fingerprint() -> Non
     assert cycle._alert_fingerprint(api_item) == (
         _build_device_health_monitor_alert_fingerprint(legacy_item)
     )
+
+
+@pytest.mark.parametrize(
+    "usb_item",
+    (
+        {"type": "LED", "deviceId": "1a86:7523", "name": "마미톡 LED"},
+        {"type": "LED", "deviceId": "0403:6001", "name": "FTDI LED"},
+        {"ID": "1A86:7523", "Name": "QinHeng CH340 serial converter"},
+        {"ID": "0403:6001", "Name": "FTDI FT232 serial converter"},
+    ),
+)
+def test_redis_led_match_accepts_normalized_and_raw_ch340_ftdi_payloads(
+    usb_item: Mapping[str, Any],
+) -> None:
+    state = {"acme": {"usbList": [dict(usb_item)]}}
+
+    assert cycle.redis_device_led_usb_presence(state) is True
+    assert cycle._redis_requires_ssh_verification(state) is False
+
+
+def test_non_led_health_signals_do_not_create_periodic_ssh_candidate() -> None:
+    state = {
+        "captureBoardStatus": "none",
+        "captureBoardType": "YUH01",
+        "diskUsage": "99%",
+        "acme": {
+            "usbList": [
+                {"type": "LED", "deviceId": "1a86:7523"},
+                {"type": "CAPTUREBOARD", "deviceId": "1164:f57a"},
+            ]
+        },
+    }
+
+    # 캡처보드와 저장공간은 장비 이벤트/별도 진단의 영역이고 LED가
+    # 보이면 주기 SSH를 열지 않는다.
+    assert cycle._redis_requires_ssh_verification(state) is False
+
+
+def test_explicit_led_missing_usb_list_requires_led_ssh_verification() -> None:
+    assert cycle._redis_requires_ssh_verification(
+        {"acme": {"usbList": []}}
+    ) is True
+    # usbList 필드 자체가 없으면 누락으로 단정하지 않는다.
+    assert cycle._redis_requires_ssh_verification({"acme": {}}) is False
+    assert cycle.redis_device_led_usb_presence(
+        {"acme": {"usbList": "invalid"}}
+    ) is None
+    # LED가 단어 일부일 뿐인 일반 제품명은 연결된 LED로 오인하지 않는다.
+    assert cycle.redis_device_led_usb_presence(
+        {
+            "acme": {
+                "usbList": [
+                    {"name": "OLED display"},
+                    {"name": "Ledger security key"},
+                ]
+            }
+        }
+    ) is False
+
+
+def test_first_led_poll_drops_legacy_captureboard_pending_without_delivery() -> None:
+    calls: dict[str, Any] = {}
+    legacy_capture_pending = {
+        "#20 테스트병원|2진료실|MB2-CYCLE|캡처보드 USB 연결을 확인할 수 없어": {
+            "firstSeenAt": (_NOW - timedelta(minutes=1)).isoformat(),
+            "lastSeenAt": (_NOW - timedelta(minutes=1)).isoformat(),
+            "count": 1,
+        }
+    }
+
+    result = run_device_health_monitor_cycle(
+        request_id="health:led-migration:1",
+        now=_NOW,
+        cursor=_seed_cursor(pending=legacy_capture_pending),
+        deps=_deps(calls=calls),
+    )
+
+    # 기존 capture pending은 현재 LED 결과와 매칭되지 않아 제거되고,
+    # 새 LED 후보만 첫 확인으로 남는다.
+    assert result.deliveries == ()
+    assert len(result.cursor["pendingAlertFingerprints"]) == 1
+    pending = next(iter(result.cursor["pendingAlertFingerprints"].values()))
+    assert pending["count"] == 1
+    assert calls.get("sms", []) == []
+    assert calls.get("sheet", []) == []
 
 
 def _deps(
@@ -196,6 +287,49 @@ def _deps(
         write_event=_archive,
         start_event_archive=lambda now, logger: False,
     )
+
+
+def test_captureboard_and_disk_signals_with_led_do_not_probe_or_deliver() -> None:
+    calls: dict[str, Any] = {}
+    base_deps = _deps(calls=calls)
+    healthy_led_snapshot = {
+        "MB2-CYCLE": {
+            "deviceState": {
+                "isConnected": True,
+                "updatedAt": _NOW.isoformat(),
+                "status": "RUNNING",
+                "captureBoardStatus": "none",
+                "captureBoardType": "YUH01",
+                "diskUsage": "99%",
+                "acme": {
+                    "usbList": [
+                        {"type": "LED", "deviceId": "0403:6001"},
+                        {"type": "CAPTUREBOARD", "deviceId": "1164:f57a"},
+                    ]
+                },
+            },
+            "agentState": {"isConnected": True},
+        }
+    }
+
+    result = run_device_health_monitor_cycle(
+        request_id="health:non-led-negative:1",
+        now=_NOW,
+        cursor=_seed_cursor(),
+        deps=replace(
+            base_deps,
+            load_redis_snapshot=lambda names: healthy_led_snapshot,
+        ),
+    )
+
+    # 주기 producer는 LED가 보이면 다른 health 신호를 무시하고 모든
+    # provider mutation을 건드리지 않는다.
+    assert result.metrics["abnormalCandidateCount"] == 0
+    assert result.metrics["sshVerifiedCandidateCount"] == 0
+    assert result.deliveries == ()
+    assert calls.get("verify", []) == []
+    assert calls.get("sms", []) == []
+    assert calls.get("sheet", []) == []
 
 
 def test_device_candidate_cache_reuses_fresh_legacy_contacts() -> None:
@@ -283,6 +417,9 @@ def test_cycle_confirms_hardware_twice_then_preserves_legacy_contact_card() -> N
     assert "01012345678" in serialized_cursor
     assert "0212345678" in serialized_delivery
     alert_payload = second.deliveries[0].payload["alert"]
+    assert alert_payload["problemComponents"] == ["LED"]
+    assert alert_payload["alertCategory"] == "led"
+    assert alert_payload["smsTemplateId"] == "led_disconnected"
     assert alert_payload["smsPhoneNumber"] == "01012345678"
     assert alert_payload["smsMessage"]
     assert alert_payload["smsTemplateId"]
@@ -897,11 +1034,38 @@ def test_runtime_verification_disables_api_ssh_reopen_and_resend(
     # 한 automation request에서도 poll 재전송·stale tunnel 재개방은 막는다.
     assert captured == {
         "deviceName": "MB2-CYCLE",
-        "component": "all",
+        "component": "led",
         "resend_ssh_open": False,
         "allow_force_reopen": False,
     }
     assert result["sshReady"] is False
+
+
+def test_runtime_lsusb_failure_never_becomes_led_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle,
+        "_collect_runtime_checks",
+        lambda *args, **kwargs: (
+            {"ssh": {"ready": True, "reason": "ready"}},
+            {"deviceName": "MB2-CYCLE", "version": "2.11.308"},
+            {
+                "lsusb": {"ok": False, "reason": "timeout", "output": ""},
+                "serial_devices": {
+                    "ok": True,
+                    "reason": "",
+                    "output": "no_serial_device",
+                },
+            },
+        ),
+    )
+
+    result = cycle._verify_device_health_runtime(_device(), now=_NOW)
+
+    assert result["overallLabel"] == "확인 필요"
+    assert result["componentLabels"]["led"] == "확인 필요"
+    assert cycle._collect_alert_items((result,)) == []
 
 
 def test_default_event_writer_appends_legacy_daily_jsonl(

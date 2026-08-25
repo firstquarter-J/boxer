@@ -8,6 +8,7 @@ from typing import Any
 
 from boxer.core.utils import _display_value, _format_size, _truncate_text
 from boxer_company import settings as cs
+from boxer_company.device_led_health import LED_USB_SIGNATURES
 from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_audio_probe import (
@@ -223,9 +224,8 @@ _CAPTUREBOARD_USB_SIGNATURES = {
     (0x1164, 0x656A): "YUH01",
     (0x0B05, 0xE001): "ASUS",
 }
-_LED_USB_SIGNATURES = {
-    (0x1A86, 0x7523): "MmtLEDv3",
-}
+# Redis 1차 선별과 SSH lsusb 2차 판정이 같은 CH340/FTDI 정본을 쓴다.
+_LED_USB_SIGNATURES = LED_USB_SIGNATURES
 _VOICE_SET_SPECS: dict[str, dict[str, Any]] = {
     "n": {
         "label": "귀여운 음성",
@@ -617,8 +617,9 @@ _PROBE_COMPONENT_COMMAND_KEYS = {
         "video_devices",
         "v4l2_devices",
     ),
+    # LED 확인에는 USB ID와 시리얼 경로만 필요하다. 공통 tools 탐색을
+    # 빼서 자동 LED 후보 검증과 수동 LED 점검을 같은 최소 명령으로 맞춘다.
     "led": (
-        "tools",
         "lsusb",
         "serial_devices",
     ),
@@ -986,6 +987,31 @@ def _parse_usb_devices(text: str) -> dict[str, Any]:
         "reason": "ok",
         "devices": devices,
     }
+
+
+def _parse_usb_devices_from_check(check: dict[str, Any] | None) -> dict[str, Any]:
+    """SSH 명령 실패를 빈 USB 목록과 구분해 false alert를 막는다."""
+
+    payload = check if isinstance(check, dict) else {}
+    if not payload:
+        return {
+            "available": False,
+            "reason": "lsusb_check_missing",
+            "devices": [],
+        }
+    parsed = _parse_usb_devices(
+        _display_value(payload.get("output"), default="")
+    )
+    if payload.get("ok") is False:
+        return {
+            **parsed,
+            "available": False,
+            "reason": _display_value(
+                payload.get("reason"),
+                default="lsusb_command_failed",
+            ),
+        }
+    return parsed
 
 
 def _parse_device_path_list(text: str, *, missing_token: str) -> dict[str, Any]:
@@ -1853,6 +1879,19 @@ def _summarize_led_probe(
     if serial_paths:
         evidence_parts.append(f"시리얼 경로 `{len(serial_paths)}개`")
 
+    if not usb_devices.get("available"):
+        reason = _display_value(
+            usb_devices.get("reason"),
+            default="lsusb_unavailable",
+        )
+        return {
+            "status": "warning",
+            "label": "확인 필요",
+            "summary": "LED USB 확인 명령을 실행하지 못했어",
+            "evidence": f"lsusb 확인 불가: {reason}",
+            "overviewDetail": f"lsusb 확인 불가: {reason}",
+            "action": "lsusb 명령 상태를 확인한 뒤 LED 연결을 다시 점검해",
+        }
     if matches:
         return {
             "status": "pass",
@@ -3417,7 +3456,7 @@ def _probe_device_runtime_component(
     elif component == "captureboard":
         summary = _summarize_captureboard_probe(
             device_info=device_info,
-            usb_devices=_parse_usb_devices(_display_value((checks.get("lsusb") or {}).get("output"), default="")),
+            usb_devices=_parse_usb_devices_from_check(checks.get("lsusb")),
             video_devices=_parse_device_path_list(
                 _display_value((checks.get("video_devices") or {}).get("output"), default=""),
                 missing_token="no_video_device",
@@ -3427,7 +3466,7 @@ def _probe_device_runtime_component(
         title = "*장비 캡처보드 점검*"
     elif component == "led":
         summary = _summarize_led_probe(
-            usb_devices=_parse_usb_devices(_display_value((checks.get("lsusb") or {}).get("output"), default="")),
+            usb_devices=_parse_usb_devices_from_check(checks.get("lsusb")),
             serial_devices=_parse_device_path_list(
                 _display_value((checks.get("serial_devices") or {}).get("output"), default=""),
                 missing_token="no_serial_device",
@@ -3493,7 +3532,7 @@ def _probe_device_status_overview(
         )
         captureboard_summary = _summarize_captureboard_probe(
             device_info=device_info,
-            usb_devices=_parse_usb_devices(_display_value((checks.get("lsusb") or {}).get("output"), default="")),
+            usb_devices=_parse_usb_devices_from_check(checks.get("lsusb")),
             video_devices=_parse_device_path_list(
                 _display_value((checks.get("video_devices") or {}).get("output"), default=""),
                 missing_token="no_video_device",
@@ -3501,7 +3540,7 @@ def _probe_device_status_overview(
             v4l2_devices=_display_value((checks.get("v4l2_devices") or {}).get("output"), default=""),
         )
         led_summary = _summarize_led_probe(
-            usb_devices=_parse_usb_devices(_display_value((checks.get("lsusb") or {}).get("output"), default="")),
+            usb_devices=_parse_usb_devices_from_check(checks.get("lsusb")),
             serial_devices=_parse_device_path_list(
                 _display_value((checks.get("serial_devices") or {}).get("output"), default=""),
                 missing_token="no_serial_device",

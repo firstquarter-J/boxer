@@ -262,6 +262,20 @@ def _pending_alert_state(fingerprint: str, seen_at: datetime) -> dict:
 
 
 class DeviceHealthMonitorReporterTests(unittest.TestCase):
+    def test_sms_guide_uses_led_category_without_issue_keyword(self) -> None:
+        guide = reporter._build_device_health_monitor_sms_guide(
+            {
+                "room": "2진료실",
+                "device": "MB2-C00419",
+                "issue": "연결 확인 필요",
+                "alertCategory": "led",
+                "problemComponents": [],
+            }
+        )
+
+        self.assertTrue(guide["supported"])
+        self.assertEqual(guide["templateId"], "led_disconnected")
+
     def setUp(self) -> None:
         with reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE_LOCK:
             reporter._DEVICE_HEALTH_MONITOR_RUNTIME_STATE.clear()
@@ -4190,7 +4204,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         evidence_payload = {
             "route": "device_status_probe",
             "source": "mda_graphql+ssh",
-            "request": {"deviceName": "MB2-C00043", "component": "all"},
+            "request": {"deviceName": "MB2-C00043", "component": "led"},
             "device": {
                 "deviceName": "MB2-C00043",
                 "captureBoardType": "LS_HDMI",
@@ -4200,12 +4214,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             "ssh": {"ready": True, "reason": "ready", "host": "127.0.0.1", "port": 2222},
         }
         checks = {
-            "voice_config": {"output": "VOICE_TYPE=s\nLOCALE=ko_KR\nSILENT_START=false"},
-            "pm2_jlist": {"output": "[]"},
             "lsusb": {"output": ""},
             "serial_devices": {"output": "no_serial_device"},
-            "video_devices": {"output": "/dev/video0"},
-            "v4l2_devices": {"output": "video-device"},
         }
 
         with (
@@ -4213,22 +4223,6 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                 "boxer_company_adapter_slack.device_health_monitor_reporter._collect_device_health_monitor_runtime_checks_once",
                 return_value=(evidence_payload, evidence_payload["device"], checks),
             ) as collect_mock,
-            patch(
-                "boxer_company_adapter_slack.device_health_monitor_reporter._summarize_audio_path_probe",
-                return_value={"status": "pass", "label": "정상", "summary": "오디오 정상"},
-            ),
-            patch(
-                "boxer_company_adapter_slack.device_health_monitor_reporter._summarize_pm2_probe",
-                return_value={"status": "pass", "label": "정상", "summary": "PM2 정상"},
-            ),
-            patch(
-                "boxer_company_adapter_slack.device_health_monitor_reporter._build_trashcan_storage_summary_from_checks",
-                return_value={"status": "pass", "label": "정상", "summary": "용량 정상"},
-            ),
-            patch(
-                "boxer_company_adapter_slack.device_health_monitor_reporter._summarize_captureboard_probe",
-                return_value={"status": "pass", "label": "정상", "summary": "캡처보드 정상"},
-            ),
             patch(
                 "boxer_company_adapter_slack.device_health_monitor_reporter._summarize_led_probe",
                 return_value={
@@ -4242,7 +4236,7 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
 
         collect_mock.assert_called_once_with(
             "MB2-C00043",
-            "all",
+            "led",
             now=None,
             ssh_tunnel_records=None,
         )
@@ -4250,12 +4244,16 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(result["hospitalSeq"], 69)
         self.assertEqual(result["hospitalName"], "수지미래산부인과의원(용인)")
         self.assertEqual(result["roomName"], "1진료실")
+        self.assertEqual(result["componentLabels"]["audio"], "정상")
+        self.assertEqual(result["componentLabels"]["pm2"], "정상")
+        self.assertEqual(result["componentLabels"]["storage"], "정상")
+        self.assertEqual(result["componentLabels"]["captureboard"], "정상")
         self.assertEqual(result["componentLabels"]["led"], "이상")
         self.assertEqual(result["priorityReason"], "LED 이상")
         self.assertEqual(result["statusPayload"]["route"], "device_health_monitor")
         self.assertEqual(result["statusPayload"]["source"], "mda_graphql+ssh_linux_commands")
         self.assertEqual(result["statusPayload"]["checks"], checks)
-        self.assertEqual(result["statusPayload"]["device"]["voiceType"], "s")
+        self.assertEqual(result["statusPayload"]["device"].get("voiceType", ""), "")
         alert_items = reporter._collect_daily_device_round_abnormal_alert_items(
             {
                 "hospitalSeq": 69,
@@ -4264,7 +4262,44 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
             }
         )
         self.assertEqual(alert_items[0]["issue"], "LED USB 장치를 찾지 못했어")
-        self.assertEqual(alert_items[0]["voiceType"], "s")
+        self.assertEqual(alert_items[0]["voiceType"], "")
+
+    def test_local_lsusb_failure_never_becomes_led_alert(self) -> None:
+        device_context = {
+            "deviceName": "MB2-C00043",
+            "hospitalSeq": 69,
+            "hospitalName": "수지미래산부인과의원(용인)",
+            "roomName": "1진료실",
+        }
+        status_payload = reporter._build_device_health_monitor_status_payload(
+            device_name="MB2-C00043",
+            evidence_payload={
+                "device": {"deviceName": "MB2-C00043"},
+                "ssh": {"ready": True, "reason": "ready"},
+            },
+            device_info={"deviceName": "MB2-C00043"},
+            checks={
+                "lsusb": {"ok": False, "reason": "timeout", "output": ""},
+                "serial_devices": {
+                    "ok": True,
+                    "reason": "",
+                    "output": "no_serial_device",
+                },
+            },
+        )
+        result = reporter._build_device_health_monitor_result(
+            device_context,
+            status_payload,
+        )
+
+        self.assertEqual(result["overallLabel"], "확인 필요")
+        self.assertEqual(result["componentLabels"]["led"], "확인 필요")
+        self.assertEqual(
+            reporter._collect_daily_device_round_abnormal_alert_items(
+                {"deviceResults": [result]}
+            ),
+            [],
+        )
 
     def test_builds_summary_from_redis_batch_without_ssh_for_normal_devices(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -4284,15 +4319,20 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
                         "deviceName": "MB2-C00043",
                         "isConnected": True,
                         "status": "CONNECTED",
-                        "captureBoardStatus": "connected",
+                        # local rollback도 캡처보드 status/disk를 health 후보로
+                        # 쓰지 않고 FTDI LED 존재만으로 SSH를 생략해야 한다.
+                        "captureBoardStatus": "none",
                         "captureBoardType": "LS_HDMI",
                         "updatedAt": local_now.isoformat(),
                         "acme": {
                             "usbList": [
-                                {"name": "MMTLED"},
-                                {"name": "LS_HDMI captureboard"},
+                                {"type": "LED", "deviceId": "0403:6001"},
+                                {
+                                    "type": "CAPTUREBOARD",
+                                    "deviceId": "1164:f57a",
+                                },
                             ],
-                            "systemInfo": {"hddUsage": "20%"},
+                            "systemInfo": {"hddUsage": "99%"},
                         },
                     },
                     "agentState": {
@@ -5012,8 +5052,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         self.assertEqual(evidence_payload["ssh"]["pollCount"], 1)
         self.assertTrue(evidence_payload["ssh"]["openedThisRun"])
         self.assertFalse(evidence_payload["ssh"]["reusedExisting"])
-        self.assertEqual(set(checks), {"tools", "lsusb", "serial_devices"})
-        self.assertEqual(command_mock.call_count, 3)
+        self.assertEqual(set(checks), {"lsusb", "serial_devices"})
+        self.assertEqual(command_mock.call_count, 2)
         close_ssh_mock.assert_called_once_with("MB2-C00043", host="127.0.0.1")
         self.assertEqual(evidence_payload["ssh"]["close"]["status"], "closed")
         self.assertEqual(ssh_tunnel_records["MB2-C00043"]["closeStatus"], "closed")
@@ -5053,8 +5093,8 @@ class DeviceHealthMonitorReporterTests(unittest.TestCase):
         connect_mock.assert_called_once_with("127.0.0.1", 2222)
         self.assertTrue(fake_client.closed)
         self.assertTrue(evidence_payload["ssh"]["ready"])
-        self.assertEqual(set(checks), {"tools", "lsusb", "serial_devices"})
-        self.assertEqual(command_mock.call_count, 3)
+        self.assertEqual(set(checks), {"lsusb", "serial_devices"})
+        self.assertEqual(command_mock.call_count, 2)
 
     def test_does_not_close_owned_tunnel_when_another_ssh_client_is_active(self) -> None:
         local_now = datetime(2026, 5, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))

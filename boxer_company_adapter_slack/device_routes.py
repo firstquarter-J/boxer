@@ -546,18 +546,19 @@ def _format_device_health_monitor_alert_delivery_status(status_payload: dict[str
     source = _display_value(status_payload.get("source"), default="env")
     source_label = "Slack 명령" if source == "slack_override" else ".env 기본값"
     lines = [
-        "*이상 알림 발송 설정*",
+        "*LED 이상 알림 발송 설정*",
         f"• 상태: *{'켜짐' if enabled else '꺼짐'}*",
         f"• 기준: {source_label}",
         f"• .env 기본값: `{'켜짐' if env_default else '꺼짐'}`",
-        "• 적용: 다음 장비 상태 모니터 poll부터",
+        "• 적용: 다음 LED 감시 poll부터",
+        "• 범위: 장비 자체 캡처보드·녹화 이벤트 알림에는 영향 없음",
     ]
     updated_at = _display_value(status_payload.get("updatedAt"), default="")
     updated_by = _display_value(status_payload.get("updatedBy"), default="")
     if source == "slack_override" and (updated_at or updated_by):
         lines.append(f"• 마지막 변경: `{updated_at or '미확인'}` / `{updated_by or '미확인'}`")
     if not bool(status_payload.get("monitorEnabled")):
-        lines.append("• 참고: 장비 상태 모니터 자체가 꺼져 있어. `DEVICE_HEALTH_MONITOR_ENABLED=true`가 필요해")
+        lines.append("• 참고: LED 감시 자체가 꺼져 있어. `DEVICE_HEALTH_MONITOR_ENABLED=true`가 필요해")
     return "\n".join(lines)
 
 
@@ -605,7 +606,7 @@ def _handle_device_routes(
                 handler_type="router",
             )
             context.reply(
-                "원격 자동화 모드에서는 장비 이상 알림 설정의 정본이 API "
+                "원격 자동화 모드에서는 LED 이상 알림 설정의 정본이 API "
                 "durable state야. Slack 명령으로 상태를 확인하거나 바꿀 수 없어"
             )
             return True
@@ -636,7 +637,7 @@ def _handle_device_routes(
             )
         except Exception:
             context.logger.exception("Device health alert delivery control failed")
-            context.reply("이상 알림 발송 설정 변경 중 오류가 발생했어. 상태 파일 권한을 확인해줘")
+            context.reply("LED 이상 알림 발송 설정 변경 중 오류가 발생했어. 상태 파일 권한을 확인해줘")
         return True
 
     if auto_update_control:

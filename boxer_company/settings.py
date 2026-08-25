@@ -273,6 +273,8 @@ DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT = int(
 DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS = int(
     os.getenv("DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS", "30")
 )
+# 상태 이전 호환을 위해 legacy key 이름은 유지하지만 실행 범위는 LED
+# 누락 선별과 LED 전용 SSH 재검증뿐이다.
 DEVICE_HEALTH_MONITOR_ENABLED = (
     os.getenv("DEVICE_HEALTH_MONITOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

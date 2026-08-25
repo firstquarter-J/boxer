@@ -981,7 +981,12 @@ def _build_device_health_alert_sms_guide(
                 "케이블이 빠져 있거나 헐거우면 영상이 정상적으로 들어오지 않을 수 있습니다."
             ),
         }
-    if "led" in lowered or "엘이디" in issue:
+    if (
+        target.alert_category == "led"
+        or "LED" in components
+        or "led" in lowered
+        or "엘이디" in issue
+    ):
         return {
             "supported": True,
             "templateId": "led_disconnected",

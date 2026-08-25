@@ -210,7 +210,8 @@ class DeviceRouteHandlerTests(unittest.TestCase):
         self.assertIs(set_alert_delivery.call_args.kwargs["logger"], logger)
         self.assertIn("상태: *켜짐*", replies[0])
         self.assertIn("Slack 명령", replies[0])
-        self.assertIn("다음 장비 상태 모니터 poll부터", replies[0])
+        self.assertIn("다음 LED 감시 poll부터", replies[0])
+        self.assertIn("캡처보드·녹화 이벤트 알림에는 영향 없음", replies[0])
 
     def test_device_health_alert_delivery_status_command_does_not_change_setting(self) -> None:
         replies: list[str] = []

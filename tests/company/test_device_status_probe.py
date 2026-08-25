@@ -27,6 +27,7 @@ from boxer_company.routers.device_status_probe import (
     _parse_pm2_memory_restart_values,
     _parse_pm2_processes,
     _parse_usb_devices,
+    _parse_usb_devices_from_check,
     _parse_voice_config,
     _probe_device_remote_access,
     _probe_device_status_overview,
@@ -373,6 +374,50 @@ class DeviceStatusProbeParsingTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "pass")
         self.assertIn("LED USB", summary["evidence"])
+
+    def test_summarizes_ftdi_led_as_pass(self) -> None:
+        summary = _summarize_led_probe(
+            usb_devices=_parse_usb_devices(
+                "Bus 001 Device 004: ID 0403:6001 FTDI FT232 Serial (UART) IC"
+            ),
+            serial_devices=_parse_device_path_list(
+                "/dev/ttyUSB0",
+                missing_token="no_serial_device",
+            ),
+        )
+
+        # 구형 FTDI LED도 MommyBox usb 정본과 같은 LED로 판정한다.
+        self.assertEqual(summary["status"], "pass")
+        self.assertIn("LED USB", summary["evidence"])
+
+    def test_led_probe_does_not_report_missing_when_lsusb_command_failed(self) -> None:
+        usb_devices = _parse_usb_devices_from_check(
+            {"ok": False, "reason": "timeout", "output": ""}
+        )
+        summary = _summarize_led_probe(
+            usb_devices=usb_devices,
+            serial_devices=_parse_device_path_list(
+                "no_serial_device",
+                missing_token="no_serial_device",
+            ),
+        )
+
+        # 명령 실패는 장치 부재 근거가 아니므로 이상 알림이 아닌 재점검이다.
+        self.assertEqual(summary["status"], "warning")
+        self.assertEqual(summary["label"], "확인 필요")
+        self.assertIn("명령을 실행하지 못했어", summary["summary"])
+
+    def test_led_probe_does_not_report_missing_when_lsusb_is_unavailable(self) -> None:
+        summary = _summarize_led_probe(
+            usb_devices=_parse_usb_devices("lsusb_missing"),
+            serial_devices=_parse_device_path_list(
+                "no_serial_device",
+                missing_token="no_serial_device",
+            ),
+        )
+
+        self.assertEqual(summary["status"], "warning")
+        self.assertEqual(summary["label"], "확인 필요")
 
     def test_builds_led_pattern_help_reply_with_warning_and_network_note(self) -> None:
         reply = _build_led_pattern_help_reply("LED 초록불 길게 깜빡이다가 빨간불 잠시 들어옴 반복은 뭐야?")
