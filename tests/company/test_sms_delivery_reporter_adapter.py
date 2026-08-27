@@ -2,7 +2,7 @@ import logging
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from boxer_company_adapter_slack import sms_delivery_reporter
 
@@ -52,6 +52,51 @@ class SmsDeliveryReporterAdapterTests(unittest.TestCase):
             api_client.run.call_args.kwargs["cycle"],
             "sms_delivery",
         )
+
+    def test_scheduler_mode_executes_neither_local_nor_remote_sms_cycle(self) -> None:
+        logger = logging.getLogger("test.sms_delivery_reporter_adapter.scheduler")
+        api_client = Mock()
+
+        with (
+            patch.object(
+                sms_delivery_reporter.cs,
+                "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+                True,
+            ),
+            patch.object(
+                sms_delivery_reporter,
+                "run_sms_delivery_cycle_once",
+            ) as local_cycle,
+        ):
+            changed = sms_delivery_reporter._run_sms_delivery_reporter_once(
+                logger,
+                automation_client=api_client,
+            )
+
+        self.assertEqual(changed, 0)
+        local_cycle.assert_not_called()
+        api_client.run.assert_not_called()
+
+    def test_scheduler_mode_never_starts_slack_sms_thread(self) -> None:
+        with (
+            patch.object(
+                sms_delivery_reporter.cs,
+                "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+                True,
+            ),
+            patch.object(
+                sms_delivery_reporter.threading,
+                "Thread",
+            ) as create_thread,
+        ):
+            sms_delivery_reporter.attach_sms_delivery_reporter(
+                logger=logging.getLogger(
+                    "test.sms_delivery_reporter_adapter.attach"
+                ),
+                automation_client=Mock(),
+            )
+
+        create_thread.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -23,6 +23,15 @@ class CompanyApiSettingsTests(unittest.TestCase):
         "assistant.device.alert.execute",
         "assistant.automation.execute",
     ]
+    _AUTOMATION_TRANSPORT_CAPABILITIES = [
+        "assistant.turn.read",
+        "assistant.device.probe",
+        "assistant.device.ssh.open",
+        "assistant.operation.execute",
+        "assistant.device.alert.execute",
+        "assistant.automation.transport",
+        "assistant.hpa.change.execute",
+    ]
 
     @staticmethod
     def _registry(
@@ -442,6 +451,61 @@ class CompanyApiSettingsTests(unittest.TestCase):
         self.assertEqual(settings.callers, ())
         self.assertEqual(
             settings.configuration_error,
+            "automation_caller_configuration_invalid",
+        )
+
+    def test_scheduler_cutover_replaces_execute_with_transport_capability(
+        self,
+    ) -> None:
+        base_env = {
+            "WEEKLY_RECORDINGS_REPORT_ENABLED": "true",
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true",
+            "SMS_DELIVERY_OUTBOX_PATH": (
+                "/var/lib/boxer-company-api/sms_delivery_outbox.json"
+            ),
+            "DB_QUERY_ENABLED": "true",
+            "DB_HOST": "db.internal",
+            "DB_USERNAME": "readonly",
+            "DB_PASSWORD": "not-logged",
+            "DB_DATABASE": "box",
+        }
+        configured = load_company_api_settings(
+            {
+                **base_env,
+                "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
+                    capabilities=self._AUTOMATION_TRANSPORT_CAPABILITIES
+                ),
+            }
+        )
+        stale_execute = load_company_api_settings(
+            {
+                **base_env,
+                "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
+                    capabilities=self._AUTOMATION_CAPABILITIES
+                ),
+            }
+        )
+        missing_hpa_capability = load_company_api_settings(
+            {
+                **base_env,
+                "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
+                    capabilities=[
+                        capability
+                        for capability in self._AUTOMATION_TRANSPORT_CAPABILITIES
+                        if capability != "assistant.hpa.change.execute"
+                    ]
+                ),
+            }
+        )
+
+        self.assertIsNone(configured.configuration_error)
+        self.assertTrue(configured.automation_scheduler_enabled)
+        self.assertEqual(
+            stale_execute.configuration_error,
+            "automation_caller_configuration_invalid",
+        )
+        self.assertEqual(
+            missing_hpa_capability.configuration_error,
             "automation_caller_configuration_invalid",
         )
 

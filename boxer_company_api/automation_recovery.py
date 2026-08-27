@@ -22,16 +22,12 @@ from boxer_company.device_health_monitor_cycle import (
 from boxer_company.automation import AutomationCycleContractError
 from boxer_company.device_health_state_bundle import (
     build_device_notification_api_cursor,
-    build_device_notification_legacy_state,
-    build_device_health_rollback_bundle,
-    create_protected_json_file,
     DeviceHealthStateBundleError,
     FILE_DIGEST_PATTERN,
     load_protected_json_file,
     validate_device_health_state_bundle,
 )
 from boxer_company_api.automation import (
-    AutomationStateSnapshot,
     JsonAutomationCycleStateStore,
 )
 
@@ -404,181 +400,6 @@ def inspect_device_health_monitor_state(
         "healthStateDigest": target_state_digest,
         "notificationStatePresent": notification_exists,
         "notificationTargetStateDigest": notification_target_state_digest,
-    }
-
-
-def inspect_device_health_monitor_rollback_source(
-    *,
-    state_path: str | Path,
-    tenant_id: str,
-    sms_outbox_path: str | Path,
-) -> Mapping[str, Any]:
-    """rollback 전 두 API cycle과 SMS outbox의 exact revision을 확인한다."""
-
-    _validate_identity(
-        tenant_id=tenant_id,
-        cycle="device_health_monitor",
-        cycle_key="continuous",
-        request_id="device-health-state-rollback-inspect",
-    )
-    store = JsonAutomationCycleStateStore(state_path)
-    try:
-        with store.locked_snapshot() as snapshot:
-            cycle_states = _inspect_rollback_cycle_states(
-                snapshot,
-                tenant_id=tenant_id,
-                require_drained=False,
-            )
-    except AutomationCycleContractError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    sms_state = _inspect_strict_sms_recovery_state(sms_outbox_path)
-    return {
-        **cycle_states["healthSummary"],
-        "kind": "device_health_rollback_source",
-        "healthStateDigest": cycle_states["healthStateDigest"],
-        "notificationStateDigest": cycle_states[
-            "notificationStateDigest"
-        ],
-        "notificationStatePresent": cycle_states[
-            "notificationStatePresent"
-        ],
-        "healthPendingCounts": cycle_states["healthPendingCounts"],
-        "notificationPendingCounts": cycle_states[
-            "notificationPendingCounts"
-        ],
-        "smsStateDigest": sms_state["stateDigest"],
-        "smsOutboxItemCount": sms_state["outboxItemCount"],
-        "smsUnresolvedClaimCount": sms_state[
-            "unresolvedClaimCount"
-        ],
-        "smsSettledClaimCount": sms_state["settledClaimCount"],
-        "smsActiveSettledClaimCount": sms_state[
-            "activeSettledClaimCount"
-        ],
-    }
-
-
-def export_device_health_monitor_rollback_bundle(
-    *,
-    state_path: str | Path,
-    tenant_id: str,
-    sms_outbox_path: str | Path,
-    bundle_path: str | Path,
-    expected_cursor_digest: str,
-    expected_health_state_digest: str,
-    expected_notification_state_digest: str,
-    expected_sms_state_digest: str,
-    now: datetime | None = None,
-) -> Mapping[str, Any]:
-    """drained API state exact revision을 Slack용 rollback bundle로 내보낸다."""
-
-    _validate_identity(
-        tenant_id=tenant_id,
-        cycle="device_health_monitor",
-        cycle_key="continuous",
-        request_id="device-health-state-rollback-export",
-    )
-    if (
-        not _CURSOR_DIGEST_PATTERN.fullmatch(str(expected_cursor_digest or ""))
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_health_state_digest or "")
-        )
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_notification_state_digest or "")
-        )
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_sms_state_digest or "")
-        )
-    ):
-        raise AutomationRecoveryError(
-            "device health rollback export confirmation is invalid"
-        )
-    actual_now = now or datetime.now(timezone.utc)
-    if actual_now.tzinfo is None:
-        raise AutomationRecoveryError("device health rollback export time is invalid")
-    store = JsonAutomationCycleStateStore(state_path)
-    try:
-        # inspect부터 bundle 원자 생성까지 runtime writer와 동일한 state flock을
-        # 유지해 health/notification 두 revision의 TOCTOU를 막는다.
-        with store.locked_snapshot() as snapshot:
-            cycle_states = _inspect_drained_rollback_cycle_states(
-                snapshot,
-                tenant_id=tenant_id,
-            )
-            cursor = cycle_states["healthCursor"]
-            cursor_digest = cycle_states["cursorDigest"]
-            if (
-                cursor_digest != expected_cursor_digest
-                or cycle_states["healthStateDigest"]
-                != expected_health_state_digest
-                or cycle_states["notificationStateDigest"]
-                != expected_notification_state_digest
-            ):
-                raise AutomationRecoveryError(
-                    "device health rollback API state changed"
-                )
-            sms_state = _inspect_exact_drained_sms_recovery_state(
-                sms_outbox_path,
-                expected_state_digest=expected_sms_state_digest,
-                now=actual_now,
-                operation="rollback export",
-            )
-            try:
-                bundle = build_device_health_rollback_bundle(
-                    cursor=cursor,
-                    notification_cursor=cycle_states[
-                        "notificationCursor"
-                    ],
-                    source_cursor_digest=cursor_digest,
-                    health_state_digest=cycle_states[
-                        "healthStateDigest"
-                    ],
-                    notification_state_digest=cycle_states[
-                        "notificationStateDigest"
-                    ],
-                    sms_state_digest=str(sms_state["stateDigest"]),
-                    exported_at=actual_now,
-                )
-                bundle_digest = create_protected_json_file(
-                    bundle_path,
-                    bundle,
-                    label="device health rollback bundle",
-                )
-            except DeviceHealthStateBundleError as exc:
-                raise AutomationRecoveryError(str(exc)) from exc
-            # SMS는 별도 lock domain이라 생성 직후 exact digest를 다시
-            # 확인한다. drift 시 만들어진 bundle을 제거하고 fail closed한다.
-            try:
-                final_sms_state = _inspect_exact_drained_sms_recovery_state(
-                    sms_outbox_path,
-                    expected_state_digest=expected_sms_state_digest,
-                    now=actual_now,
-                    operation="rollback export",
-                )
-            except AutomationRecoveryError:
-                Path(bundle_path).unlink(missing_ok=True)
-                raise
-            if final_sms_state["stateDigest"] != sms_state["stateDigest"]:
-                Path(bundle_path).unlink(missing_ok=True)
-                raise AutomationRecoveryError(
-                    "device health rollback source changed"
-                )
-    except AutomationCycleContractError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    payload = bundle["payload"]
-    return {
-        "exported": True,
-        "kind": "device_health_rollback_bundle",
-        "cursorDigest": cursor_digest,
-        "healthStateDigest": cycle_states["healthStateDigest"],
-        "notificationStateDigest": cycle_states[
-            "notificationStateDigest"
-        ],
-        "smsStateDigest": sms_state["stateDigest"],
-        "bundleDigest": bundle_digest,
-        "pendingDecision": payload["pendingDecision"],
-        "alertFingerprintCount": len(payload["alertFingerprints"]),
-        "pendingFingerprintCount": len(payload["pendingAlertFingerprints"]),
     }
 
 
@@ -1036,213 +857,6 @@ def _validate_device_health_seed_payload(
     }
 
 
-def _inspect_drained_rollback_cycle_states(
-    snapshot: AutomationStateSnapshot,
-    *,
-    tenant_id: str,
-) -> dict[str, Any]:
-    return _inspect_rollback_cycle_states(
-        snapshot,
-        tenant_id=tenant_id,
-        require_drained=True,
-    )
-
-
-def _inspect_rollback_cycle_states(
-    snapshot: AutomationStateSnapshot,
-    *,
-    tenant_id: str,
-    require_drained: bool,
-) -> dict[str, Any]:
-    """health/notification raw state를 정규화 없이 검사하고 digest한다."""
-
-    health_key = _state_key(
-        tenant_id,
-        "device_health_monitor",
-        "continuous",
-    )
-    health_exists, health_state = snapshot.cycle(health_key)
-    health_state_digest = _automation_target_state_digest(
-        health_state,
-        exists=health_exists,
-    )
-    if not health_exists:
-        raise AutomationRecoveryError(
-            "device health rollback source is not seeded"
-        )
-    health_markers = _strict_marker_counts(
-        health_state,
-        label="device health automation",
-    )
-    health_pending = health_state.get("pendingDeliveries")
-    if not isinstance(health_pending, list):
-        raise AutomationRecoveryError(
-            "device health automation pending deliveries are invalid"
-        )
-    cursor = health_state.get("cursor")
-    if not isinstance(cursor, Mapping):
-        raise AutomationRecoveryError(
-            "device health automation state is not seeded"
-        )
-    try:
-        cursor_digest = device_health_monitor_cursor_digest(cursor)
-    except ValueError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    health_outbox_counts = _strict_pending_cursor_counts(
-        cursor,
-        label="device health rollback cursor",
-    )
-
-    notification_key = _state_key(
-        tenant_id,
-        "device_notification_alert",
-        "continuous",
-    )
-    notification_exists, notification_state = snapshot.cycle(
-        notification_key
-    )
-    notification_state_digest = _automation_target_state_digest(
-        notification_state,
-        exists=notification_exists,
-    )
-    if not notification_exists:
-        raise AutomationRecoveryError(
-            "device notification rollback source is not seeded"
-        )
-    notification_markers = _strict_marker_counts(
-        notification_state,
-        label="device notification automation",
-    )
-    raw_pending = notification_state.get("pendingDeliveries")
-    if not isinstance(raw_pending, list):
-        raise AutomationRecoveryError(
-            "device notification pending deliveries are invalid"
-        )
-    notification_pending = raw_pending
-    notification_cursor = notification_state.get("cursor")
-    if not isinstance(notification_cursor, Mapping):
-        raise AutomationRecoveryError(
-            "device notification automation cursor is invalid"
-        )
-    notification_outbox_counts = _strict_pending_cursor_counts(
-        notification_cursor,
-        label="device notification rollback cursor",
-    )
-    if not any(notification_outbox_counts.values()):
-        try:
-            # drained cursor는 inspect도 export와 같은 strict schema를 써
-            # malformed incident를 정상 count로 축약하지 않는다.
-            build_device_notification_legacy_state(notification_cursor)
-        except DeviceHealthStateBundleError as exc:
-            raise AutomationRecoveryError(str(exc)) from exc
-
-    if require_drained and any(health_markers.values()):
-        raise AutomationRecoveryError(
-            "device health automation state is missing or uncertain"
-        )
-    if require_drained and health_pending:
-        raise AutomationRecoveryError(
-            "device health automation has pending deliveries"
-        )
-    if require_drained and any(health_outbox_counts.values()):
-        raise AutomationRecoveryError(
-            "device health rollback cursor outbox is not drained"
-        )
-    if require_drained and any(notification_markers.values()):
-        raise AutomationRecoveryError(
-            "device notification automation state is uncertain"
-        )
-    if require_drained and notification_pending:
-        raise AutomationRecoveryError(
-            "device notification automation has pending deliveries"
-        )
-    if require_drained and any(notification_outbox_counts.values()):
-        raise AutomationRecoveryError(
-            "device notification rollback cursor outbox is not drained"
-        )
-
-    override = cursor.get("alertDeliveryOverride")
-    if not isinstance(override, Mapping) or type(override.get("enabled")) is not bool:
-        raise AutomationRecoveryError(
-            "device health automation state is invalid"
-        )
-    health_summary = {
-        "seeded": True,
-        "cycle": "device_health_monitor",
-        "alertDeliveryEnabled": override["enabled"],
-        "alertFingerprintCount": len(cursor.get("alertFingerprints") or {}),
-        "pendingFingerprintCount": len(
-            cursor.get("pendingAlertFingerprints") or {}
-        ),
-        "pendingDeliveryCount": len(health_pending),
-        "inFlight": bool(health_markers["inFlightCount"]),
-        "ackInFlight": bool(health_markers["ackInFlightCount"]),
-        "cursorDigest": cursor_digest,
-        "targetStateDigest": health_state_digest,
-    }
-    return {
-        "healthCursor": dict(cursor),
-        "cursorDigest": cursor_digest,
-        "healthStateDigest": health_state_digest,
-        "notificationStateDigest": notification_state_digest,
-        "notificationStatePresent": notification_exists,
-        "notificationCursor": dict(notification_cursor),
-        "healthSummary": health_summary,
-        "healthPendingCounts": {
-            **health_markers,
-            "pendingDeliveryCount": len(health_pending),
-            **health_outbox_counts,
-        },
-        "notificationPendingCounts": {
-            **notification_markers,
-            "pendingDeliveryCount": len(notification_pending),
-            **notification_outbox_counts,
-        },
-    }
-
-
-def _strict_marker_counts(
-    state: Mapping[str, Any],
-    *,
-    label: str,
-) -> dict[str, int]:
-    result: dict[str, int] = {}
-    for key, result_key in (
-        ("inFlight", "inFlightCount"),
-        ("ackInFlight", "ackInFlightCount"),
-    ):
-        if key not in state:
-            result[result_key] = 0
-            continue
-        if not isinstance(state.get(key), Mapping):
-            raise AutomationRecoveryError(
-                f"{label} state is missing or uncertain"
-            )
-        result[result_key] = 1
-    return result
-
-
-def _strict_pending_cursor_counts(
-    cursor: Mapping[str, Any],
-    *,
-    label: str,
-) -> dict[str, int]:
-    result: dict[str, int] = {}
-    for key, result_key in (
-        ("pendingDeliveryContexts", "pendingDeliveryContextCount"),
-        ("pendingSheetAlerts", "pendingSheetAlertCount"),
-        ("pendingSheetRepairs", "pendingSheetRepairCount"),
-    ):
-        if key not in cursor:
-            result[result_key] = 0
-            continue
-        value = cursor.get(key)
-        if not isinstance(value, Mapping):
-            raise AutomationRecoveryError(f"{label} outbox is invalid")
-        result[result_key] = len(value)
-    return result
-
-
 def _inspect_strict_sms_recovery_state(
     sms_outbox_path: str | Path,
     *,
@@ -1354,12 +968,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Confirm that boxer-company-api is stopped before editing state.",
     )
     parser.add_argument("--import-device-health-forward-bundle-path")
-    parser.add_argument("--export-device-health-rollback-bundle-path")
     parser.add_argument("--expected-bundle-digest")
     parser.add_argument("--expected-target-state-digest")
     parser.add_argument("--expected-notification-target-state-digest")
-    parser.add_argument("--expected-health-state-digest")
-    parser.add_argument("--expected-notification-state-digest")
     parser.add_argument("--expected-sms-state-digest")
     parser.add_argument(
         "--pending-decision",
@@ -1367,10 +978,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--inspect-device-health-state",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--inspect-device-health-rollback-source",
         action="store_true",
     )
     parser.add_argument(
@@ -1397,9 +1004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         bool(value)
         for value in (
             args.import_device_health_forward_bundle_path,
-            args.export_device_health_rollback_bundle_path,
             args.inspect_device_health_state,
-            args.inspect_device_health_rollback_source,
             args.set_alert_delivery_enabled,
         )
     )
@@ -1445,47 +1050,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = inspect_device_health_monitor_state(
                 state_path=args.state_path,
                 tenant_id=args.tenant_id,
-            )
-        elif args.inspect_device_health_rollback_source:
-            if not all(
-                (args.state_path, args.tenant_id, args.sms_outbox_path)
-            ):
-                raise AutomationRecoveryError(
-                    "device health rollback inspect identity is incomplete"
-                )
-            result = inspect_device_health_monitor_rollback_source(
-                state_path=args.state_path,
-                tenant_id=args.tenant_id,
-                sms_outbox_path=args.sms_outbox_path,
-            )
-        elif args.export_device_health_rollback_bundle_path:
-            if not all(
-                (
-                    args.state_path,
-                    args.tenant_id,
-                    args.expected_cursor_digest,
-                    args.expected_health_state_digest,
-                    args.expected_notification_state_digest,
-                    args.sms_outbox_path,
-                    args.expected_sms_state_digest,
-                )
-            ):
-                raise AutomationRecoveryError(
-                    "device health rollback export confirmation is incomplete"
-                )
-            result = export_device_health_monitor_rollback_bundle(
-                state_path=args.state_path,
-                tenant_id=args.tenant_id,
-                sms_outbox_path=args.sms_outbox_path,
-                bundle_path=args.export_device_health_rollback_bundle_path,
-                expected_cursor_digest=args.expected_cursor_digest,
-                expected_health_state_digest=(
-                    args.expected_health_state_digest
-                ),
-                expected_notification_state_digest=(
-                    args.expected_notification_state_digest
-                ),
-                expected_sms_state_digest=args.expected_sms_state_digest,
             )
         elif args.set_alert_delivery_enabled:
             if not all(
@@ -1564,10 +1128,8 @@ if __name__ == "__main__":
 
 __all__ = [
     "AutomationRecoveryError",
-    "export_device_health_monitor_rollback_bundle",
     "import_device_health_monitor_forward_bundle",
     "inspect_device_health_monitor_state",
-    "inspect_device_health_monitor_rollback_source",
     "main",
     "override_device_health_monitor_alert_delivery",
     "resolve_automatic_sms_uncertain_claim",

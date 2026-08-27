@@ -4870,13 +4870,31 @@ def _run_device_health_monitor_once(
     now: datetime | None = None,
     automation_client: CompanyAutomationApiClient | None = None,
 ) -> bool:
+    scheduler_enabled = bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    )
+    local_now = _coerce_daily_device_round_now(now)
+    if scheduler_enabled:
+        # API companion이 일정과 domain 실행을 소유할 때 Slack은 주입된
+        # transport client가 있는 cycle만 전달하고 local monitor로 돌아가지 않는다.
+        if automation_client is None:
+            return False
+        return _run_device_health_monitor_remote_once(
+            client,
+            logger,
+            automation_client=automation_client,
+            local_now=local_now,
+        )
     if not cs.DEVICE_HEALTH_MONITOR_ENABLED:
         return False
     if automation_client is None and not s.DB_QUERY_ENABLED:
         logger.warning("장비 상태 모니터를 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
 
-    local_now = _coerce_daily_device_round_now(now)
     if automation_client is not None:
         return _run_device_health_monitor_remote_once(
             client,
@@ -5147,6 +5165,20 @@ def _run_device_health_monitor_remote_once(
 ) -> bool:
     """Slack은 API delivery transport만 맡고 legacy domain state는 읽지 않는다."""
 
+    if bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    ):
+        return _pull_device_health_monitor_delivery_once(
+            client,
+            logger,
+            automation_client=automation_client,
+            local_now=local_now,
+        )
+
     channel_id = _device_health_monitor_channel_id()
     if not channel_id:
         logger.warning(
@@ -5238,6 +5270,104 @@ def _run_device_health_monitor_remote_once(
         "Completed remote device health poll deliveries=%s sent=%s",
         len(result.deliveries),
         len(result.deliveries),
+    )
+    return True
+
+
+def _pull_device_health_monitor_delivery_once(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    automation_client: CompanyAutomationApiClient,
+    local_now: datetime,
+) -> bool:
+    """API scheduler의 pending batch 하나만 Slack으로 전달한다."""
+
+    cycle = "device_health_monitor"
+    # 먼저 이전 Slack 성공 receipt를 닫는다. batch journal이면 stored key와
+    # batch ID가 ACK 정본이므로 placeholder key는 legacy ACK에만 쓰인다.
+    flush_automation_deliveries(
+        automation_client,
+        cycle=cycle,
+        cycle_key="pending",
+        scheduled_at=local_now,
+        logger=logger,
+    )
+    batch = automation_client.pull_pending(
+        request_id=build_automation_request_id(
+            cycle=cycle,
+            cycle_key="pending",
+            scheduled_at=local_now,
+        ),
+        cycle=cycle,
+    )
+    if batch is None:
+        return False
+    if (
+        batch.cycle != cycle
+        or not batch.deliveries
+        or any(
+            delivery.kind != "device_health_alert"
+            for delivery in batch.deliveries
+        )
+    ):
+        raise RuntimeError("장비 상태 모니터 API delivery 계약이 올바르지 않아")
+
+    # API가 같은 실행에서 만든 LED alert들은 기존 카드처럼 한 메시지로
+    # 묶고, 모든 delivery receipt를 같은 batch metadata와 원자 저장한다.
+    report_summary = _build_remote_device_health_alert_batch_summary(
+        tuple(delivery.payload for delivery in batch.deliveries)
+    )
+    delivery_ids = tuple(
+        sorted(delivery.delivery_id for delivery in batch.deliveries)
+    )
+    batch_digest = hashlib.sha256(
+        "\0".join(delivery_ids).encode("utf-8")
+    ).hexdigest()[:32]
+    slack_delivery = _post_daily_device_round_abnormal_alert(
+        client,
+        report_summary,
+        channel_id=batch.channel_id,
+        message_ts="",
+        logger=logger,
+        include_blocks=True,
+        include_actions=True,
+        client_msg_id=build_automation_delivery_client_msg_id(
+            cycle=cycle,
+            cycle_key=batch.cycle_key,
+            delivery_id=f"device_health_monitor:{batch_digest}",
+            part="alert",
+        ),
+    )
+    if slack_delivery is None:
+        # Slack 실패 시 API pending을 그대로 남기고 local 감지로 우회하지 않는다.
+        return False
+    external_message_id = _display_value(
+        slack_delivery.get("messageTs"),
+        default="",
+    )
+    permalink = _display_value(
+        slack_delivery.get("permalink"),
+        default="",
+    )
+    remember_automation_deliveries(
+        cycle=cycle,
+        cycle_key=batch.cycle_key,
+        deliveries=tuple(
+            AutomationSlackDelivery(
+                delivery_id=delivery_id,
+                external_message_id=external_message_id,
+                permalink=permalink,
+                delivered_at=local_now,
+            )
+            for delivery_id in delivery_ids
+        ),
+        batch=batch,
+    )
+    logger.info(
+        "Delivered API-owned device health batch channel=%s deliveries=%s",
+        batch.channel_id,
+        len(batch.deliveries),
     )
     return True
 
@@ -5393,7 +5523,19 @@ def _device_health_monitor_loop(
     logger: logging.Logger,
     automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
-    poll_interval_sec = max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC))
+    scheduler_enabled = bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    )
+    # API scheduler 모드의 간격은 Slack transport poll일 뿐 domain 일정이 아니다.
+    poll_interval_sec = (
+        30
+        if scheduler_enabled
+        else max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC))
+    )
     archive_attempt_date = None
     archive_thread: threading.Thread | None = None
     while True:
@@ -5534,39 +5676,69 @@ def attach_device_health_monitor_reporter(
     notification_automation_client: CompanyAutomationApiClient | None = None,
     sms_delivery_automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
-    health_monitor_enabled = bool(cs.DEVICE_HEALTH_MONITOR_ENABLED)
-    notification_alert_enabled = bool(cs.DEVICE_NOTIFICATION_ALERT_ENABLED)
-    sms_delivery_enabled = bool(cs.SMS_DELIVERY_REPORTER_ENABLED)
+    scheduler_enabled = bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    )
+    # 새 모드에서는 API allowlist가 활성 cycle의 정본이다. Slack의 과거
+    # feature flag가 꺼져 있어도 주입된 client가 있으면 transport를 유지한다.
+    health_monitor_enabled = (
+        automation_client is not None
+        if scheduler_enabled
+        else bool(cs.DEVICE_HEALTH_MONITOR_ENABLED)
+    )
+    notification_alert_enabled = (
+        notification_automation_client is not None
+        if scheduler_enabled
+        else bool(cs.DEVICE_NOTIFICATION_ALERT_ENABLED)
+    )
+    sms_delivery_enabled = (
+        False
+        if scheduler_enabled
+        else bool(cs.SMS_DELIVERY_REPORTER_ENABLED)
+    )
+    action_bridge_enabled = bool(
+        health_monitor_enabled
+        or notification_alert_enabled
+        or (scheduler_enabled and action_api_bridge is not None)
+    )
     if not any(
         (
             health_monitor_enabled,
             notification_alert_enabled,
             sms_delivery_enabled,
+            action_bridge_enabled,
         )
     ):
         return
 
     actual_logger = logger or logging.getLogger(__name__)
-    # 신규 SMS 접수를 먼저 끈 뒤에도 API outbox가 빌 때까지 최종 결과 poller만
-    # 독립적으로 유지할 수 있다. local rollback은 기존 health/notification
-    # reporter가 켜질 때 자동으로 붙던 동작을 그대로 보존한다.
-    if sms_delivery_enabled or (
-        sms_delivery_automation_client is None
-        and (health_monitor_enabled or notification_alert_enabled)
+    # 기존 모드에서는 신규 SMS 접수를 먼저 끈 뒤에도 API outbox가 빌 때까지
+    # 최종 결과 poller만 독립적으로 유지할 수 있다.
+    if not scheduler_enabled and (
+        sms_delivery_enabled
+        or (
+            sms_delivery_automation_client is None
+            and (health_monitor_enabled or notification_alert_enabled)
+        )
     ):
         attach_sms_delivery_reporter(
             logger=actual_logger,
             automation_client=sms_delivery_automation_client,
         )
 
-    if not health_monitor_enabled and not notification_alert_enabled:
+    if not action_bridge_enabled:
         return
 
-    local_data_reporter_enabled = (
-        health_monitor_enabled and automation_client is None
-    ) or (
-        notification_alert_enabled
-        and notification_automation_client is None
+    local_data_reporter_enabled = not scheduler_enabled and (
+        (health_monitor_enabled and automation_client is None)
+        or (
+            notification_alert_enabled
+            and notification_automation_client is None
+        )
     )
     if local_data_reporter_enabled and not s.DB_QUERY_ENABLED:
         actual_logger.warning(
@@ -5581,8 +5753,9 @@ def attach_device_health_monitor_reporter(
 
     # 두 remote cycle 모두 같은 action ID를 내보내므로 어느 한 쪽이라도
     # API 소유이면 bridge 누락 시 legacy mutation을 실행하지 않는다.
-    require_action_api_bridge = (
-        automation_client is not None
+    require_action_api_bridge = bool(
+        scheduler_enabled
+        or automation_client is not None
         or notification_automation_client is not None
     )
     if action_api_bridge is None and not require_action_api_bridge:
@@ -5614,8 +5787,14 @@ def attach_device_health_monitor_reporter(
             daemon=True,
         )
         _DEVICE_HEALTH_MONITOR_THREAD.start()
-        actual_logger.info(
-            "Started device health monitor channel=%s interval=%ss",
-            _device_health_monitor_channel_id(),
-            max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC)),
-        )
+        if scheduler_enabled:
+            actual_logger.info(
+                "Started API-owned device health delivery transport interval=%ss",
+                30,
+            )
+        else:
+            actual_logger.info(
+                "Started device health monitor channel=%s interval=%ss",
+                _device_health_monitor_channel_id(),
+                max(30, int(cs.DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC)),
+            )

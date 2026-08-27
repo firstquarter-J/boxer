@@ -17,7 +17,9 @@ from boxer_company_api.settings import (
 
 
 class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
-    def test_http_contract_runs_new_operational_db_only_routes(self) -> None:
+    def test_http_contract_runs_weekly_and_blocks_underprivileged_device_detail(
+        self,
+    ) -> None:
         token = "o" * 48
         settings = CompanyApiSettings(
             host="127.0.0.1",
@@ -95,32 +97,6 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
             ) as ssh_query,
             TestClient(app) as client,
         ):
-            # route constructor의 기본 callable은 import 시 고정되므로
-            # 실제 API runtime route 인스턴스에 안전한 DB stub을 주입한다.
-            device_query = Mock(
-                return_value=(
-                    "*장비 조회 결과*\n"
-                    "• 장비명: `MB2-C00419`\n"
-                    "• status: `ACTIVE`"
-                )
-            )
-            structured_routes = runtime.start_turn(
-                CompanyAssistantRequest(
-                    request_id="stub-probe",
-                    tenant_id="TENANT-1",
-                    actor_id="ACTOR-1",
-                    channel="slack",
-                    conversation_id="THREAD-OPERATIONAL-1",
-                    question="MB2-C00419 장비 정보",
-                    locale="ko",
-                )
-            ).routes_for_stage("structured")
-            device_db_detail_route = next(
-                route
-                for route in structured_routes
-                if route.name == "device_db_detail"
-            )
-            device_db_detail_route._query_devices = device_query
             weekly = client.post(
                 "/internal/v1/assistant/turns",
                 headers=headers,
@@ -148,17 +124,11 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
             "weekly_recordings_summary",
         )
         self.assertFalse(weekly.json()["usedLlm"])
-        self.assertEqual(device.status_code, 200)
-        self.assertEqual(device.json()["route"], "device_db_detail")
-        self.assertIn(
-            "DB 저장 status",
-            device.json()["messages"][0]["body"],
-        )
+        # exact 장비 상세는 client의 structured hint와 무관하게
+        # server matcher가 live 경계로 올리며 추가 권한 없이는 막힌다.
+        self.assertEqual(device.status_code, 403)
+        self.assertEqual(device.json()["code"], "caller_not_allowed")
         weekly_query.assert_called_once()
-        device_query.assert_called_once()
-        self.assertFalse(
-            device_query.call_args.kwargs["include_live_enrichment"]
-        )
         mda_query.assert_not_called()
         ssh_query.assert_not_called()
 
@@ -1260,7 +1230,7 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
             count_only=False,
         )
 
-    def test_http_contract_runs_real_company_read_only_runtime(
+    def test_http_contract_blocks_sensitive_request_before_read_only_runtime(
         self,
     ) -> None:
         token = "i" * 48
@@ -1318,16 +1288,10 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["route"],
-            "unsupported_live_diagnostic",
-        )
-        self.assertEqual(response.json()["outcome"], "denied")
-        self.assertEqual(
-            response.json()["fallbackReason"],
-            "read_only_boundary",
-        )
+        # routeGroup을 생략해도 진단 시작은 server matcher가
+        # operations로 올려 runtime 진입 전에 capability로 차단한다.
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "caller_not_allowed")
 
         # 같은 HTTP 경계에서 실제 deterministic read-only route도
         # 외부 LLM이나 Notion 호출 없이 정상 답변까지 완주한다.

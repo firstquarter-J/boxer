@@ -39,6 +39,10 @@ from boxer_company.automation import (
     AutomationCycleContractError,
     build_default_automation_cycle_service,
 )
+from boxer_company.hpa_change_coordinator import (
+    HpaChangeCoordinator,
+    create_hpa_change_coordinator,
+)
 from boxer_company_api.automation import (
     AutomationCycleInput,
     AutomationCycleUncertainError,
@@ -46,10 +50,20 @@ from boxer_company_api.automation import (
     JsonAutomationCycleStateStore,
     serialize_automation_cycle_result,
 )
+from boxer_company_api.automation_delivery import (
+    AutomationDeliveryAckInput,
+    AutomationDeliveryBroker,
+    AutomationDeliveryPullInput,
+    serialize_automation_delivery_ack,
+    serialize_automation_delivery_batch,
+)
 from boxer_company_api.auth import CallerRegistry
+from boxer_company_api.hpa_change_router import create_hpa_change_router
+from boxer_company_api.hpa_change_transport import HpaChangeTransportService
 from boxer_company_api.observability import emit_api_event
 from boxer_company_api.policies import (
     authorize_automation_cycle,
+    authorize_automation_transport,
     authorize_turn,
     validate_request_id,
     validate_traceparent,
@@ -73,6 +87,9 @@ from boxer_company_api.settings import (
     CompanyApiSettings,
     company_api_local_readiness,
     load_company_api_settings,
+)
+from boxer_company_api.turn_routing import (
+    resolve_effective_turn_route,
 )
 from boxer_company.routers.device_ssh_security import (
     company_api_device_ssh_context,
@@ -103,14 +120,37 @@ class _AutomationCoordinator(Protocol):
         ...
 
 
+class _AutomationDeliveryBroker(Protocol):
+    def pull(self, *, tenant_id: str, cycle: str | None = None) -> Any:
+        ...
+
+    def acknowledge(
+        self,
+        *,
+        request_id: str,
+        tenant_id: str,
+        batch_id: str,
+        receipts: tuple[Any, ...],
+    ) -> Any:
+        ...
+
+
 ReadinessProbe = Callable[[], bool]
 
 _SERVICE_NAME = "boxer-company-api"
 _TURN_PATH = "/internal/v1/assistant/turns"
 _AUTOMATION_CYCLE_PATH = "/internal/v1/automation/cycles"
+_AUTOMATION_DELIVERY_PULL_PATH = (
+    "/internal/v1/automation/deliveries/pull"
+)
+_AUTOMATION_DELIVERY_ACK_PATH = (
+    "/internal/v1/automation/deliveries/ack"
+)
 _RUNTIME_UNSET = object()
 _PROBE_UNSET = object()
 _AUTOMATION_UNSET = object()
+_AUTOMATION_DELIVERY_UNSET = object()
+_HPA_CHANGE_UNSET = object()
 _REQUEST_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
 )
@@ -128,6 +168,12 @@ def create_company_api_app(
     automation_coordinator: (
         _AutomationCoordinator | None | object
     ) = _AUTOMATION_UNSET,
+    automation_delivery_broker: (
+        _AutomationDeliveryBroker | None | object
+    ) = _AUTOMATION_DELIVERY_UNSET,
+    hpa_change_coordinator: (
+        HpaChangeCoordinator | None | object
+    ) = _HPA_CHANGE_UNSET,
 ) -> FastAPI:
     """내부 인증 경계와 채널 중립 assistant runtime을 조립한다."""
 
@@ -141,13 +187,25 @@ def create_company_api_app(
         default_runtime_ready=default_runtime_ready,
     )
     caller_registry = CallerRegistry(api_settings)
+    if hpa_change_coordinator is _HPA_CHANGE_UNSET:
+        hpa_change_runtime: HpaChangeCoordinator | None = (
+            create_hpa_change_coordinator()
+        )
+    else:
+        hpa_change_runtime = cast(
+            HpaChangeCoordinator | None,
+            hpa_change_coordinator,
+        )
+    automation_state_store = (
+        JsonAutomationCycleStateStore(api_settings.automation_state_path)
+        if api_settings.automation_enabled_cycles
+        else None
+    )
     if automation_coordinator is _AUTOMATION_UNSET:
         automation_runtime: _AutomationCoordinator | None = (
             DurableAutomationCycleCoordinator(
                 build_default_automation_cycle_service(),
-                JsonAutomationCycleStateStore(
-                    api_settings.automation_state_path
-                ),
+                cast(JsonAutomationCycleStateStore, automation_state_store),
             )
             if api_settings.automation_enabled_cycles
             else None
@@ -156,6 +214,31 @@ def create_company_api_app(
         automation_runtime = cast(
             _AutomationCoordinator | None,
             automation_coordinator,
+        )
+    if automation_delivery_broker is _AUTOMATION_DELIVERY_UNSET:
+        delivery_runtime: _AutomationDeliveryBroker | None = (
+            AutomationDeliveryBroker(
+                cast(JsonAutomationCycleStateStore, automation_state_store),
+                cast(
+                    DurableAutomationCycleCoordinator,
+                    automation_runtime,
+                ),
+                enabled_cycles=frozenset(
+                    api_settings.automation_enabled_cycles
+                    - {"sms_delivery"}
+                ),
+            )
+            if (
+                api_settings.automation_scheduler_enabled
+                and automation_state_store is not None
+                and automation_runtime is not None
+            )
+            else None
+        )
+    else:
+        delivery_runtime = cast(
+            _AutomationDeliveryBroker | None,
+            automation_delivery_broker,
         )
     # Dynamo 같은 새 인프라 없이 현 단일 worker 안에서 Slack redelivery와
     # 같은 장비의 동시 mutation만 막는 최소 중복 억제 경계다.
@@ -192,6 +275,19 @@ def create_company_api_app(
             )
         except Exception:
             return False
+
+    if hpa_change_runtime is not None:
+        # HPA HTTP route는 Slack payload 수집과 delivery transport만 받고,
+        # GitHub credential·SQLite·상태 전이는 이 API runtime이 소유한다.
+        app.include_router(
+            create_hpa_change_router(
+                service=HpaChangeTransportService(hpa_change_runtime),
+                caller_registry=caller_registry,
+                is_ready=is_ready,
+            )
+        )
+        # SQLite connection은 app shutdown 때 닫고 Slack process에는 복제하지 않는다.
+        app.add_event_handler("shutdown", hpa_change_runtime.close)
 
     @app.middleware("http")
     async def _transport_headers(
@@ -274,7 +370,34 @@ def create_company_api_app(
             request.headers.get("Authorization"),
             request_id,
         )
-        authorize_turn(principal, turn, request_id)
+        hinted_domain_request = turn.to_company_request(request_id)
+        route_decision = resolve_effective_turn_route(
+            hinted_domain_request,
+            client_route_group=turn.routeGroup,
+        )
+        # capability는 caller가 보낸 routeGroup이 아니라 서버 matcher가
+        # 확정한 민감 범위로 검사해 None/freeform/structured 우회를 막는다.
+        authorize_turn(
+            principal,
+            turn,
+            request_id,
+            effective_route_group=route_decision.route_group,
+        )
+        if route_decision.client_hint_mismatch:
+            # 권한·caller scope 확인 뒤 안전한 일반 validation problem만
+            # 반환하고 어떤 matcher 이름이나 질문 원문도 노출하지 않는다.
+            raise CompanyApiProblem(
+                status=422,
+                code="validation_failed",
+                request_id=request_id,
+                retryable=False,
+            )
+        if route_decision.route_group != turn.routeGroup:
+            # 이후 feature flag, request-log, mutation/replay guard와 runtime이
+            # 모두 같은 server-owned effective group 하나를 사용한다.
+            turn = turn.model_copy(
+                update={"routeGroup": route_decision.route_group}
+            )
         domain_request = turn.to_company_request(request_id)
         request_log_delivery_receipt = isinstance(
             turn.operationAction,
@@ -783,7 +906,10 @@ def create_company_api_app(
             cycle.tenantId,
             request_id,
         )
-        if cycle.cycle not in api_settings.automation_enabled_cycles:
+        if (
+            api_settings.automation_scheduler_enabled
+            or cycle.cycle not in api_settings.automation_enabled_cycles
+        ):
             # capability만으로 feature-off cycle을 실행할 수 없게 운영 flag를
             # endpoint admission에도 다시 적용한다.
             raise CompanyApiProblem(
@@ -863,7 +989,172 @@ def create_company_api_app(
         )
         return JSONResponse(content=payload)
 
+    @app.post(_AUTOMATION_DELIVERY_PULL_PATH, response_model=None)
+    def pull_automation_delivery(
+        request: Request,
+        delivery_request: AutomationDeliveryPullInput,
+    ) -> JSONResponse:
+        request_id, principal = _authenticate_automation_transport_request(
+            request,
+            caller_registry=caller_registry,
+            tenant_id=delivery_request.tenantId,
+        )
+        if (
+            not api_settings.automation_scheduler_enabled
+            or delivery_runtime is None
+            or not is_ready()
+        ):
+            raise CompanyApiProblem(
+                status=503,
+                code="service_not_ready",
+                request_id=request_id,
+                retryable=False,
+            )
+        if (
+            delivery_request.cycle is not None
+            and delivery_request.cycle
+            not in api_settings.automation_enabled_cycles - {"sms_delivery"}
+        ):
+            raise CompanyApiProblem(
+                status=503,
+                code="service_not_ready",
+                request_id=request_id,
+                retryable=False,
+            )
+        started_at = time.monotonic()
+        try:
+            batch = delivery_runtime.pull(
+                tenant_id=delivery_request.tenantId,
+                cycle=delivery_request.cycle,
+            )
+        except AutomationCycleContractError:
+            raise CompanyApiProblem(
+                status=422,
+                code="validation_failed",
+                request_id=request_id,
+                retryable=False,
+            ) from None
+        except Exception as exc:
+            emit_api_event(
+                "company_api_automation_delivery_pull_failed",
+                caller_id=principal.caller_id,
+                request_id=request_id,
+                error_type=type(exc).__name__,
+                status=500,
+            )
+            raise CompanyApiProblem(
+                status=500,
+                code="internal_error",
+                request_id=request_id,
+                retryable=False,
+            ) from None
+        payload = serialize_automation_delivery_batch(batch, request_id)
+        emit_api_event(
+            "company_api_automation_delivery_pulled",
+            caller_id=principal.caller_id,
+            request_id=request_id,
+            cycle=(batch.cycle if batch is not None else ""),
+            has_batch=batch is not None,
+            status=200,
+            duration_ms=int((time.monotonic() - started_at) * 1_000),
+        )
+        return JSONResponse(content=payload)
+
+    @app.post(_AUTOMATION_DELIVERY_ACK_PATH, response_model=None)
+    def acknowledge_automation_delivery(
+        request: Request,
+        acknowledgement: AutomationDeliveryAckInput,
+    ) -> JSONResponse:
+        request_id, principal = _authenticate_automation_transport_request(
+            request,
+            caller_registry=caller_registry,
+            tenant_id=acknowledgement.tenantId,
+        )
+        if (
+            not api_settings.automation_scheduler_enabled
+            or delivery_runtime is None
+            or not is_ready()
+        ):
+            raise CompanyApiProblem(
+                status=503,
+                code="service_not_ready",
+                request_id=request_id,
+                retryable=False,
+            )
+        started_at = time.monotonic()
+        try:
+            result = delivery_runtime.acknowledge(
+                request_id=request_id,
+                tenant_id=acknowledgement.tenantId,
+                batch_id=acknowledgement.batchId,
+                receipts=acknowledgement.to_receipts(),
+            )
+            payload = serialize_automation_delivery_ack(
+                batch_id=acknowledgement.batchId,
+                result=result,
+                request_id=request_id,
+            )
+        except AutomationCycleUncertainError:
+            raise CompanyApiProblem(
+                status=409,
+                code="operation_in_progress",
+                request_id=request_id,
+                retryable=False,
+            ) from None
+        except AutomationCycleContractError:
+            raise CompanyApiProblem(
+                status=422,
+                code="validation_failed",
+                request_id=request_id,
+                retryable=False,
+            ) from None
+        except Exception as exc:
+            emit_api_event(
+                "company_api_automation_delivery_ack_failed",
+                caller_id=principal.caller_id,
+                request_id=request_id,
+                error_type=type(exc).__name__,
+                status=500,
+            )
+            raise CompanyApiProblem(
+                status=500,
+                code="internal_error",
+                request_id=request_id,
+                retryable=False,
+            ) from None
+        emit_api_event(
+            "company_api_automation_delivery_acknowledged",
+            caller_id=principal.caller_id,
+            request_id=request_id,
+            acknowledged=bool(payload["acknowledged"]),
+            status=200,
+            duration_ms=int((time.monotonic() - started_at) * 1_000),
+        )
+        return JSONResponse(content=payload)
+
     return app
+
+
+def _authenticate_automation_transport_request(
+    request: Request,
+    *,
+    caller_registry: CallerRegistry,
+    tenant_id: str,
+) -> tuple[str, Any]:
+    """pull/ACK가 같은 request ID·trace·caller 경계를 공유하게 한다."""
+
+    request_id = validate_request_id(request.headers.get("X-Request-ID"))
+    request.state.request_id = request_id
+    request.state.traceparent = validate_traceparent(
+        request.headers.get("traceparent"),
+        request_id,
+    )
+    principal = caller_registry.authenticate(
+        request.headers.get("Authorization"),
+        request_id,
+    )
+    authorize_automation_transport(principal, tenant_id, request_id)
+    return request_id, principal
 
 
 def _accepts_ndjson(request: Request) -> bool:

@@ -14,9 +14,7 @@ from boxer_company.device_health_state_bundle import (
     DeviceHealthStateBundleError,
     FILE_DIGEST_PATTERN,
     load_protected_json_file,
-    replace_protected_json_file,
     validate_device_notification_legacy_state,
-    validate_device_health_state_bundle,
 )
 from boxer_company.sms_delivery_cycle import (
     inspect_automatic_sms_recovery_state,
@@ -255,251 +253,9 @@ def _inspect_configured_sms_recovery_state(
     return state
 
 
-def _inspect_exact_drained_sms_recovery_target(
-    *,
-    sms_outbox_path: str | Path,
-    expected_state_digest: str,
-    now: datetime,
-) -> Mapping[str, Any]:
-    """Slack runtime의 canonical SMS revision과 세 drain 조건을 묶는다."""
-
-    state = _inspect_configured_sms_recovery_state(
-        sms_outbox_path=sms_outbox_path,
-        now=now,
-    )
-    if (
-        state["stateDigest"] != expected_state_digest
-        or state["outboxItemCount"] != 0
-        or state["unresolvedClaimCount"] != 0
-        or state["activeSettledClaimCount"] != 0
-    ):
-        raise DeviceHealthStateBundleError(
-            "Slack rollback import SMS target is not exact drained"
-        )
-    return state
-
-
-def import_device_health_rollback_bundle(
-    *,
-    bundle_path: str | Path,
-    expected_bundle_digest: str,
-    state_path: str | Path,
-    expected_state_digest: str,
-    notification_state_path: str | Path,
-    expected_notification_state_digest: str,
-    sms_outbox_path: str | Path,
-    expected_sms_state_digest: str,
-    now: datetime | None = None,
-) -> Mapping[str, Any]:
-    """검증된 API rollback bundle을 exact Slack state와 SMS target에 import한다."""
-
-    if (
-        not FILE_DIGEST_PATTERN.fullmatch(str(expected_bundle_digest or ""))
-        or not FILE_DIGEST_PATTERN.fullmatch(str(expected_state_digest or ""))
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_notification_state_digest or "")
-        )
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_sms_state_digest or "")
-        )
-        or not str(sms_outbox_path or "").strip()
-    ):
-        raise DeviceHealthStateBundleError("rollback import digest is invalid")
-    actual_now = now or datetime.now(timezone.utc)
-    if actual_now.tzinfo is None:
-        raise DeviceHealthStateBundleError("rollback import time is invalid")
-    raw_bundle, bundle_digest = load_protected_json_file(
-        bundle_path,
-        label="device health rollback bundle",
-    )
-    if bundle_digest != expected_bundle_digest:
-        raise DeviceHealthStateBundleError("rollback bundle changed")
-    bundle = validate_device_health_state_bundle(
-        raw_bundle,
-        direction="api_to_slack",
-    )
-    # import 시작 전에 실제 Slack runtime이 쓸 canonical SMS 두 파일이
-    # initialized/protected/drained인지 exact digest로 먼저 확정한다.
-    _inspect_exact_drained_sms_recovery_target(
-        sms_outbox_path=sms_outbox_path,
-        expected_state_digest=expected_sms_state_digest,
-        now=actual_now,
-    )
-    state, state_digest = load_protected_json_file(
-        state_path,
-        label="Slack device health state",
-    )
-    if not isinstance(state, Mapping) or state_digest != expected_state_digest:
-        raise DeviceHealthStateBundleError("Slack device health state changed")
-    notification_state, notification_state_digest = load_protected_json_file(
-        notification_state_path,
-        label="Slack device notification state",
-    )
-    if notification_state_digest != expected_notification_state_digest:
-        raise DeviceHealthStateBundleError(
-            "Slack device notification state changed"
-        )
-    current_notification = validate_device_notification_legacy_state(
-        notification_state,
-        require_drained=True,
-    )
-    payload = bundle["payload"]
-    existing_marker = state.get("apiRollbackMigration")
-    raw_notification_marker = (
-        notification_state.get("apiRollbackMigration")
-        if isinstance(notification_state, Mapping)
-        else None
-    )
-    notification_matches = (
-        current_notification == payload["notificationState"]
-        and isinstance(raw_notification_marker, Mapping)
-        and raw_notification_marker.get("bundleDigest") == bundle_digest
-    )
-    health_matches = (
-        state.get("alertDeliveryOverride") == payload["alertDeliveryOverride"]
-        and state.get("alertFingerprints") == payload["alertFingerprints"]
-        and state.get("pendingAlertFingerprints")
-        == payload["pendingAlertFingerprints"]
-        and isinstance(existing_marker, Mapping)
-        and existing_marker.get("bundleDigest") == bundle_digest
-    )
-    if (
-        health_matches
-        and notification_matches
-    ):
-        final_sms_state = _inspect_exact_drained_sms_recovery_target(
-            sms_outbox_path=sms_outbox_path,
-            expected_state_digest=expected_sms_state_digest,
-            now=actual_now,
-        )
-        return {
-            "updated": False,
-            "kind": "device_health_rollback_import",
-            "bundleDigest": bundle_digest,
-            "slackStateDigest": state_digest,
-            "slackNotificationStateDigest": notification_state_digest,
-            "targetSmsStateDigest": final_sms_state["stateDigest"],
-            "pendingDecision": payload["pendingDecision"],
-        }
-    if health_matches and not notification_matches:
-        # health marker는 transaction의 마지막 commit marker다. 이것만 먼저
-        # 존재하면 중지 전 partial import 여부를 안전하게 판정할 수 없다.
-        raise DeviceHealthStateBundleError(
-            "Slack rollback state is inconsistent"
-        )
-
-    next_notification_state_digest = notification_state_digest
-    if not notification_matches:
-        next_notification_state = {
-            **payload["notificationState"],
-            "apiRollbackMigration": {
-                "version": 1,
-                "migratedAt": actual_now.astimezone(timezone.utc).isoformat(),
-                "bundleDigest": bundle_digest,
-                "apiNotificationStateDigest": bundle["safety"][
-                    "notificationStateDigest"
-                ],
-                "previousSlackStateDigest": notification_state_digest,
-            },
-        }
-        # notification을 먼저 commit하고 health marker를 마지막에 써서 중간
-        # 종료도 stopped-service 상태에서 같은 bundle로 재개할 수 있게 한다.
-        _, final_bundle_digest = load_protected_json_file(
-            bundle_path,
-            label="device health rollback bundle",
-        )
-        if final_bundle_digest != bundle_digest:
-            raise DeviceHealthStateBundleError("rollback bundle changed")
-        # notification CAS 직전에 SMS target을 다시 확인해 partial import가
-        # 다른 provider revision과 결합되지 않게 한다.
-        _inspect_exact_drained_sms_recovery_target(
-            sms_outbox_path=sms_outbox_path,
-            expected_state_digest=expected_sms_state_digest,
-            now=actual_now,
-        )
-        next_notification_state_digest = replace_protected_json_file(
-            notification_state_path,
-            next_notification_state,
-            expected_existing_digest=notification_state_digest,
-            label="Slack device notification state",
-        )
-        try:
-            _inspect_exact_drained_sms_recovery_target(
-                sms_outbox_path=sms_outbox_path,
-                expected_state_digest=expected_sms_state_digest,
-                now=actual_now,
-            )
-        except DeviceHealthStateBundleError as exc:
-            # notification은 이미 CAS됐으므로 write 0처럼 숨기지 않는다.
-            # Slack은 계속 중지한 채 같은 bundle의 partial marker를 수동 검토한다.
-            raise DeviceHealthStateBundleError(
-                "Slack rollback notification state was applied; "
-                "SMS target requires manual verification"
-            ) from exc
-    next_state = {
-        **dict(state),
-        "alertDeliveryOverride": payload["alertDeliveryOverride"],
-        "alertFingerprints": payload["alertFingerprints"],
-        "pendingAlertFingerprints": payload["pendingAlertFingerprints"],
-        "apiRollbackMigration": {
-            "version": 1,
-            "migratedAt": actual_now.astimezone(timezone.utc).isoformat(),
-            "bundleDigest": bundle_digest,
-            "apiCursorDigest": bundle["sourceDigest"],
-            "previousSlackStateDigest": state_digest,
-            "pendingDecision": payload["pendingDecision"],
-        },
-    }
-    # health commit marker 직전에도 bundle bytes를 다시 확인한다.
-    _, final_bundle_digest = load_protected_json_file(
-        bundle_path,
-        label="device health rollback bundle",
-    )
-    if final_bundle_digest != bundle_digest:
-        raise DeviceHealthStateBundleError("rollback bundle changed")
-    _inspect_exact_drained_sms_recovery_target(
-        sms_outbox_path=sms_outbox_path,
-        expected_state_digest=expected_sms_state_digest,
-        now=actual_now,
-    )
-    next_state_digest = replace_protected_json_file(
-        state_path,
-        next_state,
-        expected_existing_digest=state_digest,
-        label="Slack device health state",
-    )
-    try:
-        final_sms_state = _inspect_exact_drained_sms_recovery_target(
-            sms_outbox_path=sms_outbox_path,
-            expected_state_digest=expected_sms_state_digest,
-            now=actual_now,
-        )
-    except DeviceHealthStateBundleError as exc:
-        # health commit marker까지 기록됐으므로 성공으로 축약하지 않고
-        # 적용 완료 상태 그대로 서비스 중지·수동 확인을 요구한다.
-        raise DeviceHealthStateBundleError(
-            "Slack rollback state was applied; "
-            "SMS target requires manual verification"
-        ) from exc
-    return {
-        "updated": True,
-        "kind": "device_health_rollback_import",
-        "bundleDigest": bundle_digest,
-        "previousSlackStateDigest": state_digest,
-        "slackStateDigest": next_state_digest,
-        "previousSlackNotificationStateDigest": notification_state_digest,
-        "slackNotificationStateDigest": next_notification_state_digest,
-        "targetSmsStateDigest": final_sms_state["stateDigest"],
-        "pendingDecision": payload["pendingDecision"],
-        "alertFingerprintCount": len(payload["alertFingerprints"]),
-        "pendingFingerprintCount": len(payload["pendingAlertFingerprints"]),
-        "notificationLastSeenId": payload["notificationState"]["lastSeenId"],
-    }
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export/import offline device health state bundles on Slack host."
+        description="Inspect or export device health state on the Slack host."
     )
     parser.add_argument(
         "--state-path",
@@ -515,11 +271,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--inspect-state", action="store_true")
     parser.add_argument("--export-forward-bundle-path")
-    parser.add_argument("--import-rollback-bundle-path")
     parser.add_argument("--expected-state-digest")
     parser.add_argument("--expected-notification-state-digest")
     parser.add_argument("--expected-sms-state-digest")
-    parser.add_argument("--expected-bundle-digest")
     parser.add_argument(
         "--confirm-slack-service-stopped",
         action="store_true",
@@ -534,7 +288,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         for value in (
             args.inspect_state,
             args.export_forward_bundle_path,
-            args.import_rollback_bundle_path,
         )
     )
     if modes != 1:
@@ -550,7 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 notification_state_path=args.notification_state_path,
                 sms_outbox_path=args.sms_outbox_path,
             )
-        elif args.export_forward_bundle_path:
+        else:
             if not all(
                 (
                     args.state_path,
@@ -574,33 +327,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_sms_state_digest=args.expected_sms_state_digest,
                 sms_outbox_path=args.sms_outbox_path,
             )
-        else:
-            if not all(
-                (
-                    args.state_path,
-                    args.notification_state_path,
-                    args.expected_state_digest,
-                    args.expected_notification_state_digest,
-                    args.expected_bundle_digest,
-                    args.sms_outbox_path,
-                    args.expected_sms_state_digest,
-                )
-            ):
-                raise DeviceHealthStateBundleError(
-                    "rollback import confirmation is incomplete"
-                )
-            result = import_device_health_rollback_bundle(
-                bundle_path=args.import_rollback_bundle_path,
-                expected_bundle_digest=args.expected_bundle_digest,
-                state_path=args.state_path,
-                expected_state_digest=args.expected_state_digest,
-                notification_state_path=args.notification_state_path,
-                expected_notification_state_digest=(
-                    args.expected_notification_state_digest
-                ),
-                sms_outbox_path=args.sms_outbox_path,
-                expected_sms_state_digest=args.expected_sms_state_digest,
-            )
     except DeviceHealthStateBundleError as exc:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
@@ -613,7 +339,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "export_device_health_forward_bundle",
-    "import_device_health_rollback_bundle",
     "inspect_slack_device_health_state",
     "main",
 ]

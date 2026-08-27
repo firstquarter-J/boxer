@@ -28,6 +28,17 @@ def _run_sms_delivery_reporter_once(
 ) -> int:
     """local 호환 또는 공통 API cycle을 정확히 한 번 실행한다."""
 
+    if bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    ):
+        # scheduler companion이 provider outbox drain까지 소유하므로 Slack은
+        # local/API cycle 어느 쪽도 실행하지 않는다.
+        return 0
+
     if automation_client is not None:
         scheduled_at = now or datetime.now().astimezone()
         if scheduled_at.tzinfo is None:
@@ -53,6 +64,14 @@ def _sms_delivery_reporter_loop(
     logger: logging.Logger,
     automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
+    if bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    ):
+        return
     # Slack 프로세스는 실행 시각만 결정하고 provider·outbox·Sheet 처리는 company에 맡긴다.
     poll_interval_sec = max(
         10,
@@ -77,6 +96,15 @@ def attach_sms_delivery_reporter(
     logger: logging.Logger | None = None,
     automation_client: CompanyAutomationApiClient | None = None,
 ) -> None:
+    if bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    ):
+        # 새 모드에서 SMS receipt cycle은 API companion 전용이며 Slack thread를 만들지 않는다.
+        return
     if automation_client is None and (
         not cs.DEVICE_HEALTH_SHEET_ENABLED
         or str(cs.DEVICE_HEALTH_MONITOR_SMS_PROVIDER or "").strip().lower() != "solapi"

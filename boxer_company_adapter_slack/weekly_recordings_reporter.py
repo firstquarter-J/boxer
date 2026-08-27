@@ -1,8 +1,9 @@
 import json
 import logging
+import re
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,24 @@ from boxer_company_adapter_slack.automation_reporter import (
 
 _WEEKLY_RECORDINGS_REPORT_THREAD: threading.Thread | None = None
 _WEEKLY_RECORDINGS_REPORT_THREAD_LOCK = threading.Lock()
+_WEEKLY_TRANSPORT_CYCLE_KEY_PATTERN = re.compile(
+    r"^weekly:(\d{4}-\d{2}-\d{2})$"
+)
+_SLACK_TRANSPORT_CHANNEL_ID_PATTERN = re.compile(
+    r"^[CGD][A-Z0-9]{5,31}$"
+)
+
+
+def _automation_scheduler_enabled() -> bool:
+    """신·구 버전이 함께 배포되는 동안 새 소유권 flag를 안전하게 읽는다."""
+
+    return bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    )
 
 
 def _weekly_recordings_report_state_path() -> Path:
@@ -93,6 +112,19 @@ def _run_weekly_recordings_report_if_due(
 ) -> bool:
     if not cs.WEEKLY_RECORDINGS_REPORT_ENABLED:
         return False
+    local_now = _coerce_weekly_recordings_report_now(now)
+    if _automation_scheduler_enabled():
+        # 일정·주차·목적지는 API scheduler가 정본이다. Slack은 local
+        # channel/DB/state를 읽기 전에 pending transport로 바로 들어간다.
+        if automation_client is None:
+            logger.warning("주간 recordings transport를 켤 수 없어. API client가 없어")
+            return False
+        return _run_weekly_recordings_report_transport(
+            client,
+            logger,
+            automation_client=automation_client,
+            poll_now=local_now,
+        )
     if automation_client is None and not s.DB_QUERY_ENABLED:
         logger.warning("주간 recordings 리포트를 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
@@ -102,7 +134,6 @@ def _run_weekly_recordings_report_if_due(
         logger.warning("주간 recordings 리포트 채널 ID가 없어. WEEKLY_RECORDINGS_REPORT_CHANNEL_ID를 확인해줘")
         return False
 
-    local_now = _coerce_weekly_recordings_report_now(now)
     state = _load_weekly_recordings_report_state(logger=logger)
     target_week_start_date, target_week_end_date = _resolve_weekly_recordings_report_target_week(
         now=local_now
@@ -247,6 +278,195 @@ def _run_weekly_recordings_report_if_due(
     return True
 
 
+def _run_weekly_recordings_report_transport(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    automation_client: CompanyAutomationApiClient,
+    poll_now: datetime,
+) -> bool:
+    """API-owned 주간 pending 한 건을 Slack thread로만 전달한다."""
+
+    # crash journal을 먼저 닫아 API cursor가 전진한 뒤 다음 pending을
+    # 조회한다. batch metadata가 있으면 flush 내부에서 pull/ACK endpoint를 쓴다.
+    flush_automation_deliveries(
+        automation_client,
+        cycle="weekly_recordings",
+        cycle_key="transport:weekly",
+        scheduled_at=poll_now,
+        logger=logger,
+    )
+    batch = automation_client.pull_pending(
+        request_id=build_automation_request_id(
+            cycle="weekly_recordings",
+            cycle_key="transport:pull",
+            scheduled_at=poll_now,
+        ),
+        cycle="weekly_recordings",
+    )
+    if batch is None:
+        return False
+
+    report_summary, render_now = _validate_weekly_transport_batch(batch)
+    delivery = batch.deliveries[0]
+    message_text = _format_weekly_recordings_report(
+        report_summary,
+        now=render_now,
+        include_title=False,
+    )
+    message_blocks = _build_weekly_recordings_report_blocks(
+        report_summary,
+        now=render_now,
+        include_header=False,
+    )
+    title_response = client.chat_postMessage(
+        channel=batch.channel_id,
+        text=_WEEKLY_RECORDINGS_REPORT_TITLE,
+        unfurl_links=False,
+        unfurl_media=False,
+        client_msg_id=build_automation_delivery_client_msg_id(
+            cycle=batch.cycle,
+            cycle_key=batch.cycle_key,
+            delivery_id=delivery.delivery_id,
+            part="title",
+        ),
+    )
+    thread_ts = _extract_weekly_recordings_message_ts(title_response)
+    if not thread_ts:
+        raise RuntimeError("주간 recordings 리포트 제목 메시지 ts를 받지 못했어")
+    report_response = client.chat_postMessage(
+        channel=batch.channel_id,
+        text=message_text,
+        blocks=message_blocks,
+        thread_ts=thread_ts,
+        unfurl_links=False,
+        unfurl_media=False,
+        client_msg_id=build_automation_delivery_client_msg_id(
+            cycle=batch.cycle,
+            cycle_key=batch.cycle_key,
+            delivery_id=delivery.delivery_id,
+            part="report",
+        ),
+    )
+    report_message_ts = (
+        _extract_weekly_recordings_message_ts(report_response) or thread_ts
+    )
+    # domain payload는 저장하지 않고 exact batch identity와 Slack receipt만
+    # 남겨 재기동 뒤에도 같은 API pending을 ACK한다.
+    remember_automation_delivery(
+        cycle=batch.cycle,
+        cycle_key=batch.cycle_key,
+        delivery=AutomationSlackDelivery(
+            delivery_id=delivery.delivery_id,
+            external_message_id=report_message_ts,
+            permalink="",
+            delivered_at=poll_now,
+        ),
+        batch=batch,
+    )
+    logger.info(
+        "Posted weekly recordings transport channel=%s cycle_key=%s",
+        batch.channel_id,
+        batch.cycle_key,
+    )
+    return True
+
+
+def _validate_weekly_transport_batch(batch: Any) -> tuple[dict[str, Any], datetime]:
+    """주간 renderer가 이해하는 scheduler batch만 exact 계약으로 허용한다."""
+
+    cycle_key_match = _WEEKLY_TRANSPORT_CYCLE_KEY_PATTERN.fullmatch(
+        str(getattr(batch, "cycle_key", "") or "")
+    )
+    deliveries = getattr(batch, "deliveries", ())
+    scheduled_at = getattr(batch, "scheduled_at", None)
+    render_now = (
+        _coerce_weekly_recordings_report_now(scheduled_at)
+        if isinstance(scheduled_at, datetime) and scheduled_at.tzinfo is not None
+        else None
+    )
+    if (
+        getattr(batch, "cycle", None) != "weekly_recordings"
+        or cycle_key_match is None
+        or not _SLACK_TRANSPORT_CHANNEL_ID_PATTERN.fullmatch(
+            str(getattr(batch, "channel_id", "") or "")
+        )
+        or getattr(batch, "conversation", {}) != {}
+        or not isinstance(scheduled_at, datetime)
+        or scheduled_at.tzinfo is None
+        or render_now is None
+        or not isinstance(deliveries, tuple)
+        or len(deliveries) != 1
+        or deliveries[0].kind != "weekly_recordings_report"
+    ):
+        raise RuntimeError("주간 recordings transport batch 계약이 올바르지 않아")
+    try:
+        week_start = date.fromisoformat(cycle_key_match.group(1))
+    except ValueError as exc:
+        raise RuntimeError(
+            "주간 recordings transport batch 계약이 올바르지 않아"
+        ) from exc
+    week_end = week_start + timedelta(days=6)
+    delivery = deliveries[0]
+    payload = delivery.payload
+    expected_keys = {
+        "weekStartDate",
+        "weekEndDate",
+        "previousWeekStartDate",
+        "previousWeekEndDate",
+        "hospitalCount",
+        "totalCount",
+        "previousTotalCount",
+        "totalDelta",
+        "totalChangeRate",
+        "topRows",
+        "topRowsLimit",
+        "surgeRows",
+        "surgeCount",
+        "dropRows",
+        "dropCount",
+        "changeRowsLimit",
+    }
+    count_keys = {
+        "hospitalCount",
+        "totalCount",
+        "previousTotalCount",
+        "topRowsLimit",
+        "surgeCount",
+        "dropCount",
+        "changeRowsLimit",
+    }
+    if (
+        week_start.weekday() != 0
+        or delivery.delivery_id
+        != f"weekly_recordings:{week_start.isoformat()}"
+        or not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload.get("weekStartDate") != week_start.isoformat()
+        or payload.get("weekEndDate") != week_end.isoformat()
+        or payload.get("previousWeekStartDate")
+        != (week_start - timedelta(days=7)).isoformat()
+        or payload.get("previousWeekEndDate")
+        != (week_start - timedelta(days=1)).isoformat()
+        or render_now.date() != week_start + timedelta(days=7)
+        or any(
+            type(payload.get(key)) is not int or payload[key] < 0
+            for key in count_keys
+        )
+        or type(payload.get("totalDelta")) is not int
+        or (
+            payload.get("totalChangeRate") is not None
+            and type(payload.get("totalChangeRate")) not in {int, float}
+        )
+        or any(
+            not isinstance(payload.get(key), list)
+            for key in ("topRows", "surgeRows", "dropRows")
+        )
+    ):
+        raise RuntimeError("주간 recordings transport batch 계약이 올바르지 않아")
+    return dict(payload), render_now
+
+
 def _extract_weekly_recordings_message_ts(response: Any) -> str:
     direct = str(
         getattr(response, "get", lambda *_args, **_kwargs: "")("ts")
@@ -289,12 +509,18 @@ def attach_weekly_recordings_reporter(
         return
 
     actual_logger = logger or logging.getLogger(__name__)
-    if automation_client is None and not s.DB_QUERY_ENABLED:
+    scheduler_enabled = _automation_scheduler_enabled()
+    if scheduler_enabled and automation_client is None:
+        actual_logger.warning(
+            "주간 recordings transport가 활성화됐는데 API client가 없어 시작하지 않을게"
+        )
+        return
+    if not scheduler_enabled and automation_client is None and not s.DB_QUERY_ENABLED:
         actual_logger.warning("주간 recordings 리포트가 활성화됐는데 DB_QUERY_ENABLED가 꺼져 있어 시작하지 않을게")
         return
 
     channel_id = str(cs.WEEKLY_RECORDINGS_REPORT_CHANNEL_ID or "").strip()
-    if not channel_id:
+    if not scheduler_enabled and not channel_id:
         actual_logger.warning(
             "주간 recordings 리포트가 활성화됐는데 채널 ID가 없어. WEEKLY_RECORDINGS_REPORT_CHANNEL_ID를 확인해줘"
         )
@@ -317,9 +543,12 @@ def attach_weekly_recordings_reporter(
         )
         _WEEKLY_RECORDINGS_REPORT_THREAD.start()
 
-    actual_logger.info(
-        "Started weekly recordings report scheduler channel=%s every Monday at %02d:%02d KST",
-        channel_id,
-        max(0, min(23, int(cs.WEEKLY_RECORDINGS_REPORT_HOUR_KST))),
-        max(0, min(59, int(cs.WEEKLY_RECORDINGS_REPORT_MINUTE_KST))),
-    )
+    if scheduler_enabled:
+        actual_logger.info("Started weekly recordings Slack transport")
+    else:
+        actual_logger.info(
+            "Started weekly recordings report scheduler channel=%s every Monday at %02d:%02d KST",
+            channel_id,
+            max(0, min(23, int(cs.WEEKLY_RECORDINGS_REPORT_HOUR_KST))),
+            max(0, min(59, int(cs.WEEKLY_RECORDINGS_REPORT_MINUTE_KST))),
+        )

@@ -43,6 +43,20 @@ class BarcodeValidationRouteDetectionTests(unittest.TestCase):
             )
         )
 
+    def test_does_not_match_playbook_policy_question_from_barcode_thread(self) -> None:
+        self.assertFalse(
+            _is_barcode_validation_status_request(
+                "바코드 검증 기준이 뭐야?",
+                "12345678910",
+            )
+        )
+        self.assertTrue(
+            _is_barcode_validation_status_request(
+                "검증 기준상 이 바코드는 통과해?",
+                "12345678910",
+            )
+        )
+
 
 class BarcodeValidationQueryTests(unittest.TestCase):
     @patch("boxer_company.routers.barcode_validation._lookup_mda_special_barcodes_by_barcode")

@@ -184,6 +184,16 @@ MOMMYBOX_REF_LEGACY_PATH = os.getenv(
     str(Path(MOMMYBOX_REFERENCE_ROOT) / "legacy"),
 ).strip()
 
+# true이면 automation 일정과 domain 실행은 API companion만 소유하고,
+# Slack reporter는 pending pull·렌더링·receipt ACK만 수행한다.
+BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED = (
+    os.getenv(
+        "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+        "false",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 WEEKLY_RECORDINGS_REPORT_ENABLED = (
     os.getenv("WEEKLY_RECORDINGS_REPORT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 )

@@ -128,8 +128,14 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
                 "boxer-company-api": (
                     "boxer_company_api.runtime:main"
                 ),
+                "boxer-company-api-automation": (
+                    "boxer_company_api.automation_scheduler:main"
+                ),
                 "boxer-company-api-automation-resolve": (
                     "boxer_company_api.automation_recovery:main"
+                ),
+                "boxer-company-api-hpa-coordinator": (
+                    "boxer_company_api.hpa_change_coordinator_runner:main"
                 ),
             },
         )

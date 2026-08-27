@@ -10,17 +10,9 @@ from typing import Mapping
 
 import pytest
 
-from boxer_company.device_health_monitor_cycle import (
-    build_device_health_monitor_seed_cursor,
-    device_health_monitor_cursor_digest,
-)
 from boxer_company.device_health_state_bundle import (
     build_device_notification_api_cursor,
-    build_device_notification_legacy_state,
-    build_device_health_rollback_bundle,
-    create_protected_json_file,
     DeviceHealthStateBundleError,
-    validate_device_health_state_bundle,
 )
 from boxer_company.sms_delivery_cycle import (
     inspect_automatic_sms_recovery_state,
@@ -28,7 +20,6 @@ from boxer_company.sms_delivery_cycle import (
 from boxer_company_adapter_slack import device_health_state_migration
 from boxer_company_adapter_slack.device_health_state_migration import (
     export_device_health_forward_bundle,
-    import_device_health_rollback_bundle,
     inspect_slack_device_health_state,
     main,
 )
@@ -151,16 +142,11 @@ def _notification_export_args(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def _rollback_notification_cursor() -> dict[str, object]:
-    return build_device_notification_api_cursor(_legacy_notification_state())
-
-
-def test_captureboard_quiet_incident_roundtrip_preserves_activity_state() -> None:
+def test_captureboard_quiet_incident_forward_cursor_preserves_activity_state() -> None:
     legacy_state = _legacy_notification_state()
     legacy_state["lastSeenId"] = 15
     incident = legacy_state["captureboardIncidents"]["MB2-C1"]
-    # quiet window의 재시작 정본이 forward/rollback 중 초기값으로
-    # 되돌아가지 않게 한다.
+    # quiet window의 재시작 정본이 forward 중 초기값으로 되돌아가지 않게 한다.
     incident.update(
         {
             "slackMessageTs": "1710000000.000150",
@@ -174,8 +160,6 @@ def test_captureboard_quiet_incident_roundtrip_preserves_activity_state() -> Non
 
     api_cursor = build_device_notification_api_cursor(legacy_state)
     api_incident = api_cursor["captureboardIncidents"]["MB2-C1"]
-    rollback_state = build_device_notification_legacy_state(api_cursor)
-    rollback_incident = rollback_state["captureboardIncidents"]["MB2-C1"]
 
     assert api_incident["rootExternalMessageId"] == incident["slackMessageTs"]
     assert api_incident["rootPermalink"] == incident["slackPermalink"]
@@ -186,9 +170,6 @@ def test_captureboard_quiet_incident_roundtrip_preserves_activity_state() -> Non
         "suppressedCount",
     ):
         assert api_incident[field] == incident[field]
-        assert rollback_incident[field] == incident[field]
-    assert rollback_incident["slackMessageTs"] == incident["slackMessageTs"]
-    assert rollback_incident["slackPermalink"] == incident["slackPermalink"]
 
 
 def _initialize_sms_recovery_state(
@@ -221,58 +202,6 @@ def _initialize_sms_recovery_state(
         require_initialized=True,
     )
     return outbox_path, state
-
-
-def _rollback_import_case(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> dict[str, object]:
-    """Slack rollback SMS CAS 테스트용 exact bundle/target revision을 만든다."""
-
-    alerts, pending = _fingerprints()
-    cursor = build_device_health_monitor_seed_cursor(
-        legacy_alert_delivery_enabled=False,
-        alert_fingerprints=alerts,
-        pending_alert_fingerprints=pending,
-        pending_decision="preserve",
-        seeded_at=_NOW,
-    )
-    bundle = build_device_health_rollback_bundle(
-        cursor=cursor,
-        notification_cursor=_rollback_notification_cursor(),
-        source_cursor_digest=device_health_monitor_cursor_digest(cursor),
-        sms_state_digest="1" * 64,
-        health_state_digest="2" * 64,
-        notification_state_digest="3" * 64,
-        exported_at=_NOW,
-    )
-    bundle_path = tmp_path / "rollback.bundle.json"
-    bundle_digest = create_protected_json_file(
-        bundle_path,
-        bundle,
-        label="test rollback bundle",
-    )
-    state_path = tmp_path / "legacy.json"
-    state_digest = _write_protected(state_path, _legacy_state())
-    notification_state_path = tmp_path / "notification.json"
-    notification_state_digest = _write_protected(
-        notification_state_path,
-        _legacy_notification_state(),
-    )
-    sms_outbox_path, sms_state = _initialize_sms_recovery_state(
-        tmp_path,
-        monkeypatch,
-    )
-    return {
-        "bundle_path": bundle_path,
-        "bundle_digest": bundle_digest,
-        "state_path": state_path,
-        "state_digest": state_digest,
-        "notification_state_path": notification_state_path,
-        "notification_state_digest": notification_state_digest,
-        "sms_outbox_path": sms_outbox_path,
-        "sms_state_digest": sms_state["stateDigest"],
-    }
 
 
 def test_forward_export_uses_live_digest_and_creates_0600_canonical_bundle(
@@ -349,33 +278,13 @@ def test_slack_bundle_mutation_cli_requires_stopped_service(
     assert not bundle_path.exists()
 
 
-def test_slack_rollback_cli_requires_sms_target_confirmation(
-    tmp_path: Path,
-) -> None:
-    """rollback CLI는 configured SMS path와 exact digest 없이는 시작하지 않는다."""
+def test_slack_migration_cli_exposes_forward_direction_only() -> None:
+    """Slack host CLI가 API→Slack import를 다시 열지 않게 고정한다."""
 
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "--state-path",
-                str(tmp_path / "health.json"),
-                "--notification-state-path",
-                str(tmp_path / "notification.json"),
-                "--sms-outbox-path",
-                str(tmp_path / "sms.json"),
-                "--import-rollback-bundle-path",
-                str(tmp_path / "rollback.bundle.json"),
-                "--expected-state-digest",
-                "1" * 64,
-                "--expected-notification-state-digest",
-                "2" * 64,
-                "--expected-bundle-digest",
-                "3" * 64,
-                "--confirm-slack-service-stopped",
-            ]
-        )
+    help_text = device_health_state_migration._build_parser().format_help()
 
-    assert str(exc_info.value) == "rollback import confirmation is incomplete"
+    assert "--export-forward-bundle-path" in help_text
+    assert "--import-rollback-bundle-path" not in help_text
 
 
 def test_forward_export_state_drift_and_insecure_parent_write_zero(
@@ -712,397 +621,3 @@ def test_forward_export_rejects_ambiguous_fingerprint_or_boolean_count(
         )
 
     assert not bundle_path.exists()
-
-
-def test_rollback_import_preserves_pending_decision_and_legacy_unrelated_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    alerts, pending = _fingerprints()
-    cursor = build_device_health_monitor_seed_cursor(
-        legacy_alert_delivery_enabled=False,
-        alert_fingerprints=alerts,
-        pending_alert_fingerprints=pending,
-        pending_decision="assume_delivered",
-        seeded_at=_NOW,
-    )
-    cursor_digest = device_health_monitor_cursor_digest(cursor)
-    bundle = build_device_health_rollback_bundle(
-        cursor=cursor,
-        notification_cursor=_rollback_notification_cursor(),
-        source_cursor_digest=cursor_digest,
-        sms_state_digest="1" * 64,
-        health_state_digest="2" * 64,
-        notification_state_digest="3" * 64,
-        exported_at=_NOW,
-    )
-    assert bundle["safety"]["activeSettledClaimCount"] == 0
-    unsafe_bundle = json.loads(json.dumps(bundle))
-    unsafe_bundle["safety"]["activeSettledClaimCount"] = 1
-    with pytest.raises(DeviceHealthStateBundleError, match="payload is invalid"):
-        validate_device_health_state_bundle(
-            unsafe_bundle,
-            direction="api_to_slack",
-        )
-    bundle_path = tmp_path / "rollback.bundle.json"
-    bundle_digest = create_protected_json_file(
-        bundle_path,
-        bundle,
-        label="test rollback bundle",
-    )
-    state_path = tmp_path / "legacy.json"
-    state_digest = _write_protected(state_path, _legacy_state())
-    notification_state_path = tmp_path / "notification.json"
-    notification_state_digest = _write_protected(
-        notification_state_path,
-        _legacy_notification_state(),
-    )
-    sms_outbox_path, sms_state = _initialize_sms_recovery_state(
-        tmp_path,
-        monkeypatch,
-    )
-
-    result = import_device_health_rollback_bundle(
-        bundle_path=bundle_path,
-        expected_bundle_digest=bundle_digest,
-        state_path=state_path,
-        expected_state_digest=state_digest,
-        notification_state_path=notification_state_path,
-        expected_notification_state_digest=notification_state_digest,
-        sms_outbox_path=sms_outbox_path,
-        expected_sms_state_digest=str(sms_state["stateDigest"]),
-        now=_NOW,
-    )
-
-    migrated = json.loads(state_path.read_text(encoding="utf-8"))
-    migrated_notification = json.loads(
-        notification_state_path.read_text(encoding="utf-8")
-    )
-    assert result["updated"] is True
-    assert migrated["unrelatedLocalCursor"] == {"keep": True}
-    assert migrated["pendingAlertFingerprints"] == {}
-    assert len(migrated["alertFingerprints"]) == 2
-    assert migrated["apiRollbackMigration"]["pendingDecision"] == (
-        "assume_delivered"
-    )
-    assert migrated_notification["lastSeenId"] == 12
-    assert all(
-        key.startswith("sha256:")
-        for key in migrated_notification["recordingStallIncidents"]
-    )
-    assert migrated_notification["apiRollbackMigration"]["bundleDigest"] == (
-        bundle_digest
-    )
-    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
-    assert result["targetSmsStateDigest"] == sms_state["stateDigest"]
-    migrated_bytes = state_path.read_bytes()
-    replay = import_device_health_rollback_bundle(
-        bundle_path=bundle_path,
-        expected_bundle_digest=bundle_digest,
-        state_path=state_path,
-        expected_state_digest=str(result["slackStateDigest"]),
-        notification_state_path=notification_state_path,
-        expected_notification_state_digest=str(
-            result["slackNotificationStateDigest"]
-        ),
-        sms_outbox_path=sms_outbox_path,
-        expected_sms_state_digest=str(sms_state["stateDigest"]),
-        now=_NOW,
-    )
-    assert replay["updated"] is False
-    assert state_path.read_bytes() == migrated_bytes
-
-
-def test_rollback_import_bundle_or_live_state_drift_writes_zero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    alerts, pending = _fingerprints()
-    cursor = build_device_health_monitor_seed_cursor(
-        legacy_alert_delivery_enabled=True,
-        alert_fingerprints=alerts,
-        pending_alert_fingerprints=pending,
-        pending_decision="preserve",
-        seeded_at=_NOW,
-    )
-    bundle = build_device_health_rollback_bundle(
-        cursor=cursor,
-        notification_cursor=_rollback_notification_cursor(),
-        source_cursor_digest=device_health_monitor_cursor_digest(cursor),
-        sms_state_digest="1" * 64,
-        health_state_digest="2" * 64,
-        notification_state_digest="3" * 64,
-        exported_at=_NOW,
-    )
-    bundle_path = tmp_path / "rollback.bundle.json"
-    expected_bundle_digest = create_protected_json_file(
-        bundle_path,
-        bundle,
-        label="test rollback bundle",
-    )
-    state_path = tmp_path / "legacy.json"
-    original = _legacy_state()
-    state_digest = _write_protected(state_path, original)
-    notification_state_path = tmp_path / "notification.json"
-    notification_state_digest = _write_protected(
-        notification_state_path,
-        _legacy_notification_state(),
-    )
-    sms_outbox_path, sms_state = _initialize_sms_recovery_state(
-        tmp_path,
-        monkeypatch,
-    )
-
-    bundle["sourceDigest"] = "0" * 24
-    _write_protected(bundle_path, bundle)
-    with pytest.raises(DeviceHealthStateBundleError, match="bundle changed"):
-        import_device_health_rollback_bundle(
-            bundle_path=bundle_path,
-            expected_bundle_digest=expected_bundle_digest,
-            state_path=state_path,
-            expected_state_digest=state_digest,
-            notification_state_path=notification_state_path,
-            expected_notification_state_digest=notification_state_digest,
-            sms_outbox_path=sms_outbox_path,
-            expected_sms_state_digest=str(sms_state["stateDigest"]),
-            now=_NOW,
-        )
-    assert json.loads(state_path.read_text(encoding="utf-8")) == original
-
-    # bundle을 원래 revision으로 복원한 뒤 live state만 drift시켜도 write 0이다.
-    restored_bundle_digest = _write_protected(bundle_path, build_device_health_rollback_bundle(
-        cursor=cursor,
-        notification_cursor=_rollback_notification_cursor(),
-        source_cursor_digest=device_health_monitor_cursor_digest(cursor),
-        sms_state_digest="1" * 64,
-        health_state_digest="2" * 64,
-        notification_state_digest="3" * 64,
-        exported_at=_NOW,
-    ))
-    changed_state = {**original, "unrelatedLocalCursor": {"keep": False}}
-    _write_protected(state_path, changed_state)
-    with pytest.raises(DeviceHealthStateBundleError, match="state changed"):
-        import_device_health_rollback_bundle(
-            bundle_path=bundle_path,
-            expected_bundle_digest=restored_bundle_digest,
-            state_path=state_path,
-            expected_state_digest=state_digest,
-            notification_state_path=notification_state_path,
-            expected_notification_state_digest=notification_state_digest,
-            sms_outbox_path=sms_outbox_path,
-            expected_sms_state_digest=str(sms_state["stateDigest"]),
-            now=_NOW,
-        )
-    assert json.loads(state_path.read_text(encoding="utf-8")) == changed_state
-
-
-def test_rollback_import_rejects_unprotected_bundle_leaf_write_zero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    alerts, pending = _fingerprints()
-    cursor = build_device_health_monitor_seed_cursor(
-        legacy_alert_delivery_enabled=True,
-        alert_fingerprints=alerts,
-        pending_alert_fingerprints=pending,
-        pending_decision="preserve",
-        seeded_at=_NOW,
-    )
-    bundle = build_device_health_rollback_bundle(
-        cursor=cursor,
-        notification_cursor=_rollback_notification_cursor(),
-        source_cursor_digest=device_health_monitor_cursor_digest(cursor),
-        sms_state_digest="1" * 64,
-        health_state_digest="2" * 64,
-        notification_state_digest="3" * 64,
-        exported_at=_NOW,
-    )
-    bundle_path = tmp_path / "rollback.bundle.json"
-    bundle_digest = _write_protected(bundle_path, bundle)
-    os.chmod(bundle_path, 0o644)
-    state_path = tmp_path / "legacy.json"
-    original = _legacy_state()
-    state_digest = _write_protected(state_path, original)
-    notification_state_path = tmp_path / "notification.json"
-    notification_state_digest = _write_protected(
-        notification_state_path,
-        _legacy_notification_state(),
-    )
-    sms_outbox_path, sms_state = _initialize_sms_recovery_state(
-        tmp_path,
-        monkeypatch,
-    )
-
-    with pytest.raises(DeviceHealthStateBundleError, match="not protected"):
-        import_device_health_rollback_bundle(
-            bundle_path=bundle_path,
-            expected_bundle_digest=bundle_digest,
-            state_path=state_path,
-            expected_state_digest=state_digest,
-            notification_state_path=notification_state_path,
-            expected_notification_state_digest=notification_state_digest,
-            sms_outbox_path=sms_outbox_path,
-            expected_sms_state_digest=str(sms_state["stateDigest"]),
-            now=_NOW,
-        )
-
-    assert json.loads(state_path.read_text(encoding="utf-8")) == original
-
-
-@pytest.mark.parametrize(
-    "pending_field",
-    (
-        "outboxItemCount",
-        "unresolvedClaimCount",
-        "activeSettledClaimCount",
-    ),
-)
-def test_rollback_import_requires_all_sms_target_drain_counts_zero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    pending_field: str,
-) -> None:
-    case = _rollback_import_case(tmp_path, monkeypatch)
-    expected_sms_digest = str(case["sms_state_digest"])
-    blocked_sms_state = {
-        "stateDigest": expected_sms_digest,
-        "outboxItemCount": 0,
-        "unresolvedClaimCount": 0,
-        "settledClaimCount": 0,
-        "activeSettledClaimCount": 0,
-    }
-    blocked_sms_state[pending_field] = 1
-    monkeypatch.setattr(
-        device_health_state_migration,
-        "_inspect_configured_sms_recovery_state",
-        lambda **_kwargs: blocked_sms_state,
-    )
-    state_path = Path(case["state_path"])
-    notification_state_path = Path(case["notification_state_path"])
-    state_before = state_path.read_bytes()
-    notification_before = notification_state_path.read_bytes()
-
-    with pytest.raises(DeviceHealthStateBundleError, match="not exact drained"):
-        import_device_health_rollback_bundle(
-            bundle_path=case["bundle_path"],
-            expected_bundle_digest=str(case["bundle_digest"]),
-            state_path=state_path,
-            expected_state_digest=str(case["state_digest"]),
-            notification_state_path=notification_state_path,
-            expected_notification_state_digest=str(
-                case["notification_state_digest"]
-            ),
-            sms_outbox_path=case["sms_outbox_path"],
-            expected_sms_state_digest=expected_sms_digest,
-            now=_NOW,
-        )
-
-    assert state_path.read_bytes() == state_before
-    assert notification_state_path.read_bytes() == notification_before
-
-
-def test_rollback_import_rejects_noncanonical_sms_target_write_zero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    case = _rollback_import_case(tmp_path, monkeypatch)
-    alternate = tmp_path / "alternate-sms.json"
-    alternate_digest = _write_protected(
-        alternate,
-        {"version": 1, "items": []},
-    )
-    _write_protected(
-        alternate.with_name(f"{alternate.name}.automatic-claims.json"),
-        {"version": 2, "claims": {}},
-    )
-    # expected digest는 두 raw file의 결합 digest이므로 strict inspector로 얻는다.
-    alternate_state = inspect_automatic_sms_recovery_state(
-        outbox_path=alternate,
-        expected_outbox_path=alternate,
-        require_initialized=True,
-        now=_NOW,
-    )
-    assert alternate_digest
-    state_path = Path(case["state_path"])
-    notification_state_path = Path(case["notification_state_path"])
-    state_before = state_path.read_bytes()
-    notification_before = notification_state_path.read_bytes()
-
-    with pytest.raises(DeviceHealthStateBundleError, match="state is invalid"):
-        import_device_health_rollback_bundle(
-            bundle_path=case["bundle_path"],
-            expected_bundle_digest=str(case["bundle_digest"]),
-            state_path=state_path,
-            expected_state_digest=str(case["state_digest"]),
-            notification_state_path=notification_state_path,
-            expected_notification_state_digest=str(
-                case["notification_state_digest"]
-            ),
-            sms_outbox_path=alternate,
-            expected_sms_state_digest=str(alternate_state["stateDigest"]),
-            now=_NOW,
-        )
-
-    assert state_path.read_bytes() == state_before
-    assert notification_state_path.read_bytes() == notification_before
-
-
-@pytest.mark.parametrize(
-    ("drift_call", "message", "health_applied", "notification_applied"),
-    (
-        (2, "not exact drained", False, False),
-        (5, "state was applied", True, True),
-    ),
-)
-def test_rollback_import_rechecks_sms_before_and_after_state_cas(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    drift_call: int,
-    message: str,
-    health_applied: bool,
-    notification_applied: bool,
-) -> None:
-    case = _rollback_import_case(tmp_path, monkeypatch)
-    real_inspector = (
-        device_health_state_migration._inspect_configured_sms_recovery_state
-    )
-    calls = 0
-
-    def _drifting_inspector(**kwargs: object) -> Mapping[str, object]:
-        nonlocal calls
-        calls += 1
-        state = dict(real_inspector(**kwargs))
-        if calls == drift_call:
-            state["stateDigest"] = "f" * 64
-        return state
-
-    monkeypatch.setattr(
-        device_health_state_migration,
-        "_inspect_configured_sms_recovery_state",
-        _drifting_inspector,
-    )
-
-    with pytest.raises(DeviceHealthStateBundleError, match=message):
-        import_device_health_rollback_bundle(
-            bundle_path=case["bundle_path"],
-            expected_bundle_digest=str(case["bundle_digest"]),
-            state_path=case["state_path"],
-            expected_state_digest=str(case["state_digest"]),
-            notification_state_path=case["notification_state_path"],
-            expected_notification_state_digest=str(
-                case["notification_state_digest"]
-            ),
-            sms_outbox_path=case["sms_outbox_path"],
-            expected_sms_state_digest=str(case["sms_state_digest"]),
-            now=_NOW,
-        )
-
-    health = json.loads(Path(case["state_path"]).read_text(encoding="utf-8"))
-    notification = json.loads(
-        Path(case["notification_state_path"]).read_text(encoding="utf-8")
-    )
-    # post-CAS drift는 적용 사실을 지우지 않고 서비스 중지·수동 확인 상태로 둔다.
-    assert ("apiRollbackMigration" in health) is health_applied
-    assert (
-        "apiRollbackMigration" in notification
-    ) is notification_applied

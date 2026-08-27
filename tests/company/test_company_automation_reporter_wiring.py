@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import logging
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from boxer_company.automation import AutomationDelivery
 from boxer_company_adapter_slack import daily_device_round_reporter as daily
 from boxer_company_adapter_slack import device_health_monitor_reporter as health
 from boxer_company_adapter_slack import device_notification_alert_reporter as notification
 from boxer_company_adapter_slack import weekly_recordings_reporter as weekly
+from boxer_company_adapter_slack.automation_api_client import (
+    AutomationRemoteDeliveryBatch,
+)
 
 
 _NOW = datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -39,6 +45,34 @@ def _api_result(
         deliveries=deliveries,
         metrics={},
         outcome="completed" if deliveries else "no_change",
+    )
+
+
+def _delivery_batch(
+    *,
+    cycle: str,
+    cycle_key: str,
+    deliveries: tuple[AutomationDelivery, ...],
+    channel_id: str = "C123456",
+) -> AutomationRemoteDeliveryBatch:
+    """API pull 계약과 같은 deterministic batch ID를 만드는 fixture다."""
+
+    raw = "\0".join(
+        (
+            "T1",
+            cycle,
+            cycle_key,
+            *sorted(delivery.delivery_id for delivery in deliveries),
+        )
+    )
+    return AutomationRemoteDeliveryBatch(
+        batch_id="batch:" + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        tenant_id="T1",
+        cycle=cycle,
+        cycle_key=cycle_key,
+        scheduled_at=_NOW,
+        channel_id=channel_id,
+        deliveries=deliveries,
     )
 
 
@@ -233,7 +267,10 @@ def test_health_remote_posts_semantic_alert_without_local_probe() -> None:
             "_post_daily_device_round_abnormal_alert",
             return_value=posted,
         ) as post_alert,
-        patch.object(health, "_build_device_health_monitor_summary") as local_probe,
+        patch.object(
+            health,
+            "_build_device_health_monitor_summary",
+        ) as local_probe,
     ):
         sent = health._run_device_health_monitor_once(
             object(),
@@ -263,6 +300,190 @@ def test_health_remote_posts_semantic_alert_without_local_probe() -> None:
         "캡처보드 연결 상태를 확인해 주세요."
     )
     assert first_result["smsTemplateId"] == "captureboard_disconnected"
+
+
+def test_health_scheduler_mode_pulls_server_owned_batch_without_cycle_run() -> None:
+    deliveries = tuple(
+        AutomationDelivery(
+            delivery_id=f"device_health_monitor:led:{index}",
+            kind="device_health_alert",
+            payload={
+                "alert": {
+                    "hospitalSeq": str(index),
+                    "hospitalName": f"테스트병원{index}",
+                    "room": f"{index}진료실",
+                    "device": f"MB2-TEST{index}",
+                    "issue": "LED 이상",
+                    "problemComponents": ["LED"],
+                }
+            },
+        )
+        for index in (1, 2)
+    )
+    batch = _delivery_batch(
+        cycle="device_health_monitor",
+        cycle_key="continuous",
+        deliveries=deliveries,
+        channel_id="C654321",
+    )
+    api = Mock()
+    api.pull_pending.return_value = batch
+    posted = {"messageTs": "1723000000.000001", "permalink": ""}
+
+    with (
+        patch.object(
+            health.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            True,
+        ),
+        patch.object(health.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
+        patch.object(health.s, "DB_QUERY_ENABLED", False),
+        patch.object(
+            health,
+            "_device_health_monitor_channel_id",
+            side_effect=AssertionError("local channel must not be read"),
+        ),
+        patch.object(health, "flush_automation_deliveries") as flush,
+        patch.object(health, "remember_automation_deliveries") as remember,
+        patch.object(
+            health,
+            "_post_daily_device_round_abnormal_alert",
+            return_value=posted,
+        ) as post_alert,
+        patch.object(health, "_build_device_health_monitor_summary") as local_probe,
+    ):
+        sent = health._run_device_health_monitor_once(
+            object(),
+            logging.getLogger("test.automation.health.scheduler"),
+            now=_NOW,
+            automation_client=api,
+        )
+
+    assert sent is True
+    flush.assert_called_once()
+    api.pull_pending.assert_called_once_with(
+        request_id=api.pull_pending.call_args.kwargs["request_id"],
+        cycle="device_health_monitor",
+    )
+    api.run.assert_not_called()
+    local_probe.assert_not_called()
+    assert post_alert.call_args.kwargs["channel_id"] == "C654321"
+    assert remember.call_args.kwargs["cycle_key"] == batch.cycle_key
+    assert remember.call_args.kwargs["batch"] is batch
+
+
+def test_health_scheduler_attach_ignores_local_flags_and_keeps_action_bridge() -> None:
+    app = SimpleNamespace(client=object())
+    automation_client = Mock()
+    action_bridge = Mock()
+    thread = Mock()
+
+    with (
+        patch.object(
+            health.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            True,
+        ),
+        patch.object(health.cs, "DEVICE_HEALTH_MONITOR_ENABLED", False),
+        patch.object(health.cs, "DEVICE_NOTIFICATION_ALERT_ENABLED", False),
+        patch.object(health.cs, "SMS_DELIVERY_REPORTER_ENABLED", True),
+        patch.object(health.s, "DB_QUERY_ENABLED", False),
+        patch.object(health, "_DEVICE_HEALTH_MONITOR_THREAD", None),
+        patch.object(
+            health.threading,
+            "Thread",
+            return_value=thread,
+        ) as create_thread,
+        patch.object(health, "attach_sms_delivery_reporter") as attach_sms,
+        patch.object(
+            health,
+            "_attach_device_health_monitor_alert_actions",
+        ) as attach_actions,
+        patch.object(
+            health,
+            "_device_health_monitor_channel_id",
+            side_effect=AssertionError("local channel must not be read"),
+        ),
+    ):
+        health.attach_device_health_monitor_reporter(
+            app,
+            logger=logging.getLogger("test.automation.health.attach"),
+            base_access_checker=Mock(),
+            action_api_bridge=action_bridge,
+            automation_client=automation_client,
+            sms_delivery_automation_client=Mock(),
+        )
+
+    attach_sms.assert_not_called()
+    attach_actions.assert_called_once()
+    assert attach_actions.call_args.args[3] is action_bridge
+    assert attach_actions.call_args.kwargs["require_action_api_bridge"] is True
+    create_thread.assert_called_once()
+    thread.start.assert_called_once()
+
+
+def test_health_journal_crash_replays_same_aggregate_client_id() -> None:
+    delivery = AutomationDelivery(
+        delivery_id="device_health_monitor:led:1",
+        kind="device_health_alert",
+        payload={
+            "alert": {
+                "hospitalSeq": "1",
+                "hospitalName": "테스트병원",
+                "room": "1진료실",
+                "device": "MB2-TEST1",
+                "issue": "LED 이상",
+                "problemComponents": ["LED"],
+            }
+        },
+    )
+    batch = _delivery_batch(
+        cycle="device_health_monitor",
+        cycle_key="continuous",
+        deliveries=(delivery,),
+    )
+    api = Mock()
+    api.pull_pending.return_value = batch
+
+    with (
+        patch.object(
+            health.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            True,
+        ),
+        patch.object(health, "flush_automation_deliveries", return_value=False),
+        patch.object(
+            health,
+            "_post_daily_device_round_abnormal_alert",
+            return_value={"messageTs": "1723000000.000001", "permalink": ""},
+        ) as post_alert,
+        patch.object(
+            health,
+            "remember_automation_deliveries",
+            side_effect=(RuntimeError("journal write failed"), None),
+        ) as remember,
+    ):
+        with pytest.raises(RuntimeError, match="journal write failed"):
+            health._run_device_health_monitor_once(
+                object(),
+                logging.getLogger("test.automation.health.crash"),
+                now=_NOW,
+                automation_client=api,
+            )
+        sent = health._run_device_health_monitor_once(
+            object(),
+            logging.getLogger("test.automation.health.replay"),
+            now=_NOW,
+            automation_client=api,
+        )
+
+    assert sent is True
+    assert post_alert.call_count == 2
+    assert (
+        post_alert.call_args_list[0].kwargs["client_msg_id"]
+        == post_alert.call_args_list[1].kwargs["client_msg_id"]
+    )
+    assert remember.call_count == 2
 
 
 def test_notification_remote_posts_api_alert_without_local_db_or_sms() -> None:
@@ -302,6 +523,175 @@ def test_notification_remote_posts_api_alert_without_local_db_or_sms() -> None:
     local_db.assert_not_called()
     api.run.assert_called_once()
     remember.assert_called_once()
+
+
+def test_notification_scheduler_mode_uses_batch_target_without_cycle_run() -> None:
+    delivery = AutomationDelivery(
+        delivery_id="device_notification:42",
+        kind="device_notification_alert",
+        payload={
+            "alertSummary": {"deviceResults": [{}]},
+            "render": {
+                "includeActions": True,
+                "includeDeviceVoiceAction": True,
+            },
+        },
+    )
+    batch = _delivery_batch(
+        cycle="device_notification_alert",
+        cycle_key="notification:42",
+        deliveries=(delivery,),
+        channel_id="C654321",
+    )
+    api = Mock()
+    api.pull_pending.return_value = batch
+
+    with (
+        patch.object(
+            notification.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            True,
+        ),
+        patch.object(
+            notification.cs,
+            "DEVICE_NOTIFICATION_ALERT_ENABLED",
+            False,
+        ),
+        patch.object(notification.cs, "DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", ""),
+        patch.object(notification.s, "DB_QUERY_ENABLED", False),
+        patch.object(notification, "flush_automation_deliveries") as flush,
+        patch.object(notification, "remember_automation_delivery") as remember,
+        patch.object(
+            notification,
+            "_post_daily_device_round_abnormal_alert",
+            return_value={"messageTs": "1723000000.000042", "permalink": ""},
+        ) as post_alert,
+        patch.object(
+            notification,
+            "_load_latest_device_notification_id",
+        ) as local_db,
+    ):
+        sent = notification._run_device_notification_alert_once(
+            object(),
+            logging.getLogger("test.automation.notification.scheduler"),
+            now=_NOW,
+            automation_client=api,
+        )
+
+    assert sent is True
+    flush.assert_called_once()
+    api.pull_pending.assert_called_once_with(
+        request_id=api.pull_pending.call_args.kwargs["request_id"],
+        cycle="device_notification_alert",
+    )
+    api.run.assert_not_called()
+    local_db.assert_not_called()
+    assert post_alert.call_args.kwargs["channel_id"] == "C654321"
+    assert remember.call_args.kwargs["cycle_key"] == batch.cycle_key
+    assert remember.call_args.kwargs["batch"] is batch
+
+
+def test_notification_scheduler_attach_needs_no_local_flag_channel_or_db() -> None:
+    app = SimpleNamespace(client=object())
+    automation_client = Mock()
+    thread = Mock()
+
+    with (
+        patch.object(
+            notification.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            True,
+        ),
+        patch.object(
+            notification.cs,
+            "DEVICE_NOTIFICATION_ALERT_ENABLED",
+            False,
+        ),
+        patch.object(notification.cs, "DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", ""),
+        patch.object(notification.s, "DB_QUERY_ENABLED", False),
+        patch.object(notification, "_DEVICE_NOTIFICATION_ALERT_THREAD", None),
+        patch.object(
+            notification.threading,
+            "Thread",
+            return_value=thread,
+        ) as create_thread,
+    ):
+        notification.attach_device_notification_alert_reporter(
+            app,
+            logger=logging.getLogger("test.automation.notification.attach"),
+            auto_sms_sender=Mock(),
+            automation_client=automation_client,
+        )
+
+    create_thread.assert_called_once()
+    assert create_thread.call_args.kwargs["args"][2] is None
+    assert create_thread.call_args.kwargs["args"][3] is automation_client
+    thread.start.assert_called_once()
+
+
+def test_notification_journal_crash_replays_same_delivery_client_id() -> None:
+    delivery = AutomationDelivery(
+        delivery_id="device_notification:42",
+        kind="device_notification_alert",
+        payload={
+            "alertSummary": {"deviceResults": [{}]},
+            "render": {
+                "includeActions": True,
+                "includeDeviceVoiceAction": True,
+            },
+        },
+    )
+    batch = _delivery_batch(
+        cycle="device_notification_alert",
+        cycle_key="continuous",
+        deliveries=(delivery,),
+    )
+    api = Mock()
+    api.pull_pending.return_value = batch
+
+    with (
+        patch.object(
+            notification.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            True,
+        ),
+        patch.object(
+            notification,
+            "flush_automation_deliveries",
+            return_value=False,
+        ),
+        patch.object(
+            notification,
+            "_post_daily_device_round_abnormal_alert",
+            return_value={"messageTs": "1723000000.000042", "permalink": ""},
+        ) as post_alert,
+        patch.object(
+            notification,
+            "remember_automation_delivery",
+            side_effect=(RuntimeError("journal write failed"), None),
+        ) as remember,
+    ):
+        with pytest.raises(RuntimeError, match="journal write failed"):
+            notification._run_device_notification_alert_once(
+                object(),
+                logging.getLogger("test.automation.notification.crash"),
+                now=_NOW,
+                automation_client=api,
+            )
+        sent = notification._run_device_notification_alert_once(
+            object(),
+            logging.getLogger("test.automation.notification.replay"),
+            now=_NOW,
+            automation_client=api,
+        )
+
+    assert sent is True
+    assert post_alert.call_count == 2
+    assert (
+        post_alert.call_args_list[0].kwargs["client_msg_id"]
+        == post_alert.call_args_list[1].kwargs["client_msg_id"]
+    )
+    assert remember.call_count == 2
 
 
 def test_notification_remote_drains_legacy_batch_after_each_receipt() -> None:

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import stat
+import threading
 from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -108,6 +115,117 @@ class _DailyHandler:
         )
 
 
+@dataclass
+class _ConcurrentWeeklyHandler:
+    """외부 실행을 멈춰 다른 coordinator의 예약 경쟁을 관찰한다."""
+
+    name: str = "weekly_recordings"
+    block_run: bool = False
+    block_acknowledge: bool = False
+    calls: int = 0
+    acknowledge_calls: int = 0
+    run_started: threading.Event = field(default_factory=threading.Event)
+    run_release: threading.Event = field(default_factory=threading.Event)
+    acknowledge_started: threading.Event = field(
+        default_factory=threading.Event
+    )
+    acknowledge_release: threading.Event = field(
+        default_factory=threading.Event
+    )
+    _counter_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
+
+    def run(
+        self,
+        request: AutomationCycleRequest,
+    ) -> AutomationCycleResult:
+        del request
+        with self._counter_lock:
+            self.calls += 1
+        if self.block_run:
+            self.run_started.set()
+            if not self.run_release.wait(timeout=10):
+                raise RuntimeError("concurrent run test timed out")
+        return AutomationCycleResult(
+            cycle="weekly_recordings",
+            outcome="completed",
+            cursor={"cycleCompleted": True},
+            deliveries=(
+                AutomationDelivery(
+                    delivery_id="weekly_recordings:2026-08-03",
+                    kind="weekly_recordings_report",
+                    payload={"totalCount": 10},
+                ),
+            ),
+            metrics={"recordingCount": 10},
+        )
+
+    def acknowledge(
+        self,
+        request: AutomationCycleRequest,
+        receipts: tuple[AutomationDeliveryReceipt, ...],
+    ) -> dict[str, Any]:
+        with self._counter_lock:
+            self.acknowledge_calls += 1
+        if self.block_acknowledge:
+            self.acknowledge_started.set()
+            if not self.acknowledge_release.wait(timeout=10):
+                raise RuntimeError("concurrent acknowledgement test timed out")
+        return {
+            **dict(request.cursor),
+            "acknowledgedCount": len(receipts),
+        }
+
+
+class _BarrierFirstLoadStateStore(JsonAutomationCycleStateStore):
+    """분리 load/save 회귀 시 두 coordinator가 같은 revision을 읽게 한다."""
+
+    def __init__(self, path: Path, barrier: threading.Barrier) -> None:
+        super().__init__(path)
+        self._first_load_barrier = barrier
+        self._first_load_used = False
+
+    def load(self, key: str) -> dict[str, Any]:
+        state = super().load(key)
+        if not self._first_load_used:
+            self._first_load_used = True
+            self._first_load_barrier.wait(timeout=5)
+        return state
+
+
+class _FinalizeGateStateStore(JsonAutomationCycleStateStore):
+    """finalize CAS 직전에 peer write를 결정적으로 끼워 넣는다."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.before_finalize = threading.Event()
+        self.resume_finalize = threading.Event()
+        self._mutation_count = 0
+        self._mutation_count_lock = threading.Lock()
+
+    def mutate_cycle(
+        self,
+        key: str,
+        updater: Any,
+        *,
+        expected_document_digest: str | None = None,
+    ) -> Any:
+        with self._mutation_count_lock:
+            self._mutation_count += 1
+            mutation_count = self._mutation_count
+        if mutation_count == 2:
+            self.before_finalize.set()
+            if not self.resume_finalize.wait(timeout=10):
+                raise RuntimeError("finalize test timed out")
+        return super().mutate_cycle(
+            key,
+            updater,
+            expected_document_digest=expected_document_digest,
+        )
+
+
 def _trigger(
     request_id: str,
     *,
@@ -136,6 +254,46 @@ def _coordinator(
         JsonAutomationCycleStateStore(state_path),
         clock=lambda: _NOW,
     )
+
+
+def _state_key(trigger: AutomationCycleTrigger) -> str:
+    raw = "\0".join(
+        (trigger.tenant_id, trigger.cycle, trigger.cycle_key)
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _finish_concurrent_reservations(
+    futures: tuple[
+        Future[AutomationCycleResult],
+        Future[AutomationCycleResult],
+    ],
+    release: threading.Event,
+) -> AutomationCycleResult:
+    """한 예약만 외부 실행에 들어갔고 다른 예약은 막혔는지 확인한다."""
+
+    try:
+        completed, _ = wait(
+            futures,
+            timeout=3,
+            return_when=FIRST_COMPLETED,
+        )
+        assert len(completed) == 1
+        with pytest.raises(AutomationCycleUncertainError):
+            next(iter(completed)).result()
+    finally:
+        release.set()
+
+    successful: list[AutomationCycleResult] = []
+    uncertain_count = 0
+    for future in futures:
+        try:
+            successful.append(future.result(timeout=5))
+        except AutomationCycleUncertainError:
+            uncertain_count += 1
+    assert uncertain_count == 1
+    assert len(successful) == 1
+    return successful[0]
 
 
 def test_coordinator_persists_delivery_before_return_and_does_not_rerun(
@@ -275,6 +433,204 @@ def test_failed_handler_leaves_durable_uncertain_guard(
         coordinator.run(_trigger("cycle:second"))
 
     assert handler.calls == 1
+
+
+def test_concurrent_coordinator_store_instances_reserve_run_once(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "concurrent-run.json"
+    handler = _ConcurrentWeeklyHandler(block_run=True)
+    load_barrier = threading.Barrier(2)
+    first = DurableAutomationCycleCoordinator(
+        AutomationCycleService((handler,)),  # type: ignore[arg-type]
+        _BarrierFirstLoadStateStore(state_path, load_barrier),
+        clock=lambda: _NOW,
+    )
+    second = DurableAutomationCycleCoordinator(
+        AutomationCycleService((handler,)),  # type: ignore[arg-type]
+        _BarrierFirstLoadStateStore(state_path, load_barrier),
+        clock=lambda: _NOW,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(first.run, _trigger("cycle:concurrent:first")),
+            executor.submit(second.run, _trigger("cycle:concurrent:second")),
+        )
+        assert handler.run_started.wait(timeout=3)
+        result = _finish_concurrent_reservations(
+            futures,
+            handler.run_release,
+        )
+
+    assert result.outcome == "completed"
+    assert handler.calls == 1
+
+
+def test_concurrent_coordinator_store_instances_call_ack_hook_once(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "concurrent-ack.json"
+    handler = _ConcurrentWeeklyHandler()
+    initial = DurableAutomationCycleCoordinator(
+        AutomationCycleService((handler,)),  # type: ignore[arg-type]
+        JsonAutomationCycleStateStore(state_path),
+        clock=lambda: _NOW,
+    ).run(_trigger("cycle:initial"))
+    receipt = AutomationDeliveryReceipt(
+        delivery_id=initial.deliveries[0].delivery_id,
+        status="sent",
+        external_message_id="171.001",
+        permalink="https://example.slack.com/archives/C1/p1",
+        delivered_at=_NOW,
+    )
+    handler.block_acknowledge = True
+    load_barrier = threading.Barrier(2)
+    first = DurableAutomationCycleCoordinator(
+        AutomationCycleService((handler,)),  # type: ignore[arg-type]
+        _BarrierFirstLoadStateStore(state_path, load_barrier),
+        clock=lambda: _NOW,
+    )
+    second = DurableAutomationCycleCoordinator(
+        AutomationCycleService((handler,)),  # type: ignore[arg-type]
+        _BarrierFirstLoadStateStore(state_path, load_barrier),
+        clock=lambda: _NOW,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(
+                first.run,
+                _trigger(
+                    "cycle:ack:concurrent:first",
+                    receipts=(receipt,),
+                    ack_only=True,
+                ),
+            ),
+            executor.submit(
+                second.run,
+                _trigger(
+                    "cycle:ack:concurrent:second",
+                    receipts=(receipt,),
+                    ack_only=True,
+                ),
+            ),
+        )
+        assert handler.acknowledge_started.wait(timeout=3)
+        result = _finish_concurrent_reservations(
+            futures,
+            handler.acknowledge_release,
+        )
+
+    state = next(
+        iter(json.loads(state_path.read_text(encoding="utf-8"))["cycles"].values())
+    )
+    assert result.outcome == "no_change"
+    assert handler.acknowledge_calls == 1
+    assert state["pendingDeliveries"] == []
+    assert "ackInFlight" not in state
+
+
+def test_run_finalize_merges_latest_revision_without_lost_update(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "finalize-cas.json"
+    trigger = _trigger("cycle:finalize-cas")
+    state_key = _state_key(trigger)
+    gated_store = _FinalizeGateStateStore(state_path)
+    coordinator = DurableAutomationCycleCoordinator(
+        AutomationCycleService((_WeeklyHandler(),)),  # type: ignore[arg-type]
+        gated_store,
+        clock=lambda: _NOW,
+    )
+    peer_store = JsonAutomationCycleStateStore(state_path)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(coordinator.run, trigger)
+        try:
+            assert gated_store.before_finalize.wait(timeout=3)
+
+            def _write_peer_field(
+                exists: bool,
+                current: dict[str, Any],
+            ) -> tuple[dict[str, Any], None]:
+                assert exists
+                assert "inFlight" in current
+                return {
+                    **current,
+                    "concurrentAudit": {"writer": "peer"},
+                }, None
+
+            peer_store.mutate_cycle(state_key, _write_peer_field)
+        finally:
+            gated_store.resume_finalize.set()
+        result = future.result(timeout=5)
+
+    state = next(
+        iter(json.loads(state_path.read_text(encoding="utf-8"))["cycles"].values())
+    )
+    assert result.outcome == "completed"
+    assert state["concurrentAudit"] == {"writer": "peer"}
+    assert state["lastRequestId"] == trigger.request_id
+    assert "inFlight" not in state
+
+
+def test_run_finalize_rejects_same_request_id_with_replaced_marker(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "marker-mismatch.json"
+    trigger = _trigger("cycle:marker-mismatch")
+    state_key = _state_key(trigger)
+    peer_store = JsonAutomationCycleStateStore(state_path)
+
+    @dataclass
+    class _MarkerReplacingHandler:
+        name: str = "weekly_recordings"
+
+        def run(
+            self,
+            request: AutomationCycleRequest,
+        ) -> AutomationCycleResult:
+            def _replace_marker(
+                exists: bool,
+                current: dict[str, Any],
+            ) -> tuple[dict[str, Any], None]:
+                assert exists
+                marker = dict(current["inFlight"])
+                assert marker["requestId"] == request.request_id
+                marker["startedAt"] = (
+                    _NOW + timedelta(seconds=1)
+                ).isoformat()
+                return {**current, "inFlight": marker}, None
+
+            peer_store.mutate_cycle(state_key, _replace_marker)
+            return AutomationCycleResult(
+                cycle="weekly_recordings",
+                outcome="completed",
+                cursor={"cycleCompleted": True},
+                metrics={"recordingCount": 0},
+            )
+
+    coordinator = DurableAutomationCycleCoordinator(
+        AutomationCycleService((_MarkerReplacingHandler(),)),  # type: ignore[arg-type]
+        JsonAutomationCycleStateStore(state_path),
+        clock=lambda: _NOW,
+    )
+
+    with pytest.raises(
+        AutomationCycleUncertainError,
+        match="state changed during execution",
+    ):
+        coordinator.run(trigger)
+
+    state = next(
+        iter(json.loads(state_path.read_text(encoding="utf-8"))["cycles"].values())
+    )
+    assert state["inFlight"]["requestId"] == trigger.request_id
+    assert state["inFlight"]["startedAt"] == (
+        _NOW + timedelta(seconds=1)
+    ).isoformat()
+    assert "lastResult" not in state
 
 
 def test_invalid_request_is_rejected_before_inflight_is_persisted(

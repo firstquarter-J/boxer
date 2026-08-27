@@ -454,7 +454,7 @@ class CompanyApiClientSettings:
 def load_company_api_client_settings(
     env: Mapping[str, str] | None = None,
 ) -> CompanyApiClientSettings:
-    """Slack client 설정을 읽고 remote 계열 mode만 credential을 요구한다."""
+    """production Slack entry의 완전 remote 설정만 fail-closed로 읽는다."""
 
     source = os.environ if env is None else env
     notion_mode = _rollout_mode_setting(
@@ -517,57 +517,38 @@ def load_company_api_client_settings(
         source,
         "BOXER_COMPANY_API_AUTOMATION_MODE",
     )
-    if operations_mode == "shadow":
-        # 사용자에게 응답을 버린 숨은 mutation은 실행하지 않는다.
+    rollout_modes = (
+        notion_mode,
+        structured_mode,
+        device_mode,
+        device_detail_mode,
+        recording_failure_mode,
+        barcode_log_mode,
+        barcode_mode,
+        barcode_residual_mode,
+        barcode_timeline_mode,
+        barcode_freeform_mode,
+        freeform_mode,
+        playbook_mode,
+        weekly_summary_mode,
+        operations_mode,
+        automation_mode,
+    )
+    if any(mode != "remote" for mode in rollout_modes):
+        # Slack-local 실행과 shadow 비교는 production rollback 경계가 아니다.
+        # mode 하나라도 remote가 아니면 credential을 읽기 전에 기동을 막는다.
         raise CompanyApiContractError(
-            "company_api_operations_shadow_unsafe"
-        )
-    if automation_mode == "shadow":
-        # timer가 버리는 숨은 mutation cycle은 실행하지 않는다.
-        raise CompanyApiContractError(
-            "company_api_automation_shadow_unsafe"
+            "company_api_transport_only_remote_required"
         )
     automation_remote_cycles = _automation_remote_cycles_setting(
         source,
         automation_mode=automation_mode,
     )
-    if (
-        COMPANY_ACTION_AUTOMATION_CYCLES.intersection(
-            automation_remote_cycles
-        )
-        and operations_mode != "remote"
-    ):
+    if frozenset(automation_remote_cycles) != COMPANY_AUTOMATION_CYCLES:
+        # 일부 cycle만 Slack에 남기는 혼합 소유권도 local rollback이므로
+        # production entry에서는 다섯 cycle exact set만 허용한다.
         raise CompanyApiContractError(
-            "company_api_remote_automation_requires_remote_operations"
-        )
-
-    # 모든 route group이 local이면 즉시 롤백 상태다. 이전 remote
-    # transport 값이 잘못 남아 있어도 전부 폐기해 Slack 기동을 막지 않는다.
-    if all(
-        mode == "local"
-        for mode in (
-            notion_mode,
-            structured_mode,
-            device_mode,
-            device_detail_mode,
-            recording_failure_mode,
-            barcode_log_mode,
-            barcode_mode,
-            barcode_residual_mode,
-            barcode_timeline_mode,
-            barcode_freeform_mode,
-            freeform_mode,
-            playbook_mode,
-            weekly_summary_mode,
-            operations_mode,
-            automation_mode,
-        )
-    ):
-        return CompanyApiClientSettings(
-            base_url="",
-            token="",
-            notion_mode="local",
-            structured_mode="local",
+            "company_api_automation_remote_cycles_invalid"
         )
 
     raw_base_url = str(
@@ -765,6 +746,28 @@ def load_company_api_client_settings(
     if automation_fallback_enabled:
         raise CompanyApiContractError(
             "company_api_automation_fallback_unsafe"
+        )
+    if any(
+        (
+            notion_fallback_enabled,
+            structured_fallback_enabled,
+            device_fallback_enabled,
+            device_detail_fallback_enabled,
+            recording_failure_fallback_enabled,
+            barcode_log_fallback_enabled,
+            barcode_fallback_enabled,
+            barcode_residual_fallback_enabled,
+            barcode_timeline_fallback_enabled,
+            barcode_freeform_fallback_enabled,
+            freeform_fallback_enabled,
+            playbook_fallback_enabled,
+            weekly_summary_fallback_enabled,
+            operations_fallback_enabled,
+            automation_fallback_enabled,
+        )
+    ):
+        raise CompanyApiContractError(
+            "company_api_transport_only_remote_required"
         )
     automation_tenant_id = str(
         source.get(

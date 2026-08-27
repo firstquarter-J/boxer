@@ -45,6 +45,13 @@ from boxer_company_adapter_slack.company_api_client import (
     CompanyAssistantApiClient,
     load_company_api_client_settings,
 )
+from boxer_company_adapter_slack.hpa_change_api_client import (
+    HpaChangeApiClient,
+    build_hpa_change_remote_routes_config,
+)
+from boxer_company_adapter_slack.hpa_change_remote_reporter import (
+    attach_hpa_change_remote_reporter,
+)
 from boxer_company_adapter_slack.automation_api_client import (
     CompanyAutomationApiClient,
 )
@@ -100,13 +107,11 @@ from boxer_company_adapter_slack.health import (
     _build_dependency_failure_reply,
     _format_ping_llm_status,
 )
-from boxer_company_adapter_slack.hpa_change_reporter import attach_hpa_change_reporter
 from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRoutesContext,
     HpaChangeRoutesDeps,
     _handle_hpa_change_request,
 )
-from boxer_company_adapter_slack.hpa_change_runtime import create_hpa_change_runtime
 from boxer_company_adapter_slack.knowledge_routes import (
     KnowledgeRoutesContext,
     KnowledgeRoutesDeps,
@@ -447,10 +452,34 @@ def _validate_automation_sms_cycle_ownership(
         )
 
 
+def _require_transport_only_remote_settings(
+    settings: CompanyApiClientSettings,
+) -> None:
+    """production Slack entry에서 legacy 실행 경계를 다시 열지 못하게 한다."""
+
+    if (
+        settings.transport_only_remote
+        and bool(
+            getattr(
+                cs,
+                "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+                False,
+            )
+        )
+    ):
+        return
+    # mode뿐 아니라 scheduler 소유권 flag도 함께 고정해 설정 실수로
+    # Slack due timer와 domain cycle endpoint가 다시 열리지 않게 한다.
+    raise CompanyApiContractError(
+        "company_api_transport_only_remote_required"
+    )
+
+
 def create_app() -> App:
     _validate_ec2_runtime_aws_env()
     app_logger = logging.getLogger(__name__)
     company_api_settings = load_company_api_client_settings()
+    _require_transport_only_remote_settings(company_api_settings)
     _validate_automation_sms_cycle_ownership(company_api_settings)
     transport_only_remote = company_api_settings.transport_only_remote
     local_llm_required = not transport_only_remote
@@ -727,7 +756,30 @@ def create_app() -> App:
             claude_client = _build_claude_client(timeout_sec=s.ANTHROPIC_TIMEOUT_SEC)
         except Exception:
             app_logger.warning("Failed to initialize Claude client; continuing without it", exc_info=True)
-    hpa_change_runtime = create_hpa_change_runtime(logger=app_logger)
+    hpa_change_routes_config = build_hpa_change_remote_routes_config()
+    hpa_change_api_client = (
+        HpaChangeApiClient(
+            company_api_settings,
+            workspace_id=company_api_settings.automation_tenant_id,
+            logger=app_logger,
+        )
+        if hpa_change_routes_config.enabled
+        else None
+    )
+
+    def _submit_hpa_change_request(request: Any) -> Any:
+        if hpa_change_api_client is None:
+            raise CompanyApiContractError(
+                "company_api_hpa_transport_disabled"
+            )
+        return hpa_change_api_client.submit_request(request)
+
+    def _lookup_hpa_change_thread(*args: Any, **kwargs: Any) -> Any:
+        if hpa_change_api_client is None:
+            raise CompanyApiContractError(
+                "company_api_hpa_transport_disabled"
+            )
+        return hpa_change_api_client.lookup_thread_job(*args, **kwargs)
     s3_client: Any | None = None
 
     def _get_s3_client() -> Any:
@@ -942,10 +994,10 @@ def create_app() -> App:
                 client=client,
                 logger=logger,
             ),
-            hpa_change_runtime.routes_config,
+            hpa_change_routes_config,
             HpaChangeRoutesDeps(
-                submit_request=hpa_change_runtime.submit_request,
-                lookup_thread_job=hpa_change_runtime.lookup_thread_job,
+                submit_request=_submit_hpa_change_request,
+                lookup_thread_job=_lookup_hpa_change_thread,
             ),
         ):
             return
@@ -2559,7 +2611,13 @@ def create_app() -> App:
         )
 
     app = create_slack_app(_handle_company_mention, _handle_company_message)
-    attach_hpa_change_reporter(app, hpa_change_runtime, logger=app_logger)
+    if hpa_change_api_client is not None:
+        attach_hpa_change_remote_reporter(
+            app,
+            hpa_change_api_client,
+            poll_interval_sec=cs.HPA_CHANGE_POLL_INTERVAL_SEC,
+            logger=app_logger,
+        )
     attach_weekly_recordings_reporter(
         app,
         logger=app_logger,

@@ -30,6 +30,8 @@ _DEVICE_HEALTH_ALERT_EXECUTE_CAPABILITY = (
     "assistant.device.alert.execute"
 )
 _AUTOMATION_EXECUTE_CAPABILITY = "assistant.automation.execute"
+_AUTOMATION_TRANSPORT_CAPABILITY = "assistant.automation.transport"
+_EFFECTIVE_ROUTE_UNSET = object()
 
 
 def validate_request_id(value: str | None) -> str:
@@ -72,15 +74,24 @@ def authorize_turn(
     principal: CallerPrincipal,
     turn: AssistantTurnInput,
     request_id: str | None = None,
+    *,
+    effective_route_group: str | None | object = _EFFECTIVE_ROUTE_UNSET,
 ) -> CallerPrincipal:
     """서버가 인증한 caller scope와 turn의 actor/channel/context를 교차 검증한다."""
 
+    # HTTP app은 pure pre-match 결과를 명시적으로 넘긴다. 직접 호출하는
+    # 기존 정책 테스트만 wire 값을 기본값으로 사용해 호환한다.
+    route_group = (
+        turn.routeGroup
+        if effective_route_group is _EFFECTIVE_ROUTE_UNSET
+        else effective_route_group
+    )
     if not _matches_scope(
         _TURN_CAPABILITY,
         principal.capabilities,
     ):
         _raise_not_allowed(request_id)
-    if turn.routeGroup == "device_detail" and any(
+    if route_group == "device_detail" and any(
         not _matches_scope(capability, principal.capabilities)
         for capability in (
             _DEVICE_PROBE_CAPABILITY,
@@ -90,7 +101,7 @@ def authorize_turn(
         # 이 assistant turn 하나가 MDA/SSH probe와 필요 시 tunnel open까지
         # 수행하므로 두 장비 권한을 모두 가진 caller만 진입시킨다.
         _raise_not_allowed(request_id)
-    if turn.routeGroup == "operations" and not _matches_scope(
+    if route_group == "operations" and not _matches_scope(
         _OPERATION_EXECUTE_CAPABILITY,
         principal.capabilities,
     ):
@@ -154,6 +165,25 @@ def authorize_automation_cycle(
     return principal
 
 
+def authorize_automation_transport(
+    principal: CallerPrincipal,
+    tenant_id: str,
+    request_id: str | None = None,
+) -> CallerPrincipal:
+    """Slack gateway가 domain 실행 없이 pull/ACK만 하도록 별도 검증한다."""
+
+    if not _matches_scope(
+        _AUTOMATION_TRANSPORT_CAPABILITY,
+        principal.capabilities,
+    ):
+        _raise_not_allowed(request_id)
+    if not _matches_scope(tenant_id, principal.tenant_ids):
+        _raise_not_allowed(request_id)
+    if not _matches_scope("slack", principal.channels):
+        _raise_not_allowed(request_id)
+    return principal
+
+
 def _matches_scope(value: str, allowed: frozenset[str]) -> bool:
     return "*" in allowed or value in allowed
 
@@ -168,6 +198,7 @@ def _raise_not_allowed(request_id: str | None) -> None:
 
 __all__ = [
     "authorize_automation_cycle",
+    "authorize_automation_transport",
     "authorize_turn",
     "validate_request_id",
     "validate_traceparent",

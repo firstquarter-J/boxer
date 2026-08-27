@@ -38,6 +38,7 @@ _MAX_ACKNOWLEDGED_IDS = 500
 _STATE_VERSION = 1
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _STATE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
 _MISSING_STATE_DIGEST = hashlib.sha256(
     b"boxer.automation-state.missing.v1"
 ).hexdigest()
@@ -216,6 +217,27 @@ class AutomationCycleTrigger:
         repr=False,
     )
     ack_only: bool = False
+    # HTTP compatibility trigger에는 없고 API scheduler가 만든 새 run에만
+    # 있다. pending이 생길 때 이 snapshot을 durable transport 정본으로 쓴다.
+    delivery_target: Mapping[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.delivery_target is None:
+            return
+        _validate_delivery_target(self.delivery_target)
+        object.__setattr__(
+            self,
+            "delivery_target",
+            {
+                "channelId": str(self.delivery_target["channelId"]),
+                "conversation": dict(
+                    self.delivery_target.get("conversation") or {}
+                ),
+            },
+        )
 
 
 class AutomationCycleUncertainError(RuntimeError):
@@ -235,6 +257,20 @@ class AutomationStateSnapshot:
         if key not in cycles:
             return False, {}
         return True, dict(cycles[key])
+
+
+@dataclass(frozen=True, slots=True)
+class _CoordinatorTransition:
+    """한 atomic state 전이가 예약한 다음 coordinator 동작이다."""
+
+    kind: Literal["return", "run", "acknowledge"]
+    result: AutomationCycleResult | None = None
+    request: AutomationCycleRequest | None = None
+    receipts: tuple[AutomationDeliveryReceipt, ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    marker: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 _MutationResult = TypeVar("_MutationResult")
@@ -606,7 +642,6 @@ class DurableAutomationCycleCoordinator:
         self._state_store = state_store
         self._logger = logger or logging.getLogger(__name__)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._lock = threading.RLock()
 
     def run(self, trigger: AutomationCycleTrigger) -> AutomationCycleResult:
         # Slack scheduler가 확정한 기존 실행 시각·옵션을 domain 입력으로
@@ -618,163 +653,310 @@ class DurableAutomationCycleCoordinator:
                 "automation cycle handler is not configured"
             )
         state_key = _build_state_key(trigger)
-        with self._lock:
-            state = self._state_store.load(state_key)
-            if trigger.cycle == "device_health_monitor":
-                # health pending replay와 ackOnly도 API-owned seed에서만
-                # 유효하다. raw durable cursor를 state load 직후 검증해 과거
-                # delivery가 잘못된/missing seed를 우회해 Slack으로 나가지
-                # 못하게 한다.
-                raw_health_cursor = state.get("cursor")
-                if not isinstance(raw_health_cursor, Mapping):
-                    raise AutomationCycleContractError(
-                        "device health monitor API state seed is required"
-                    )
-                self._service.validate(
-                    AutomationCycleRequest(
-                        request_id=trigger.request_id,
-                        tenant_id=trigger.tenant_id,
-                        cycle=trigger.cycle,
-                        scheduled_at=trigger.scheduled_at,
-                        cursor=raw_health_cursor,
-                        options=dict(trigger.options),
-                    )
-                )
-            if state.get("inFlight") or state.get("ackInFlight"):
-                # timeout/crash 후 완료 여부를 모르면 같은 target을 자동 실행하지 않는다.
-                raise AutomationCycleUncertainError(
-                    "automation cycle execution is uncertain"
-                )
-            sent_receipts = _unapplied_sent_receipts(
-                state,
-                trigger.delivery_receipts,
+        while True:
+            # 현재 revision 판정과 marker 예약을 한 flock 안에서 끝내 별도
+            # coordinator/process가 같은 외부 mutation을 함께 시작하지 못한다.
+            transition = self._state_store.mutate_cycle(
+                state_key,
+                lambda exists, current: self._reserve_transition(
+                    exists=exists,
+                    current=current,
+                    state_key=state_key,
+                    trigger=trigger,
+                    admission_now=admission_now,
+                ),
             )
-            if (
-                sent_receipts
-                and self._service.has_acknowledger(trigger.cycle)
-            ):
-                acknowledgement_request = AutomationCycleRequest(
+            if transition.kind == "return":
+                if transition.result is None:
+                    raise AutomationCycleContractError(
+                        "automation coordinator transition is invalid"
+                    )
+                return transition.result
+            if transition.request is None or not transition.marker:
+                raise AutomationCycleContractError(
+                    "automation coordinator transition is invalid"
+                )
+
+            if transition.kind == "acknowledge":
+                # provider/Sheet 후속 mutation 중에는 file lock을 잡지 않는다.
+                # 실패하면 finalize가 실행되지 않아 exact marker가 남는다.
+                updated_cursor = self._service.acknowledge(
+                    transition.request,
+                    transition.receipts,
+                )
+                self._finalize_acknowledgement(
+                    state_key=state_key,
+                    trigger=trigger,
+                    expected_marker=transition.marker,
+                    updated_cursor=updated_cursor,
+                )
+                # ACK가 닫은 최신 state에서 ackOnly/pending/completed 판정을
+                # 다시 원자 수행한다. 이미 적용한 receipt는 hook을 재호출하지 않는다.
+                continue
+
+            if transition.kind != "run":
+                raise AutomationCycleContractError(
+                    "automation coordinator transition is invalid"
+                )
+            # 외부 조회·장비/provider mutation은 durable marker가 보이는 동안
+            # 실행하되 flock은 잡지 않는다. 실패 시 marker를 보존한다.
+            result = self._service.run(transition.request)
+            completion_now = self._clock()
+            if completion_now.tzinfo is None:
+                raise AutomationCycleContractError(
+                    "automation completion clock is invalid"
+                )
+            self._finalize_run(
+                state_key=state_key,
+                trigger=trigger,
+                completion_now=completion_now,
+                expected_marker=transition.marker,
+                result=result,
+            )
+            self._logger.info(
+                "Automation coordinator stored result cycle=%s outcome=%s deliveries=%s",
+                trigger.cycle,
+                result.outcome,
+                len(result.deliveries),
+            )
+            return result
+
+    def _reserve_transition(
+        self,
+        *,
+        exists: bool,
+        current: dict[str, Any],
+        state_key: str,
+        trigger: AutomationCycleTrigger,
+        admission_now: datetime,
+    ) -> tuple[Mapping[str, Any], _CoordinatorTransition]:
+        del exists
+        state = dict(current)
+        if trigger.cycle == "device_health_monitor":
+            # health pending replay와 ackOnly도 API-owned seed에서만
+            # 유효하다. raw durable cursor를 marker 판정보다 먼저 검증한다.
+            raw_health_cursor = state.get("cursor")
+            if not isinstance(raw_health_cursor, Mapping):
+                raise AutomationCycleContractError(
+                    "device health monitor API state seed is required"
+                )
+            self._service.validate(
+                AutomationCycleRequest(
                     request_id=trigger.request_id,
                     tenant_id=trigger.tenant_id,
                     cycle=trigger.cycle,
-                    # 기존 local reporter가 사용하던 poll 시각을 그대로
-                    # 후속 Sheet/provider 처리에도 전달한다.
                     scheduled_at=trigger.scheduled_at,
-                    cursor=dict(state.get("cursor") or {}),
+                    cursor=raw_health_cursor,
                     options=dict(trigger.options),
                 )
-                self._service.validate(acknowledgement_request)
-                # Sheet append 같은 receipt 후속 mutation도 실행 전에 durable
-                # marker를 남기고 실패하면 sent ack를 적용하지 않는다.
-                state["ackInFlight"] = {
-                    "requestId": trigger.request_id,
-                    "deliveryIds": [
-                        receipt.delivery_id
-                        for receipt in sent_receipts
-                    ],
-                    "startedAt": admission_now.isoformat(),
-                }
-                self._state_store.save(state_key, state)
-                try:
-                    updated_cursor = self._service.acknowledge(
-                        acknowledgement_request,
-                        sent_receipts,
-                    )
-                except Exception:
-                    # ackInFlight를 보존해 다음 poll의 mutation 재실행을 막는다.
-                    raise
-                state["cursor"] = dict(updated_cursor)
-                state["domainCycleComplete"] = bool(
-                    updated_cursor.get("cycleCompleted")
-                )
-                state = _apply_delivery_receipts(
-                    state,
-                    trigger.delivery_receipts,
-                )
-                state.pop("ackInFlight", None)
-                self._state_store.save(state_key, state)
-            else:
-                state = _apply_delivery_receipts(
-                    state,
-                    trigger.delivery_receipts,
-                )
-            if (
-                not trigger.delivery_receipts
-                and not trigger.ack_only
-                and state.get("lastRequestId") == trigger.request_id
-                and isinstance(state.get("lastResult"), dict)
-            ):
-                return _restore_result(state["lastResult"])
+            )
+        if "inFlight" in state or "ackInFlight" in state:
+            # 값이 malformed/falsey여도 완료 여부를 증명할 수 없으므로
+            # 운영자 exact-marker resolve 전에는 fail-closed한다.
+            raise AutomationCycleUncertainError(
+                "automation cycle execution is uncertain"
+            )
 
-            pending_result = _pending_result(trigger.cycle, state)
-            if trigger.ack_only or pending_result.deliveries:
-                self._state_store.save(state_key, state)
-                return pending_result
-            if state.get("cycleCompleted"):
-                self._state_store.save(state_key, state)
-                return AutomationCycleResult(
+        sent_receipts = _unapplied_sent_receipts(
+            state,
+            trigger.delivery_receipts,
+        )
+        if sent_receipts and self._service.has_acknowledger(trigger.cycle):
+            acknowledgement_request = AutomationCycleRequest(
+                request_id=trigger.request_id,
+                tenant_id=trigger.tenant_id,
+                cycle=trigger.cycle,
+                # 기존 local reporter가 사용하던 poll 시각을 후속
+                # Sheet/provider 처리에도 그대로 전달한다.
+                scheduled_at=trigger.scheduled_at,
+                cursor=dict(state.get("cursor") or {}),
+                options=dict(trigger.options),
+            )
+            self._service.validate(acknowledgement_request)
+            marker = {
+                "requestId": trigger.request_id,
+                "deliveryIds": [
+                    receipt.delivery_id for receipt in sent_receipts
+                ],
+                "startedAt": admission_now.isoformat(),
+            }
+            return {
+                **state,
+                "ackInFlight": marker,
+            }, _CoordinatorTransition(
+                kind="acknowledge",
+                request=acknowledgement_request,
+                receipts=sent_receipts,
+                marker=marker,
+            )
+
+        # receipt-only와 replay 판정도 같은 revision에 반영해 concurrent
+        # poll이 이미 ACK한 delivery나 stale response cache를 되살리지 못한다.
+        state = _apply_delivery_receipts(
+            state,
+            trigger.delivery_receipts,
+        )
+        if (
+            not trigger.delivery_receipts
+            and not trigger.ack_only
+            and state.get("lastRequestId") == trigger.request_id
+            and isinstance(state.get("lastResult"), dict)
+        ):
+            return state, _CoordinatorTransition(
+                kind="return",
+                result=_restore_result(state["lastResult"]),
+            )
+
+        pending_result = _pending_result(trigger.cycle, state)
+        if trigger.ack_only or pending_result.deliveries:
+            return state, _CoordinatorTransition(
+                kind="return",
+                result=pending_result,
+            )
+        if state.get("cycleCompleted"):
+            return state, _CoordinatorTransition(
+                kind="return",
+                result=AutomationCycleResult(
                     cycle=trigger.cycle,
                     outcome="no_change",
                     cursor={},
                     metrics={"deliveryCount": 0},
-                )
-
-            # cursor/options의 일반 계약과 handler별 option 계약을 모두
-            # durable in-flight보다 먼저 끝내 입력 오류가 cycle을 잠그지 않게 한다.
-            domain_cursor = dict(state.get("cursor") or {})
-            if trigger.cycle == "daily_device_round":
-                # 자정을 넘기는 야간 창도 server-derived cycle key 날짜를
-                # delivery id와 domain cursor가 그대로 공유하게 한다.
-                domain_cursor.setdefault(
-                    "windowKey",
-                    trigger.cycle_key.removeprefix("daily:"),
-                )
-            domain_request = AutomationCycleRequest(
-                request_id=trigger.request_id,
-                tenant_id=trigger.tenant_id,
-                cycle=trigger.cycle,
-                scheduled_at=trigger.scheduled_at,
-                cursor=domain_cursor,
-                options=dict(trigger.options),
-                progress_callback=(
-                    (
-                        lambda progress_cursor: self._checkpoint_progress(
-                            state_key=state_key,
-                            request_id=trigger.request_id,
-                            cursor=progress_cursor,
-                        )
-                    )
-                    if trigger.cycle == "daily_device_round"
-                    else None
                 ),
             )
-            self._service.validate(domain_request)
-            # 외부 조회·mutation 전에 durable in-flight를 먼저 기록한다.
-            state["inFlight"] = {
-                "requestId": trigger.request_id,
-                "startedAt": admission_now.isoformat(),
-            }
-            self._state_store.save(state_key, state)
 
-        try:
-            result = self._service.run(domain_request)
-        except Exception:
-            # inFlight를 지우지 않아 다음 poll이 mutation을 재실행하지 않게 한다.
-            raise
-
-        with self._lock:
-            current = self._state_store.load(state_key)
-            in_flight = current.get("inFlight") or {}
-            if in_flight.get("requestId") != trigger.request_id:
-                raise AutomationCycleUncertainError(
-                    "automation cycle state changed during execution"
+        # cursor/options의 일반 계약과 handler별 option 계약을 durable
+        # in-flight보다 먼저 끝내 입력 오류가 cycle을 잠그지 않게 한다.
+        domain_cursor = dict(state.get("cursor") or {})
+        if trigger.cycle == "daily_device_round":
+            # 자정을 넘기는 야간 창도 server-derived cycle key 날짜를
+            # delivery id와 domain cursor가 그대로 공유하게 한다.
+            domain_cursor.setdefault(
+                "windowKey",
+                trigger.cycle_key.removeprefix("daily:"),
+            )
+        marker = {
+            "requestId": trigger.request_id,
+            "startedAt": admission_now.isoformat(),
+        }
+        scheduler_metadata = _scheduler_transport_metadata(trigger)
+        if scheduler_metadata is not None:
+            # exact marker에도 목적지 snapshot을 넣어 외부 실행 중 설정이
+            # 바뀌어도 finalize가 다른 channel로 pending을 만들지 못하게 한다.
+            marker["deliveryTarget"] = dict(
+                scheduler_metadata["deliveryTarget"]
+            )
+        domain_request = AutomationCycleRequest(
+            request_id=trigger.request_id,
+            tenant_id=trigger.tenant_id,
+            cycle=trigger.cycle,
+            scheduled_at=trigger.scheduled_at,
+            cursor=domain_cursor,
+            options=dict(trigger.options),
+            progress_callback=(
+                (
+                    lambda progress_cursor: self._checkpoint_progress(
+                        state_key=state_key,
+                        expected_marker=marker,
+                        cursor=progress_cursor,
+                    )
                 )
-            serialized_result = _serialize_result_state(result)
-            pending_deliveries = [
-                _serialize_delivery(delivery)
-                for delivery in result.deliveries
-            ]
-            domain_complete = bool(result.cursor.get("cycleCompleted"))
+                if trigger.cycle == "daily_device_round"
+                else None
+            ),
+        )
+        self._service.validate(domain_request)
+        reserved_state = {
+            **state,
+            "inFlight": marker,
+        }
+        if scheduler_metadata is not None:
+            reserved_state.update(scheduler_metadata)
+        return reserved_state, _CoordinatorTransition(
+            kind="run",
+            request=domain_request,
+            marker=marker,
+        )
+
+    def _finalize_acknowledgement(
+        self,
+        *,
+        state_key: str,
+        trigger: AutomationCycleTrigger,
+        expected_marker: Mapping[str, Any],
+        updated_cursor: Mapping[str, Any],
+    ) -> None:
+        def _update(
+            exists: bool,
+            current: dict[str, Any],
+        ) -> tuple[Mapping[str, Any], None]:
+            self._require_exact_marker(
+                exists=exists,
+                current=current,
+                marker_name="ackInFlight",
+                expected_marker=expected_marker,
+                phase="acknowledgement",
+            )
+            next_state = {
+                **current,
+                "cursor": dict(updated_cursor),
+                "domainCycleComplete": bool(
+                    updated_cursor.get("cycleCompleted")
+                ),
+            }
+            next_state = _apply_delivery_receipts(
+                next_state,
+                trigger.delivery_receipts,
+            )
+            next_state.pop("ackInFlight", None)
+            return next_state, None
+
+        self._state_store.mutate_cycle(state_key, _update)
+
+    def _finalize_run(
+        self,
+        *,
+        state_key: str,
+        trigger: AutomationCycleTrigger,
+        completion_now: datetime,
+        expected_marker: Mapping[str, Any],
+        result: AutomationCycleResult,
+    ) -> None:
+        # 직렬화 실패도 외부 실행의 완료 여부를 자동 단정하지 않도록
+        # marker를 건드리기 전에 결과 payload를 완전히 준비한다.
+        serialized_result = _serialize_result_state(result)
+        pending_deliveries = [
+            _serialize_delivery(delivery) for delivery in result.deliveries
+        ]
+        domain_complete = bool(result.cursor.get("cycleCompleted"))
+        scheduler_metadata = _scheduler_transport_metadata(trigger)
+        pending_metadata: dict[str, Any] = {}
+        if pending_deliveries and scheduler_metadata is not None:
+            pending_ids = tuple(
+                str(item["deliveryId"]) for item in pending_deliveries
+            )
+            pending_metadata = {
+                **scheduler_metadata,
+                "pendingScheduledAt": trigger.scheduled_at.isoformat(),
+                "pendingCreatedAt": completion_now.isoformat(),
+                "pendingBatchId": _build_delivery_batch_id(
+                    tenant_id=trigger.tenant_id,
+                    cycle=trigger.cycle,
+                    cycle_key=trigger.cycle_key,
+                    delivery_ids=pending_ids,
+                ),
+            }
+
+        def _update(
+            exists: bool,
+            current: dict[str, Any],
+        ) -> tuple[Mapping[str, Any], None]:
+            self._require_exact_marker(
+                exists=exists,
+                current=current,
+                marker_name="inFlight",
+                expected_marker=expected_marker,
+                phase="execution",
+            )
             next_state = {
                 **current,
                 "cursor": dict(result.cursor),
@@ -783,24 +965,51 @@ class DurableAutomationCycleCoordinator:
                 "cycleCompleted": domain_complete and not pending_deliveries,
                 "lastRequestId": trigger.request_id,
                 "lastResult": serialized_result,
-                "lastCompletedAt": admission_now.isoformat(),
+                # fixed-delay는 실제 handler 완료 시각부터 계산한다.
+                "lastCompletedAt": completion_now.isoformat(),
+                **pending_metadata,
             }
+            if not pending_deliveries:
+                for key in (
+                    "pendingScheduledAt",
+                    "pendingCreatedAt",
+                    "pendingBatchId",
+                ):
+                    next_state.pop(key, None)
             next_state.pop("inFlight", None)
-            self._state_store.save(state_key, next_state)
+            return next_state, None
 
-        self._logger.info(
-            "Automation coordinator stored result cycle=%s outcome=%s deliveries=%s",
-            trigger.cycle,
-            result.outcome,
-            len(result.deliveries),
+        self._state_store.mutate_cycle(state_key, _update)
+
+    @staticmethod
+    def _require_exact_marker(
+        *,
+        exists: bool,
+        current: Mapping[str, Any],
+        marker_name: Literal["inFlight", "ackInFlight"],
+        expected_marker: Mapping[str, Any],
+        phase: str,
+    ) -> None:
+        actual_marker = current.get(marker_name)
+        opposite_marker = (
+            "ackInFlight" if marker_name == "inFlight" else "inFlight"
         )
-        return result
+        if (
+            not exists
+            or marker_name not in current
+            or not isinstance(actual_marker, Mapping)
+            or dict(actual_marker) != dict(expected_marker)
+            or opposite_marker in current
+        ):
+            raise AutomationCycleUncertainError(
+                f"automation cycle state changed during {phase}"
+            )
 
     def _checkpoint_progress(
         self,
         *,
         state_key: str,
-        request_id: str,
+        expected_marker: Mapping[str, Any],
         cursor: Mapping[str, Any],
     ) -> None:
         """현재 in-flight와 같은 실행의 active cursor만 원자 저장한다."""
@@ -809,15 +1018,13 @@ class DurableAutomationCycleCoordinator:
             exists: bool,
             current: dict[str, Any],
         ) -> tuple[Mapping[str, Any], None]:
-            in_flight = current.get("inFlight")
-            if (
-                not exists
-                or not isinstance(in_flight, Mapping)
-                or in_flight.get("requestId") != request_id
-            ):
-                raise AutomationCycleUncertainError(
-                    "automation cycle state changed during progress"
-                )
+            self._require_exact_marker(
+                exists=exists,
+                current=current,
+                marker_name="inFlight",
+                expected_marker=expected_marker,
+                phase="progress",
+            )
             return {
                 **current,
                 # hospital_started와 각 device_started마다 기존 local
@@ -825,8 +1032,7 @@ class DurableAutomationCycleCoordinator:
                 "cursor": dict(cursor),
             }, None
 
-        with self._lock:
-            self._state_store.mutate_cycle(state_key, _update)
+        self._state_store.mutate_cycle(state_key, _update)
 
 
 def serialize_automation_cycle_result(
@@ -860,6 +1066,7 @@ def validate_automation_trigger_admission(
         raise AutomationCycleContractError(
             "automation schedule must be timezone-aware"
         )
+    _validate_delivery_target(trigger.delivery_target)
 
     if trigger.ack_only:
         # Slack 발송 직후 재시작하거나 window가 넘어가도 과거 pending
@@ -960,6 +1167,60 @@ def _build_state_key(trigger: AutomationCycleTrigger) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _scheduler_transport_metadata(
+    trigger: AutomationCycleTrigger,
+) -> dict[str, Any] | None:
+    target = trigger.delivery_target
+    if target is None:
+        return None
+    _validate_delivery_target(target)
+    return {
+        "identity": {
+            "tenantId": trigger.tenant_id,
+            "cycle": trigger.cycle,
+            "cycleKey": trigger.cycle_key,
+        },
+        "deliveryTarget": {
+            "channelId": str(target["channelId"]),
+            "conversation": dict(target.get("conversation") or {}),
+        },
+    }
+
+
+def _validate_delivery_target(value: Mapping[str, Any] | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping) or set(value) != {
+        "channelId",
+        "conversation",
+    }:
+        raise AutomationCycleContractError(
+            "automation delivery target is invalid"
+        )
+    channel_id = str(value.get("channelId") or "").strip()
+    conversation = value.get("conversation")
+    if (
+        not _SLACK_CHANNEL_ID_RE.fullmatch(channel_id)
+        or not isinstance(conversation, Mapping)
+    ):
+        raise AutomationCycleContractError(
+            "automation delivery target is invalid"
+        )
+
+
+def _build_delivery_batch_id(
+    *,
+    tenant_id: str,
+    cycle: str,
+    cycle_key: str,
+    delivery_ids: tuple[str, ...],
+) -> str:
+    raw = "\0".join(
+        (tenant_id, cycle, cycle_key, *sorted(delivery_ids))
+    )
+    return f"batch:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
 def _apply_delivery_receipts(
     state: Mapping[str, Any],
     receipts: tuple[AutomationDeliveryReceipt, ...],
@@ -997,6 +1258,12 @@ def _apply_delivery_receipts(
         "domainCycleComplete"
     ):
         next_state["cycleCompleted"] = True
+    if not next_state["pendingDeliveries"]:
+        # batch metadata는 duplicate ACK 판정에 필요하지 않다. durable
+        # acknowledged IDs만 남기고 새 batch와 섞이지 않게 즉시 닫는다.
+        next_state.pop("pendingScheduledAt", None)
+        next_state.pop("pendingCreatedAt", None)
+        next_state.pop("pendingBatchId", None)
     if accepted_receipt:
         # 발송 완료된 과거 응답을 같은 request ID replay가 다시 delivery로
         # 내보내지 않도록 receipt 반영과 함께 response cache를 닫는다.

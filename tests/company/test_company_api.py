@@ -2087,6 +2087,233 @@ class CompanyApiContractTests(unittest.TestCase):
             "operations",
         )
 
+    def test_server_prematch_blocks_operation_capability_bypass_without_hint(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        responses = []
+        with TestClient(app) as client:
+            for suffix, route_group in (
+                ("missing", None),
+                ("freeform", "freeform"),
+            ):
+                payload = _payload(
+                    question="MB2-C00419 장비 종료해줘",
+                    scope={"deviceName": "MB2-C00419"},
+                )
+                if route_group is not None:
+                    payload["routeGroup"] = route_group
+                responses.append(
+                    client.post(
+                        "/internal/v1/assistant/turns",
+                        headers=_headers(
+                            request_id=f"req-prematch-operation-{suffix}"
+                        ),
+                        json=payload,
+                    )
+                )
+
+        # 누락과 낮춘 hint 모두 server matcher 기준 execute 권한을 요구한다.
+        self.assertEqual(
+            [response.status_code for response in responses],
+            [403, 403],
+        )
+        self.assertTrue(
+            all(
+                response.json()["code"] == "caller_not_allowed"
+                for response in responses
+            )
+        )
+        self.assertEqual(runtime.requests, [])
+
+    def test_server_prematch_runs_and_replays_unhinted_mutation_once(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_power_off",
+                outcome="answered",
+                messages=(AssistantMessage(body="종료 요청 완료"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 종료해줘",
+            scope={"deviceName": "MB2-C00419"},
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-operation-replay"),
+                json=payload,
+            )
+            replay = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-operation-replay"),
+                json=payload,
+            )
+
+        # effective group은 runtime stage와 mutation fingerprint 양쪽에 같다.
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.json(), first.json())
+        self.assertEqual(runtime.stages, ["operations"])
+        self.assertEqual(
+            runtime.requests[0].metadata["route_group"],
+            "operations",
+        )
+
+    def test_server_prematch_rejects_operation_hint_mismatch(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-operation-drift"),
+                json=_payload(
+                    question="MB2-C00419 장비 종료해줘",
+                    routeGroup="freeform",
+                    scope={"deviceName": "MB2-C00419"},
+                ),
+            )
+
+        # client hint가 민감 route를 낮추면 일반 validation 문제로 끝낸다.
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["code"], "validation_failed")
+        self.assertEqual(runtime.requests, [])
+
+    def test_server_prematch_protects_unhinted_live_device_detail(
+        self,
+    ) -> None:
+        denied_runtime = _FakeRuntime()
+        denied_app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=denied_runtime,
+            readiness_probe=lambda: True,
+        )
+        accepted_runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_detail",
+                outcome="answered",
+                messages=(AssistantMessage(body="장비 상세 결과"),),
+            )
+        )
+        accepted_app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                )
+            ),
+            assistant_runtime=accepted_runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="MB2-C00419 장비 정보",
+            scope={"deviceName": "MB2-C00419"},
+        )
+
+        with TestClient(denied_app) as client:
+            denied = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-detail-denied"),
+                json=payload,
+            )
+        with TestClient(accepted_app) as client:
+            accepted = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-detail-accepted"),
+                json=payload,
+            )
+            mismatched = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-detail-drift"),
+                json={**payload, "routeGroup": "structured"},
+            )
+
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied_runtime.requests, [])
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(mismatched.status_code, 422)
+        self.assertEqual(mismatched.json()["code"], "validation_failed")
+        self.assertEqual(accepted_runtime.stages, ["structured"])
+        self.assertEqual(
+            accepted_runtime.requests[0].metadata["route_group"],
+            "device_detail",
+        )
+
+    def test_server_prematch_applies_feature_flags_to_unhinted_routes(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.device.probe",
+                    "assistant.device.ssh.open",
+                    "assistant.operation.execute",
+                ),
+                live_device_enabled=False,
+                operations_enabled=False,
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            operation = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-operation-off"),
+                json=_payload(
+                    question="MB2-C00419 장비 종료해줘",
+                    scope={"deviceName": "MB2-C00419"},
+                ),
+            )
+            detail = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-detail-off"),
+                json=_payload(
+                    question="MB2-C00419 장비 정보",
+                    scope={"deviceName": "MB2-C00419"},
+                ),
+            )
+
+        self.assertEqual(operation.status_code, 503)
+        self.assertFalse(operation.json()["retryable"])
+        self.assertEqual(detail.status_code, 503)
+        self.assertFalse(detail.json()["retryable"])
+        self.assertEqual(runtime.requests, [])
+
     def test_success_persists_central_api_request_log_best_effort(self) -> None:
         runtime = _FakeRuntime(
             CompanyAssistantResult(
@@ -3314,6 +3541,12 @@ class CompanyApiContractTests(unittest.TestCase):
                 "/health/ready",
                 "/internal/v1/assistant/turns",
                 "/internal/v1/automation/cycles",
+                "/internal/v1/automation/deliveries/pull",
+                "/internal/v1/automation/deliveries/ack",
+                "/internal/v1/hpa-change/requests",
+                "/internal/v1/hpa-change/threads/lookup",
+                "/internal/v1/hpa-change/deliveries/pull",
+                "/internal/v1/hpa-change/deliveries/ack",
             },
         )
         with TestClient(app) as client:

@@ -150,6 +150,24 @@ _DAILY_DEVICE_ROUND_ACTIVE_PROGRESS_KEYS = (
     "activeDeviceName",
     "activeDeviceUpdatedAt",
 )
+_DAILY_TRANSPORT_CYCLE_KEY_PATTERN = re.compile(
+    r"^daily:(\d{4}-\d{2}-\d{2})$"
+)
+_SLACK_TRANSPORT_CHANNEL_ID_PATTERN = re.compile(
+    r"^[CGD][A-Z0-9]{5,31}$"
+)
+
+
+def _automation_scheduler_enabled() -> bool:
+    """신·구 버전이 함께 배포되는 동안 새 소유권 flag를 안전하게 읽는다."""
+
+    return bool(
+        getattr(
+            cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        )
+    )
 
 
 def _daily_device_round_state_path() -> Path:
@@ -1525,6 +1543,19 @@ def _run_daily_device_round_if_due(
 ) -> bool:
     if not cs.DAILY_DEVICE_ROUND_ENABLED:
         return False
+    local_now = _coerce_daily_device_round_now(now)
+    if _automation_scheduler_enabled():
+        # 새 모드에서는 API scheduler가 일정·옵션·목적지를 모두 확정한다.
+        # Slack은 local DB/MDA/channel 설정을 읽기 전에 transport로 들어간다.
+        if automation_client is None:
+            logger.warning("일일 장비 순회 transport를 켤 수 없어. API client가 없어")
+            return False
+        return _run_daily_device_round_transport(
+            client,
+            logger,
+            automation_client=automation_client,
+            poll_now=local_now,
+        )
     if automation_client is None and not s.DB_QUERY_ENABLED:
         logger.warning("일일 장비 순회를 켤 수 없어. DB_QUERY_ENABLED가 비활성이야")
         return False
@@ -1540,7 +1571,6 @@ def _run_daily_device_round_if_due(
         logger.warning("일일 장비 순회 채널 ID가 없어. DAILY_DEVICE_ROUND_CHANNEL_ID를 확인해줘")
         return False
 
-    local_now = _coerce_daily_device_round_now(now)
     raw_state = _load_daily_device_round_state(logger=logger)
     state = _normalize_daily_device_round_state(raw_state, now=local_now)
     if automation_client is not None:
@@ -2010,6 +2040,223 @@ def _run_daily_device_round_remote(
     return True
 
 
+def _run_daily_device_round_transport(
+    client: Any,
+    logger: logging.Logger,
+    *,
+    automation_client: CompanyAutomationApiClient,
+    poll_now: datetime,
+) -> bool:
+    """API-owned 일일 pending 한 건을 기존 Slack thread 형식으로 전달한다."""
+
+    # 이전 poll의 crash journal을 먼저 닫는다. 신규 batch metadata가 있으면
+    # flush 내부가 exact pull/ACK endpoint를 사용하고 legacy receipt만 구 API로 간다.
+    flush_automation_deliveries(
+        automation_client,
+        cycle="daily_device_round",
+        cycle_key="transport:daily",
+        scheduled_at=poll_now,
+        logger=logger,
+    )
+    batch = automation_client.pull_pending(
+        request_id=build_automation_request_id(
+            cycle="daily_device_round",
+            cycle_key="transport:pull",
+            scheduled_at=poll_now,
+        ),
+        cycle="daily_device_round",
+    )
+    if batch is None:
+        return False
+
+    report_summary, render_now, window_key = (
+        _validate_daily_device_round_transport_batch(batch)
+    )
+    delivery = batch.deliveries[0]
+    state = _load_daily_device_round_state(logger=logger)
+    thread_ts = ""
+    if (
+        str(state.get("windowKey") or "").strip() == window_key
+        and str(state.get("windowThreadChannelId") or "").strip()
+        == batch.channel_id
+    ):
+        thread_ts = str(state.get("windowThreadTs") or "").strip()
+
+    if not thread_ts:
+        title_response = client.chat_postMessage(
+            channel=batch.channel_id,
+            text=_build_daily_device_round_window_title_text(render_now),
+            unfurl_links=False,
+            unfurl_media=False,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle=batch.cycle,
+                cycle_key=batch.cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="title",
+            ),
+        )
+        thread_ts = _extract_daily_device_round_thread_ts(title_response)
+        if not thread_ts:
+            raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+        # thread ts는 Slack transport 복구 정보일 뿐 domain cursor가 아니다.
+        # 기존 상태의 사용자 override는 건드리지 않고 같은 파일에 보존한다.
+        state = _persist_daily_device_round_transport_state(
+            {
+                **state,
+                "windowKey": window_key,
+                "windowThreadTs": thread_ts,
+                "windowThreadChannelId": batch.channel_id,
+                "channelId": batch.channel_id,
+            }
+        )
+
+    message_text = _build_daily_device_round_report_text(
+        report_summary,
+        now=render_now,
+    )
+    message_blocks = _build_remote_daily_device_round_blocks(
+        report_summary,
+        now=render_now,
+    )
+    message_block_chunks = _split_daily_device_round_blocks(message_blocks)
+    last_message_ts = ""
+    # POST 결과가 불명확한 순간 다른 fallback 표현으로 전환하면 먼저
+    # 성공한 chunk와 전체 fallback이 함께 보일 수 있다. 예외는 그대로
+    # 전파하고 다음 pull에서 같은 client_msg_id의 chunk만 다시 시도한다.
+    for index, block_chunk in enumerate(message_block_chunks):
+        response = client.chat_postMessage(
+            channel=batch.channel_id,
+            text=_build_daily_device_round_chunk_text(
+                message_text,
+                chunk_index=index,
+                chunk_count=len(message_block_chunks),
+            ),
+            blocks=block_chunk,
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle=batch.cycle,
+                cycle_key=batch.cycle_key,
+                delivery_id=delivery.delivery_id,
+                part=f"chunk:{index}",
+            ),
+        )
+        last_message_ts = (
+            _extract_daily_device_round_thread_ts(response)
+            or last_message_ts
+        )
+
+    # exact batch identity가 receipt와 같은 원자 journal에 들어가야 재기동
+    # 후 `/deliveries/ack`가 다른 pending을 잘못 닫지 않는다.
+    remember_automation_delivery(
+        cycle=batch.cycle,
+        cycle_key=batch.cycle_key,
+        delivery=AutomationSlackDelivery(
+            delivery_id=delivery.delivery_id,
+            external_message_id=last_message_ts or thread_ts,
+            permalink="",
+            delivered_at=poll_now,
+        ),
+        batch=batch,
+    )
+    _persist_daily_device_round_transport_state(
+        {
+            **state,
+            "windowKey": window_key,
+            "windowThreadTs": thread_ts,
+            "windowThreadChannelId": batch.channel_id,
+            "lastRunDate": render_now.date().isoformat(),
+            "lastHospitalSeq": report_summary.get("hospitalSeq"),
+            "lastHospitalName": report_summary.get("hospitalName"),
+            "lastSentAt": poll_now.isoformat(),
+            "channelId": batch.channel_id,
+        }
+    )
+    logger.info(
+        "Posted daily device round transport channel=%s cycle_key=%s hospitalSeq=%s",
+        batch.channel_id,
+        batch.cycle_key,
+        report_summary.get("hospitalSeq"),
+    )
+    return True
+
+
+def _validate_daily_device_round_transport_batch(
+    batch: Any,
+) -> tuple[dict[str, Any], datetime, str]:
+    """일일 renderer가 이해하는 scheduler batch 한 건만 허용한다."""
+
+    cycle_key_match = _DAILY_TRANSPORT_CYCLE_KEY_PATTERN.fullmatch(
+        str(getattr(batch, "cycle_key", "") or "")
+    )
+    scheduled_at = getattr(batch, "scheduled_at", None)
+    deliveries = getattr(batch, "deliveries", ())
+    render_now = (
+        _coerce_daily_device_round_now(scheduled_at)
+        if isinstance(scheduled_at, datetime) and scheduled_at.tzinfo is not None
+        else None
+    )
+    if (
+        getattr(batch, "cycle", None) != "daily_device_round"
+        or cycle_key_match is None
+        or not _SLACK_TRANSPORT_CHANNEL_ID_PATTERN.fullmatch(
+            str(getattr(batch, "channel_id", "") or "")
+        )
+        or getattr(batch, "conversation", {}) != {}
+        or not isinstance(scheduled_at, datetime)
+        or scheduled_at.tzinfo is None
+        or render_now is None
+        or not isinstance(deliveries, tuple)
+        or len(deliveries) != 1
+        or deliveries[0].kind != "daily_device_round_report"
+    ):
+        raise RuntimeError("일일 장비 순회 transport batch 계약이 올바르지 않아")
+    try:
+        window_date = datetime.fromisoformat(cycle_key_match.group(1)).date()
+    except ValueError as exc:
+        raise RuntimeError(
+            "일일 장비 순회 transport batch 계약이 올바르지 않아"
+        ) from exc
+    window_key = window_date.isoformat()
+    delivery = deliveries[0]
+    report_summary = _validate_remote_daily_device_round_presentation(
+        delivery.payload
+    )
+    hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
+    scheduled_date = render_now.date()
+    if (
+        hospital_seq is None
+        or hospital_seq <= 0
+        # 순회 window가 자정을 넘으면 cycle key는 시작일을 유지하지만
+        # 실제 presentation의 runDate는 API 실행일(다음 날)이 된다.
+        or scheduled_date not in {window_date, window_date + timedelta(days=1)}
+        or report_summary.get("runDate") != scheduled_date.isoformat()
+        or delivery.delivery_id
+        != f"daily_device_round:{window_key}:{hospital_seq}"
+    ):
+        raise RuntimeError("일일 장비 순회 transport batch 계약이 올바르지 않아")
+    return (
+        report_summary,
+        render_now,
+        window_key,
+    )
+
+
+def _persist_daily_device_round_transport_state(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """schedule 정규화 없이 Slack thread 위치만 crash-safe하게 보존한다."""
+
+    snapshot = dict(state)
+    with _DAILY_DEVICE_ROUND_STATE_LOCK:
+        _save_daily_device_round_state(snapshot)
+        with _DAILY_DEVICE_ROUND_RUNTIME_STATE_LOCK:
+            _DAILY_DEVICE_ROUND_RUNTIME_STATE.clear()
+            _DAILY_DEVICE_ROUND_RUNTIME_STATE.update(snapshot)
+    return snapshot
+
+
 def _validate_remote_daily_device_round_presentation(
     payload: Any,
 ) -> dict[str, Any]:
@@ -2199,18 +2446,25 @@ def attach_daily_device_round_reporter(
         return
 
     actual_logger = logger or logging.getLogger(__name__)
-    if automation_client is None and not s.DB_QUERY_ENABLED:
+    scheduler_enabled = _automation_scheduler_enabled()
+    if scheduler_enabled and automation_client is None:
+        actual_logger.warning(
+            "일일 장비 순회 transport가 활성화됐는데 API client가 없어 시작하지 않을게"
+        )
+        return
+    if not scheduler_enabled and automation_client is None and not s.DB_QUERY_ENABLED:
         actual_logger.warning("일일 장비 순회가 활성화됐는데 DB_QUERY_ENABLED가 꺼져 있어 시작하지 않을게")
         return
     if (
-        automation_client is None
+        not scheduler_enabled
+        and automation_client is None
         and not _is_daily_device_round_runtime_configured()
     ):
         actual_logger.warning("일일 장비 순회가 활성화됐는데 MDA/SSH 설정이 부족해 시작하지 않을게")
         return
 
     channel_id = str(cs.DAILY_DEVICE_ROUND_CHANNEL_ID or "").strip()
-    if not channel_id:
+    if not scheduler_enabled and not channel_id:
         actual_logger.warning(
             "일일 장비 순회가 활성화됐는데 채널 ID가 없어. DAILY_DEVICE_ROUND_CHANNEL_ID를 확인해줘"
         )
@@ -2233,14 +2487,19 @@ def attach_daily_device_round_reporter(
         )
         _DAILY_DEVICE_ROUND_THREAD.start()
 
-    local_tz = _daily_device_round_timezone()
-    (start_hour, start_minute), (end_hour, end_minute) = _daily_device_round_window_schedule()
-    actual_logger.info(
-        "Started daily device round scheduler channel=%s every day from %02d:%02d to %02d:%02d %s",
-        channel_id,
-        start_hour,
-        start_minute,
-        end_hour,
-        end_minute,
-        local_tz.key,
-    )
+    if scheduler_enabled:
+        actual_logger.info("Started daily device round Slack transport")
+    else:
+        local_tz = _daily_device_round_timezone()
+        (start_hour, start_minute), (end_hour, end_minute) = (
+            _daily_device_round_window_schedule()
+        )
+        actual_logger.info(
+            "Started daily device round scheduler channel=%s every day from %02d:%02d to %02d:%02d %s",
+            channel_id,
+            start_hour,
+            start_minute,
+            end_hour,
+            end_minute,
+            local_tz.key,
+        )

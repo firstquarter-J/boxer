@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import ANY, patch
 from zoneinfo import ZoneInfo
 
@@ -196,7 +197,7 @@ class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
 
             def run(self, **kwargs: object) -> object:
                 self.calls.append(kwargs)
-                return object()
+                return SimpleNamespace(deliveries=())
 
         automation_client = _AutomationClient()
 

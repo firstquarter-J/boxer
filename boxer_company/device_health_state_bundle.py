@@ -12,9 +12,6 @@ import stat
 import tempfile
 from typing import Any, Literal, Mapping
 
-from boxer_company.device_health_fingerprint import (
-    validate_and_canonicalize_device_health_alert_fingerprint_key,
-)
 from boxer_company.device_health_monitor_cycle import (
     build_device_health_monitor_seed_cursor,
 )
@@ -38,21 +35,11 @@ _FORWARD_BUNDLE_KEYS = frozenset(
         "safety",
     }
 )
-_ROLLBACK_BUNDLE_KEYS = _FORWARD_BUNDLE_KEYS
 _FORWARD_PAYLOAD_KEYS = frozenset(
     {
         "alertDeliveryEnabled",
         "alertFingerprints",
         "pendingAlertFingerprints",
-        "notificationState",
-    }
-)
-_ROLLBACK_PAYLOAD_KEYS = frozenset(
-    {
-        "alertDeliveryOverride",
-        "alertFingerprints",
-        "pendingAlertFingerprints",
-        "pendingDecision",
         "notificationState",
     }
 )
@@ -64,22 +51,6 @@ _FORWARD_SAFETY_KEYS = frozenset(
         "smsUnresolvedClaimCount",
         "activeSettledClaimCount",
         "smsStateDigest",
-    }
-)
-_ROLLBACK_SAFETY_KEYS = frozenset(
-    {
-        "inFlightCount",
-        "ackInFlightCount",
-        "pendingDeliveryCount",
-        "pendingDeliveryContextCount",
-        "pendingSheetAlertCount",
-        "pendingSheetRepairCount",
-        "smsOutboxItemCount",
-        "smsUnresolvedClaimCount",
-        "activeSettledClaimCount",
-        "smsStateDigest",
-        "healthStateDigest",
-        "notificationStateDigest",
     }
 )
 
@@ -105,28 +76,6 @@ _LEGACY_NOTIFICATION_OPTIONAL_KEYS = frozenset(
         "apiRollbackMigration",
     }
 )
-_API_NOTIFICATION_CURSOR_KEYS = frozenset(
-    {
-        "initialized",
-        "initializedAt",
-        "lastSeenId",
-        "lastPolledAt",
-        "pendingDeliveryContexts",
-        "recordingStallIncidents",
-        "captureboardIncidents",
-        "recentCaptureboardAlerts",
-        "pendingSheetRepairs",
-        "lastSheetWriteStatus",
-        "autoSmsClaims",
-        "cycleCompleted",
-        "captureboardIncidentsLastSheetCheckedAt",
-        "lastSentAt",
-        "lastSentNotificationId",
-        "lastExternalMessageId",
-        "lastPermalink",
-    }
-)
-_RECORDING_INCIDENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_RECORDING_INCIDENT_HASH_PATTERN = re.compile(
     r"^sha256:([0-9a-f]{64})$"
 )
@@ -137,7 +86,7 @@ _CAPTUREBOARD_INCIDENT_CODES = frozenset(
 
 
 class DeviceHealthStateBundleError(RuntimeError):
-    """offline migration bundle이나 protected file 계약 위반이다."""
+    """forward migration bundle이나 protected file 계약 위반이다."""
 
 
 def build_device_health_forward_bundle(
@@ -188,8 +137,8 @@ def build_device_health_forward_bundle(
         )
     except (TypeError, ValueError) as exc:
         raise DeviceHealthStateBundleError(str(exc)) from exc
-    notification_state = build_device_notification_legacy_state(
-        build_device_notification_api_cursor(legacy_notification_state)
+    notification_state = _build_forward_notification_bundle_state(
+        legacy_notification_state
     )
     bundle = {
         "schema": DEVICE_HEALTH_STATE_BUNDLE_SCHEMA,
@@ -218,91 +167,17 @@ def build_device_health_forward_bundle(
     return bundle
 
 
-def build_device_health_rollback_bundle(
-    *,
-    cursor: Mapping[str, Any],
-    notification_cursor: Mapping[str, Any],
-    source_cursor_digest: str,
-    sms_state_digest: str,
-    health_state_digest: str,
-    notification_state_digest: str,
-    exported_at: datetime,
-) -> dict[str, Any]:
-    """API cursor에서 Slack import에 필요한 dedupe/override만 투영한다."""
-
-    if not re.fullmatch(r"[0-9a-f]{24}", str(source_cursor_digest or "")):
-        raise DeviceHealthStateBundleError("rollback cursor digest is invalid")
-    if not FILE_DIGEST_PATTERN.fullmatch(str(sms_state_digest or "")):
-        raise DeviceHealthStateBundleError("rollback SMS state digest is invalid")
-    if (
-        not FILE_DIGEST_PATTERN.fullmatch(str(health_state_digest or ""))
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(notification_state_digest or "")
-        )
-    ):
-        raise DeviceHealthStateBundleError("rollback cycle state digest is invalid")
-    if exported_at.tzinfo is None:
-        raise DeviceHealthStateBundleError("rollback export time is invalid")
-    override = cursor.get("alertDeliveryOverride")
-    ownership = cursor.get("stateOwnership")
-    if not isinstance(override, Mapping) or not isinstance(ownership, Mapping):
-        raise DeviceHealthStateBundleError("rollback cursor is invalid")
-    payload = {
-        "alertDeliveryOverride": dict(override),
-        "alertFingerprints": _canonical_fingerprint_state(
-            cursor.get("alertFingerprints")
-        ),
-        "pendingAlertFingerprints": _canonical_fingerprint_state(
-            cursor.get("pendingAlertFingerprints")
-        ),
-        "pendingDecision": str(ownership.get("pendingDecision") or ""),
-        "notificationState": build_device_notification_legacy_state(
-            notification_cursor
-        ),
-    }
-    bundle = {
-        "schema": DEVICE_HEALTH_STATE_BUNDLE_SCHEMA,
-        "version": DEVICE_HEALTH_STATE_BUNDLE_VERSION,
-        "direction": "api_to_slack",
-        "exportedAt": exported_at.astimezone(timezone.utc).isoformat(),
-        "sourceDigest": source_cursor_digest,
-        "payload": payload,
-        "safety": {
-            "inFlightCount": 0,
-            "ackInFlightCount": 0,
-            "pendingDeliveryCount": 0,
-            "pendingDeliveryContextCount": 0,
-            "pendingSheetAlertCount": 0,
-            "pendingSheetRepairCount": 0,
-            "smsOutboxItemCount": 0,
-            "smsUnresolvedClaimCount": 0,
-            # rollback 직후 Slack producer가 같은 장애를 다시 claim할 수
-            # 있으므로 settled claim의 60초 안전창도 완전히 drain한다.
-            "activeSettledClaimCount": 0,
-            "smsStateDigest": sms_state_digest,
-            "healthStateDigest": health_state_digest,
-            "notificationStateDigest": notification_state_digest,
-        },
-    }
-    validate_device_health_state_bundle(bundle, direction="api_to_slack")
-    return bundle
-
-
 def validate_device_health_state_bundle(
     value: Any,
     *,
-    direction: Literal["slack_to_api", "api_to_slack"],
+    direction: Literal["slack_to_api"],
 ) -> dict[str, Any]:
-    """전송된 bundle의 version/direction/payload를 strict 검증한다."""
+    """Slack에서 API로 전송된 bundle을 strict 검증한다."""
 
     if (
         not isinstance(value, Mapping)
-        or set(value)
-        != (
-            _FORWARD_BUNDLE_KEYS
-            if direction == "slack_to_api"
-            else _ROLLBACK_BUNDLE_KEYS
-        )
+        or direction != "slack_to_api"
+        or set(value) != _FORWARD_BUNDLE_KEYS
         or value.get("schema") != DEVICE_HEALTH_STATE_BUNDLE_SCHEMA
         or type(value.get("version")) is not int
         or value.get("version") != DEVICE_HEALTH_STATE_BUNDLE_VERSION
@@ -312,129 +187,56 @@ def validate_device_health_state_bundle(
     ):
         raise DeviceHealthStateBundleError("device health bundle is invalid")
     source_digest = str(value.get("sourceDigest") or "")
-    expected_source_pattern = (
-        FILE_DIGEST_PATTERN
-        if direction == "slack_to_api"
-        else re.compile(r"^[0-9a-f]{24}$")
-    )
-    if not expected_source_pattern.fullmatch(source_digest):
+    if not FILE_DIGEST_PATTERN.fullmatch(source_digest):
         raise DeviceHealthStateBundleError("device health bundle source is invalid")
     payload = dict(value["payload"])
-    if direction == "slack_to_api":
-        safety = value.get("safety")
-        if (
-            set(payload) != _FORWARD_PAYLOAD_KEYS
-            or type(payload.get("alertDeliveryEnabled")) is not bool
-            or not isinstance(payload.get("alertFingerprints"), Mapping)
-            or not isinstance(
-                payload.get("pendingAlertFingerprints"), Mapping
+    safety = value.get("safety")
+    if (
+        set(payload) != _FORWARD_PAYLOAD_KEYS
+        or type(payload.get("alertDeliveryEnabled")) is not bool
+        or not isinstance(payload.get("alertFingerprints"), Mapping)
+        or not isinstance(payload.get("pendingAlertFingerprints"), Mapping)
+        or not isinstance(payload.get("notificationState"), Mapping)
+        or not isinstance(safety, Mapping)
+        or set(safety) != _FORWARD_SAFETY_KEYS
+        or any(
+            type(safety.get(key)) is not int or safety.get(key) != 0
+            for key in (
+                "notificationPendingEventCount",
+                "smsOutboxItemCount",
+                "smsUnresolvedClaimCount",
+                "activeSettledClaimCount",
             )
-            or not isinstance(payload.get("notificationState"), Mapping)
-            or not isinstance(safety, Mapping)
-            or set(safety) != _FORWARD_SAFETY_KEYS
-            or any(
-                type(safety.get(key)) is not int or safety.get(key) != 0
-                for key in (
-                    "notificationPendingEventCount",
-                    "smsOutboxItemCount",
-                    "smsUnresolvedClaimCount",
-                    "activeSettledClaimCount",
-                )
-            )
-            or not FILE_DIGEST_PATTERN.fullmatch(
-                str(safety.get("notificationStateDigest") or "")
-            )
-            or not FILE_DIGEST_PATTERN.fullmatch(
-                str(safety.get("smsStateDigest") or "")
-            )
-        ):
-            raise DeviceHealthStateBundleError("forward bundle payload is invalid")
-        try:
-            cursor = build_device_health_monitor_seed_cursor(
-                legacy_alert_delivery_enabled=payload[
-                    "alertDeliveryEnabled"
-                ],
-                alert_fingerprints=payload.get("alertFingerprints"),
-                pending_alert_fingerprints=payload.get(
-                    "pendingAlertFingerprints"
-                ),
-                pending_decision="preserve",
-                seeded_at=_parse_aware_datetime(value["exportedAt"])
-                or datetime.now(timezone.utc),
-            )
-        except (TypeError, ValueError) as exc:
-            raise DeviceHealthStateBundleError(str(exc)) from exc
-        payload["alertFingerprints"] = cursor["alertFingerprints"]
-        payload["pendingAlertFingerprints"] = cursor[
-            "pendingAlertFingerprints"
-        ]
-        payload["notificationState"] = validate_device_notification_legacy_state(
-            payload["notificationState"],
-            require_drained=True,
         )
-    else:
-        safety = value.get("safety")
-        override = payload.get("alertDeliveryOverride")
-        pending_decision = str(payload.get("pendingDecision") or "")
-        if (
-            set(payload) != _ROLLBACK_PAYLOAD_KEYS
-            or not isinstance(override, Mapping)
-            or set(override) != {"enabled", "updatedAt", "updatedBy"}
-            or type(override.get("enabled")) is not bool
-            or _parse_aware_datetime(override.get("updatedAt")) is None
-            or str(override.get("updatedBy") or "")
-            not in {"manual_cutover_seed", "manual_offline_override"}
-            or pending_decision not in {"preserve", "assume_delivered"}
-            or not isinstance(safety, Mapping)
-            or set(safety) != _ROLLBACK_SAFETY_KEYS
-            or any(
-                type(safety.get(key)) is not int or safety.get(key) != 0
-                for key in (
-                    "inFlightCount",
-                    "ackInFlightCount",
-                    "pendingDeliveryCount",
-                    "pendingDeliveryContextCount",
-                    "pendingSheetAlertCount",
-                    "pendingSheetRepairCount",
-                    "smsOutboxItemCount",
-                    "smsUnresolvedClaimCount",
-                    "activeSettledClaimCount",
-                )
-            )
-            or not FILE_DIGEST_PATTERN.fullmatch(
-                str(safety.get("smsStateDigest") or "")
-            )
-            or not FILE_DIGEST_PATTERN.fullmatch(
-                str(safety.get("healthStateDigest") or "")
-            )
-            or not FILE_DIGEST_PATTERN.fullmatch(
-                str(safety.get("notificationStateDigest") or "")
-            )
-        ):
-            raise DeviceHealthStateBundleError("rollback bundle payload is invalid")
-        try:
-            cursor = build_device_health_monitor_seed_cursor(
-                legacy_alert_delivery_enabled=override["enabled"],
-                alert_fingerprints=payload.get("alertFingerprints"),
-                pending_alert_fingerprints=payload.get(
-                    "pendingAlertFingerprints"
-                ),
-                pending_decision="preserve",
-                seeded_at=_parse_aware_datetime(value["exportedAt"])
-                or datetime.now(timezone.utc),
-            )
-        except (TypeError, ValueError) as exc:
-            raise DeviceHealthStateBundleError(str(exc)) from exc
-        payload["alertDeliveryOverride"] = dict(override)
-        payload["alertFingerprints"] = cursor["alertFingerprints"]
-        payload["pendingAlertFingerprints"] = cursor[
-            "pendingAlertFingerprints"
-        ]
-        payload["pendingDecision"] = pending_decision
-        payload["notificationState"] = validate_device_notification_legacy_state(
-            payload.get("notificationState"),
-            require_drained=True,
+        or not FILE_DIGEST_PATTERN.fullmatch(
+            str(safety.get("notificationStateDigest") or "")
         )
+        or not FILE_DIGEST_PATTERN.fullmatch(
+            str(safety.get("smsStateDigest") or "")
+        )
+    ):
+        raise DeviceHealthStateBundleError("forward bundle payload is invalid")
+    try:
+        cursor = build_device_health_monitor_seed_cursor(
+            legacy_alert_delivery_enabled=payload["alertDeliveryEnabled"],
+            alert_fingerprints=payload.get("alertFingerprints"),
+            pending_alert_fingerprints=payload.get(
+                "pendingAlertFingerprints"
+            ),
+            pending_decision="preserve",
+            seeded_at=_parse_aware_datetime(value["exportedAt"])
+            or datetime.now(timezone.utc),
+        )
+    except (TypeError, ValueError) as exc:
+        raise DeviceHealthStateBundleError(str(exc)) from exc
+    payload["alertFingerprints"] = cursor["alertFingerprints"]
+    payload["pendingAlertFingerprints"] = cursor[
+        "pendingAlertFingerprints"
+    ]
+    payload["notificationState"] = validate_device_notification_legacy_state(
+        payload["notificationState"],
+        require_drained=True,
+    )
     return {**dict(value), "payload": payload}
 
 
@@ -459,7 +261,9 @@ def validate_device_notification_legacy_state(
         raise DeviceHealthStateBundleError(
             "Slack device notification state schema is invalid"
         )
-    _validate_rollback_marker(value.get("apiRollbackMigration"))
+    _validate_historical_api_migration_marker(
+        value.get("apiRollbackMigration")
+    )
     initialized = value.get("initialized")
     last_seen_id = value.get("lastSeenId")
     pending_events = value.get("pendingEvents")
@@ -633,12 +437,14 @@ def build_device_notification_api_cursor(
     }
 
 
-def build_device_notification_legacy_state(
-    notification_cursor: Mapping[str, Any],
+def _build_forward_notification_bundle_state(
+    legacy_state: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """drained API notification cursor를 Slack rollback 표현으로 변환한다."""
+    """forward bundle에서 notification 원문 식별자를 제거한다."""
 
-    cursor = _validate_api_notification_cursor(notification_cursor)
+    # Slack 원본을 먼저 API cursor로 정규화한 뒤 bundle 호환 표현으로
+    # 투영해 barcode/fileId 원문이 offline 전달 파일에 남지 않게 한다.
+    cursor = build_device_notification_api_cursor(legacy_state)
     recording_incidents = {
         f"sha256:{digest}": {
             "phase": item["phase"],
@@ -836,28 +642,9 @@ def inspect_protected_json_target_revision(
     return load_protected_json_file(path, label=label)
 
 
-def _canonical_fingerprint_state(value: Any) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, Mapping):
-        raise DeviceHealthStateBundleError("fingerprint state is invalid")
-    result: dict[str, dict[str, Any]] = {}
-    for raw_key, raw_item in value.items():
-        if not isinstance(raw_item, Mapping):
-            raise DeviceHealthStateBundleError("fingerprint state is invalid")
-        try:
-            key = validate_and_canonicalize_device_health_alert_fingerprint_key(
-                raw_key
-            )
-        except ValueError as exc:
-            raise DeviceHealthStateBundleError(str(exc)) from exc
-        if key in result:
-            raise DeviceHealthStateBundleError(
-                "canonical fingerprint collision requires manual review"
-            )
-        result[key] = dict(raw_item)
-    return result
+def _validate_historical_api_migration_marker(value: Any) -> None:
+    """과거 reverse 이전 marker는 forward 감사 입력으로만 허용한다."""
 
-
-def _validate_rollback_marker(value: Any) -> None:
     if value is None:
         return
     if (
@@ -884,7 +671,7 @@ def _validate_rollback_marker(value: Any) -> None:
         )
     ):
         raise DeviceHealthStateBundleError(
-            "Slack device notification rollback marker is invalid"
+            "Slack device notification migration marker is invalid"
         )
 
 
@@ -1143,296 +930,6 @@ def _strict_legacy_captureboard_incidents(
     return result
 
 
-def _validate_api_notification_cursor(
-    value: Any,
-) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != _API_NOTIFICATION_CURSOR_KEYS:
-        raise DeviceHealthStateBundleError(
-            "API device notification cursor schema is invalid"
-        )
-    if any(
-        not isinstance(value.get(key), Mapping) or value.get(key)
-        for key in (
-            "pendingDeliveryContexts",
-            "pendingSheetRepairs",
-            "autoSmsClaims",
-        )
-    ):
-        raise DeviceHealthStateBundleError(
-            "API device notification cursor is not drained"
-        )
-    if type(value.get("cycleCompleted")) is not bool:
-        raise DeviceHealthStateBundleError(
-            "API device notification cursor is invalid"
-        )
-    initialized = value.get("initialized")
-    last_seen_id = value.get("lastSeenId")
-    if (
-        type(initialized) is not bool
-        or type(last_seen_id) is not int
-        or last_seen_id < 0
-    ):
-        raise DeviceHealthStateBundleError(
-            "API device notification cursor is invalid"
-        )
-    initialized_at = _strict_optional_datetime_text(
-        value.get("initializedAt"),
-        field="API notification initializedAt",
-    )
-    last_polled_at = _strict_optional_datetime_text(
-        value.get("lastPolledAt"),
-        field="API notification lastPolledAt",
-    )
-    if initialized and (not initialized_at or not last_polled_at):
-        raise DeviceHealthStateBundleError(
-            "API device notification initialized cursor is invalid"
-        )
-    last_sent_at = _strict_optional_datetime_text(
-        value.get("lastSentAt"),
-        field="API notification lastSentAt",
-    )
-    last_sent_id = _strict_nonnegative_int(
-        value.get("lastSentNotificationId"),
-        field="API notification last sent id",
-    )
-    if last_sent_id > last_seen_id or (last_sent_id and not last_sent_at):
-        raise DeviceHealthStateBundleError(
-            "API device notification sent cursor is invalid"
-        )
-    recent_alerts = _strict_recent_captureboard_alerts(
-        value.get("recentCaptureboardAlerts")
-    )
-    recording_incidents = _strict_api_recording_incidents(
-        value.get("recordingStallIncidents")
-    )
-    captureboard_incidents = _strict_api_captureboard_incidents(
-        value.get("captureboardIncidents")
-    )
-    observed_ids = [last_sent_id]
-    observed_ids.extend(
-        int(item.get("notificationId") or 0)
-        for item in recent_alerts.values()
-    )
-    observed_ids.extend(
-        int(item.get("lastNotificationId") or 0)
-        for item in recording_incidents.values()
-    )
-    observed_ids.extend(
-        int(item.get("openedNotificationId") or 0)
-        for item in captureboard_incidents.values()
-    )
-    if max(observed_ids, default=0) > last_seen_id:
-        raise DeviceHealthStateBundleError(
-            "API device notification incident cursor is ahead of lastSeenId"
-        )
-    return {
-        **dict(value),
-        "initializedAt": initialized_at,
-        "lastPolledAt": last_polled_at,
-        "recordingStallIncidents": recording_incidents,
-        "captureboardIncidents": captureboard_incidents,
-        "recentCaptureboardAlerts": recent_alerts,
-        "captureboardIncidentsLastSheetCheckedAt": _strict_optional_datetime_text(
-            value.get("captureboardIncidentsLastSheetCheckedAt"),
-            field="API notification captureboard sheet check",
-        ),
-        "lastSentAt": last_sent_at,
-        "lastSentNotificationId": last_sent_id,
-        "lastExternalMessageId": _strict_text(
-            value.get("lastExternalMessageId"),
-            field="API notification external message id",
-            max_length=256,
-        ),
-        "lastPermalink": _strict_text(
-            value.get("lastPermalink"),
-            field="API notification permalink",
-            max_length=2_048,
-        ),
-        "lastSheetWriteStatus": _strict_text(
-            value.get("lastSheetWriteStatus"),
-            field="API notification Sheet status",
-            max_length=64,
-        ),
-    }
-
-
-def _strict_api_recording_incidents(value: Any) -> dict[str, dict[str, Any]]:
-    expected_keys = {
-        "phase",
-        "deviceName",
-        "lastNotificationId",
-        "lastOccurredAt",
-        "lastDurationSeconds",
-        "lastCurrentSize",
-        "rootExternalMessageId",
-        "rootPermalink",
-        "lastCommentNotificationId",
-    }
-    if not isinstance(value, Mapping):
-        raise DeviceHealthStateBundleError(
-            "API device notification recording incidents are invalid"
-        )
-    result: dict[str, dict[str, Any]] = {}
-    for raw_digest, raw_item in value.items():
-        digest = str(raw_digest or "")
-        if (
-            not _RECORDING_INCIDENT_HASH_PATTERN.fullmatch(digest)
-            or not isinstance(raw_item, Mapping)
-            or set(raw_item) != expected_keys
-        ):
-            raise DeviceHealthStateBundleError(
-                "API device notification recording incident is invalid"
-            )
-        phase = str(raw_item.get("phase") or "")
-        if phase not in {"candidate", "alerted"}:
-            raise DeviceHealthStateBundleError(
-                "API device notification recording incident phase is invalid"
-            )
-        item = {
-            "phase": phase,
-            "deviceName": _strict_required_text(
-                raw_item.get("deviceName"),
-                field="API notification recording device",
-                max_length=255,
-            ),
-            "lastNotificationId": _strict_positive_int(
-                raw_item.get("lastNotificationId"),
-                field="API notification recording last id",
-            ),
-            "lastOccurredAt": _strict_required_datetime_text(
-                raw_item.get("lastOccurredAt"),
-                field="API notification recording last time",
-            ),
-            "lastDurationSeconds": _strict_positive_int(
-                raw_item.get("lastDurationSeconds"),
-                field="API notification recording duration",
-            ),
-            "lastCurrentSize": _strict_optional_nonnegative_int(
-                raw_item.get("lastCurrentSize"),
-                field="API notification recording current size",
-            ),
-            "rootExternalMessageId": _strict_text(
-                raw_item.get("rootExternalMessageId"),
-                field="API notification recording root message",
-                max_length=256,
-            ),
-            "rootPermalink": _strict_text(
-                raw_item.get("rootPermalink"),
-                field="API notification recording permalink",
-                max_length=2_048,
-            ),
-            "lastCommentNotificationId": _strict_optional_positive_int(
-                raw_item.get("lastCommentNotificationId"),
-                field="API notification recording comment id",
-            ),
-        }
-        if phase == "alerted" and not item["rootExternalMessageId"]:
-            raise DeviceHealthStateBundleError(
-                "API device notification recording root message is invalid"
-            )
-        result[digest] = item
-    return result
-
-
-def _strict_api_captureboard_incidents(value: Any) -> dict[str, dict[str, Any]]:
-    allowed_keys = {
-        "deviceName",
-        "deviceSeq",
-        "status",
-        "rootExternalMessageId",
-        "rootPermalink",
-        "rowNumber",
-        "openedNotificationId",
-        "openedCode",
-        "openedAt",
-        "lastSheetCheckedAt",
-        "lastSuppressedAt",
-        "lastSuppressedNotificationId",
-        "lastSuppressedCode",
-        "suppressedCount",
-    }
-    if not isinstance(value, Mapping):
-        raise DeviceHealthStateBundleError(
-            "API device notification captureboard incidents are invalid"
-        )
-    result: dict[str, dict[str, Any]] = {}
-    for raw_device_name, raw_item in value.items():
-        device_name = _strict_required_text(
-            raw_device_name,
-            field="API notification captureboard device",
-            max_length=255,
-        )
-        if (
-            not isinstance(raw_item, Mapping)
-            or not {"deviceName", "status"}.issubset(raw_item)
-            or set(raw_item) - allowed_keys
-            or raw_item.get("deviceName") != device_name
-            or str(raw_item.get("status") or "")
-            not in _CAPTUREBOARD_INCIDENT_STATUSES
-        ):
-            raise DeviceHealthStateBundleError(
-                "API device notification captureboard incident is invalid"
-            )
-        opened_code = str(raw_item.get("openedCode") or "")
-        if opened_code not in _CAPTUREBOARD_INCIDENT_CODES:
-            raise DeviceHealthStateBundleError(
-                "API device notification captureboard incident code is invalid"
-            )
-        result[device_name] = {
-            "deviceName": device_name,
-            "deviceSeq": _strict_optional_positive_int(
-                raw_item.get("deviceSeq"),
-                field="API notification captureboard device seq",
-            ),
-            "status": str(raw_item["status"]),
-            "rootExternalMessageId": _strict_text(
-                raw_item.get("rootExternalMessageId"),
-                field="API notification captureboard root message",
-                max_length=256,
-            ),
-            "rootPermalink": _strict_text(
-                raw_item.get("rootPermalink"),
-                field="API notification captureboard permalink",
-                max_length=2_048,
-            ),
-            "rowNumber": _strict_optional_positive_int(
-                raw_item.get("rowNumber"),
-                field="API notification captureboard row",
-            ),
-            "openedNotificationId": _strict_optional_positive_int(
-                raw_item.get("openedNotificationId"),
-                field="API notification captureboard opened id",
-            ),
-            "openedCode": opened_code,
-            "openedAt": _strict_optional_datetime_text(
-                raw_item.get("openedAt"),
-                field="API notification captureboard opened time",
-            ),
-            "lastSheetCheckedAt": _strict_optional_datetime_text(
-                raw_item.get("lastSheetCheckedAt"),
-                field="API notification captureboard sheet check",
-            ),
-            "lastSuppressedAt": _strict_optional_datetime_text(
-                raw_item.get("lastSuppressedAt"),
-                field="API notification captureboard suppressed time",
-            ),
-            "lastSuppressedNotificationId": _strict_optional_positive_int(
-                raw_item.get("lastSuppressedNotificationId"),
-                field="API notification captureboard suppressed id",
-            ),
-            "lastSuppressedCode": _strict_text(
-                raw_item.get("lastSuppressedCode"),
-                field="API notification captureboard suppressed code",
-                max_length=64,
-            ),
-            "suppressedCount": _strict_nonnegative_int(
-                raw_item.get("suppressedCount", 0),
-                field="API notification captureboard suppressed count",
-            ),
-        }
-    return result
-
-
 def _recording_incident_digest(
     key: str,
     item: Mapping[str, Any],
@@ -1633,9 +1130,7 @@ def _parse_aware_datetime(value: Any) -> datetime | None:
 
 __all__ = [
     "build_device_notification_api_cursor",
-    "build_device_notification_legacy_state",
     "build_device_health_forward_bundle",
-    "build_device_health_rollback_bundle",
     "create_protected_json_file",
     "DeviceHealthStateBundleError",
     "FILE_DIGEST_PATTERN",

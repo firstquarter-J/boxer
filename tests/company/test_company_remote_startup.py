@@ -52,6 +52,20 @@ def _all_remote_settings() -> CompanyApiClientSettings:
 
 
 class CompanyRemoteStartupTests(unittest.TestCase):
+    def test_transport_only_startup_requires_api_owned_scheduler(self) -> None:
+        with patch.object(
+            company.cs,
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            False,
+        ):
+            with self.assertRaisesRegex(
+                CompanyApiContractError,
+                "company_api_transport_only_remote_required",
+            ):
+                company._require_transport_only_remote_settings(
+                    _all_remote_settings()
+                )
+
     def _create_app(
         self,
         settings: CompanyApiClientSettings,
@@ -135,8 +149,8 @@ class CompanyRemoteStartupTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(
                     company,
-                    "create_hpa_change_runtime",
-                    return_value=Mock(),
+                    "build_hpa_change_remote_routes_config",
+                    return_value=SimpleNamespace(enabled=False),
                 )
             )
             stack.enter_context(
@@ -148,7 +162,7 @@ class CompanyRemoteStartupTests(unittest.TestCase):
             )
             reporters: dict[str, Mock] = {}
             for reporter_name in (
-                "attach_hpa_change_reporter",
+                "attach_hpa_change_remote_reporter",
                 "attach_weekly_recordings_reporter",
                 "attach_device_health_monitor_reporter",
                 "attach_device_notification_alert_reporter",
@@ -157,6 +171,13 @@ class CompanyRemoteStartupTests(unittest.TestCase):
                 reporters[reporter_name] = stack.enter_context(
                     patch.object(company, reporter_name)
                 )
+            stack.enter_context(
+                patch.object(
+                    company.cs,
+                    "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+                    True,
+                )
+            )
             # reporter 설정 조합만 바꾸고 실제 thread나 외부 접근은 모두 막는다.
             for flag_name in _REPORTER_FLAGS:
                 stack.enter_context(
@@ -506,7 +527,7 @@ class CompanyRemoteStartupTests(unittest.TestCase):
                     sms_provider=provider,
                 )
 
-    def test_any_local_shadow_or_fallback_keeps_local_provider(self) -> None:
+    def test_any_local_shadow_or_fallback_blocks_production_entry(self) -> None:
         remote = _all_remote_settings()
         cases: tuple[tuple[str, CompanyApiClientSettings], ...] = (
             ("local", replace(remote, notion_mode="local")),
@@ -519,19 +540,13 @@ class CompanyRemoteStartupTests(unittest.TestCase):
 
         for name, settings in cases:
             with self.subTest(path=name):
-                result = self._create_app(settings)
-
-                result.validate_tokens.assert_called_once_with(
-                    include_llm=True,
-                    include_data_sources=True,
-                )
-                result.build_claude.assert_called_once_with(
-                    timeout_sec=company.s.ANTHROPIC_TIMEOUT_SEC
-                )
-                self.assertEqual(
-                    result.answer_engine.call_args.kwargs["provider"],
-                    "claude",
-                )
+                # production create_app은 local provider 구성까지 진행하지
+                # 않고 mode/fallback 경계에서 즉시 fail-closed한다.
+                with self.assertRaisesRegex(
+                    CompanyApiContractError,
+                    "company_api_transport_only_remote_required",
+                ):
+                    self._create_app(settings)
 
 
 if __name__ == "__main__":

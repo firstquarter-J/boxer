@@ -54,7 +54,7 @@ _CAPABILITY_PATTERN = re.compile(
 )
 _ALLOWED_CHANNELS = frozenset({"slack", "web", "api"})
 _REQUIRED_TURN_CAPABILITY = "assistant.turn.read"
-_AUTOMATION_SLACK_CAPABILITIES = frozenset(
+_LEGACY_AUTOMATION_SLACK_CAPABILITIES = frozenset(
     {
         "assistant.turn.read",
         "assistant.device.probe",
@@ -62,6 +62,17 @@ _AUTOMATION_SLACK_CAPABILITIES = frozenset(
         "assistant.operation.execute",
         "assistant.device.alert.execute",
         "assistant.automation.execute",
+    }
+)
+_SCHEDULER_AUTOMATION_SLACK_CAPABILITIES = frozenset(
+    {
+        "assistant.turn.read",
+        "assistant.device.probe",
+        "assistant.device.ssh.open",
+        "assistant.operation.execute",
+        "assistant.device.alert.execute",
+        "assistant.automation.transport",
+        "assistant.hpa.change.execute",
     }
 )
 _LIVE_DEVICE_SLACK_CAPABILITIES = frozenset(
@@ -117,6 +128,9 @@ class CompanyApiSettings:
     # 직접 주입하는 테스트 app은 기존 endpoint 계약을 유지하고, env loader로
     # 만든 운영 설정만 실제 reporter flag에 맞춘 cycle 집합을 전달한다.
     automation_enabled_cycles: frozenset[str] = _ALL_AUTOMATION_CYCLES
+    # 새 companion과 pull/ACK transport는 명시 flag로 함께 열고, 이때
+    # Slack caller의 domain execute capability를 transport로 교체한다.
+    automation_scheduler_enabled: bool = False
 
     @property
     def authentication_configured(self) -> bool:
@@ -145,6 +159,13 @@ def load_company_api_settings(
         live_device_enabled=live_device_enabled,
     )
     automation_enabled_cycles = _automation_enabled_cycles(source)
+    (
+        automation_scheduler_enabled,
+        automation_scheduler_error,
+    ) = _load_automation_scheduler_enabled(
+        source,
+        enabled_cycles=automation_enabled_cycles,
+    )
     host, port, server_error = _load_server_settings(source)
     automation_storage_required = bool(automation_enabled_cycles)
     sms_delivery_storage_required = _sms_delivery_storage_required(source)
@@ -184,6 +205,7 @@ def load_company_api_settings(
                 or operations_dependency_error
                 or automation_error
                 or automation_dependency_error
+                or automation_scheduler_error
                 or "caller_registry_missing"
             ),
             automation_state_path=automation_state_path,
@@ -200,6 +222,7 @@ def load_company_api_settings(
             request_log_enabled=request_log_enabled,
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
+            automation_scheduler_enabled=automation_scheduler_enabled,
         )
 
     try:
@@ -218,6 +241,7 @@ def load_company_api_settings(
                 or operations_dependency_error
                 or automation_error
                 or automation_dependency_error
+                or automation_scheduler_error
                 or "caller_registry_invalid"
             ),
             automation_state_path=automation_state_path,
@@ -234,10 +258,14 @@ def load_company_api_settings(
             request_log_enabled=request_log_enabled,
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
+            automation_scheduler_enabled=automation_scheduler_enabled,
         )
 
     automation_caller_error = (
-        _validate_automation_slack_caller(callers)
+        _validate_automation_slack_caller(
+            callers,
+            scheduler_enabled=automation_scheduler_enabled,
+        )
         if automation_storage_required
         else None
     )
@@ -260,6 +288,7 @@ def load_company_api_settings(
         or operations_dependency_error is not None
         or automation_error is not None
         or automation_dependency_error is not None
+        or automation_scheduler_error is not None
         or automation_caller_error is not None
         or live_device_caller_error is not None
         or operations_caller_error is not None
@@ -276,6 +305,7 @@ def load_company_api_settings(
                 or operations_dependency_error
                 or automation_error
                 or automation_dependency_error
+                or automation_scheduler_error
                 or automation_caller_error
                 or live_device_caller_error
                 or operations_caller_error
@@ -294,6 +324,7 @@ def load_company_api_settings(
             request_log_enabled=request_log_enabled,
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
+            automation_scheduler_enabled=automation_scheduler_enabled,
         )
     return CompanyApiSettings(
         host=host,
@@ -313,6 +344,7 @@ def load_company_api_settings(
         request_log_enabled=request_log_enabled,
         request_log_path=request_log_path,
         automation_enabled_cycles=automation_enabled_cycles,
+        automation_scheduler_enabled=automation_scheduler_enabled,
     )
 
 
@@ -385,6 +417,26 @@ def _load_operations_enabled(
     if raw_value in _FALSE_VALUES:
         return False, None
     return False, "operations_configuration_invalid"
+
+
+def _load_automation_scheduler_enabled(
+    env: Mapping[str, str],
+    *,
+    enabled_cycles: frozenset[str],
+) -> tuple[bool, str | None]:
+    """API scheduler와 transport 소유권을 한 feature flag로 전환한다."""
+
+    raw_value = str(
+        env.get(
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            "false",
+        )
+    ).strip().lower()
+    if raw_value in _FALSE_VALUES:
+        return False, None
+    if raw_value not in _TRUE_VALUES or not enabled_cycles:
+        return False, "automation_scheduler_configuration_invalid"
+    return True, None
 
 
 def _load_request_log_settings(
@@ -954,11 +1006,18 @@ def _parse_caller_registry(
 
 def _validate_automation_slack_caller(
     callers: tuple[CompanyApiCallerSettings, ...],
+    *,
+    scheduler_enabled: bool,
 ) -> str | None:
     slack_callers = [caller for caller in callers if "slack" in caller.channels]
+    required_capabilities = (
+        _SCHEDULER_AUTOMATION_SLACK_CAPABILITIES
+        if scheduler_enabled
+        else _LEGACY_AUTOMATION_SLACK_CAPABILITIES
+    )
     if (
         len(slack_callers) != 1
-        or slack_callers[0].capabilities != _AUTOMATION_SLACK_CAPABILITIES
+        or slack_callers[0].capabilities != required_capabilities
     ):
         return "automation_caller_configuration_invalid"
     return None

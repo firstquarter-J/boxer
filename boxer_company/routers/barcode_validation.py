@@ -37,6 +37,12 @@ _BARCODE_VALIDATION_STATUS_HINTS = (
     "REFUND",
     "refund",
 )
+_BARCODE_VALIDATION_POLICY_HINTS = (
+    "기준",
+    "정책",
+    "규칙",
+    "방법",
+)
 _BLOCKING_SPECIAL_TYPE_LABELS = {
     "FREE": "무료 바코드(핑크 바코드)",
     "REFUND": "환불 처리 바코드",
@@ -78,9 +84,20 @@ def _is_barcode_validation_status_request(question: str, barcode: str | None) ->
     normalized = str(question or "").strip()
     if not normalized:
         return False
+    has_status_hint = _contains_any_hint(
+        normalized,
+        _BARCODE_VALIDATION_STATUS_HINTS,
+    )
+    if (
+        _contains_any_hint(normalized, _BARCODE_VALIDATION_POLICY_HINTS)
+        and not has_status_hint
+    ):
+        # thread에 바코드가 있어도 "검증 기준" 같은 플레이북 질문은
+        # 현재 바코드의 MDA 상태 조회로 선점하지 않는다.
+        return False
     if _contains_any_hint(normalized, _BARCODE_VALIDATION_CONTEXT_HINTS):
         return True
-    return _contains_any_hint(normalized, _BARCODE_VALIDATION_STATUS_HINTS)
+    return has_status_hint
 
 
 def _is_barcode_pink_classification_reason_request(question: str, barcode: str | None) -> bool:

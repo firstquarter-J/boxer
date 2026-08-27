@@ -4,6 +4,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+from pathlib import Path
 import threading
 from typing import Any
 import unittest
@@ -31,6 +32,56 @@ _TRACEPARENT = (
 _QUESTION = "회사 노션에서 커머스 운영 기준 찾아줘"
 _SILENT_LOGGER = logging.getLogger(f"{__name__}.silent")
 _SILENT_LOGGER.disabled = True
+_REMOTE_MODE_ENV_KEYS = (
+    "BOXER_COMPANY_API_NOTION_MODE",
+    "BOXER_COMPANY_API_STRUCTURED_MODE",
+    "BOXER_COMPANY_API_DEVICE_MODE",
+    "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
+    "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
+    "BOXER_COMPANY_API_BARCODE_LOG_MODE",
+    "BOXER_COMPANY_API_BARCODE_MODE",
+    "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE",
+    "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE",
+    "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
+    "BOXER_COMPANY_API_FREEFORM_MODE",
+    "BOXER_COMPANY_API_PLAYBOOK_MODE",
+    "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
+    "BOXER_COMPANY_API_OPERATIONS_MODE",
+    "BOXER_COMPANY_API_AUTOMATION_MODE",
+)
+_REMOTE_FALLBACK_ENV_KEYS = tuple(
+    key.replace("_MODE", "_FALLBACK_ENABLED")
+    for key in _REMOTE_MODE_ENV_KEYS
+)
+_ALL_AUTOMATION_CYCLES = (
+    "weekly_recordings",
+    "daily_device_round",
+    "device_health_monitor",
+    "device_notification_alert",
+    "sms_delivery",
+)
+
+
+def _remote_loader_env(**overrides: str) -> dict[str, str]:
+    """production Slack entry가 요구하는 완전 remote env fixture다."""
+
+    env = {
+        "BOXER_COMPANY_API_BASE_URL": "http://10.40.102.50:8010",
+        "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
+        "BOXER_COMPANY_API_AUTOMATION_TENANT_ID": "lifex",
+        "BOXER_COMPANY_API_AUTOMATION_REMOTE_CYCLES": ",".join(
+            _ALL_AUTOMATION_CYCLES
+        ),
+        "BOXER_COMPANY_AUTOMATION_DELIVERY_STATE_PATH": str(
+            Path(__file__).resolve().with_name(
+                ".company-api-delivery-state.json"
+            )
+        ),
+        **{key: "remote" for key in _REMOTE_MODE_ENV_KEYS},
+        **{key: "false" for key in _REMOTE_FALLBACK_ENV_KEYS},
+    }
+    env.update(overrides)
+    return env
 
 
 @dataclass
@@ -369,98 +420,31 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                     ).transport_only_remote
                 )
 
-    def test_local_is_the_credential_free_rollback_default(self) -> None:
-        settings = load_company_api_client_settings({})
+    def test_missing_or_local_configuration_has_no_rollback_path(self) -> None:
+        for env in (
+            {},
+            _remote_loader_env(BOXER_COMPANY_API_NOTION_MODE="local"),
+            _remote_loader_env(BOXER_COMPANY_API_NOTION_MODE="shadow"),
+        ):
+            with self.subTest(env_keys=sorted(env)):
+                with self.assertRaisesRegex(
+                    CompanyApiContractError,
+                    "company_api_transport_only_remote_required",
+                ):
+                    load_company_api_client_settings(env)
 
-        self.assertEqual(settings.notion_mode, "local")
-        self.assertEqual(settings.structured_mode, "local")
-        self.assertEqual(settings.device_mode, "local")
-        self.assertEqual(settings.device_detail_mode, "local")
-        self.assertEqual(settings.recording_failure_mode, "local")
-        self.assertEqual(settings.barcode_log_mode, "local")
-        self.assertEqual(settings.barcode_mode, "local")
-        self.assertEqual(settings.barcode_residual_mode, "local")
-        self.assertEqual(settings.barcode_timeline_mode, "local")
-        self.assertEqual(settings.barcode_freeform_mode, "local")
-        self.assertEqual(settings.freeform_mode, "local")
-        self.assertEqual(settings.playbook_mode, "local")
-        self.assertEqual(settings.weekly_summary_mode, "local")
-        self.assertEqual(settings.operations_mode, "local")
-        self.assertEqual(settings.operations_read_timeout_sec, 1_300.0)
-        self.assertFalse(settings.enabled)
-        self.assertEqual(settings.base_url, "")
-        self.assertEqual(settings.token, "")
-        self.assertFalse(settings.notion_fallback_enabled)
-        self.assertFalse(settings.structured_fallback_enabled)
-        self.assertFalse(settings.device_fallback_enabled)
-        self.assertFalse(settings.device_detail_fallback_enabled)
-        self.assertFalse(settings.recording_failure_fallback_enabled)
-        self.assertFalse(settings.barcode_log_fallback_enabled)
-        self.assertFalse(settings.barcode_fallback_enabled)
-        self.assertFalse(settings.barcode_residual_fallback_enabled)
-        self.assertFalse(settings.barcode_timeline_fallback_enabled)
-        self.assertFalse(settings.barcode_freeform_fallback_enabled)
-        self.assertFalse(settings.freeform_fallback_enabled)
-        self.assertFalse(settings.playbook_fallback_enabled)
-        self.assertFalse(settings.weekly_summary_fallback_enabled)
-        self.assertFalse(settings.operations_fallback_enabled)
-
-    def test_local_rollback_ignores_stale_remote_credentials(self) -> None:
-        settings = load_company_api_client_settings(
-            {
-                "BOXER_COMPANY_API_NOTION_MODE": "local",
-                "BOXER_COMPANY_API_STRUCTURED_MODE": "local",
-                "BOXER_COMPANY_API_DEVICE_MODE": "local",
-                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "local",
-                "BOXER_COMPANY_API_RECORDING_FAILURE_MODE": "local",
-                "BOXER_COMPANY_API_BARCODE_LOG_MODE": "local",
-                "BOXER_COMPANY_API_BARCODE_MODE": "local",
-                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "local",
-                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "local",
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "local",
-                "BOXER_COMPANY_API_FREEFORM_MODE": "local",
-                "BOXER_COMPANY_API_PLAYBOOK_MODE": "local",
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "local",
-                "BOXER_COMPANY_API_OPERATIONS_MODE": "local",
-                "BOXER_COMPANY_API_BASE_URL": "http://public.example.com",
-                "BOXER_COMPANY_API_SERVICE_TOKEN": "stale-invalid-token",
-                "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "invalid",
-                "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "-1",
-                "BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC": "invalid",
-                "BOXER_COMPANY_API_MAX_RETRIES": "999",
-                "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_DEVICE_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_RECORDING_FAILURE_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_BARCODE_LOG_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_BARCODE_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED": "invalid",
-                "BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED": "invalid",
-            }
+    def test_stale_credentials_cannot_reenable_local_rollback(self) -> None:
+        env = _remote_loader_env(
+            BOXER_COMPANY_API_NOTION_MODE="local",
+            BOXER_COMPANY_API_BASE_URL="http://public.example.com",
+            BOXER_COMPANY_API_SERVICE_TOKEN="stale-invalid-token",
         )
 
-        self.assertEqual(settings.notion_mode, "local")
-        self.assertEqual(settings.structured_mode, "local")
-        self.assertEqual(settings.device_mode, "local")
-        self.assertEqual(settings.device_detail_mode, "local")
-        self.assertEqual(settings.recording_failure_mode, "local")
-        self.assertEqual(settings.barcode_log_mode, "local")
-        self.assertEqual(settings.barcode_mode, "local")
-        self.assertEqual(settings.barcode_residual_mode, "local")
-        self.assertEqual(settings.barcode_timeline_mode, "local")
-        self.assertEqual(settings.barcode_freeform_mode, "local")
-        self.assertEqual(settings.freeform_mode, "local")
-        self.assertEqual(settings.playbook_mode, "local")
-        self.assertEqual(settings.weekly_summary_mode, "local")
-        self.assertEqual(settings.operations_mode, "local")
-        self.assertEqual(settings.base_url, "")
-        self.assertEqual(settings.token, "")
+        with self.assertRaisesRegex(
+            CompanyApiContractError,
+            "company_api_transport_only_remote_required",
+        ):
+            load_company_api_client_settings(env)
 
     def test_manual_remote_settings_cannot_bypass_transport_validation(
         self,
@@ -517,26 +501,26 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
 
     def test_remote_settings_validate_internal_transport_and_hide_token(self) -> None:
         settings = load_company_api_client_settings(
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010/"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_NOTION_MODE": "shadow",
-                "BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC": "1.5",
-                "BOXER_COMPANY_API_READ_TIMEOUT_SEC": "75",
-                "BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC": "720",
-                "BOXER_COMPANY_API_MAX_RETRIES": "2",
-                "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "false",
-            }
+            _remote_loader_env(
+                BOXER_COMPANY_API_BASE_URL="http://10.40.102.50:8010/",
+                BOXER_COMPANY_API_CONNECT_TIMEOUT_SEC="1.5",
+                BOXER_COMPANY_API_READ_TIMEOUT_SEC="75",
+                BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC="720",
+                BOXER_COMPANY_API_MAX_RETRIES="2",
+            )
         )
 
         self.assertEqual(
             settings.base_url,
             "http://10.40.102.50:8010",
         )
-        self.assertEqual(settings.notion_mode, "shadow")
-        self.assertEqual(settings.structured_mode, "local")
+        self.assertTrue(settings.transport_only_remote)
+        self.assertEqual(settings.notion_mode, "remote")
+        self.assertEqual(settings.structured_mode, "remote")
+        self.assertEqual(
+            frozenset(settings.automation_remote_cycles),
+            frozenset(_ALL_AUTOMATION_CYCLES),
+        )
         self.assertEqual(settings.connect_timeout_sec, 1.5)
         self.assertEqual(settings.read_timeout_sec, 75)
         self.assertEqual(settings.operations_read_timeout_sec, 720)
@@ -545,136 +529,58 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertFalse(settings.structured_fallback_enabled)
         self.assertNotIn(_TOKEN, repr(settings))
 
-    def test_structured_mode_independently_enables_shared_transport(
+    def test_every_route_mode_must_be_remote(
         self,
     ) -> None:
-        settings = load_company_api_client_settings(
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_NOTION_MODE": "local",
-                "BOXER_COMPANY_API_STRUCTURED_MODE": "remote",
-                "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED": "false",
-                "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "true",
-            }
-        )
+        for mode_key in _REMOTE_MODE_ENV_KEYS:
+            for unsafe_mode in ("local", "shadow"):
+                with self.subTest(
+                    mode_key=mode_key,
+                    unsafe_mode=unsafe_mode,
+                ):
+                    with self.assertRaisesRegex(
+                        CompanyApiContractError,
+                        "company_api_transport_only_remote_required",
+                    ):
+                        load_company_api_client_settings(
+                            _remote_loader_env(
+                                **{mode_key: unsafe_mode}
+                            )
+                        )
 
-        self.assertTrue(settings.enabled)
-        self.assertEqual(settings.notion_mode, "local")
-        self.assertEqual(settings.structured_mode, "remote")
-        self.assertFalse(settings.notion_fallback_enabled)
-        self.assertTrue(settings.structured_fallback_enabled)
-        self.assertEqual(
-            settings.base_url,
-            "http://10.40.102.50:8010",
-        )
-
-    def test_remaining_route_mode_independently_enables_shared_transport(
+    def test_automation_remote_cycles_must_be_exact_full_set(
         self,
     ) -> None:
-        mode_keys = (
-            (
-                "BOXER_COMPANY_API_DEVICE_MODE",
-                "device_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
-                "device_detail_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
-                "recording_failure_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_BARCODE_LOG_MODE",
-                "barcode_log_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_BARCODE_MODE",
-                "barcode_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_PLAYBOOK_MODE",
-                "playbook_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE",
-                "barcode_residual_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE",
-                "barcode_timeline_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
-                "barcode_freeform_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_FREEFORM_MODE",
-                "freeform_mode",
-            ),
-            (
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
-                "weekly_summary_mode",
-            ),
+        unsafe_values = (
+            "",
+            "weekly_recordings",
+            "weekly_recordings,daily_device_round",
+            "weekly_recordings,weekly_recordings",
+            ",".join((*_ALL_AUTOMATION_CYCLES, "unknown")),
         )
-        for env_key, field_name in mode_keys:
-            with self.subTest(field_name=field_name):
-                settings = load_company_api_client_settings(
-                    {
-                        "BOXER_COMPANY_API_BASE_URL": (
-                            "http://10.40.102.50:8010"
-                        ),
-                        "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                        env_key: "shadow",
-                    }
-                )
+        for cycles in unsafe_values:
+            with self.subTest(cycles=cycles):
+                with self.assertRaisesRegex(
+                    CompanyApiContractError,
+                    "company_api_automation_remote_cycles_invalid",
+                ):
+                    load_company_api_client_settings(
+                        _remote_loader_env(
+                            BOXER_COMPANY_API_AUTOMATION_REMOTE_CYCLES=(
+                                cycles
+                            )
+                        )
+                    )
 
-                self.assertTrue(settings.enabled)
-                self.assertTrue(settings.shadow_enabled)
-                self.assertEqual(
-                    getattr(settings, field_name),
-                    "shadow",
-                )
-        self.assertNotIn(_TOKEN, repr(settings))
-
-    def test_new_route_fallbacks_load_only_for_non_local_modes(self) -> None:
-        # 신규 route는 같은 transport를 써도 fallback 정책은 각자 가진다.
-        cases = (
-            (
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED",
-                "weekly_summary_fallback_enabled",
-            ),
-            (
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED",
-                "barcode_freeform_fallback_enabled",
-            ),
-            (
-                "BOXER_COMPANY_API_FREEFORM_MODE",
-                "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED",
-                "freeform_fallback_enabled",
-            ),
-        )
-        for mode_key, fallback_key, field_name in cases:
-            with self.subTest(field_name=field_name):
-                settings = load_company_api_client_settings(
-                    {
-                        "BOXER_COMPANY_API_BASE_URL": (
-                            "http://10.40.102.50:8010"
-                        ),
-                        "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                        mode_key: "remote",
-                        fallback_key: "true",
-                    }
-                )
-
-                self.assertTrue(settings.enabled)
-                self.assertFalse(settings.shadow_enabled)
-                self.assertTrue(getattr(settings, field_name))
+    def test_every_local_fallback_is_rejected(self) -> None:
+        for fallback_key in _REMOTE_FALLBACK_ENV_KEYS:
+            with self.subTest(fallback_key=fallback_key):
+                with self.assertRaises(CompanyApiContractError):
+                    load_company_api_client_settings(
+                        _remote_loader_env(
+                            **{fallback_key: "true"}
+                        )
+                    )
 
     def test_device_detail_rejects_local_fallback_when_non_local(
         self,
@@ -686,16 +592,11 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             "company_api_device_detail_fallback_unsafe",
         ):
             load_company_api_client_settings(
-                {
-                    "BOXER_COMPANY_API_BASE_URL": (
-                        "http://10.40.102.50:8010"
-                    ),
-                    "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                    "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "remote",
-                    "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED": (
+                _remote_loader_env(
+                    BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED=(
                         "true"
-                    ),
-                }
+                    )
+                )
             )
 
         with self.assertRaisesRegex(
@@ -714,13 +615,7 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self,
     ) -> None:
         settings = load_company_api_client_settings(
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_OPERATIONS_MODE": "remote",
-            }
+            _remote_loader_env()
         )
 
         self.assertTrue(settings.enabled)
@@ -729,15 +624,12 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
         self.assertFalse(settings.shadow_enabled)
 
         for env in (
-            {"BOXER_COMPANY_API_OPERATIONS_MODE": "shadow"},
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_OPERATIONS_MODE": "remote",
-                "BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED": "true",
-            },
+            _remote_loader_env(
+                BOXER_COMPANY_API_OPERATIONS_MODE="shadow"
+            ),
+            _remote_loader_env(
+                BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED="true"
+            ),
         ):
             with self.subTest(env_keys=sorted(env)):
                 with self.assertRaises(CompanyApiContractError):

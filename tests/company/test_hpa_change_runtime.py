@@ -25,6 +25,9 @@ from boxer_company_adapter_slack.hpa_change_runtime import (
     HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS,
     create_hpa_change_runtime,
 )
+from boxer_company_adapter_slack.company_api_client import (
+    CompanyApiClientSettings,
+)
 from boxer_company.hpa_change_workflow import (
     GitHubArtifactArchive,
     GitHubWorkflowRun,
@@ -146,6 +149,12 @@ def _mark_needs_clarification(runtime: Any, task_id: str) -> None:
 
 
 class HpaChangeRuntimeTests(unittest.TestCase):
+    def test_company_entry_no_longer_exposes_local_hpa_runtime(self) -> None:
+        self.assertFalse(hasattr(company, "create_hpa_change_runtime"))
+        self.assertFalse(hasattr(company, "attach_hpa_change_reporter"))
+        self.assertTrue(hasattr(company, "HpaChangeApiClient"))
+        self.assertTrue(hasattr(company, "attach_hpa_change_remote_reporter"))
+
     def test_disabled_runtime_does_not_require_github_credentials(self) -> None:
         settings = SimpleNamespace(HPA_CHANGE_REQUEST_ENABLED=False)
 
@@ -542,11 +551,11 @@ class HpaChangeRuntimeTests(unittest.TestCase):
     def test_company_app_routes_hpa_before_ping_and_attaches_reporter(self) -> None:
         captured_handlers: dict[str, Any] = {}
         fake_app = SimpleNamespace(client=object())
-        fake_runtime = SimpleNamespace(
-            routes_config=HpaChangeRoutesConfig(enabled=True),
+        fake_api_client = SimpleNamespace(
             submit_request=Mock(),
             lookup_thread_job=Mock(),
         )
+        routes_config = HpaChangeRoutesConfig(enabled=True)
 
         def fake_create_slack_app(mention_handler: Any, message_handler: Any) -> Any:
             captured_handlers["mention"] = mention_handler
@@ -556,11 +565,30 @@ class HpaChangeRuntimeTests(unittest.TestCase):
         with (
             patch.object(company, "_validate_ec2_runtime_aws_env"),
             patch.object(company, "_validate_tokens"),
+            # HPA handler 순서 테스트는 production remote-only 시작 계약과
+            # 독립적이므로 legacy 조립 설정과 시작 guard를 격리한다.
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=CompanyApiClientSettings(
+                    base_url="",
+                    token="",
+                ),
+            ),
+            patch.object(
+                company,
+                "_require_transport_only_remote_settings",
+            ),
             patch.object(company.s, "LLM_PROVIDER", ""),
             patch.object(
                 company,
-                "create_hpa_change_runtime",
-                return_value=fake_runtime,
+                "build_hpa_change_remote_routes_config",
+                return_value=routes_config,
+            ),
+            patch.object(
+                company,
+                "HpaChangeApiClient",
+                return_value=fake_api_client,
             ),
             patch.object(
                 company,
@@ -574,7 +602,10 @@ class HpaChangeRuntimeTests(unittest.TestCase):
                 "create_slack_app",
                 side_effect=fake_create_slack_app,
             ),
-            patch.object(company, "attach_hpa_change_reporter") as attach_reporter,
+            patch.object(
+                company,
+                "attach_hpa_change_remote_reporter",
+            ) as attach_reporter,
             patch.object(company, "attach_weekly_recordings_reporter"),
             patch.object(company, "attach_device_health_monitor_reporter"),
             patch.object(
@@ -607,13 +638,21 @@ class HpaChangeRuntimeTests(unittest.TestCase):
 
         self.assertIs(app, fake_app)
         handle_hpa.assert_called_once()
-        self.assertIs(
-            handle_hpa.call_args.args[2].lookup_thread_job,
-            fake_runtime.lookup_thread_job,
+        # closure 자체를 노출하지 않고 실제 remote client로 위임하는지만 검증한다.
+        handle_hpa.call_args.args[2].lookup_thread_job(
+            "TWORK",
+            "CHPA",
+            "1720580000.000001",
+            "1720580400.000100",
         )
+        fake_api_client.lookup_thread_job.assert_called_once()
         check_ping.assert_not_called()
         attach_reporter.assert_called_once()
-        self.assertIs(attach_reporter.call_args.args[1], fake_runtime)
+        self.assertIs(attach_reporter.call_args.args[1], fake_api_client)
+        self.assertEqual(
+            attach_reporter.call_args.kwargs["poll_interval_sec"],
+            company.cs.HPA_CHANGE_POLL_INTERVAL_SEC,
+        )
         attach_notification_reporter.assert_called_once()
         self.assertIs(
             attach_notification_reporter.call_args.kwargs["auto_sms_sender"],

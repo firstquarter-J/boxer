@@ -197,6 +197,10 @@ class CompanyRouteContractTests(unittest.TestCase):
             is_allowed=Mock(return_value=base_access_allowed),
         )
         payload = _mention_payload(text=text, question=question)
+        loader_is_patched = isinstance(
+            company.load_company_api_client_settings,
+            Mock,
+        )
 
         def fake_create_slack_app(
             mention_handler: Callable[..., None],
@@ -232,6 +236,26 @@ class CompanyRouteContractTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(company, "_validate_ec2_runtime_aws_env"))
             stack.enter_context(patch.object(company, "_validate_tokens"))
+            # production entry의 remote-only 시작 guard는 startup 계약에서
+            # 검증한다. 이 harness는 보존된 route 구현과 직접 settings
+            # 주입 조합만 검사하므로 조립 guard를 격리한다.
+            stack.enter_context(
+                patch.object(
+                    company,
+                    "_require_transport_only_remote_settings",
+                )
+            )
+            if not loader_is_patched:
+                stack.enter_context(
+                    patch.object(
+                        company,
+                        "load_company_api_client_settings",
+                        return_value=CompanyApiClientSettings(
+                            base_url="",
+                            token="",
+                        ),
+                    )
+                )
             # 라우팅 계약은 자동 reporter의 운영 env와 독립적으로 검증한다.
             # Solapi producer/consumer 조합은 remote-startup 전용 테스트가 맡는다.
             stack.enter_context(
@@ -292,8 +316,8 @@ class CompanyRouteContractTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(
                     company,
-                    "create_hpa_change_runtime",
-                    return_value=fake_runtime,
+                    "build_hpa_change_remote_routes_config",
+                    return_value=fake_runtime.routes_config,
                 )
             )
             stack.enter_context(
@@ -304,7 +328,7 @@ class CompanyRouteContractTests(unittest.TestCase):
                 )
             )
             for reporter_name in (
-                "attach_hpa_change_reporter",
+                "attach_hpa_change_remote_reporter",
                 "attach_weekly_recordings_reporter",
                 "attach_device_health_monitor_reporter",
                 "attach_device_notification_alert_reporter",

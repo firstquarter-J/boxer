@@ -446,6 +446,14 @@ class HpaChangeJobStore:
         );
         CREATE INDEX IF NOT EXISTS idx_hpa_change_jobs_status_updated_at
         ON hpa_change_jobs(status, updated_at);
+        CREATE TABLE IF NOT EXISTS hpa_change_delivery_receipts (
+            task_id TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            acknowledged_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, delivery_state),
+            FOREIGN KEY(task_id) REFERENCES hpa_change_jobs(task_id)
+        );
         """
         with self._lock:
             self._connection.executescript(schema)
@@ -1157,6 +1165,140 @@ class HpaChangeJobStore:
             if int(cursor.rowcount or 0) != 1:
                 raise KeyError(f"HPA 변경 작업을 찾지 못했어: {task_id}")
         return self.get_job(task_id)
+
+    def mark_delivery_notified(
+        self,
+        task_id: str,
+        status: str | HpaChangePollState,
+        delivery_id: str,
+        *,
+        advance_review_posted: bool = False,
+    ) -> tuple[HpaChangeJob, bool]:
+        """exact ACK와 필요한 review 상태 전이를 한 transaction에 남긴다."""
+
+        normalized_task_id = str(task_id or "").strip()
+        normalized_status = str(
+            status.value if isinstance(status, HpaChangePollState) else status
+        ).strip()
+        normalized_delivery_id = str(delivery_id or "").strip()
+        if normalized_status not in {item.value for item in HpaChangePollState}:
+            raise ValueError("알림 완료 상태가 올바르지 않아")
+        if not re.fullmatch(r"hpa-delivery:[0-9a-f]{64}", normalized_delivery_id):
+            raise ValueError("HPA delivery id가 올바르지 않아")
+        now_text = _datetime_to_text(_coerce_utc(self._clock()))
+        created = False
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                job_row = self._connection.execute(
+                    "SELECT task_id, status FROM hpa_change_jobs WHERE task_id = ?",
+                    (normalized_task_id,),
+                ).fetchone()
+                if job_row is None:
+                    raise KeyError(f"HPA 변경 작업을 찾지 못했어: {task_id}")
+                current_status = HpaChangeStatus(str(job_row["status"]))
+                if advance_review_posted and (
+                    normalized_status != HpaChangePollState.REVIEW_READY.value
+                    or current_status
+                    not in {
+                        HpaChangeStatus.REVIEW_READY,
+                        HpaChangeStatus.REVIEW_POSTED,
+                        HpaChangeStatus.DISPATCHING,
+                        HpaChangeStatus.DISPATCHED,
+                        HpaChangeStatus.RUNNING,
+                        HpaChangeStatus.WORKFLOW_SUCCEEDED,
+                        HpaChangeStatus.RESULT_READY,
+                        HpaChangeStatus.PR_CREATED,
+                        HpaChangeStatus.NO_CHANGE_NEEDED,
+                        HpaChangeStatus.FAILED,
+                        HpaChangeStatus.CANCELED,
+                    }
+                ):
+                    raise InvalidHpaChangeTransition(
+                        "검토 결과 delivery ACK의 작업 상태가 올바르지 않아"
+                    )
+                receipt_row = self._connection.execute(
+                    """
+                    SELECT delivery_id
+                    FROM hpa_change_delivery_receipts
+                    WHERE task_id = ? AND delivery_state = ?
+                    """,
+                    (normalized_task_id, normalized_status),
+                ).fetchone()
+                if receipt_row is not None:
+                    if str(receipt_row["delivery_id"]) != normalized_delivery_id:
+                        raise ValueError("같은 HPA 상태가 다른 delivery id로 이미 ACK됐어")
+                else:
+                    self._connection.execute(
+                        """
+                        INSERT INTO hpa_change_delivery_receipts (
+                            task_id, delivery_state, delivery_id, acknowledged_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            normalized_task_id,
+                            normalized_status,
+                            normalized_delivery_id,
+                            now_text,
+                        ),
+                    )
+                    created = True
+                if (
+                    advance_review_posted
+                    and current_status is HpaChangeStatus.REVIEW_READY
+                ):
+                    # Slack 검토 게시 ACK와 REVIEW_POSTED 사이에 process가
+                    # 종료돼 구현 dispatch가 영구 정지하지 않게 함께 commit한다.
+                    self._connection.execute(
+                        """
+                        UPDATE hpa_change_jobs
+                        SET notified_status = ?, status = ?,
+                            status_message = ?, updated_at = ?
+                        WHERE task_id = ?
+                        """,
+                        (
+                            normalized_status,
+                            HpaChangeStatus.REVIEW_POSTED.value,
+                            "Slack 검토 결과 게시 완료, 구현 dispatch 준비 중",
+                            now_text,
+                            normalized_task_id,
+                        ),
+                    )
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE hpa_change_jobs
+                        SET notified_status = ?, updated_at = ?
+                        WHERE task_id = ?
+                        """,
+                        (normalized_status, now_text, normalized_task_id),
+                    )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return self.get_job(normalized_task_id), created
+
+    def get_delivery_receipt(
+        self,
+        task_id: str,
+        status: str | HpaChangePollState,
+    ) -> str | None:
+        """ACK timeout retry가 exact delivery였는지 원문 payload 없이 확인한다."""
+
+        normalized_status = str(
+            status.value if isinstance(status, HpaChangePollState) else status
+        ).strip()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT delivery_id
+                FROM hpa_change_delivery_receipts
+                WHERE task_id = ? AND delivery_state = ?
+                """,
+                (str(task_id or "").strip(), normalized_status),
+            ).fetchone()
+        return str(row["delivery_id"]) if row is not None else None
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row) -> HpaChangeJob:
