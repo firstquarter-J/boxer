@@ -179,6 +179,82 @@ class DailyDeviceRoundReporterPreviewTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             reporter._validate_remote_daily_device_round_presentation(poisoned)
 
+    def test_remote_receipt_is_flushed_after_daily_window_closes(self) -> None:
+        client = _FakeSlackClient()
+        logger = logging.getLogger("test.daily_device_round_reporter")
+        local_now = datetime(
+            2026,
+            8,
+            27,
+            6,
+            0,
+            tzinfo=ZoneInfo("Asia/Seoul"),
+        )
+        class _AutomationClient:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def run(self, **kwargs: object) -> object:
+                self.calls.append(kwargs)
+                return object()
+
+        automation_client = _AutomationClient()
+
+        with TemporaryDirectory() as temporary_directory:
+            delivery_state_path = (
+                Path(temporary_directory) / "automation_delivery.json"
+            )
+            with (
+                patch.object(
+                    reporter.cs,
+                    "AUTOMATION_DELIVERY_STATE_PATH",
+                    str(delivery_state_path),
+                ),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_HOUR_KST", 22),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_MINUTE_KST", 0),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_HOUR_KST", 6),
+                patch.object(reporter.cs, "DAILY_DEVICE_ROUND_END_MINUTE_KST", 0),
+            ):
+                # 05:59 Slack 발송 성공 receipt가 06:00 poll에서 과거
+                # cycle key 그대로 ACK되는 운영 경계 사례를 재현한다.
+                reporter.remember_automation_delivery(
+                    cycle="daily_device_round",
+                    cycle_key="daily:2026-08-26",
+                    delivery=reporter.AutomationSlackDelivery(
+                        delivery_id="daily_device_round:hospital:85",
+                        external_message_id="2000.001",
+                        permalink="",
+                        delivered_at=local_now.replace(
+                            hour=5,
+                            minute=59,
+                        ),
+                    ),
+                )
+                sent = reporter._run_daily_device_round_remote(
+                    client,
+                    logger,
+                    automation_client=automation_client,  # type: ignore[arg-type]
+                    local_now=local_now,
+                    state={"windowKey": "2026-08-26"},
+                    channel_id="C_DAILY",
+                )
+                journal = json.loads(
+                    delivery_state_path.read_text(encoding="utf-8")
+                )
+
+        self.assertFalse(sent)
+        self.assertEqual(client.messages, [])
+        self.assertEqual(len(automation_client.calls), 1)
+        self.assertEqual(
+            automation_client.calls[0]["cycle_key"],
+            "daily:2026-08-26",
+        )
+        self.assertIs(automation_client.calls[0]["ack_only"], True)
+        self.assertEqual(
+            journal["cycles"]["daily_device_round"]["receipts"],
+            [],
+        )
+
 
 class DailyDeviceRoundReporterDueTests(unittest.TestCase):
     def setUp(self) -> None:

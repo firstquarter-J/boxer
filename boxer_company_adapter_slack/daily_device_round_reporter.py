@@ -1795,9 +1795,10 @@ def _run_daily_device_round_remote(
     """일정·Slack thread만 관리하고 장비 순회 실행은 API에 위임한다."""
 
     window_key = _daily_device_round_window_key(local_now)
-    if window_key is None:
-        return False
-    cycle_key = f"daily:{window_key}"
+    # Slack 발송은 창 마지막 poll에서도 성공할 수 있다. 다음 poll이 종료
+    # 시각을 넘겼더라도 journal의 exact cycleKey를 먼저 ACK해야 API cursor가
+    # 발송 완료 상태로 닫힌다. 실제 ACK key는 flush가 journal에서 읽는다.
+    cycle_key = f"daily:{window_key or local_now.date().isoformat()}"
     # local 실행과 동일하게 Slack 제어 상태가 env 기본값을 덮어쓴
     # 최종 옵션을 API에 넘겨 remote 전환 후에도 운영 제어를 유지한다.
     options = {
@@ -1823,6 +1824,8 @@ def _run_daily_device_round_remote(
         options=options,
         logger=logger,
     ):
+        return False
+    if window_key is None:
         return False
     if not _is_daily_device_round_due(local_now, state):
         return False
