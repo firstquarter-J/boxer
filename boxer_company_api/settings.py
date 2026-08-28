@@ -1039,6 +1039,7 @@ def _parse_caller(payload: Any) -> CompanyApiCallerSettings:
         "tenantIds",
         "channels",
         "actorIds",
+        "allowAnonymousActor",
         "capabilities",
     }
     if set(payload) - allowed_keys:
@@ -1046,9 +1047,13 @@ def _parse_caller(payload: Any) -> CompanyApiCallerSettings:
 
     caller_id = _required_text(payload.get("callerId"))
     token = _required_text(payload.get("token"))
+    # 기존 운영 registry의 false 값만 입력 호환으로 버린다. true나 다른
+    # 형식은 계속 거부해 non-null actor 보안 경계를 다시 열지 않는다.
+    allow_anonymous_actor = payload.get("allowAnonymousActor", False)
     if (
         not _CALLER_ID_PATTERN.fullmatch(caller_id)
         or not _TOKEN_PATTERN.fullmatch(token)
+        or allow_anonymous_actor is not False
     ):
         raise ValueError("caller identity is invalid")
 

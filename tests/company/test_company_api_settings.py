@@ -1032,7 +1032,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
             },
         )
 
-    def test_legacy_anonymous_actor_field_is_rejected(
+    def test_legacy_false_anonymous_actor_field_is_input_compatible(
         self,
     ) -> None:
         settings = load_company_api_settings(
@@ -1055,11 +1055,26 @@ class CompanyApiSettingsTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(settings.callers, ())
-        self.assertEqual(
-            settings.configuration_error,
-            "caller_registry_invalid",
+        self.assertIsNone(settings.configuration_error)
+        self.assertEqual(len(settings.callers), 1)
+        self.assertFalse(
+            hasattr(settings.callers[0], "allow_anonymous_actor")
         )
+
+    def test_legacy_true_anonymous_actor_field_is_rejected(
+        self,
+    ) -> None:
+        registry = json.loads(self._registry())
+        registry[0]["allowAnonymousActor"] = True
+
+        settings = load_company_api_settings(
+            {
+                "BOXER_COMPANY_API_CALLERS_JSON": json.dumps(registry),
+            }
+        )
+
+        self.assertEqual(settings.callers, ())
+        self.assertEqual(settings.configuration_error, "caller_registry_invalid")
 
 
 if __name__ == "__main__":
