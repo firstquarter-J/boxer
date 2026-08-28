@@ -55,6 +55,7 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
             packages,
             [
                 "boxer_company",
+                "boxer_company.assets",
                 "boxer_company.assistant",
                 "boxer_company.routers",
             ],

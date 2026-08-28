@@ -112,6 +112,8 @@ query PaginatedDevices($listOptions: DeviceListOptions!) {
       deviceState {
         captureBoardType
         isConnected
+        isRecording
+        isUploading
         status
         connectedAt
         updatedAt
@@ -403,6 +405,12 @@ def _normalize_optional_mda_boolean(value: Any) -> bool | None:
     return _normalize_mda_boolean(value)
 
 
+def _normalize_device_activity_boolean(value: Any) -> bool | None:
+    """녹화·업로드 안전 가드는 GraphQL의 실제 Boolean만 신뢰한다."""
+
+    return value if isinstance(value, bool) else None
+
+
 def _normalize_optional_mda_int(value: Any) -> int | None:
     # MDA의 신규 장비 설정은 bool이 아니라 -1/0/1 숫자 상태를 유지해야 한다.
     if value is None:
@@ -461,6 +469,12 @@ def _normalize_mda_device_detail(row: dict[str, Any], *, device_name: str) -> di
         "roomName": _display_value(hospital_room.get("roomName"), default="미확인"),
         "isConnected": _normalize_mda_boolean(agent_state.get("isConnected")),
         "deviceIsConnected": _normalize_mda_boolean(device_state.get("isConnected")),
+        "isRecording": _normalize_device_activity_boolean(
+            device_state.get("isRecording")
+        ),
+        "isUploading": _normalize_device_activity_boolean(
+            device_state.get("isUploading")
+        ),
         "deviceStatus": _normalize_mda_state_text(device_state.get("status")),
         "deviceConnectedAt": _display_value(device_state.get("connectedAt"), default=""),
         "deviceUpdatedAt": _display_value(device_state.get("updatedAt"), default=""),

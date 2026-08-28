@@ -732,6 +732,11 @@ def create_company_api_app(
                     message_count=len(payload["messages"]),
                     enabled=api_settings.request_log_enabled,
                     db_path=api_settings.request_log_path,
+                    operation_result=getattr(
+                        result,
+                        "operation_result",
+                        None,
+                    ),
                 )
             )
             if not request_log_persisted:
@@ -1260,6 +1265,37 @@ def _stream_ndjson_frames(
         emitted_bytes += len(encoded)
 
 
+def _safe_operation_request_log_metadata(
+    operation_result: Any,
+) -> dict[str, str]:
+    """허용한 스캐너 패치 receipt만 중앙 감사 metadata로 축약한다."""
+
+    if not isinstance(operation_result, dict) or frozenset(
+        operation_result
+    ) != {
+        "kind",
+        "deviceName",
+        "status",
+        "scriptSha256",
+    }:
+        return {}
+    device_name = str(operation_result.get("deviceName") or "")
+    status = str(operation_result.get("status") or "")
+    script_sha = str(operation_result.get("scriptSha256") or "")
+    if (
+        operation_result.get("kind") != "device_scanner_abi_patch"
+        or not re.fullmatch(r"MB2-[A-Z0-9]+", device_name)
+        or status not in {"repair_success", "no_action_required"}
+        or not re.fullmatch(r"[a-f0-9]{64}", script_sha)
+    ):
+        return {}
+    return {
+        "deviceName": device_name,
+        "operationStatus": status,
+        "scriptSha256": script_sha,
+    }
+
+
 def _persist_turn_request_log(
     *,
     turn: AssistantTurnInput,
@@ -1271,6 +1307,7 @@ def _persist_turn_request_log(
     db_path: str,
     status_override: str | None = None,
     error_type: str | None = None,
+    operation_result: Any = None,
 ) -> bool:
     """Slack과 분리된 API 프로세스가 회사 요청 감사 저장소를 소유한다."""
 
@@ -1308,6 +1345,13 @@ def _persist_turn_request_log(
     record_status = (
         status_override
         or ("pending_delivery" if pending_delivery else outcome)
+    )
+    request_log_metadata = {
+        "routeGroup": turn.routeGroup or "all",
+        "domainOutcome": outcome,
+    }
+    request_log_metadata.update(
+        _safe_operation_request_log_metadata(operation_result)
     )
     try:
         _save_request_log_record(
@@ -1365,10 +1409,7 @@ def _persist_turn_request_log(
                     else max(0, message_count)
                 ),
                 "errorType": error_type,
-                "metadata": {
-                    "routeGroup": turn.routeGroup or "all",
-                    "domainOutcome": outcome,
-                },
+                "metadata": request_log_metadata,
             },
             db_path=db_path,
         )

@@ -19,6 +19,9 @@ from boxer_company.assistant.device_operations_route import (
 from boxer_company.assistant.request_log_contract import (
     legacy_company_request_log_route_name,
 )
+from boxer_company.routers.device_scanner_abi_patch import (
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+)
 from boxer_company_adapter_slack import company, structured_routes
 import boxer_company_adapter_slack.fun as fun_routes
 from boxer_company_adapter_slack.company_api_client import (
@@ -659,6 +662,195 @@ class CompanyRouteContractTests(unittest.TestCase):
                         "first_replied_at_utc"
                     ]
                 )
+
+    def test_scanner_abi_patch_mention_uses_remote_operations_and_renders_once(
+        self,
+    ) -> None:
+        settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+        )
+        api_client = Mock()
+        api_client.answer.return_value = CompanyAssistantResult(
+            route=DEVICE_SCANNER_ABI_PATCH_ROUTE,
+            outcome="answered",
+            messages=(
+                AssistantMessage(
+                    body="스캐너 ABI 패치 적용 완료",
+                    mention_actor=False,
+                ),
+            ),
+        )
+        api_client.acknowledge_request_log_delivery.return_value = (
+            _request_log_delivery_ack()
+        )
+        question = "MB2-A00037 스캐너 패치"
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=api_client,
+            ),
+            patch.object(
+                company,
+                "_load_slack_user_name",
+                return_value="테스트 사용자",
+            ),
+        ):
+            result = self._invoke_mention(
+                text=question,
+                question=question,
+            )
+
+        # Slack은 matcher와 전달만 담당하고 장비 작업은 operations API가
+        # 정확히 한 번 소유한다. 실제 Slack client/say는 이 harness에 없다.
+        api_client.answer.assert_called_once()
+        api_client.answer_with_progress.assert_not_called()
+        self.assertEqual(
+            api_client.answer.call_args.kwargs,
+            {"route_group": "operations"},
+        )
+        operation_request = api_client.answer.call_args.args[0]
+        self.assertEqual(operation_request.question, question)
+        self.assertEqual(
+            operation_request.request_id,
+            "slack:T-CONTRACT:C0CONTRACT:1784800000.000002",
+        )
+        self.assertEqual(
+            result.route_calls,
+            _REMOTE_DEVICE_STAGE_ROUTE_CALLS[1:],
+        )
+        self.assertEqual(
+            result.reply_calls,
+            [("스캐너 ABI 패치 적용 완료", {"mention_user": False})],
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_name"],
+            "device scanner ABI patch",
+        )
+        self.assertEqual(
+            result.payload["request_log"]["handler_type"],
+            "company_api",
+        )
+        self.assertEqual(
+            result.payload["request_log"]["route_mode"],
+            "remote",
+        )
+        self.assertTrue(result.payload["request_log"]["skip_persist"])
+        api_client.acknowledge_request_log_delivery.assert_called_once()
+
+    def test_scanner_abi_patch_intent_blocks_priority_and_local_execution(
+        self,
+    ) -> None:
+        # HPA/ping/help 표현을 섞어도 Slack-local 우선 gate를 실행하지 않고,
+        # remote에서는 exact parser의 안전한 실패만 렌더링한다.
+        question = (
+            "HPA 구현하고 MB2-A00037 스캐너 패치한 뒤 "
+            "ping 사용법 알려줘"
+        )
+        remote_settings = CompanyApiClientSettings(
+            base_url="http://127.0.0.1:8010",
+            token="service-token-" + ("x" * 40),
+            operations_mode="remote",
+        )
+        remote_client = Mock()
+        remote_client.answer.return_value = CompanyAssistantResult(
+            route=DEVICE_SCANNER_ABI_PATCH_ROUTE,
+            outcome="failed",
+            messages=(AssistantMessage(body="정확한 단일 장비 명령이 필요해"),),
+            fallback_reason="device_scanner_abi_patch_command_required",
+        )
+        remote_client.acknowledge_request_log_delivery.return_value = (
+            _request_log_delivery_ack()
+        )
+
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=remote_settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=remote_client,
+            ),
+        ):
+            remote_result = self._invoke_mention(
+                text=question,
+                question=question,
+                route_results={"_handle_hpa_change_request": True},
+            )
+
+        remote_client.answer.assert_called_once()
+        remote_client.answer_with_progress.assert_not_called()
+        self.assertEqual(
+            remote_client.answer.call_args.kwargs,
+            {"route_group": "operations"},
+        )
+        self.assertEqual(
+            remote_result.route_calls,
+            _REMOTE_DEVICE_STAGE_ROUTE_CALLS[1:],
+        )
+        self.assertEqual(
+            remote_result.reply_calls,
+            [("정확한 단일 장비 명령이 필요해", {})],
+        )
+
+        # local/shadow 소유권에서는 HPA나 기존 장비 handler로 되돌리지 않고
+        # API 전용 안내 한 건으로 즉시 fail-closed한다.
+        local_settings = CompanyApiClientSettings(
+            base_url="",
+            token="",
+            operations_mode="local",
+        )
+        local_client = Mock()
+        with (
+            patch.object(
+                company,
+                "load_company_api_client_settings",
+                return_value=local_settings,
+            ),
+            patch.object(
+                company,
+                "CompanyAssistantApiClient",
+                return_value=local_client,
+            ),
+        ):
+            local_result = self._invoke_mention(
+                text=question,
+                question=question,
+                route_results={"_handle_hpa_change_request": True},
+            )
+
+        local_client.answer.assert_not_called()
+        local_client.answer_with_progress.assert_not_called()
+        self.assertEqual(local_result.route_calls, [])
+        self.assertEqual(
+            local_result.reply_calls,
+            [
+                (
+                    "스캐너 ABI 패치는 회사 API가 연결된 박서에서만 "
+                    "실행할 수 있어",
+                    {},
+                )
+            ],
+        )
+        self.assertEqual(
+            local_result.payload["request_log"]["route_name"],
+            "device scanner ABI patch",
+        )
+        self.assertEqual(
+            local_result.payload["request_log"]["status"],
+            "failed",
+        )
 
     def test_mutation_question_keeps_legacy_local_and_remote_routing(self) -> None:
         question = "MB2-C00419 박스 업데이트 방법 알려줘"

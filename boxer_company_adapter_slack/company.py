@@ -224,6 +224,10 @@ from boxer_company.assistant.device_operations_route import (
     DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
     DEVICE_OPERATION_DELIVERY_ACTION,
 )
+from boxer_company.routers.device_scanner_abi_patch import (
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+    _is_device_scanner_abi_patch_intent,
+)
 from boxer_company import settings as cs
 # 기존 characterization test와 외부 patch 지점만 유지하고 실제 추출은 runtime이 맡는다.
 from boxer_company.utils import _extract_barcode
@@ -980,8 +984,33 @@ def create_app() -> App:
             reply(BASE_ACCESS_DENIED_REPLY)
             return
 
+        # 스캐너 ABI 패치 후보는 정확한 명령 여부와 무관하게
+        # operations API에서만 fail-closed 판정한다. Slack-local HPA,
+        # ping, help가 혼합문의 일부를 먼저 실행하지 못하게 한다.
+        scanner_abi_patch_intent = _is_device_scanner_abi_patch_intent(
+            question
+        )
+        if (
+            scanner_abi_patch_intent
+            and company_api_settings.operations_mode != "remote"
+        ):
+            # 잘못된 local 조립에서도 운영 명령 원문을 Slack
+            # 로컬 request-log에 남기지 않는다.
+            _set_request_log_skip_persist(payload, True)
+            _set_request_log_route(
+                payload,
+                assistant_slack_route_name(
+                    DEVICE_SCANNER_ABI_PATCH_ROUTE
+                ),
+                handler_type="company_api",
+                route_mode="remote",
+            )
+            _set_request_log_status(payload, "failed")
+            reply("스캐너 ABI 패치는 회사 API가 연결된 박서에서만 실행할 수 있어")
+            return
+
         # 코드 변경 요청은 일반 질의나 ping보다 먼저 격리 worker intake로 고정한다.
-        if _handle_hpa_change_request(
+        if not scanner_abi_patch_intent and _handle_hpa_change_request(
             HpaChangeRoutesContext(
                 question=question,
                 payload=payload,
@@ -1002,7 +1031,7 @@ def create_app() -> App:
         ):
             return
 
-        if "ping" in text:
+        if not scanner_abi_patch_intent and "ping" in text:
             _set_request_log_route(payload, "ping")
             if company_api_settings.freeform_mode == "remote":
                 try:
@@ -1050,7 +1079,10 @@ def create_app() -> App:
             logger.info("Responded with ping health in thread_ts=%s provider=none", thread_ts)
             return
 
-        if _is_usage_help_request(question):
+        if (
+            not scanner_abi_patch_intent
+            and _is_usage_help_request(question)
+        ):
             _set_request_log_route(payload, "usage_help", route_mode="guide")
             reply(_build_usage_help_response(), mention_user=False)
             logger.info("Responded with usage help in thread_ts=%s", thread_ts)

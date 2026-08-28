@@ -66,6 +66,17 @@ from boxer_company.routers.device_status_probe import (
     _probe_device_runtime_component,
     _probe_device_status_overview,
 )
+from boxer_company.routers.device_scanner_abi_patch import (
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+    DeviceScannerAbiPatchError,
+    _apply_device_scanner_abi_patch,
+    _build_device_scanner_abi_patch_command_message,
+    _build_device_scanner_abi_patch_config_message,
+    _extract_device_name_for_scanner_abi_patch,
+    _is_device_scanner_abi_patch_intent,
+    _is_device_scanner_abi_patch_request,
+    _is_device_scanner_abi_patch_runtime_configured,
+)
 from boxer_company.routers.device_update import (
     _build_device_power_control_config_message,
     _build_device_update_config_message,
@@ -127,6 +138,7 @@ _MUTATING_DEVICE_OPERATION_ROUTES = frozenset(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_SCANNER_ABI_PATCH_ROUTE,
         DEVICE_OPERATION_DELIVERY_ACTION,
         "device_memory_patch",
     }
@@ -186,6 +198,7 @@ class DeviceOperationsRouteDeps:
     request_box_update: OperationFn = _request_device_box_update
     request_agent_update: OperationFn = _request_device_agent_update
     request_power_off: OperationFn = _request_device_power_off
+    apply_scanner_abi_patch: OperationFn = _apply_device_scanner_abi_patch
     probe_audio: OperationFn = _probe_device_audio_output
     probe_remote_access: OperationFn = _probe_device_remote_access
     probe_runtime_component: OperationFn = _probe_device_runtime_component
@@ -247,6 +260,10 @@ def match_device_operation_candidate_route(
         return "device_diagnostic_followup"
 
     question = request.question
+    if _is_device_scanner_abi_patch_intent(question):
+        # 다른 장비 mutation과 섞인 문장도 일부 실행하지 않도록 가장 먼저
+        # 전용 route에 격리하고 exact parser에서 전체 문장을 거부한다.
+        return DEVICE_SCANNER_ABI_PATCH_ROUTE
     is_voice_change = _is_device_voice_change_request(question)
     if (
         _is_device_voice_catalog_request(question)
@@ -533,6 +550,14 @@ class DeviceOperationsAssistantRoute:
                 body="저장된 장비 진단 상태가 없어 다른 답변 경로를 확인할게",
                 fallback_reason="diagnostic_snapshot_missing",
             )
+        except DeviceScannerAbiPatchError as exc:
+            return _result(
+                route=route,
+                outcome="failed",
+                body=slack_mrkdwn_to_commonmark(exc.user_message),
+                fallback_reason=exc.fallback_reason,
+                prefix_bodies=tuple(progress_notices),
+            )
         except ValueError as exc:
             self._logger.warning(
                 "Device operation input rejected request_id=%s route=%s "
@@ -635,6 +660,16 @@ class DeviceOperationsAssistantRoute:
             else:
                 body = _build_device_status_probe_config_message()
         elif (
+            route == DEVICE_SCANNER_ABI_PATCH_ROUTE
+            and device_name
+            and _is_device_scanner_abi_patch_request(
+                question,
+                device_name=device_name,
+            )
+            and not _is_device_scanner_abi_patch_runtime_configured()
+        ):
+            body = _build_device_scanner_abi_patch_config_message()
+        elif (
             route == "device_remote_access_probe"
             and not self._deps.mda_configured()
         ):
@@ -685,6 +720,45 @@ class DeviceOperationsAssistantRoute:
         if route == "device_diagnostic_snapshot" and device_name is None:
             return _DeviceOperationExecution(
                 _build_device_diagnostic_device_required_message()
+            )
+        if route == DEVICE_SCANNER_ABI_PATCH_ROUTE:
+            if not _is_device_scanner_abi_patch_request(
+                request.question,
+                device_name=device_name,
+            ):
+                raise DeviceScannerAbiPatchError(
+                    _build_device_scanner_abi_patch_command_message(),
+                    "device_scanner_abi_patch_command_required",
+                )
+            result_text, patch_result = self._deps.apply_scanner_abi_patch(
+                request.question,
+                device_name=device_name,
+                resend_ssh_open=False,
+            )
+            operation_result: Mapping[str, Any] | None = None
+            if (
+                isinstance(patch_result, Mapping)
+                and patch_result.get("route")
+                == DEVICE_SCANNER_ABI_PATCH_ROUTE
+                and patch_result.get("device") == device_name
+                and patch_result.get("status")
+                in {"repair_success", "no_action_required"}
+                and re.fullmatch(
+                    r"[a-f0-9]{64}",
+                    str(patch_result.get("scriptSha256") or ""),
+                )
+            ):
+                # HTTP 응답에는 노출하지 않고 API 중앙 감사 저장소만 읽는
+                # 최소 receipt다. SSH endpoint나 원격 출력은 포함하지 않는다.
+                operation_result = {
+                    "kind": "device_scanner_abi_patch",
+                    "deviceName": device_name,
+                    "status": patch_result["status"],
+                    "scriptSha256": patch_result["scriptSha256"],
+                }
+            return _DeviceOperationExecution(
+                result_text,
+                operation_result=operation_result,
             )
         if device_name is None:
             # 각 legacy matcher가 장비명을 찾은 route만 domain helper를 호출한다.
@@ -1318,6 +1392,11 @@ def _extract_device_name_for_route(
         "device_power_off",
     }:
         return _extract_device_name_for_update(question) or structured_device_name
+    if route == DEVICE_SCANNER_ABI_PATCH_ROUTE:
+        return (
+            _extract_device_name_for_scanner_abi_patch(question)
+            or structured_device_name
+        )
     if route == "device_audio_probe":
         return (
             _extract_device_name_for_audio_probe(question)
@@ -1409,6 +1488,7 @@ def _mention_actor_for_operation_result(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_SCANNER_ABI_PATCH_ROUTE,
     }
 
 

@@ -19,6 +19,7 @@ from boxer_company.assistant.request_log_contract import (
         ("device_box_update", "device box update"),
         ("device_agent_update", "device agent update"),
         ("device_power_off", "device power off"),
+        ("device_scanner_abi_patch", "device scanner ABI patch"),
         ("device_audio_probe", "device audio probe"),
         ("device_remote_access_probe", "device remote access probe"),
         ("device_memory_patch", "device memory patch"),

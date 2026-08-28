@@ -67,6 +67,9 @@ from boxer_company.routers.device_file_probe import (
 from boxer_company.routers.recording_streaming_restore import (
     _extract_recording_streaming_restore_month,
 )
+from boxer_company.routers.device_scanner_abi_patch import (
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+)
 
 
 _MUTATING_OPERATION_ROUTES = frozenset(
@@ -83,6 +86,7 @@ _MUTATING_OPERATION_ROUTES = frozenset(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_SCANNER_ABI_PATCH_ROUTE,
         DEVICE_OPERATION_DELIVERY_ACTION,
         "device_memory_patch",
     }
@@ -122,6 +126,7 @@ _DEVICE_OPERATION_ROUTES = frozenset(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_SCANNER_ABI_PATCH_ROUTE,
         DEVICE_OPERATION_DELIVERY_ACTION,
         "device_audio_probe",
         "device_remote_access_probe",
@@ -174,6 +179,7 @@ _LIVE_DEVICE_OPERATION_ROUTES = frozenset(
         "device_box_update",
         "device_agent_update",
         "device_power_off",
+        DEVICE_SCANNER_ABI_PATCH_ROUTE,
         DEVICE_OPERATION_DELIVERY_ACTION,
         "device_audio_probe",
         "device_remote_access_probe",
@@ -236,6 +242,10 @@ def match_company_operation_route(
     if device_action_route == DEVICE_OPERATION_DELIVERY_ACTION:
         # Slack 최종 메시지 성공 뒤 온 typed receipt는 질문 속 학습/admin/file
         # 표현보다 먼저 잡아 원 장비 명령을 다시 실행하지 않는다.
+        return device_action_route
+    if device_action_route == DEVICE_SCANNER_ABI_PATCH_ROUTE:
+        # 스캐너 패치와 학습/admin/file 등 다른 명령을 섞어도 일부만 먼저
+        # 실행하지 않는다. 전용 exact parser가 전체 문장을 fail-closed한다.
         return device_action_route
     raw_operation_action = scoped.metadata.get("operation_action")
     if (
@@ -599,6 +609,7 @@ def company_operation_route_names() -> frozenset[str]:
             "device_box_update",
             "device_agent_update",
             "device_power_off",
+            DEVICE_SCANNER_ABI_PATCH_ROUTE,
             DEVICE_OPERATION_DELIVERY_ACTION,
             "device_audio_probe",
             "device_remote_access_probe",

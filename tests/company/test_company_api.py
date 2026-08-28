@@ -2179,6 +2179,101 @@ class CompanyApiContractTests(unittest.TestCase):
             "operations",
         )
 
+    def test_server_prematch_protects_scanner_patch_and_replays_once(
+        self,
+    ) -> None:
+        question = "MB2-A00037 스캐너 패치"
+        payload = _payload(
+            question=question,
+            scope={"deviceName": "MB2-A00037"},
+        )
+
+        denied_runtime = _FakeRuntime()
+        denied_app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=denied_runtime,
+            readiness_probe=lambda: True,
+        )
+        with TestClient(denied_app) as client:
+            denied = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-scanner-patch-denied"),
+                json=payload,
+            )
+
+        # client가 routeGroup을 빼도 서버 matcher가 mutation capability를
+        # 먼저 요구하고 runtime이나 장비 의존성에는 진입하지 않는다.
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "caller_not_allowed")
+        self.assertEqual(denied_runtime.requests, [])
+
+        live_off_runtime = _FakeRuntime()
+        live_off_app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                ),
+                live_device_enabled=False,
+            ),
+            assistant_runtime=live_off_runtime,
+            readiness_probe=lambda: True,
+        )
+        with TestClient(live_off_app) as client:
+            live_off = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-scanner-patch-live-off"),
+                json={**payload, "routeGroup": "operations"},
+            )
+
+        self.assertEqual(live_off.status_code, 503)
+        self.assertFalse(live_off.json()["retryable"])
+        self.assertEqual(live_off_runtime.requests, [])
+
+        accepted_runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_scanner_abi_patch",
+                outcome="answered",
+                messages=(
+                    AssistantMessage(
+                        body="스캐너 ABI 패치 적용 완료",
+                        mention_actor=False,
+                    ),
+                ),
+            )
+        )
+        accepted_app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                )
+            ),
+            assistant_runtime=accepted_runtime,
+            readiness_probe=lambda: True,
+        )
+        with TestClient(accepted_app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-scanner-patch-replay"),
+                json=payload,
+            )
+            replay = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-scanner-patch-replay"),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.json(), first.json())
+        self.assertEqual(accepted_runtime.stages, ["operations"])
+        self.assertEqual(len(accepted_runtime.requests), 1)
+        self.assertEqual(
+            accepted_runtime.requests[0].metadata["route_group"],
+            "operations",
+        )
+
     def test_server_prematch_rejects_operation_hint_mismatch(
         self,
     ) -> None:
@@ -2362,6 +2457,80 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(
             record["normalizedQuestion"],
             "12345678910 최근 촬영 영상 몇 개야?",
+        )
+
+    def test_scanner_patch_receipt_is_saved_only_as_safe_audit_metadata(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_scanner_abi_patch",
+                outcome="answered",
+                messages=(
+                    AssistantMessage(
+                        body="스캐너 ABI 패치 적용 완료",
+                        mention_actor=False,
+                    ),
+                ),
+                operation_result={
+                    "kind": "device_scanner_abi_patch",
+                    "deviceName": "MB2-A00037",
+                    "status": "repair_success",
+                    "scriptSha256": "a" * 64,
+                },
+            )
+        )
+        with patch(
+            "boxer_company_api.app._initialize_request_log_readiness",
+            return_value=True,
+        ), patch(
+            "boxer_company_api.app._secure_request_log_leaf",
+            return_value=True,
+        ), patch(
+            "boxer_company_api.app._ensure_request_log_schema"
+        ), patch(
+            "boxer_company_api.app._save_request_log_record"
+        ) as save_request_log:
+            app = create_company_api_app(
+                settings=_settings(
+                    capabilities=(
+                        "assistant.turn.read",
+                        "assistant.operation.execute",
+                    ),
+                    request_log_enabled=True,
+                ),
+                assistant_runtime=runtime,
+                readiness_probe=lambda: True,
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/internal/v1/assistant/turns",
+                    headers=_headers(request_id="req-scanner-patch-audit"),
+                    json=_payload(
+                        question="MB2-A00037 스캐너 패치",
+                        routeGroup="operations",
+                        scope={
+                            "deviceName": "MB2-A00037",
+                            "channelContextId": "C01",
+                        },
+                        contextEntries=[],
+                    ),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("operationResult", response.json())
+        save_request_log.assert_called_once()
+        record = save_request_log.call_args.args[0]
+        self.assertEqual(record["requestText"], "[민감 operations 요청]")
+        self.assertEqual(
+            record["metadata"],
+            {
+                "routeGroup": "operations",
+                "domainOutcome": "answered",
+                "deviceName": "MB2-A00037",
+                "operationStatus": "repair_success",
+                "scriptSha256": "a" * 64,
+            },
         )
 
     def test_blank_freeform_persists_bot_only_mention_request_log(

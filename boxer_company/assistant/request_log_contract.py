@@ -34,6 +34,7 @@ _LEGACY_COMPANY_REQUEST_LOG_ROUTE_NAMES = {
     "device_memory_patch": "device memory patch",
     "device_pm2_probe": "device pm2 probe",
     "device_power_off": "device power off",
+    "device_scanner_abi_patch": "device scanner ABI patch",
     "device_remote_access_probe": "device remote access probe",
     "device_status_probe": "device status probe",
     "device_update_status": "device update status",
