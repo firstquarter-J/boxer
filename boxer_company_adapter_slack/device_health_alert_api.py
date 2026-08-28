@@ -9,7 +9,7 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
-from boxer_company.assistant.device_health_alert_action_route import (
+from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
     DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -381,8 +381,6 @@ def _validate_device_health_alert_api_result(
     if (
         result.used_llm
         or result.sources
-        or result.suggested_action is not None
-        or result.async_job is not None
     ):
         raise CompanyApiContractError(
             "device_health_alert_response_unsafe"

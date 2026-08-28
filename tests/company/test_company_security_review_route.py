@@ -287,7 +287,6 @@ def test_security_review_http_uses_operations_capability_without_device_alert_ca
                 tenant_ids=frozenset({"T1"}),
                 channels=frozenset({"slack"}),
                 actor_ids=frozenset({"U1"}),
-                allow_anonymous_actor=False,
                 capabilities=frozenset(
                     {
                         "assistant.turn.read",

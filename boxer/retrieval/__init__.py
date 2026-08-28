@@ -4,6 +4,9 @@ from boxer.retrieval.knowledge import (
     KnowledgeSource,
     MarkdownKnowledgeSource,
     NotionKnowledgeSource,
+    normalize_knowledge_text,
+    score_knowledge_document,
+    tokenize_knowledge_text,
 )
 
 __all__ = [
@@ -12,4 +15,7 @@ __all__ = [
     "KnowledgeSource",
     "MarkdownKnowledgeSource",
     "NotionKnowledgeSource",
+    "normalize_knowledge_text",
+    "score_knowledge_document",
+    "tokenize_knowledge_text",
 ]

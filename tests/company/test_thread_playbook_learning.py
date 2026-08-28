@@ -1,11 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
-import logging
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
+from boxer_company.operation_routing import _is_thread_playbook_learning_request
 from boxer_company.thread_playbook_learning import (
     ThreadPlaybookDraft,
     ThreadPlaybookSaveResult,
@@ -18,76 +18,13 @@ from boxer_company.thread_playbook_learning import (
     _ensure_legacy_thread_sources_migrated,
     _extract_page_source_keys,
     _generate_thread_playbook_draft,
-    _inspect_thread_source_index,
     _inspect_thread_source_index_state,
-    _is_thread_playbook_learning_request,
     _learn_slack_thread_playbook,
     _refresh_thread_source_reservation,
     _save_thread_playbook_to_notion,
     _thread_source_owner,
 )
 from boxer_company.notion_playbooks import _parse_notion_rag_index_line
-from boxer_company_adapter_slack.thread_learning_routes import (
-    ThreadLearningRoutesContext,
-    _handle_thread_learning_routes,
-)
-
-
-class FakeSlackClient:
-    def __init__(self) -> None:
-        self.permalink_calls: list[dict[str, str]] = []
-
-    def conversations_replies(self, **kwargs):
-        return {
-            "messages": [
-                {
-                    "ts": "1.0",
-                    "user": "U_ROSA",
-                    "text": "녹화시작을 누르지 않았으나 자동으로 녹화시작이 되어 확인 요청",
-                },
-                {
-                    "ts": "1.1",
-                    "user": "U_HYUN",
-                    "text": "모션감지 사용안함 설정은 바코드 스캔 후 1시간이 지나면 자동 녹화를 시작합니다.",
-                },
-                {
-                    "ts": "1.2",
-                    "user": "U_HYUN",
-                    "text": "v2.11.300 버전부터 이렇게 동작하고 있습니다.",
-                },
-                {
-                    "ts": "1.3",
-                    "user": "U_REQUESTER",
-                    "text": "<@UBOT> 이 스레드 학습",
-                },
-            ],
-            "has_more": False,
-        }
-
-    def chat_getPermalink(self, **kwargs):
-        self.permalink_calls.append(kwargs)
-        return {"permalink": "https://slack.example/thread"}
-
-
-class FailingPermalinkSlackClient(FakeSlackClient):
-    def chat_getPermalink(self, **kwargs):
-        raise RuntimeError("permalink unavailable")
-
-
-def _payload() -> dict[str, object]:
-    return {
-        "raw_text": "<@UBOT> 이 스레드 학습",
-        "text": "이 스레드 학습",
-        "question": "이 스레드 학습",
-        "user_id": "U_REQUESTER",
-        "workspace_id": "W123",
-        "channel_id": "C123",
-        "current_ts": "1.3",
-        "thread_ts": "1.0",
-        "request_log": {},
-    }
-
-
 def _notion_text_block(
     block_id: str,
     block_type: str,
@@ -148,11 +85,14 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             ),
         ]
 
-        page_id, insert_after, found_heading = _inspect_thread_source_index(blocks, source_key=source_key)
+        state = _inspect_thread_source_index_state(blocks, source_key=source_key)
 
-        self.assertEqual(page_id, target_page_id)
-        self.assertEqual(insert_after, "44444444444444444444444444444444")
-        self.assertTrue(found_heading)
+        self.assertEqual(state.page_id, target_page_id)
+        self.assertEqual(
+            state.insert_after_block_id,
+            "44444444444444444444444444444444",
+        )
+        self.assertTrue(state.found_index_heading)
 
     def test_source_index_rejects_one_key_pointing_to_multiple_pages(self) -> None:
         source_key = _build_slack_thread_source_key("W123", "C123", "1.0")
@@ -171,7 +111,7 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
         ]
 
         with self.assertRaises(RuntimeError):
-            _inspect_thread_source_index(blocks, source_key=source_key)
+            _inspect_thread_source_index_state(blocks, source_key=source_key)
 
     def test_source_index_selects_same_winner_for_duplicate_pending_blocks(self) -> None:
         source_key = _build_slack_thread_source_key("W123", "C123", "1.0")
@@ -197,7 +137,10 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
 
         self.assertEqual(forward.pending_block_id, "a" * 32)
         self.assertEqual(reversed_state.pending_block_id, "a" * 32)
-        self.assertEqual(forward.pending_block_ids, ("a" * 32, "b" * 32))
+        self.assertEqual(
+            tuple(reservation.block_id for reservation in forward.pending_reservations),
+            ("a" * 32, "b" * 32),
+        )
 
     def test_loser_pending_cannot_refresh_reservation(self) -> None:
         root_page_id = "d" * 32
@@ -353,8 +296,11 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             first_blocks = _ensure_legacy_thread_sources_migrated(root_page_id)
             second_blocks = _ensure_legacy_thread_sources_migrated(root_page_id)
 
-        page_id, _, _ = _inspect_thread_source_index(first_blocks, source_key=permalink_key)
-        self.assertEqual(page_id, legacy_page_id)
+        state = _inspect_thread_source_index_state(
+            first_blocks,
+            source_key=permalink_key,
+        )
+        self.assertEqual(state.page_id, legacy_page_id)
         self.assertEqual(first_blocks, second_blocks)
         self.assertEqual(page_mock.call_count, 1)
         self.assertEqual(request_mock.call_count, 1)
@@ -368,7 +314,7 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
         }
         with (
             patch("boxer_company.notion_playbooks.cs.NOTION_TOKEN_COMPANY", ""),
-            patch("boxer_company.notion_playbooks.s.NOTION_TOKEN_PERSONAL", "personal-token"),
+            patch("boxer.core.settings.NOTION_TOKEN_PERSONAL", "personal-token"),
             patch("boxer_company.thread_playbook_learning._generate_thread_playbook_draft") as generate_mock,
             patch("boxer_company.thread_playbook_learning._notion_request") as notion_mock,
         ):
@@ -384,7 +330,13 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
         with (
             patch("boxer_company.notion_playbooks.cs.NOTION_TOKEN_COMPANY", "company-token"),
             patch("boxer_company.notion_playbooks.cs.THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID", ""),
-            patch("boxer_company.notion_playbooks.s.NOTION_TEST_PAGE_ID", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            # 공개 설정에서 제거된 구 개인 페이지 키가 주입돼도 회사
+            # Notion root로 fallback하지 않는 호환 경계를 검증한다.
+            patch(
+                "boxer.core.settings.NOTION_TEST_PAGE_ID",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                create=True,
+            ),
             patch("boxer_company.thread_playbook_learning._generate_thread_playbook_draft") as generate_mock,
             patch("boxer_company.thread_playbook_learning._notion_request") as notion_mock,
         ):
@@ -464,7 +416,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             )
 
         self.assertEqual(result.page_id, created_page_id)
-        self.assertTrue(result.rag_index_updated)
         self.assertEqual(calls[0][0], "/pages")
         self.assertEqual(calls[1][0], f"/blocks/{root_page_id}/children")
         index_payload = calls[1][2] or {}
@@ -582,7 +533,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             )
 
         self.assertFalse(result.created)
-        self.assertFalse(result.rag_index_updated)
         self.assertEqual(result.page_id, existing_page_id)
         self.assertEqual(result.url, "https://notion.example/existing")
         self.assertIn("자동 녹화", result.keywords)
@@ -617,7 +567,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             page_id,
             "https://notion.example/page",
             ["자동 녹화"],
-            True,
             created=False,
         )
 
@@ -682,7 +631,13 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
                 "migration=slack-permalink:v1 | status=complete",
             ),
         ]
-        existing_result = ThreadPlaybookSaveResult("기존 페이지", page_id, "", [], False, created=False)
+        existing_result = ThreadPlaybookSaveResult(
+            "기존 페이지",
+            page_id,
+            "",
+            [],
+            created=False,
+        )
 
         with (
             patch("boxer_company.thread_playbook_learning._is_company_notion_configured", return_value=True),
@@ -878,7 +833,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             )
 
         self.assertFalse(result.created)
-        self.assertTrue(result.rag_index_updated)
         self.assertEqual(result.page_id, created_page_id)
         self.assertEqual(calls["page"], 1)
         self.assertEqual(calls["reserve"], 1)
@@ -926,7 +880,12 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
             calls["save"] += 1
             with state_lock:
                 state["page_id"] = page_id
-            return ThreadPlaybookSaveResult("제목", page_id, "https://notion.example/page", ["키워드"], True)
+            return ThreadPlaybookSaveResult(
+                "제목",
+                page_id,
+                "https://notion.example/page",
+                ["키워드"],
+            )
 
         def run_learning() -> ThreadPlaybookSaveResult:
             start_barrier.wait()
@@ -964,7 +923,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
                     page_id,
                     "https://notion.example/page",
                     ["키워드"],
-                    False,
                     created=False,
                 ),
             ),
@@ -976,135 +934,6 @@ class ThreadPlaybookLearningTests(unittest.TestCase):
         find_page_mock.assert_not_called()
         self.assertEqual({result.page_id for result in results}, {page_id})
         self.assertEqual(sorted(result.created for result in results), [False, True])
-
-    def test_thread_learning_route_learns_before_freeform(self) -> None:
-        replies: list[str] = []
-        client = FakeSlackClient()
-
-        with (
-            patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ENABLED", True),
-            patch(
-                "boxer_company_adapter_slack.thread_learning_routes._learn_slack_thread_playbook",
-                return_value=type(
-                    "Result",
-                    (),
-                    {
-                        "title": "모션감지 사용안함 상태 자동 녹화 시작",
-                        "url": "https://notion.example/playbook",
-                        "keywords": ["자동 녹화", "모션감지 사용안함"],
-                        "page_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    },
-                )(),
-            ) as learn_mock,
-        ):
-            handled = _handle_thread_learning_routes(
-                ThreadLearningRoutesContext(
-                    question="이 스레드 학습",
-                    payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U_REQUESTER",
-                    workspace_id="W123",
-                    channel_id="C123",
-                    current_ts="1.3",
-                    thread_ts="1.0",
-                    reply=lambda text, **kwargs: replies.append(text),
-                    logger=logging.getLogger(__name__),
-                    client=client,
-                    claude_client=object(),
-                )
-            )
-
-        self.assertTrue(handled)
-        self.assertEqual(len(replies), 1)
-        self.assertIn("스레드 학습 완료", replies[0])
-        learn_mock.assert_called_once()
-        learned_thread_text = learn_mock.call_args.args[0]
-        self.assertIn("1시간이 지나면 자동 녹화", learned_thread_text)
-        self.assertNotIn("이 스레드 학습", learned_thread_text)
-        self.assertEqual(learn_mock.call_args.kwargs["workspace_id"], "W123")
-        self.assertEqual(learn_mock.call_args.kwargs["channel_id"], "C123")
-        self.assertEqual(learn_mock.call_args.kwargs["thread_ts"], "1.0")
-
-    def test_thread_learning_route_marks_existing_playbook(self) -> None:
-        replies: list[str] = []
-        client = FakeSlackClient()
-
-        with (
-            patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ENABLED", True),
-            patch(
-                "boxer_company_adapter_slack.thread_learning_routes._learn_slack_thread_playbook",
-                return_value=type(
-                    "Result",
-                    (),
-                    {
-                        "title": "기존 자동 녹화 플레이북",
-                        "url": "https://notion.example/existing",
-                        "keywords": ["자동 녹화"],
-                        "page_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                        "created": False,
-                    },
-                )(),
-            ),
-        ):
-            handled = _handle_thread_learning_routes(
-                ThreadLearningRoutesContext(
-                    question="이 스레드 학습",
-                    payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U_REQUESTER",
-                    workspace_id="W123",
-                    channel_id="C123",
-                    current_ts="1.3",
-                    thread_ts="1.0",
-                    reply=lambda text, **kwargs: replies.append(text),
-                    logger=logging.getLogger(__name__),
-                    client=client,
-                    claude_client=object(),
-                )
-            )
-
-        self.assertTrue(handled)
-        self.assertEqual(len(replies), 1)
-        self.assertIn("이미 학습된 스레드야", replies[0])
-        self.assertIn("https://notion.example/existing", replies[0])
-
-    def test_thread_learning_route_continues_when_permalink_lookup_fails(self) -> None:
-        replies: list[str] = []
-        client = FailingPermalinkSlackClient()
-
-        with (
-            patch("boxer_company_adapter_slack.thread_learning_routes.cs.THREAD_PLAYBOOK_LEARNING_ENABLED", True),
-            patch(
-                "boxer_company_adapter_slack.thread_learning_routes._learn_slack_thread_playbook",
-                return_value=ThreadPlaybookSaveResult(
-                    "기존 플레이북",
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "https://notion.example/existing",
-                    ["자동 녹화"],
-                    False,
-                    created=False,
-                ),
-            ) as learn_mock,
-        ):
-            handled = _handle_thread_learning_routes(
-                ThreadLearningRoutesContext(
-                    question="이 스레드 학습",
-                    payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U_REQUESTER",
-                    workspace_id="W123",
-                    channel_id="C123",
-                    current_ts="1.3",
-                    thread_ts="1.0",
-                    reply=lambda text, **kwargs: replies.append(text),
-                    logger=logging.getLogger(__name__),
-                    client=client,
-                    claude_client=object(),
-                )
-            )
-
-        self.assertTrue(handled)
-        self.assertIn("이미 학습된 스레드야", replies[0])
-        self.assertIsNone(learn_mock.call_args.kwargs["thread_permalink"])
-        self.assertEqual(learn_mock.call_args.kwargs["workspace_id"], "W123")
-
 
 if __name__ == "__main__":
     unittest.main()

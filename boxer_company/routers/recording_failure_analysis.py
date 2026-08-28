@@ -6,21 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from boxer_company import settings as cs
-from boxer.core.utils import _display_value, _truncate_text
-
-_FAILURE_ANALYSIS_HINTS = (
-    "녹화 실패",
-    "실패 원인",
-    "원인 분석",
-    "왜 실패",
-    "왜 안 됐",
-    "왜 깨졌",
-    "영상 손상",
-    "손상 원인",
-    "업로드 실패",
-    "정상 녹화 안",
-    "정상 녹화 실패",
-)
+from boxer.core.utils import _truncate_text
+from boxer_company.utils import _display_value
 
 _CODE_HINTS = (
     "마미박스",
@@ -155,18 +142,6 @@ _TAG_CODE_TARGETS: dict[str, list[dict[str, Any]]] = {
         },
     ],
 }
-
-
-def _is_recording_failure_analysis_request(question: str, barcode: str | None) -> bool:
-    if not barcode:
-        return False
-    return _has_recording_failure_analysis_hints(question)
-
-
-def _has_recording_failure_analysis_hints(question: str) -> bool:
-    text = (question or "").strip()
-    lowered = text.lower()
-    return any(hint in text or hint in lowered for hint in _FAILURE_ANALYSIS_HINTS)
 
 
 def _has_code_hints(question: str) -> bool:

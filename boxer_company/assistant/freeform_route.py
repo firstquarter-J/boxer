@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# 마지막 freeform guard도 Slack/API와 같은 provider-free matcher를 쓴다.
+from boxer_company.read_routing import match_company_freeform_route
+
 import re
 from collections.abc import Callable
 import logging
@@ -53,25 +56,6 @@ _META_PREFIX_REWRITES: tuple[tuple[re.Pattern[str], str], ...] = (
         "밈 프레임",
     ),
 )
-
-
-def match_company_freeform_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """adapter가 명시한 마지막 자유대화 stage만 처리한다."""
-
-    route_group = str(request.metadata.get("route_group") or "").strip()
-    if route_group != "freeform":
-        return None
-    # direct caller가 final fallback stage를 골라 PII·장비 변경·복원 같은
-    # operation capability를 우회하지 못하게 같은 순수 matcher를 재검사한다.
-    from boxer_company.assistant.operations import (
-        match_company_operation_route,
-    )
-
-    if match_company_operation_route(request) is not None:
-        return None
-    return "company_freeform"
 
 
 class CompanyFreeformAssistantRoute:

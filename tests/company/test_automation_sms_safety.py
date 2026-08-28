@@ -17,7 +17,7 @@ from boxer_company.automation import (
 )
 from boxer_company.device_health_monitor_cycle import (
     DeviceHealthMonitorCycleDeps,
-    build_device_health_monitor_seed_cursor,
+    build_clean_device_health_monitor_cursor,
     run_device_health_monitor_cycle,
 )
 from boxer_company.device_notification_cycle import (
@@ -205,7 +205,6 @@ def _notification_handler(
     deps = DeviceNotificationCycleDeps(
         load_latest_id=lambda: 12,
         load_next_event=lambda last_seen_id: (12, _notification_event()),
-        load_sheet_incidents=lambda: {},
         append_sheet_alerts=append_sheet or (
             lambda items, **kwargs: 1
         ),
@@ -262,11 +261,8 @@ def test_led_health_and_captureboard_notification_use_independent_provider_claim
     health_first = run_device_health_monitor_cycle(
         request_id="health:shared-sms:seed",
         now=_NOW - timedelta(minutes=1),
-        cursor=build_device_health_monitor_seed_cursor(
-            legacy_alert_delivery_enabled=True,
-            alert_fingerprints={},
-            pending_alert_fingerprints={},
-            pending_decision="preserve",
+        cursor=build_clean_device_health_monitor_cursor(
+            alert_delivery_enabled=True,
             seeded_at=_NOW - timedelta(minutes=2),
         ),
         deps=health_deps,

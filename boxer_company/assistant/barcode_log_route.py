@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+# 로그 실행은 Slack/API가 공유하는 provider-free 분류·scope 정본을 소비한다.
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    _context_has_log_request,
+    _extract_device_name_scope,
+    _extract_log_date_with_presence,
+    _is_barcode_log_analysis_request,
+    _looks_like_scope_followup,
+    _metadata_followup_kind,
+    _resolve_barcode_log_barcode,
+    resolve_assistant_request_scope,
+)
+
 import logging
 import re
 from typing import Any, Callable
@@ -28,10 +41,7 @@ from boxer_company.assistant.service import (
     RequestScopedRecordingsContext,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
-    resolve_assistant_request_scope,
-    window_assistant_context_entries,
 )
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
@@ -42,10 +52,6 @@ from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_phase1_window,
     _analyze_barcode_log_scan_events,
     _build_phase2_scope_request_message,
-    _extract_device_name_scope,
-    _extract_hospital_room_scope,
-    _extract_log_date_with_presence,
-    _is_barcode_log_analysis_request,
     _is_error_focused_request,
     _is_scan_focused_request,
     _is_normal_video_status,
@@ -59,7 +65,6 @@ from boxer_company.routers.recording_failure_analysis import (
     _classify_record,
     _get_top_error_group,
 )
-from boxer_company.utils import _extract_barcode
 
 
 ConfigCheck = Callable[[], bool]
@@ -152,7 +157,7 @@ class BarcodeLogAssistantRoute:
             scope = resolve_assistant_request_scope(request)
         except AssistantRequestScopeMismatch as mismatch:
             return build_scope_mismatch_result(mismatch)
-        barcode = scope.barcode or self._resolve_barcode(request)
+        barcode = scope.barcode or _resolve_barcode_log_barcode(request)
         hospital_name = scope.hospital_name
         room_name = scope.room_name
         has_context_log_request = bool(
@@ -629,146 +634,12 @@ class BarcodeLogAssistantRoute:
             used_llm=used_llm,
         )
 
+
     @staticmethod
     def _resolve_barcode(request: CompanyAssistantRequest) -> str | None:
-        metadata_barcode = _primitive_scope_text(
-            request.metadata.get("barcode")
-        )
-        if metadata_barcode:
-            return metadata_barcode
-        direct_barcode = _extract_barcode(request.question)
-        if direct_barcode:
-            return direct_barcode
+        """기존 호출점은 유지하되 판정은 순수 정본에 위임한다."""
 
-        # follow-up에서는 최신 대화부터 확인해
-        # 동일 actor가 남긴 이전 요청의 바코드만 복원한다.
-        for entry in reversed(window_assistant_context_entries(request)):
-            author_id = str(entry.get("author_id") or "").strip()
-            if not request.actor_id or author_id != request.actor_id:
-                continue
-            recovered = _extract_barcode(str(entry.get("text") or ""))
-            if recovered:
-                return recovered
-        return None
-
-    @staticmethod
-    def _resolve_manual_scope(
-        request: CompanyAssistantRequest,
-    ) -> tuple[str | None, str | None]:
-        parsed_hospital, parsed_room = _extract_hospital_room_scope(
-            request.question
-        )
-        hospital_name = (
-            _primitive_scope_text(request.metadata.get("hospital_name"))
-            or _primitive_scope_text(
-                request.metadata.get("phase2_hospital_name")
-            )
-            or parsed_hospital
-        )
-        room_name = (
-            _primitive_scope_text(request.metadata.get("room_name"))
-            or _primitive_scope_text(request.metadata.get("phase2_room_name"))
-            or parsed_room
-        )
-        return hospital_name, room_name
-
-
-def match_barcode_log_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """DB/S3 조회 없이 직접 로그 요청과 동일 actor의 2차 범위 입력만 고른다."""
-
-    try:
-        scope = resolve_assistant_request_scope(request)
-    except AssistantRequestScopeMismatch:
-        return None
-    barcode = scope.barcode or BarcodeLogAssistantRoute._resolve_barcode(
-        request
-    )
-    hospital_name = scope.hospital_name
-    room_name = scope.room_name
-    if not (hospital_name and room_name):
-        hospital_name, room_name = (
-            BarcodeLogAssistantRoute._resolve_manual_scope(request)
-        )
-    if _is_barcode_log_analysis_request(request.question, barcode):
-        return "barcode_log_analysis"
-
-    has_context_log_request = bool(
-        _context_has_log_request(request)
-        or _metadata_followup_kind(request) == "barcode_log"
-    )
-    try:
-        _, has_scope_date = _extract_log_date_with_presence(
-            request.question
-        )
-    except ValueError:
-        has_scope_date = _looks_like_scope_followup(
-            barcode=barcode,
-            hospital_name=hospital_name,
-            room_name=room_name,
-            has_context_log_request=has_context_log_request,
-        )
-    if (
-        has_scope_date
-        and _looks_like_scope_followup(
-            barcode=barcode,
-            hospital_name=hospital_name,
-            room_name=room_name,
-            has_context_log_request=has_context_log_request,
-        )
-    ):
-        return "barcode_log_analysis"
-    return None
-
-
-def _context_has_log_request(request: CompanyAssistantRequest) -> bool:
-    return any(
-        (
-            "로그" in str(entry.get("text") or "")
-            or bool(
-                re.search(
-                    r"\blog\b",
-                    str(entry.get("text") or "").lower(),
-                )
-            )
-        )
-        for entry in window_assistant_context_entries(request)
-        if (
-            request.actor_id
-            and str(entry.get("author_id") or "").strip()
-            == request.actor_id
-        )
-    )
-
-
-def _metadata_followup_kind(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    value = request.metadata.get("followup_kind")
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().lower()
-    return normalized or None
-
-
-def _looks_like_scope_followup(
-    *,
-    barcode: str | None,
-    hospital_name: str | None,
-    room_name: str | None,
-    has_context_log_request: bool,
-) -> bool:
-    return bool(
-        barcode and hospital_name and room_name and has_context_log_request
-    )
-
-
-def _primitive_scope_text(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    normalized = " ".join(value.split()).strip()
-    return normalized or None
+        return _resolve_barcode_log_barcode(request)
 
 
 def _scope_guidance_reason(result_text: str) -> str | None:
@@ -1559,5 +1430,4 @@ def _result(
 
 __all__ = [
     "BarcodeLogAssistantRoute",
-    "match_barcode_log_route",
 ]

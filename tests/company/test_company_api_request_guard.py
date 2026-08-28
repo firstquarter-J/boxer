@@ -110,7 +110,6 @@ def test_uncertain_mutation_never_expires_during_process_lifetime() -> None:
     now = [0.0]
     guard = MutationRequestGuard(
         clock=lambda: now[0],
-        uncertain_ttl_sec=60.0,
     )
     first = guard.reserve(
         caller_id="slack-prod",

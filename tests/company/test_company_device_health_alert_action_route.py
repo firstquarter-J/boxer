@@ -29,8 +29,8 @@ from boxer_company.assistant.device_health_alert_action_route import (
 )
 from boxer_company.assistant.operations import (
     company_operation_route_names,
-    match_company_operation_route,
 )
+from boxer_company.operation_routing import match_company_operation_route
 from boxer_company.routers.device_ssh_security import (
     company_api_device_ssh_context,
 )
@@ -38,7 +38,6 @@ from boxer_company_api.auth import CallerPrincipal
 from boxer_company_api.policies import authorize_turn
 from boxer_company_api.problems import CompanyApiProblem
 from boxer_company_api.schemas import AssistantTurnInput, serialize_result
-from boxer_company_adapter_slack import device_health_monitor_reporter
 
 
 def _action_metadata(
@@ -522,47 +521,6 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
         self.assertFalse(mutation_state.mutation_attempted)
         post_mock.assert_not_called()
 
-    def test_view_auto_sms_modal_performs_no_db_mda_or_sms_call(self) -> None:
-        item = {
-            "hospital": "분당제일병원",
-            "hospitalSeq": "31",
-            "room": "2진료실",
-            "device": "MB2-C00419",
-            "issue": "캡처보드 연결 확인 필요",
-            "smsPhoneNumber": "01012345678",
-            "smsMessage": "이미 발송한 문자",
-        }
-        with (
-            patch.object(
-                device_health_monitor_reporter,
-                "_lookup_device_health_monitor_hospital_contact",
-            ) as db_mock,
-            patch.object(
-                device_health_monitor_reporter,
-                "_post_device_health_monitor_sms_payload",
-            ) as sms_mock,
-            patch.object(
-                device_health_monitor_reporter,
-                "_dispatch_device_health_monitor_voice_guide",
-            ) as mda_mock,
-        ):
-            view = device_health_monitor_reporter._build_device_health_monitor_sms_modal_view(
-                item=item,
-                actor_user_id="ACTOR-1",
-                channel_id="CHANNEL-1",
-                message_ts="100.1",
-                thread_ts="100.1",
-                mode="view_auto_sent",
-            )
-
-        self.assertEqual(
-            view["callback_id"],
-            "device_health_alert_auto_sms_view_modal",
-        )
-        db_mock.assert_not_called()
-        sms_mock.assert_not_called()
-        mda_mock.assert_not_called()
-
     def test_operation_route_allowlist_contains_all_action_results(self) -> None:
         self.assertTrue(
             {
@@ -682,14 +640,18 @@ class DeviceHealthAlertActionApiContractTests(unittest.TestCase):
             tenant_ids=frozenset({"TENANT-1"}),
             channels=frozenset({"slack"}),
             actor_ids=frozenset({"ACTOR-1"}),
-            allow_anonymous_actor=False,
             capabilities=frozenset(
                 {"assistant.turn.read", "assistant.operation.execute"}
             ),
         )
 
         with self.assertRaises(CompanyApiProblem) as raised:
-            authorize_turn(base_principal, turn, "REQ-1")
+            authorize_turn(
+                base_principal,
+                turn,
+                "REQ-1",
+                effective_route_group="operations",
+            )
         self.assertEqual(raised.exception.status, 403)
 
         authorized = replace(
@@ -702,7 +664,15 @@ class DeviceHealthAlertActionApiContractTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertIs(authorize_turn(authorized, turn, "REQ-1"), authorized)
+        self.assertIs(
+            authorize_turn(
+                authorized,
+                turn,
+                "REQ-1",
+                effective_route_group="operations",
+            ),
+            authorized,
+        )
 
     def test_api_receipt_excludes_phone_message_and_ids_from_body(self) -> None:
         deps = replace(

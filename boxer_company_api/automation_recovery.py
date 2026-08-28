@@ -1,31 +1,27 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Iterator, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from boxer_company.sms_delivery_cycle import (
     inspect_automatic_sms_recovery_state,
     settle_automatic_sms_delivery_claim_for_recovery,
 )
 from boxer_company.device_health_monitor_cycle import (
-    build_device_health_monitor_seed_cursor,
+    build_clean_device_health_monitor_cursor,
     device_health_monitor_cursor_digest,
     update_device_health_monitor_alert_delivery_override,
 )
 from boxer_company.automation import AutomationCycleContractError
-from boxer_company.device_health_state_bundle import (
-    build_device_notification_api_cursor,
-    DeviceHealthStateBundleError,
-    FILE_DIGEST_PATTERN,
-    load_protected_json_file,
-    validate_device_health_state_bundle,
+from boxer_company.protected_json import (
+    create_protected_json_file,
+    ProtectedJsonFileError,
 )
 from boxer_company_api.automation import (
     JsonAutomationCycleStateStore,
@@ -54,263 +50,77 @@ _MAX_RESOLUTION_HISTORY = 20
 _SMS_DEVICE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SMS_CATEGORY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CURSOR_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{24}$")
-_DEVICE_HEALTH_SEED_KEYS = frozenset(
-    {
-        "version",
-        "legacyAlertDeliveryEnabled",
-        "alertFingerprints",
-        "pendingAlertFingerprints",
-    }
-)
 
 
 class AutomationRecoveryError(RuntimeError):
     """불명 상태를 안전하게 식별하거나 해제할 수 없을 때 발생한다."""
 
 
-def seed_device_health_monitor_state(
+def initialize_clean_automation_state(
     *,
     state_path: str | Path,
     tenant_id: str,
-    legacy_state: Mapping[str, Any],
-    pending_decision: Literal["preserve", "assume_delivered"],
+    initial_alert_delivery_enabled: bool,
     now: datetime | None = None,
 ) -> Mapping[str, Any]:
-    """서비스 중지 뒤 검토된 legacy override/dedupe를 API에 최초 seed한다."""
+    """새 API host에 전체 automation document를 create-only로 초기화한다."""
 
     _validate_identity(
         tenant_id=tenant_id,
         cycle="device_health_monitor",
         cycle_key="continuous",
-        request_id="device-health-state-seed",
+        request_id="automation-state-initialize",
     )
+    if type(initial_alert_delivery_enabled) is not bool:
+        raise AutomationRecoveryError(
+            "initial alert delivery setting is invalid"
+        )
     actual_now = now or datetime.now(timezone.utc)
     if actual_now.tzinfo is None:
-        raise AutomationRecoveryError("device health seed time is invalid")
-    _, state, result = _build_device_health_seed_state(
-        legacy_state=legacy_state,
-        pending_decision=pending_decision,
+        raise AutomationRecoveryError("automation initialization time is invalid")
+
+    # 신규 host에는 과거 Slack fingerprint를 추측해 복원하지 않는다. 빈
+    # dedupe와 명시적 alert override만 기존 cursor 계약으로 함께 만든다.
+    health_state, result = _build_clean_device_health_state(
+        initial_alert_delivery_enabled=initial_alert_delivery_enabled,
         now=actual_now,
     )
-
-    store = JsonAutomationCycleStateStore(state_path)
     state_key = _state_key(
         tenant_id,
         "device_health_monitor",
         "continuous",
     )
-
-    def _seed_once(
-        exists: bool,
-        _current: dict[str, Any],
-    ) -> tuple[Mapping[str, Any], None]:
-        if exists:
-            # 기존 empty object도 과거 실행이 남긴 revision일 수 있으므로
-            # absent target과 같다고 보지 않고 수동 검토 전까지 막는다.
-            raise AutomationRecoveryError(
-                "device health automation state is not empty"
-            )
-        return state, None
-
-    try:
-        store.mutate_cycle(state_key, _seed_once)
-    except AutomationCycleContractError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    return result
-
-
-def import_device_health_monitor_forward_bundle(
-    *,
-    state_path: str | Path,
-    tenant_id: str,
-    bundle_path: str | Path,
-    expected_bundle_digest: str,
-    expected_target_state_digest: str,
-    expected_notification_target_state_digest: str,
-    sms_outbox_path: str | Path,
-    expected_sms_state_digest: str,
-    pending_decision: Literal["preserve", "assume_delivered"],
-    now: datetime | None = None,
-) -> Mapping[str, Any]:
-    """API host의 empty health/notification/SMS target에 한 번만 import한다."""
-
-    if (
-        not FILE_DIGEST_PATTERN.fullmatch(str(expected_bundle_digest or ""))
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_target_state_digest or "")
-        )
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_notification_target_state_digest or "")
-        )
-        or not FILE_DIGEST_PATTERN.fullmatch(
-            str(expected_sms_state_digest or "")
-        )
-    ):
-        raise AutomationRecoveryError(
-            "device health forward import confirmation is invalid"
-        )
-    actual_now = now or datetime.now(timezone.utc)
-    if actual_now.tzinfo is None:
-        raise AutomationRecoveryError("device health forward import time is invalid")
-    try:
-        raw_bundle, bundle_digest = load_protected_json_file(
-            bundle_path,
-            label="device health forward bundle",
-        )
-        if bundle_digest != expected_bundle_digest:
-            raise AutomationRecoveryError("device health forward bundle changed")
-        bundle = validate_device_health_state_bundle(
-            raw_bundle,
-            direction="slack_to_api",
-        )
-    except DeviceHealthStateBundleError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    payload = bundle["payload"]
-    _, seed_state, seed_result = _build_device_health_seed_state(
-        legacy_state={
-            "version": 1,
-            "legacyAlertDeliveryEnabled": payload[
-                "alertDeliveryEnabled"
-            ],
-            "alertFingerprints": payload["alertFingerprints"],
-            "pendingAlertFingerprints": payload[
-                "pendingAlertFingerprints"
-            ],
-        },
-        pending_decision=pending_decision,
-        now=actual_now,
-    )
-    try:
-        notification_cursor = build_device_notification_api_cursor(
-            payload["notificationState"]
-        )
-    except DeviceHealthStateBundleError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    notification_seed_state = {
-        "cursor": notification_cursor,
-        "pendingDeliveries": [],
-        "acknowledgedDeliveryIds": [],
-        "domainCycleComplete": False,
-        "cycleCompleted": False,
+    document = {
+        "version": 1,
+        "cycles": {state_key: health_state},
     }
-    store = JsonAutomationCycleStateStore(state_path)
-    health_state_key = _state_key(
-        tenant_id,
-        "device_health_monitor",
-        "continuous",
-    )
-    notification_state_key = _state_key(
-        tenant_id,
-        "device_notification_alert",
-        "continuous",
-    )
-
-    # clean API host도 runtime이 실제 사용할 canonical SMS 두 파일을 먼저
-    # 초기화하고 drain해야 한다. 임의의 빈 파일이나 stale cooldown을
-    # health/notification seed와 별개로 승인하지 않는다.
-    _inspect_exact_drained_sms_recovery_state(
-        sms_outbox_path,
-        expected_state_digest=expected_sms_state_digest,
-        now=actual_now,
-        operation="forward import",
-    )
-
-    # bundle digest 재확인과 target absent 판정을 한 state flock 안의 CAS
-    # writer에 바로 연결해 두 recovery process가 동시에 seed하지 못하게 한다.
     try:
-        _, final_bundle_digest = load_protected_json_file(
-            bundle_path,
-            label="device health forward bundle",
+        state_digest = create_protected_json_file(
+            state_path,
+            document,
+            label="automation state",
         )
-    except DeviceHealthStateBundleError as exc:
+        store = JsonAutomationCycleStateStore(state_path)
+        with store.locked_snapshot() as snapshot:
+            exists, stored_health_state = snapshot.cycle(state_key)
+            if (
+                not snapshot.exists
+                or snapshot.digest != state_digest
+                or snapshot.document != document
+                or not exists
+                or stored_health_state != health_state
+            ):
+                # 생성 후 검증 실패 시 자동 삭제하지 않는다. 운영자가 원본
+                # revision을 보존한 채 원인을 확인해야 재초기화를 막을 수 있다.
+                raise AutomationRecoveryError(
+                    "automation state initialization verification failed"
+                )
+    except (ProtectedJsonFileError, AutomationCycleContractError) as exc:
         raise AutomationRecoveryError(str(exc)) from exc
-    if final_bundle_digest != bundle_digest:
-        raise AutomationRecoveryError("device health forward bundle changed")
-
-    target_digest = ""
-    notification_target_digest = ""
-
-    def _import_absent_targets(
-        current_states: dict[str, tuple[bool, dict[str, Any]]],
-    ) -> tuple[Mapping[str, Mapping[str, Any]], None]:
-        nonlocal target_digest, notification_target_digest
-        exists, current = current_states[health_state_key]
-        notification_exists, notification_current = current_states[
-            notification_state_key
-        ]
-        target_digest = _automation_target_state_digest(
-            current,
-            exists=exists,
-        )
-        notification_target_digest = _automation_target_state_digest(
-            notification_current,
-            exists=notification_exists,
-        )
-        if (
-            target_digest != expected_target_state_digest
-            or notification_target_digest
-            != expected_notification_target_state_digest
-            or exists
-            or notification_exists
-        ):
-            raise AutomationRecoveryError(
-                "device health forward targets are not exact empty state"
-            )
-        # source bundle도 target document flock 안에서 다시 확인해 두 cycle
-        # seed가 한 revision의 exact source에만 결합되게 한다.
-        try:
-            _, locked_bundle_digest = load_protected_json_file(
-                bundle_path,
-                label="device health forward bundle",
-            )
-        except DeviceHealthStateBundleError as exc:
-            raise AutomationRecoveryError(str(exc)) from exc
-        if locked_bundle_digest != bundle_digest:
-            raise AutomationRecoveryError(
-                "device health forward bundle changed"
-            )
-        _inspect_exact_drained_sms_recovery_state(
-            sms_outbox_path,
-            expected_state_digest=expected_sms_state_digest,
-            now=actual_now,
-            operation="forward import",
-        )
-        return {
-            health_state_key: seed_state,
-            notification_state_key: notification_seed_state,
-        }, None
-
-    try:
-        store.mutate_cycles(
-            (health_state_key, notification_state_key),
-            _import_absent_targets,
-        )
-    except AutomationCycleContractError as exc:
-        raise AutomationRecoveryError(str(exc)) from exc
-    # SMS는 automation document와 별도 lock domain이다. 서비스가 중지된
-    # offline 절차에서도 CAS 직후 exact revision을 다시 확인해 target SMS
-    # state drift가 seed 성공으로 보고되지 않게 한다.
-    final_sms_state = _inspect_exact_drained_sms_recovery_state(
-        sms_outbox_path,
-        expected_state_digest=expected_sms_state_digest,
-        now=actual_now,
-        operation="forward import",
-    )
     return {
-        **seed_result,
-        "bundleDigest": bundle_digest,
-        "sourceSlackStateDigest": bundle["sourceDigest"],
-        "previousTargetStateDigest": target_digest,
-        "sourceSlackNotificationStateDigest": bundle["safety"][
-            "notificationStateDigest"
-        ],
-        "previousNotificationTargetStateDigest": notification_target_digest,
-        "notificationStateDigest": _automation_target_state_digest(
-            notification_seed_state,
-            exists=True,
-        ),
-        "notificationLastSeenId": notification_cursor["lastSeenId"],
-        "targetSmsStateDigest": final_sms_state["stateDigest"],
+        **result,
+        "initialized": True,
+        "automationStateDigest": state_digest,
     }
 
 
@@ -357,8 +167,8 @@ def inspect_device_health_monitor_state(
     cursor = state.get("cursor")
     if not isinstance(cursor, Mapping):
         if exists:
-            # present-but-malformed target은 forward import가 쓸 수 있는 empty
-            # state가 아니며 inspect에서도 정상 미seed로 축약하지 않는다.
+            # present-but-malformed target은 신규 초기화 대상이 아니며
+            # inspect에서도 정상 미seed로 축약하지 않는다.
             raise AutomationRecoveryError(
                 "device health automation state is invalid"
             )
@@ -781,27 +591,18 @@ def _automation_target_state_digest(
     ).hexdigest()
 
 
-def _build_device_health_seed_state(
+def _build_clean_device_health_state(
     *,
-    legacy_state: Mapping[str, Any],
-    pending_decision: Literal["preserve", "assume_delivered"],
+    initial_alert_delivery_enabled: bool,
     now: datetime,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """검토한 legacy payload를 저장 직전까지 완전히 검증한다."""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """과거 source/export 없이 신규 host의 최소 health state만 만든다."""
 
     if now.tzinfo is None:
-        raise AutomationRecoveryError("device health seed time is invalid")
-    payload = _validate_device_health_seed_payload(legacy_state)
+        raise AutomationRecoveryError("device health state time is invalid")
     try:
-        cursor = build_device_health_monitor_seed_cursor(
-            legacy_alert_delivery_enabled=payload[
-                "legacyAlertDeliveryEnabled"
-            ],
-            alert_fingerprints=payload["alertFingerprints"],
-            pending_alert_fingerprints=payload[
-                "pendingAlertFingerprints"
-            ],
-            pending_decision=pending_decision,
+        cursor = build_clean_device_health_monitor_cursor(
+            alert_delivery_enabled=initial_alert_delivery_enabled,
             seeded_at=now,
         )
         cursor_digest = device_health_monitor_cursor_digest(cursor)
@@ -814,7 +615,7 @@ def _build_device_health_seed_state(
         "domainCycleComplete": False,
         "cycleCompleted": False,
     }
-    return cursor, state, {
+    return state, {
         "seeded": True,
         "cycle": "device_health_monitor",
         "alertDeliveryEnabled": bool(
@@ -824,35 +625,10 @@ def _build_device_health_seed_state(
         "pendingFingerprintCount": len(
             cursor["pendingAlertFingerprints"]
         ),
-        "pendingDecision": pending_decision,
         "cursorDigest": cursor_digest,
         "healthStateDigest": _automation_target_state_digest(
             state,
             exists=True,
-        ),
-    }
-
-
-def _validate_device_health_seed_payload(
-    value: Mapping[str, Any],
-) -> dict[str, Any]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != _DEVICE_HEALTH_SEED_KEYS
-        or type(value.get("version")) is not int
-        or value.get("version") != 1
-        or type(value.get("legacyAlertDeliveryEnabled")) is not bool
-        or not isinstance(value.get("alertFingerprints"), Mapping)
-        or not isinstance(value.get("pendingAlertFingerprints"), Mapping)
-    ):
-        raise AutomationRecoveryError("device health seed payload is invalid")
-    return {
-        "legacyAlertDeliveryEnabled": value[
-            "legacyAlertDeliveryEnabled"
-        ],
-        "alertFingerprints": dict(value["alertFingerprints"]),
-        "pendingAlertFingerprints": dict(
-            value["pendingAlertFingerprints"]
         ),
     }
 
@@ -878,31 +654,6 @@ def _inspect_strict_sms_recovery_state(
         raise AutomationRecoveryError(
             "device health SMS state is unreadable"
         ) from exc
-
-
-def _inspect_exact_drained_sms_recovery_state(
-    sms_outbox_path: str | Path,
-    *,
-    expected_state_digest: str,
-    now: datetime,
-    operation: str,
-) -> dict[str, Any]:
-    """한 canonical SMS revision에서 outbox·claim·cooldown을 모두 drain한다."""
-
-    state = _inspect_strict_sms_recovery_state(
-        sms_outbox_path,
-        now=now,
-    )
-    if (
-        state["stateDigest"] != expected_state_digest
-        or state["outboxItemCount"] != 0
-        or state["unresolvedClaimCount"] != 0
-        or state["activeSettledClaimCount"] != 0
-    ):
-        raise AutomationRecoveryError(
-            f"device health {operation} SMS outbox is not exact drained state"
-        )
-    return state
 
 
 def _parse_cli_bool(value: str | None, *, field: str) -> bool:
@@ -967,14 +718,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Confirm that boxer-company-api is stopped before editing state.",
     )
-    parser.add_argument("--import-device-health-forward-bundle-path")
-    parser.add_argument("--expected-bundle-digest")
-    parser.add_argument("--expected-target-state-digest")
-    parser.add_argument("--expected-notification-target-state-digest")
-    parser.add_argument("--expected-sms-state-digest")
     parser.add_argument(
-        "--pending-decision",
-        choices=("preserve", "assume_delivered"),
+        "--initialize-clean-automation-state",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--initial-alert-delivery-enabled",
+        choices=("true", "false"),
     )
     parser.add_argument(
         "--inspect-device-health-state",
@@ -1003,7 +753,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     device_health_modes = sum(
         bool(value)
         for value in (
-            args.import_device_health_forward_bundle_path,
+            args.initialize_clean_automation_state,
             args.inspect_device_health_state,
             args.set_alert_delivery_enabled,
         )
@@ -1013,34 +763,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.confirm_service_stopped:
         raise SystemExit("automation_recovery_requires_stopped_service")
     try:
-        if args.import_device_health_forward_bundle_path:
+        if args.initialize_clean_automation_state:
             if not all(
                 (
                     args.state_path,
                     args.tenant_id,
-                    args.pending_decision,
-                    args.expected_bundle_digest,
-                    args.expected_target_state_digest,
-                    args.expected_notification_target_state_digest,
-                    args.sms_outbox_path,
-                    args.expected_sms_state_digest,
+                    args.initial_alert_delivery_enabled,
                 )
             ):
                 raise AutomationRecoveryError(
-                    "device health forward import confirmation is incomplete"
+                    "automation initialization confirmation is incomplete"
                 )
-            result = import_device_health_monitor_forward_bundle(
+            result = initialize_clean_automation_state(
                 state_path=args.state_path,
                 tenant_id=args.tenant_id,
-                bundle_path=args.import_device_health_forward_bundle_path,
-                expected_bundle_digest=args.expected_bundle_digest,
-                expected_target_state_digest=args.expected_target_state_digest,
-                expected_notification_target_state_digest=(
-                    args.expected_notification_target_state_digest
+                initial_alert_delivery_enabled=_parse_cli_bool(
+                    args.initial_alert_delivery_enabled,
+                    field="initial alert delivery enabled",
                 ),
-                sms_outbox_path=args.sms_outbox_path,
-                expected_sms_state_digest=args.expected_sms_state_digest,
-                pending_decision=args.pending_decision,
             )
         elif args.inspect_device_health_state:
             if not all((args.state_path, args.tenant_id)):
@@ -1128,11 +868,10 @@ if __name__ == "__main__":
 
 __all__ = [
     "AutomationRecoveryError",
-    "import_device_health_monitor_forward_bundle",
+    "initialize_clean_automation_state",
     "inspect_device_health_monitor_state",
     "main",
     "override_device_health_monitor_alert_delivery",
     "resolve_automatic_sms_uncertain_claim",
     "resolve_automation_uncertain_state",
-    "seed_device_health_monitor_state",
 ]

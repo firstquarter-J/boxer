@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterator, Literal, Mapping, TypeVar
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from boxer_company.automation import (
     AutomationCycleContractError,
@@ -30,10 +30,7 @@ from boxer_company.automation import (
 )
 
 
-_CYCLE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$"
-_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$"
 _DELIVERY_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
-_MAX_RECEIPTS = 100
 _MAX_ACKNOWLEDGED_IDS = 500
 _STATE_VERSION = 1
 _MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -104,106 +101,6 @@ class AutomationDeliveryReceiptInput(_StrictModel):
         return normalized
 
 
-class AutomationCycleInput(_StrictModel):
-    tenantId: str = Field(
-        min_length=1,
-        max_length=256,
-        pattern=_IDENTIFIER_PATTERN,
-    )
-    cycle: Literal[
-        "weekly_recordings",
-        "daily_device_round",
-        "device_health_monitor",
-        "device_notification_alert",
-        "sms_delivery",
-    ]
-    cycleKey: str = Field(
-        min_length=1,
-        max_length=192,
-        pattern=_CYCLE_KEY_PATTERN,
-    )
-    scheduledAt: datetime
-    options: dict[str, Any] = Field(default_factory=dict)
-    deliveryReceipts: list[AutomationDeliveryReceiptInput] = Field(
-        default_factory=list,
-        max_length=_MAX_RECEIPTS,
-    )
-    ackOnly: bool = False
-
-    @field_validator("scheduledAt")
-    @classmethod
-    def _validate_scheduled_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None:
-            raise ValueError("scheduledAt must be timezone-aware")
-        return value
-
-    @model_validator(mode="after")
-    def _validate_receipts(self) -> "AutomationCycleInput":
-        ids = [item.deliveryId for item in self.deliveryReceipts]
-        if len(ids) != len(set(ids)):
-            raise ValueError("delivery receipts must be unique")
-        allowed_options: dict[str, frozenset[str]] = {
-            "weekly_recordings": frozenset(),
-            "daily_device_round": frozenset(
-                {
-                    "autoUpdateAgent",
-                    "autoUpdateBoxFree",
-                    "autoUpdateBoxPaid",
-                    "autoCleanupTrashCan",
-                    "autoPowerOff",
-                }
-            ),
-            # health delivery override와 fingerprint dedupe는 API durable
-            # cursor가 소유하므로 Slack 요청 option으로 바꿀 수 없다.
-            "device_health_monitor": frozenset(),
-            "device_notification_alert": frozenset(),
-            "sms_delivery": frozenset(),
-        }
-        if set(self.options) - allowed_options[self.cycle]:
-            raise ValueError("automation options contain unsupported fields")
-        if any(not isinstance(value, bool) for value in self.options.values()):
-            raise ValueError("automation options must be booleans")
-        # handler 진입 전 cycle별 mutation option을 고정해 잘못된 입력이
-        # durable in-flight 상태를 만들지 않게 한다.
-        return self
-
-    def to_trigger(self, request_id: str) -> "AutomationCycleTrigger":
-        return AutomationCycleTrigger(
-            request_id=request_id,
-            tenant_id=self.tenantId,
-            cycle=self.cycle,
-            cycle_key=self.cycleKey,
-            scheduled_at=self.scheduledAt,
-            options=dict(self.options),
-            delivery_receipts=tuple(
-                AutomationDeliveryReceipt(
-                    delivery_id=item.deliveryId,
-                    status=item.status,
-                    external_message_id=item.externalMessageId,
-                    permalink=item.permalink,
-                    delivered_at=item.deliveredAt,
-                )
-                for item in self.deliveryReceipts
-            ),
-            ack_only=self.ackOnly,
-        )
-
-
-class AutomationDeliveryOutput(_StrictModel):
-    deliveryId: str
-    kind: str
-    payload: dict[str, Any]
-
-
-class AutomationCycleOutput(_StrictModel):
-    requestId: str
-    cycle: str
-    outcome: Literal["completed", "no_change"]
-    deliveries: list[AutomationDeliveryOutput]
-    metrics: dict[str, Any]
-    autoRetryAllowed: Literal[False] = False
-
-
 @dataclass(frozen=True, slots=True)
 class AutomationCycleTrigger:
     request_id: str
@@ -217,7 +114,7 @@ class AutomationCycleTrigger:
         repr=False,
     )
     ack_only: bool = False
-    # HTTP compatibility trigger에는 없고 API scheduler가 만든 새 run에만
+    # ACK-only transport trigger에는 없고 API scheduler가 만든 새 run에만
     # 있다. pending이 생길 때 이 snapshot을 durable transport 정본으로 쓴다.
     delivery_target: Mapping[str, Any] | None = field(
         default=None,
@@ -302,9 +199,6 @@ class JsonAutomationCycleStateStore:
             _, state = snapshot.cycle(key)
             return state
 
-    def save(self, key: str, state: Mapping[str, Any]) -> None:
-        self.mutate_cycle(key, lambda _exists, _state: (dict(state), None))
-
     def mutate_cycle(
         self,
         key: str,
@@ -338,61 +232,6 @@ class JsonAutomationCycleStateStore:
                     return result
                 cycles = dict(snapshot.document["cycles"])
                 cycles[key] = dict(next_state)
-                self._write_document_unlocked(
-                    {"version": _STATE_VERSION, "cycles": cycles}
-                )
-                return result
-
-    def mutate_cycles(
-        self,
-        keys: tuple[str, ...],
-        updater: Callable[
-            [dict[str, tuple[bool, dict[str, Any]]]],
-            tuple[Mapping[str, Mapping[str, Any]], _MutationResult],
-        ],
-        *,
-        expected_document_digest: str | None = None,
-    ) -> _MutationResult:
-        """한 document revision에서 여러 cycle을 한 번에 CAS 교체한다."""
-
-        if not keys or len(set(keys)) != len(keys):
-            raise AutomationCycleContractError(
-                "automation state keys are invalid"
-            )
-        for key in keys:
-            self._validate_state_key(key)
-        with self._lock:
-            with self._exclusive_file_lock():
-                snapshot = self._load_snapshot_unlocked()
-                if (
-                    expected_document_digest is not None
-                    and snapshot.digest != expected_document_digest
-                ):
-                    raise AutomationCycleContractError(
-                        "automation state changed"
-                    )
-                current = {
-                    key: snapshot.cycle(key)
-                    for key in keys
-                }
-                next_states, result = updater(current)
-                if set(next_states) != set(keys) or any(
-                    not isinstance(next_states.get(key), Mapping)
-                    for key in keys
-                ):
-                    raise AutomationCycleContractError(
-                        "automation state update is invalid"
-                    )
-                if all(
-                    exists and dict(next_states[key]) == state
-                    for key, (exists, state) in current.items()
-                ):
-                    return result
-                cycles = dict(snapshot.document["cycles"])
-                for key in keys:
-                    cycles[key] = dict(next_states[key])
-                # health/notification cutover seed가 서로 다른 revision에
-                # 남으면 cursor gap이 생기므로 문서 write는 정확히 한 번이다.
                 self._write_document_unlocked(
                     {"version": _STATE_VERSION, "cycles": cycles}
                 )
@@ -644,7 +483,7 @@ class DurableAutomationCycleCoordinator:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def run(self, trigger: AutomationCycleTrigger) -> AutomationCycleResult:
-        # Slack scheduler가 확정한 기존 실행 시각·옵션을 domain 입력으로
+        # API scheduler가 확정한 실행 시각·옵션을 domain 입력으로
         # 유지하고, API는 형식과 cycle 논리만 먼저 검증한다.
         admission_now = self._clock()
         validate_automation_trigger_admission(trigger)
@@ -658,8 +497,7 @@ class DurableAutomationCycleCoordinator:
             # coordinator/process가 같은 외부 mutation을 함께 시작하지 못한다.
             transition = self._state_store.mutate_cycle(
                 state_key,
-                lambda exists, current: self._reserve_transition(
-                    exists=exists,
+                lambda _exists, current: self._reserve_transition(
                     current=current,
                     state_key=state_key,
                     trigger=trigger,
@@ -724,13 +562,11 @@ class DurableAutomationCycleCoordinator:
     def _reserve_transition(
         self,
         *,
-        exists: bool,
         current: dict[str, Any],
         state_key: str,
         trigger: AutomationCycleTrigger,
         admission_now: datetime,
     ) -> tuple[Mapping[str, Any], _CoordinatorTransition]:
-        del exists
         state = dict(current)
         if trigger.cycle == "device_health_monitor":
             # health pending replay와 ackOnly도 API-owned seed에서만
@@ -1035,32 +871,10 @@ class DurableAutomationCycleCoordinator:
         self._state_store.mutate_cycle(state_key, _update)
 
 
-def serialize_automation_cycle_result(
-    result: AutomationCycleResult,
-    request_id: str,
-) -> dict[str, Any]:
-    payload = AutomationCycleOutput(
-        requestId=request_id,
-        cycle=result.cycle,
-        outcome=result.outcome,
-        deliveries=[
-            AutomationDeliveryOutput(
-                deliveryId=delivery.delivery_id,
-                kind=delivery.kind,
-                payload=dict(delivery.payload),
-            )
-            for delivery in result.deliveries
-        ],
-        metrics=dict(result.metrics),
-        autoRetryAllowed=False,
-    )
-    return payload.model_dump(mode="json")
-
-
 def validate_automation_trigger_admission(
     trigger: AutomationCycleTrigger,
 ) -> None:
-    """기존 Slack scheduler의 cycle identity와 option 형식만 검증한다."""
+    """API scheduler의 cycle identity와 option 형식만 검증한다."""
 
     if trigger.scheduled_at.tzinfo is None:
         raise AutomationCycleContractError(
@@ -1356,16 +1170,12 @@ def _restore_result(payload: Mapping[str, Any]) -> AutomationCycleResult:
 
 
 __all__ = [
-    "AutomationCycleInput",
-    "AutomationCycleOutput",
     "AutomationCycleTrigger",
     "AutomationCycleUncertainError",
     "AutomationStateSnapshot",
-    "AutomationDeliveryOutput",
     "AutomationDeliveryReceipt",
     "AutomationDeliveryReceiptInput",
     "DurableAutomationCycleCoordinator",
     "JsonAutomationCycleStateStore",
-    "serialize_automation_cycle_result",
     "validate_automation_trigger_admission",
 ]

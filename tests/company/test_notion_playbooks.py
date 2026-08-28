@@ -22,7 +22,7 @@ class NotionPlaybooksTests(unittest.TestCase):
         with (
             patch("boxer_company.notion_playbooks.cs.NOTION_TOKEN_COMPANY", ""),
             patch("boxer_company.notion_playbooks.cs.THREAD_PLAYBOOK_NOTION_ROOT_PAGE_ID", "a" * 32),
-            patch("boxer_company.notion_playbooks.s.NOTION_TOKEN_PERSONAL", "personal-token"),
+            patch("boxer.core.settings.NOTION_TOKEN_PERSONAL", "personal-token"),
             patch("boxer_company.notion_playbooks._fetch_all_notion_blocks") as fetch_mock,
         ):
             references = _select_notion_references("마미박스 녹화 프로세스 설명해줘")
@@ -34,7 +34,7 @@ class NotionPlaybooksTests(unittest.TestCase):
     def test_company_rag_index_helper_does_not_fallback_to_personal_token(self) -> None:
         with (
             patch("boxer_company.notion_playbooks.cs.NOTION_TOKEN_COMPANY", ""),
-            patch("boxer_company.notion_playbooks.s.NOTION_TOKEN_PERSONAL", "personal-token"),
+            patch("boxer.core.settings.NOTION_TOKEN_PERSONAL", "personal-token"),
             patch("boxer_company.notion_playbooks._fetch_all_notion_blocks") as fetch_mock,
             self.assertRaises(RuntimeError),
         ):

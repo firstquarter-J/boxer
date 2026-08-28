@@ -15,12 +15,14 @@ from boxer_company.assistant.device_operations_route import (
     DeviceOperationsRouteDeps,
 )
 from boxer_company.assistant.operations import (
+    company_operation_route_names,
+    match_live_device_company_operation_route,
+    match_mutation_capable_company_operation_route,
+)
+from boxer_company.operation_routing import (
     as_operations_request,
     company_operation_legacy_stage,
-    company_operation_route_names,
-    is_mutation_capable_company_operation,
     match_company_operation_route,
-    match_live_device_company_operation_route,
 )
 from boxer_company.routers.device_scanner_abi_patch import (
     DEVICE_SCANNER_ABI_PATCH_ROUTE,
@@ -145,7 +147,7 @@ def test_scanner_patch_route_uses_operations_mutation_and_live_device_gates(
 
     assert match_company_operation_route(request) == DEVICE_SCANNER_ABI_PATCH_ROUTE
     assert company_operation_legacy_stage(request) == "device"
-    assert is_mutation_capable_company_operation(request)
+    assert match_mutation_capable_company_operation_route(request)
     assert (
         match_live_device_company_operation_route(request)
         == DEVICE_SCANNER_ABI_PATCH_ROUTE

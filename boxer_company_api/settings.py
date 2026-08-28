@@ -54,16 +54,6 @@ _CAPABILITY_PATTERN = re.compile(
 )
 _ALLOWED_CHANNELS = frozenset({"slack", "web", "api"})
 _REQUIRED_TURN_CAPABILITY = "assistant.turn.read"
-_LEGACY_AUTOMATION_SLACK_CAPABILITIES = frozenset(
-    {
-        "assistant.turn.read",
-        "assistant.device.probe",
-        "assistant.device.ssh.open",
-        "assistant.operation.execute",
-        "assistant.device.alert.execute",
-        "assistant.automation.execute",
-    }
-)
 _SCHEDULER_AUTOMATION_SLACK_CAPABILITIES = frozenset(
     {
         "assistant.turn.read",
@@ -100,7 +90,6 @@ class CompanyApiCallerSettings:
     tenant_ids: frozenset[str]
     channels: frozenset[str]
     actor_ids: frozenset[str]
-    allow_anonymous_actor: bool
     capabilities: frozenset[str]
 
 
@@ -125,11 +114,11 @@ class CompanyApiSettings:
     operations_enabled: bool = True
     request_log_enabled: bool = False
     request_log_path: str = _DEFAULT_REQUEST_LOG_SQLITE_PATH
-    # 직접 주입하는 테스트 app은 기존 endpoint 계약을 유지하고, env loader로
-    # 만든 운영 설정만 실제 reporter flag에 맞춘 cycle 집합을 전달한다.
+    # 운영 점검이 reporter flag의 resolved 집합을 원문 env 없이 볼 수 있게
+    # 유지한다. 실제 실행 admission은 scheduler가 같은 flag를 다시 검증한다.
     automation_enabled_cycles: frozenset[str] = _ALL_AUTOMATION_CYCLES
-    # 새 companion과 pull/ACK transport는 명시 flag로 함께 열고, 이때
-    # Slack caller의 domain execute capability를 transport로 교체한다.
+    # companion과 pull/ACK transport는 명시 flag로 함께 열며 Slack caller는
+    # domain 실행 권한 없이 transport capability만 가진다.
     automation_scheduler_enabled: bool = False
 
     @property
@@ -153,21 +142,17 @@ def load_company_api_settings(
         source,
         required=live_device_enabled or operations_enabled,
     )
-    operations_dependency_error = _load_operations_dependency_settings(
-        source,
-        enabled=operations_enabled,
-        live_device_enabled=live_device_enabled,
-    )
     automation_enabled_cycles = _automation_enabled_cycles(source)
     (
         automation_scheduler_enabled,
         automation_scheduler_error,
-    ) = _load_automation_scheduler_enabled(
-        source,
-        enabled_cycles=automation_enabled_cycles,
-    )
+    ) = _load_automation_scheduler_enabled(source)
     host, port, server_error = _load_server_settings(source)
-    automation_storage_required = bool(automation_enabled_cycles)
+    # reporter flag는 신규 실행 admission만 닫는다. scheduler transport가
+    # 살아 있으면 feature-off 뒤 남은 pending을 drain할 state도 계속 연다.
+    automation_storage_required = bool(
+        automation_enabled_cycles or automation_scheduler_enabled
+    )
     sms_delivery_storage_required = _sms_delivery_storage_required(source)
     automation_state_path, automation_error = (
         _load_automation_state_path(source)
@@ -202,7 +187,6 @@ def load_company_api_settings(
                 or live_device_error
                 or operations_error
                 or request_log_error
-                or operations_dependency_error
                 or automation_error
                 or automation_dependency_error
                 or automation_scheduler_error
@@ -238,7 +222,6 @@ def load_company_api_settings(
                 or live_device_error
                 or operations_error
                 or request_log_error
-                or operations_dependency_error
                 or automation_error
                 or automation_dependency_error
                 or automation_scheduler_error
@@ -264,7 +247,6 @@ def load_company_api_settings(
     automation_caller_error = (
         _validate_automation_slack_caller(
             callers,
-            scheduler_enabled=automation_scheduler_enabled,
         )
         if automation_storage_required
         else None
@@ -285,7 +267,6 @@ def load_company_api_settings(
         or live_device_error is not None
         or operations_error is not None
         or request_log_error is not None
-        or operations_dependency_error is not None
         or automation_error is not None
         or automation_dependency_error is not None
         or automation_scheduler_error is not None
@@ -302,7 +283,6 @@ def load_company_api_settings(
                 or live_device_error
                 or operations_error
                 or request_log_error
-                or operations_dependency_error
                 or automation_error
                 or automation_dependency_error
                 or automation_scheduler_error
@@ -421,10 +401,8 @@ def _load_operations_enabled(
 
 def _load_automation_scheduler_enabled(
     env: Mapping[str, str],
-    *,
-    enabled_cycles: frozenset[str],
 ) -> tuple[bool, str | None]:
-    """API scheduler와 transport 소유권을 한 feature flag로 전환한다."""
+    """신규 cycle이 없어도 기존 pending drain transport는 유지한다."""
 
     raw_value = str(
         env.get(
@@ -434,7 +412,7 @@ def _load_automation_scheduler_enabled(
     ).strip().lower()
     if raw_value in _FALSE_VALUES:
         return False, None
-    if raw_value not in _TRUE_VALUES or not enabled_cycles:
+    if raw_value not in _TRUE_VALUES:
         return False, "automation_scheduler_configuration_invalid"
     return True, None
 
@@ -463,24 +441,6 @@ def _load_request_log_settings(
             "request_log_configuration_invalid"
         )
     return True, raw_path, None
-
-
-def _load_operations_dependency_settings(
-    env: Mapping[str, str],
-    *,
-    enabled: bool,
-    live_device_enabled: bool,
-) -> str | None:
-    """operations의 공통 기동 경계와 route별 kill switch를 분리한다."""
-
-    del env, live_device_enabled
-    if not enabled:
-        return None
-    # 기존 Slack은 DB/S3/app-user/MDA/복구 설정 하나가 비어 있거나 기능이
-    # 꺼져 있어도 프로세스를 계속 띄우고 해당 route에서만 전용 안내를
-    # 반환했다. 공통 API도 request-log/caller 검증은 전역에서 유지하되,
-    # 기능별 dependency는 각 domain route가 같은 문구로 판정하게 둔다.
-    return None
 
 
 def _load_automation_dependency_settings(
@@ -898,6 +858,27 @@ def company_api_local_readiness(settings: CompanyApiSettings) -> bool:
             if path.exists() or path.is_symlink()
         ):
             return False
+        automation_path = Path(settings.automation_state_path)
+        if (
+            settings.automation_storage_required
+            and automation_path.exists()
+        ):
+            # 권한만 정상인 구 /cycles state도 non-empty pending을 transport가
+            # 숨길 수 있다. raw revision을 쓰지 않고 exact metadata를 검사한다.
+            from boxer_company_api.automation import (
+                AutomationCycleContractError,
+                JsonAutomationCycleStateStore,
+            )
+            from boxer_company_api.automation_delivery import (
+                validate_automation_delivery_state,
+            )
+
+            try:
+                validate_automation_delivery_state(
+                    JsonAutomationCycleStateStore(automation_path)
+                )
+            except AutomationCycleContractError:
+                return False
     if settings.device_health_sheet_enabled and not _secure_json_object_file(
         Path(settings.google_application_credentials_path)
     ):
@@ -1006,18 +987,12 @@ def _parse_caller_registry(
 
 def _validate_automation_slack_caller(
     callers: tuple[CompanyApiCallerSettings, ...],
-    *,
-    scheduler_enabled: bool,
 ) -> str | None:
     slack_callers = [caller for caller in callers if "slack" in caller.channels]
-    required_capabilities = (
-        _SCHEDULER_AUTOMATION_SLACK_CAPABILITIES
-        if scheduler_enabled
-        else _LEGACY_AUTOMATION_SLACK_CAPABILITIES
-    )
     if (
         len(slack_callers) != 1
-        or slack_callers[0].capabilities != required_capabilities
+        or slack_callers[0].capabilities
+        != _SCHEDULER_AUTOMATION_SLACK_CAPABILITIES
     ):
         return "automation_caller_configuration_invalid"
     return None
@@ -1064,7 +1039,6 @@ def _parse_caller(payload: Any) -> CompanyApiCallerSettings:
         "tenantIds",
         "channels",
         "actorIds",
-        "allowAnonymousActor",
         "capabilities",
     }
     if set(payload) - allowed_keys:
@@ -1072,12 +1046,9 @@ def _parse_caller(payload: Any) -> CompanyApiCallerSettings:
 
     caller_id = _required_text(payload.get("callerId"))
     token = _required_text(payload.get("token"))
-    allow_anonymous_actor = payload.get("allowAnonymousActor", False)
     if (
         not _CALLER_ID_PATTERN.fullmatch(caller_id)
         or not _TOKEN_PATTERN.fullmatch(token)
-        or not isinstance(allow_anonymous_actor, bool)
-        or allow_anonymous_actor
     ):
         raise ValueError("caller identity is invalid")
 
@@ -1105,7 +1076,6 @@ def _parse_caller(payload: Any) -> CompanyApiCallerSettings:
         tenant_ids=tenant_ids,
         channels=channels,
         actor_ids=actor_ids,
-        allow_anonymous_actor=allow_anonymous_actor,
         capabilities=capabilities,
     )
 

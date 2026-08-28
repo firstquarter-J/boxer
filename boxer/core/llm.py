@@ -273,57 +273,6 @@ def _check_claude_health(
     }
 
 
-def _ask_ollama(
-    question: str,
-    system_prompt: str | None = None,
-    *,
-    model: str | None = None,
-    timeout_sec: int | None = None,
-    max_tokens: int | None = None,
-    temperature: float | None = None,
-) -> str:
-    prompt = (system_prompt or s.DEFAULT_SYSTEM_PROMPT).strip()
-    actual_timeout = max(1, timeout_sec if timeout_sec is not None else s.OLLAMA_TIMEOUT_SEC)
-    actual_temperature = s.OLLAMA_TEMPERATURE if temperature is None else temperature
-    options: dict[str, int | float] = {
-        "temperature": actual_temperature,
-    }
-    if max_tokens is not None and max_tokens > 0:
-        options["num_predict"] = max_tokens
-    payload = {
-        "model": (model or s.OLLAMA_MODEL).strip(),
-        "system": prompt,
-        "prompt": question,
-        "stream": False,
-        "options": options,
-    }
-    req = request.Request(
-        url=f"{s.OLLAMA_BASE_URL}/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=actual_timeout) as response:
-            body = response.read().decode("utf-8")
-    except TimeoutError as exc:
-        raise TimeoutError(f"Ollama API timed out after {actual_timeout}s") from exc
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Ollama API HTTP {exc.code}: {detail[:200]}") from exc
-    except error.URLError as exc:
-        if "timed out" in str(exc.reason).lower():
-            raise TimeoutError(f"Ollama API timed out after {actual_timeout}s") from exc
-        raise RuntimeError(f"Ollama API connection failed: {exc.reason}") from exc
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Ollama API returned invalid JSON") from exc
-
-    return _sanitize_ollama_output(str(data.get("response", "")).strip())
-
-
 def _ask_ollama_chat(
     question: str,
     system_prompt: str | None = None,

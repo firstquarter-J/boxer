@@ -2,6 +2,11 @@
 
 Company-specific domain package for Boxer.
 
+The base install exposes provider-free DTOs and routing contracts for adapters.
+DB, S3, MDA/SSH, Redis, Google, and HPA execution dependencies are isolated in
+the `runtime` extra and are installed by `boxer_company_api`, not by the Slack
+gateway.
+
 This package contains company-only:
 
 - settings

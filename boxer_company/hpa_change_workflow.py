@@ -20,6 +20,10 @@ from urllib.parse import quote
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from boxer_company.transport_contracts import (
+    HpaChangePollResult,
+    HpaChangePollState,
+)
 
 
 _TASK_ID_PATTERN = re.compile(r"^hpa-[0-9]{14}-[a-f0-9]{8}-[a-f0-9]{8}$")
@@ -337,27 +341,6 @@ class HpaChangeRequest:
     thread_url: str = ""
     attachments: tuple[HpaChangeAttachment, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-class HpaChangePollState(str, Enum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    REVIEW_READY = "review_ready"
-    NEEDS_CLARIFICATION = "needs_clarification"
-    PR_OPENED = "pr_opened"
-    NO_CHANGE_NEEDED = "no_change_needed"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True, repr=False)
-class HpaChangePollResult:
-    task_id: str
-    state: HpaChangePollState
-    job: HpaChangeJob
-    run_url: str
-    result: dict[str, Any]
-    message: str
-    pr_urls: tuple[str, ...]
 
 
 TaskIdFactory = Callable[[str, datetime], str]
@@ -705,28 +688,6 @@ class HpaChangeJobStore:
             ).fetchone()
         return self._row_to_job(row) if row is not None else None
 
-    def list_jobs(
-        self,
-        *,
-        statuses: Sequence[HpaChangeStatus] | None = None,
-        limit: int = 100,
-    ) -> list[HpaChangeJob]:
-        actual_limit = max(1, min(500, int(limit)))
-        params: list[Any] = []
-        where = ""
-        if statuses:
-            normalized_statuses = [HpaChangeStatus(item).value for item in statuses]
-            placeholders = ", ".join("?" for _ in normalized_statuses)
-            where = f"WHERE status IN ({placeholders})"
-            params.extend(normalized_statuses)
-        params.append(actual_limit)
-        with self._lock:
-            rows = self._connection.execute(
-                f"SELECT * FROM hpa_change_jobs {where} ORDER BY updated_at ASC LIMIT ?",
-                params,
-            ).fetchall()
-        return [self._row_to_job(row) for row in rows]
-
     def list_reportable_jobs(self, *, limit: int = 500) -> list[HpaChangeJob]:
         """진행 중 작업과 아직 terminal 알림을 보내지 않은 작업만 오래된 순서로 돌려준다."""
 
@@ -870,12 +831,6 @@ class HpaChangeJobStore:
                 raise
         return self.get_job(normalized_task_id)
 
-    def begin_dispatch(self, task_id: str) -> HpaChangeJob:
-        claimed = self.claim_review_dispatch(task_id)
-        if claimed is None:
-            return self.get_job(task_id)
-        return claimed
-
     def claim_review_dispatch(
         self,
         task_id: str,
@@ -1011,13 +966,6 @@ class HpaChangeJobStore:
             status_message="검토 결과 게시 전 대기",
         )
 
-    def mark_review_posted(self, task_id: str) -> HpaChangeJob:
-        return self.transition(
-            task_id,
-            HpaChangeStatus.REVIEW_POSTED,
-            status_message="Slack 검토 결과 게시 완료, 구현 dispatch 준비 중",
-        )
-
     def claim_implementation_dispatch(
         self,
         task_id: str,
@@ -1145,26 +1093,6 @@ class HpaChangeJobStore:
             HpaChangeStatus.CANCELED,
             status_message=message,
         )
-
-    def mark_notified(self, task_id: str, status: str | HpaChangePollState) -> HpaChangeJob:
-        normalized_status = str(
-            status.value if isinstance(status, HpaChangePollState) else status
-        ).strip()
-        if normalized_status not in {item.value for item in HpaChangePollState}:
-            raise ValueError("알림 완료 상태가 올바르지 않아")
-        now_text = _datetime_to_text(_coerce_utc(self._clock()))
-        with self._lock:
-            cursor = self._connection.execute(
-                """
-                UPDATE hpa_change_jobs
-                SET notified_status = ?, updated_at = ?
-                WHERE task_id = ?
-                """,
-                (normalized_status, now_text, str(task_id or "").strip()),
-            )
-            if int(cursor.rowcount or 0) != 1:
-                raise KeyError(f"HPA 변경 작업을 찾지 못했어: {task_id}")
-        return self.get_job(task_id)
 
     def mark_delivery_notified(
         self,
@@ -1583,31 +1511,18 @@ class GitHubCoordinatorConfig:
 
 
 @dataclass(frozen=True)
-class GitHubDispatchReceipt:
-    task_id: str
-    event_type: str
-    dispatched_at: datetime
-
-
-@dataclass(frozen=True)
 class GitHubWorkflowRun:
     run_id: int
     status: str
     conclusion: str
     html_url: str
-    display_title: str
-    run_attempt: int
     created_at: datetime | None
-    updated_at: datetime | None
 
 
 @dataclass(frozen=True)
 class GitHubArtifactArchive:
     artifact_id: int
-    workflow_run_id: int
     name: str
-    size_in_bytes: int
-    sha256: str
     content: bytes = field(repr=False)
 
 
@@ -1620,17 +1535,15 @@ class GitHubCoordinatorClient:
         token_provider: GitHubTokenProvider,
         *,
         session: Any | None = None,
-        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
         self._token_provider = token_provider
         self._session = session or requests.Session()
-        self._clock = clock
 
     def dispatch_job(
         self,
         job: HpaChangeJob,
-    ) -> GitHubDispatchReceipt:
+    ) -> None:
         if not _TASK_ID_PATTERN.fullmatch(job.task_id):
             raise ValueError("dispatch할 HPA task id 형식이 올바르지 않아")
 
@@ -1665,18 +1578,13 @@ class GitHubCoordinatorClient:
             expected_statuses={204},
             json_body=body,
         )
-        return GitHubDispatchReceipt(
-            task_id=job.task_id,
-            event_type=self.config.event_type,
-            dispatched_at=_coerce_utc(self._clock()),
-        )
 
     def dispatch_implementation(
         self,
         job: HpaChangeJob,
         *,
         review_run_id: int,
-    ) -> GitHubDispatchReceipt:
+    ) -> None:
         """Slack에 검토 결과를 게시한 뒤에만 구현 workflow를 시작한다."""
 
         if not _TASK_ID_PATTERN.fullmatch(job.task_id):
@@ -1703,11 +1611,6 @@ class GitHubCoordinatorClient:
             f"/{self.config.repository_path}/dispatches",
             expected_statuses={204},
             json_body=body,
-        )
-        return GitHubDispatchReceipt(
-            task_id=job.task_id,
-            event_type=self.config.implementation_event_type,
-            dispatched_at=_coerce_utc(self._clock()),
         )
 
     def find_workflow_run(
@@ -1835,10 +1738,7 @@ class GitHubCoordinatorClient:
             raise GitHubArtifactError("GitHub result artifact가 올바른 ZIP 파일이 아니야")
         return GitHubArtifactArchive(
             artifact_id=artifact_id,
-            workflow_run_id=int(run_id),
             name=expected_artifact_name,
-            size_in_bytes=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
             content=content,
         )
 
@@ -1953,10 +1853,7 @@ class GitHubCoordinatorClient:
             status=str(data.get("status") or "").strip().lower(),
             conclusion=str(data.get("conclusion") or "").strip().lower(),
             html_url=redact_sensitive_text(str(data.get("html_url") or "").strip()),
-            display_title=str(data.get("display_title") or "").strip(),
-            run_attempt=max(1, int(data.get("run_attempt") or 1)),
             created_at=parse_optional_datetime(data.get("created_at")),
-            updated_at=parse_optional_datetime(data.get("updated_at")),
         )
 
 
@@ -1970,9 +1867,6 @@ class HpaChangeWorkflowService:
     ) -> None:
         self.store = store
         self.github = github
-
-    def register_request(self, **kwargs: Any) -> HpaChangeJobRegistration:
-        return self.store.register_job(**kwargs)
 
     def submit(self, request: HpaChangeRequest) -> tuple[HpaChangeJob, bool]:
         """Slack 재전송은 기존 job을 돌려주고, 최초 요청만 coordinator에 전달한다."""
@@ -2414,9 +2308,7 @@ class HpaChangeWorkflowService:
             task_id=job.task_id,
             state=state,
             job=job,
-            run_url=job.workflow_run_url,
             result=job.result,
-            message=job.error_message or job.status_message,
             pr_urls=job.pr_urls,
         )
 
@@ -2430,7 +2322,6 @@ __all__ = [
     "GitHubArtifactNotReady",
     "GitHubCoordinatorClient",
     "GitHubCoordinatorConfig",
-    "GitHubDispatchReceipt",
     "GitHubTokenProvider",
     "GitHubWorkflowRun",
     "HpaChangeJob",

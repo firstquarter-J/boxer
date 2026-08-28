@@ -1,6 +1,6 @@
 from typing import Any, Callable
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
 
 
@@ -18,31 +18,6 @@ _DEVICE_VOICE_TYPES = {
     "기존 귀여운 음성": "ln",
     "기존 진지한 음성": "ls",
 }
-_DEVICE_VOICE_CHANGE_HINTS = (
-    "바꿔",
-    "바꾸",
-    "변경해",
-    "변경하",
-    "설정해",
-    "설정하",
-    "적용해",
-    "적용하",
-    "전환해",
-    "전환하",
-)
-_DEVICE_VOICE_CATALOG_HINTS = (
-    "음성 세트 목록",
-    "음성세트 목록",
-    "음성 목록",
-    "음성목록",
-    "음성 세트 종류",
-    "음성세트 종류",
-    "음성 종류",
-    "지원 음성",
-    "음성 선택지",
-    "음성 스캔 명령",
-    "음성 명령어",
-)
 
 
 def _device_voice_labels() -> tuple[str, ...]:
@@ -56,16 +31,6 @@ def _extract_device_voice_label(question: str) -> str | None:
         if label in text:
             return label
     return None
-
-
-def _is_device_voice_change_request(question: str) -> bool:
-    text = " ".join(str(question or "").split())
-    return "음성" in text and any(hint in text for hint in _DEVICE_VOICE_CHANGE_HINTS)
-
-
-def _is_device_voice_catalog_request(question: str) -> bool:
-    text = " ".join(str(question or "").split())
-    return any(hint in text for hint in _DEVICE_VOICE_CATALOG_HINTS)
 
 
 def _build_device_voice_catalog_message() -> str:

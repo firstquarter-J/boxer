@@ -1,6 +1,6 @@
 import unittest
 
-from boxer_company.routers.barcode_log import (
+from boxer_company.read_routing import (
     _extract_device_name_scope,
     _extract_device_status_filter,
     _extract_leading_hospital_scope,
@@ -63,7 +63,6 @@ class DeviceQueryRoutingTests(unittest.TestCase):
         self.assertFalse(
             _is_recordings_filter_query_request(
                 question,
-                barcode=None,
                 target_date=None,
                 target_year=None,
                 hospital_name=hospital_name,

@@ -14,7 +14,7 @@ class SlackPublicApiTests(unittest.TestCase):
         )
 
     def test_public_request_log_route_setter_updates_payload(self) -> None:
-        payload = {"request_log": {}}
+        payload = {}
 
         boxer_adapter_slack.set_request_log_route(
             payload,
@@ -26,6 +26,7 @@ class SlackPublicApiTests(unittest.TestCase):
         self.assertEqual(payload["request_log"]["route_name"], "example_default")
         self.assertEqual(payload["request_log"]["route_mode"], "faq")
         self.assertEqual(payload["request_log"]["status"], "handled")
+        self.assertNotIn("request_audit", payload)
 
 
 if __name__ == "__main__":

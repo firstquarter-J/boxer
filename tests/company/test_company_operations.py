@@ -7,14 +7,16 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
 )
 from boxer_company.assistant.operations import (
-    as_operations_request,
     build_company_operation_routes,
-    company_operation_legacy_stage,
     company_operation_route_names,
-    is_mutation_capable_company_operation,
     is_uncertain_company_mutation_result,
-    match_company_operation_route,
     match_live_device_company_operation_route,
+    match_mutation_capable_company_operation_route,
+)
+from boxer_company.operation_routing import (
+    as_operations_request,
+    company_operation_legacy_stage,
+    match_company_operation_route,
 )
 from boxer_company.assistant.device_operations_route import (
     DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
@@ -202,7 +204,7 @@ def test_device_delivery_receipt_precedes_natural_language_routes() -> None:
         == DEVICE_OPERATION_DELIVERY_ACTION
     )
     assert company_operation_legacy_stage(request) == "device"
-    assert is_mutation_capable_company_operation(request)
+    assert match_mutation_capable_company_operation_route(request)
     assert (
         match_live_device_company_operation_route(request)
         == DEVICE_OPERATION_DELIVERY_ACTION
@@ -369,7 +371,7 @@ def test_explicit_mutation_commands_keep_their_operation_routes() -> None:
     }
     for question, route in expected.items():
         assert match_company_operation_route(_request(question)) == route
-        assert is_mutation_capable_company_operation(_request(question))
+        assert match_mutation_capable_company_operation_route(_request(question))
 
 
 def test_read_only_operations_do_not_enter_mutation_guard() -> None:
@@ -384,7 +386,7 @@ def test_read_only_operations_do_not_enter_mutation_guard() -> None:
     for question in questions:
         request = _request(question)
         assert match_company_operation_route(request) is not None
-        assert not is_mutation_capable_company_operation(request)
+        assert not match_mutation_capable_company_operation_route(request)
 
 
 def test_live_device_gate_excludes_private_and_file_id_only_reads() -> None:
@@ -423,7 +425,7 @@ def test_live_device_reads_that_can_open_ssh_enter_mutation_guard() -> None:
     for question, route in expected.items():
         request = _request(question)
         assert match_company_operation_route(request) == route
-        assert is_mutation_capable_company_operation(request)
+        assert match_mutation_capable_company_operation_route(request)
 
     followup = _request(
         "최근 종료 원인",
@@ -440,7 +442,7 @@ def test_live_device_reads_that_can_open_ssh_enter_mutation_guard() -> None:
         match_company_operation_route(followup)
         == "device_diagnostic_followup"
     )
-    assert is_mutation_capable_company_operation(followup)
+    assert match_mutation_capable_company_operation_route(followup)
 
 
 def test_only_ambiguous_failed_mutation_results_stay_uncertain() -> None:

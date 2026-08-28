@@ -10,7 +10,7 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
-from boxer_company.assistant.private_admin_routes import (
+from boxer_company.operation_routing import (
     ADMIN_READONLY_SQL_ROUTE,
     ADMIN_REQUEST_LOG_ROUTE,
     ADMIN_S3_DEVICE_LOG_ROUTE,
@@ -20,6 +20,9 @@ from boxer_company.assistant.private_admin_routes import (
     BARCODE_PINK_CLASSIFICATION_ROUTE,
     BARCODE_VALIDATION_STATUS_ROUTE,
     RECORDING_STREAMING_RESTORE_ROUTE,
+    match_private_operations_route,
+)
+from boxer_company.assistant.private_admin_routes import (
     AdminReadonlySqlAssistantRoute,
     AdminRequestLogAssistantRoute,
     AdminS3DeviceLogAssistantRoute,
@@ -31,7 +34,6 @@ from boxer_company.assistant.private_admin_routes import (
     PrivateOperationsRouteDeps,
     RecordingStreamingRestoreAssistantRoute,
     build_private_operations_routes,
-    match_private_operations_route,
 )
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
@@ -78,8 +80,6 @@ def _assert_private_result(
     testcase.assertEqual(result.messages[0].format, "commonmark")
     testcase.assertEqual(result.sources, ())
     testcase.assertFalse(result.used_llm)
-    testcase.assertIsNone(result.suggested_action)
-    testcase.assertIsNone(result.async_job)
 
 
 class PrivateOperationsMatcherTests(unittest.TestCase):

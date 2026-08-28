@@ -16,18 +16,12 @@ from boxer_company.automation import (
 from boxer_company.device_health_monitor_cycle import (
     DeviceHealthMonitorCycleDeps,
     acknowledge_device_health_monitor_deliveries,
-    build_device_health_monitor_seed_cursor,
+    build_clean_device_health_monitor_cursor,
     device_health_monitor_cursor_digest,
     run_device_health_monitor_cycle,
     update_device_health_monitor_alert_delivery_override,
 )
 from boxer_company.redis_device_state import DeviceStateRedisUnavailable
-from boxer_company_adapter_slack.daily_device_round_reporter import (
-    _collect_daily_device_round_abnormal_alert_items,
-)
-from boxer_company_adapter_slack.device_health_monitor_reporter import (
-    _build_device_health_monitor_alert_fingerprint,
-)
 
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -39,15 +33,15 @@ def _seed_cursor(
     enabled: bool = True,
     alerts: Mapping[str, Any] | None = None,
     pending: Mapping[str, Any] | None = None,
-    pending_decision: str = "preserve",
 ) -> dict[str, Any]:
-    return build_device_health_monitor_seed_cursor(
-        legacy_alert_delivery_enabled=enabled,
-        alert_fingerprints=alerts or {},
-        pending_alert_fingerprints=pending or {},
-        pending_decision=pending_decision,
+    cursor = build_clean_device_health_monitor_cursor(
+        alert_delivery_enabled=enabled,
         seeded_at=_NOW - timedelta(minutes=5),
     )
+    # 런타임 회귀 fixture만 이전 cycle에서 이어진 유효 fingerprint를 주입한다.
+    cursor["alertFingerprints"] = dict(alerts or {})
+    cursor["pendingAlertFingerprints"] = dict(pending or {})
+    return cursor
 
 
 def _device() -> dict[str, Any]:
@@ -110,28 +104,6 @@ def _verified_abnormal(
         "sshReady": True,
         "sshReason": "ready",
     }
-
-
-def test_api_and_legacy_collectors_share_canonical_hospital_fingerprint() -> None:
-    device = _device()
-    result = dict(_verified_abnormal(device, _NOW))
-    # production SSH verifier가 collector 전에 적용하는 동일 issue 요약을
-    # 재현해 실제 API/legacy 생성 경계의 key parity를 비교한다.
-    result["issue"] = cycle._build_daily_device_round_issue_summary(result)
-    api_item = cycle._collect_alert_items((result,))[0]
-    legacy_item = _collect_daily_device_round_abnormal_alert_items(
-        {
-            "hospitalSeq": device["hospitalSeq"],
-            "hospitalName": device["hospitalName"],
-            "deviceResults": [result],
-        }
-    )[0]
-
-    assert api_item["hospital"] == "#20 테스트병원"
-    assert legacy_item["hospital"] == "#20 테스트병원"
-    assert cycle._alert_fingerprint(api_item) == (
-        _build_device_health_monitor_alert_fingerprint(legacy_item)
-    )
 
 
 @pytest.mark.parametrize(

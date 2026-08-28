@@ -1,23 +1,4 @@
-import re
-
 _PUBLIC_EXAMPLE_BARCODE = "12345678910"
-
-_USAGE_HELP_PATTERN = re.compile(
-    r"^(?:사용법|사용 방법|도움말|help|헬프|명령어(?:\s*목록)?)\s*(?:알려줘|보여줘|안내해줘)?$",
-    re.IGNORECASE,
-)
-
-
-def _normalize_usage_help_question(question: str) -> str:
-    normalized = " ".join(str(question or "").strip().split())
-    return normalized.rstrip("!?.")
-
-
-def _is_usage_help_request(question: str) -> bool:
-    normalized = _normalize_usage_help_question(question)
-    if not normalized:
-        return False
-    return bool(_USAGE_HELP_PATTERN.fullmatch(normalized))
 
 
 def _build_usage_help_response() -> str:

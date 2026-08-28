@@ -2,9 +2,11 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
-from boxer_company.routers.barcode_validation import (
+from boxer_company.operation_routing import (
     _is_barcode_pink_classification_reason_request,
     _is_barcode_validation_status_request,
+)
+from boxer_company.routers.barcode_validation import (
     _query_barcode_pink_classification_reason,
     _query_barcode_validation_status,
 )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -9,9 +8,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from boxer.retrieval import KnowledgeDocument, KnowledgeSearchResult
-
-_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[가-힣]+")
+from boxer.retrieval import (
+    KnowledgeDocument,
+    KnowledgeSearchResult,
+    normalize_knowledge_text,
+    score_knowledge_document,
+    tokenize_knowledge_text,
+)
 
 
 class WebChatStore:
@@ -609,7 +612,7 @@ class WebChatStore:
         return int((row or {}).get("count") or 0)
 
     def search_knowledge_documents(self, query: str, *, limit: int = 5) -> list[KnowledgeSearchResult]:
-        tokens = _tokenize_search_text(query)
+        tokens = tokenize_knowledge_text(query)
         if not tokens:
             return []
 
@@ -627,7 +630,8 @@ class WebChatStore:
                 source_uri=row["source_uri"],
                 metadata=_decode_json_object(row.get("metadata_json"), default={}),
             )
-            score = _score_knowledge_document(document, query=query, tokens=tokens)
+            # 후보 수집 방식이 달라도 공개 knowledge source와 동일한 scorer로 최종 순서를 정한다.
+            score = score_knowledge_document(document, query=query, tokens=tokens)
             if score <= 0:
                 continue
             results.append(
@@ -647,8 +651,10 @@ class WebChatStore:
         limit: int,
     ) -> list[dict[str, Any]]:
         rows_by_id: dict[str, dict[str, Any]] = {}
-        normalized_query = _normalize_search_text(query)
-        ascii_tokens = [token for token in tokens if re.search(r"[a-z0-9_]", token)]
+        # 후보 수집도 공통 scorer와 같은 정규화/tokenizer 계약을 사용해
+        # source별 대소문자·공백 처리 차이로 결과가 누락되지 않게 한다.
+        normalized_query = normalize_knowledge_text(query)
+        ascii_tokens = [token for token in tokens if token.isascii()]
 
         if ascii_tokens:
             match_query = " OR ".join(ascii_tokens)
@@ -858,41 +864,3 @@ def _nullable_strip(value: Any) -> str | None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _tokenize_search_text(text: str) -> list[str]:
-    seen: set[str] = set()
-    tokens: list[str] = []
-    for token in _TOKEN_PATTERN.findall(_normalize_search_text(text)):
-        if token in seen:
-            continue
-        seen.add(token)
-        tokens.append(token)
-    return tokens
-
-
-def _normalize_search_text(text: str) -> str:
-    return str(text or "").strip().lower()
-
-
-def _score_knowledge_document(document: KnowledgeDocument, *, query: str, tokens: list[str]) -> float:
-    query_tokens = set(tokens)
-    if not query_tokens:
-        return 0.0
-
-    normalized_query = _normalize_search_text(query)
-    normalized_title = _normalize_search_text(document.title)
-    normalized_haystack = _normalize_search_text(f"{document.title}\n{document.content}")
-    haystack_tokens = set(_tokenize_search_text(normalized_haystack))
-    matched_tokens = query_tokens & haystack_tokens
-    matched_substrings = {token for token in query_tokens if token in normalized_haystack}
-    if not matched_tokens and not matched_substrings:
-        return 0.0
-
-    # alpha 단계에서는 BM25보다 재현 가능한 overlap 점수가 문서 후보를 안정적으로 고르기 쉽다.
-    matched = matched_tokens | matched_substrings
-    coverage_score = len(matched) / max(1, len(query_tokens))
-    density_score = len(matched) / max(1.0, len(haystack_tokens) ** 0.5)
-    phrase_bonus = 0.25 if normalized_query and normalized_query in normalized_haystack else 0.0
-    title_bonus = 0.15 if any(token in normalized_title for token in query_tokens) else 0.0
-    return round(coverage_score + density_score + phrase_bonus + title_bonus, 4)

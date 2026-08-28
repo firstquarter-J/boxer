@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import pymysql
 try:
     import paramiko
 except ImportError:  # pragma: no cover - runtime guard
@@ -12,8 +11,9 @@ except ImportError:  # pragma: no cover - runtime guard
 
 from boxer_company import settings as cs
 from boxer.core import settings as s
-from boxer.core.utils import _display_value, _format_datetime, _truncate_text
+from boxer.core.utils import _truncate_text
 from boxer.retrieval.connectors.db import _create_db_connection
+from boxer_company.utils import _display_value, _format_datetime
 from boxer_company.routers.mda_graphql import (
     _get_mda_devices_details,
     _is_mda_graphql_configured,
@@ -549,7 +549,7 @@ def _query_recordings_list_by_barcode(
     if has_more:
         lines.append(f"• 참고: 최근 `{limit}개`만 표시했고 이전 영상은 생략했어")
 
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_baby_ai_list_by_barcode(barcode: str, target_date: str | None = None) -> str:
@@ -672,7 +672,7 @@ def _query_baby_ai_list_by_barcode(barcode: str, target_date: str | None = None)
     if has_more:
         lines.append(f"• 참고: 최근 `{limit}개`만 표시했고 이전 베이비매직은 생략했어")
 
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_recordings_detail_by_barcode(
@@ -728,7 +728,7 @@ def _query_recordings_detail_by_barcode(
     if has_more:
         lines.append(f"• 참고: 최근 `{limit}개`만 표시했고 이전 영상은 생략했어")
 
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_recordings_length_by_barcode(
@@ -779,7 +779,7 @@ def _query_recordings_length_by_barcode(
     if has_more:
         lines.append(f"• 참고: 최근 `{limit}개`만 표시했고 이전 영상은 생략했어")
 
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _load_recordings_timeline_summary_by_barcode(
@@ -1054,7 +1054,7 @@ def _query_all_recorded_dates_by_barcode(
             f"• 참고: 최근 `{limit}개` 컨텍스트 기준 집계라 이전 녹화 날짜가 더 있을 수 있어"
         )
 
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _format_barcode_label(value: object) -> str:
@@ -1062,130 +1062,6 @@ def _format_barcode_label(value: object) -> str:
         return f"{int(value):011d}"
     except (TypeError, ValueError):
         return _display_value(value, default="미확인")
-
-
-def _query_ultrasound_captures(
-    *,
-    barcode: str | None = None,
-    target_date: str | None = None,
-    hospital_seq: int | None = None,
-    hospital_room_seq: int | None = None,
-    count_only: bool = False,
-) -> str:
-    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
-        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
-
-    normalized_barcode = str(barcode or "").strip() or None
-    if hospital_seq is not None:
-        hospital_seq = int(hospital_seq)
-    if hospital_room_seq is not None:
-        hospital_room_seq = int(hospital_room_seq)
-
-    if not any((normalized_barcode, target_date, hospital_seq is not None, hospital_room_seq is not None)):
-        raise ValueError("캡처 조회는 barcode, 날짜, hospitalSeq, hospitalRoomSeq 중 최소 1개 조건이 필요해")
-
-    where_clauses: list[str] = []
-    params: list[object] = []
-    if normalized_barcode:
-        where_clauses.append("uc.barcode = %s")
-        params.append(int(normalized_barcode))
-    if target_date:
-        utc_start, utc_end = _local_date_to_utc_range(target_date)
-        where_clauses.append("uc.capturedAt >= %s")
-        where_clauses.append("uc.capturedAt < %s")
-        params.extend([utc_start, utc_end])
-    if hospital_seq is not None:
-        where_clauses.append("uc.hospitalSeq = %s")
-        params.append(hospital_seq)
-    if hospital_room_seq is not None:
-        where_clauses.append("uc.hospitalRoomSeq = %s")
-        params.append(hospital_room_seq)
-
-    where_sql = " AND ".join(where_clauses) if where_clauses else "1 = 1"
-    limit = max(1, min(100, cs.RECORDINGS_CONTEXT_LIMIT))
-
-    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT COUNT(*) AS captureCount "
-                "FROM ultrasound_captures uc "
-                f"WHERE {where_sql}",
-                tuple(params),
-            )
-            summary = cursor.fetchone() or {}
-            total_count = int(summary.get("captureCount") or 0)
-
-            rows: list[dict[str, Any]] = []
-            if not count_only and total_count > 0:
-                cursor.execute(
-                    "SELECT "
-                    "uc.seq, "
-                    "uc.barcode, "
-                    "uc.fileId, "
-                    "uc.hospitalSeq, "
-                    "uc.hospitalRoomSeq, "
-                    "uc.deviceSeq, "
-                    "uc.s3Bucket, "
-                    "uc.s3FileKey, "
-                    "uc.studyInstanceUid, "
-                    "uc.capturedAt, "
-                    "uc.createdAt, "
-                    "h.hospitalName AS hospitalName, "
-                    "hr.roomName AS roomName "
-                    "FROM ultrasound_captures uc "
-                    "LEFT JOIN hospitals h ON uc.hospitalSeq = h.seq "
-                    "LEFT JOIN hospital_rooms hr ON uc.hospitalRoomSeq = hr.seq "
-                    f"WHERE {where_sql} "
-                    "ORDER BY uc.capturedAt DESC, uc.seq DESC "
-                    "LIMIT %s",
-                    tuple([*params, limit]),
-                )
-                rows = cursor.fetchall() or []
-    finally:
-        connection.close()
-
-    title = "*초음파 캡처 조회 결과*"
-    lines = [title]
-    if normalized_barcode:
-        lines.append(f"• 바코드: `{normalized_barcode}`")
-    if target_date:
-        lines.append(f"• 날짜(KST): `{target_date}`")
-    if hospital_seq is not None:
-        lines.append(f"• hospitalSeq: `{hospital_seq}`")
-    if hospital_room_seq is not None:
-        lines.append(f"• hospitalRoomSeq: `{hospital_room_seq}`")
-    lines.append(f"• ultrasound_captures row 수: *{total_count}개*")
-
-    if count_only:
-        return "\n".join(lines)
-
-    if total_count <= 0:
-        lines.append("• 결과: 조건에 맞는 캡처 기록이 없어")
-        return "\n".join(lines)
-
-    lines.append("• 캡처 목록(최근순):")
-    for index, row in enumerate(rows, start=1):
-        lines.extend(
-            [
-                f"- {index}.",
-                f"  barcode: `{_format_barcode_label(row.get('barcode'))}`",
-                f"  capturedAt(KST): `{_format_recorded_at_local(row.get('capturedAt'))}`",
-                f"  fileId: `{_display_value(row.get('fileId'), default='미확인')}`",
-                f"  hospitalSeq: `{_display_value(row.get('hospitalSeq'), default='미확인')}`",
-                f"  hospitalRoomSeq: `{_display_value(row.get('hospitalRoomSeq'), default='미확인')}`",
-                f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
-                f"  병실: `{_display_value(row.get('roomName'), default='미확인')}`",
-                f"  s3FileKey: `{_display_value(row.get('s3FileKey'), default='미확인')}`",
-                "",
-            ]
-        )
-
-    if lines and lines[-1] == "":
-        lines.pop()
-    if total_count > len(rows):
-        lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 캡처는 생략했어")
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_recordings_by_filters(
@@ -1361,7 +1237,7 @@ def _query_recordings_by_filters(
         lines.pop()
     if total_count > len(rows):
         lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 영상은 생략했어")
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_ultrasound_captures_by_filters(
@@ -1530,7 +1406,7 @@ def _query_ultrasound_captures_by_filters(
         lines.pop()
     if total_count > len(rows):
         lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 캡처는 생략했어")
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_hospitals_by_filters(
@@ -1671,7 +1547,7 @@ def _query_hospitals_by_filters(
         lines.pop()
     if total_count > len(rows):
         lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 병원은 생략했어")
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_hospital_rooms_by_filters(
@@ -1794,7 +1670,7 @@ def _query_hospital_rooms_by_filters(
         lines.pop()
     if total_count > len(rows):
         lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 병실은 생략했어")
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _query_devices_by_filters(
@@ -1996,7 +1872,7 @@ def _query_devices_by_filters(
             else None
         )
         lines.extend(_build_device_detail_lines(rows[0], line_prefix="• ", ssh_status=ssh_status))
-        return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+        return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
     lines.extend(summary_lines)
     lines.append("• 장비 목록(최신 seq순):")
@@ -2009,7 +1885,7 @@ def _query_devices_by_filters(
         lines.pop()
     if total_count > len(rows):
         lines.append(f"• 참고: 최근 `{len(rows)}개`만 표시했고 이전 장비는 생략했어")
-    return _truncate_text("\n".join(lines), max(1, s.DB_QUERY_MAX_RESULT_CHARS))
+    return _truncate_text("\n".join(lines), max(1, cs.DB_QUERY_MAX_RESULT_CHARS))
 
 
 def _lookup_device_contexts_by_barcode(
@@ -2026,53 +1902,6 @@ def _lookup_device_contexts_by_barcode_on_date(
 ) -> list[dict[str, Any]]:
     recording_rows = _load_recordings_rows_on_date_by_barcode(barcode, target_date)
     return _lookup_device_contexts_from_recording_rows(recording_rows)
-
-
-def _lookup_device_contexts_by_device_names(
-    device_names: list[str] | tuple[str, ...] | set[str],
-) -> list[dict[str, Any]]:
-    if not s.DB_HOST or not s.DB_USERNAME or not s.DB_PASSWORD or not s.DB_DATABASE:
-        raise RuntimeError("DB 접속 정보(DB_*)가 비어 있어")
-
-    ordered_names: list[str] = []
-    seen_names: set[str] = set()
-    for raw_name in device_names:
-        normalized_name = str(raw_name or "").strip()
-        if not normalized_name or normalized_name in seen_names:
-            continue
-        seen_names.add(normalized_name)
-        ordered_names.append(normalized_name)
-    if not ordered_names:
-        return []
-
-    placeholders = ", ".join(["%s"] * len(ordered_names))
-    connection = _create_db_connection(s.DB_QUERY_TIMEOUT_SEC)
-    try:
-        with connection.cursor() as cursor:
-            # 로그 키에서 찾은 장비명을 DB 메타와 다시 결합해서 병원/병실 근거를 함께 보여준다.
-            cursor.execute(
-                "SELECT "
-                "d.seq AS deviceSeq, "
-                "d.deviceName AS deviceName, "
-                "d.hospitalSeq AS hospitalSeq, "
-                "d.hospitalRoomSeq AS hospitalRoomSeq, "
-                "h.hospitalName AS hospitalName, "
-                "hr.roomName AS roomName "
-                "FROM devices d "
-                "LEFT JOIN hospitals h ON d.hospitalSeq = h.seq "
-                "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
-                f"WHERE d.deviceName IN ({placeholders})",
-                tuple(ordered_names),
-            )
-            rows = cursor.fetchall() or []
-    finally:
-        connection.close()
-
-    order_map = {name: index for index, name in enumerate(ordered_names)}
-    return sorted(
-        rows,
-        key=lambda row: order_map.get(str(row.get("deviceName") or "").strip(), len(order_map)),
-    )
 
 
 def _lookup_device_contexts_from_recording_rows(
@@ -2288,17 +2117,6 @@ def _lookup_device_contexts_by_hospital_room_seqs(
         connection.close()
 
     return items
-
-
-def _lookup_device_names_by_barcode(
-    barcode: str,
-    recordings_context: dict[str, Any] | None = None,
-) -> list[str]:
-    items = _lookup_device_contexts_by_barcode(
-        barcode,
-        recordings_context=recordings_context,
-    )
-    return [str(item.get("deviceName")) for item in items if item.get("deviceName")]
 
 
 def _lookup_device_contexts_by_hospital_room(

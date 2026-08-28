@@ -6,7 +6,7 @@ from typing import Any, Callable
 from urllib import error, request
 
 from boxer_company import settings as cs
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company.routers.device_ssh_security import (
     _company_api_device_ssh_open_attempted,
     _is_company_api_device_ssh_context,
@@ -55,16 +55,6 @@ mutation SendCommand($deviceName: String!, $command: String!, $acme: JSON) {
 _UPDATE_BOX_MUTATION = """
 mutation UpdateBox($deviceName: String!, $version: String!, $silent: Boolean!) {
   updateBox(deviceName: $deviceName, version: $version, silent: $silent) {
-    affected
-    status
-    message
-  }
-}
-"""
-
-_UPDATE_AGENT_MUTATION = """
-mutation UpdateAgent($deviceName: String!, $force: Boolean!) {
-  updateAgent(deviceName: $deviceName, force: $force) {
     affected
     status
     message
@@ -554,15 +544,6 @@ def _get_mda_devices_details(device_names: list[str]) -> dict[str, dict[str, Any
     return details
 
 
-def _get_mda_device_versions(device_names: list[str]) -> dict[str, str]:
-    versions: dict[str, str] = {}
-    for normalized_name, detail in _get_mda_devices_details(device_names).items():
-        version = str((detail or {}).get("version") or "").strip()
-        if version:
-            versions[normalized_name] = version
-    return versions
-
-
 def _lookup_mda_special_barcodes_by_barcode(barcode: str) -> list[dict[str, Any]]:
     normalized_barcode = str(barcode or "").strip()
     if not normalized_barcode:
@@ -728,35 +709,6 @@ def _open_mda_device_ssh(
     }
 
 
-def _close_mda_device_ssh(
-    device_name: str,
-    *,
-    host: str | None = None,
-) -> dict[str, Any]:
-    actual_host = (host or cs.MDA_SSH_OPEN_HOST).strip()
-    if not actual_host:
-        raise RuntimeError("MDA_SSH_OPEN_HOST가 비어 있어")
-
-    data = _execute_mda_graphql_mutation(
-        _SSH_ORDER_MUTATION,
-        {
-            "deviceName": device_name,
-            "action": "close",
-            "host": actual_host,
-        },
-        before_request=_mark_company_api_mutation_attempted,
-    )
-    result = data.get("sshOrder")
-    if not isinstance(result, dict):
-        raise RuntimeError("sshOrder 응답 형식이 올바르지 않아")
-    return {
-        "affected": _display_value(result.get("affected"), default=""),
-        "status": _display_value(result.get("status"), default=""),
-        "message": _display_value(result.get("message"), default=""),
-        "host": actual_host,
-    }
-
-
 def _update_mda_device_box(
     device_name: str,
     *,
@@ -775,29 +727,6 @@ def _update_mda_device_box(
     result = data.get("updateBox")
     if not isinstance(result, dict):
         raise RuntimeError("updateBox 응답 형식이 올바르지 않아")
-    return {
-        "affected": result.get("affected"),
-        "status": bool(result.get("status")),
-        "message": _display_value(result.get("message"), default=""),
-    }
-
-
-def _update_mda_device_agent(
-    device_name: str,
-    *,
-    force: bool = False,
-) -> dict[str, Any]:
-    data = _execute_mda_graphql_mutation(
-        _UPDATE_AGENT_MUTATION,
-        {
-            "deviceName": device_name,
-            "force": bool(force),
-        },
-        before_request=_mark_company_api_mutation_attempted,
-    )
-    result = data.get("updateAgent")
-    if not isinstance(result, dict):
-        raise RuntimeError("updateAgent 응답 형식이 올바르지 않아")
     return {
         "affected": result.get("affected"),
         "status": bool(result.get("status")),

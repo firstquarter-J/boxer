@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -32,53 +32,18 @@ _TRACEPARENT = (
 _QUESTION = "회사 노션에서 커머스 운영 기준 찾아줘"
 _SILENT_LOGGER = logging.getLogger(f"{__name__}.silent")
 _SILENT_LOGGER.disabled = True
-_REMOTE_MODE_ENV_KEYS = (
-    "BOXER_COMPANY_API_NOTION_MODE",
-    "BOXER_COMPANY_API_STRUCTURED_MODE",
-    "BOXER_COMPANY_API_DEVICE_MODE",
-    "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
-    "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
-    "BOXER_COMPANY_API_BARCODE_LOG_MODE",
-    "BOXER_COMPANY_API_BARCODE_MODE",
-    "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE",
-    "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE",
-    "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
-    "BOXER_COMPANY_API_FREEFORM_MODE",
-    "BOXER_COMPANY_API_PLAYBOOK_MODE",
-    "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
-    "BOXER_COMPANY_API_OPERATIONS_MODE",
-    "BOXER_COMPANY_API_AUTOMATION_MODE",
-)
-_REMOTE_FALLBACK_ENV_KEYS = tuple(
-    key.replace("_MODE", "_FALLBACK_ENABLED")
-    for key in _REMOTE_MODE_ENV_KEYS
-)
-_ALL_AUTOMATION_CYCLES = (
-    "weekly_recordings",
-    "daily_device_round",
-    "device_health_monitor",
-    "device_notification_alert",
-    "sms_delivery",
-)
-
-
 def _remote_loader_env(**overrides: str) -> dict[str, str]:
-    """production Slack entry가 요구하는 완전 remote env fixture다."""
+    """production Slack entry의 API transport env fixture다."""
 
     env = {
         "BOXER_COMPANY_API_BASE_URL": "http://10.40.102.50:8010",
         "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
         "BOXER_COMPANY_API_AUTOMATION_TENANT_ID": "lifex",
-        "BOXER_COMPANY_API_AUTOMATION_REMOTE_CYCLES": ",".join(
-            _ALL_AUTOMATION_CYCLES
-        ),
         "BOXER_COMPANY_AUTOMATION_DELIVERY_STATE_PATH": str(
             Path(__file__).resolve().with_name(
                 ".company-api-delivery-state.json"
             )
         ),
-        **{key: "remote" for key in _REMOTE_MODE_ENV_KEYS},
-        **{key: "false" for key in _REMOTE_FALLBACK_ENV_KEYS},
     }
     env.update(overrides)
     return env
@@ -157,8 +122,6 @@ def _settings(
         connect_timeout_sec=2.0,
         read_timeout_sec=90.0,
         max_retries=max_retries,
-        notion_mode="remote",
-        notion_fallback_enabled=True,
     )
 
 
@@ -241,8 +204,6 @@ def _success_payload(
         ],
         "usedLlm": True,
         "fallbackReason": None,
-        "suggestedAction": None,
-        "asyncJob": None,
     }
 
 
@@ -356,104 +317,41 @@ def _client(
 
 
 class CompanyApiClientSettingsTests(unittest.TestCase):
-    def test_transport_only_remote_requires_every_route_and_fallback(
-        self,
-    ) -> None:
-        # 새 rollout field가 추가돼도 완전 remote 판정에서 빠지지 않도록
-        # dataclass field 전체를 기준으로 경계를 고정한다.
-        base = CompanyApiClientSettings(
-            base_url="http://127.0.0.1:8010",
-            token=_TOKEN,
+    def test_runtime_settings_have_no_rollout_switches(self) -> None:
+        # 실행 경로가 remote-only라 과거 rollout 소유권 설정은 dataclass
+        # 표면과 startup validation 양쪽에 존재하지 않아야 한다.
+        field_names = set(CompanyApiClientSettings.__dataclass_fields__)
+
+        self.assertFalse(
+            any(name.endswith("_mode") for name in field_names)
         )
-        mode_fields = tuple(
-            item.name
-            for item in fields(base)
-            if item.name.endswith("_mode")
+        self.assertFalse(
+            any(name.endswith("_fallback_enabled") for name in field_names)
         )
-        fallback_fields = tuple(
-            item.name
-            for item in fields(base)
-            if item.name.endswith("_fallback_enabled")
-        )
-        remote = replace(
-            base,
-            **{name: "remote" for name in mode_fields},
-            **{name: False for name in fallback_fields},
-            automation_remote_cycles=(
-                "weekly_recordings",
-                "daily_device_round",
-                "device_health_monitor",
-                "device_notification_alert",
-                "sms_delivery",
-            ),
+        self.assertNotIn("automation_remote_cycles", field_names)
+
+    def test_remote_settings_load_transport_values(self) -> None:
+        settings = load_company_api_client_settings(_remote_loader_env())
+
+        self.assertEqual(settings.base_url, "http://10.40.102.50:8010")
+        self.assertEqual(settings.automation_tenant_id, "lifex")
+        self.assertNotIn(_TOKEN, repr(settings))
+
+    def test_removed_rollout_env_is_ignored(self) -> None:
+        settings = load_company_api_client_settings(
+            _remote_loader_env(
+                BOXER_COMPANY_API_NOTION_MODE="local",
+                BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED="true",
+                BOXER_COMPANY_API_AUTOMATION_REMOTE_CYCLES="unknown",
+            )
         )
 
-        self.assertTrue(remote.transport_only_remote)
-        for field_name in mode_fields:
-            for mode in ("local", "shadow"):
-                with self.subTest(field_name=field_name, mode=mode):
-                    changes: dict[str, Any] = {field_name: mode}
-                    if field_name == "operations_mode":
-                        # remote action cycle은 operations와 분리할 수
-                        # 없으므로 이 property 테스트에서만 함께 놓는다.
-                        changes["automation_remote_cycles"] = tuple(
-                            cycle
-                            for cycle in remote.automation_remote_cycles
-                            if cycle
-                            not in {
-                                "device_health_monitor",
-                                "device_notification_alert",
-                            }
-                        )
-                    self.assertFalse(
-                        replace(
-                            remote,
-                            **changes,
-                        ).transport_only_remote
-                    )
-        for field_name in fallback_fields:
-            with self.subTest(field_name=field_name):
-                self.assertFalse(
-                    replace(
-                        remote,
-                        **{field_name: True},
-                    ).transport_only_remote
-                )
+        # 물리적으로 local handler가 없으므로 구 env는 동작을 바꾸지 않는다.
+        self.assertEqual(settings.base_url, "http://10.40.102.50:8010")
 
-    def test_missing_or_local_configuration_has_no_rollback_path(self) -> None:
-        for env in (
-            {},
-            _remote_loader_env(BOXER_COMPANY_API_NOTION_MODE="local"),
-            _remote_loader_env(BOXER_COMPANY_API_NOTION_MODE="shadow"),
-        ):
-            with self.subTest(env_keys=sorted(env)):
-                with self.assertRaisesRegex(
-                    CompanyApiContractError,
-                    "company_api_transport_only_remote_required",
-                ):
-                    load_company_api_client_settings(env)
-
-    def test_stale_credentials_cannot_reenable_local_rollback(self) -> None:
-        env = _remote_loader_env(
-            BOXER_COMPANY_API_NOTION_MODE="local",
-            BOXER_COMPANY_API_BASE_URL="http://public.example.com",
-            BOXER_COMPANY_API_SERVICE_TOKEN="stale-invalid-token",
-        )
-
-        with self.assertRaisesRegex(
-            CompanyApiContractError,
-            "company_api_transport_only_remote_required",
-        ):
-            load_company_api_client_settings(env)
-
-    def test_manual_remote_settings_cannot_bypass_transport_validation(
-        self,
-    ) -> None:
+    def test_manual_settings_validate_only_remote_transport_values(self) -> None:
         invalid_settings = (
-            replace(
-                _settings(),
-                base_url="http://public.example.com",
-            ),
+            replace(_settings(), base_url="http://public.example.com"),
             replace(_settings(), token="short"),
             replace(_settings(), read_timeout_sec=float("nan")),
             replace(
@@ -461,34 +359,6 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                 operations_read_timeout_sec=float("nan"),
             ),
             replace(_settings(), max_retries=3),
-            replace(_settings(), structured_mode="invalid"),
-            replace(_settings(), structured_fallback_enabled="true"),
-            replace(_settings(), device_detail_mode="invalid"),
-            replace(
-                _settings(),
-                device_detail_fallback_enabled="true",
-            ),
-            replace(_settings(), weekly_summary_mode="invalid"),
-            replace(
-                _settings(),
-                weekly_summary_fallback_enabled="true",
-            ),
-            replace(_settings(), barcode_freeform_mode="invalid"),
-            replace(
-                _settings(),
-                barcode_freeform_fallback_enabled="true",
-            ),
-            replace(_settings(), freeform_mode="invalid"),
-            replace(
-                _settings(),
-                freeform_fallback_enabled="true",
-            ),
-            replace(_settings(), operations_mode="shadow"),
-            replace(
-                _settings(),
-                operations_mode="remote",
-                operations_fallback_enabled=True,
-            ),
         )
 
         for settings in invalid_settings:
@@ -499,7 +369,28 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
                         session=_FakeSession(),
                     )
 
-    def test_remote_settings_validate_internal_transport_and_hide_token(self) -> None:
+    def test_remote_configuration_rejects_missing_or_unsafe_values(self) -> None:
+        cases = (
+            {},
+            _remote_loader_env(BOXER_COMPANY_API_SERVICE_TOKEN=""),
+            _remote_loader_env(
+                BOXER_COMPANY_API_BASE_URL="http://public.example.com:8010"
+            ),
+            _remote_loader_env(
+                BOXER_COMPANY_API_BASE_URL=(
+                    "https://user:password@api.example.com"
+                )
+            ),
+            _remote_loader_env(
+                BOXER_COMPANY_API_BASE_URL="https://api.example.com/path"
+            ),
+        )
+        for env in cases:
+            with self.subTest(env_keys=sorted(env)):
+                with self.assertRaises(CompanyApiContractError):
+                    load_company_api_client_settings(env)
+
+    def test_remote_transport_numbers_are_loaded_and_bounded(self) -> None:
         settings = load_company_api_client_settings(
             _remote_loader_env(
                 BOXER_COMPANY_API_BASE_URL="http://10.40.102.50:8010/",
@@ -510,288 +401,11 @@ class CompanyApiClientSettingsTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            settings.base_url,
-            "http://10.40.102.50:8010",
-        )
-        self.assertTrue(settings.transport_only_remote)
-        self.assertEqual(settings.notion_mode, "remote")
-        self.assertEqual(settings.structured_mode, "remote")
-        self.assertEqual(
-            frozenset(settings.automation_remote_cycles),
-            frozenset(_ALL_AUTOMATION_CYCLES),
-        )
+        self.assertEqual(settings.base_url, "http://10.40.102.50:8010")
         self.assertEqual(settings.connect_timeout_sec, 1.5)
         self.assertEqual(settings.read_timeout_sec, 75)
         self.assertEqual(settings.operations_read_timeout_sec, 720)
         self.assertEqual(settings.max_retries, 2)
-        self.assertFalse(settings.notion_fallback_enabled)
-        self.assertFalse(settings.structured_fallback_enabled)
-        self.assertNotIn(_TOKEN, repr(settings))
-
-    def test_every_route_mode_must_be_remote(
-        self,
-    ) -> None:
-        for mode_key in _REMOTE_MODE_ENV_KEYS:
-            for unsafe_mode in ("local", "shadow"):
-                with self.subTest(
-                    mode_key=mode_key,
-                    unsafe_mode=unsafe_mode,
-                ):
-                    with self.assertRaisesRegex(
-                        CompanyApiContractError,
-                        "company_api_transport_only_remote_required",
-                    ):
-                        load_company_api_client_settings(
-                            _remote_loader_env(
-                                **{mode_key: unsafe_mode}
-                            )
-                        )
-
-    def test_automation_remote_cycles_must_be_exact_full_set(
-        self,
-    ) -> None:
-        unsafe_values = (
-            "",
-            "weekly_recordings",
-            "weekly_recordings,daily_device_round",
-            "weekly_recordings,weekly_recordings",
-            ",".join((*_ALL_AUTOMATION_CYCLES, "unknown")),
-        )
-        for cycles in unsafe_values:
-            with self.subTest(cycles=cycles):
-                with self.assertRaisesRegex(
-                    CompanyApiContractError,
-                    "company_api_automation_remote_cycles_invalid",
-                ):
-                    load_company_api_client_settings(
-                        _remote_loader_env(
-                            BOXER_COMPANY_API_AUTOMATION_REMOTE_CYCLES=(
-                                cycles
-                            )
-                        )
-                    )
-
-    def test_every_local_fallback_is_rejected(self) -> None:
-        for fallback_key in _REMOTE_FALLBACK_ENV_KEYS:
-            with self.subTest(fallback_key=fallback_key):
-                with self.assertRaises(CompanyApiContractError):
-                    load_company_api_client_settings(
-                        _remote_loader_env(
-                            **{fallback_key: "true"}
-                        )
-                    )
-
-    def test_device_detail_rejects_local_fallback_when_non_local(
-        self,
-    ) -> None:
-        # remote 전환 뒤 tunnel lifecycle을 가진 legacy local 경로로
-        # 조용히 되돌아가지 않도록 env와 수동 settings를 fail-closed한다.
-        with self.assertRaisesRegex(
-            CompanyApiContractError,
-            "company_api_device_detail_fallback_unsafe",
-        ):
-            load_company_api_client_settings(
-                _remote_loader_env(
-                    BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED=(
-                        "true"
-                    )
-                )
-            )
-
-        with self.assertRaisesRegex(
-            CompanyApiContractError,
-            "company_api_device_detail_fallback_unsafe",
-        ):
-            CompanyAssistantApiClient(
-                replace(
-                    _settings(),
-                    device_detail_mode="remote",
-                    device_detail_fallback_enabled=True,
-                )
-            )
-
-    def test_operations_allows_only_remote_without_fallback(
-        self,
-    ) -> None:
-        settings = load_company_api_client_settings(
-            _remote_loader_env()
-        )
-
-        self.assertTrue(settings.enabled)
-        self.assertEqual(settings.operations_mode, "remote")
-        self.assertFalse(settings.operations_fallback_enabled)
-        self.assertFalse(settings.shadow_enabled)
-
-        for env in (
-            _remote_loader_env(
-                BOXER_COMPANY_API_OPERATIONS_MODE="shadow"
-            ),
-            _remote_loader_env(
-                BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED="true"
-            ),
-        ):
-            with self.subTest(env_keys=sorted(env)):
-                with self.assertRaises(CompanyApiContractError):
-                    load_company_api_client_settings(env)
-
-    def test_notion_and_structured_modes_enable_transport_independently(
-        self,
-    ) -> None:
-        base = _settings()
-        cases = (
-            ("local", "local", False, False),
-            ("shadow", "local", True, True),
-            ("local", "shadow", True, True),
-            ("remote", "local", True, False),
-            ("local", "remote", True, False),
-        )
-        for (
-            notion_mode,
-            structured_mode,
-            expected_enabled,
-            expected_shadow_enabled,
-        ) in cases:
-            with self.subTest(
-                notion_mode=notion_mode,
-                structured_mode=structured_mode,
-            ):
-                settings = replace(
-                    base,
-                    notion_mode=notion_mode,
-                    structured_mode=structured_mode,
-                )
-                self.assertEqual(settings.enabled, expected_enabled)
-                self.assertEqual(
-                    settings.shadow_enabled,
-                    expected_shadow_enabled,
-                )
-
-    def test_remote_configuration_rejects_unsafe_or_missing_values(self) -> None:
-        cases = (
-            {
-                "BOXER_COMPANY_API_NOTION_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_STRUCTURED_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_STRUCTURED_MODE": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_PLAYBOOK_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_FREEFORM_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_OPERATIONS_MODE": "remote",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_STRUCTURED_MODE": "shadow",
-                "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_PLAYBOOK_MODE": "shadow",
-                "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE": "shadow",
-                "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE": "shadow",
-                "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE": "shadow",
-                "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_FREEFORM_MODE": "shadow",
-                "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_DEVICE_DETAIL_MODE": "shadow",
-                "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://10.40.102.50:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE": "shadow",
-                "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED": "invalid",
-            },
-            {
-                "BOXER_COMPANY_API_NOTION_MODE": "remote",
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "http://public.example.com:8010"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-            },
-            {
-                "BOXER_COMPANY_API_NOTION_MODE": "remote",
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "https://user:password@api.example.com"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-            },
-            {
-                "BOXER_COMPANY_API_NOTION_MODE": "remote",
-                "BOXER_COMPANY_API_BASE_URL": (
-                    "https://api.example.com/path"
-                ),
-                "BOXER_COMPANY_API_SERVICE_TOKEN": _TOKEN,
-            },
-        )
-        for env in cases:
-            with self.subTest(env_keys=sorted(env)):
-                with self.assertRaises(CompanyApiContractError):
-                    load_company_api_client_settings(env)
 
 
 class CompanyApiClientContractTests(unittest.TestCase):
@@ -988,7 +602,6 @@ class CompanyApiClientContractTests(unittest.TestCase):
         session = _FakeSession(_success_response(request.request_id))
         settings = replace(
             _settings(),
-            operations_mode="remote",
             operations_read_timeout_sec=701,
         )
 
@@ -1959,7 +1572,7 @@ class CompanyApiClientContractTests(unittest.TestCase):
             str(raised.exception),
         )
 
-    def test_response_contract_rejects_mismatch_actions_and_unsafe_sources(
+    def test_response_contract_rejects_mismatch_unknown_fields_and_unsafe_sources(
         self,
     ) -> None:
         request = _request()
@@ -1967,9 +1580,9 @@ class CompanyApiClientContractTests(unittest.TestCase):
 
         mismatched = _success_payload("OTHER-REQUEST")
         cases.append(mismatched)
-        action = _success_payload(request.request_id)
-        action["suggestedAction"] = {"action": "unsafe"}
-        cases.append(action)
+        removed_field = _success_payload(request.request_id)
+        removed_field["removedField"] = {"value": "unsafe"}
+        cases.append(removed_field)
         extra = _success_payload(request.request_id)
         extra["unexpected"] = "field"
         cases.append(extra)

@@ -11,11 +11,15 @@ requires-python = ">=3.11"
 dependencies = [
   "boxer>=0.1.0",
   "fastapi==0.116.1",
+  "pydantic>=2.11,<3",
   "uvicorn==0.35.0",
   "websockets==15.0.1",
   "itsdangerous==2.2.0",
-  "httpx==0.28.1",
 ]
+
+[project.optional-dependencies]
+# FastAPI TestClient가 쓰는 HTTP client는 Web 서버 runtime과 분리한다.
+test = ["httpx==0.28.1"]
 
 [project.urls]
 Repository = "https://github.com/firstquarter-J/boxer"

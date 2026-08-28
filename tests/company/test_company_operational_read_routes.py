@@ -6,8 +6,10 @@ import pymysql
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.operational_read_routes import (
-    WEEKLY_RECORDINGS_SUMMARY_ROUTE,
     WeeklyRecordingsSummaryAssistantRoute,
+)
+from boxer_company.read_routing import (
+    WEEKLY_RECORDINGS_SUMMARY_ROUTE,
     match_weekly_recordings_summary_route,
 )
 
@@ -117,7 +119,6 @@ class WeeklyRecordingsSummaryAssistantRouteTests(unittest.TestCase):
         self.assertFalse(result.messages[0].mention_actor)
         self.assertFalse(result.used_llm)
         self.assertEqual(result.sources, ())
-        self.assertIsNone(result.suggested_action)
 
     def test_returns_no_evidence_for_empty_week(self) -> None:
         with (

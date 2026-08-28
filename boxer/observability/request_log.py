@@ -742,19 +742,6 @@ def _backup_request_log_to_s3(
     )
 
 
-def _backup_request_log_to_configured_s3(
-    *,
-    db_path: str | Path | None = None,
-    s3_client: Any | None = None,
-) -> dict[str, Any] | None:
-    if not s.REQUEST_LOG_SQLITE_S3_BACKUP_ENABLED:
-        return None
-    return _backup_request_log_to_s3(
-        db_path=db_path,
-        s3_client=s3_client,
-    )
-
-
 def _restore_request_log_from_s3(
     *,
     db_path: str | Path | None = None,
@@ -839,21 +826,6 @@ def _initialize_request_log_storage(
         "dbPath": str(actual_path),
         "restored": restore_result,
     }
-
-
-RequestAuditRecord = RequestLogRecord
-_request_audit_timezone = _request_log_timezone
-_normalize_request_audit_metadata = _normalize_request_log_metadata
-_normalize_request_audit_record = _normalize_request_log_record
-_request_audit_db_path = _request_log_db_path
-_ensure_request_audit_schema = _ensure_request_log_schema
-_save_request_audit_record = _save_request_log_record
-_backup_request_audit_to_s3 = _backup_request_log_to_s3
-_backup_request_audit_to_configured_s3 = _backup_request_log_to_configured_s3
-_restore_request_audit_from_s3 = _restore_request_log_from_s3
-_restore_request_audit_from_configured_s3 = _restore_request_log_from_configured_s3
-_run_request_audit_backup_job = _run_request_log_backup_job
-_initialize_request_audit_storage = _initialize_request_log_storage
 
 
 def main() -> int:

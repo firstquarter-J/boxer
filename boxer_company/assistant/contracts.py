@@ -56,14 +56,6 @@ class AssistantMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class SuggestedAction:
-    action: str
-    label: str
-    requires_confirmation: bool = False
-    parameters: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
 class CompanyAssistantResult:
     route: str
     outcome: AssistantOutcome
@@ -71,8 +63,6 @@ class CompanyAssistantResult:
     sources: tuple[SourceReference, ...] = field(default_factory=tuple)
     used_llm: bool = False
     fallback_reason: str | None = None
-    suggested_action: SuggestedAction | None = None
-    async_job: Mapping[str, Any] | None = None
     # 실행 receipt는 대화 본문에 섞지 않고 adapter의 후속 추적 저장에만 쓴다.
     # transport는 route별 고정 schema로 다시 검증해야 한다.
     operation_result: Mapping[str, Any] | None = None
@@ -87,5 +77,4 @@ __all__ = [
     "CompanyAssistantResult",
     "DeliveryScope",
     "SourceReference",
-    "SuggestedAction",
 ]

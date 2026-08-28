@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.device_health_sheet import (
     _SMS_SHEET_ACCEPTED,
@@ -1073,9 +1073,9 @@ def _create_sms_recovery_json_file(
 
     # module import 시에는 device health cycle이 이 모듈을 사용하므로,
     # initializer 실행 시점에만 공통 protected JSON primitive를 가져온다.
-    from boxer_company.device_health_state_bundle import (
+    from boxer_company.protected_json import (
         create_protected_json_file,
-        DeviceHealthStateBundleError,
+        ProtectedJsonFileError,
     )
 
     try:
@@ -1085,7 +1085,7 @@ def _create_sms_recovery_json_file(
             label="SMS recovery state",
         )
         created_stat = path.lstat()
-    except (DeviceHealthStateBundleError, OSError) as exc:
+    except (ProtectedJsonFileError, OSError) as exc:
         raise ValueError("문자 발송 recovery leaf를 생성할 수 없어") from exc
     return (
         digest,
@@ -1389,28 +1389,6 @@ def remember_sms_delivery_sheet_record(
 
     _mutate_sms_delivery_outbox(_upsert, outbox_path=outbox_path)
     return True
-
-
-def remember_accepted_sms_delivery(
-    alert_item: dict[str, Any],
-    *,
-    detected_at: datetime | str,
-    permalink: str | None = None,
-    outbox_path: str | Path | None = None,
-) -> bool:
-    # 기존 호출자 호환용 API는 이름대로 접수 상태만 보존한다.
-    if (
-        not isinstance(alert_item, dict)
-        or _display_value(alert_item.get("smsDeliveryStatus"), default="")
-        != _SMS_DELIVERY_ACCEPTED
-    ):
-        return False
-    return remember_sms_delivery_sheet_record(
-        alert_item,
-        detected_at=detected_at,
-        permalink=permalink,
-        outbox_path=outbox_path,
-    )
 
 
 def _set_sms_delivery_outbox_status(

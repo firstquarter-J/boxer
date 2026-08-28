@@ -72,7 +72,6 @@ class BaseAccessMutationResult:
     allowed: bool
     changed: bool
     stale: bool
-    member: BaseAccessMember
 
 
 class BaseAccessStore(Protocol):
@@ -184,7 +183,6 @@ class LocalFileBaseAccessStore:
                     allowed=current.allowed,
                     changed=False,
                     stale=current.ordering_key > ordering_key,
-                    member=current,
                 )
 
             member = BaseAccessMember(
@@ -202,7 +200,6 @@ class LocalFileBaseAccessStore:
                 allowed=allowed,
                 changed=current is None or current.allowed != allowed,
                 stale=False,
-                member=member,
             )
 
     def seed_members(

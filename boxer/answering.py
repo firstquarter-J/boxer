@@ -7,6 +7,7 @@ from typing import Any, Callable
 from boxer.context.entries import ContextEntry
 from boxer.context.windowing import _render_context_text
 from boxer.core import settings as s
+from boxer.core.llm import _build_claude_client
 from boxer.retrieval.synthesis import _synthesize_retrieval_answer
 
 
@@ -182,10 +183,32 @@ class AnswerEngine:
         )
 
 
+def create_answer_engine_from_settings() -> AnswerEngine:
+    """공개 adapter가 같은 feature flag와 provider credential 조립을 사용하게 한다."""
+    # 합성 flag가 꺼진 프로세스는 provider client도 만들지 않아 모든 채널이 같은 경계에서 닫힌다.
+    provider = s.LLM_PROVIDER if s.LLM_SYNTHESIS_ENABLED else ""
+    provider_client: Any | None = None
+    has_claude_credentials = any(
+        value and "REPLACE_ME" not in value
+        for value in (
+            s.ANTHROPIC_API_KEY,
+            s.ANTHROPIC_AUTH_TOKEN,
+            s.ANTHROPIC_AUTH_TOKEN_COMMAND,
+        )
+    )
+    if provider == "claude" and has_claude_credentials:
+        provider_client = _build_claude_client()
+    return AnswerEngine(
+        provider=provider,
+        provider_client=provider_client,
+    )
+
+
 __all__ = [
     "AnswerEngine",
     "AnswerRequest",
     "AnswerResult",
     "EvidenceTransform",
+    "create_answer_engine_from_settings",
     "synthesize_retrieval_answer",
 ]

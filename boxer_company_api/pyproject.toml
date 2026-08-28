@@ -9,7 +9,7 @@ description = "Private company assistant API for Boxer."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "boxer-company>=0.1.0",
+  "boxer-company[runtime]>=0.1.0",
   "fastapi==0.116.1",
   "pydantic>=2.11,<3",
   "uvicorn==0.35.0",

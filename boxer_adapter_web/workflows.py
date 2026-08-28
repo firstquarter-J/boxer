@@ -55,9 +55,6 @@ class WorkflowCatalog:
         workflows = _parse_workflows(config.get("workflows"), starter_entries)
         return cls(starter_entries, workflows)
 
-    def starter_entries(self) -> list[StarterEntry]:
-        return list(self._starter_entries)
-
     def starter_options(self) -> list[str]:
         return [entry.label for entry in self._starter_entries]
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import os
 import stat
 from dataclasses import dataclass, field
@@ -25,18 +24,18 @@ from boxer_company.hpa_change_workflow import (
     HpaChangeAttachment,
     HpaChangeJob,
     HpaChangeJobStore,
-    HpaChangePollState,
     HpaChangeRequest,
     HpaChangeStatus,
     HpaChangeWorkflowService,
     InvalidHpaChangeContinuation,
     StaticGitHubTokenProvider,
 )
-
-
-HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS = frozenset(
-    {"C02C08K7YEN", "C068FVD5V7Y"}
+from boxer_company.transport_contracts import (
+    HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS,
+    HpaChangePollState,
 )
+
+
 _GITHUB_EVENT_TYPE = "boxer-hpa-change"
 _GITHUB_RUN_NAME_PREFIX = "Boxer HPA Review"
 _GITHUB_IMPLEMENTATION_RUN_NAME_PREFIX = "Boxer HPA Implementation"

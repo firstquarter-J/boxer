@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+# 장비 실행은 provider-free 정본이 확정한 route와 target parser만 소비한다.
+from boxer_company._operation_routing_device import (
+    _OPERATIONS_ROUTE_GROUP,
+)
+from boxer_company.operation_routing import (
+    _extract_device_name_for_audio_probe,
+    _extract_device_name_for_diagnostic_freeform,
+    _extract_device_name_for_diagnostic_start,
+    _extract_device_name_for_remote_access_probe,
+    _extract_device_name_for_status_probe,
+    _extract_device_name_for_update,
+    match_device_operation_route,
+)
+from boxer_company.read_routing import _extract_device_name_scope
+
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -23,11 +38,8 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
-from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_audio_probe import (
     _build_device_audio_probe_config_message,
-    _extract_device_name_for_audio_probe,
-    _is_device_audio_probe_request,
     _probe_device_audio_output,
 )
 from boxer_company.routers.device_diagnostics import (
@@ -35,57 +47,38 @@ from boxer_company.routers.device_diagnostics import (
     _build_device_diagnostic_followup_evidence,
     _build_device_diagnostic_followup_fallback,
     _build_device_diagnostic_device_required_message,
-    _extract_device_name_for_diagnostic_freeform,
-    _extract_device_name_for_diagnostic_start,
-    _has_device_diagnostic_start_hint,
-    _is_device_diagnostic_freeform_request,
-    _is_device_diagnostic_start_request,
     _is_device_diagnostic_runtime_configured,
     _load_device_diagnostic_snapshot,
     _start_device_diagnostic_freeform_analysis,
     _start_device_diagnostic_snapshot,
 )
-from boxer_company.routers.device_led_log import (
-    _is_device_led_log_analysis_request,
-)
 from boxer_company.routers.device_status_probe import (
     _build_device_memory_patch_config_message,
     _build_device_remote_access_probe_config_message,
     _build_device_status_probe_config_message,
-    _extract_device_name_for_remote_access_probe,
-    _extract_device_name_for_status_probe,
-    _is_device_captureboard_probe_request,
-    _is_device_led_probe_request,
-    _is_device_led_pattern_help_request,
-    _is_device_memory_patch_request,
-    _is_device_pm2_probe_request,
-    _is_device_remote_access_probe_request,
-    _is_device_status_probe_request,
     _patch_device_pm2_memory,
     _probe_device_remote_access,
     _probe_device_runtime_component,
     _probe_device_status_overview,
 )
 from boxer_company.routers.device_scanner_abi_patch import (
-    DEVICE_SCANNER_ABI_PATCH_ROUTE,
     DeviceScannerAbiPatchError,
     _apply_device_scanner_abi_patch,
     _build_device_scanner_abi_patch_command_message,
     _build_device_scanner_abi_patch_config_message,
     _extract_device_name_for_scanner_abi_patch,
-    _is_device_scanner_abi_patch_intent,
     _is_device_scanner_abi_patch_request,
     _is_device_scanner_abi_patch_runtime_configured,
+)
+from boxer_company.transport_contracts import (
+    DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
+    DEVICE_OPERATION_DELIVERY_ACTION,
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
 )
 from boxer_company.routers.device_update import (
     _build_device_power_control_config_message,
     _build_device_update_config_message,
     _build_device_update_activity_input,
-    _extract_device_name_for_update,
-    _is_device_agent_update_request,
-    _is_device_box_update_request,
-    _is_device_power_off_request,
-    _is_device_update_status_request,
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
@@ -98,8 +91,6 @@ from boxer_company.routers.device_voice_control import (
     _build_device_voice_device_required_message,
     _change_device_voice,
     _extract_device_voice_label,
-    _is_device_voice_catalog_request,
-    _is_device_voice_change_request,
 )
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
@@ -115,11 +106,6 @@ OperationResult = tuple[str, dict[str, Any]]
 OperationFn = Callable[..., OperationResult]
 ActivityLogFn = Callable[[dict[str, Any]], dict[str, Any]]
 
-_OPERATIONS_ROUTE_GROUP = "operations"
-DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION = (
-    "device_diagnostic_followup_probe"
-)
-DEVICE_OPERATION_DELIVERY_ACTION = "device_operation_delivery"
 _DELIVERED_DEVICE_OPERATION_ROUTES = frozenset(
     {
         "device_box_update",
@@ -131,18 +117,6 @@ _DEVICE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}")
 _VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}")
 _DELIVERY_WAIT_STATUS = frozenset({"completed", "timed_out"})
 _MAX_DEVICE_OPERATION_DELIVERY_STATES = 1_024
-_MUTATING_DEVICE_OPERATION_ROUTES = frozenset(
-    {
-        "device_voice_change",
-        "device_diagnostic_snapshot",
-        "device_box_update",
-        "device_agent_update",
-        "device_power_off",
-        DEVICE_SCANNER_ABI_PATCH_ROUTE,
-        DEVICE_OPERATION_DELIVERY_ACTION,
-        "device_memory_patch",
-    }
-)
 _SYNTHESIZED_DEVICE_OPERATION_ROUTES = frozenset(
     {
         "device_audio_probe",
@@ -225,171 +199,6 @@ class DeviceOperationsRouteDeps:
     mda_configured: Callable[[], bool] = _mda_configured
 
 
-def match_device_operation_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """operations stage에서 기존 Slack matcher 결과를 그대로 반환한다."""
-
-    return match_device_operation_candidate_route(request)
-
-
-def match_device_operation_candidate_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """안내 질문도 포함해 guard가 선점할 operation 후보만 분류한다."""
-
-    route_group = str(
-        request.metadata.get("route_group") or ""
-    ).strip()
-    if route_group != _OPERATIONS_ROUTE_GROUP:
-        return None
-
-    operation_action = request.metadata.get("operation_action")
-    if _has_device_operation_delivery_action(operation_action):
-        # 전달 receipt가 변조됐더라도 자연어 update matcher로 다시 내려가
-        # 장비 명령을 재실행하지 않는다. 상세 형식은 handler에서 fail-closed한다.
-        return DEVICE_OPERATION_DELIVERY_ACTION
-    if (
-        isinstance(operation_action, dict)
-        and operation_action
-        == {"name": DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION}
-    ):
-        # Slack의 기존 knowledge 위치는 bounded thread 문구가 아니라 API
-        # 프로세스의 실제 `(tenant, channel, thread)` snapshot 존재 여부를
-        # 확인했다. 이 typed probe만 context start hint 없이 같은 조회를 연다.
-        return "device_diagnostic_followup"
-
-    question = request.question
-    if _is_device_scanner_abi_patch_intent(question):
-        # 다른 장비 mutation과 섞인 문장도 일부 실행하지 않도록 가장 먼저
-        # 전용 route에 격리하고 exact parser에서 전체 문장을 거부한다.
-        return DEVICE_SCANNER_ABI_PATCH_ROUTE
-    is_voice_change = _is_device_voice_change_request(question)
-    if (
-        _is_device_voice_catalog_request(question)
-        and not is_voice_change
-    ):
-        # catalog는 장비에 명령을 보내지 않는 전역 목록이라 target이 없어도 된다.
-        return "device_voice_catalog"
-    structured_device_name = _extract_device_name_scope(question)
-    diagnostic_device_name = (
-        _extract_device_name_for_diagnostic_start(question)
-        or structured_device_name
-    )
-    update_device_name = (
-        _extract_device_name_for_update(question) or structured_device_name
-    )
-    audio_device_name = (
-        _extract_device_name_for_audio_probe(question)
-        or structured_device_name
-    )
-    remote_access_device_name = (
-        _extract_device_name_for_remote_access_probe(question)
-        or structured_device_name
-    )
-    status_device_name = (
-        _extract_device_name_for_status_probe(question)
-        or structured_device_name
-    )
-
-    if is_voice_change:
-        # 기존 Slack은 음성 변경을 LED read assistant보다 먼저 처리했다.
-        # 혼합 문장도 local mutation으로 새지 않고 operations가 소유한다.
-        return "device_voice_change"
-
-    # 기존 read-only LED 로그/패턴 안내를 live component probe가 선점하면
-    # S3 근거와 가이드 대신 장비 SSH를 실행하므로 명시적으로 넘긴다.
-    if _is_device_led_log_analysis_request(
-        question,
-        device_name=structured_device_name,
-    ) or _is_device_led_pattern_help_request(question):
-        return None
-
-    # 구체적인 mutation과 component probe를 generic 상태보다 먼저 판정한다.
-    if _has_device_diagnostic_start_hint(question) and not (
-        diagnostic_device_name
-    ):
-        # Slack 로컬도 진단 의도만 있으면 route가 장비명 보강 안내를 맡았다.
-        return "device_diagnostic_snapshot"
-    if _is_device_diagnostic_start_request(
-        question,
-        device_name=diagnostic_device_name,
-    ):
-        return "device_diagnostic_snapshot"
-    if _is_device_update_status_request(
-        question,
-        device_name=update_device_name,
-    ):
-        return "device_update_status"
-    if _is_device_box_update_request(
-        question,
-        device_name=update_device_name,
-    ):
-        return "device_box_update"
-    if _is_device_agent_update_request(
-        question,
-        device_name=update_device_name,
-    ):
-        return "device_agent_update"
-    if _is_device_power_off_request(
-        question,
-        device_name=update_device_name,
-    ):
-        # 기존 Slack은 업데이트 뒤, audio/status probe보다 전원 종료를
-        # 먼저 판정했다. 혼합 문장도 같은 장비 명령을 고른다.
-        return "device_power_off"
-    if _is_device_audio_probe_request(
-        question,
-        device_name=audio_device_name,
-    ):
-        return "device_audio_probe"
-    if _is_device_remote_access_probe_request(
-        question,
-        device_name=remote_access_device_name,
-    ):
-        return "device_remote_access_probe"
-    if _is_device_memory_patch_request(
-        question,
-        device_name=status_device_name,
-    ):
-        return "device_memory_patch"
-    if _is_device_pm2_probe_request(
-        question,
-        device_name=status_device_name,
-    ):
-        return "device_pm2_probe"
-    if _is_device_captureboard_probe_request(
-        question,
-        device_name=status_device_name,
-    ):
-        return "device_captureboard_probe"
-    if _is_device_led_probe_request(
-        question,
-        device_name=status_device_name,
-    ):
-        return "device_led_probe"
-    if _is_device_status_probe_request(
-        question,
-        device_name=status_device_name,
-    ):
-        return "device_status_probe"
-    if _is_device_diagnostic_followup_request(request):
-        # 기존 Slack도 명시 장비 operation을 모두 판정한 뒤 저장된 진단
-        # snapshot을 일반 thread 후속 질문의 근거로 사용했다.
-        return "device_diagnostic_followup"
-    if (
-        _is_device_diagnostic_freeform_request(
-            question,
-            device_name=(
-                _extract_device_name_for_diagnostic_freeform(question)
-                or structured_device_name
-            ),
-        )
-    ):
-        return "device_diagnostic_analysis"
-    return None
-
-
 def is_device_operation_delivery_receipt(
     request: CompanyAssistantRequest,
 ) -> bool:
@@ -407,55 +216,6 @@ def is_device_operation_delivery_receipt(
         and action.get("name") == DEVICE_OPERATION_DELIVERY_ACTION
         and action.get("phase") == "delivered"
         and isinstance(action.get("delivery"), Mapping)
-    )
-
-
-def _has_device_operation_delivery_action(value: Any) -> bool:
-    """동일 이름의 malformed action도 자연어 mutation보다 먼저 격리한다."""
-
-    return bool(
-        isinstance(value, Mapping)
-        and value.get("name") == DEVICE_OPERATION_DELIVERY_ACTION
-    )
-
-
-def match_device_mutation_guard_candidate_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """실행 matcher가 넘긴 과거 power 질문도 local 진입 전에 잡는다."""
-
-    route = match_device_operation_candidate_route(request)
-    return route if route in _MUTATING_DEVICE_OPERATION_ROUTES else None
-
-
-def has_ambiguous_device_mutation_target(
-    request: CompanyAssistantRequest,
-) -> bool:
-    """기존 Slack은 parser가 첫 번째로 찾은 장비를 바로 사용했다."""
-
-    del request
-    return False
-
-
-def has_device_diagnostic_followup_query(question: str) -> bool:
-    """thread context를 읽을 가치가 있는 진단 후속 질문인지 판정한다."""
-
-    # snapshot이 있는 thread에서는 정해진 command 질문뿐 아니라 모든
-    # 자연어 후속 질문을 처리했던 Slack 동작을 위해 비어 있지 않으면 읽는다.
-    return bool(str(question or "").strip())
-
-
-def _is_device_diagnostic_followup_request(
-    request: CompanyAssistantRequest,
-) -> bool:
-    if not str(request.question or "").strip():
-        return False
-    # Slack 로컬은 thread key에 저장된 snapshot이 있으면 요청자 구분 없이
-    # 후속 질문에 재사용했다. API matcher도 전달된 thread 시작 문맥만 본다.
-    return any(
-        _has_device_diagnostic_start_hint(str(entry.get("text") or ""))
-        for entry in request.context_entries
-        if isinstance(entry, dict)
     )
 
 
@@ -1209,7 +969,8 @@ def _device_operation_delivery_from_receipt(
     # 모듈 import cycle을 피하려고 receipt 실행 시점에만 전체 legacy
     # matcher를 가져온다. 장비 parser뿐 아니라 학습/admin/file 우선순위까지
     # 제거된 원 질문에서 다시 확인해야 위조 manifest가 activity를 못 만든다.
-    from boxer_company.assistant.operations import (
+    # delivery manifest 재검증도 provider 실행 모듈 대신 같은 순수 정본을 쓴다.
+    from boxer_company.operation_routing import (
         match_company_operation_route,
     )
 
@@ -1527,10 +1288,5 @@ __all__ = [
     "DEVICE_OPERATION_DELIVERY_ACTION",
     "DeviceOperationsAssistantRoute",
     "DeviceOperationsRouteDeps",
-    "has_ambiguous_device_mutation_target",
-    "has_device_diagnostic_followup_query",
     "is_device_operation_delivery_receipt",
-    "match_device_mutation_guard_candidate_route",
-    "match_device_operation_candidate_route",
-    "match_device_operation_route",
 ]

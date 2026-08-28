@@ -20,12 +20,14 @@ from boxer_company.assistant.knowledge_routes import (
     NotionPlaybookQARouteDeps,
     build_company_read_only_knowledge_routes,
     build_notion_playbook_query,
+)
+from boxer_company.assistant.service import RequestScopedRecordingsContext
+from boxer_company.read_routing import (
     looks_like_notion_playbook_followup,
     looks_like_notion_playbook_question,
     match_barcode_evidence_freeform_route,
     match_notion_playbook_route,
 )
-from boxer_company.assistant.service import RequestScopedRecordingsContext
 
 
 BARCODE = "12345678910"

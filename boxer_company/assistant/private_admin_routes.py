@@ -1,5 +1,25 @@
 from __future__ import annotations
 
+from boxer_company._operation_routing_private import (
+    _is_operations_request,
+    _match_private_operations_route_strict,
+)
+from boxer_company.operation_routing import (
+    ADMIN_READONLY_SQL_ROUTE,
+    ADMIN_REQUEST_LOG_ROUTE,
+    ADMIN_S3_DEVICE_LOG_ROUTE,
+    ADMIN_S3_ULTRASOUND_ROUTE,
+    APP_USER_BABY_ANALYSIS_ROUTE,
+    APP_USER_PROFILE_ROUTE,
+    BARCODE_PINK_CLASSIFICATION_ROUTE,
+    BARCODE_VALIDATION_STATUS_ROUTE,
+    RECORDING_STREAMING_RESTORE_ROUTE,
+    RequestLogQuerySpec,
+    _extract_db_query,
+    _extract_request_log_query,
+    _extract_s3_request,
+)
+
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
@@ -26,8 +46,10 @@ from boxer_company.assistant.contracts import (
     DeliveryScope,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
+)
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
     resolve_assistant_request_scope,
 )
 from boxer_company.retrieval_rules import (
@@ -37,46 +59,24 @@ from boxer_company.retrieval_rules import (
 from boxer_company.routers.app_user import (
     _analyze_app_user_baby_selection_by_barcode,
     _lookup_app_user_by_barcode,
-    _should_analyze_app_user_baby_selection,
-    _should_lookup_barcode,
 )
 from boxer_company.routers.barcode_validation import (
-    _is_barcode_pink_classification_reason_request,
-    _is_barcode_validation_status_request,
     _query_barcode_pink_classification_reason,
     _query_barcode_validation_status,
 )
 from boxer_company.routers.db_query import (
-    _extract_db_query,
     _format_db_query_result,
 )
 from boxer_company.routers.recording_streaming_restore import (
-    _is_recording_streaming_restore_request,
     _query_recording_streaming_restore_by_barcode_month,
 )
 from boxer_company.routers.request_log_query import (
-    RequestLogQuerySpec,
-    _extract_request_log_query,
     _query_request_log_text,
 )
 from boxer_company.routers.s3_domain import (
-    _extract_s3_request,
     _query_s3_device_log,
     _query_s3_ultrasound_by_barcode,
 )
-
-
-OPERATIONS_ROUTE_GROUP = "operations"
-
-APP_USER_PROFILE_ROUTE = "app_user_lookup"
-APP_USER_BABY_ANALYSIS_ROUTE = "app_user_baby_selection_analysis"
-BARCODE_VALIDATION_STATUS_ROUTE = "barcode_validation_status"
-BARCODE_PINK_CLASSIFICATION_ROUTE = "barcode_pink_classification_reason"
-ADMIN_S3_ULTRASOUND_ROUTE = "admin_s3_ultrasound"
-ADMIN_S3_DEVICE_LOG_ROUTE = "admin_s3_device_log"
-ADMIN_READONLY_SQL_ROUTE = "admin_readonly_sql"
-ADMIN_REQUEST_LOG_ROUTE = "admin_request_log"
-RECORDING_STREAMING_RESTORE_ROUTE = "recording_streaming_restore"
 
 
 TextQuery = Callable[[str], str]
@@ -199,95 +199,6 @@ class PrivateOperationsRouteDeps:
     # 기존 조회 문자열을 그대로 반환해 local rollback과 테스트를 보존한다.
     answer_composer: CompanyEvidenceAnswerComposer | None = None
     timeout_message: str = _DEFAULT_SYNTHESIS_TIMEOUT_MESSAGE
-
-
-def match_private_operations_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """외부 조회나 mutation 없이 operations 요청의 정확한 route만 고른다."""
-
-    if not _is_operations_request(request):
-        return None
-    try:
-        return _match_private_operations_route_strict(request)
-    except AssistantRequestScopeMismatch:
-        # 실제 실행 route가 같은 불일치를 값 노출 없는 guard 응답으로 닫는다.
-        return None
-
-
-def _is_operations_request(request: CompanyAssistantRequest) -> bool:
-    return (
-        str(request.metadata.get("route_group") or "").strip()
-        == OPERATIONS_ROUTE_GROUP
-    )
-
-
-def _match_private_operations_route_strict(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    question = request.question
-    barcode = resolve_assistant_request_scope(request).barcode
-
-    # 기존 Slack은 admin handler를 Notion·장비·바코드 handler보다 먼저
-    # 실행했다. 한 문장에 바코드 작업 표현이 함께 있어도 명시적인 S3/DB/
-    # request-log 요청이 조회 route를 선점하도록 이 순서를 그대로 둔다.
-    s3_route = _match_s3_operation(question)
-    if s3_route is not None:
-        return s3_route
-    if _extract_request_log_query(question) is not None:
-        return ADMIN_REQUEST_LOG_ROUTE
-    if _extract_db_query(question) is not None:
-        return ADMIN_READONLY_SQL_ROUTE
-
-    # 더 구체적인 PII 원인 분석을 일반 profile 조회보다 먼저 고정한다.
-    if barcode and _should_analyze_app_user_baby_selection(question, barcode):
-        return APP_USER_BABY_ANALYSIS_ROUTE
-    if barcode and _should_lookup_barcode(question, barcode):
-        return APP_USER_PROFILE_ROUTE
-
-    if barcode and _is_barcode_pink_classification_reason_request(
-        question,
-        barcode,
-    ):
-        return BARCODE_PINK_CLASSIFICATION_ROUTE
-    if barcode and _is_barcode_validation_status_request(question, barcode):
-        return BARCODE_VALIDATION_STATUS_ROUTE
-    # 기존 barcode handler는 핑크/유효성 read를 먼저 끝낸 뒤에만 월 단위
-    # streaming 복원을 실행했다. 혼합 문장에서 mutation이 앞서지 않게 한다.
-    if barcode and _is_recording_streaming_restore_request(question, barcode):
-        return RECORDING_STREAMING_RESTORE_ROUTE
-
-    return None
-
-
-def _match_s3_operation(question: str) -> str | None:
-    """S3 parser만 실행하며 잘못된 형식도 전용 route의 안전한 안내로 보낸다."""
-
-    try:
-        request = _extract_s3_request(question)
-    except ValueError:
-        normalized = " ".join(str(question or "").split())
-        lowered = normalized.lower()
-        if not lowered.startswith("s3 ") and lowered != "s3":
-            return None
-        if "로그" in normalized or "log" in lowered:
-            return ADMIN_S3_DEVICE_LOG_ROUTE
-        if any(token in normalized for token in ("영상", "초음파")) or (
-            "ultrasound" in lowered
-        ):
-            return ADMIN_S3_ULTRASOUND_ROUTE
-        # 기존 admin handler는 `s3`로 시작한 미지원 형식도 parser 오류를
-        # 바로 답했다. 첫 S3 route를 입력 오류 sink로 써 remote에서도
-        # local fallback 없이 같은 안내를 반환한다.
-        return ADMIN_S3_ULTRASOUND_ROUTE
-
-    if request is None:
-        return None
-    if request.get("kind") == "ultrasound":
-        return ADMIN_S3_ULTRASOUND_ROUTE
-    if request.get("kind") == "log":
-        return ADMIN_S3_DEVICE_LOG_ROUTE
-    return None
 
 
 def _match_for_execution(
@@ -1053,8 +964,6 @@ def _result(
         sources=(),
         used_llm=False,
         fallback_reason=fallback_reason,
-        suggested_action=None,
-        async_job=None,
     )
 
 
@@ -1128,16 +1037,6 @@ def build_private_operations_routes(
 
 
 __all__ = [
-    "ADMIN_READONLY_SQL_ROUTE",
-    "ADMIN_REQUEST_LOG_ROUTE",
-    "ADMIN_S3_DEVICE_LOG_ROUTE",
-    "ADMIN_S3_ULTRASOUND_ROUTE",
-    "APP_USER_BABY_ANALYSIS_ROUTE",
-    "APP_USER_PROFILE_ROUTE",
-    "BARCODE_PINK_CLASSIFICATION_ROUTE",
-    "BARCODE_VALIDATION_STATUS_ROUTE",
-    "OPERATIONS_ROUTE_GROUP",
-    "RECORDING_STREAMING_RESTORE_ROUTE",
     "AdminReadonlySqlAssistantRoute",
     "AdminRequestLogAssistantRoute",
     "AdminS3DeviceLogAssistantRoute",
@@ -1149,5 +1048,4 @@ __all__ = [
     "PrivateOperationsRouteDeps",
     "RecordingStreamingRestoreAssistantRoute",
     "build_private_operations_routes",
-    "match_private_operations_route",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 from typing import Callable
@@ -19,9 +20,6 @@ from boxer_company.automation import (
 from boxer_company.device_notification_cycle import (
     DeviceNotificationAlertCycleHandler,
     DeviceNotificationCycleDeps,
-)
-from boxer_company.device_health_state_bundle import (
-    build_device_notification_api_cursor,
 )
 
 
@@ -89,7 +87,6 @@ def _deps(
     *,
     latest_id: int = 0,
     next_result: tuple[int, dict | None] = (0, None),
-    sheet_incidents: dict | None = None,
     sheet_rows: int | None = None,
     sms_result: dict | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -97,7 +94,6 @@ def _deps(
     mocks = {
         "latest": Mock(return_value=latest_id),
         "next": Mock(return_value=next_result),
-        "load_sheet": Mock(return_value=sheet_incidents),
         "append_sheet": Mock(return_value=sheet_rows),
         "send_sms": Mock(
             return_value=sms_result
@@ -118,7 +114,6 @@ def _deps(
         DeviceNotificationCycleDeps(
             load_latest_id=mocks["latest"],
             load_next_event=mocks["next"],
-            load_sheet_incidents=mocks["load_sheet"],
             append_sheet_alerts=mocks["append_sheet"],
             send_sms=mocks["send_sms"],
             claim_sms_delivery=mocks["claim_sms"],
@@ -136,6 +131,19 @@ def _initialized_cursor(last_seen_id: int = 11) -> dict:
         "lastSeenId": last_seen_id,
         "pendingDeliveryContexts": {},
     }
+
+
+def _recording_incident_key(
+    device_name: str,
+    file_id: str,
+    barcode: str,
+    file_type: str = "recording",
+) -> str:
+    return hashlib.sha256(
+        "\0".join(
+            (device_name, file_id, barcode, file_type)
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def test_first_cycle_initializes_at_latest_id_without_replaying_history() -> None:
@@ -164,13 +172,12 @@ def test_production_cycle_loads_one_fixed_legacy_batch_then_drains_receipts(
         "details": {"voiceType": "n", "segmentCount": 2},
     }
     load_batch = Mock(return_value=(14, [first_event, second_event]))
-    base_deps, mocks = _deps(sheet_incidents={}, sheet_rows=1)
+    base_deps, mocks = _deps(sheet_rows=1)
     deps = DeviceNotificationCycleDeps(
         load_latest_id=base_deps.load_latest_id,
         # default function identity가 실제 API의 batch 경로를 선택한다.
         load_next_event=cycle._load_next_device_notification,
         load_event_batch=load_batch,
-        load_sheet_incidents=base_deps.load_sheet_incidents,
         append_sheet_alerts=base_deps.append_sheet_alerts,
         send_sms=base_deps.send_sms,
         claim_sms_delivery=base_deps.claim_sms_delivery,
@@ -204,33 +211,15 @@ def test_production_cycle_loads_one_fixed_legacy_batch_then_drains_receipts(
     mocks["next"].assert_not_called()
 
 
-def test_migrated_cursor_processes_cutover_gap_instead_of_skipping_to_latest() -> None:
-    observed_at = _NOW.isoformat()
-    migrated_cursor = build_device_notification_api_cursor(
-        {
-            "initialized": True,
-            "initializedAt": observed_at,
-            "lastSeenId": 11,
-            "lastPolledAt": observed_at,
-            "pendingEvents": [],
-            "recentCaptureboardAlerts": {},
-            "recordingStallIncidents": {},
-            "captureboardIncidents": {},
-            "captureboardIncidentsLastSheetCheckedAt": "",
-            "lastSentAt": "",
-            "lastSentNotificationId": 0,
-            "lastSlackMessageTs": "",
-            "lastSlackPermalink": "",
-        }
-    )
+def test_persisted_cursor_processes_gap_instead_of_skipping_to_latest() -> None:
+    persisted_cursor = _initialized_cursor(last_seen_id=11)
     deps, mocks = _deps(
         latest_id=1200,
         next_result=(12, _captureboard_event()),
-        sheet_incidents={},
     )
     handler = DeviceNotificationAlertCycleHandler(deps)
 
-    result = handler.run(_request(cursor=migrated_cursor))
+    result = handler.run(_request(cursor=persisted_cursor))
 
     assert result.cursor["lastSeenId"] == 12
     assert len(result.deliveries) == 1
@@ -238,51 +227,35 @@ def test_migrated_cursor_processes_cutover_gap_instead_of_skipping_to_latest() -
     mocks["next"].assert_called_once_with(11)
 
 
-def test_migrated_recording_incident_continues_in_original_thread() -> None:
+def test_persisted_recording_incident_continues_in_original_thread() -> None:
     first_occurred_at = "2026-08-14T00:55:00+00:00"
     event = _recording_stall_event(
         12,
         duration_seconds=240,
         occurred_at="2026-08-14T00:59:00+00:00",
     )
-    legacy_key = "MB2-C00992|recording-file|81000000000|recording"
-    cursor = build_device_notification_api_cursor(
-        {
-            "initialized": True,
-            "initializedAt": first_occurred_at,
-            "lastSeenId": 11,
-            "lastPolledAt": first_occurred_at,
-            "pendingEvents": [],
-            "recentCaptureboardAlerts": {},
-            "recordingStallIncidents": {
-                legacy_key: {
-                    "phase": "alerted",
-                    "deviceName": "MB2-C00992",
-                    "barcode": "81000000000",
-                    "fileId": "recording-file",
-                    "fileType": "recording",
-                    "currentStatus": "recording",
-                    "firstNotificationId": 11,
-                    "firstOccurredAt": first_occurred_at,
-                    "firstDurationSeconds": 120,
-                    "lastNotificationId": 11,
-                    "lastOccurredAt": first_occurred_at,
-                    "lastDurationSeconds": 120,
-                    "lastCurrentSize": 1000,
-                    "slackMessageTs": "1710000000.000100",
-                    "slackPermalink": "https://example.slack.com/archives/C1/p1",
-                    "lastCommentNotificationId": None,
-                }
-            },
-            "captureboardIncidents": {},
-            "captureboardIncidentsLastSheetCheckedAt": "",
-            "lastSentAt": first_occurred_at,
-            "lastSentNotificationId": 11,
-            "lastSlackMessageTs": "1710000000.000100",
-            "lastSlackPermalink": "https://example.slack.com/archives/C1/p1",
-        }
+    incident_key = _recording_incident_key(
+        "MB2-C00992",
+        "recording-file",
+        "81000000000",
     )
-    deps, mocks = _deps(next_result=(12, event), sheet_incidents={})
+    cursor = {
+        **_initialized_cursor(last_seen_id=11),
+        "recordingStallIncidents": {
+            incident_key: {
+                "phase": "alerted",
+                "deviceName": "MB2-C00992",
+                "lastNotificationId": 11,
+                "lastOccurredAt": first_occurred_at,
+                "lastDurationSeconds": 120,
+                "lastCurrentSize": 1000,
+                "rootExternalMessageId": "1710000000.000100",
+                "rootPermalink": "https://example.slack.com/archives/C1/p1",
+                "lastCommentNotificationId": None,
+            }
+        },
+    }
+    deps, mocks = _deps(next_result=(12, event))
     handler = DeviceNotificationAlertCycleHandler(deps)
 
     result = handler.run(_request(cursor=cursor))
@@ -299,7 +272,6 @@ def test_captureboard_cycle_preserves_contact_and_hides_sms_identifiers() -> Non
     event = _captureboard_event()
     deps, mocks = _deps(
         next_result=(12, event),
-        sheet_incidents={},
         sheet_rows=1,
     )
     handler = DeviceNotificationAlertCycleHandler(
@@ -350,7 +322,6 @@ def test_notification_delivery_keeps_legacy_event_message_and_merge_error() -> N
     captureboard["message"] = "현장 캡처보드 장애 메시지"
     captureboard_deps, _ = _deps(
         next_result=(13, captureboard),
-        sheet_incidents={},
     )
     captureboard_result = DeviceNotificationAlertCycleHandler(
         captureboard_deps
@@ -372,7 +343,6 @@ def test_notification_delivery_keeps_legacy_event_message_and_merge_error() -> N
     }
     merge_deps, _ = _deps(
         next_result=(14, merge_event),
-        sheet_incidents={},
     )
     merge_result = DeviceNotificationAlertCycleHandler(merge_deps).run(
         _request(cursor=_initialized_cursor(last_seen_id=13))
@@ -415,7 +385,6 @@ def test_sms_claim_uses_provider_immediate_server_clock() -> None:
     provider_now = _NOW + timedelta(minutes=5)
     deps, mocks = _deps(
         next_result=(12, _captureboard_event()),
-        sheet_incidents={},
         clock=lambda: provider_now,
     )
     handler = DeviceNotificationAlertCycleHandler(deps)
@@ -433,7 +402,6 @@ def test_sms_claim_uses_provider_immediate_server_clock() -> None:
 def test_sent_receipt_appends_sheet_then_closes_delivery_context() -> None:
     deps, mocks = _deps(
         next_result=(12, _captureboard_event()),
-        sheet_incidents={},
         sheet_rows=1,
     )
     handler = DeviceNotificationAlertCycleHandler(deps)
@@ -481,7 +449,6 @@ def test_sent_receipt_appends_sheet_then_closes_delivery_context() -> None:
     ).astimezone(timezone.utc).isoformat()
     assert incident["lastSuppressedAt"] == ""
     mocks["append_sheet"].assert_called_once()
-    mocks["load_sheet"].assert_not_called()
     sheet_item = mocks["append_sheet"].call_args.args[0][0]
     assert sheet_item["smsGroupId"] == "group-private-marker"
     assert sheet_item["smsMessageId"] == "message-private-marker"
@@ -501,7 +468,6 @@ def test_recording_stall_followup_becomes_channel_neutral_thread_delivery() -> N
     )
     first_deps, first_mocks = _deps(
         next_result=(31, first_event),
-        sheet_incidents={},
     )
     handler = DeviceNotificationAlertCycleHandler(first_deps)
     first_result = handler.run(
@@ -529,7 +495,6 @@ def test_recording_stall_followup_becomes_channel_neutral_thread_delivery() -> N
     )
     second_deps, second_mocks = _deps(
         next_result=(32, second_event),
-        sheet_incidents={},
     )
     second_handler = DeviceNotificationAlertCycleHandler(second_deps)
     second_result = second_handler.run(
@@ -552,31 +517,6 @@ def test_recording_stall_followup_becomes_channel_neutral_thread_delivery() -> N
     second_mocks["send_sms"].assert_not_called()
 
 
-def test_sheet_snapshot_alone_does_not_suppress_captureboard_event() -> None:
-    event = _captureboard_event(40)
-    deps, mocks = _deps(
-        next_result=(40, event),
-        sheet_incidents={
-            "MB2-C00992": {
-                "deviceName": "MB2-C00992",
-                "status": "처리중",
-                "slackPermalink": "https://lifexio.slack.com/archives/C1/p1",
-                "rowNumber": 3,
-            }
-        },
-    )
-    handler = DeviceNotificationAlertCycleHandler(deps)
-
-    result = handler.run(
-        _request(cursor=_initialized_cursor(last_seen_id=39))
-    )
-
-    assert result.outcome == "completed"
-    assert len(result.deliveries) == 1
-    mocks["send_sms"].assert_called_once()
-    mocks["load_sheet"].assert_not_called()
-
-
 def test_sent_incident_suppresses_repeat_after_cursor_restart_without_sheet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -587,7 +527,6 @@ def test_sent_incident_suppresses_repeat_after_cursor_restart_without_sheet(
     )
     first_deps, first_mocks = _deps(
         next_result=(40, _captureboard_event(40)),
-        sheet_incidents={},
         sheet_rows=None,
     )
     first_handler = DeviceNotificationAlertCycleHandler(first_deps)
@@ -612,9 +551,7 @@ def test_sent_incident_suppresses_repeat_after_cursor_restart_without_sheet(
     restarted_cursor = json.loads(json.dumps(acknowledged))
     second_deps, second_mocks = _deps(
         next_result=(41, _captureboard_event(41)),
-        sheet_incidents={},
     )
-    second_mocks["load_sheet"].side_effect = RuntimeError("Sheets down")
     second_result = DeviceNotificationAlertCycleHandler(second_deps).run(
         _request(
             cursor=restarted_cursor,
@@ -636,7 +573,6 @@ def test_sent_incident_suppresses_repeat_after_cursor_restart_without_sheet(
         _NOW + timedelta(seconds=30)
     ).isoformat()
     second_mocks["send_sms"].assert_not_called()
-    second_mocks["load_sheet"].assert_not_called()
 
 
 def test_captureboard_flapping_sequence_stays_in_one_sliding_incident(
@@ -694,7 +630,6 @@ def test_captureboard_flapping_sequence_stays_in_one_sliding_incident(
     assert incident["suppressedCount"] == 3
     assert mocks["send_sms"].call_count == 1
     assert mocks["append_sheet"].call_count == 1
-    mocks["load_sheet"].assert_not_called()
 
 
 def test_captureboard_quiet_window_slides_and_expires(
@@ -748,7 +683,6 @@ def test_captureboard_quiet_window_slides_and_expires(
     # 마지막 반복 뒤 10분 동안 조용했으면 같은 장비라도 새 루트를 만든다.
     assert len(expired_result.deliveries) == 1
     expired_mocks["send_sms"].assert_called_once()
-    expired_mocks["load_sheet"].assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -791,13 +725,11 @@ def test_invalid_or_future_incident_timestamp_allows_new_root(
 
     assert len(result.deliveries) == 1
     mocks["send_sms"].assert_called_once()
-    mocks["load_sheet"].assert_not_called()
 
 
 def test_provider_exception_is_not_retried_and_is_marked_uncertain() -> None:
     deps, mocks = _deps(
         next_result=(50, _captureboard_event(50)),
-        sheet_incidents={},
     )
     mocks["send_sms"].side_effect = TimeoutError("private provider detail")
     handler = DeviceNotificationAlertCycleHandler(deps)
@@ -816,7 +748,6 @@ def test_provider_exception_is_not_retried_and_is_marked_uncertain() -> None:
 def test_confirm_required_receipt_with_group_is_persisted_immediately() -> None:
     deps, mocks = _deps(
         next_result=(53, _captureboard_event(53)),
-        sheet_incidents={},
         sms_result={
             "status": "error",
             "ok": False,
@@ -848,7 +779,6 @@ def test_confirm_required_receipt_with_group_is_persisted_immediately() -> None:
 def test_receipt_persist_failure_is_confirm_safe_without_provider_retry() -> None:
     deps, mocks = _deps(
         next_result=(51, _captureboard_event(51)),
-        sheet_incidents={},
     )
     mocks["remember_sms"].side_effect = OSError("private outbox failure")
     handler = DeviceNotificationAlertCycleHandler(deps)
@@ -878,7 +808,6 @@ def test_receipt_persist_failure_is_confirm_safe_without_provider_retry() -> Non
 def test_sheet_append_failure_moves_to_non_blocking_outbox_repair_marker() -> None:
     deps, mocks = _deps(
         next_result=(52, _captureboard_event(52)),
-        sheet_incidents={},
     )
     mocks["append_sheet"].side_effect = TimeoutError("private sheet failure")
     handler = DeviceNotificationAlertCycleHandler(deps)
@@ -936,7 +865,6 @@ def test_sheet_append_failure_without_group_retries_directly_from_safe_cursor(
     event["hospitalDeviceAlertPhone"] = ""
     deps, mocks = _deps(
         next_result=(54, event),
-        sheet_incidents={},
     )
     # 최초 ack만 실패하고 다음 poll의 direct repair는 성공 또는 disabled로
     # 확정되어 같은 cursor 항목을 영구 보존하지 않아야 한다.
@@ -1002,7 +930,6 @@ def test_sheet_pending_reconciles_committed_timeout_without_duplicate_append() -
     event["hospitalDeviceAlertPhone"] = ""
     deps, mocks = _deps(
         next_result=(55, event),
-        sheet_incidents={},
     )
     committed_delivery_ids: set[str] = set()
     physical_append_count = 0

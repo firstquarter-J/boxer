@@ -65,6 +65,25 @@ class AutomationDeliveryJournal:
         )
 
 
+def validate_automation_delivery_journal_preflight(
+    *,
+    state_path: str | Path | None = None,
+) -> None:
+    """remote-only 기동 전에 모든 남은 receipt의 exact batch를 검증한다."""
+
+    # 읽기 전용 검사만 수행한다. 구 no-batch journal은 추측 ACK하거나
+    # 자동 삭제하지 않고 운영자가 파일과 API pending을 함께 확인하게 한다.
+    for cycle in sorted(COMPANY_AUTOMATION_CYCLES):
+        journal = load_automation_delivery_journal(
+            cycle=cycle,
+            state_path=state_path,
+        )
+        if journal is not None and journal.batch is None:
+            raise CompanyApiContractError(
+                "company_api_automation_delivery_batch_missing"
+            )
+
+
 def load_automation_delivery_journal(
     *,
     cycle: str,
@@ -314,11 +333,10 @@ def flush_automation_deliveries(
     cycle: str,
     cycle_key: str,
     scheduled_at: datetime,
-    options: dict[str, Any] | None = None,
     logger: logging.Logger | None = None,
     state_path: str | Path | None = None,
 ) -> bool:
-    """저장된 sent receipt를 API hook에 한 번 전달하고 성공 뒤에만 지운다."""
+    """저장된 exact batch receipt를 API ACK 뒤에만 지운다."""
 
     _validate_cycle_identity(cycle, cycle_key)
     path = _delivery_state_path(state_path)
@@ -366,41 +384,29 @@ def flush_automation_deliveries(
         )
         for item in deliveries
     )
-    if batch_reference is not None:
-        if set(receipt_ids) != set(batch_reference.delivery_ids):
-            # 일부 Slack POST만 끝난 crash 상태는 같은 batch pull로 나머지를
-            # 복구할 때까지 journal과 API pending을 모두 그대로 둔다.
-            return False
-        acknowledgement = api_client.acknowledge_batch(
+    if batch_reference is None:
+        # scheduler cutover 뒤 Slack journal은 exact batch identity를 반드시
+        # 가져야 한다. 구 journal을 추측 ACK하지 않고 운영 복구 대상으로 남긴다.
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_batch_missing",
             request_id=request_id,
-            batch=batch_reference,
-            receipts=remote_receipts,
         )
-        if not acknowledgement.acknowledged:
-            # API가 pending을 유지한 ACK는 성공이 아니다. journal을 보존한
-            # 채 reporter loop를 중단해 같은 batch를 즉시 pull·재발송하지 않는다.
-            raise CompanyApiContractError(
-                "company_api_automation_delivery_ack_incomplete",
-                request_id=request_id,
-            )
-    else:
-        # feature flag 전환 전 journal 한 건은 기존 endpoint로만 닫는다.
-        legacy_acknowledgement = api_client.run(
+    if set(receipt_ids) != set(batch_reference.delivery_ids):
+        # 일부 Slack POST만 끝난 crash 상태는 같은 batch pull로 나머지를
+        # 복구할 때까지 journal과 API pending을 모두 그대로 둔다.
+        return False
+    acknowledgement = api_client.acknowledge_batch(
+        request_id=request_id,
+        batch=batch_reference,
+        receipts=remote_receipts,
+    )
+    if not acknowledgement.acknowledged:
+        # API가 pending을 유지한 ACK는 성공이 아니다. journal을 보존한
+        # 채 reporter loop를 중단해 같은 batch를 즉시 pull·재발송하지 않는다.
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_ack_incomplete",
             request_id=request_id,
-            cycle=cycle,
-            cycle_key=stored_cycle_key,
-            scheduled_at=scheduled_at,
-            options=options or {},
-            receipts=remote_receipts,
-            ack_only=True,
         )
-        if legacy_acknowledgement.deliveries:
-            # 구 endpoint도 pending을 돌려주면 ACK가 끝난 것이 아니다.
-            # 전환 직전 journal을 지우거나 새 pull로 재발송하지 않는다.
-            raise CompanyApiContractError(
-                "company_api_automation_delivery_ack_incomplete",
-                request_id=request_id,
-            )
 
     with _STATE_LOCK:
         latest = _load_document(path)

@@ -59,13 +59,19 @@ class PyprojectBoundaryTests(unittest.TestCase):
         data = _load_toml(PROJECT_ROOT / "boxer_adapter_web" / "pyproject.toml")
         project = data.get("project") or {}
         dependencies = project.get("dependencies", [])
+        optional_dependencies = project.get("optional-dependencies", {})
         packages = ((data.get("tool") or {}).get("setuptools") or {}).get("packages", [])
         scripts = project.get("scripts", {})
 
         self.assertEqual(project.get("name"), "boxer-adapter-web")
         self.assertIn("boxer>=0.1.0", dependencies)
         self.assertIn("fastapi==0.116.1", dependencies)
+        # schema가 Pydantic v2 API를 직접 쓰므로 FastAPI의 transitive
+        # dependency 해석에 기대지 않는다.
+        self.assertIn("pydantic>=2.11,<3", dependencies)
         self.assertIn("websockets==15.0.1", dependencies)
+        self.assertNotIn("httpx==0.28.1", dependencies)
+        self.assertEqual(optional_dependencies, {"test": ["httpx==0.28.1"]})
         self.assertEqual(packages, ["boxer_adapter_web"])
         self.assertEqual(scripts["boxer-web"], "boxer_adapter_web.runtime:main")
         self.assertEqual(
@@ -111,6 +117,7 @@ class PyprojectBoundaryTests(unittest.TestCase):
         self.assertFalse((PROJECT_ROOT / "boxer" / "context" / "models.py").exists())
         self.assertFalse((PROJECT_ROOT / "boxer" / "retrieval" / "connectors" / "request_log.py").exists())
         self.assertFalse((PROJECT_ROOT / "boxer" / "observability" / "request_log_backup.py").exists())
+        self.assertFalse((PROJECT_ROOT / "boxer" / "observability" / "request_audit.py").exists())
         self.assertFalse((PROJECT_ROOT / "boxer" / "observability" / "request_audit_backup.py").exists())
 
 

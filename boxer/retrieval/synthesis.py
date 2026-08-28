@@ -116,7 +116,7 @@ def _build_retrieval_synthesis_input(
             "2) Use only evidence.\n"
             "3) If evidence is insufficient, say what is missing.\n"
             "4) Do not claim actions or results not in evidence.\n"
-            "5) Do not suggest using another barcode/service unless evidence explicitly says so.\n"
+            "5) Do not change the requested subject or data source unless evidence explicitly supports it.\n"
             "6) For factual checks, start with direct yes/no and one-sentence reason."
             f"{normalized_extra_rules}"
         )
@@ -131,7 +131,7 @@ def _build_retrieval_synthesis_input(
         "2) Use only evidence.\n"
         "3) If evidence is insufficient, say what is missing.\n"
         "4) Do not claim actions or results not in evidence.\n"
-        "5) Do not suggest using another barcode/service unless evidence explicitly says so.\n"
+        "5) Do not change the requested subject or data source unless evidence explicitly supports it.\n"
         "6) For factual checks, start with direct yes/no and one-sentence reason."
         f"{normalized_extra_rules}"
     )

@@ -4,13 +4,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from boxer_company.routers.device_status_probe import (
-    _collect_runtime_checks,
-    _build_trashcan_storage_usage,
-    _build_led_pattern_help_evidence,
-    _build_led_pattern_help_reply,
-    _build_device_remote_access_probe_config_message,
-    _patch_device_pm2_memory,
+from boxer_company.operation_routing import (
     _extract_device_name_for_remote_access_probe,
     _extract_device_name_for_status_probe,
     _is_device_captureboard_probe_request,
@@ -20,6 +14,14 @@ from boxer_company.routers.device_status_probe import (
     _is_device_pm2_probe_request,
     _is_device_remote_access_probe_request,
     _is_device_status_probe_request,
+)
+from boxer_company.routers.device_status_probe import (
+    _collect_runtime_checks,
+    _build_trashcan_storage_usage,
+    _build_led_pattern_help_evidence,
+    _build_led_pattern_help_reply,
+    _build_device_remote_access_probe_config_message,
+    _patch_device_pm2_memory,
     _parse_count_value,
     _parse_device_path_list,
     _parse_directory_usage,

@@ -9,6 +9,13 @@ description = "Company-specific domain package for Boxer."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "boxer>=0.1.0",
+]
+
+[project.optional-dependencies]
+# Slack transport는 provider-free 계약만 설치하고, 실제 회사 도메인 실행
+# 의존성은 공통 API install unit이 명시적으로 선택한다.
+runtime = [
   "boxer[db,s3]>=0.1.0",
   "cryptography>=43,<49",
   "google-auth>=2.38,<3",

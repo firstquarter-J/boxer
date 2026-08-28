@@ -115,13 +115,13 @@ def _search_documents(
     *,
     limit: int = 5,
 ) -> list[KnowledgeSearchResult]:
-    query_tokens = _tokenize(query)
+    query_tokens = tokenize_knowledge_text(query)
     if not query_tokens:
         return []
 
     results: list[KnowledgeSearchResult] = []
     for document in documents:
-        score = _score_document(document, query_tokens)
+        score = score_knowledge_document(document, query=query, tokens=query_tokens)
         if score <= 0:
             continue
         results.append(KnowledgeSearchResult(document=document, score=score))
@@ -130,25 +130,51 @@ def _search_documents(
     return results[: max(1, limit)]
 
 
-def _score_document(document: KnowledgeDocument, query_tokens: set[str]) -> float:
-    haystack_tokens = _tokenize(f"{document.title}\n{document.content}")
-    if not haystack_tokens:
+def tokenize_knowledge_text(text: str) -> list[str]:
+    """Markdown/Notion과 adapter 저장소가 함께 쓰는 결정적 검색 토큰을 만든다."""
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for token in _TOKEN_PATTERN.findall(normalize_knowledge_text(text)):
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def score_knowledge_document(
+    document: KnowledgeDocument,
+    *,
+    query: str,
+    tokens: list[str] | None = None,
+) -> float:
+    """source 종류와 무관하게 같은 overlap/phrase/title 점수로 문서를 정렬한다."""
+    query_tokens = set(tokens if tokens is not None else tokenize_knowledge_text(query))
+    if not query_tokens:
         return 0.0
 
+    normalized_query = normalize_knowledge_text(query)
+    normalized_title = normalize_knowledge_text(document.title)
+    normalized_haystack = normalize_knowledge_text(f"{document.title}\n{document.content}")
+    haystack_tokens = set(tokenize_knowledge_text(normalized_haystack))
     matched_tokens = query_tokens & haystack_tokens
-    if not matched_tokens:
+    matched_substrings = {token for token in query_tokens if token in normalized_haystack}
+    if not matched_tokens and not matched_substrings:
         return 0.0
 
-    # 완전한 BM25까지는 과하고, alpha에선 token overlap 기반 점수면 검색 품질과 테스트 재현성이 충분하다.
-    coverage_score = len(matched_tokens) / len(query_tokens)
-    density_score = len(matched_tokens) / math.sqrt(len(haystack_tokens))
-    return round(coverage_score + density_score, 4)
+    # 단순한 결정적 점수는 원격 source와 SQLite 후보가 같은 순서를 재현하게 한다.
+    matched = matched_tokens | matched_substrings
+    coverage_score = len(matched) / max(1, len(query_tokens))
+    density_score = len(matched) / max(1.0, math.sqrt(len(haystack_tokens)))
+    phrase_bonus = 0.25 if normalized_query and normalized_query in normalized_haystack else 0.0
+    title_bonus = 0.15 if any(token in normalized_title for token in query_tokens) else 0.0
+    return round(coverage_score + density_score + phrase_bonus + title_bonus, 4)
 
 
-def _tokenize(text: str) -> set[str]:
-    # 한글 FAQ도 같은 검색 경로에서 바로 맞도록 영문/숫자와 한글 토큰을 함께 잡는다.
-    normalized = (text or "").lower()
-    return {token for token in _TOKEN_PATTERN.findall(normalized) if token}
+def normalize_knowledge_text(text: str) -> str:
+    """모든 knowledge source와 adapter가 공유하는 검색 문자열 정규화 계약이다."""
+
+    return str(text or "").strip().lower()
 
 
 __all__ = [
@@ -157,4 +183,7 @@ __all__ = [
     "KnowledgeSource",
     "MarkdownKnowledgeSource",
     "NotionKnowledgeSource",
+    "normalize_knowledge_text",
+    "score_knowledge_document",
+    "tokenize_knowledge_text",
 ]

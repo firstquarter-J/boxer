@@ -9,7 +9,7 @@ import re
 from typing import Any, Callable, Mapping, Sequence
 
 from boxer.core import settings as core_settings
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as company_settings
 from boxer_company.assistant.device_health_alert_action_route import (
@@ -70,7 +70,9 @@ _MONITOR_OPTION_KEYS: frozenset[str] = frozenset()
 _MONITOR_STATE_OWNER = "company_api"
 _MONITOR_STATE_VERSION = 1
 _MONITOR_PENDING_DECISIONS = frozenset({"preserve", "assume_delivered"})
-_MAX_MIGRATED_FINGERPRINTS = 10_000
+# LED USB의 순간 재인식으로 알림이 생기지 않게 연속 실패를 두 번 확인한다.
+_REQUIRED_CONFIRMATION_POLLS = 2
+_MAX_FINGERPRINTS = 10_000
 _COMPONENT_KEYS = ("audio", "pm2", "storage", "captureboard", "led")
 _COMPONENT_LABELS = {
     "audio": "스피커",
@@ -168,54 +170,26 @@ class DeviceHealthMonitorCycleDeps:
     )
 
 
-def build_device_health_monitor_seed_cursor(
+def build_clean_device_health_monitor_cursor(
     *,
-    legacy_alert_delivery_enabled: bool,
-    alert_fingerprints: Mapping[str, Any] | None,
-    pending_alert_fingerprints: Mapping[str, Any] | None,
-    pending_decision: str,
+    alert_delivery_enabled: bool,
     seeded_at: datetime,
 ) -> dict[str, Any]:
-    """검토된 Slack legacy 상태만 API durable cursor로 좁혀 이관한다."""
+    """신규 API host에 이력 없는 health cursor를 create-only로 만든다."""
 
-    if type(legacy_alert_delivery_enabled) is not bool:
-        raise ValueError("legacy alert delivery setting must be a boolean")
+    if type(alert_delivery_enabled) is not bool:
+        raise ValueError("alert delivery setting must be a boolean")
     if seeded_at.tzinfo is None:
         raise ValueError("device health monitor seed time must be timezone-aware")
-    if pending_decision not in _MONITOR_PENDING_DECISIONS:
-        raise ValueError("device health monitor pending decision is invalid")
 
-    migrated_alerts = _validate_migrated_fingerprint_state(
-        alert_fingerprints,
-        timestamp_key="firstAlertedAt",
-    )
-    migrated_pending = _validate_migrated_fingerprint_state(
-        pending_alert_fingerprints,
-        timestamp_key="firstSeenAt",
-    )
     seeded_at_text = seeded_at.astimezone(timezone.utc).isoformat()
-    if pending_decision == "assume_delivered":
-        # legacy pending의 실제 발송 여부가 불명확하면 최근 발송으로 승격해
-        # 첫 API poll이 Slack/SMS mutation을 중복 실행하지 않게 한다.
-        for fingerprint, pending in migrated_pending.items():
-            migrated_alerts.setdefault(
-                fingerprint,
-                {
-                    "firstAlertedAt": seeded_at_text,
-                    "lastAlertedAt": seeded_at_text,
-                    "lastSeenAt": str(
-                        pending.get("lastSeenAt") or seeded_at_text
-                    ),
-                    "count": max(1, int(pending.get("count") or 0)),
-                },
-            )
-        migrated_pending = {}
-
+    # digest는 빈 신규 상태와 운영자가 선택한 delivery gate만 증명한다.
+    # 과거 fingerprint나 불명 pending을 추측해 이 constructor에 넣지 않는다.
     seed_payload = {
-        "legacyAlertDeliveryEnabled": legacy_alert_delivery_enabled,
-        "alertFingerprints": migrated_alerts,
-        "pendingAlertFingerprints": migrated_pending,
-        "pendingDecision": pending_decision,
+        "alertDeliveryEnabled": alert_delivery_enabled,
+        "alertFingerprints": {},
+        "pendingAlertFingerprints": {},
+        "pendingDecision": "preserve",
     }
     seed_digest = hashlib.sha256(
         json.dumps(
@@ -232,16 +206,16 @@ def build_device_health_monitor_seed_cursor(
                 "version": _MONITOR_STATE_VERSION,
                 "seededAt": seeded_at_text,
                 "seedDigest": seed_digest,
-                "pendingDecision": pending_decision,
+                "pendingDecision": "preserve",
                 "overrideRevision": 0,
             },
             "alertDeliveryOverride": {
-                "enabled": legacy_alert_delivery_enabled,
+                "enabled": alert_delivery_enabled,
                 "updatedAt": seeded_at_text,
-                "updatedBy": "manual_cutover_seed",
+                "updatedBy": "clean_initializer",
             },
-            "alertFingerprints": migrated_alerts,
-            "pendingAlertFingerprints": migrated_pending,
+            "alertFingerprints": {},
+            "pendingAlertFingerprints": {},
         }
     )
 
@@ -340,7 +314,6 @@ def run_device_health_monitor_cycle(
         )
     except Exception as exc:
         return _unavailable_cycle_run(
-            request_id=request_id,
             now=local_now,
             state=state,
             reason="device_cache_unavailable",
@@ -364,7 +337,6 @@ def run_device_health_monitor_cycle(
         redis_snapshot = actual_deps.load_redis_snapshot(device_names)
     except Exception as exc:
         return _unavailable_cycle_run(
-            request_id=request_id,
             now=local_now,
             state=state,
             reason="redis_unavailable",
@@ -904,7 +876,7 @@ def _validate_raw_monitor_cursor(value: Mapping[str, Any] | None) -> None:
         raw_state = value.get(key)
         if key not in value or not isinstance(raw_state, Mapping):
             raise ValueError("device health monitor fingerprint state is invalid")
-        _validate_migrated_fingerprint_state(
+        _validate_fingerprint_state(
             raw_state,
             timestamp_key=timestamp_key,
         )
@@ -1233,7 +1205,6 @@ def _verify_device_health_runtime(
             result,
             evidence=evidence,
             checks=checks,
-            overview={},
         )
         return result
 
@@ -1297,7 +1268,6 @@ def _verify_device_health_runtime(
         result,
         evidence=evidence,
         checks=checks,
-        overview=overview,
     )
     result.pop("statusPayload", None)
     return result
@@ -1308,7 +1278,6 @@ def _runtime_device_event_payload(
     *,
     evidence: Mapping[str, Any],
     checks: Mapping[str, Any],
-    overview: Mapping[str, Any],
 ) -> dict[str, Any]:
     """legacy SSH verified event의 bounded probe 요약을 만든다."""
 
@@ -1474,7 +1443,7 @@ def _collect_alert_updates(
         last_alerted = _parse_datetime(previous.get("lastAlertedAt"))
         pending = previous_pending.get(fingerprint, {})
         count = max(0, int(pending.get("count") or 0)) + 1
-        confirmed = count >= _required_confirmation_polls(item)
+        confirmed = count >= _REQUIRED_CONFIRMATION_POLLS
         reminder_due = bool(last_alerted and now - last_alerted >= reminder)
         should_deliver = delivery_enabled and (reminder_due or (not last_alerted and confirmed))
         if should_deliver:
@@ -1866,7 +1835,6 @@ def _delivery_payload(
 
 def _unavailable_cycle_run(
     *,
-    request_id: str,
     now: datetime,
     state: Mapping[str, Any],
     reason: str,
@@ -1884,7 +1852,6 @@ def _unavailable_cycle_run(
         "monitorUnavailableReason": reason,
         "monitorUnavailableErrorType": error_type,
     }
-    del request_id
     archive_status = _write_health_event_best_effort(
         "monitor_unavailable",
         now,
@@ -2328,6 +2295,7 @@ def _normalize_monitor_alert_delivery_override(
         return None
     updated_by = _text(value.get("updatedBy"))
     if updated_by not in {
+        "clean_initializer",
         "manual_cutover_seed",
         "manual_offline_override",
     }:
@@ -2339,14 +2307,14 @@ def _normalize_monitor_alert_delivery_override(
     }
 
 
-def _validate_migrated_fingerprint_state(
+def _validate_fingerprint_state(
     value: Mapping[str, Any] | None,
     *,
     timestamp_key: str,
 ) -> dict[str, dict[str, Any]]:
     if value is None:
         return {}
-    if not isinstance(value, Mapping) or len(value) > _MAX_MIGRATED_FINGERPRINTS:
+    if not isinstance(value, Mapping) or len(value) > _MAX_FINGERPRINTS:
         raise ValueError("device health monitor fingerprint seed is invalid")
     result: dict[str, dict[str, Any]] = {}
     for raw_key, raw_item in value.items():
@@ -2390,7 +2358,7 @@ def _validate_migrated_fingerprint_state(
             ):
                 raise ValueError("device health monitor fingerprint time is invalid")
             normalized["lastAlertedAt"] = last_alerted_at
-        # 이전 bundle은 dedupe key의 4개 축을 모두 보존해야 한다.
+        # durable cursor는 dedupe key의 네 축을 모두 보존해야 한다.
         canonical_key = (
             validate_and_canonicalize_device_health_alert_fingerprint_key(key)
         )
@@ -2559,13 +2527,6 @@ def _alert_fingerprint(item: Mapping[str, Any]) -> str:
     return canonical_device_health_alert_fingerprint(item)
 
 
-def _required_confirmation_polls(item: Mapping[str, Any]) -> int:
-    del item
-    # LED USB의 순간 재인식으로 알림이 생기지 않게 SSH에서도 두 poll
-    # 연속 실패했을 때만 신규 delivery를 만든다.
-    return 2
-
-
 def _suppressible_captureboard(item: Mapping[str, Any]) -> bool:
     return set(item.get("problemComponents") or []) == {"캡처보드"}
 
@@ -2632,7 +2593,7 @@ def _text(value: Any) -> str:
 
 __all__ = [
     "acknowledge_device_health_monitor_deliveries",
-    "build_device_health_monitor_seed_cursor",
+    "build_clean_device_health_monitor_cursor",
     "device_health_monitor_cursor_digest",
     "DeviceHealthMonitorCycleDelivery",
     "DeviceHealthMonitorCycleDeps",

@@ -1,3 +1,6 @@
+from boxer_company._operation_routing_device import (
+    _select_device_diagnostic_followup_command_keys,
+)
 import re
 import threading
 import time
@@ -5,9 +8,9 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from boxer.core.utils import _display_value, _truncate_text
+from boxer.core.utils import _truncate_text
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
-from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.device_status_probe import (
     _display_device_status_probe_reason,
@@ -16,74 +19,11 @@ from boxer_company.routers.device_status_probe import (
 )
 from boxer_company.routers.mda_graphql import _wait_for_mda_device_agent_ssh
 
-_LEADING_DEVICE_DIAGNOSTIC_SCOPE_PATTERN = re.compile(
-    r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
-    re.IGNORECASE,
-)
-_DEVICE_DIAGNOSTIC_START_HINTS = (
-    "진단 시작",
-    "진단시작",
-)
 _DEVICE_DIAGNOSTIC_LOG_PATTERN = re.compile(
     r"(error|exception|fatal|fail|failed|restart|restarted|exit|exited|oom|out of memory|"
     r"killed process|heap|segfault|timeout|timed out|에러|오류|실패|재시작|재부팅)",
     re.IGNORECASE,
 )
-_DEVICE_DIAGNOSTIC_LIVE_FOLLOWUP_HINTS = (
-    "왜",
-    "원인",
-    "로그",
-    "log",
-    "앱",
-    "app",
-    "pm2",
-    "시스템",
-    "system",
-    "os",
-    "journal",
-    "꺼졌",
-    "꺼짐",
-    "종료",
-    "전원",
-    "재시작",
-    "재부팅",
-    "크래시",
-    "에러",
-    "오류",
-    "실패",
-    "메모리",
-    "memory",
-    "디스크",
-    "disk",
-)
-_DEVICE_DIAGNOSTIC_APP_LOG_HINTS = (
-    "왜",
-    "원인",
-    "로그",
-    "log",
-    "앱",
-    "app",
-    "pm2",
-    "재시작",
-    "크래시",
-    "에러",
-    "오류",
-    "실패",
-)
-_DEVICE_DIAGNOSTIC_SYSTEM_LOG_HINTS = (
-    "시스템",
-    "system",
-    "os",
-    "journal",
-    "꺼졌",
-    "꺼짐",
-    "종료",
-    "전원",
-    "재부팅",
-    "크래시",
-)
-_DEVICE_DIAGNOSTIC_MEMORY_HINTS = ("메모리", "memory", "oom", "out of memory")
-_DEVICE_DIAGNOSTIC_DISK_HINTS = ("디스크", "disk", "용량", "저장공간")
 _LOGIN_SHELL_USER_PATH_EXPORT = 'export PATH="$HOME/.npm-global/bin:$HOME/bin:/usr/local/bin:$PATH"; '
 _PM2_JLIST_COMMAND = (
     "bash -lc '"
@@ -205,58 +145,12 @@ _DEVICE_DIAGNOSTIC_SNAPSHOTS: dict[str, dict[str, Any]] = {}
 _DEVICE_DIAGNOSTIC_SNAPSHOTS_LOCK = threading.Lock()
 
 
-def _normalize_device_diagnostic_question(question: str) -> str:
-    text = re.sub(r"<@[^>]+>", " ", str(question or "")).strip()
-    return re.sub(r"[`'\"“”‘’]+", "", text)
-
-
-def _has_device_diagnostic_start_hint(question: str) -> bool:
-    normalized = _normalize_device_diagnostic_question(question)
-    return any(hint in normalized for hint in _DEVICE_DIAGNOSTIC_START_HINTS)
-
-
-def _extract_device_name_for_diagnostic_start(question: str) -> str | None:
-    normalized = _normalize_device_diagnostic_question(question)
-    extracted = _extract_device_name_scope(normalized)
-    if extracted and _has_device_diagnostic_start_hint(normalized):
-        return extracted
-
-    matched = _LEADING_DEVICE_DIAGNOSTIC_SCOPE_PATTERN.search(normalized)
-    if not matched:
-        return None
-
-    candidate = " ".join(str(matched.group(1) or "").split()).strip()
-    remainder = " ".join(str(matched.group(2) or "").split()).strip()
-    if not candidate or not _has_device_diagnostic_start_hint(remainder):
-        return None
-    return candidate
-
-
-def _is_device_diagnostic_start_request(question: str, device_name: str | None = None) -> bool:
-    resolved_device_name = str(device_name or _extract_device_name_for_diagnostic_start(question) or "").strip()
-    return bool(resolved_device_name and _has_device_diagnostic_start_hint(question))
-
-
 def _is_device_diagnostic_runtime_configured() -> bool:
     return bool(
         cs.MDA_GRAPHQL_URL
         and cs.MDA_ADMIN_USER_PASSWORD
         and cs.DEVICE_SSH_PASSWORD
     )
-
-
-def _extract_device_name_for_diagnostic_freeform(question: str) -> str | None:
-    device_name = _extract_device_name_scope(_normalize_device_diagnostic_question(question))
-    if not device_name:
-        return None
-    if not _select_device_diagnostic_followup_command_keys(question):
-        return None
-    return device_name
-
-
-def _is_device_diagnostic_freeform_request(question: str, device_name: str | None = None) -> bool:
-    resolved_device_name = str(device_name or _extract_device_name_for_diagnostic_freeform(question) or "").strip()
-    return bool(resolved_device_name and _select_device_diagnostic_followup_command_keys(question))
 
 
 def _build_device_diagnostic_config_message() -> str:
@@ -333,11 +227,6 @@ def _load_device_diagnostic_snapshot(
         return dict(snapshot) if isinstance(snapshot, dict) else None
 
 
-def _clear_device_diagnostic_snapshots() -> None:
-    with _DEVICE_DIAGNOSTIC_SNAPSHOTS_LOCK:
-        _DEVICE_DIAGNOSTIC_SNAPSHOTS.clear()
-
-
 def _build_device_diagnostic_ssh_state(wait_result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     device_info = wait_result.get("device") if isinstance(wait_result.get("device"), dict) else {}
     agent_ssh = device_info.get("agentSsh") if isinstance(device_info.get("agentSsh"), dict) else {}
@@ -382,33 +271,6 @@ def _run_device_diagnostic_commands(
         result["output"] = _truncate_text(output, 8000)
         results[key] = result
     return results
-
-
-def _has_any_device_diagnostic_hint(question: str, hints: tuple[str, ...]) -> bool:
-    text = _normalize_device_diagnostic_question(question)
-    lowered = text.lower()
-    return any(hint in text or hint in lowered for hint in hints)
-
-
-def _select_device_diagnostic_followup_command_keys(question: str) -> list[str]:
-    if not _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_LIVE_FOLLOWUP_HINTS):
-        return []
-
-    selected: list[str] = ["pm2_jlist"]
-    if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_APP_LOG_HINTS):
-        selected.extend(["pm2_describe_box", "pm2_describe_agent", "pm2_logs_box", "pm2_logs_agent", "app_recent_logs"])
-    if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_SYSTEM_LOG_HINTS):
-        selected.extend(["reboot_history", "system_journal_recent", "kernel_oom"])
-    if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_MEMORY_HINTS):
-        selected.extend(["memory", "kernel_oom"])
-    if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_DISK_HINTS):
-        selected.append("disk")
-
-    deduped: list[str] = []
-    for key in selected:
-        if key not in deduped:
-            deduped.append(key)
-    return deduped
 
 
 def _extract_device_diagnostic_log_lines(checks: dict[str, dict[str, Any]]) -> list[dict[str, str]]:

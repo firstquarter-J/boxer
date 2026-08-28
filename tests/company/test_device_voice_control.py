@@ -1,58 +1,17 @@
-import logging
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
+from boxer_company.operation_routing import (
+    _is_device_voice_catalog_request,
+    _is_device_voice_change_request,
+)
 from boxer_company.routers.device_voice_control import (
     _build_device_voice_catalog_message,
     _build_device_voice_choices_message,
     _change_device_voice,
     _dispatch_device_voice_guide,
     _extract_device_voice_label,
-    _is_device_voice_catalog_request,
-    _is_device_voice_change_request,
 )
-from boxer_company_adapter_slack.device_routes import (
-    DeviceRoutesContext,
-    DeviceRoutesDeps,
-    _handle_device_routes,
-)
-
-
-def _deps() -> DeviceRoutesDeps:
-    return DeviceRoutesDeps(
-        get_s3_client=lambda: None,
-        get_recordings_context=lambda: {},
-        has_recordings_device_mapping=lambda context: False,
-        send_dm_message=lambda user_id, text: False,
-        build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-        reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
-    )
-
-
-def _context(question: str, replies: list[str], *, user_id: str = "UHYUN") -> DeviceRoutesContext:
-    payload = {
-        "text": question,
-        "question": question,
-        "user_id": user_id,
-        "workspace_id": "W123",
-        "channel_id": "C123",
-        "current_ts": "1.1",
-        "thread_ts": "1.0",
-    }
-    return DeviceRoutesContext(
-        question=question,
-        barcode=None,
-        phase2_hospital_name=None,
-        phase2_room_name=None,
-        payload=payload,  # type: ignore[arg-type]
-        user_id=user_id,
-        workspace_id="W123",
-        channel_id="C123",
-        thread_ts="1.0",
-        reply=lambda text, **kwargs: replies.append(text),
-        client=None,
-        logger=logging.getLogger(__name__),
-    )
 
 
 class DeviceVoiceControlTests(unittest.TestCase):
@@ -178,86 +137,6 @@ class DeviceVoiceControlTests(unittest.TestCase):
             "기존 진지한 음성",
         ):
             self.assertIn(f"*{label}*", message)
-
-    def test_route_sends_voice_change_for_any_user(self) -> None:
-        replies: list[str] = []
-        dispatch = {"affected": 1, "status": True, "message": "sent"}
-
-        with (
-            patch("boxer_company_adapter_slack.device_routes.cs.MDA_GRAPHQL_URL", "https://mda.example/graphql"),
-            patch("boxer_company_adapter_slack.device_routes.cs.MDA_ADMIN_USER_PASSWORD", "secret"),
-            patch(
-                "boxer_company_adapter_slack.device_routes._send_mda_device_command",
-                return_value=dispatch,
-            ) as send_command,
-        ):
-            context = _context("MB2-C00419 기존 진지한 음성으로 바꿔줘", replies)
-            handled = _handle_device_routes(context, _deps())
-
-        self.assertTrue(handled)
-        send_command.assert_called_once_with(
-            "MB2-C00419",
-            command="scansim",
-            acme="S_VOICE_LEGACY_2",
-        )
-        self.assertIn("기존 진지한 음성", replies[0])
-        self.assertEqual(context.payload["request_log"]["route_name"], "device voice change")
-
-    def test_route_answers_voice_catalog_without_dispatching_command(self) -> None:
-        replies: list[str] = []
-
-        with patch(
-            "boxer_company_adapter_slack.device_routes._send_mda_device_command",
-        ) as send_command:
-            context = _context("음성 세트 목록", replies)
-            handled = _handle_device_routes(context, _deps())
-
-        self.assertTrue(handled)
-        send_command.assert_not_called()
-        self.assertIn("*장비 음성 세트 목록*", replies[0])
-        self.assertIn("`S_VOICE1`", replies[0])
-        self.assertIn("`S_VOICE_LEGACY_2`", replies[0])
-        self.assertEqual(
-            context.payload["request_log"]["route_name"],
-            "device voice catalog",
-        )
-
-    def test_route_does_not_apply_user_allowlist(self) -> None:
-        replies: list[str] = []
-        dispatch = {"affected": 1, "status": True, "message": "sent"}
-
-        with (
-            patch("boxer_company_adapter_slack.device_routes.cs.MDA_GRAPHQL_URL", "https://mda.example/graphql"),
-            patch("boxer_company_adapter_slack.device_routes.cs.MDA_ADMIN_USER_PASSWORD", "secret"),
-            patch(
-                "boxer_company_adapter_slack.device_routes._send_mda_device_command",
-                return_value=dispatch,
-            ) as send_command,
-        ):
-            handled = _handle_device_routes(
-                _context("MB2-C00419 귀여운 음성으로 바꿔줘", replies, user_id="UOTHER"),
-                _deps(),
-            )
-
-        self.assertTrue(handled)
-        send_command.assert_called_once_with(
-            "MB2-C00419",
-            command="scansim",
-            acme="S_VOICE1",
-        )
-        self.assertIn("명령 전송 완료", replies[0])
-
-    def test_route_requests_device_name_before_dispatch(self) -> None:
-        replies: list[str] = []
-
-        handled = _handle_device_routes(
-            _context("진지한 음성으로 바꿔줘", replies),
-            _deps(),
-        )
-
-        self.assertTrue(handled)
-        self.assertIn("장비명이 필요해", replies[0])
-
 
 if __name__ == "__main__":
     unittest.main()

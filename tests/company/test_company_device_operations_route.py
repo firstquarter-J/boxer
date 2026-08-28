@@ -16,8 +16,8 @@ from boxer_company.assistant.device_operations_route import (
     DEVICE_OPERATION_DELIVERY_ACTION,
     DeviceOperationsAssistantRoute,
     DeviceOperationsRouteDeps,
-    match_device_operation_route,
 )
+from boxer_company.operation_routing import match_device_operation_route
 
 
 def _request(

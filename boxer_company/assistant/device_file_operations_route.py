@@ -1,5 +1,22 @@
 from __future__ import annotations
 
+# 파일 실행은 provider-free 정본과 실행에 필요한 scope parser만 소비한다.
+from boxer_company._operation_routing_file import (
+    _BARCODE_PATTERN,
+    _explicit_device_names,
+    _first_metadata_text,
+    _request_file_hospital_room,
+    _request_log_hospital_room,
+    _single_request_barcode,
+    is_device_file_download_delivery_receipt,
+)
+from boxer_company.operation_routing import (
+    match_device_file_operation_route,
+)
+from boxer_company.read_routing import (
+    _extract_log_date_with_presence,
+)
+
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -23,10 +40,6 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
     SourceReference,
 )
-from boxer_company.routers.barcode_log import (
-    _extract_hospital_room_scope,
-    _extract_log_date_with_presence,
-)
 from boxer_company.routers.box_db import (
     _load_recordings_context_by_barcode,
     _lookup_device_contexts_by_barcode,
@@ -38,11 +51,8 @@ from boxer_company.routers.device_file_probe import (
     _build_device_file_probe_config_message,
     _build_device_file_recovery_config_message,
     _build_device_file_scope_request_message,
-    _is_barcode_device_file_probe_request,
     _locate_barcode_file_candidates,
-    _should_download_device_files,
     _should_probe_device_files,
-    _should_recover_device_files,
     _should_render_compact_device_download_result,
     _should_render_compact_device_file_list,
     _should_render_compact_device_recovery_result,
@@ -50,45 +60,25 @@ from boxer_company.routers.device_file_probe import (
 )
 from boxer_company.routers.device_log_upload import (
     _check_and_request_device_log_upload,
-    _extract_hospital_room_scope_for_log_upload,
-    _is_device_log_upload_check_request,
 )
 from boxer_company.routers.mda_graphql import (
     _create_mda_activity_log,
     _send_mda_device_command,
 )
-from boxer_company.routers.recording_streaming_restore import (
-    _extract_recording_streaming_restore_month,
-    _is_recording_streaming_restore_request,
+from boxer_company.transport_contracts import (
+    DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE,
+    DEVICE_FILE_DOWNLOAD_DELIVERY_ACTION,
+    DEVICE_FILE_DOWNLOAD_ROUTE,
+    DEVICE_FILE_LOOKUP_ROUTE,
+    DEVICE_FILE_RECOVERY_ROUTE,
+    DEVICE_LOG_UPLOAD_ROUTE,
+    TRUSTED_MDA_RECOVERY_SCOPE_METADATA_KEY,
+    build_trusted_mda_recovery_scope_metadata,
+    needs_device_file_operation_context,
+    resolve_device_file_operation_scope,
 )
 
 
-DEVICE_LOG_UPLOAD_ROUTE = "device_log_upload"
-DEVICE_FILE_LOOKUP_ROUTE = "device_file_lookup"
-DEVICE_FILE_DOWNLOAD_ROUTE = "device_file_download"
-DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE = (
-    "device_file_download_barcode_required"
-)
-DEVICE_FILE_RECOVERY_ROUTE = "device_file_recovery"
-DEVICE_FILE_DOWNLOAD_DELIVERY_ACTION = (
-    "device_file_download_delivery"
-)
-TRUSTED_MDA_RECOVERY_SCOPE_METADATA_KEY = (
-    "trusted_mda_recovery_scope"
-)
-
-_OPERATIONS_ROUTE_GROUP = "operations"
-_BARCODE_PATTERN = re.compile(r"(?<!\d)(\d{11})(?!\d)")
-_DEVICE_NAME_LABEL_PATTERN = re.compile(
-    r"(?:장비명|devicename)\s*[:=]?\s*([A-Za-z0-9._-]+)",
-    re.IGNORECASE,
-)
-_DEVICE_NAME_TOKEN_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])"
-    r"([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9-]*\d[A-Za-z0-9-]*)"
-    r"(?![A-Za-z0-9])",
-    re.IGNORECASE,
-)
 _SLACK_LINK_PATTERN = re.compile(r"<(https?://[^|>\s]+)\|([^>\n]+)>")
 _MAX_PRIVATE_LINK_URI_CHARS = 16_384
 _MAX_DOWNLOAD_DELIVERY_STATES = 1_024
@@ -199,93 +189,6 @@ class _DeviceFileDownloadDelivery:
     log_date: str
     records: tuple[dict[str, Any], ...]
     used_expanded_scope: bool
-
-
-def match_device_file_operation_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """외부 호출 없이 기존 Slack parser의 첫 작업 범위를 분류한다."""
-
-    if (
-        str(request.metadata.get("route_group") or "").strip()
-        != _OPERATIONS_ROUTE_GROUP
-    ):
-        return None
-    if is_device_file_download_delivery_receipt(request):
-        # DM 성공 뒤 같은 request ID로 들어오는 typed receipt는 자연어를
-        # 다시 실행하지 않고 URL 없는 delivery manifest만 확정한다.
-        return DEVICE_FILE_DOWNLOAD_ROUTE
-    question = request.question
-    if (
-        _single_request_barcode(request) is None
-        and _is_missing_barcode_device_download_request(question)
-    ):
-        # 기존 Slack의 바코드 선행 안내를 장비 음성/상태 mutation보다 먼저
-        # 확정해 복합 문장이 다른 작업으로 내려가지 않게 한다.
-        return DEVICE_FILE_DOWNLOAD_BARCODE_REQUIRED_ROUTE
-    explicit_devices = _explicit_device_names(question)
-    if _is_device_log_upload_check_request(question):
-        hospital_name, room_name = _request_log_hospital_room(request)
-        if explicit_devices or (hospital_name and room_name):
-            return DEVICE_LOG_UPLOAD_ROUTE
-        return None
-
-    barcode = _single_request_barcode(request)
-    if barcode is None:
-        return None
-    if _is_recording_streaming_restore_request(question, barcode):
-        try:
-            _extract_recording_streaming_restore_month(question)
-        except ValueError:
-            # 일자가 지정된 장비 파일 복구는 아래 파일 route가 소유한다.
-            pass
-        else:
-            # 월 단위 MDA recordings 복원은 기존 전용 operation이 소유한다.
-            return None
-    if not _is_barcode_device_file_probe_request(question, barcode):
-        return None
-    if _should_recover_device_files(question):
-        return DEVICE_FILE_RECOVERY_ROUTE
-    if _should_download_device_files(question):
-        return DEVICE_FILE_DOWNLOAD_ROUTE
-    return DEVICE_FILE_LOOKUP_ROUTE
-
-
-def is_device_file_download_delivery_receipt(
-    request: CompanyAssistantRequest,
-) -> bool:
-    """고정된 delivered action만 다운로드 전달 receipt로 인정한다."""
-
-    if (
-        str(request.metadata.get("route_group") or "").strip()
-        != _OPERATIONS_ROUTE_GROUP
-    ):
-        return False
-    action = request.metadata.get("operation_action")
-    return bool(
-        isinstance(action, Mapping)
-        and frozenset(action) == {"name", "phase", "delivery"}
-        and str(action.get("name") or "").strip()
-        == DEVICE_FILE_DOWNLOAD_DELIVERY_ACTION
-        and str(action.get("phase") or "").strip() == "delivered"
-    )
-
-
-def _is_missing_barcode_device_download_request(question: str) -> bool:
-    if _single_explicit_barcode(question) is not None:
-        return False
-    if not _should_download_device_files(question):
-        return False
-    normalized = str(question or "").strip()
-    availability_hints = (
-        "다운로드 가능 상태",
-        "다운로드 가능 여부",
-        "다운로드 가능한지",
-        "다운 가능 상태",
-        "다운 가능 여부",
-        "다운 가능한지",
-    )
-    return not any(hint in normalized for hint in availability_hints)
 
 
 class DeviceFileOperationsAssistantRoute:
@@ -1373,40 +1276,6 @@ def _is_safe_private_link_uri(uri: str) -> bool:
     )
 
 
-def build_trusted_mda_recovery_scope_metadata(
-    *,
-    barcode: str,
-    log_date: str,
-    device_context: Mapping[str, Any],
-) -> dict[str, Any]:
-    """검증된 Slack MDA 복구 root를 API에 넘기는 고정 metadata 계약이다."""
-
-    scope = _normalize_trusted_mda_recovery_scope(
-        {
-            "barcode": barcode,
-            "logDate": log_date,
-            "deviceName": device_context.get("deviceName"),
-            "hospitalName": device_context.get("hospitalName"),
-            "roomName": device_context.get("roomName"),
-        }
-    )
-    if scope is None:
-        raise ValueError("trusted MDA recovery scope is invalid")
-    return {TRUSTED_MDA_RECOVERY_SCOPE_METADATA_KEY: scope}
-
-
-def resolve_device_file_operation_scope(
-    request: CompanyAssistantRequest,
-) -> tuple[str | None, str | None]:
-    """Slack root 검증 전에 route와 같은 바코드·날짜 scope를 해석한다."""
-
-    barcode = _single_request_barcode(request)
-    log_date, has_requested_date = _extract_log_date_with_presence(
-        request.question
-    )
-    return barcode, log_date if has_requested_date else None
-
-
 def _trusted_mda_recovery_device_contexts(
     request: CompanyAssistantRequest,
     *,
@@ -1470,92 +1339,6 @@ def _normalize_trusted_mda_recovery_scope(
     }
 
 
-def _single_explicit_barcode(question: str) -> str | None:
-    matched = _BARCODE_PATTERN.search(str(question or ""))
-    return matched.group(1) if matched is not None else None
-
-
-def _single_request_barcode(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    explicit = _single_explicit_barcode(request.question)
-    if explicit is not None:
-        return explicit
-    metadata_barcode = str(request.metadata.get("barcode") or "").strip()
-    if _BARCODE_PATTERN.fullmatch(metadata_barcode):
-        return metadata_barcode
-    # 기존 turn scope처럼 같은 요청자의 최신 thread 메시지부터 보고,
-    # 한 thread에 과거 바코드가 여러 개 있어도 가장 최근 대상을 쓴다.
-    for entry in reversed(_request_context_entries(request)):
-        matched = _BARCODE_PATTERN.search(str(entry.get("text") or ""))
-        if matched is not None:
-            return matched.group(1)
-    return None
-
-
-def _request_file_hospital_room(
-    request: CompanyAssistantRequest,
-) -> tuple[str | None, str | None]:
-    """현재 질문을 우선하고 adapter의 phase2 scope는 fallback으로 쓴다."""
-
-    question_hospital, question_room = _extract_hospital_room_scope(
-        request.question
-    )
-    metadata_hospital = _first_metadata_text(
-        request,
-        "hospital_name",
-        "hospitalName",
-        "phase2_hospital_name",
-        "phase2HospitalName",
-    )
-    metadata_room = _first_metadata_text(
-        request,
-        "room_name",
-        "roomName",
-        "phase2_room_name",
-        "phase2RoomName",
-    )
-    return (
-        question_hospital or metadata_hospital,
-        question_room or metadata_room,
-    )
-
-
-def _request_log_hospital_room(
-    request: CompanyAssistantRequest,
-) -> tuple[str | None, str | None]:
-    hospital_name, room_name = _extract_hospital_room_scope_for_log_upload(
-        request.question
-    )
-    if hospital_name and room_name:
-        return hospital_name, room_name
-    metadata_hospital, metadata_room = _request_file_hospital_room(request)
-    if metadata_hospital and metadata_room:
-        return metadata_hospital, metadata_room
-    for entry in reversed(_request_context_entries(request)):
-        hospital_name, room_name = (
-            _extract_hospital_room_scope_for_log_upload(
-                str(entry.get("text") or "")
-            )
-        )
-        if hospital_name and room_name:
-            return hospital_name, room_name
-    return None, None
-
-
-def _first_metadata_text(
-    request: CompanyAssistantRequest,
-    *keys: str,
-) -> str | None:
-    for key in keys:
-        value = request.metadata.get(key)
-        if isinstance(value, str):
-            normalized = " ".join(value.split()).strip()
-            if normalized:
-                return normalized
-    return None
-
-
 def _request_actor_name(request: CompanyAssistantRequest) -> str | None:
     return _first_metadata_text(
         request,
@@ -1583,56 +1366,6 @@ def _extract_log_upload_date(
         if scope_value:
             date_question = date_question.replace(scope_value, " ")
     return _extract_log_date_with_presence(date_question)
-
-
-def _request_context_entries(
-    request: CompanyAssistantRequest,
-) -> tuple[dict[str, Any], ...]:
-    """Slack thread 전체를 원래 순서대로 보존한다."""
-
-    return tuple(
-        entry
-        for entry in request.context_entries
-        if isinstance(entry, dict)
-    )
-
-
-def needs_device_file_operation_context(question: str) -> bool:
-    """현재 질문에 target이 없을 때만 Slack thread 문맥을 요청한다."""
-
-    normalized = str(question or "")
-    if _is_device_log_upload_check_request(normalized):
-        devices = _explicit_device_names(normalized)
-        hospital_name, room_name = _extract_hospital_room_scope_for_log_upload(
-            normalized
-        )
-        return not devices and not (hospital_name and room_name)
-    if _single_explicit_barcode(normalized) is not None:
-        return False
-    return _is_barcode_device_file_probe_request(normalized, "context")
-
-
-def has_ambiguous_device_file_operation_scope(
-    request: CompanyAssistantRequest,
-) -> bool:
-    """기존 Slack은 현재 질문이나 최신 thread 문맥의 첫 범위를 썼다."""
-
-    del request
-    return False
-
-
-def _explicit_device_names(question: str) -> dict[str, str]:
-    normalized = re.sub(r"<@[^>]+>", " ", str(question or ""))
-    candidates = [
-        *(match.group(1) for match in _DEVICE_NAME_LABEL_PATTERN.finditer(normalized)),
-        *(match.group(1) for match in _DEVICE_NAME_TOKEN_PATTERN.finditer(normalized)),
-    ]
-    exact: dict[str, str] = {}
-    for raw_candidate in candidates:
-        candidate = str(raw_candidate or "").strip().strip("`'\"")
-        if candidate and cs.S3_DEVICE_NAME_PATTERN.fullmatch(candidate):
-            exact.setdefault(candidate.casefold(), candidate)
-    return exact
 
 
 def _single_explicit_device_name(question: str) -> str | None:
@@ -1683,9 +1416,6 @@ __all__ = [
     "DeviceFileOperationsAssistantRoute",
     "DeviceFileOperationsRouteDeps",
     "build_trusted_mda_recovery_scope_metadata",
-    "has_ambiguous_device_file_operation_scope",
-    "is_device_file_download_delivery_receipt",
-    "match_device_file_operation_route",
     "needs_device_file_operation_context",
     "resolve_device_file_operation_scope",
 ]

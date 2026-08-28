@@ -5,7 +5,7 @@ from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.sms_delivery import (
     _SMS_DELIVERY_ACCEPTED,

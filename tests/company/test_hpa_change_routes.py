@@ -449,9 +449,7 @@ class HpaChangeRoutesTests(unittest.TestCase):
         self.assertEqual(request.selection_mode, "thread")
         self.assertEqual(request.requester_user_id, "UOTHER")
         self.assertEqual(request.source_channel_id, "CHPA")
-        self.assertEqual(request.thread_message_count, 1)
         self.assertIn(requirement, request.thread_text)
-        self.assertNotIn("slack.com", request.question)
         self.assertIn("TASK-DIRECT", replies[0][0])
         self.assertIn("스레드 1개", replies[0][0])
 
@@ -612,7 +610,6 @@ class HpaChangeRoutesTests(unittest.TestCase):
             request.thread_url,
             "https://workspace.slack.com/archives/CHPA/p1.0",
         )
-        self.assertEqual(request.thread_message_count, 2)
         self.assertIn("HPA CR 반영 요청", request.thread_text)
         self.assertIn("현재 HPA는 Vercel이 아니야", request.thread_text)
         self.assertEqual([item.name for item in request.attachments], ["scan-precrop.ts", "hand-qa.tsx"])

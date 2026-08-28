@@ -83,17 +83,12 @@ def _request() -> HpaChangeRequest:
         ),
         event_ts="1720580400.000100",
         requester_user_id="U07A5FM5XPD",
-        question="HPA 변경 요청",
         thread_text="Bonus 프롬프트 변경을 검토해줘",
-        thread_message_count=1,
         attachments=(
             HpaChangeAttachment(
-                file_id="FPRIVATE",
                 name="handoff.txt",
-                mimetype="text/plain",
                 size_bytes=11,
                 content="prompt body",
-                message_ts="1720580000.000001",
             ),
         ),
         initiator_user_id="U07A5FM5XPD",

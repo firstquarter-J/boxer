@@ -1,3 +1,8 @@
+from boxer_company._operation_routing_device import (
+    _LEADING_DEVICE_UPDATE_SCOPE_PATTERN,
+    _extract_device_name_for_update,
+    _normalize_device_update_question,
+)
 import json
 import re
 import shlex
@@ -6,9 +11,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
-from boxer_company.routers.barcode_log import _extract_device_name_scope
+from boxer_company.read_routing import _extract_device_name_scope
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.device_ssh_security import (
     _mark_company_api_mutation_attempted,
@@ -24,63 +29,9 @@ from boxer_company.routers.mda_graphql import (
 )
 from boxer_company.routers.ssh_command import _close_ssh_streams, _wait_for_ssh_exit_status
 
-_LEADING_DEVICE_UPDATE_SCOPE_PATTERN = re.compile(
-    r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
-    re.IGNORECASE,
-)
 _SEMVER_PATTERN = re.compile(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)")
 _AGENT_GIT_KV_PATTERN = re.compile(r"^(HEAD|ORIGIN_MAIN|BRANCH|PKG_VERSION|ORIGIN_PKG_VERSION)=(.*)$")
 
-_UPDATE_HINTS = (
-    "업데이트",
-    "update",
-    "upgrade",
-    "패치",
-)
-_UPDATE_STATUS_HINTS = (
-    "상태",
-    "현황",
-    "확인",
-    "체크",
-)
-_GENERIC_DEVICE_HINTS = (
-    "장비",
-    "device",
-)
-_BOX_UPDATE_HINTS = (
-    "박스",
-    "box",
-    "mommybox-v2",
-    "momybox-v2",
-    "mommybox",
-    "momybox",
-)
-_AGENT_UPDATE_HINTS = (
-    "에이전트",
-    "agent",
-    "mommybox-v2-agent",
-    "momybox-v2-agent",
-    "mommybox-agent",
-    "momybox-agent",
-)
-_POWER_HINTS = (
-    "전원",
-    "power",
-)
-_POWER_OFF_HINTS = (
-    "장비 종료",
-    "장비종료",
-    "전원 종료",
-    "전원종료",
-    "전원 꺼",
-    "전원꺼",
-    "전원 끄기",
-    "전원 꺼줘",
-    "꺼버려",
-    "power off",
-    "poweroff",
-    "shutdown",
-)
 _LOGIN_SHELL_USER_PATH_EXPORT = 'export PATH="$HOME/.npm-global/bin:$HOME/bin:/usr/local/bin:$PATH"; '
 _PM2_JLIST_COMMAND = (
     "bash -lc '"
@@ -89,7 +40,6 @@ _PM2_JLIST_COMMAND = (
     "pm2 jlist 2>&1; "
     "else echo pm2_missing; fi'"
 )
-_AGENT_REPO_PATH = "/home/mommytalk/mommybox-v2-agent"
 _AGENT_GIT_STATUS_COMMAND = (
     "bash -lc '"
     "if [ -d /home/mommytalk/mommybox-v2-agent/.git ]; then "
@@ -152,34 +102,6 @@ class _DeviceSshOpenBudget:
     initial_open_used: bool = False
 
 
-def _normalize_device_update_question(question: str) -> str:
-    text = re.sub(r"<@[^>]+>", " ", str(question or "")).strip()
-    return re.sub(r"[`'\"“”‘’]+", "", text)
-
-
-def _contains_hint(text: str, hints: tuple[str, ...]) -> bool:
-    normalized = str(text or "").strip()
-    lowered = normalized.lower()
-    return any(hint in normalized or hint in lowered for hint in hints)
-
-
-def _extract_device_name_for_update(question: str) -> str | None:
-    normalized = _normalize_device_update_question(question)
-    extracted = _extract_device_name_scope(normalized)
-    if extracted and _contains_hint(normalized, _UPDATE_HINTS + _UPDATE_STATUS_HINTS):
-        return extracted
-
-    matched = _LEADING_DEVICE_UPDATE_SCOPE_PATTERN.search(normalized)
-    if not matched:
-        return None
-
-    candidate = " ".join(str(matched.group(1) or "").split()).strip()
-    remainder = " ".join(str(matched.group(2) or "").split()).strip()
-    if not candidate or not _contains_hint(remainder, _UPDATE_HINTS + _UPDATE_STATUS_HINTS):
-        return None
-    return candidate
-
-
 def _extract_requested_update_version(question: str) -> str | None:
     matched = _SEMVER_PATTERN.search(_normalize_device_update_question(question))
     if not matched:
@@ -201,64 +123,6 @@ def _resolve_update_device_name(question: str, device_name: str | None = None) -
     if not resolved:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 박스 업데이트`")
     return resolved
-
-
-def _is_device_update_status_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_update_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_update(normalized) or "").strip()
-    if not resolved_device_name:
-        return False
-    return _contains_hint(normalized, _UPDATE_HINTS) and _contains_hint(normalized, _UPDATE_STATUS_HINTS)
-
-
-def _is_device_agent_update_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_update_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_update(normalized) or "").strip()
-    if not resolved_device_name or _is_device_update_status_request(normalized, resolved_device_name):
-        return False
-    return _contains_hint(normalized, _UPDATE_HINTS) and _contains_hint(normalized, _AGENT_UPDATE_HINTS)
-
-
-def _is_device_box_update_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_update_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_update(normalized) or "").strip()
-    if not resolved_device_name or _is_device_update_status_request(normalized, resolved_device_name):
-        return False
-    if _contains_hint(normalized, _AGENT_UPDATE_HINTS):
-        return False
-    return _contains_hint(normalized, _UPDATE_HINTS) and (
-        _contains_hint(normalized, _BOX_UPDATE_HINTS)
-        or _contains_hint(normalized, _GENERIC_DEVICE_HINTS)
-    )
-
-
-def _is_device_power_off_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_update_question(question)
-    matched = _LEADING_DEVICE_UPDATE_SCOPE_PATTERN.search(normalized)
-    leading_device_name = " ".join(str(matched.group(1) or "").split()).strip() if matched else ""
-    resolved_device_name = str(
-        device_name
-        or _extract_device_name_scope(normalized)
-        or leading_device_name
-        or _extract_device_name_for_update(normalized)
-        or ""
-    ).strip()
-    if not resolved_device_name:
-        return False
-    if (
-        _is_device_update_status_request(normalized, resolved_device_name)
-        or _is_device_agent_update_request(normalized, resolved_device_name)
-        or _is_device_box_update_request(normalized, resolved_device_name)
-    ):
-        return False
-    if _contains_hint(normalized, _POWER_OFF_HINTS):
-        return True
-    return _contains_hint(normalized, _POWER_HINTS) and (
-        "꺼" in normalized
-        or "끄" in normalized
-        or "종료" in normalized
-        or "off" in normalized.lower()
-    )
 
 
 def _build_device_update_config_message() -> str:

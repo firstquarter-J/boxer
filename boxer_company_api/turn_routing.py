@@ -3,11 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
-from boxer_company.assistant.device_db_detail_route import (
+from boxer_company.operation_routing import match_company_operation_route
+from boxer_company.read_routing import (
     match_device_detail_route,
-)
-from boxer_company.assistant.operations import (
-    match_company_operation_route,
 )
 
 
@@ -16,7 +14,6 @@ class EffectiveTurnRoute:
     """API가 외부 조회 없이 확정한 turn 보안·실행 범위다."""
 
     route_group: str | None
-    matched_route: str | None = None
     client_hint_mismatch: bool = False
 
 
@@ -35,7 +32,6 @@ def resolve_effective_turn_route(
     if operation_route is not None:
         return _sensitive_route(
             "operations",
-            matched_route=operation_route,
             client_route_group=normalized_hint,
         )
 
@@ -45,7 +41,6 @@ def resolve_effective_turn_route(
     if device_detail_route is not None:
         return _sensitive_route(
             "device_detail",
-            matched_route=device_detail_route,
             client_route_group=normalized_hint,
         )
 
@@ -57,14 +52,12 @@ def resolve_effective_turn_route(
 def _sensitive_route(
     route_group: str,
     *,
-    matched_route: str,
     client_route_group: str | None,
 ) -> EffectiveTurnRoute:
     """민감 분류와 명시적 client hint가 다르면 실행 전 불일치로 표시한다."""
 
     return EffectiveTurnRoute(
         route_group=route_group,
-        matched_route=matched_route,
         client_hint_mismatch=(
             client_route_group is not None
             and client_route_group != route_group

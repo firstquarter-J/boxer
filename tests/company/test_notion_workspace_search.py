@@ -6,7 +6,6 @@ from boxer_company.notion_workspace_search import (
     _CONTENT_CACHE,
     CompanyNotionSearchResult,
     _PARENT_CACHE,
-    _build_company_notion_search_reply,
     _extract_company_notion_search_query,
     _load_company_notion_page_lines,
     _load_company_notion_references,
@@ -248,23 +247,6 @@ class CompanyNotionSearchTests(unittest.TestCase):
             )
 
         self.assertEqual(results, [])
-
-    def test_reply_contains_only_safe_notion_links(self) -> None:
-        result = CompanyNotionSearchResult(
-            object_id=_COMMERCE_PAGE_ID,
-            object_type="page",
-            title="Commerce & Sales",
-            url=f"https://app.notion.com/p/{_COMMERCE_PAGE_ID}",
-            last_edited_time="",
-        )
-
-        reply = _build_company_notion_search_reply("Commerce", [result])
-
-        self.assertIn("회사 Notion 검색", reply)
-        self.assertIn("Commerce &amp; Sales", reply)
-        self.assertIn(result.url, reply)
-        self.assertIn("제목 검색", reply)
-
 
 class CompanyNotionContentTests(unittest.TestCase):
     def setUp(self) -> None:

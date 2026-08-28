@@ -176,8 +176,6 @@ def _settings(
         connect_timeout_sec=0.5,
         read_timeout_sec=2.0,
         max_retries=0,
-        notion_mode="remote",
-        notion_fallback_enabled=True,
     )
 
 

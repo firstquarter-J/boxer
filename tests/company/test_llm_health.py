@@ -1,10 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-import pymysql
-from botocore.exceptions import ClientError
-
-from boxer_company_adapter_slack.company import _build_dependency_failure_reply, _format_ping_llm_status
+from boxer_company_adapter_slack.health import (
+    _format_ping_llm_status,
+)
 from boxer.core.llm import _build_claude_client, _check_claude_health, _resolve_anthropic_auth_token
 
 
@@ -88,25 +87,6 @@ class ClaudeHealthTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("응답 오류", str(result["summary"]))
-
-
-class DependencyFailureReplyTests(unittest.TestCase):
-    def test_maps_db_errors_to_db_reply(self) -> None:
-        message = _build_dependency_failure_reply("바코드 로그 분석", pymysql.MySQLError("db down"))
-
-        self.assertEqual(
-            message,
-            "바코드 로그 분석 중 오류가 발생했어. DB 연결 또는 조회에 실패했어",
-        )
-
-    def test_maps_s3_access_denied_to_permission_reply(self) -> None:
-        error = ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
-        message = _build_dependency_failure_reply("바코드 로그 분석", error)
-
-        self.assertEqual(
-            message,
-            "바코드 로그 분석 중 오류가 발생했어. S3 접근 권한을 확인해줘",
-        )
 
 
 if __name__ == "__main__":

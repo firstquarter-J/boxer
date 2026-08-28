@@ -195,7 +195,6 @@ def create_app():
                 tenant_ids=frozenset({_EXPECTED_TENANT_ID}),
                 channels=frozenset({"slack"}),
                 actor_ids=frozenset({_EXPECTED_ACTOR_ID}),
-                allow_anonymous_actor=False,
                 capabilities=frozenset({"assistant.turn.read"}),
             ),
         ),

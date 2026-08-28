@@ -2,29 +2,15 @@ import re
 from collections import Counter
 from typing import Any
 
-from boxer.core import settings as s
-from boxer.core.utils import _display_value, _format_size, _normalize_spaces, _truncate_text
-from boxer_company.routers.barcode_log import _extract_device_name_scope, _extract_log_date_with_presence
+from boxer.core.utils import _truncate_text
+from boxer_company import settings as cs
+from boxer_company.utils import (
+    _display_value,
+    _format_size,
+)
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
 
-_DEVICE_LED_LOG_HINTS = ("led", "엘이디")
-_DEVICE_LOG_HINTS = ("로그", "log")
-_DEVICE_LED_LOG_INVESTIGATION_HINTS = (
-    "이상",
-    "문제",
-    "조사",
-    "분석",
-    "확인",
-    "찾아",
-    "있을까",
-    "있나",
-    "있어",
-    "원인",
-    "전원오프",
-    "전원 오프",
-    "오프상태",
-)
 _LED_COMMAND_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}\.\d{3}).*"
     r"\[MmtLED\]\s+info:\s+Sending Command\s+(?P<command>LC:[A-Z0-9:]+)",
@@ -103,23 +89,6 @@ _COMMAND_SPECS: dict[str, dict[str, str]] = {
     },
 }
 _NORMAL_STATES = {"ready", "motion", "recording", "paused"}
-
-
-def _is_device_led_log_analysis_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_spaces(question).lower()
-    if not normalized:
-        return False
-    resolved_device_name = str(device_name or _extract_device_name_scope(question) or "").strip()
-    if not resolved_device_name:
-        return False
-    has_led_hint = any(hint in normalized for hint in _DEVICE_LED_LOG_HINTS)
-    has_log_hint = any(hint in normalized for hint in _DEVICE_LOG_HINTS)
-    has_investigation_hint = any(hint in normalized for hint in _DEVICE_LED_LOG_INVESTIGATION_HINTS)
-    try:
-        _, has_requested_date = _extract_log_date_with_presence(question)
-    except ValueError:
-        has_requested_date = False
-    return bool(has_led_hint and (has_log_hint or (has_requested_date and has_investigation_hint)))
 
 
 def _format_led_log_date_required_message(device_name: str | None = None) -> str:
@@ -266,7 +235,7 @@ def _analyze_device_led_log(
             "logDate": log_date,
         },
         "logFound": True,
-        "s3Bucket": s.S3_LOG_BUCKET,
+        "s3Bucket": cs.S3_LOG_BUCKET,
         "s3Key": log_data.get("key"),
         "contentLength": log_data.get("content_length"),
         "lineCount": len(lines),
@@ -352,11 +321,10 @@ def _render_device_led_log_analysis(payload: dict[str, Any]) -> str:
         for line in hardware_failure_lines[:5]:
             lines.append(f"- `{_line_timestamp(line) or '-'}` {_truncate_text(line, 260)}")
 
-    return _truncate_text("\n".join(lines), s.S3_QUERY_MAX_RESULT_CHARS)
+    return _truncate_text("\n".join(lines), cs.S3_QUERY_MAX_RESULT_CHARS)
 
 
 __all__ = [
     "_analyze_device_led_log",
     "_format_led_log_date_required_message",
-    "_is_device_led_log_analysis_request",
 ]

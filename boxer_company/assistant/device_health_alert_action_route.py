@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# 순수 분류 정본은 provider-free 모듈이 소유하고 이 실행 모듈은 재수출한다.
+from boxer_company.operation_routing import (
+    _DEVICE_HEALTH_ALERT_ACTION_ROUTES,
+    match_device_health_alert_action_route,
+)
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
@@ -10,7 +16,6 @@ from typing import Any, Callable, Mapping
 import requests
 
 from boxer.core import settings as core_settings
-from boxer.core.utils import _display_value
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as company_settings
 from boxer_company.device_health_event_log import (
@@ -42,17 +47,18 @@ from boxer_company.sms_delivery import (
 from boxer_company.sms_delivery_cycle import (
     remember_sms_delivery_sheet_record,
 )
+from boxer_company.transport_contracts import (
+    DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
+    DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+    DEVICE_HEALTH_ALERT_SMS_ACTION,
+    DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
+    DEVICE_HEALTH_ALERT_SMS_ROUTE,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
+    DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
+    DEVICE_HEALTH_ALERT_VOICE_ACTION,
+    DEVICE_HEALTH_ALERT_VOICE_ROUTE,
+)
 
-
-DEVICE_HEALTH_ALERT_SMS_ACTION = "device_health_alert_contact_hospital"
-DEVICE_HEALTH_ALERT_VOICE_ACTION = "device_health_alert_device_voice_guide"
-DEVICE_HEALTH_ALERT_MARK_DONE_ACTION = "device_health_alert_mark_done"
-DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION = "device_health_alert_ui_receipt"
-DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE = "device_health_alert_sms_prepare"
-DEVICE_HEALTH_ALERT_SMS_ROUTE = "device_health_alert_sms"
-DEVICE_HEALTH_ALERT_VOICE_ROUTE = "device_health_alert_voice_guide"
-DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE = "device_health_alert_mark_done"
-DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE = "device_health_alert_ui_receipt"
 
 _DEVICE_HEALTH_ALERT_ACTION_LABELS = {
     DEVICE_HEALTH_ALERT_SMS_ACTION: "병원 문자 보내기",
@@ -60,10 +66,6 @@ _DEVICE_HEALTH_ALERT_ACTION_LABELS = {
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION: "확인 완료",
 }
 
-_DEVICE_HEALTH_ALERT_ACTION_ROUTES = {
-    DEVICE_HEALTH_ALERT_VOICE_ACTION: DEVICE_HEALTH_ALERT_VOICE_ROUTE,
-    DEVICE_HEALTH_ALERT_MARK_DONE_ACTION: DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
-}
 _DEVICE_HEALTH_ALERT_VOICE_MINIMUM_VERSION = (2, 11, 308)
 _DEVICE_HEALTH_ALERT_VOICE_MINIMUM_VERSION_TEXT = "2.11.308"
 _DEVICE_HEALTH_ALERT_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
@@ -677,33 +679,6 @@ class DeviceHealthAlertActionAssistantRoute:
                 f"• 대상: `{_format_target(action.target)}`"
             ),
         )
-
-
-def match_device_health_alert_action_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """question 내용과 무관하게 검증된 typed metadata만 분류한다."""
-
-    if str(request.metadata.get("route_group") or "").strip() != "operations":
-        return None
-    raw_action = request.metadata.get("operation_action")
-    if not isinstance(raw_action, Mapping):
-        return None
-    action_name = str(raw_action.get("name") or "").strip()
-    if action_name == DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION:
-        return (
-            DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE
-            if str(raw_action.get("phase") or "").strip() == "receipt"
-            else None
-        )
-    if action_name == DEVICE_HEALTH_ALERT_SMS_ACTION:
-        phase = str(raw_action.get("phase") or "").strip()
-        if phase == "prepare":
-            return DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE
-        if phase == "execute":
-            return DEVICE_HEALTH_ALERT_SMS_ROUTE
-        return None
-    return _DEVICE_HEALTH_ALERT_ACTION_ROUTES.get(action_name)
 
 
 def _parse_device_health_alert_action(

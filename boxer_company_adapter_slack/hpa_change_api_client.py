@@ -12,10 +12,11 @@ from typing import Any, Mapping
 import requests
 
 from boxer_company import settings as company_settings
-from boxer_company.hpa_change_coordinator import (
+from boxer_company.transport_contracts import (
     HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS,
+    HpaChangePollResult,
+    HpaChangePollState,
 )
-from boxer_company.hpa_change_workflow import HpaChangePollResult, HpaChangePollState
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiAmbiguousTimeoutError,
     CompanyApiAvailabilityError,
@@ -111,9 +112,7 @@ class HpaChangeRemoteDelivery:
             task_id=self.task_id,
             state=self.state,
             job=job_view,  # type: ignore[arg-type]
-            run_url="",
             result=dict(self.result),
-            message="",
             pr_urls=self.pr_urls,
         )
 

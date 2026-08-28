@@ -145,7 +145,7 @@ def test_set_allowed_persists_newer_operation_atomically(tmp_path: Path) -> None
     )
 
     assert (result.allowed, result.changed, result.stale) == (False, True, False)
-    assert store.get_member(WORKSPACE_ID, USER_ID) == result.member
+    assert store.get_member(WORKSPACE_ID, USER_ID).allowed is False
     assert list(tmp_path.glob(".access.json.*.tmp")) == []
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 

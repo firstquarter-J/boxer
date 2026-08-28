@@ -1,7 +1,3 @@
-import re
-from datetime import datetime
-from typing import Any
-
 from boxer.core import settings as s
 
 
@@ -39,12 +35,9 @@ def _validate_data_source_tokens(missing: list[str]) -> None:
             missing.append("DB_DATABASE")
 
     if s.S3_QUERY_ENABLED:
+        # 공개 S3 connector는 region/client 조립만 책임지고 bucket·조회 정책은 domain adapter가 검증한다.
         if not s.AWS_REGION or "REPLACE_ME" in s.AWS_REGION:
             missing.append("AWS_REGION")
-        if not s.S3_ULTRASOUND_BUCKET or "REPLACE_ME" in s.S3_ULTRASOUND_BUCKET:
-            missing.append("S3_ULTRASOUND_BUCKET")
-        if not s.S3_LOG_BUCKET or "REPLACE_ME" in s.S3_LOG_BUCKET:
-            missing.append("S3_LOG_BUCKET")
 
 
 def _validate_tokens(*, include_llm: bool = True, include_data_sources: bool = True) -> None:
@@ -62,62 +55,7 @@ def _validate_tokens(*, include_llm: bool = True, include_data_sources: bool = T
         )
 
 
-def _extract_question(text: str) -> str:
-    return re.sub(r"<@[^>]+>", "", text).strip()
-
-
-def _display_value(value: Any, default: str = "없음") -> str:
-    if value is None:
-        return default
-    text = str(value).strip()
-    if not text:
-        return default
-    return text
-
-
-def _safe_float(value: str) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float("inf")
-
-
-def _normalize_spaces(text: str) -> str:
-    return " ".join((text or "").strip().split())
-
-
 def _truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars] + "...(truncated)"
-
-
-def _format_datetime(value: Any) -> str:
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(value, str):
-        return value
-    return "unknown"
-
-
-def _format_size(size: int | None) -> str:
-    if size is None:
-        return "unknown"
-    value = float(max(0, int(size)))
-    units = ["B", "KB", "MB", "GB", "TB"]
-    index = 0
-    while value >= 1024 and index < len(units) - 1:
-        value /= 1024
-        index += 1
-    if index == 0:
-        return f"{int(value)} {units[index]}"
-    return f"{value:.1f} {units[index]}"
-
-
-def _format_reply_text(user_id: str | None, text: str) -> str:
-    clean_text = (text or "").strip()
-    if not clean_text:
-        clean_text = "응답 내용이 비어 있어"
-    if user_id:
-        return f"<@{user_id}> {clean_text}"
-    return clean_text

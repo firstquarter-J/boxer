@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+# 실행 모듈의 복원 구현과 순수 라우팅 정본을 각각 경계별로 검증한다.
+from boxer_company.operation_routing import _is_recording_streaming_restore_request
 from boxer_company.routers import recording_streaming_restore
 from boxer_company.routers.recording_streaming_restore import (
     RecordingStreamingRestoreResult,
@@ -28,7 +30,7 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
         question = "35033165423 2024년 4월 영상 블라인드를 해제해줘"
 
         self.assertTrue(
-            recording_streaming_restore._is_recording_streaming_restore_request(
+            _is_recording_streaming_restore_request(
                 question,
                 "35033165423",
             )
@@ -45,7 +47,7 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
         )
         # 운영자가 "복구"라고 요청해도 같은 스트리밍 종료 영상 복원으로 라우팅한다.
         self.assertTrue(
-            recording_streaming_restore._is_recording_streaming_restore_request(
+            _is_recording_streaming_restore_request(
                 "35033165423 2024년 4월 영상 복구",
                 "35033165423",
             )
@@ -155,9 +157,7 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
         self.assertEqual(result.target_year, 2024)
         self.assertEqual(result.target_month, 4)
         self.assertEqual(result.db_target_count, 2)
-        self.assertEqual(result.mda_candidate_count, 2)
         self.assertEqual(result.restorable_count, 1)
-        self.assertEqual(result.requested_count, 1)
         self.assertEqual(result.restored_count, 1)
         restore_mock.assert_called_once()
         restore_kwargs = restore_mock.call_args.kwargs
@@ -283,7 +283,6 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
                 requester="U123",
             )
 
-        self.assertEqual(result.requested_count, 2)
         self.assertEqual(result.restored_count, 0)
         self.assertEqual(result.failed_count, 2)
         self.assertEqual(len(result.failed_items), 2)
@@ -340,9 +339,7 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
             target_year=2024,
             target_month=4,
             db_target_count=2,
-            mda_candidate_count=2,
             restorable_count=2,
-            requested_count=2,
             restored_count=2,
             failed_count=0,
             message="복원 2건, 실패 0건",
@@ -352,7 +349,6 @@ class RecordingStreamingRestoreRoutingTests(unittest.TestCase):
                     hospital_seq=53,
                     hospital_name="미래산부인과(춘천)",
                     db_target_count=2,
-                    mda_candidate_count=2,
                     restorable_count=2,
                 )
             ],

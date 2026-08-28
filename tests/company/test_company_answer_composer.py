@@ -179,7 +179,12 @@ class CompanyEvidenceAnswerComposerTests(unittest.TestCase):
         )
         self.assertEqual(answer_request.evidence, {"recordingCount": 3})
         self.assertEqual(answer_request.system_prompt, "근거만 사용해")
-        self.assertEqual(answer_request.extra_rules, "숫자를 보존해")
+        self.assertEqual(
+            answer_request.extra_rules,
+            "숫자를 보존해\n"
+            "Do not suggest another barcode or service unless the provided "
+            "evidence explicitly supports it.",
+        )
         self.assertIs(answer_request.evidence_transform, transform)
         self.assertEqual(answer_request.max_tokens, 320)
         self.assertEqual(answer_request.timeout_sec, 15)

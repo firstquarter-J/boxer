@@ -76,6 +76,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 "device_diagnostic_followup",
                 "notion_playbook_qa",
                 "barcode_evidence_freeform",
+                "usage_help",
                 "company_llm_health",
                 "company_daily_fortune",
                 "company_team_fun",
@@ -148,6 +149,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(
             turn.service_for_stage("freeform").route_names,
             (
+                "usage_help",
                 "company_llm_health",
                 "company_daily_fortune",
                 "company_team_fun",

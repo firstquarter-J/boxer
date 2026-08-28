@@ -5,8 +5,8 @@ import unittest
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.knowledge_write_route import (
     ThreadPlaybookLearningAssistantRoute,
-    match_thread_playbook_learning_route,
 )
+from boxer_company.operation_routing import match_thread_playbook_learning_route
 from boxer_company.thread_playbook_learning import ThreadPlaybookSaveResult
 
 
@@ -93,7 +93,6 @@ class ThreadPlaybookLearningAssistantRouteTests(unittest.TestCase):
                 page_id="page-1",
                 url="https://www.notion.so/page-1",
                 keywords=["장비", "장애"],
-                rag_index_updated=True,
             )
 
         result = ThreadPlaybookLearningAssistantRoute(

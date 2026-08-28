@@ -1,9 +1,12 @@
-import re
+from boxer_company._operation_routing_file import (
+    _extract_recording_streaming_restore_month,
+)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from boxer.core import settings as s
+from boxer_company import settings as cs
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.routers.box_db import _local_zone
@@ -21,7 +24,6 @@ class _StreamingRestoreHospitalSummary:
     hospital_seq: int
     hospital_name: str
     db_target_count: int
-    mda_candidate_count: int
     restorable_count: int
 
 
@@ -31,9 +33,7 @@ class RecordingStreamingRestoreResult:
     target_year: int
     target_month: int
     db_target_count: int
-    mda_candidate_count: int
     restorable_count: int
-    requested_count: int
     restored_count: int
     failed_count: int
     message: str
@@ -45,77 +45,11 @@ class RecordingStreamingRestoreResult:
     s3_restore_failed_count: int = 0
     s3_restore_items: list[dict[str, Any]] = field(default_factory=list)
 
-_YEAR_MONTH_PATTERN = re.compile(
-    r"(20\d{2})\s*(?:"
-    r"년\s*(0?[1-9]|1[0-2])(?:\s*월(?!\s*(?:[0-3]?\d\s*일|\d))|(?!\s*(?:월|일|[0-3]?\d\s*일|\d)))"
-    r"|[-./]\s*(0?[1-9]|1[0-2])(?!\s*(?:[-./]\s*\d{1,2}|\d))"
-    r")"
-)
-_COMPACT_YEAR_MONTH_PATTERN = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)")
 # 운영 요청에서는 복원/복구/블라인드 해제를 같은 MDA 복원 의도로 본다.
-_STREAMING_RESTORE_ACTION_PATTERN = re.compile(
-    r"(스트리밍\s*종료.*(?:복원|복구|해제|원복)|복원|복구|원복|"
-    r"블라인드(?:를|을)?\s*해제|숨김(?:을|를)?\s*해제|unblind|reveal|"
-    r"공개\s*(?:처리|전환|해줘|해|시켜)|노출\s*(?:처리|전환|해줘|해|시켜|가능))",
-    re.IGNORECASE,
-)
-_RECORDING_MEDIA_PATTERN = re.compile(
-    r"(영상|동영상|녹화|recording|recordings|ultrasound)",
-    re.IGNORECASE,
-)
 _S3_ARCHIVE_STORAGE_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
 _S3_ARCHIVE_STATUSES = {"ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"}
 _S3_RESTORE_DAYS = 7
 _S3_RESTORE_TIER = "Standard"
-
-
-def _is_recording_streaming_restore_request(question: str, barcode: str | None) -> bool:
-    if not barcode:
-        return False
-    normalized = question or ""
-    return bool(
-        _RECORDING_MEDIA_PATTERN.search(normalized)
-        and _STREAMING_RESTORE_ACTION_PATTERN.search(normalized)
-    )
-
-
-def _extract_recording_streaming_restore_month(question: str) -> tuple[int, int]:
-    normalized = question or ""
-    year_month_match = _YEAR_MONTH_PATTERN.search(normalized)
-    if year_month_match:
-        month_text = year_month_match.group(2) or year_month_match.group(3)
-        return int(year_month_match.group(1)), int(month_text)
-
-    compact_match = _COMPACT_YEAR_MONTH_PATTERN.search(normalized)
-    if compact_match:
-        return int(compact_match.group(1)), int(compact_match.group(2))
-
-    raise ValueError("복원할 연도와 월을 같이 입력해줘. 예: `35033165423 2024년 4월 영상 복원`")
-
-
-def _to_local_datetime(value: Any) -> datetime | None:
-    parsed: datetime | None = None
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str) and value.strip():
-        raw = value.strip().replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            return None
-
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(_local_zone())
-
-
-def _recording_row_year_month(row: dict[str, Any]) -> tuple[int, int] | None:
-    local_dt = _to_local_datetime(row.get("recordedAt"))
-    if local_dt is None:
-        return None
-    return local_dt.year, local_dt.month
 
 
 def _local_month_to_utc_range(target_year: int, target_month: int) -> tuple[datetime, datetime]:
@@ -345,7 +279,7 @@ def _recording_s3_restore_target(
     row: dict[str, Any],
     candidate: dict[str, Any],
 ) -> tuple[str, str] | None:
-    bucket = str(row.get("s3Bucket") or s.S3_ULTRASOUND_BUCKET or "").strip()
+    bucket = str(row.get("s3Bucket") or cs.S3_ULTRASOUND_BUCKET or "").strip()
     key = str(candidate.get("expectedS3FileKey") or row.get("s3FileKey") or "").strip()
     if not bucket or not key:
         return None
@@ -461,9 +395,7 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
         )
 
     hospital_summaries: list[_StreamingRestoreHospitalSummary] = []
-    total_mda_candidate_count = 0
     total_restorable_count = 0
-    total_requested_count = 0
     total_restored_count = 0
     total_failed_count = 0
     failed_items: list[dict[str, Any]] = []
@@ -483,21 +415,18 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
             for candidate in candidates
             if (seq := _candidate_seq(candidate)) in target_recording_seqs
         }
-        scoped_candidates = list(candidate_by_seq.values())
         restorable_seqs = [
             seq
             for seq, candidate in sorted(candidate_by_seq.items())
             if bool(candidate.get("restorable"))
         ]
 
-        total_mda_candidate_count += len(scoped_candidates)
         total_restorable_count += len(restorable_seqs)
         hospital_summaries.append(
             _StreamingRestoreHospitalSummary(
                 hospital_seq=hospital_seq,
                 hospital_name=str(group.get("hospitalName") or "미확인"),
                 db_target_count=len(group["rows"]),
-                mda_candidate_count=len(scoped_candidates),
                 restorable_count=len(restorable_seqs),
             )
         )
@@ -530,7 +459,6 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
             if (seq := _candidate_seq(item)) is not None
         }
 
-        total_requested_count += requested_count
         if mda_status:
             total_restored_count += restored_count
             total_failed_count += failed_count
@@ -574,9 +502,7 @@ def _restore_streaming_stopped_recordings_by_barcode_month(
         target_year=target_year,
         target_month=requested_month,
         db_target_count=len(target_rows),
-        mda_candidate_count=total_mda_candidate_count,
         restorable_count=total_restorable_count,
-        requested_count=total_requested_count,
         restored_count=total_restored_count,
         failed_count=total_failed_count,
         message=" / ".join(messages),

@@ -2,114 +2,15 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company.routers.mda_graphql import _lookup_mda_special_barcodes_by_barcode
 
-_BARCODE_VALIDATION_CONTEXT_HINTS = (
-    "유효성 검사",
-    "유효성 검증",
-    "바코드 검증",
-    "걸리는 바코드",
-    "막히는 바코드",
-    "차단 대상",
-    "제한 대상",
-    "special_barcodes",
-    "special barcode",
-)
-_BARCODE_VALIDATION_STATUS_HINTS = (
-    "걸리",
-    "막히",
-    "차단",
-    "제한",
-    "통과",
-    "허용",
-    "무료 바코드",
-    "무료바코드",
-    "핑크 바코드",
-    "핑크바코드",
-    "pink barcode",
-    "FREE",
-    "환불 바코드",
-    "환불바코드",
-    "환불",
-    "REFUND",
-    "refund",
-)
-_BARCODE_VALIDATION_POLICY_HINTS = (
-    "기준",
-    "정책",
-    "규칙",
-    "방법",
-)
 _BLOCKING_SPECIAL_TYPE_LABELS = {
     "FREE": "무료 바코드(핑크 바코드)",
     "REFUND": "환불 처리 바코드",
 }
-_PINK_CLASSIFICATION_REASON_HINTS = (
-    "왜",
-    "이유",
-    "분류되지",
-    "분류 안",
-    "기록되지",
-    "기록 안",
-    "등록되지",
-    "등록 안",
-    "안됐",
-    "안 됐",
-    "누락",
-    "대조",
-    "첫 녹화",
-    "첫녹화",
-)
-_PINK_CLASSIFICATION_SUBJECT_HINTS = (
-    "핑크",
-    "무료",
-    "FREE",
-    "special_barcodes",
-    "special barcode",
-)
-
-
-def _contains_any_hint(question: str, hints: tuple[str, ...]) -> bool:
-    normalized = str(question or "").strip()
-    lowered = normalized.lower()
-    return any(hint in normalized or hint.lower() in lowered for hint in hints)
-
-
-def _is_barcode_validation_status_request(question: str, barcode: str | None) -> bool:
-    if not str(barcode or "").strip():
-        return False
-    normalized = str(question or "").strip()
-    if not normalized:
-        return False
-    has_status_hint = _contains_any_hint(
-        normalized,
-        _BARCODE_VALIDATION_STATUS_HINTS,
-    )
-    if (
-        _contains_any_hint(normalized, _BARCODE_VALIDATION_POLICY_HINTS)
-        and not has_status_hint
-    ):
-        # thread에 바코드가 있어도 "검증 기준" 같은 플레이북 질문은
-        # 현재 바코드의 MDA 상태 조회로 선점하지 않는다.
-        return False
-    if _contains_any_hint(normalized, _BARCODE_VALIDATION_CONTEXT_HINTS):
-        return True
-    return has_status_hint
-
-
-def _is_barcode_pink_classification_reason_request(question: str, barcode: str | None) -> bool:
-    if not str(barcode or "").strip():
-        return False
-    normalized = str(question or "").strip()
-    if not normalized:
-        return False
-    return _contains_any_hint(
-        normalized,
-        _PINK_CLASSIFICATION_SUBJECT_HINTS,
-    ) and _contains_any_hint(normalized, _PINK_CLASSIFICATION_REASON_HINTS)
 
 
 def _normalize_special_barcode_type(value: Any) -> str:

@@ -80,12 +80,9 @@ class HpaChangeThreadLookupResult:
 
 @dataclass(frozen=True)
 class HpaChangeAttachment:
-    file_id: str
     name: str
-    mimetype: str
     size_bytes: int
     content: str
-    message_ts: str
 
 
 @dataclass(frozen=True)
@@ -98,9 +95,7 @@ class HpaChangeRequest:
     thread_url: str
     event_ts: str
     requester_user_id: str
-    question: str
     thread_text: str
-    thread_message_count: int
     attachments: tuple[HpaChangeAttachment, ...]
     # 링크 선택 모드에서는 질문 대상과 실행 요청자를 분리해 보존한다.
     initiator_user_id: str = ""
@@ -531,8 +526,8 @@ def _collect_candidate_files(
     *,
     config: HpaChangeRoutesConfig,
     logger: logging.Logger,
-) -> list[tuple[dict[str, Any], str]]:
-    candidates: list[tuple[dict[str, Any], str]] = []
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     seen_files: set[str] = set()
 
     for message in messages:
@@ -562,7 +557,9 @@ def _collect_candidate_files(
             if dedup_key in seen_files:
                 continue
             seen_files.add(dedup_key)
-            candidates.append((file_payload, str(message.get("ts") or "").strip()))
+            # worker payload에는 파일 본문과 이름만 전달하므로 Slack 메시지
+            # timestamp를 별도 attachment 상태로 보존하지 않는다.
+            candidates.append(file_payload)
 
     if len(candidates) > max(0, config.max_attachment_count):
         raise HpaChangeIntakeError(
@@ -670,7 +667,7 @@ def _collect_attachments(
     max_file_bytes = max(0, config.max_attachment_bytes)
     max_total_bytes = max(0, config.max_total_attachment_bytes)
 
-    for file_payload, message_ts in candidates:
+    for file_payload in candidates:
         file_url = str(
             file_payload.get("url_private_download")
             or file_payload.get("url_private")
@@ -720,12 +717,9 @@ def _collect_attachments(
 
         attachments.append(
             HpaChangeAttachment(
-                file_id=str(file_payload.get("id") or "").strip(),
                 name=str(file_payload.get("name") or file_payload.get("title") or "").strip(),
-                mimetype=str(file_payload.get("mimetype") or "").strip(),
                 size_bytes=len(raw_content),
                 content=content,
-                message_ts=message_ts,
             )
         )
     return tuple(attachments)
@@ -1103,9 +1097,7 @@ def _handle_hpa_change_request(
         thread_url=source_permalink,
         event_ts=event_ts,
         requester_user_id=requester_user_id,
-        question=str(context.question or "").strip(),
         thread_text=thread_text,
-        thread_message_count=len(messages),
         attachments=attachments,
         initiator_user_id=actor_user_id,
         source_channel_id=source_channel_id,

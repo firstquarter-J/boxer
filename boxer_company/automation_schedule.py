@@ -13,11 +13,6 @@ AutomationScheduleCycle = Literal[
     "device_notification_alert",
     "sms_delivery",
 ]
-AutomationScheduleCadence = Literal[
-    "weekly",
-    "daily_window",
-    "fixed_delay",
-]
 
 _ALL_CYCLES = frozenset(
     {
@@ -105,15 +100,9 @@ class AutomationScheduleConfig:
 class AutomationScheduleDecision:
     """한 시점에 domain run이 가능한지와 그 durable identity를 나타낸다."""
 
-    cycle: AutomationScheduleCycle
-    cadence: AutomationScheduleCadence
     due: bool
     cycle_key: str | None
     scheduled_at: datetime | None
-    eligible_at: datetime | None
-    next_due_at: datetime | None
-    window_end_at: datetime | None = None
-    fixed_delay: timedelta | None = None
 
 
 def plan_automation_cycle(
@@ -184,22 +173,11 @@ def _plan_weekly(
 ) -> AutomationScheduleDecision:
     local_date = local_now.date()
     if local_now.weekday() != 0:
-        days_until_monday = 7 - local_now.weekday()
-        next_eligible = _local_datetime(
-            local_date + timedelta(days=days_until_monday),
-            config.weekly_hour,
-            config.weekly_minute,
-            config.timezone,
-        )
         # 기존 의미대로 월요일 전체를 놓쳤으면 화요일에 소급 실행하지 않는다.
         return AutomationScheduleDecision(
-            cycle="weekly_recordings",
-            cadence="weekly",
             due=False,
             cycle_key=None,
             scheduled_at=None,
-            eligible_at=next_eligible,
-            next_due_at=next_eligible,
         )
 
     eligible_at = _local_datetime(
@@ -213,20 +191,10 @@ def _plan_weekly(
     completed = completed_cycle_key == cycle_key
     eligible = _at_or_after(local_now, eligible_at)
     due = eligible and not completed
-    if completed:
-        next_due_at = eligible_at + timedelta(days=7)
-    elif eligible:
-        next_due_at = None
-    else:
-        next_due_at = eligible_at
     return AutomationScheduleDecision(
-        cycle="weekly_recordings",
-        cadence="weekly",
         due=due,
         cycle_key=cycle_key,
         scheduled_at=local_now if due else None,
-        eligible_at=eligible_at,
-        next_due_at=next_due_at,
     )
 
 
@@ -238,36 +206,22 @@ def _plan_daily(
 ) -> AutomationScheduleDecision:
     window = _current_daily_window(local_now, config)
     if window is None:
-        next_eligible = _next_daily_window_start(local_now, config)
         # 종료된 window의 pending ACK는 transport가 과거 exact cycleKey로
         # 처리한다. planner의 no-due는 새 domain run만 금지하는 의미다.
         return AutomationScheduleDecision(
-            cycle="daily_device_round",
-            cadence="daily_window",
             due=False,
             cycle_key=None,
             scheduled_at=None,
-            eligible_at=next_eligible,
-            next_due_at=next_eligible,
         )
 
-    window_date, window_start, window_end = window
+    window_date, _window_start, _window_end = window
     cycle_key = f"daily:{window_date.isoformat()}"
     completed = completed_cycle_key == cycle_key
     due = not completed
     return AutomationScheduleDecision(
-        cycle="daily_device_round",
-        cadence="daily_window",
         due=due,
         cycle_key=cycle_key,
         scheduled_at=local_now if due else None,
-        eligible_at=window_start,
-        next_due_at=(
-            _next_daily_window_start(local_now, config)
-            if completed
-            else None
-        ),
-        window_end_at=window_end,
     )
 
 
@@ -290,14 +244,9 @@ def _plan_continuous(
         ).astimezone(config.timezone)
     due = _at_or_after(local_now, eligible_at)
     return AutomationScheduleDecision(
-        cycle=cycle,
-        cadence="fixed_delay",
         due=due,
         cycle_key="continuous",
         scheduled_at=local_now if due else None,
-        eligible_at=eligible_at,
-        next_due_at=None if due else eligible_at,
-        fixed_delay=fixed_delay,
     )
 
 
@@ -355,33 +304,6 @@ def _current_daily_window(
             _daily_boundary(local_date, config, start=False),
         )
     return None
-
-
-def _next_daily_window_start(
-    local_now: datetime,
-    config: AutomationScheduleConfig,
-) -> datetime:
-    local_date = local_now.date()
-    start_minutes = (
-        config.daily_start_hour * 60 + config.daily_start_minute
-    )
-    end_minutes = config.daily_end_hour * 60 + config.daily_end_minute
-    if start_minutes == end_minutes:
-        return _local_datetime(
-            local_date + timedelta(days=1),
-            0,
-            0,
-            config.timezone,
-        )
-
-    candidate = _daily_boundary(local_date, config, start=True)
-    if local_now < candidate:
-        return candidate
-    return _daily_boundary(
-        local_date + timedelta(days=1),
-        config,
-        start=True,
-    )
 
 
 def _daily_boundary(
@@ -455,7 +377,6 @@ def _validate_fixed_delay(
 
 
 __all__ = [
-    "AutomationScheduleCadence",
     "AutomationScheduleConfig",
     "AutomationScheduleCycle",
     "AutomationScheduleDecision",

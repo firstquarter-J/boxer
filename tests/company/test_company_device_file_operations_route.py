@@ -9,9 +9,9 @@ from boxer_company.assistant.device_file_operations_route import (
     DeviceFileOperationsAssistantRoute,
     DeviceFileOperationsRouteDeps,
     build_trusted_mda_recovery_scope_metadata,
-    match_device_file_operation_route,
     needs_device_file_operation_context,
 )
+from boxer_company.operation_routing import match_device_file_operation_route
 from boxer_company_api.schemas import (
     DeviceFileDownloadDeliveryActionInput,
 )

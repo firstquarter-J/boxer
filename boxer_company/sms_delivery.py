@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import requests
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
 
 _SMS_DELIVERY_ACCEPTED = "accepted"

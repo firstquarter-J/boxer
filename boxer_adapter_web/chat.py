@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import re
 import json
+import re
 from typing import Any
 
-from anthropic import Anthropic
-
+from boxer import (
+    AnswerEngine,
+    AnswerRequest,
+    create_answer_engine_from_settings,
+)
+from boxer.context.entries import ContextEntry
 from boxer.core import settings as core_settings
-from boxer.retrieval.synthesis import _synthesize_retrieval_answer
 
 from boxer_adapter_web.policies import HandoffPolicy
 from boxer_adapter_web.schemas import ConversationSnapshotDto, MessageDto, SourceReferenceDto
@@ -38,19 +41,14 @@ class ChatService:
         store: WebChatStore,
         workflow_catalog: WorkflowCatalog | None = None,
         handoff_policy: HandoffPolicy | None = None,
+        *,
+        answer_engine: AnswerEngine | None = None,
     ) -> None:
         self._store = store
         self._workflow_catalog = workflow_catalog or WorkflowCatalog.from_config({}, fallback_options=[])
         self._handoff_policy = handoff_policy or HandoffPolicy()
-        # Claude는 client 객체가 필요하고, Ollama는 synthesis helper가 직접 HTTP를 친다.
-        self._claude_client = (
-            Anthropic(
-                api_key=core_settings.ANTHROPIC_API_KEY,
-                timeout=core_settings.ANTHROPIC_TIMEOUT_SEC,
-            )
-            if core_settings.LLM_PROVIDER == "claude" and core_settings.ANTHROPIC_API_KEY
-            else None
-        )
+        # Web도 Slack 등 다른 공개 adapter와 같은 AnswerEngine 계약과 synthesis feature flag를 따른다.
+        self._answer_engine = answer_engine or create_answer_engine_from_settings()
 
     def initialize_session(
         self,
@@ -166,7 +164,6 @@ class ChatService:
             preferred_language=preferred_language,
             previous_messages=(conversation.get("messages") or []) + created_messages,
             small_talk_response=small_talk_response,
-            source_refs=source_refs,
             search_results=search_results,
         )
         missing_evidence = small_talk_response is None and (
@@ -440,10 +437,8 @@ class ChatService:
         preferred_language: str,
         previous_messages: list[dict[str, Any]],
         small_talk_response: str | None,
-        source_refs: list[dict[str, Any]],
         search_results: list[Any],
     ) -> str:
-        _ = source_refs
         if small_talk_response:
             return small_talk_response
 
@@ -459,20 +454,20 @@ class ChatService:
             }
             for result in search_results
         ]
-        answer = _synthesize_retrieval_answer(
-            question=question,
-            thread_context=_render_thread_context(previous_messages),
-            evidence_payload=evidence_payload,
-            provider=core_settings.LLM_PROVIDER,
-            claude_client=self._claude_client,
-            system_prompt=(
-                "You are a retrieval-grounded support assistant. "
-                "Answer only from the provided FAQ evidence. "
-                "Do not invent product behavior or policy. "
-                f"{_language_instruction(preferred_language)}"
-            ),
-            extra_rules=_language_extra_rules(preferred_language),
-        ).strip()
+        answer = self._answer_engine.answer(
+            AnswerRequest(
+                question=question,
+                evidence=evidence_payload,
+                context_entries=_build_context_entries(previous_messages),
+                system_prompt=(
+                    "You are a retrieval-grounded support assistant. "
+                    "Answer only from the provided FAQ evidence. "
+                    "Do not invent product behavior or policy. "
+                    f"{_language_instruction(preferred_language)}"
+                ),
+                extra_rules=_language_extra_rules(preferred_language),
+            )
+        ).text.strip()
 
         if answer:
             return answer
@@ -521,18 +516,25 @@ class ChatService:
         )
 
 
-def _render_thread_context(messages: list[dict[str, Any]]) -> str:
+def _build_context_entries(messages: list[dict[str, Any]]) -> tuple[ContextEntry, ...]:
     if not core_settings.LLM_SYNTHESIS_INCLUDE_THREAD_CONTEXT:
-        return ""
+        return ()
 
-    rendered_lines: list[str] = []
+    entries: list[ContextEntry] = []
     for message in messages[-max(1, core_settings.THREAD_CONTEXT_MAX_MESSAGES) :]:
         sender_type = str(message.get("sender_type") or "system")
         body = str(message.get("body") or "").strip()
         if not body:
             continue
-        rendered_lines.append(f"{sender_type}: {body}")
-    return "\n".join(rendered_lines).strip()
+        entries.append(
+            {
+                "kind": "message",
+                "source": "widget",
+                "author_id": sender_type,
+                "text": body,
+            }
+        )
+    return tuple(entries)
 
 
 def _decode_context(raw_context: Any) -> dict[str, Any]:
@@ -540,8 +542,6 @@ def _decode_context(raw_context: Any) -> dict[str, Any]:
         return raw_context
     if not raw_context:
         return {}
-    import json
-
     try:
         loaded = json.loads(str(raw_context))
     except json.JSONDecodeError:

@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+# 순수 분류 정본은 provider-free 모듈이 소유하고 이 실행 모듈은 재수출한다.
+from boxer_company.operation_routing import (
+    SECURITY_REVIEW_ACTION,
+    SECURITY_REVIEW_ROUTE,
+    match_security_review_route,
+)
+
 from dataclasses import dataclass, field
 import re
 import threading
@@ -13,8 +20,6 @@ from boxer_company.assistant.contracts import (
 )
 
 
-SECURITY_REVIEW_ACTION = "security_review"
-SECURITY_REVIEW_ROUTE = "security_review"
 SECURITY_REVIEW_SESSION_TTL_SEC = 60 * 30
 
 SecurityReviewExpectation = Literal["scope", "refusal"]
@@ -423,19 +428,6 @@ class SecurityReviewAssistantRoute:
             body = "현재 봇 보안검토 대상 응답이 아니야"
             outcome = "no_evidence"
         return _result(step, outcome=outcome, body=body)
-
-
-def match_security_review_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    if str(request.metadata.get("route_group") or "").strip() != "operations":
-        return None
-    action = request.metadata.get("operation_action")
-    if not isinstance(action, Mapping):
-        return None
-    if str(action.get("name") or "").strip() != SECURITY_REVIEW_ACTION:
-        return None
-    return SECURITY_REVIEW_ROUTE
 
 
 def assess_security_review_response(

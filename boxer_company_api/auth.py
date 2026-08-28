@@ -19,7 +19,6 @@ class CallerPrincipal:
     tenant_ids: frozenset[str]
     channels: frozenset[str]
     actor_ids: frozenset[str]
-    allow_anonymous_actor: bool
     capabilities: frozenset[str]
 
 
@@ -74,7 +73,6 @@ class CallerRegistry:
             tenant_ids=matched.tenant_ids,
             channels=matched.channels,
             actor_ids=matched.actor_ids,
-            allow_anonymous_actor=matched.allow_anonymous_actor,
             capabilities=matched.capabilities,
         )
 

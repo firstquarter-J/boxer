@@ -28,7 +28,6 @@ from boxer_company.automation import (
 )
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
-    _load_device_health_sheet_captureboard_incidents,
 )
 from boxer_company.sms_delivery import (
     _SMS_DELIVERY_ACCEPTED,
@@ -243,11 +242,6 @@ class DeviceNotificationCycleDeps:
     ] = _load_next_device_notification
     load_event_batch: Callable[..., tuple[int, list[dict[str, Any]]]] = (
         _load_device_notification_batch
-    )
-    # 이전 주입형 port 생성 호환만 유지한다. 캡처보드 incident 판단은 이
-    # Sheet snapshot을 호출하지 않고 automation cursor만 정본으로 사용한다.
-    load_sheet_incidents: Callable[[], dict[str, dict[str, Any]] | None] = (
-        _load_device_health_sheet_captureboard_incidents
     )
     append_sheet_alerts: Callable[..., int | None] = (
         _append_device_health_sheet_alerts

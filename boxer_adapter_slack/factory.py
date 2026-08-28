@@ -55,7 +55,3 @@ def load_entrypoint(path: str) -> Callable[[], Any]:
 def create_app() -> Any:
     factory = load_entrypoint(ss.ADAPTER_ENTRYPOINT)
     return factory()
-
-
-# legacy alias
-_load_entrypoint = load_entrypoint

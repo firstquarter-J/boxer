@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+# 구조화 실행은 provider-free 정본이 확정한 파싱 결과만 소비한다.
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    _build_structured_query_match,
+    _is_weekly_recordings_report_request,
+)
+
 import logging
 from typing import Callable
 
 import pymysql
-
-from boxer_company import settings as cs
-from boxer_company.assistant.barcode_query_route import (
-    match_barcode_timeline_route,
-)
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     AssistantOutcome,
@@ -18,26 +19,7 @@ from boxer_company.assistant.contracts import (
 )
 from boxer_company.assistant.commonmark import slack_mrkdwn_to_commonmark
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
-    resolve_assistant_request_scope,
-)
-from boxer_company.routers.barcode_log import (
-    _extract_capture_seq_filters,
-    _extract_device_flag_filters,
-    _extract_device_name_scope,
-    _extract_device_seq_filter,
-    _extract_device_status_filter,
-    _extract_hospital_room_scope,
-    _extract_leading_hospital_scope,
-    _extract_log_date_with_presence,
-    _extract_year_filter,
-    _is_barcode_all_recorded_dates_request,
-    _is_devices_filter_query_request,
-    _is_hospitals_filter_query_request,
-    _is_hospital_rooms_filter_query_request,
-    _is_recordings_filter_query_request,
-    _is_ultrasound_capture_filter_query_request,
 )
 from boxer_company.routers.box_db import (
     _query_devices_by_filters,
@@ -46,35 +28,6 @@ from boxer_company.routers.box_db import (
     _query_recordings_by_filters,
     _query_ultrasound_captures_by_filters,
 )
-from boxer_company.routers.recording_streaming_restore import (
-    _is_recording_streaming_restore_request,
-)
-from boxer_company.weekly_recordings_report import (
-    _is_weekly_recordings_report_request,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _StructuredQueryMatch:
-    """DB 호출 전에 확정한 구조화 조회 종류와 파싱 결과다."""
-
-    route: str
-    barcode: str | None
-    target_date: str | None
-    target_year: int | None
-    hospital_name: str | None
-    room_name: str | None
-    hospital_seq: int | None
-    hospital_room_seq: int | None
-    device_name: str | None
-    device_seq: int | None
-    device_status: str | None
-    active_flag: int | None
-    install_flag: int | None
-    count_only: bool
-    date_error: ValueError | None
-
-
 class StructuredAssistantRoute:
     name = "structured"
 
@@ -285,177 +238,6 @@ class StructuredAssistantRoute:
             )
 
 
-def match_structured_read_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """조회 없이 구조화 route만 분류해 adapter의 HTTP 전환 범위를 고정한다."""
-
-    try:
-        matched = _build_structured_query_match(
-            request,
-            is_weekly_report_request=(
-                _is_weekly_recordings_report_request
-            ),
-        )
-    except AssistantRequestScopeMismatch:
-        # scope 불일치는 기존 local guard가 값 노출 없이 처리하게 둔다.
-        return None
-    return matched.route if matched is not None else None
-
-
-def match_structured_device_count_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """live enrichment가 필요 없는 장비 개수·존재 조회만 분류한다."""
-
-    try:
-        matched = _build_structured_query_match(
-            request,
-            is_weekly_report_request=(
-                _is_weekly_recordings_report_request
-            ),
-        )
-    except AssistantRequestScopeMismatch:
-        return None
-    if (
-        matched is not None
-        and matched.route == "devices_filter"
-        and matched.count_only
-    ):
-        # 개수 응답은 row 상세를 만들기 전에 반환하므로 MDA/SSH 보강과
-        # sshOrder mutation을 호출하지 않는다.
-        return matched.route
-    return None
-
-
-def _build_structured_query_match(
-    request: CompanyAssistantRequest,
-    *,
-    is_weekly_report_request: Callable[..., bool],
-) -> _StructuredQueryMatch | None:
-    """기존 route 우선순위를 보존하며 파싱만 하고 외부 조회는 하지 않는다."""
-
-    question = request.question
-    barcode = resolve_assistant_request_scope(request).barcode
-    if _is_recording_streaming_restore_request(question, barcode):
-        # 복원은 상태 변경 작업이라 read-only assistant service 밖에 유지한다.
-        return None
-    if _is_barcode_all_recorded_dates_request(question, barcode):
-        # 더 구체적인 바코드 날짜 route가 뒤 stage에서 응답하도록
-        # 일반 recordings 필터가 같은 질문을 먼저 흡수하지 않는다.
-        return None
-    if match_barcode_timeline_route(request) is not None:
-        # 일반 날짜 목록·개수는 유지하고 명시적인 마지막 시점·날짜별
-        # 존재 여부만 뒤의 barcode stage가 같은 질문을 처리하게 한다.
-        return None
-
-    try:
-        parsed_date, has_requested_date = (
-            _extract_log_date_with_presence(question)
-        )
-        target_date = parsed_date if has_requested_date else None
-    except ValueError as exc:
-        target_date = None
-        date_error: ValueError | None = exc
-    else:
-        date_error = None
-
-    target_year = _extract_year_filter(question)
-    if target_year is not None and target_date is None:
-        date_error = None
-    hospital_name, room_name = _extract_hospital_room_scope(question)
-    if not hospital_name:
-        hospital_name = _extract_leading_hospital_scope(question)
-    hospital_seq, hospital_room_seq = _extract_capture_seq_filters(
-        question
-    )
-    device_name = _extract_device_name_scope(question)
-    device_seq = _extract_device_seq_filter(question)
-    device_status = _extract_device_status_filter(question)
-    active_flag, install_flag = _extract_device_flag_filters(question)
-    count_only = _is_generic_count_or_existence_request(question)
-
-    route: str | None = None
-    if _is_hospitals_filter_query_request(
-        question,
-        target_date=target_date,
-        target_year=target_year,
-        hospital_name=hospital_name,
-        hospital_seq=hospital_seq,
-    ):
-        route = "hospitals_filter"
-    elif _is_hospital_rooms_filter_query_request(
-        question,
-        hospital_name=hospital_name,
-        room_name=room_name,
-        hospital_seq=hospital_seq,
-        hospital_room_seq=hospital_room_seq,
-    ):
-        route = "hospital_rooms_filter"
-    elif _is_devices_filter_query_request(
-        question,
-        device_name=device_name,
-        device_seq=device_seq,
-        hospital_name=hospital_name,
-        room_name=room_name,
-        hospital_seq=hospital_seq,
-        hospital_room_seq=hospital_room_seq,
-        status=device_status,
-        active_flag=active_flag,
-        install_flag=install_flag,
-    ):
-        route = "devices_filter"
-    elif is_weekly_report_request(
-        question,
-        barcode=barcode,
-        target_date=target_date,
-    ):
-        # Slack Block을 쓰는 주간 리포트는 adapter가 기존 형식으로 렌더링한다.
-        return None
-    elif _is_ultrasound_capture_filter_query_request(
-        question,
-        barcode=barcode,
-        target_date=target_date,
-        target_year=target_year,
-        hospital_name=hospital_name,
-        room_name=room_name,
-        hospital_seq=hospital_seq,
-        hospital_room_seq=hospital_room_seq,
-    ):
-        route = "ultrasound_captures_filter"
-    elif _is_recordings_filter_query_request(
-        question,
-        barcode=barcode,
-        target_date=target_date,
-        target_year=target_year,
-        hospital_name=hospital_name,
-        room_name=room_name,
-        hospital_seq=hospital_seq,
-        hospital_room_seq=hospital_room_seq,
-    ):
-        route = "recordings_filter"
-
-    if route is None:
-        return None
-    return _StructuredQueryMatch(
-        route=route,
-        barcode=barcode,
-        target_date=target_date,
-        target_year=target_year,
-        hospital_name=hospital_name,
-        room_name=room_name,
-        hospital_seq=hospital_seq,
-        hospital_room_seq=hospital_room_seq,
-        device_name=device_name,
-        device_seq=device_seq,
-        device_status=device_status,
-        active_flag=active_flag,
-        install_flag=install_flag,
-        count_only=count_only,
-        date_error=date_error,
-    )
-
-
 def _raise_or_call(
     error: ValueError | None,
     query: Callable[[], str],
@@ -463,15 +245,6 @@ def _raise_or_call(
     if error is not None:
         raise error
     return query()
-
-
-def _is_generic_count_or_existence_request(question: str) -> bool:
-    text = (question or "").strip()
-    lowered = text.lower()
-    return any(token in text for token in cs.VIDEO_COUNT_HINT_TOKENS) or any(
-        token in text
-        for token in ("있나", "있어", "있는지", "유무", "존재", "몇")
-    ) or "count" in lowered
 
 
 def _to_commonmark(text: str) -> str:
@@ -495,6 +268,4 @@ def _result(
 
 __all__ = [
     "StructuredAssistantRoute",
-    "match_structured_device_count_route",
-    "match_structured_read_route",
 ]

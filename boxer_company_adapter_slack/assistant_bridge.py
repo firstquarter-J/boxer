@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from boxer.context.entries import ContextEntry
 from boxer_adapter_slack.common import MentionPayload, SlackReplyFn
-from boxer_company.assistant import (
+from boxer_company.assistant.contracts import (
     AssistantLink,
     CompanyAssistantRequest,
     CompanyAssistantResult,

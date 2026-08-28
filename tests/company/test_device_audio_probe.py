@@ -1,9 +1,11 @@
 import unittest
 from unittest.mock import patch
 
-from boxer_company.routers.device_audio_probe import (
+from boxer_company.operation_routing import (
     _extract_device_name_for_audio_probe,
     _is_device_audio_probe_request,
+)
+from boxer_company.routers.device_audio_probe import (
     _parse_mixer_control,
     _parse_playback_devices,
     _parse_playback_test,

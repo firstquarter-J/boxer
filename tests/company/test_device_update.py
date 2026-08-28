@@ -1,15 +1,17 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from boxer_company.routers.device_update import (
-    _AGENT_GIT_STATUS_COMMAND,
-    _DeviceSshOpenBudget,
-    _build_device_update_activity_input,
+from boxer_company.operation_routing import (
     _extract_device_name_for_update,
     _is_device_agent_update_request,
     _is_device_box_update_request,
     _is_device_power_off_request,
     _is_device_update_status_request,
+)
+from boxer_company.routers.device_update import (
+    _AGENT_GIT_STATUS_COMMAND,
+    _DeviceSshOpenBudget,
+    _build_device_update_activity_input,
     _parse_agent_repo_state,
     _query_device_update_status,
     _request_device_agent_update,

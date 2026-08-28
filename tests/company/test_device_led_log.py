@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import patch
 
+from boxer_company.operation_routing import _is_device_led_log_analysis_request
 from boxer_company.routers.device_led_log import (
     _analyze_device_led_log,
-    _is_device_led_log_analysis_request,
 )
 
 

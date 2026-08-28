@@ -44,7 +44,6 @@ BASE_ACCESS_UNAVAILABLE_REPLY = "박서 사용 권한을 확인할 수 없어. �
 class SlackBaseAccessRuntime:
     """Slack 진입점 전체가 공유하는 단일 Boxer 사용 권한 runtime."""
 
-    settings: BaseAccessSettings
     store: BaseAccessStore | None
     logger: logging.Logger
 
@@ -90,7 +89,7 @@ def build_slack_base_access_runtime(
             type(exc).__name__,
         )
         store = None
-    return SlackBaseAccessRuntime(settings=settings, store=store, logger=actual_logger)
+    return SlackBaseAccessRuntime(store=store, logger=actual_logger)
 
 
 def _parse_base_access_management_command(

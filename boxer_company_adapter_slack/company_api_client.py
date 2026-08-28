@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
-from boxer_company.assistant import (
+from boxer_company.assistant.contracts import (
     AssistantLink,
     AssistantMessage,
     CompanyAssistantRequest,
@@ -108,8 +108,6 @@ _TURN_KEYS = frozenset(
         "sources",
         "usedLlm",
         "fallbackReason",
-        "suggestedAction",
-        "asyncJob",
     }
 )
 _TURN_WITH_OPERATION_RESULT_KEYS = frozenset(
@@ -213,7 +211,6 @@ _SENSITIVE_SOURCE_PARAMETER_MARKERS = (
     "signature",
     "token",
 )
-_RolloutMode = Literal["local", "shadow", "remote"]
 _RouteGroup = Literal[
     "notion",
     "device",
@@ -253,9 +250,6 @@ COMPANY_AUTOMATION_CYCLES = frozenset(
         "sms_delivery",
     }
 )
-COMPANY_ACTION_AUTOMATION_CYCLES = frozenset(
-    {"device_health_monitor", "device_notification_alert"}
-)
 
 
 class CompanyApiClientError(RuntimeError):
@@ -276,11 +270,11 @@ class CompanyApiClientError(RuntimeError):
 
 
 class CompanyApiAvailabilityError(CompanyApiClientError):
-    """read-only local fallback을 허용할 수 있는 API 가용성 오류다."""
+    """API가 응답할 수 없는 transport 가용성 오류다."""
 
 
 class CompanyApiPolicyError(CompanyApiClientError):
-    """인증·권한 거부이며 local fallback으로 우회하면 안 되는 오류다."""
+    """인증·권한 거부이며 다른 실행 경계로 우회하면 안 되는 오류다."""
 
 
 class CompanyApiContractError(CompanyApiClientError, ValueError):
@@ -300,257 +294,16 @@ class CompanyApiClientSettings:
     # 기존 동기 Agent install과 완료 poll이 각각 최대 10분 이어질 수 있어
     # 두 구간과 응답 여유를 한 HTTP 요청 안에서 그대로 보존한다.
     operations_read_timeout_sec: float = 1_300.0
-    # 일일 순회는 병원 단위 동기 실행이라 별도 긴 timeout을 쓰되 재시도하지 않는다.
-    automation_read_timeout_sec: float = 1_800.0
     max_retries: int = 1
     automation_tenant_id: str = ""
-    notion_mode: _RolloutMode = "local"
-    notion_fallback_enabled: bool = False
-    structured_mode: _RolloutMode = "local"
-    structured_fallback_enabled: bool = False
-    device_mode: _RolloutMode = "local"
-    device_fallback_enabled: bool = False
-    # 세부 route군은 기존 상위 route군과 독립적으로 전환·롤백한다.
-    device_detail_mode: _RolloutMode = "local"
-    device_detail_fallback_enabled: bool = False
-    recording_failure_mode: _RolloutMode = "local"
-    recording_failure_fallback_enabled: bool = False
-    barcode_log_mode: _RolloutMode = "local"
-    barcode_log_fallback_enabled: bool = False
-    barcode_mode: _RolloutMode = "local"
-    barcode_fallback_enabled: bool = False
-    barcode_residual_mode: _RolloutMode = "local"
-    barcode_residual_fallback_enabled: bool = False
-    barcode_timeline_mode: _RolloutMode = "local"
-    barcode_timeline_fallback_enabled: bool = False
-    barcode_freeform_mode: _RolloutMode = "local"
-    barcode_freeform_fallback_enabled: bool = False
-    # 근거 route가 모두 비어 있을 때만 쓰는 일반 회사 자유대화다.
-    freeform_mode: _RolloutMode = "local"
-    freeform_fallback_enabled: bool = False
-    playbook_mode: _RolloutMode = "local"
-    playbook_fallback_enabled: bool = False
-    weekly_summary_mode: _RolloutMode = "local"
-    weekly_summary_fallback_enabled: bool = False
-    # Mutation transport는 local/shadow fallback 없이 한 번만 호출한다.
-    operations_mode: _RolloutMode = "local"
-    operations_fallback_enabled: bool = False
-    automation_mode: _RolloutMode = "local"
-    automation_fallback_enabled: bool = False
-    automation_remote_cycles: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        remote_cycles = _validate_automation_remote_cycles(
-            self.automation_remote_cycles,
-            required=self.automation_mode == "remote",
-        )
-        # health·notification remote card의 action은 operations API가
-        # 실행한다. callback이 legacy mutation으로 내려가는 조합은
-        # 직접 생성한 설정에서도 fail-closed한다.
-        if (
-            COMPANY_ACTION_AUTOMATION_CYCLES.intersection(remote_cycles)
-            and self.operations_mode != "remote"
-        ):
-            raise CompanyApiContractError(
-                "company_api_remote_automation_requires_remote_operations"
-            )
-
-    def is_automation_cycle_remote(self, cycle: str) -> bool:
-        """개별 cycle이 공통 API 소유인지 확인한다."""
-
-        return (
-            self.automation_mode == "remote"
-            and cycle in self.automation_remote_cycles
-        )
-
-    @property
-    def transport_only_remote(self) -> bool:
-        """Slack-local route나 fallback이 전혀 없는 완전 remote 상태다."""
-
-        # health와 사람 fun 생성은 별도 mode를 늘리지 않고 일반
-        # freeform 소유권을 함께 따른다.
-        rollout_settings = (
-            (self.notion_mode, self.notion_fallback_enabled),
-            (self.structured_mode, self.structured_fallback_enabled),
-            (self.device_mode, self.device_fallback_enabled),
-            (
-                self.device_detail_mode,
-                self.device_detail_fallback_enabled,
-            ),
-            (
-                self.recording_failure_mode,
-                self.recording_failure_fallback_enabled,
-            ),
-            (self.barcode_log_mode, self.barcode_log_fallback_enabled),
-            (self.barcode_mode, self.barcode_fallback_enabled),
-            (
-                self.barcode_residual_mode,
-                self.barcode_residual_fallback_enabled,
-            ),
-            (
-                self.barcode_timeline_mode,
-                self.barcode_timeline_fallback_enabled,
-            ),
-            (
-                self.barcode_freeform_mode,
-                self.barcode_freeform_fallback_enabled,
-            ),
-            (self.freeform_mode, self.freeform_fallback_enabled),
-            (self.playbook_mode, self.playbook_fallback_enabled),
-            (
-                self.weekly_summary_mode,
-                self.weekly_summary_fallback_enabled,
-            ),
-            (self.operations_mode, self.operations_fallback_enabled),
-            (self.automation_mode, self.automation_fallback_enabled),
-        )
-        return all(
-            mode == "remote" and not fallback_enabled
-            for mode, fallback_enabled in rollout_settings
-        )
-
-    @property
-    def enabled(self) -> bool:
-        return any(
-            mode in {"shadow", "remote"}
-            for mode in (
-                self.notion_mode,
-                self.structured_mode,
-                self.device_mode,
-                self.device_detail_mode,
-                self.recording_failure_mode,
-                self.barcode_log_mode,
-                self.barcode_mode,
-                self.barcode_residual_mode,
-                self.barcode_timeline_mode,
-                self.barcode_freeform_mode,
-                self.freeform_mode,
-                self.playbook_mode,
-                self.weekly_summary_mode,
-                self.operations_mode,
-                self.automation_mode,
-            )
-        )
-
-    @property
-    def shadow_enabled(self) -> bool:
-        return "shadow" in {
-            self.notion_mode,
-            self.structured_mode,
-            self.device_mode,
-            self.device_detail_mode,
-            self.recording_failure_mode,
-            self.barcode_log_mode,
-            self.barcode_mode,
-            self.barcode_residual_mode,
-            self.barcode_timeline_mode,
-            self.barcode_freeform_mode,
-            self.freeform_mode,
-            self.playbook_mode,
-            self.weekly_summary_mode,
-        }
 
 
 def load_company_api_client_settings(
     env: Mapping[str, str] | None = None,
 ) -> CompanyApiClientSettings:
-    """production Slack entry의 완전 remote 설정만 fail-closed로 읽는다."""
+    """Slack이 공통 API와 receipt journal에 필요한 설정만 읽는다."""
 
     source = os.environ if env is None else env
-    notion_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_NOTION_MODE",
-    )
-    structured_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_STRUCTURED_MODE",
-    )
-    device_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_DEVICE_MODE",
-    )
-    device_detail_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_DEVICE_DETAIL_MODE",
-    )
-    recording_failure_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_RECORDING_FAILURE_MODE",
-    )
-    barcode_log_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_BARCODE_LOG_MODE",
-    )
-    barcode_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_BARCODE_MODE",
-    )
-    barcode_residual_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_BARCODE_RESIDUAL_MODE",
-    )
-    barcode_timeline_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_BARCODE_TIMELINE_MODE",
-    )
-    barcode_freeform_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_BARCODE_FREEFORM_MODE",
-    )
-    freeform_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_FREEFORM_MODE",
-    )
-    playbook_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_PLAYBOOK_MODE",
-    )
-    weekly_summary_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_WEEKLY_SUMMARY_MODE",
-    )
-    operations_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_OPERATIONS_MODE",
-    )
-    automation_mode = _rollout_mode_setting(
-        source,
-        "BOXER_COMPANY_API_AUTOMATION_MODE",
-    )
-    rollout_modes = (
-        notion_mode,
-        structured_mode,
-        device_mode,
-        device_detail_mode,
-        recording_failure_mode,
-        barcode_log_mode,
-        barcode_mode,
-        barcode_residual_mode,
-        barcode_timeline_mode,
-        barcode_freeform_mode,
-        freeform_mode,
-        playbook_mode,
-        weekly_summary_mode,
-        operations_mode,
-        automation_mode,
-    )
-    if any(mode != "remote" for mode in rollout_modes):
-        # Slack-local 실행과 shadow 비교는 production rollback 경계가 아니다.
-        # mode 하나라도 remote가 아니면 credential을 읽기 전에 기동을 막는다.
-        raise CompanyApiContractError(
-            "company_api_transport_only_remote_required"
-        )
-    automation_remote_cycles = _automation_remote_cycles_setting(
-        source,
-        automation_mode=automation_mode,
-    )
-    if frozenset(automation_remote_cycles) != COMPANY_AUTOMATION_CYCLES:
-        # 일부 cycle만 Slack에 남기는 혼합 소유권도 local rollback이므로
-        # production entry에서는 다섯 cycle exact set만 허용한다.
-        raise CompanyApiContractError(
-            "company_api_automation_remote_cycles_invalid"
-        )
-
     raw_base_url = str(
         source.get("BOXER_COMPANY_API_BASE_URL", "")
     ).strip()
@@ -584,11 +337,6 @@ def load_company_api_client_settings(
         "BOXER_COMPANY_API_OPERATIONS_READ_TIMEOUT_SEC",
         1_300.0,
     )
-    automation_read_timeout_sec = _positive_float_setting(
-        source,
-        "BOXER_COMPANY_API_AUTOMATION_READ_TIMEOUT_SEC",
-        1_800.0,
-    )
     max_retries = _bounded_int_setting(
         source,
         "BOXER_COMPANY_API_MAX_RETRIES",
@@ -596,250 +344,27 @@ def load_company_api_client_settings(
         minimum=0,
         maximum=2,
     )
-    notion_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_NOTION_FALLBACK_ENABLED",
-            False,
-        )
-        if notion_mode != "local"
-        else False
-    )
-    structured_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_STRUCTURED_FALLBACK_ENABLED",
-            False,
-        )
-        if structured_mode != "local"
-        else False
-    )
-    device_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_DEVICE_FALLBACK_ENABLED",
-            False,
-        )
-        if device_mode != "local"
-        else False
-    )
-    device_detail_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_DEVICE_DETAIL_FALLBACK_ENABLED",
-            False,
-        )
-        if device_detail_mode != "local"
-        else False
-    )
-    if device_detail_fallback_enabled:
-        # generic 장비 상세 cutover가 Slack의 legacy live 경로로 조용히
-        # 되돌아가지 않도록 이 route는 운영 fallback을 항상 막는다.
-        raise CompanyApiContractError(
-            "company_api_device_detail_fallback_unsafe"
-        )
-    recording_failure_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_RECORDING_FAILURE_FALLBACK_ENABLED",
-            False,
-        )
-        if recording_failure_mode != "local"
-        else False
-    )
-    barcode_log_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_BARCODE_LOG_FALLBACK_ENABLED",
-            False,
-        )
-        if barcode_log_mode != "local"
-        else False
-    )
-    barcode_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_BARCODE_FALLBACK_ENABLED",
-            False,
-        )
-        if barcode_mode != "local"
-        else False
-    )
-    barcode_residual_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_BARCODE_RESIDUAL_FALLBACK_ENABLED",
-            False,
-        )
-        if barcode_residual_mode != "local"
-        else False
-    )
-    barcode_timeline_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_BARCODE_TIMELINE_FALLBACK_ENABLED",
-            False,
-        )
-        if barcode_timeline_mode != "local"
-        else False
-    )
-    barcode_freeform_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_BARCODE_FREEFORM_FALLBACK_ENABLED",
-            False,
-        )
-        if barcode_freeform_mode != "local"
-        else False
-    )
-    freeform_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_FREEFORM_FALLBACK_ENABLED",
-            False,
-        )
-        if freeform_mode != "local"
-        else False
-    )
-    playbook_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_PLAYBOOK_FALLBACK_ENABLED",
-            False,
-        )
-        if playbook_mode != "local"
-        else False
-    )
-    weekly_summary_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_WEEKLY_SUMMARY_FALLBACK_ENABLED",
-            False,
-        )
-        if weekly_summary_mode != "local"
-        else False
-    )
-    operations_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_OPERATIONS_FALLBACK_ENABLED",
-            False,
-        )
-        if operations_mode != "local"
-        else False
-    )
-    if operations_fallback_enabled:
-        # API가 받았는 mutation의 완료 여부를 모르는 상태에서
-        # Slack local 작업을 재실행하지 않도록 설정부터 막는다.
-        raise CompanyApiContractError(
-            "company_api_operations_fallback_unsafe"
-        )
-    automation_fallback_enabled = (
-        _boolean_setting(
-            source,
-            "BOXER_COMPANY_API_AUTOMATION_FALLBACK_ENABLED",
-            False,
-        )
-        if automation_mode != "local"
-        else False
-    )
-    if automation_fallback_enabled:
-        raise CompanyApiContractError(
-            "company_api_automation_fallback_unsafe"
-        )
-    if any(
-        (
-            notion_fallback_enabled,
-            structured_fallback_enabled,
-            device_fallback_enabled,
-            device_detail_fallback_enabled,
-            recording_failure_fallback_enabled,
-            barcode_log_fallback_enabled,
-            barcode_fallback_enabled,
-            barcode_residual_fallback_enabled,
-            barcode_timeline_fallback_enabled,
-            barcode_freeform_fallback_enabled,
-            freeform_fallback_enabled,
-            playbook_fallback_enabled,
-            weekly_summary_fallback_enabled,
-            operations_fallback_enabled,
-            automation_fallback_enabled,
-        )
-    ):
-        raise CompanyApiContractError(
-            "company_api_transport_only_remote_required"
-        )
     automation_tenant_id = str(
         source.get(
             "BOXER_COMPANY_API_AUTOMATION_TENANT_ID",
             "",
         )
     ).strip()
-    if (
-        automation_mode == "remote"
-        and not _IDENTIFIER_PATTERN.fullmatch(automation_tenant_id)
-    ):
+    if not _IDENTIFIER_PATTERN.fullmatch(automation_tenant_id):
         raise CompanyApiContractError(
             "company_api_automation_tenant_invalid"
         )
-    if automation_mode == "remote":
-        _validate_automation_delivery_state_path(
-            source.get("BOXER_COMPANY_AUTOMATION_DELIVERY_STATE_PATH", "")
-        )
+    _validate_automation_delivery_state_path(
+        source.get("BOXER_COMPANY_AUTOMATION_DELIVERY_STATE_PATH", "")
+    )
     return CompanyApiClientSettings(
         base_url=base_url,
         token=token,
         connect_timeout_sec=connect_timeout_sec,
         read_timeout_sec=read_timeout_sec,
         operations_read_timeout_sec=operations_read_timeout_sec,
-        automation_read_timeout_sec=automation_read_timeout_sec,
         max_retries=max_retries,
         automation_tenant_id=automation_tenant_id,
-        notion_mode=notion_mode,
-        notion_fallback_enabled=notion_fallback_enabled,
-        structured_mode=structured_mode,
-        structured_fallback_enabled=(
-            structured_fallback_enabled
-        ),
-        device_mode=device_mode,
-        device_fallback_enabled=device_fallback_enabled,
-        device_detail_mode=device_detail_mode,
-        device_detail_fallback_enabled=(
-            device_detail_fallback_enabled
-        ),
-        recording_failure_mode=recording_failure_mode,
-        recording_failure_fallback_enabled=(
-            recording_failure_fallback_enabled
-        ),
-        barcode_log_mode=barcode_log_mode,
-        barcode_log_fallback_enabled=barcode_log_fallback_enabled,
-        barcode_mode=barcode_mode,
-        barcode_fallback_enabled=barcode_fallback_enabled,
-        barcode_residual_mode=barcode_residual_mode,
-        barcode_residual_fallback_enabled=(
-            barcode_residual_fallback_enabled
-        ),
-        barcode_timeline_mode=barcode_timeline_mode,
-        barcode_timeline_fallback_enabled=(
-            barcode_timeline_fallback_enabled
-        ),
-        barcode_freeform_mode=barcode_freeform_mode,
-        barcode_freeform_fallback_enabled=(
-            barcode_freeform_fallback_enabled
-        ),
-        freeform_mode=freeform_mode,
-        freeform_fallback_enabled=freeform_fallback_enabled,
-        playbook_mode=playbook_mode,
-        playbook_fallback_enabled=playbook_fallback_enabled,
-        weekly_summary_mode=weekly_summary_mode,
-        weekly_summary_fallback_enabled=(
-            weekly_summary_fallback_enabled
-        ),
-        operations_mode=operations_mode,
-        operations_fallback_enabled=False,
-        automation_mode=automation_mode,
-        automation_fallback_enabled=False,
-        automation_remote_cycles=automation_remote_cycles,
     )
 
 
@@ -907,12 +432,6 @@ class CompanyAssistantApiClient:
         *,
         route_group: _RouteGroup | None = None,
     ) -> CompanyAssistantResult:
-        if not self._settings.enabled:
-            raise CompanyApiContractError(
-                "company_api_client_disabled",
-                request_id=request.request_id,
-            )
-
         request_id = _validate_request(
             request,
             route_group=route_group,
@@ -997,7 +516,7 @@ class CompanyAssistantApiClient:
                 ) from exc
             except requests.exceptions.ConnectionError as exc:
                 # 연결 후 reset인지 구분할 수 없으므로 같은 요청을 자동
-                # 재실행하지 않고 read-only fallback 판단으로 넘긴다.
+                # 재실행하지 않고 remote 실패 경계로 그대로 올린다.
                 self._log_failure(
                     "connection_failed",
                     request_id=request_id,
@@ -1070,11 +589,6 @@ class CompanyAssistantApiClient:
     ) -> CompanyAssistantResult:
         """부분 결과를 즉시 소비하고 terminal final 하나만 반환한다."""
 
-        if not self._settings.enabled:
-            raise CompanyApiContractError(
-                "company_api_client_disabled",
-                request_id=request.request_id,
-            )
         if not callable(on_partial_result):
             raise CompanyApiContractError(
                 "company_api_progress_callback_invalid",
@@ -1365,7 +879,7 @@ class CompanyAssistantApiClient:
                 request_id=request_id,
             )
         if status >= 500:
-            # internal_error는 재시도하지 않지만 read-only local fallback은 허용한다.
+            # internal_error는 재시도하거나 Slack-local 실행으로 우회하지 않는다.
             raise CompanyApiAvailabilityError(
                 "company_api_server_failed",
                 status=status,
@@ -1440,101 +954,8 @@ def _validate_base_url(value: str) -> str:
 def _validate_client_settings(
     settings: CompanyApiClientSettings,
 ) -> str:
-    rollout_settings = (
-        (settings.notion_mode, settings.notion_fallback_enabled),
-        (settings.structured_mode, settings.structured_fallback_enabled),
-        (settings.device_mode, settings.device_fallback_enabled),
-        (
-            settings.device_detail_mode,
-            settings.device_detail_fallback_enabled,
-        ),
-        (
-            settings.recording_failure_mode,
-            settings.recording_failure_fallback_enabled,
-        ),
-        (settings.barcode_log_mode, settings.barcode_log_fallback_enabled),
-        (settings.barcode_mode, settings.barcode_fallback_enabled),
-        (
-            settings.barcode_residual_mode,
-            settings.barcode_residual_fallback_enabled,
-        ),
-        (
-            settings.barcode_timeline_mode,
-            settings.barcode_timeline_fallback_enabled,
-        ),
-        (
-            settings.barcode_freeform_mode,
-            settings.barcode_freeform_fallback_enabled,
-        ),
-        (
-            settings.freeform_mode,
-            settings.freeform_fallback_enabled,
-        ),
-        (settings.playbook_mode, settings.playbook_fallback_enabled),
-        (
-            settings.weekly_summary_mode,
-            settings.weekly_summary_fallback_enabled,
-        ),
-        (
-            settings.operations_mode,
-            settings.operations_fallback_enabled,
-        ),
-        (
-            settings.automation_mode,
-            settings.automation_fallback_enabled,
-        ),
-    )
-    if any(
-        mode not in {"local", "shadow", "remote"}
-        or type(fallback_enabled) is not bool
-        for mode, fallback_enabled in rollout_settings
-    ):
-        raise CompanyApiContractError("company_api_settings_invalid")
-    if settings.device_detail_fallback_enabled:
-        # API turn 자체가 필요 시 tunnel을 열 수 있고 fallback 대상인 기존
-        # Slack route도 같은 lifecycle을 소유하므로 둘을 혼용하지 않는다.
-        raise CompanyApiContractError(
-            "company_api_device_detail_fallback_unsafe"
-        )
-    if settings.operations_mode == "shadow":
-        raise CompanyApiContractError(
-            "company_api_operations_shadow_unsafe"
-        )
-    if settings.operations_fallback_enabled:
-        raise CompanyApiContractError(
-            "company_api_operations_fallback_unsafe"
-        )
-    if settings.automation_mode == "shadow":
-        raise CompanyApiContractError(
-            "company_api_automation_shadow_unsafe"
-        )
-    if settings.automation_fallback_enabled:
-        raise CompanyApiContractError(
-            "company_api_automation_fallback_unsafe"
-        )
-    remote_cycles = _validate_automation_remote_cycles(
-        settings.automation_remote_cycles,
-        required=settings.automation_mode == "remote",
-    )
-    if (
-        COMPANY_ACTION_AUTOMATION_CYCLES.intersection(remote_cycles)
-        and settings.operations_mode != "remote"
-    ):
-        raise CompanyApiContractError(
-            "company_api_remote_automation_requires_remote_operations"
-        )
-    if (
-        settings.automation_mode == "remote"
-        and not _IDENTIFIER_PATTERN.fullmatch(
-            str(settings.automation_tenant_id or "")
-        )
-    ):
-        raise CompanyApiContractError(
-            "company_api_automation_tenant_invalid"
-        )
-    if not settings.enabled:
-        return ""
-
+    # client 객체에는 rollout 선택지가 없다. remote endpoint와 transport
+    # 안전값만 검증해 모든 호출을 같은 프로세스 경계에 고정한다.
     base_url = _validate_base_url(str(settings.base_url))
     token = settings.token
     if (
@@ -1546,7 +967,6 @@ def _validate_client_settings(
         settings.connect_timeout_sec,
         settings.read_timeout_sec,
         settings.operations_read_timeout_sec,
-        settings.automation_read_timeout_sec,
     )
     if any(
         isinstance(value, bool)
@@ -1562,62 +982,6 @@ def _validate_client_settings(
     ):
         raise CompanyApiContractError("company_api_retry_invalid")
     return base_url
-
-
-def _rollout_mode_setting(
-    env: Mapping[str, str],
-    key: str,
-) -> _RolloutMode:
-    mode = str(env.get(key, "local")).strip().lower()
-    if mode not in {"local", "shadow", "remote"}:
-        raise CompanyApiContractError("company_api_mode_invalid")
-    return mode  # type: ignore[return-value]
-
-
-def _automation_remote_cycles_setting(
-    env: Mapping[str, str],
-    *,
-    automation_mode: _RolloutMode,
-) -> tuple[str, ...]:
-    """remote mode에서만 명시적 cycle allowlist를 읽는다."""
-
-    if automation_mode != "remote":
-        # local rollback은 예전 remote 값이 잘못 남아 있어도 무시한다.
-        return ()
-    raw_value = str(
-        env.get("BOXER_COMPANY_API_AUTOMATION_REMOTE_CYCLES", "")
-    ).strip()
-    cycles = tuple(item.strip() for item in raw_value.split(","))
-    return _validate_automation_remote_cycles(cycles, required=True)
-
-
-def _validate_automation_remote_cycles(
-    cycles: Any,
-    *,
-    required: bool,
-) -> tuple[str, ...]:
-    """cycle 소유권이 중복·암묵적 확장되지 않게 고정한다."""
-
-    if type(cycles) is not tuple or any(
-        type(cycle) is not str for cycle in cycles
-    ):
-        raise CompanyApiContractError(
-            "company_api_automation_remote_cycles_invalid"
-        )
-    if not required:
-        return ()
-    if (
-        not cycles
-        or any(
-            not cycle or cycle not in COMPANY_AUTOMATION_CYCLES
-            for cycle in cycles
-        )
-        or len(cycles) != len(set(cycles))
-    ):
-        raise CompanyApiContractError(
-            "company_api_automation_remote_cycles_invalid"
-        )
-    return cycles
 
 
 def _is_internal_http_host(hostname: str) -> bool:
@@ -1671,21 +1035,6 @@ def _bounded_int_setting(
     if not minimum <= value <= maximum:
         raise CompanyApiContractError("company_api_retry_invalid")
     return value
-
-
-def _boolean_setting(
-    env: Mapping[str, str],
-    key: str,
-    default: bool,
-) -> bool:
-    raw = str(
-        env.get(key, "true" if default else "false")
-    ).strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    raise CompanyApiContractError("company_api_boolean_invalid")
 
 
 def _validate_request(
@@ -2901,7 +2250,7 @@ def _deserialize_progress_stream(
         stream_route = route
         if frame_type == "final":
             return result
-        # parsing/transport 예외와 local Slack renderer 예외를 구분하기 위해
+        # parsing/transport 예외와 Slack renderer 예외를 구분하기 위해
         # callback은 위의 frame 검증 블록 밖에서 그대로 호출한다.
         on_partial_result(result)
 
@@ -3010,8 +2359,6 @@ def _deserialize_result_payload(
                 maximum=256,
             )
         )
-        or payload.get("suggestedAction") is not None
-        or payload.get("asyncJob") is not None
         or not isinstance(payload.get("messages"), list)
         or not isinstance(payload.get("sources"), list)
         or not 1 <= len(payload["messages"]) <= _MAX_RESPONSE_MESSAGES

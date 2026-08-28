@@ -90,7 +90,7 @@ class KnowledgeManager:
             return MarkdownKnowledgeSource(self._settings.markdown_root)
         if self._settings.knowledge_source == "notion":
             if not self._settings.notion_page_ids:
-                raise RuntimeError("NOTION_TEST_PAGE_ID 설정이 없어")
+                raise RuntimeError("BOXER_WEB_NOTION_PAGE_IDS 설정이 없어")
             return NotionKnowledgeSource(self._settings.notion_page_ids)
         raise RuntimeError(f"지원하지 않는 knowledge source야: {self._settings.knowledge_source}")
 

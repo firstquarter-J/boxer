@@ -1,3 +1,9 @@
+from boxer_company._operation_routing_file import (
+    _DEVICE_FILE_DOWNLOAD_HINTS,
+    _DEVICE_FILE_ID_HINTS,
+    _DEVICE_FILE_RECOVERY_HINTS,
+    _DEVICE_FILE_REMOTE_HINTS,
+)
 import base64
 import json
 import hashlib
@@ -24,7 +30,8 @@ except ImportError:  # pragma: no cover - runtime guard
     requests = None
 
 from boxer_company import settings as cs
-from boxer.core.utils import _display_value, _truncate_text
+from boxer.core.utils import _truncate_text
+from boxer_company.utils import _display_value
 from boxer_company.routers.barcode_log import (
     _build_phase2_scope_request_message,
     _error_lines_in_session,
@@ -42,8 +49,6 @@ from boxer_company.routers.box_db import (
 from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company.routers.mda_graphql import (
     _open_mda_device_ssh,
-    _get_mda_device_agent_ssh,
-    _is_mda_graphql_configured,
     _wait_for_mda_device_agent_ssh,
 )
 from boxer_company.routers.device_ssh_security import (
@@ -53,14 +58,6 @@ from boxer_company.routers.device_ssh_security import (
 )
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
-_DEVICE_FILE_ID_HINTS = (
-    "fileid",
-    "file id",
-    "파일id",
-    "파일 id",
-    "파일 아이디",
-    "파일아이디",
-)
 
 _DEVICE_FILE_LIST_HINTS = (
     "목록",
@@ -75,36 +72,7 @@ _DEVICE_FILE_LIST_HINTS = (
 )
 
 # 운영자가 "영상 꺼내"라고 말하는 경우도 장비 파일 다운로드 의도로 본다.
-_DEVICE_FILE_DOWNLOAD_HINTS = (
-    "다운로드",
-    "영상 다운",
-    "영상다운",
-    "파일 다운",
-    "파일다운",
-    "영상 꺼내",
-    "영상꺼내",
-    "파일 꺼내",
-    "파일꺼내",
-    "영상 받아",
-    "영상 받아줘",
-    "영상받아",
-    "영상받아줘",
-    "받아줘",
-    "받아 줘",
-    "내려받아",
-)
 
-_DEVICE_FILE_RECOVERY_HINTS = (
-    "영상 복구",
-    "영상복구",
-    "파일 복구",
-    "파일복구",
-    "복구",
-    "복구해",
-    "복구 해",
-    "복구해줘",
-    "복구 해줘",
-)
 
 _TEMP_FILE_PREFIXES = ("device-file-", "device-upload-")
 _DEVICE_SSH_CLIENT_ACTIVE_COUNTS: dict[str, int] = {}
@@ -184,63 +152,11 @@ def _cleanup_device_temp_dir() -> None:
     except OSError:
         return
 
-_DEVICE_FILE_REMOTE_HINTS = (
-    "파일 있",
-    "파일있",
-    "파일 있어",
-    "파일있어",
-    "파일 있는지",
-    "파일있는지",
-    "파일 존재",
-    "영상 있",
-    "영상있",
-    "영상 있어",
-    "영상있어",
-    "영상 있는지",
-    "영상있는지",
-    "영상 존재",
-    "있는지",
-    "존재 확인",
-    "남은 영상",
-    "남은 파일",
-    "장비에 남은 영상",
-    "장비에 남은 파일",
-    "장비 영상",
-    "로컬 영상",
-    "장비 파일",
-    "장비에 파일",
-    "디바이스 파일",
-    "로컬 파일",
-    *_DEVICE_FILE_DOWNLOAD_HINTS,
-    *_DEVICE_FILE_RECOVERY_HINTS,
-)
-_DEVICE_FILE_PROBE_HINTS = _DEVICE_FILE_ID_HINTS + _DEVICE_FILE_REMOTE_HINTS
-
-
-def _is_barcode_device_file_probe_request(question: str, barcode: str | None) -> bool:
-    if not barcode:
-        return False
-    text = (question or "").strip()
-    lowered = text.lower()
-    return any(hint in text or hint in lowered for hint in _DEVICE_FILE_PROBE_HINTS)
-
 
 def _should_probe_device_files(question: str) -> bool:
     text = (question or "").strip()
     lowered = text.lower()
     return any(hint in text or hint in lowered for hint in _DEVICE_FILE_REMOTE_HINTS)
-
-
-def _should_download_device_files(question: str) -> bool:
-    text = (question or "").strip()
-    lowered = text.lower()
-    return any(hint in text or hint in lowered for hint in _DEVICE_FILE_DOWNLOAD_HINTS)
-
-
-def _should_recover_device_files(question: str) -> bool:
-    text = (question or "").strip()
-    lowered = text.lower()
-    return any(hint in text or hint in lowered for hint in _DEVICE_FILE_RECOVERY_HINTS)
 
 
 def _should_render_compact_device_file_list(question: str) -> bool:
@@ -579,7 +495,6 @@ def _upload_device_files_to_uploader(
     *,
     barcode: str,
     device_name: str,
-    file_id: str,
     log_date: str,
     started_time: str,
     added_time: str,
@@ -947,7 +862,6 @@ def _render_file_candidate_result(
     barcode: str,
     log_date: str,
     mapped_device_count: int,
-    all_device_contexts: list[dict[str, Any]],
     records: list[dict[str, Any]],
     used_expanded_scope: bool,
     logs_found_any: int,
@@ -1472,7 +1386,6 @@ def _locate_barcode_file_candidates(
                                     list(remote_files),
                                     barcode=barcode,
                                     device_name=_display_value(record.get("deviceName"), default=""),
-                                    file_id=file_id,
                                     log_date=log_date,
                                     started_time=_display_value(session.get("startedRecordingTime"), default=""),
                                     added_time=_display_value(session.get("addedRecordingTime"), default=""),
@@ -1485,7 +1398,6 @@ def _locate_barcode_file_candidates(
         barcode=barcode,
         log_date=log_date,
         mapped_device_count=mapped_device_count,
-        all_device_contexts=all_device_contexts,
         records=records,
         used_expanded_scope=used_expanded_scope,
         logs_found_any=logs_found_any,

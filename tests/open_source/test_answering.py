@@ -1,23 +1,87 @@
+import subprocess
+import sys
 import unittest
+from unittest.mock import patch
 
 import boxer
 from boxer.answering import (
     AnswerEngine,
     AnswerRequest,
     AnswerResult,
+    create_answer_engine_from_settings,
     synthesize_retrieval_answer,
 )
 
 
 class AnswerEngineTests(unittest.TestCase):
+    def test_package_import_does_not_eagerly_load_llm_provider(self) -> None:
+        # Adapter의 provider-free 계약 import가 Anthropic 초기화를 유발하지 않는다.
+        script = """
+import sys
+import boxer
+
+assert 'boxer.answering' not in sys.modules
+assert 'boxer.core.llm' not in sys.modules
+assert 'anthropic' not in sys.modules
+assert boxer.ContextEntry.__name__ == 'ContextEntry'
+assert 'boxer.answering' not in sys.modules
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_top_level_package_exports_stable_answer_contract(self) -> None:
         self.assertIs(boxer.AnswerEngine, AnswerEngine)
         self.assertIs(boxer.AnswerRequest, AnswerRequest)
         self.assertIs(boxer.AnswerResult, AnswerResult)
         self.assertIs(
+            boxer.create_answer_engine_from_settings,
+            create_answer_engine_from_settings,
+        )
+        self.assertIs(
             boxer.synthesize_retrieval_answer,
             synthesize_retrieval_answer,
         )
+
+    @patch("boxer.answering._build_claude_client")
+    def test_settings_factory_closes_provider_when_synthesis_is_disabled(self, mocked_builder) -> None:
+        # feature flag가 꺼지면 provider credential 유무와 관계없이 모든 adapter가 같은 no-LLM 엔진을 받는다.
+        with (
+            patch("boxer.answering.s.LLM_SYNTHESIS_ENABLED", False),
+            patch("boxer.answering.s.LLM_PROVIDER", "claude"),
+            patch("boxer.answering.s.ANTHROPIC_API_KEY", "configured"),
+        ):
+            engine = create_answer_engine_from_settings()
+
+        self.assertEqual(engine.provider, "")
+        mocked_builder.assert_not_called()
+        result = engine.answer(AnswerRequest(question="질문", evidence={"answer": "근거"}))
+        self.assertEqual(result.failure_reason, "provider_unconfigured")
+
+    @patch("boxer.answering._build_claude_client")
+    def test_settings_factory_does_not_build_client_from_placeholder_credentials(
+        self,
+        mocked_builder,
+    ) -> None:
+        # 샘플 placeholder는 API key로 쓰거나 OAuth command로 실행하지 않는다.
+        with (
+            patch("boxer.answering.s.LLM_SYNTHESIS_ENABLED", True),
+            patch("boxer.answering.s.LLM_PROVIDER", "claude"),
+            patch("boxer.answering.s.ANTHROPIC_API_KEY", "REPLACE_ME"),
+            patch("boxer.answering.s.ANTHROPIC_AUTH_TOKEN", ""),
+            patch(
+                "boxer.answering.s.ANTHROPIC_AUTH_TOKEN_COMMAND",
+                "REPLACE_ME",
+            ),
+        ):
+            engine = create_answer_engine_from_settings()
+
+        self.assertEqual(engine.provider, "claude")
+        mocked_builder.assert_not_called()
 
     def test_answer_passes_normalized_context_and_evidence_to_provider(self) -> None:
         calls: list[dict] = []

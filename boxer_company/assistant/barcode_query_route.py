@@ -1,9 +1,32 @@
 from __future__ import annotations
 
+# Read matcher와 transport source 검증은 Slack/API가 공유하는 순수 정본을 쓴다.
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    _BABY_MAGIC_RESULT_LINK_PATTERN,
+    _extract_log_date,
+    _extract_log_date_with_presence,
+    _is_baby_ai_list_request_without_barcode,
+    _is_barcode_all_recorded_dates_request,
+    _is_barcode_baby_ai_list_request,
+    _is_barcode_last_recorded_at_request,
+    _is_barcode_video_count_request,
+    _is_barcode_video_info_request,
+    _is_barcode_video_length_request,
+    _is_barcode_video_list_request,
+    _is_barcode_video_recorded_on_date_request,
+    is_safe_baby_magic_source_uri,
+    resolve_assistant_request_scope,
+)
+from boxer_company.operation_routing import (
+    _is_barcode_pink_classification_reason_request,
+    _is_barcode_validation_status_request,
+    _is_recording_streaming_restore_request,
+)
+
 import logging
 import re
 from typing import Callable
-from urllib.parse import urlsplit
 
 import pymysql
 
@@ -25,26 +48,9 @@ from boxer_company.assistant.service import (
     RequestScopedRecordingsContext,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
-    resolve_assistant_request_scope,
-)
-from boxer_company.routers.barcode_log import (
-    _extract_log_date,
-    _extract_log_date_with_presence,
-    _is_baby_ai_list_request_without_barcode,
-    _is_barcode_all_recorded_dates_request,
-    _is_barcode_baby_ai_list_request,
-    _is_barcode_last_recorded_at_request,
-    _is_barcode_video_count_request,
-    _is_barcode_video_info_request,
-    _is_barcode_video_length_request,
-    _is_barcode_video_list_request,
-    _is_barcode_video_recorded_on_date_request,
 )
 from boxer_company.routers.barcode_validation import (
-    _is_barcode_pink_classification_reason_request,
-    _is_barcode_validation_status_request,
     _query_barcode_pink_classification_reason,
     _query_barcode_validation_status,
 )
@@ -63,129 +69,6 @@ from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
 )
-from boxer_company.routers.recording_streaming_restore import (
-    _is_recording_streaming_restore_request,
-)
-
-
-# 공통 API는 DB 조회와 입력 안내로 끝나는 route만 허용한다. MDA를 보는
-# 핑크/유효성 분류와 복원 mutation은 이 목록 밖에 두어 adapter에 남긴다.
-COMMON_API_BARCODE_QUERY_ROUTES = frozenset(
-    {
-        "barcode_video_count",
-        "baby_ai_list",
-        "barcode_baby_ai_list",
-        "barcode_video_info",
-        "barcode_video_list",
-        "barcode_video_length",
-        "barcode_all_recorded_dates",
-    }
-)
-BARCODE_TIMELINE_ROUTES = frozenset(
-    {
-        "barcode last recordedAt",
-        "barcode recordedAt-on-date",
-    }
-)
-_BARCODE_DATE_EXISTENCE_HINTS = (
-    "있어",
-    "있나",
-    "있는지",
-    "있었",
-    "유무",
-    "여부",
-    "존재",
-    "됐",
-    "되었",
-    "된 거",
-    "된게",
-    "된 게",
-    "was recorded",
-    "exists",
-    "existence",
-    "any recording",
-    "any video",
-)
-_BABY_MAGIC_RESULT_LINK_PATTERN = re.compile(
-    r"<(https?://[^>|\s]+)\|([^>]*)>"
-)
-# env가 임의 host로 바뀌어도 transport source 신뢰 경계는 회사 기본 CDN에
-# 고정한다. 이 host 밖 링크는 source와 본문 양쪽에서 클릭 가능하게 만들지 않는다.
-_BABY_MAGIC_SOURCE_HOST = (
-    urlsplit(cs.BABY_MAGIC_CDN_DEFAULT_BASE_URL).hostname or ""
-).lower()
-
-
-def match_barcode_query_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """DB/MDA 호출 없이 Slack에 남길 mutation·PII 경로를 제외해 분류한다."""
-
-    try:
-        barcode = resolve_assistant_request_scope(request).barcode
-    except AssistantRequestScopeMismatch:
-        return None
-    question = request.question
-    if _is_barcode_pink_classification_reason_request(question, barcode):
-        return "barcode_pink_classification_reason"
-    if _is_barcode_validation_status_request(question, barcode):
-        return "barcode_validation_status"
-    if _is_recording_streaming_restore_request(question, barcode):
-        return None
-    if _is_barcode_video_count_request(question, barcode):
-        return "barcode_video_count"
-    if _is_baby_ai_list_request_without_barcode(question, barcode):
-        return "baby_ai_list"
-    if _is_barcode_baby_ai_list_request(question, barcode):
-        return "barcode_baby_ai_list"
-    if _is_barcode_video_info_request(question, barcode):
-        return "barcode_video_info"
-    if _is_barcode_video_list_request(question, barcode):
-        return "barcode_video_list"
-    if _is_barcode_video_length_request(question, barcode):
-        return "barcode_video_length"
-    if _is_barcode_all_recorded_dates_request(question, barcode):
-        return "barcode_all_recorded_dates"
-    if _is_barcode_last_recorded_at_request(question, barcode):
-        return "barcode last recordedAt"
-    if _is_barcode_video_recorded_on_date_request(question, barcode):
-        return "barcode recordedAt-on-date"
-    return None
-
-
-def match_common_api_barcode_query_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """외부 조회 없이 공통 API에서 실행할 DB-only 바코드 route를 고른다."""
-
-    route = match_barcode_query_route(request)
-    if route in COMMON_API_BARCODE_QUERY_ROUTES:
-        return route
-    return None
-
-
-def match_barcode_timeline_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """일반 날짜 목록은 제외하고 명시적인 녹화 시점·존재 질문만 고른다."""
-
-    # 기존 barcode matcher의 개수·목록·정보·길이 우선순위를 먼저 적용해
-    # 날짜가 있다는 이유만으로 일반 structured 조회를 가로채지 않는다.
-    route = match_barcode_query_route(request)
-    if route == "barcode last recordedAt":
-        return route
-    if route != "barcode recordedAt-on-date":
-        return None
-
-    lowered = request.question.lower()
-    if any(
-        hint in request.question or hint in lowered
-        for hint in _BARCODE_DATE_EXISTENCE_HINTS
-    ):
-        return route
-    return None
-
-
 class BarcodeQueryAssistantRoute:
     name = "barcode_query"
 
@@ -598,35 +481,6 @@ def _build_baby_magic_sources(
     return tuple(sources)
 
 
-def is_safe_baby_magic_source_uri(value: object) -> bool:
-    normalized = str(value or "").strip()
-    if not normalized or any(
-        character.isspace()
-        or ord(character) < 32
-        or character in "<>|\\"
-        for character in normalized
-    ):
-        # API source 자체도 Slack/CommonMark delimiter와 URL parser별로
-        # 다르게 해석될 수 있는 제어문자·역슬래시를 신뢰하지 않는다.
-        return False
-    try:
-        parsed = urlsplit(normalized)
-        port = parsed.port
-    except ValueError:
-        return False
-    return bool(
-        parsed.scheme.lower() == "https"
-        and parsed.hostname is not None
-        and parsed.hostname.lower() == _BABY_MAGIC_SOURCE_HOST
-        and port is None
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and parsed.path not in {"", "/"}
-    )
-
-
 def _is_safe_barcode_answer(text: str) -> bool:
     lowered = (text or "").lower()
     return "다른 바코드" not in text and "다른 barcode" not in lowered
@@ -650,11 +504,5 @@ def _result(
 
 
 __all__ = [
-    "BARCODE_TIMELINE_ROUTES",
     "BarcodeQueryAssistantRoute",
-    "COMMON_API_BARCODE_QUERY_ROUTES",
-    "is_safe_baby_magic_source_uri",
-    "match_barcode_timeline_route",
-    "match_barcode_query_route",
-    "match_common_api_barcode_query_route",
 ]

@@ -61,13 +61,8 @@ def _settings() -> CompanyApiClientSettings:
     return CompanyApiClientSettings(
         base_url="http://127.0.0.1:8010",
         token=_TOKEN,
-        automation_mode="remote",
         automation_tenant_id="T1",
-        automation_remote_cycles=(
-            "weekly_recordings",
-            "daily_device_round",
-        ),
-        automation_read_timeout_sec=33.0,
+        read_timeout_sec=33.0,
         max_retries=2,
     )
 
@@ -126,6 +121,11 @@ def _receipt() -> AutomationRemoteReceipt:
         permalink="https://example.slack.com/archives/C123456/p1",
         delivered_at=_NOW,
     )
+
+
+def test_client_exposes_only_scheduler_delivery_transport() -> None:
+    # Slack은 domain cycle endpoint를 호출하지 않고 pending pull/exact ACK만 소유한다.
+    assert not hasattr(CompanyAutomationApiClient, "run")
 
 
 def test_pull_pending_validates_and_returns_api_owned_batch() -> None:
@@ -239,7 +239,6 @@ def test_acknowledge_batch_accepts_crash_journal_reference() -> None:
     )
 
     assert result.acknowledged is True
-    assert result.pending_delivery_count == 0
     assert len(session.calls) == 1
     call = session.calls[0]
     assert call["url"].endswith("/internal/v1/automation/deliveries/ack")
@@ -325,6 +324,44 @@ def test_acknowledge_batch_rejects_inconsistent_ack_response() -> None:
     ):
         client.acknowledge_batch(
             request_id="automation:transport:ack:invalid",
+            batch=_batch_reference(),
+            receipts=(_receipt(),),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("requestId", "automation:transport:ack:other"),
+        ("batchId", "batch:" + ("0" * 64)),
+        ("pendingDeliveryCount", -1),
+    ),
+)
+def test_acknowledge_batch_keeps_wire_correlation_validation(
+    field: str,
+    value: object,
+) -> None:
+    # 반환 DTO를 ACK 여부로 줄여도 correlation과 pending 수 검증은 transport
+    # 경계에서 계속 강제한다.
+    payload = {
+        "requestId": "automation:transport:ack:strict",
+        "batchId": _batch_id(),
+        "acknowledged": True,
+        "pendingDeliveryCount": 0,
+        "autoRetryAllowed": False,
+    }
+    payload[field] = value
+    client = CompanyAutomationApiClient(
+        _settings(),
+        session=_FakeSession(_FakeResponse(200, payload)),
+    )
+
+    with pytest.raises(
+        CompanyApiContractError,
+        match="company_api_automation_delivery_response_invalid",
+    ):
+        client.acknowledge_batch(
+            request_id="automation:transport:ack:strict",
             batch=_batch_reference(),
             receipts=(_receipt(),),
         )

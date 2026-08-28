@@ -1199,8 +1199,6 @@ class AssistantTurnOutput(BaseModel):
     )
     usedLlm: bool
     fallbackReason: str | None = Field(default=None, max_length=256)
-    suggestedAction: None = None
-    asyncJob: None = None
     operationResult: (
         DeviceFileDownloadDeliveryOutput
         | DeviceOperationDeliveryOutput
@@ -1298,9 +1296,6 @@ def serialize_result(
         sources=sources,
         usedLlm=result.used_llm,
         fallbackReason=result.fallback_reason,
-        # 변경 작업과 job payload는 별도 typed API가 생기기 전에는 노출하지 않는다.
-        suggestedAction=None,
-        asyncJob=None,
         operationResult=_serialize_operation_result(
             result.operation_result
         ),

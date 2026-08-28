@@ -4,69 +4,7 @@ from typing import Any
 from urllib import error, parse, request
 
 from boxer_company import settings as cs
-from boxer.core.utils import _display_value
-
-
-_BABY_SELECTION_CONTEXT_KEYWORDS = (
-    "유저 조회",
-    "유저조회",
-    "산모 조회",
-    "산모조회",
-    "람다",
-    "lambda",
-)
-_BABY_SELECTION_ISSUE_KEYWORDS = (
-    "안 나",
-    "안나",
-    "누락",
-    "한 명만",
-    "한명만",
-    "하나만",
-    "선택",
-)
-_BABY_SELECTION_ANALYSIS_KEYWORDS = (
-    "원인",
-    "왜",
-    "분석",
-)
-def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
-    return any(keyword in text for keyword in keywords)
-
-
-def _should_analyze_app_user_baby_selection(
-    question: str,
-    barcode: str,
-) -> bool:
-    normalized = (question or "").strip().lower()
-    if not normalized or barcode not in normalized:
-        return False
-    return _contains_any(
-        normalized,
-        _BABY_SELECTION_CONTEXT_KEYWORDS,
-    ) and _contains_any(
-        normalized,
-        _BABY_SELECTION_ISSUE_KEYWORDS,
-    ) and _contains_any(
-        normalized,
-        _BABY_SELECTION_ANALYSIS_KEYWORDS,
-    )
-
-
-def _should_lookup_barcode(question: str, barcode: str) -> bool:
-    normalized = (question or "").strip()
-    lookup_keywords = ("유저 조회", "유저조회", "산모 조회", "산모조회")
-
-    non_profile_hints_ko = ("영상", "녹화", "촬영", "로그", "개수", "갯수", "최신", "마지막")
-    has_non_profile_hint = _contains_any(normalized, non_profile_hints_ko)
-    has_lookup_keyword = _contains_any(normalized, lookup_keywords)
-    if has_non_profile_hint and not has_lookup_keyword:
-        return False
-
-    if normalized.startswith(barcode):
-        suffix = normalized[len(barcode) :].strip()
-        return suffix in lookup_keywords
-
-    return has_lookup_keyword
+from boxer_company.utils import _display_value
 
 
 def _request_app_users_by_barcode(barcode: str) -> list[dict[str, Any]]:

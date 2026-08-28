@@ -6,7 +6,6 @@ from unittest.mock import Mock, patch
 from boxer_company.base_access import (
     BaseAccessMember,
     BaseAccessMutationResult,
-    BaseAccessSettings,
     StoreUnavailable,
 )
 from boxer_company_adapter_slack import access_routes
@@ -46,9 +45,6 @@ def _payload(question: str, *, actor_user_id: str = _HYUN_USER_ID) -> dict:
 
 def _runtime(store: Mock | None) -> access_routes.SlackBaseAccessRuntime:
     return access_routes.SlackBaseAccessRuntime(
-        settings=access_routes.BaseAccessSettings(
-            state_path="/var/lib/boxer/base-access.json",
-        ),
         store=store,
         logger=logging.getLogger("test.slack_access"),
     )
@@ -118,8 +114,12 @@ class SlackBaseAccessRuntimeTests(unittest.TestCase):
             runtime = access_routes.build_slack_base_access_runtime()
 
         self.assertIs(runtime.store, store)
-        self.assertEqual(runtime.settings.state_path, "/var/lib/boxer/base-access.json")
-        build_store.assert_called_once_with(runtime.settings)
+        build_store.assert_called_once()
+        built_settings = build_store.call_args.args[0]
+        self.assertEqual(
+            built_settings.state_path,
+            "/var/lib/boxer/base-access.json",
+        )
 
         with (
             patch.object(access_routes.cs, "BOXER_BASE_ACCESS_STATE_PATH", ""),
@@ -143,7 +143,6 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             allowed=True,
             changed=True,
             stale=False,
-            member=_member(),
         )
         self.runtime = _runtime(self.store)
         self.client = Mock()
@@ -525,7 +524,6 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             allowed=False,
             changed=True,
             stale=False,
-            member=_member(allowed=False),
         )
 
         self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 박서 사용 불가"))
@@ -545,7 +543,6 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             allowed=False,
             changed=True,
             stale=False,
-            member=_member(allowed=False),
         )
 
         self.assertTrue(self._handle("Zion 박서 사용 불가"))

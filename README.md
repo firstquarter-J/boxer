@@ -72,7 +72,7 @@ open core 내부 구조:
 - `boxer/answering.py`: 공개 `AnswerEngine`, `AnswerRequest`, `AnswerResult` facade
 - `boxer/core`: 설정, LLM, 공통 utils
 - `boxer/context`: entries / builder / windowing
-- `boxer/observability`: request log / audit / sqlite snapshot helper
+- `boxer/observability`: request log / sqlite snapshot helper
 - `boxer/retrieval/connectors`: DB/S3/Notion connector
 - `boxer/retrieval/knowledge.py`: Markdown / Notion knowledge source contract
 - `boxer/retrieval/synthesis.py`: retrieval evidence masking / serialization / synthesis
@@ -98,8 +98,12 @@ S3 connector를 켜면 `AWS_REGION`은 명시적으로 넣어야 한다.
 - `BOXER_WEB_DATA_PATH`
 - `BOXER_WEB_KNOWLEDGE_SOURCE`
 - `BOXER_WEB_MARKDOWN_ROOT`
+- `BOXER_WEB_NOTION_PAGE_IDS`
 - `BOXER_WEB_ADMIN_DIST_PATH`
 - `BOXER_WEB_WIDGET_ALLOWED_ORIGINS`
+
+Notion source를 쓸 때는 `BOXER_WEB_NOTION_PAGE_IDS`에 page ID를 쉼표로 나열한다.
+기존 설치의 `NOTION_TEST_PAGE_ID`도 호환용 alias로 읽지만 새 설정 이름이 우선한다.
 
 ## 빠른 시작
 
@@ -277,11 +281,11 @@ open core에서 바로 쓸 수 있는 범용 기반은 이런 것들이다.
 - transport: WebSocket
 - persistence: SQLite
 - knowledge source: Markdown 또는 Notion
-- admin 기능: 로컬 계정 로그인, knowledge sync/status/preview, conversation log 조회
-- widget 기능: 서비스 호스팅 iframe, Boxer Web URL 주입, session restore, 대화 이력 복구, FAQ 기반 답변, `EN/KO` 언어 선택, small talk 고정 응답
+- admin 기능: 로컬 계정 로그인, knowledge sync/status/preview, conversation log 조회, 상담 인계 claim/reply/close
+- widget 기능: 서비스 호스팅 iframe, Boxer Web URL 주입, session restore, 대화 이력 복구, FAQ 기반 답변, workflow, 상담 인계, `EN/KO` 언어 선택, small talk 고정 응답
 
-이번 alpha 범위는 FAQ 검색 + grounded answer + conversation log까지다.
-handoff, 상담사 reply, multi-tenant는 아직 포함하지 않는다.
+이번 alpha 범위는 FAQ 검색 + grounded answer + workflow + handoff + 상담사 reply + conversation log까지다.
+multi-tenant는 아직 포함하지 않는다.
 
 ## Packaging And Install
 

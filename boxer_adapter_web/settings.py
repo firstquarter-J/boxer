@@ -32,19 +32,18 @@ class WebSettings:
     notion_page_ids: list[str]
     welcome_title: str
     welcome_message: str
-    starter_options: list[str]
     welcome_timezone_ko: str
     welcome_timezone_en: str
-    web_config_path: Path | None
-    workflow_config_path: Path | None
     workflow_catalog: WorkflowCatalog
     handoff_policy: HandoffPolicy
 
 
 def get_web_settings() -> WebSettings:
     # 웹 alpha는 단일 워크스페이스 전제라 설정도 env 한 벌만 읽는다.
+    # Web 이름을 우선하고 기존 NOTION_TEST_PAGE_ID는 설치 마이그레이션용 alias로만 읽는다.
     notion_page_ids = _split_csv(
-        os.getenv("NOTION_TEST_PAGE_ID", "").strip()
+        os.getenv("BOXER_WEB_NOTION_PAGE_IDS", "").strip()
+        or os.getenv("NOTION_TEST_PAGE_ID", "").strip()
     )
     web_config_path = _resolve_optional_path(os.getenv("BOXER_WEB_CONFIG_PATH", ""))
     web_config = load_workflow_config(web_config_path)
@@ -105,11 +104,8 @@ def get_web_settings() -> WebSettings:
         notion_page_ids=notion_page_ids,
         welcome_title=_env_or_config("BOXER_WEB_WELCOME_TITLE", web_config.get("welcomeTitle"), ""),
         welcome_message=_env_or_config("BOXER_WEB_WELCOME_MESSAGE", web_config.get("welcomeMessage"), ""),
-        starter_options=starter_options,
         welcome_timezone_ko=_env_or_config("BOXER_WEB_WELCOME_TIMEZONE_KO", welcome_timezones.get("ko"), ""),
         welcome_timezone_en=_env_or_config("BOXER_WEB_WELCOME_TIMEZONE_EN", welcome_timezones.get("en"), ""),
-        web_config_path=web_config_path,
-        workflow_config_path=workflow_config_path,
         workflow_catalog=workflow_catalog,
         handoff_policy=HandoffPolicy(
             on_missing_evidence=_env_or_config_bool(

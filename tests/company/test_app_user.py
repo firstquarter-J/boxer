@@ -1,10 +1,12 @@
 import unittest
 from unittest.mock import patch
 
+from boxer_company.operation_routing import (
+    _should_analyze_app_user_baby_selection,
+)
 from boxer_company.routers.app_user import (
     _analyze_app_user_baby_selection_by_barcode,
     _lookup_app_user_by_barcode,
-    _should_analyze_app_user_baby_selection,
 )
 
 

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+# 장비 read parser는 transport와 API 실행부가 공유하는 순수 정본을 쓴다.
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    _build_device_db_detail_match,
+    _build_device_detail_match,
+    _is_exact_device_detail_request,
+)
+
 import logging
 import re
 from typing import Callable
@@ -17,112 +24,15 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
 )
-from boxer_company.assistant.structured_route import (
-    _StructuredQueryMatch,
-    _build_structured_query_match,
-)
 from boxer_company.routers.box_db import _query_devices_by_filters
-from boxer_company.weekly_recordings_report import (
-    _is_weekly_recordings_report_request,
-)
 
 
 DeviceQuery = Callable[..., str]
 
 _DEVICE_DETAIL_ROUTE_GROUP = "device_detail"
 
-# 이 표현들은 구조화 DB 필터보다 별도의 실시간 진단·변경 의도가 강하다.
-# 구조화 장비 조회는 모두 API로 옮기되 status probe/PM2 같은 operation은
-# 앞선 operations stage가 계속 소유하도록 여기서 선점하지 않는다.
-_LIVE_DEVICE_INTENT_TOKENS = (
-    "온라인",
-    "오프라인",
-    "연결 상태",
-    "연결상태",
-    "연결 확인",
-    "접속 상태",
-    "접속상태",
-    "접속 확인",
-    "응답 확인",
-    "마지막 보고",
-    "최근 보고",
-    "heartbeat",
-    "last seen",
-    "lastseen",
-    "reachable",
-    "connectivity",
-    "uptime",
-    "health check",
-    "healthcheck",
-    "status probe",
-    "online",
-    "offline",
-    "connected",
-    "disconnected",
-    "connection check",
-    "핑",
-    "ping",
-    "pong",
-    "ssh",
-    "mda",
-    "엠디에이",
-    "원격 접속",
-    "원격접속",
-    "버전",
-    "version",
-    "캡처보드",
-    "캡쳐보드",
-    "캡처 카드",
-    "캡쳐 카드",
-    "captureboard",
-    "capture board",
-    "capture card",
-    "pm2",
-    "프로세스 상태",
-    "프로세스상태",
-    "process status",
-    # 읽기처럼 보이는 장비 필터 문장에 변경 동사가 붙어도 공통 turn은
-    # 절대 mutation으로 확장하지 않고 기존 Slack action 경계에 남긴다.
-    "삭제",
-    "수정",
-    "변경",
-    "업데이트",
-    "바꿔",
-    "재부팅",
-    "재시작",
-    "종료",
-    "전원",
-    "초기화",
-    "등록",
-    "해제",
-)
-_LIVE_STATUS_PROBE_PATTERNS = (
-    re.compile(r"(?:현재|지금|실시간).{0,12}상태", re.IGNORECASE),
-    re.compile(r"상태.{0,12}(?:현재|지금|실시간)", re.IGNORECASE),
-    re.compile(
-        r"(?:장비\s*)?상태\s*"
-        r"(?:확인|체크|점검|봐|보여|알려|어때|어떤|정상|작동|동작)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:장비\s*)?상태\s*[?!.,~]*$", re.IGNORECASE),
-    re.compile(
-        r"(?:device\s+)?status\s*(?:check|probe|show|tell|what|\?)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:device\s+)?status\s*[?!.,~]*$", re.IGNORECASE),
-    re.compile(
-        r"장비.{0,12}정상\s*(?:이야|인가|맞아|해|한지|인지|\?)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:정상\s*)?(?:작동|동작)\s*(?:중|해|하나|하니|하는지)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:살아\s*있|alive|responding)", re.IGNORECASE),
-)
 _UNSAFE_DETAIL_LABELS = (
     "버전:",
     "version:",
@@ -143,82 +53,6 @@ _DB_STATUS_LABEL_PATTERN = re.compile(
     r"(?<![A-Za-z가-힣])status\s*:",
     re.IGNORECASE,
 )
-_DEVICE_NAME_TOKEN_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])"
-    r"([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9-]*\d[A-Za-z0-9-]*)"
-    r"(?![A-Za-z0-9])",
-    re.IGNORECASE,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _DeviceDbDetailMatch:
-    """기존 structured parser가 확정한 DB 장비 상세 조회 인자다."""
-
-    device_name: str | None
-    device_seq: int | None
-    hospital_name: str | None
-    room_name: str | None
-    hospital_seq: int | None
-    hospital_room_seq: int | None
-    device_status: str | None
-    active_flag: int | None
-    install_flag: int | None
-
-
-def match_device_db_detail_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """외부 조회 없이 DB-only 장비 상세·목록 요청만 분류한다."""
-
-    try:
-        matched = _build_device_db_detail_match(request)
-    except AssistantRequestScopeMismatch:
-        # scope 불일치는 기존 공통 guard가 값 노출 없이 처리하게 둔다.
-        return None
-    return "device_db_detail" if matched is not None else None
-
-
-def match_device_detail_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """live 보강이 필요한 모든 비-count 장비 조회의 결과 route를 고른다."""
-
-    try:
-        matched = _build_device_detail_match(request)
-    except AssistantRequestScopeMismatch:
-        # matcher는 transport 전 분류만 맡고 scope 오류 응답은 route가 만든다.
-        return None
-    if matched is None:
-        return None
-    # exact 장비명 상세는 이미 공개된 device_detail 계약을 유지하고,
-    # deviceSeq·병원·병실·status·목록은 기존 Slack route 이름을 보존한다.
-    return (
-        _DEVICE_DETAIL_ROUTE_GROUP
-        if _is_exact_device_detail_request(request, matched)
-        else "devices_filter"
-    )
-
-
-def extract_device_detail_name(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """full 장비 상세 rollout의 exact 장비명만 같은 parser에서 꺼낸다."""
-
-    try:
-        matched = _build_device_detail_match(request)
-    except AssistantRequestScopeMismatch:
-        return None
-    if (
-        matched is None
-        or not _is_exact_device_detail_request(request, matched)
-    ):
-        return None
-    # live 상세은 MDA의 canonical deviceName을 요구한다. deviceSeq 단독
-    # 요청은 이름을 추측하지 않고 기존 local/DB-only 경계에 남긴다.
-    return str(matched.device_name or "").strip() or None
-
-
 class DeviceDetailAssistantRoute:
     """기존 Slack의 live-enriched 장비 조회 전체를 API에서 실행한다."""
 
@@ -256,7 +90,7 @@ class DeviceDetailAssistantRoute:
 
         result_route = (
             _DEVICE_DETAIL_ROUTE_GROUP
-            if _is_exact_device_detail_request(request, matched)
+            if _is_exact_device_detail_request(matched)
             else "devices_filter"
         )
         try:
@@ -408,121 +242,6 @@ class DeviceDbDetailAssistantRoute:
         )
 
 
-def _build_device_db_detail_match(
-    request: CompanyAssistantRequest,
-) -> _DeviceDbDetailMatch | None:
-    """MDA/SSH 의도는 제외하고 devices DB-only 조회만 분류한다."""
-
-    if _has_live_device_intent(request.question):
-        return None
-
-    return _build_device_query_match(request)
-
-
-def _build_device_detail_match(
-    request: CompanyAssistantRequest,
-) -> _DeviceDbDetailMatch | None:
-    """Slack에 남아 있던 live 장비 조회까지 API 대상으로 분류한다."""
-
-    matched = _build_device_query_match(request)
-    if matched is not None:
-        return matched
-
-    # 기존 structured parser가 `오프라인인지` 같은 표현을 놓쳐도 Slack의
-    # search parser처럼 본문에서 첫 번째 장비명을 골라 live 조회한다.
-    explicit_name_match = _DEVICE_NAME_TOKEN_PATTERN.search(request.question)
-    if explicit_name_match is None or not _has_live_device_intent(
-        request.question
-    ):
-        return None
-    device_name = explicit_name_match.group(1)
-    return _DeviceDbDetailMatch(
-        device_name=device_name,
-        device_seq=None,
-        hospital_name=None,
-        room_name=None,
-        hospital_seq=None,
-        hospital_room_seq=None,
-        device_status=None,
-        active_flag=None,
-        install_flag=None,
-    )
-
-
-def _build_device_query_match(
-    request: CompanyAssistantRequest,
-) -> _DeviceDbDetailMatch | None:
-    """공통 structured parser 결과를 장비 상세 인자로 한 번만 변환한다."""
-
-    parsed: _StructuredQueryMatch | None = _build_structured_query_match(
-        request,
-        is_weekly_report_request=_is_weekly_recordings_report_request,
-    )
-    if (
-        parsed is None
-        or parsed.route != "devices_filter"
-        or parsed.count_only
-    ):
-        # 개수·존재는 기존 devices_filter rollout에 유지한다.
-        return None
-
-    return _DeviceDbDetailMatch(
-        device_name=parsed.device_name,
-        device_seq=parsed.device_seq,
-        hospital_name=parsed.hospital_name,
-        room_name=parsed.room_name,
-        hospital_seq=parsed.hospital_seq,
-        hospital_room_seq=parsed.hospital_room_seq,
-        device_status=parsed.device_status,
-        active_flag=parsed.active_flag,
-        install_flag=parsed.install_flag,
-    )
-
-
-def _is_exact_device_detail_match(
-    matched: _DeviceDbDetailMatch,
-) -> bool:
-    """live 보강 대상이 고유 장비 식별자로만 제한됐는지 확인한다."""
-
-    has_exact_identifier = bool(
-        matched.device_name or matched.device_seq is not None
-    )
-    has_list_filter = any(
-        (
-            matched.hospital_name,
-            matched.room_name,
-            matched.hospital_seq is not None,
-            matched.hospital_room_seq is not None,
-            matched.device_status,
-            matched.active_flag is not None,
-            matched.install_flag is not None,
-        )
-    )
-    return has_exact_identifier and not has_list_filter
-
-
-def _is_exact_device_detail_request(
-    request: CompanyAssistantRequest,
-    matched: _DeviceDbDetailMatch,
-) -> bool:
-    """Slack parser가 확정한 첫 장비명 상세 여부를 그대로 사용한다."""
-
-    del request
-    # deviceSeq 단독 요청은 MDA canonical name을 추측하지 않고 목록 route를
-    # 유지하되, 복수 장비 표현은 parser가 먼저 고른 deviceName으로 조회한다.
-    return bool(
-        matched.device_name and _is_exact_device_detail_match(matched)
-    )
-
-
-def _has_live_device_intent(question: str) -> bool:
-    normalized = " ".join(str(question or "").split())
-    lowered = normalized.lower()
-    if any(token in lowered for token in _LIVE_DEVICE_INTENT_TOKENS):
-        return True
-    return any(pattern.search(normalized) for pattern in _LIVE_STATUS_PROBE_PATTERNS)
-
-
 def _format_db_only_device_result(raw: str) -> str:
     """live 필드가 upstream 문자열에 섞여도 transport 전에 제거한다."""
 
@@ -564,7 +283,4 @@ def _result(
 __all__ = [
     "DeviceDetailAssistantRoute",
     "DeviceDbDetailAssistantRoute",
-    "extract_device_detail_name",
-    "match_device_detail_route",
-    "match_device_db_detail_route",
 ]

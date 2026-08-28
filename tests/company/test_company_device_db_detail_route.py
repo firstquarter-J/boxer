@@ -7,9 +7,8 @@ from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.device_db_detail_route import (
     DeviceDetailAssistantRoute,
     DeviceDbDetailAssistantRoute,
-    match_device_detail_route,
-    match_device_db_detail_route,
 )
+from boxer_company.read_routing import match_device_detail_route
 
 
 def _request(
@@ -44,21 +43,6 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
             "device_detail",
         )
 
-    def test_matcher_accepts_only_device_detail_and_list_queries(self) -> None:
-        expected = (
-            "MB2-C00419 장비 정보",
-            "장비명=MB2-C00419 장비 상세",
-            "deviceSeq=42 devices",
-            "status=ACTIVE 장비 목록",
-            "activeFlag=1 장비 목록",
-        )
-
-        for question in expected:
-            with self.subTest(question=question):
-                self.assertEqual(
-                    match_device_db_detail_route(_request(question)),
-                    "device_db_detail",
-                )
 
     def test_full_matcher_preserves_exact_and_filter_route_names(self) -> None:
         exact_queries = (
@@ -87,47 +71,7 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
                     "devices_filter",
                 )
 
-    def test_matcher_leaves_count_and_existence_on_devices_filter(self) -> None:
-        existing_rollout_queries = (
-            "MB2-C00419 장비 몇 개야",
-            "MB2-C00419 장비 있나",
-            "MB2-C00419 장비 있는지",
-            "activeFlag=1 장비 개수",
-            "status=ACTIVE 장비 몇 개",
-        )
 
-        for question in existing_rollout_queries:
-            with self.subTest(question=question):
-                self.assertIsNone(
-                    match_device_db_detail_route(_request(question))
-                )
-
-    def test_db_only_matcher_rejects_live_probe_and_enrichment_intents(self) -> None:
-        live_queries = (
-            "MB2-C00419 온라인이야?",
-            "MB2-C00419 오프라인인지 확인해줘",
-            "MB2-C00419 연결 상태 확인",
-            "MB2-C00419 SSH 접속 돼?",
-            "MB2-C00419 MDA 정보",
-            "MB2-C00419 버전 알려줘",
-            "MB2-C00419 캡처보드 종류 알려줘",
-            "MB2-C00419 캡쳐 카드 종류 알려줘",
-            "MB2-C00419 엠디에이 정보 알려줘",
-            "MB2-C00419 원격 접속 확인해줘",
-            "MB2-C00419 장비 정보 삭제해줘",
-            "MB2-C00419 status 변경해줘",
-            "MB2-C00419 PM2 프로세스 상태 확인",
-            "MB2-C00419 장비 상태",
-            "MB2-C00419 장비 상태 체크",
-            "MB2-C00419 지금 상태 어때?",
-            "MB2-C00419 ping 보내봐",
-        )
-
-        for question in live_queries:
-            with self.subTest(question=question):
-                self.assertIsNone(
-                    match_device_db_detail_route(_request(question))
-                )
 
     def test_full_matcher_accepts_live_device_queries(self) -> None:
         # DB-only fallback과 달리 API live route는 deviceSeq와 장비명의
@@ -415,7 +359,6 @@ class DeviceDbDetailRouteTests(unittest.TestCase):
         self.assertEqual(result.outcome, "answered")
         self.assertFalse(result.used_llm)
         self.assertEqual(result.sources, ())
-        self.assertIsNone(result.suggested_action)
         query.assert_called_once_with(
             device_name="MB2-C00419",
             device_seq=None,

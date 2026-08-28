@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# 학습 실행은 provider-free 정본이 확정한 route만 소비한다.
+from boxer_company._operation_routing_knowledge import (
+    match_thread_playbook_learning_route,
+)
+
 from collections.abc import Callable
 import logging
 from typing import Any
@@ -14,7 +19,6 @@ from boxer_company.assistant.contracts import (
 from boxer_company import settings as company_settings
 from boxer_company.thread_playbook_learning import (
     ThreadPlaybookSaveResult,
-    _is_thread_playbook_learning_request,
     _learn_slack_thread_playbook,
 )
 
@@ -25,28 +29,6 @@ FeatureEnabled = Callable[[], bool]
 
 def _thread_playbook_learning_enabled() -> bool:
     return bool(company_settings.THREAD_PLAYBOOK_LEARNING_ENABLED)
-
-
-def match_thread_playbook_learning_candidate_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """질문형까지 포함해 thread 학습 guard가 선점할 후보를 분류한다."""
-
-    if str(request.metadata.get("route_group") or "").strip() != "operations":
-        return None
-    if request.channel != "slack" or not request.actor_id:
-        return None
-    if not _is_thread_playbook_learning_request(request.question):
-        return None
-    return "thread_playbook_learning"
-
-
-def match_thread_playbook_learning_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """기존 Slack과 같은 thread 학습 matcher 결과를 그대로 반환한다."""
-
-    return match_thread_playbook_learning_candidate_route(request)
 
 
 class ThreadPlaybookLearningAssistantRoute:
@@ -190,6 +172,4 @@ class ThreadPlaybookLearningAssistantRoute:
 __all__ = [
     "ThreadPlaybookLearningAssistantRoute",
     "ThreadPlaybookLearner",
-    "match_thread_playbook_learning_candidate_route",
-    "match_thread_playbook_learning_route",
 ]

@@ -1,3 +1,6 @@
+from boxer_company._operation_routing_device import (
+    _normalize_device_status_question,
+)
 import base64
 import hashlib
 import json
@@ -6,11 +9,11 @@ import re
 import threading
 from typing import Any
 
-from boxer.core.utils import _display_value, _format_size, _truncate_text
+from boxer.core.utils import _truncate_text
 from boxer_company import settings as cs
+from boxer_company.utils import _display_value, _format_size
 from boxer_company.device_led_health import LED_USB_SIGNATURES
 from boxer_company.notion_playbooks import _select_notion_references
-from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_audio_probe import (
     _parse_default_sink,
     _parse_mixer_control,
@@ -47,129 +50,14 @@ def _device_ssh_refresh_lock(device_name: str) -> threading.Lock:
     return _DEVICE_SSH_REFRESH_LOCKS[lock_index]
 
 
-_LEADING_DEVICE_PROBE_SCOPE_PATTERN = re.compile(
-    r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
-    re.IGNORECASE,
-)
 _USB_LINE_PATTERN = re.compile(
     r"^Bus\s+\d+\s+Device\s+\d+:\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)$",
     re.IGNORECASE,
-)
-_DEVICE_STATUS_HINTS = (
-    "장비 상태",
-    "장비 연결 상태",
-    "장비연결상태",
-    "연결 상태",
-    "연결상태",
-    "상태 점검",
-    "장비 점검",
-    "전체 상태",
-    "종합 상태",
-    "health check",
-    "healthcheck",
-    "헬스 체크",
-    "헬스체크",
-)
-_DEVICE_PM2_HINTS = ("pm2",)
-_DEVICE_MEMORY_PATCH_HINTS = (
-    "메모리 패치",
-    "메모리패치",
-    "memory patch",
-)
-_DEVICE_MEMORY_PATCH_BLOCKING_HINTS = (
-    "방법",
-    "어떻게",
-    "확인 방법",
-    "문제 확인",
-    "가이드",
-    "설명",
-    "뭐야",
-    "무엇",
-    "왜",
-)
-_DEVICE_CAPTUREBOARD_HINTS = (
-    "캡처보드",
-    "캡쳐보드",
-    "captureboard",
-    "capture board",
-)
-_DEVICE_LED_HINTS = ("led", "엘이디")
-_DEVICE_REMOTE_ACCESS_HINTS = (
-    "ssh",
-    "원격 접속",
-    "원격접속",
-    "원격 연결",
-    "원격연결",
-    "원격 진단",
-    "원격진단",
-    "원격 접근",
-    "원격접근",
-    "방화벽",
-)
-_DEVICE_REMOTE_ACCESS_ACTION_HINTS = (
-    "ping",
-    "핑",
-    "확인",
-    "점검",
-    "체크",
-    "테스트",
-)
-_DEVICE_REMOTE_ACCESS_FAILURE_HINTS = (
-    "안 돼",
-    "안되",
-    "안 돼서",
-    "안돼서",
-    "안 됨",
-    "안됨",
-    "불가",
-    "실패",
-    "막혀",
-    "닫혀",
-    "접속 안",
-    "연결 안",
-    "안 열",
-    "안열",
-    "못 붙",
-    "못붙",
 )
 _REMOTE_ACCESS_NOTION_REFERENCE_TITLES = (
     "병원 방화벽으로 MDA/원격 접속이 안 될 때",
     "초음파 영상 업로드 안됨(네트워크 이슈)",
     "네트워크 환경 가이드라인",
-)
-_DEVICE_LED_PATTERN_EXPLAIN_HINTS = (
-    "증상",
-    "패턴",
-    "의미",
-    "뜻",
-    "무슨 상태",
-    "어떤 상태",
-    "어떨 때",
-    "언제",
-    "왜",
-    "원인",
-    "나타나",
-    "나와",
-    "설명",
-)
-_DEVICE_LED_COLOR_HINTS = (
-    "초록불",
-    "녹색불",
-    "빨간불",
-    "적색불",
-    "파란불",
-    "청색불",
-    "초록",
-    "녹색",
-    "빨강",
-    "빨간",
-    "적색",
-    "파랑",
-    "파란",
-    "청색",
-    "깜빡",
-    "깜빡이",
-    "blink",
 )
 _LED_STATE_SPECS: tuple[dict[str, str], ...] = (
     {
@@ -207,13 +95,6 @@ _LED_STATE_SPECS: tuple[dict[str, str], ...] = (
         "command": "LC:3C:",
         "meaning": "종료/재시작 같은 busy 상태",
     },
-)
-_DEVICE_STATUS_ALL_HINTS = (
-    *_DEVICE_STATUS_HINTS,
-    *_DEVICE_PM2_HINTS,
-    *_DEVICE_MEMORY_PATCH_HINTS,
-    *_DEVICE_CAPTUREBOARD_HINTS,
-    *_DEVICE_LED_HINTS,
 )
 _CAPTUREBOARD_USB_SIGNATURES = {
     (0x534D, 0x0021): "LS_EASYCAP",
@@ -626,89 +507,6 @@ _PROBE_COMPONENT_COMMAND_KEYS = {
 }
 
 
-def _normalize_device_status_question(question: str) -> str:
-    text = re.sub(r"<@[^>]+>", " ", str(question or "")).strip()
-    return re.sub(r"[`'\"“”‘’]+", "", text)
-
-
-def _contains_hint(text: str, hints: tuple[str, ...]) -> bool:
-    normalized = str(text or "").strip()
-    lowered = normalized.lower()
-    return any(hint in normalized or hint in lowered for hint in hints)
-
-
-def _extract_device_name_for_status_probe(question: str) -> str | None:
-    normalized = _normalize_device_status_question(question)
-    extracted = _extract_device_name_scope(normalized)
-    if extracted and _contains_hint(normalized, _DEVICE_STATUS_ALL_HINTS):
-        return extracted
-
-    matched = _LEADING_DEVICE_PROBE_SCOPE_PATTERN.search(normalized)
-    if not matched:
-        return None
-
-    candidate = " ".join(str(matched.group(1) or "").split()).strip()
-    remainder = " ".join(str(matched.group(2) or "").split()).strip()
-    if not candidate or not _contains_hint(remainder, _DEVICE_STATUS_ALL_HINTS):
-        return None
-    return candidate
-
-
-def _extract_device_name_for_remote_access_probe(question: str) -> str | None:
-    normalized = _normalize_device_status_question(question)
-    extracted = _extract_device_name_scope(normalized)
-    if extracted and _contains_hint(normalized, _DEVICE_REMOTE_ACCESS_HINTS):
-        return extracted
-
-    matched = _LEADING_DEVICE_PROBE_SCOPE_PATTERN.search(normalized)
-    if not matched:
-        return None
-
-    candidate = " ".join(str(matched.group(1) or "").split()).strip()
-    remainder = " ".join(str(matched.group(2) or "").split()).strip()
-    if not candidate or not _contains_hint(remainder, _DEVICE_REMOTE_ACCESS_HINTS):
-        return None
-    return candidate
-
-
-def _is_device_pm2_probe_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_status_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
-    return bool(resolved_device_name and _contains_hint(normalized, _DEVICE_PM2_HINTS))
-
-
-def _is_device_memory_patch_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_status_question(question)
-    resolved_device_name = str(
-        device_name or _extract_device_name_scope(normalized) or _extract_device_name_for_status_probe(normalized) or ""
-    ).strip()
-    if not resolved_device_name or not _contains_hint(normalized, _DEVICE_MEMORY_PATCH_HINTS):
-        return False
-    return not _contains_hint(normalized, _DEVICE_MEMORY_PATCH_BLOCKING_HINTS)
-
-
-def _is_device_captureboard_probe_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_status_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
-    return bool(resolved_device_name and _contains_hint(normalized, _DEVICE_CAPTUREBOARD_HINTS))
-
-
-def _is_device_led_probe_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_status_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
-    return bool(resolved_device_name and _contains_hint(normalized, _DEVICE_LED_HINTS))
-
-
-def _is_device_led_pattern_help_request(question: str) -> bool:
-    normalized = _normalize_device_status_question(question)
-    if not normalized:
-        return False
-    has_led_context = _contains_hint(normalized, _DEVICE_LED_HINTS) or _contains_hint(normalized, _DEVICE_LED_COLOR_HINTS)
-    if not has_led_context:
-        return False
-    return _contains_hint(normalized, _DEVICE_LED_PATTERN_EXPLAIN_HINTS)
-
-
 def _infer_led_pattern_help(question: str) -> dict[str, Any]:
     normalized = _normalize_device_status_question(question)
     has_red = any(token in normalized for token in ("빨간불", "적색불", "빨강", "빨간", "적색", "red"))
@@ -824,31 +622,6 @@ def _build_led_pattern_help_reply(question: str) -> str:
         f"• 안내: {str(interpretation.get('guide') or '').strip()}",
     ]
     return "\n".join(lines)
-
-
-def _is_device_remote_access_probe_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_status_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_remote_access_probe(normalized) or "").strip()
-    if not resolved_device_name or not _contains_hint(normalized, _DEVICE_REMOTE_ACCESS_HINTS):
-        return False
-    return _contains_hint(normalized, _DEVICE_REMOTE_ACCESS_ACTION_HINTS) or _contains_hint(
-        normalized,
-        _DEVICE_REMOTE_ACCESS_FAILURE_HINTS,
-    )
-
-
-def _is_device_status_probe_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_status_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_status_probe(normalized) or "").strip()
-    if not resolved_device_name:
-        return False
-    if (
-        _is_device_pm2_probe_request(normalized, resolved_device_name)
-        or _is_device_captureboard_probe_request(normalized, resolved_device_name)
-        or _is_device_led_probe_request(normalized, resolved_device_name)
-    ):
-        return False
-    return _contains_hint(normalized, _DEVICE_STATUS_HINTS)
 
 
 def _build_device_status_probe_config_message() -> str:

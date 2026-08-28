@@ -14,27 +14,18 @@ from boxer_company_api import automation_recovery
 from boxer_company_api.automation import JsonAutomationCycleStateStore
 from boxer_company_api.automation_recovery import (
     AutomationRecoveryError,
-    import_device_health_monitor_forward_bundle,
+    initialize_clean_automation_state,
     inspect_device_health_monitor_state,
     main,
     override_device_health_monitor_alert_delivery,
     resolve_automatic_sms_uncertain_claim,
     resolve_automation_uncertain_state,
-    seed_device_health_monitor_state,
-)
-from boxer_company.device_health_state_bundle import (
-    build_device_health_forward_bundle,
-    create_protected_json_file,
 )
 from boxer_company.sms_delivery_cycle import (
     claim_automatic_sms_delivery,
     hold_automatic_sms_delivery_claim,
     inspect_automatic_sms_recovery_state,
 )
-from boxer_company_adapter_slack.device_health_state_migration import (
-    export_device_health_forward_bundle,
-)
-from boxer_company_adapter_slack import device_health_state_migration
 
 
 _TENANT = "lifex"
@@ -58,11 +49,6 @@ def _configured_initialized_sms_state(
     os.chmod(outbox, 0o600)
     os.chmod(claims, 0o600)
     monkeypatch.setenv("SMS_DELIVERY_OUTBOX_PATH", str(outbox))
-    monkeypatch.setattr(
-        device_health_state_migration.company_settings,
-        "SMS_DELIVERY_OUTBOX_PATH",
-        str(outbox),
-    )
     return outbox
 
 
@@ -71,11 +57,17 @@ def _state_key() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _notification_state_key() -> str:
-    raw = "\0".join(
-        (_TENANT, "device_notification_alert", "continuous")
+def _replace_cycle_state(
+    store: JsonAutomationCycleStateStore,
+    key: str,
+    state: dict[str, object],
+) -> None:
+    """복구 fixture도 runtime과 같은 atomic cycle 교체 경로를 쓴다."""
+
+    store.mutate_cycle(
+        key,
+        lambda _exists, _current: (state, None),
     )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _write_automation_document(path: Path, payload: object) -> None:
@@ -86,151 +78,68 @@ def _write_automation_document(path: Path, payload: object) -> None:
     os.chmod(path, 0o600)
 
 
-def _legacy_health_state(*, enabled: bool = False) -> dict[str, object]:
-    observed_at = "2026-08-20T09:00:00+09:00"
-    return {
-        "version": 1,
-        "legacyAlertDeliveryEnabled": enabled,
-        "alertFingerprints": {
-            "hospital|room|MB2-OLD|audio": {
-                "firstAlertedAt": observed_at,
-                "lastAlertedAt": observed_at,
-                "lastSeenAt": observed_at,
-                "count": 1,
-            }
-        },
-        "pendingAlertFingerprints": {
-            "hospital|room|MB2-PENDING|video": {
-                "firstSeenAt": observed_at,
-                "lastSeenAt": observed_at,
-                "count": 1,
-            }
-        },
-    }
-
-
-def _legacy_notification_state() -> dict[str, object]:
-    """forward import가 쓰는 initialized, drained notification 상태다."""
-
-    observed_at = "2026-08-20T09:00:00+09:00"
-    return {
-        "initialized": True,
-        "initializedAt": observed_at,
-        "lastSeenId": 12,
-        "lastPolledAt": observed_at,
-        "pendingEvents": [],
-        "recentCaptureboardAlerts": {},
-        "recordingStallIncidents": {},
-        "captureboardIncidents": {},
-        "captureboardIncidentsLastSheetCheckedAt": "",
-        "lastSentAt": observed_at,
-        "lastSentNotificationId": 12,
-        "lastSlackMessageTs": "1710000000.000100",
-        "lastSlackPermalink": "https://example.slack.com/archives/C1/p1",
-    }
-
-
-def _strict_sms_state(
-    outbox: Path,
-    *,
-    now: datetime | None = None,
-) -> dict[str, object]:
-    return inspect_automatic_sms_recovery_state(
-        outbox_path=outbox,
-        expected_outbox_path=outbox,
-        require_initialized=True,
-        now=now,
-    )
-
-
-def _create_forward_bundle(path: Path) -> str:
-    """SMS target CAS 테스트가 공유하는 검증된 forward bundle을 만든다."""
-
-    seed = _legacy_health_state(enabled=True)
-    bundle = build_device_health_forward_bundle(
-        legacy_state={
-            "alertDeliveryOverride": {
-                "enabled": True,
-                "updatedAt": "2026-08-20T09:00:00+09:00",
-                "updatedBy": "slack_admin",
-            },
-            "alertFingerprints": seed["alertFingerprints"],
-            "pendingAlertFingerprints": seed["pendingAlertFingerprints"],
-        },
-        legacy_notification_state=_legacy_notification_state(),
-        source_state_digest="1" * 64,
-        notification_source_state_digest="2" * 64,
-        sms_state_digest="3" * 64,
-        exported_at=_NOW,
-    )
-    return create_protected_json_file(
-        path,
-        bundle,
-        label="test forward bundle",
-    )
-
-
-def test_device_health_seed_preserves_reviewed_override_and_pending_once(
+def test_clean_initializer_creates_one_verified_health_state_once(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "automation.json"
-    result = seed_device_health_monitor_state(
+
+    initialized = initialize_clean_automation_state(
         state_path=path,
         tenant_id=_TENANT,
-        legacy_state=_legacy_health_state(enabled=False),
-        pending_decision="preserve",
-        now=datetime(2026, 8, 20, 1, 0, tzinfo=timezone.utc),
+        initial_alert_delivery_enabled=False,
+        now=_NOW,
     )
 
-    assert result["alertDeliveryEnabled"] is False
-    assert result["alertFingerprintCount"] == 1
-    assert result["pendingFingerprintCount"] == 1
+    assert initialized["initialized"] is True
+    assert initialized["alertDeliveryEnabled"] is False
+    assert initialized["alertFingerprintCount"] == 0
+    assert initialized["pendingFingerprintCount"] == 0
+    assert (path.stat().st_mode & 0o777) == 0o600
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert set(document) == {"version", "cycles"}
+    assert set(document["cycles"]) == {_state_key()}
     inspected = inspect_device_health_monitor_state(
         state_path=path,
         tenant_id=_TENANT,
     )
-    assert inspected["cursorDigest"] == result["cursorDigest"]
-    assert inspected["pendingDeliveryCount"] == 0
-    assert inspected["inFlight"] is False
+    assert inspected["seeded"] is True
+    assert inspected["cursorDigest"] == initialized["cursorDigest"]
 
-    # 최초 seed는 기존 state에 병합하거나 재적용하지 않는다.
-    with pytest.raises(AutomationRecoveryError, match="not empty"):
-        seed_device_health_monitor_state(
+    previous = path.read_bytes()
+    with pytest.raises(AutomationRecoveryError, match="already exists"):
+        initialize_clean_automation_state(
             state_path=path,
             tenant_id=_TENANT,
-            legacy_state=_legacy_health_state(enabled=False),
-            pending_decision="preserve",
+            initial_alert_delivery_enabled=True,
+            now=_NOW,
         )
+    assert path.read_bytes() == previous
 
 
-def test_device_health_seed_can_assume_uncertain_pending_was_delivered(
+def test_clean_initializer_cli_requires_stopped_service_and_explicit_alert_mode(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     path = tmp_path / "automation.json"
-    result = seed_device_health_monitor_state(
-        state_path=path,
-        tenant_id=_TENANT,
-        legacy_state=_legacy_health_state(enabled=True),
-        pending_decision="assume_delivered",
-        now=datetime(2026, 8, 20, 1, 0, tzinfo=timezone.utc),
-    )
+    args = [
+        "--state-path",
+        str(path),
+        "--tenant-id",
+        _TENANT,
+        "--initialize-clean-automation-state",
+        "--initial-alert-delivery-enabled",
+        "true",
+    ]
+    with pytest.raises(SystemExit, match="requires_stopped_service"):
+        main(args)
 
-    assert result["pendingFingerprintCount"] == 0
-    assert result["alertFingerprintCount"] == 2
-    state = JsonAutomationCycleStateStore(path).load(_state_key())
-    assert state["cursor"]["stateOwnership"]["pendingDecision"] == (
-        "assume_delivered"
-    )
-
-    malformed = _legacy_health_state(enabled=True)
-    malformed["version"] = True
-    with pytest.raises(AutomationRecoveryError, match="payload is invalid"):
-        seed_device_health_monitor_state(
-            state_path=tmp_path / "bool-version.json",
-            tenant_id=_TENANT,
-            legacy_state=malformed,
-            pending_decision="preserve",
-        )
+    assert main([*args, "--confirm-service-stopped"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["initialized"] is True
+    assert payload["alertDeliveryEnabled"] is True
+    help_text = automation_recovery._build_parser().format_help()
+    assert "--initialize-clean-automation-state" in help_text
+    assert "--import-device-health-forward-bundle-path" not in help_text
 
 
 @pytest.mark.parametrize(
@@ -289,19 +198,18 @@ def test_present_empty_health_target_is_not_absent_seed_target(
 ) -> None:
     path = tmp_path / "automation.json"
     store = JsonAutomationCycleStateStore(path)
-    store.save(_state_key(), {})
+    _replace_cycle_state(store, _state_key(), {})
 
     with pytest.raises(AutomationRecoveryError, match="invalid"):
         inspect_device_health_monitor_state(
             state_path=path,
             tenant_id=_TENANT,
         )
-    with pytest.raises(AutomationRecoveryError, match="not empty"):
-        seed_device_health_monitor_state(
+    with pytest.raises(AutomationRecoveryError, match="already exists"):
+        initialize_clean_automation_state(
             state_path=path,
             tenant_id=_TENANT,
-            legacy_state=_legacy_health_state(enabled=False),
-            pending_decision="preserve",
+            initial_alert_delivery_enabled=False,
         )
 
 
@@ -329,7 +237,7 @@ def test_runtime_and_recovery_store_instances_share_atomic_file_lock(
     )
     second_thread = threading.Thread(
         target=lambda: (
-            second.save(other_key, {"runtimeWrite": True}),
+            _replace_cycle_state(second, other_key, {"runtimeWrite": True}),
             second_done.set(),
         )
     )
@@ -350,11 +258,10 @@ def test_device_health_override_requires_exact_offline_cursor_and_no_delivery(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "automation.json"
-    seeded = seed_device_health_monitor_state(
+    seeded = initialize_clean_automation_state(
         state_path=path,
         tenant_id=_TENANT,
-        legacy_state=_legacy_health_state(enabled=False),
-        pending_decision="preserve",
+        initial_alert_delivery_enabled=False,
     )
     with pytest.raises(AutomationRecoveryError, match="state changed"):
         override_device_health_monitor_alert_delivery(
@@ -391,7 +298,7 @@ def test_device_health_override_requires_exact_offline_cursor_and_no_delivery(
     state["pendingDeliveries"] = [
         {"deliveryId": "device_health_monitor:pending"}
     ]
-    store.save(_state_key(), state)
+    _replace_cycle_state(store, _state_key(), state)
     with pytest.raises(AutomationRecoveryError, match="pending deliveries"):
         override_device_health_monitor_alert_delivery(
             state_path=path,
@@ -402,465 +309,11 @@ def test_device_health_override_requires_exact_offline_cursor_and_no_delivery(
         )
 
 
-def test_device_health_forward_bundle_cli_requires_stopped_api_and_empty_target_cas(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    state_path = tmp_path / "automation.json"
-    legacy_path = tmp_path / "legacy-health.json"
-    bundle_path = tmp_path / "health-forward.bundle.json"
-    seed = _legacy_health_state(enabled=False)
-    legacy_path.write_text(
-        json.dumps(
-            {
-                "alertDeliveryOverride": {
-                    "enabled": False,
-                    "updatedAt": "2026-08-20T09:00:00+09:00",
-                    "updatedBy": "slack_admin",
-                },
-                "alertFingerprints": seed["alertFingerprints"],
-                "pendingAlertFingerprints": seed[
-                    "pendingAlertFingerprints"
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.chmod(legacy_path, 0o600)
-    legacy_digest = hashlib.sha256(legacy_path.read_bytes()).hexdigest()
-    notification_path = tmp_path / "legacy-notification.json"
-    _write_automation_document(
-        notification_path,
-        _legacy_notification_state(),
-    )
-    notification_digest = hashlib.sha256(
-        notification_path.read_bytes()
-    ).hexdigest()
-    sms_outbox = tmp_path / "sms-outbox.json"
-    sms_state = _strict_sms_state(sms_outbox)
-    exported = export_device_health_forward_bundle(
-        state_path=legacy_path,
-        notification_state_path=notification_path,
-        bundle_path=bundle_path,
-        expected_state_digest=legacy_digest,
-        expected_notification_state_digest=notification_digest,
-        expected_sms_state_digest=str(sms_state["stateDigest"]),
-        sms_outbox_path=sms_outbox,
-        now=datetime(2026, 8, 20, 1, 0, tzinfo=timezone.utc),
-    )
-    target_state = inspect_device_health_monitor_state(
-        state_path=state_path,
-        tenant_id=_TENANT,
-    )
-    target_digest = target_state["targetStateDigest"]
-    notification_target_digest = target_state[
-        "notificationTargetStateDigest"
-    ]
-
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "--state-path",
-                str(state_path),
-                "--tenant-id",
-                _TENANT,
-                "--import-device-health-forward-bundle-path",
-                str(bundle_path),
-                "--expected-bundle-digest",
-                str(exported["bundleDigest"]),
-                "--expected-target-state-digest",
-                str(target_digest),
-                "--expected-notification-target-state-digest",
-                str(notification_target_digest),
-                "--sms-outbox-path",
-                str(sms_outbox),
-                "--expected-sms-state-digest",
-                str(sms_state["stateDigest"]),
-                "--pending-decision",
-                "preserve",
-            ]
-        )
-    assert str(exc_info.value) == (
-        "automation_recovery_requires_stopped_service"
-    )
-
-    assert main(
-        [
-            "--state-path",
-            str(state_path),
-            "--tenant-id",
-            _TENANT,
-            "--import-device-health-forward-bundle-path",
-            str(bundle_path),
-            "--expected-bundle-digest",
-            str(exported["bundleDigest"]),
-            "--expected-target-state-digest",
-            str(target_digest),
-            "--expected-notification-target-state-digest",
-            str(notification_target_digest),
-            "--sms-outbox-path",
-            str(sms_outbox),
-            "--expected-sms-state-digest",
-            str(sms_state["stateDigest"]),
-            "--pending-decision",
-            "preserve",
-            "--confirm-service-stopped",
-        ]
-    ) == 0
-    output = json.loads(capsys.readouterr().out)
-    assert output["seeded"] is True
-    assert output["pendingFingerprintCount"] == 1
-    assert output["notificationLastSeenId"] == 12
-    assert output["targetSmsStateDigest"] == sms_state["stateDigest"]
-    notification = JsonAutomationCycleStateStore(state_path).load(
-        _notification_state_key()
-    )
-    assert notification["cursor"]["lastSeenId"] == 12
-    assert "MB2-PENDING" not in json.dumps(output)
-
-
-def test_api_recovery_cli_exposes_forward_migration_only() -> None:
-    """API recovery CLI가 Slack-local export를 다시 제공하지 않게 고정한다."""
-
-    help_text = automation_recovery._build_parser().format_help()
-
-    assert "--import-device-health-forward-bundle-path" in help_text
-    assert "--export-device-health-rollback-bundle-path" not in help_text
-    assert "--inspect-device-health-rollback-source" not in help_text
-
-
-def test_forward_bundle_digest_drift_writes_zero_api_state(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "automation.json"
-    bundle_path = tmp_path / "forward.bundle.json"
-    seed = _legacy_health_state(enabled=True)
-    bundle = {
-        "schema": "boxer.device_health_state_bundle",
-        "version": 1,
-        "direction": "slack_to_api",
-        "exportedAt": "2026-08-20T01:00:00+00:00",
-        "sourceDigest": "1" * 64,
-        "payload": {
-            "alertDeliveryEnabled": True,
-            "alertFingerprints": seed["alertFingerprints"],
-            "pendingAlertFingerprints": seed[
-                "pendingAlertFingerprints"
-            ],
-            "notificationState": _legacy_notification_state(),
-        },
-        "safety": {
-            "notificationPendingEventCount": 0,
-            "notificationStateDigest": "2" * 64,
-            "smsOutboxItemCount": 0,
-            "smsUnresolvedClaimCount": 0,
-            "activeSettledClaimCount": 0,
-            "smsStateDigest": "3" * 64,
-        },
-    }
-    bundle_digest = create_protected_json_file(
-        bundle_path,
-        bundle,
-        label="test forward bundle",
-    )
-    target_state = inspect_device_health_monitor_state(
-        state_path=state_path,
-        tenant_id=_TENANT,
-    )
-    target_digest = target_state["targetStateDigest"]
-    bundle["sourceDigest"] = "2" * 64
-    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
-    os.chmod(bundle_path, 0o600)
-
-    with pytest.raises(AutomationRecoveryError, match="bundle changed"):
-        import_device_health_monitor_forward_bundle(
-            state_path=state_path,
-            tenant_id=_TENANT,
-            bundle_path=bundle_path,
-            expected_bundle_digest=bundle_digest,
-            expected_target_state_digest=str(target_digest),
-            expected_notification_target_state_digest=str(
-                target_state["notificationTargetStateDigest"]
-            ),
-            sms_outbox_path=tmp_path / "sms-outbox.json",
-            expected_sms_state_digest=str(
-                _strict_sms_state(tmp_path / "sms-outbox.json")[
-                    "stateDigest"
-                ]
-            ),
-            pending_decision="preserve",
-        )
-
-    assert JsonAutomationCycleStateStore(state_path).load(_state_key()) == {}
-
-
-def test_forward_bundle_empty_target_digest_drift_does_not_merge(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "automation.json"
-    bundle_path = tmp_path / "forward.bundle.json"
-    seed = _legacy_health_state(enabled=True)
-    bundle_digest = create_protected_json_file(
-        bundle_path,
-        {
-            "schema": "boxer.device_health_state_bundle",
-            "version": 1,
-            "direction": "slack_to_api",
-            "exportedAt": "2026-08-20T01:00:00+00:00",
-            "sourceDigest": "1" * 64,
-            "payload": {
-                "alertDeliveryEnabled": True,
-                "alertFingerprints": seed["alertFingerprints"],
-                "pendingAlertFingerprints": seed[
-                    "pendingAlertFingerprints"
-                ],
-                "notificationState": _legacy_notification_state(),
-            },
-            "safety": {
-                "notificationPendingEventCount": 0,
-                "notificationStateDigest": "2" * 64,
-                "smsOutboxItemCount": 0,
-                "smsUnresolvedClaimCount": 0,
-                "activeSettledClaimCount": 0,
-                "smsStateDigest": "3" * 64,
-            },
-        },
-        label="test forward bundle",
-    )
-    empty_target_state = inspect_device_health_monitor_state(
-        state_path=state_path,
-        tenant_id=_TENANT,
-    )
-    empty_target_digest = empty_target_state["targetStateDigest"]
-    store = JsonAutomationCycleStateStore(state_path)
-    existing = {"manualMarker": {"keep": True}}
-    store.save(_state_key(), existing)
-
-    with pytest.raises(AutomationRecoveryError, match="not exact empty"):
-        import_device_health_monitor_forward_bundle(
-            state_path=state_path,
-            tenant_id=_TENANT,
-            bundle_path=bundle_path,
-            expected_bundle_digest=bundle_digest,
-            expected_target_state_digest=str(empty_target_digest),
-            expected_notification_target_state_digest=str(
-                empty_target_state["notificationTargetStateDigest"]
-            ),
-            sms_outbox_path=tmp_path / "sms-outbox.json",
-            expected_sms_state_digest=str(
-                _strict_sms_state(tmp_path / "sms-outbox.json")[
-                    "stateDigest"
-                ]
-            ),
-            pending_decision="preserve",
-        )
-
-    assert store.load(_state_key()) == existing
-
-
-def test_forward_import_requires_canonical_initialized_drained_sms_target(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "automation.json"
-    bundle_path = tmp_path / "forward.bundle.json"
-    bundle_digest = _create_forward_bundle(bundle_path)
-    target = inspect_device_health_monitor_state(
-        state_path=state_path,
-        tenant_id=_TENANT,
-    )
-    sms_outbox = tmp_path / "sms-outbox.json"
-
-    assert claim_automatic_sms_delivery(
-        "MB2-C00419",
-        "video_signal",
-        claimed_at=_NOW,
-        outbox_path=sms_outbox,
-    )
-    unresolved = _strict_sms_state(sms_outbox, now=_NOW)
-    with pytest.raises(AutomationRecoveryError, match="not exact drained"):
-        import_device_health_monitor_forward_bundle(
-            state_path=state_path,
-            tenant_id=_TENANT,
-            bundle_path=bundle_path,
-            expected_bundle_digest=bundle_digest,
-            expected_target_state_digest=str(target["targetStateDigest"]),
-            expected_notification_target_state_digest=str(
-                target["notificationTargetStateDigest"]
-            ),
-            sms_outbox_path=sms_outbox,
-            expected_sms_state_digest=str(unresolved["stateDigest"]),
-            pending_decision="preserve",
-            now=_NOW,
-        )
-    assert JsonAutomationCycleStateStore(state_path).load(_state_key()) == {}
-
-    # configured path가 아닌 별도 initialized 파일도 clean target으로 쓰지 않는다.
-    alternate = tmp_path / "alternate-sms.json"
-    _write_automation_document(alternate, {"version": 1, "items": []})
-    _write_automation_document(
-        alternate.with_name(f"{alternate.name}.automatic-claims.json"),
-        {"version": 2, "claims": {}},
-    )
-    alternate_state = inspect_automatic_sms_recovery_state(
-        outbox_path=alternate,
-        expected_outbox_path=alternate,
-        require_initialized=True,
-        now=_NOW,
-    )
-    with pytest.raises(AutomationRecoveryError, match="unreadable"):
-        import_device_health_monitor_forward_bundle(
-            state_path=state_path,
-            tenant_id=_TENANT,
-            bundle_path=bundle_path,
-            expected_bundle_digest=bundle_digest,
-            expected_target_state_digest=str(target["targetStateDigest"]),
-            expected_notification_target_state_digest=str(
-                target["notificationTargetStateDigest"]
-            ),
-            sms_outbox_path=alternate,
-            expected_sms_state_digest=str(alternate_state["stateDigest"]),
-            pending_decision="preserve",
-            now=_NOW,
-        )
-    assert JsonAutomationCycleStateStore(state_path).load(_state_key()) == {}
-
-
-def test_forward_import_rechecks_sms_target_inside_and_after_cycle_cas(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bundle_path = tmp_path / "forward.bundle.json"
-    bundle_digest = _create_forward_bundle(bundle_path)
-    sms_outbox = tmp_path / "sms-outbox.json"
-    clean_sms = _strict_sms_state(sms_outbox, now=_NOW)
-    real_inspector = automation_recovery._inspect_strict_sms_recovery_state
-
-    for drift_call, expect_seeded in ((2, False), (3, True)):
-        state_path = tmp_path / f"automation-{drift_call}.json"
-        target = inspect_device_health_monitor_state(
-            state_path=state_path,
-            tenant_id=_TENANT,
-        )
-        calls = 0
-
-        def _drifting_inspector(
-            path: str | Path,
-            *,
-            now: datetime | None = None,
-        ) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            state = dict(real_inspector(path, now=now))
-            if calls == drift_call:
-                state["stateDigest"] = "f" * 64
-            return state
-
-        monkeypatch.setattr(
-            automation_recovery,
-            "_inspect_strict_sms_recovery_state",
-            _drifting_inspector,
-        )
-        with pytest.raises(AutomationRecoveryError, match="not exact drained"):
-            import_device_health_monitor_forward_bundle(
-                state_path=state_path,
-                tenant_id=_TENANT,
-                bundle_path=bundle_path,
-                expected_bundle_digest=bundle_digest,
-                expected_target_state_digest=str(target["targetStateDigest"]),
-                expected_notification_target_state_digest=str(
-                    target["notificationTargetStateDigest"]
-                ),
-                sms_outbox_path=sms_outbox,
-                expected_sms_state_digest=str(clean_sms["stateDigest"]),
-                pending_decision="preserve",
-                now=_NOW,
-            )
-        inspected = inspect_device_health_monitor_state(
-            state_path=state_path,
-            tenant_id=_TENANT,
-        )
-        # CAS 직전 drift는 write 0, 직후 drift는 성공 보고를 막고 수동
-        # 확인이 필요한 seeded fail-closed 상태를 보존한다.
-        assert inspected["seeded"] is expect_seeded
-        monkeypatch.setattr(
-            automation_recovery,
-            "_inspect_strict_sms_recovery_state",
-            real_inspector,
-        )
-
-
-def test_forward_import_seeds_health_and_notification_in_one_document_write(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "automation.json"
-    bundle_path = tmp_path / "forward.bundle.json"
-    seed = _legacy_health_state(enabled=True)
-    bundle_digest = create_protected_json_file(
-        bundle_path,
-        {
-            "schema": "boxer.device_health_state_bundle",
-            "version": 1,
-            "direction": "slack_to_api",
-            "exportedAt": "2026-08-20T01:00:00+00:00",
-            "sourceDigest": "1" * 64,
-            "payload": {
-                "alertDeliveryEnabled": True,
-                "alertFingerprints": seed["alertFingerprints"],
-                "pendingAlertFingerprints": seed[
-                    "pendingAlertFingerprints"
-                ],
-                "notificationState": _legacy_notification_state(),
-            },
-            "safety": {
-                "notificationPendingEventCount": 0,
-                "notificationStateDigest": "2" * 64,
-                "smsOutboxItemCount": 0,
-                "smsUnresolvedClaimCount": 0,
-                "activeSettledClaimCount": 0,
-                "smsStateDigest": "3" * 64,
-            },
-        },
-        label="test forward bundle",
-    )
-    empty = inspect_device_health_monitor_state(
-        state_path=state_path,
-        tenant_id=_TENANT,
-    )
-    store = JsonAutomationCycleStateStore(state_path)
-    store.save(_notification_state_key(), {"manualMarker": True})
-
-    with pytest.raises(AutomationRecoveryError, match="targets are not exact empty"):
-        import_device_health_monitor_forward_bundle(
-            state_path=state_path,
-            tenant_id=_TENANT,
-            bundle_path=bundle_path,
-            expected_bundle_digest=bundle_digest,
-            expected_target_state_digest=str(empty["targetStateDigest"]),
-            expected_notification_target_state_digest=str(
-                empty["notificationTargetStateDigest"]
-            ),
-            sms_outbox_path=tmp_path / "sms-outbox.json",
-            expected_sms_state_digest=str(
-                _strict_sms_state(tmp_path / "sms-outbox.json")[
-                    "stateDigest"
-                ]
-            ),
-            pending_decision="preserve",
-        )
-
-    # notification precondition이 어긋나면 health만 먼저 seed하지 않는다.
-    inspected = inspect_device_health_monitor_state(
-        state_path=state_path,
-        tenant_id=_TENANT,
-    )
-    assert inspected["seeded"] is False
-    assert store.load(_notification_state_key()) == {"manualMarker": True}
-
-
 def test_retry_clears_only_exact_inflight_marker(tmp_path: Path) -> None:
     path = tmp_path / "automation.json"
     store = JsonAutomationCycleStateStore(path)
-    store.save(
+    _replace_cycle_state(
+        store,
         _state_key(),
         {
             "cursor": {"lastRunAt": "before"},
@@ -894,7 +347,8 @@ def test_assume_completed_ack_closes_matching_delivery_context(
 ) -> None:
     path = tmp_path / "automation.json"
     store = JsonAutomationCycleStateStore(path)
-    store.save(
+    _replace_cycle_state(
+        store,
         _state_key(),
         {
             "cursor": {
@@ -938,7 +392,8 @@ def test_resolution_fails_closed_for_wrong_request_or_marker_shape(
 ) -> None:
     path = tmp_path / "automation.json"
     store = JsonAutomationCycleStateStore(path)
-    store.save(
+    _replace_cycle_state(
+        store,
         _state_key(),
         {
             "inFlight": {"requestId": _REQUEST_ID},
@@ -962,7 +417,8 @@ def test_inflight_cannot_be_assumed_completed_without_cursor_recovery(
 ) -> None:
     path = tmp_path / "automation.json"
     store = JsonAutomationCycleStateStore(path)
-    store.save(
+    _replace_cycle_state(
+        store,
         _state_key(),
         {"inFlight": {"requestId": _REQUEST_ID}},
     )
@@ -990,7 +446,8 @@ def test_window_inflight_also_cannot_be_assumed_completed(
     raw = "\0".join((tenant, cycle, cycle_key))
     state_key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     store = JsonAutomationCycleStateStore(path)
-    store.save(
+    _replace_cycle_state(
+        store,
         state_key,
         {"inFlight": {"requestId": _REQUEST_ID}},
     )

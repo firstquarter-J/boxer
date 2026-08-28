@@ -20,7 +20,6 @@ from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantResult,
     SourceReference,
-    SuggestedAction,
 )
 from boxer_company_adapter_slack.company_api_client import (
     _deserialize_result,
@@ -79,7 +78,6 @@ def _settings(
     tenant_ids: tuple[str, ...] = ("TENANT-1",),
     channels: tuple[str, ...] = ("slack",),
     actor_ids: tuple[str, ...] = ("ACTOR-1",),
-    allow_anonymous_actor: bool = False,
     capabilities: tuple[str, ...] = ("assistant.turn.read",),
     configuration_error: str | None = None,
     live_device_enabled: bool = True,
@@ -96,7 +94,6 @@ def _settings(
                 tenant_ids=frozenset(tenant_ids),
                 channels=frozenset(channels),
                 actor_ids=frozenset(actor_ids),
-                allow_anonymous_actor=allow_anonymous_actor,
                 capabilities=frozenset(capabilities),
             ),
         )
@@ -3709,7 +3706,6 @@ class CompanyApiContractTests(unittest.TestCase):
                 "/health/live",
                 "/health/ready",
                 "/internal/v1/assistant/turns",
-                "/internal/v1/automation/cycles",
                 "/internal/v1/automation/deliveries/pull",
                 "/internal/v1/automation/deliveries/ack",
                 "/internal/v1/hpa-change/requests",
@@ -4223,8 +4219,6 @@ class CompanyApiContractTests(unittest.TestCase):
                 "sources",
                 "usedLlm",
                 "fallbackReason",
-                "suggestedAction",
-                "asyncJob",
             },
         )
         self.assertEqual(body["requestId"], _REQUEST_ID)
@@ -4361,12 +4355,6 @@ class CompanyApiContractTests(unittest.TestCase):
                         uri="https://www.notion.so/source#safe-heading",
                     ),
                 ),
-                suggested_action=SuggestedAction(
-                    action="dangerous_internal_action",
-                    label="실행",
-                    parameters={"secret": "must-not-leak"},
-                ),
-                async_job={"secret": "must-not-leak"},
             )
         )
         app = create_company_api_app(
@@ -4394,8 +4382,6 @@ class CompanyApiContractTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertIsNone(response.json()["suggestedAction"])
-        self.assertIsNone(response.json()["asyncJob"])
         self.assertNotIn("must-not-leak", response.text)
 
     def test_runtime_exception_is_sanitized(self) -> None:

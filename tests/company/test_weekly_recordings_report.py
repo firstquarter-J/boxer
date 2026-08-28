@@ -247,74 +247,7 @@ class WeeklyRecordingsReportFormatTests(unittest.TestCase):
 
         self.assertIn("• 결과: 해당 주간 recordings row가 없어", message)
 
-    def test_builds_weekly_report_blocks(self) -> None:
-        blocks = report._build_weekly_recordings_report_blocks(
-            {
-                "weekStartDate": "2026-03-23",
-                "weekEndDate": "2026-03-29",
-                "previousWeekStartDate": "2026-03-16",
-                "previousWeekEndDate": "2026-03-22",
-                "hospitalCount": 2,
-                "totalCount": 1500,
-                "previousTotalCount": 1200,
-                "totalDelta": 300,
-                "totalChangeRate": 25.0,
-                "topRows": [
-                    {"hospitalSeq": 297, "hospitalName": "다온미래산부인과의원(아산)", "rowCount": 1200},
-                    {"hospitalSeq": None, "hospitalName": "미확인", "rowCount": 300},
-                ],
-                "topRowsLimit": 10,
-                "surgeRows": [
-                    {
-                        "hospitalSeq": 297,
-                        "hospitalName": "다온미래산부인과의원(아산)",
-                        "previousCount": 400,
-                        "currentCount": 1200,
-                        "delta": 800,
-                        "changeRate": 200.0,
-                    }
-                ],
-                "surgeCount": 1,
-                "dropRows": [],
-                "dropCount": 0,
-            },
-            now=datetime(2026, 4, 6, 0, 0, 1, tzinfo=timezone.utc),
-        )
 
-        self.assertEqual(blocks[0]["type"], "header")
-        self.assertIn("주간 초음파 촬영 요약", blocks[0]["text"]["text"])
-        self.assertIn("기준 주간 `2026-03-23 ~ 2026-03-29`", blocks[1]["elements"][0]["text"])
-        self.assertIn("`1,500개`", blocks[2]["fields"][0]["text"])
-        self.assertIn("*상위 병원 Top 10*", blocks[5]["text"]["text"])
-        self.assertIn("*다온미래산부인과의원(아산)* `#297` `1,200개`", blocks[5]["text"]["text"])
-        self.assertIn("*급증*", blocks[7]["text"]["text"])
-        self.assertIn("`400 -> 1,200`", blocks[7]["text"]["text"])
-        self.assertIn("*급감*\n없어", blocks[9]["text"]["text"])
-
-    def test_builds_weekly_report_blocks_without_header(self) -> None:
-        blocks = report._build_weekly_recordings_report_blocks(
-            {
-                "weekStartDate": "2026-03-23",
-                "weekEndDate": "2026-03-29",
-                "previousWeekStartDate": "2026-03-16",
-                "previousWeekEndDate": "2026-03-22",
-                "hospitalCount": 1,
-                "totalCount": 10,
-                "previousTotalCount": 8,
-                "totalDelta": 2,
-                "totalChangeRate": 25.0,
-                "topRows": [],
-                "surgeRows": [],
-                "surgeCount": 0,
-                "dropRows": [],
-                "dropCount": 0,
-            },
-            now=datetime(2026, 4, 6, 0, 0, 1, tzinfo=timezone.utc),
-            include_header=False,
-        )
-
-        self.assertEqual(blocks[0]["type"], "context")
-        self.assertIn("기준 주간 `2026-03-23 ~ 2026-03-29`", blocks[0]["elements"][0]["text"])
 
 
 if __name__ == "__main__":

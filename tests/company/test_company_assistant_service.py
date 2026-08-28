@@ -20,13 +20,11 @@ from boxer_company.assistant import (
     StructuredAssistantRoute,
 )
 from boxer_company.assistant.commonmark import slack_mrkdwn_to_commonmark
-from boxer_company.assistant.barcode_query_route import (
+from boxer_company.read_routing import (
     COMMON_API_BARCODE_QUERY_ROUTES,
     is_safe_baby_magic_source_uri,
     match_barcode_timeline_route,
     match_common_api_barcode_query_route,
-)
-from boxer_company.assistant.structured_route import (
     match_structured_read_route,
 )
 from boxer_company.notion_workspace_search import CompanyNotionSearchResult
@@ -128,8 +126,6 @@ class CompanyAssistantServiceTests(unittest.TestCase):
                 "sources",
                 "used_llm",
                 "fallback_reason",
-                "suggested_action",
-                "async_job",
                 "operation_result",
             ],
         )

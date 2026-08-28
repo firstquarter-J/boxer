@@ -20,7 +20,6 @@ from boxer_company.hpa_change_coordinator import (
 )
 from boxer_company.hpa_change_workflow import (
     GitHubArtifactArchive,
-    GitHubDispatchReceipt,
     GitHubWorkflowRun,
     HpaChangeJobStore,
     HpaChangePollState,
@@ -37,19 +36,9 @@ class _GitHub:
 
     def dispatch_job(self, job):
         self.review_dispatches.append(job.task_id)
-        return GitHubDispatchReceipt(
-            task_id=job.task_id,
-            event_type="boxer-hpa-change",
-            dispatched_at=datetime.now(timezone.utc),
-        )
 
     def dispatch_implementation(self, job, *, review_run_id: int):
         self.implementation_dispatches.append((job.task_id, review_run_id))
-        return GitHubDispatchReceipt(
-            task_id=job.task_id,
-            event_type="boxer-hpa-change",
-            dispatched_at=datetime.now(timezone.utc),
-        )
 
     def find_workflow_run(self, *_args, **_kwargs):
         return None
@@ -138,7 +127,7 @@ def _review_result() -> dict:
     }
 
 
-def _review_run(task_id: str) -> GitHubWorkflowRun:
+def _review_run() -> GitHubWorkflowRun:
     now = datetime(2026, 8, 27, 5, 0, tzinfo=timezone.utc)
     return GitHubWorkflowRun(
         run_id=501,
@@ -148,10 +137,7 @@ def _review_run(task_id: str) -> GitHubWorkflowRun:
             "https://github.com/mmtalk-app/"
             "mmb-hospital-admin-server/actions/runs/501"
         ),
-        display_title=f"Boxer HPA Review - {task_id}",
-        run_attempt=1,
         created_at=now,
-        updated_at=now,
     )
 
 
@@ -159,10 +145,7 @@ def _review_archive(task_id: str) -> GitHubArtifactArchive:
     content = b"{}"
     return GitHubArtifactArchive(
         artifact_id=700,
-        workflow_run_id=501,
         name=f"boxer-hpa-result-{task_id}",
-        size_in_bytes=len(content),
-        sha256=hashlib.sha256(content).hexdigest(),
         content=content,
     )
 
@@ -185,7 +168,7 @@ def test_tick_pauses_state_progress_until_exact_delivery_ack(tmp_path: Path) -> 
     coordinator, _github = _runtime(tmp_path)
     submitted = coordinator.submit(_request())
     assert coordinator.store is not None
-    coordinator.store.mark_running(submitted.request_id, _review_run(submitted.request_id))
+    coordinator.store.mark_running(submitted.request_id, _review_run())
 
     first = coordinator.tick()
     second = coordinator.tick()
@@ -210,7 +193,7 @@ def test_review_ack_starts_implementation_in_api_and_is_idempotent(tmp_path: Pat
     coordinator, github = _runtime(tmp_path)
     submitted = coordinator.submit(_request())
     assert coordinator.store is not None
-    run = _review_run(submitted.request_id)
+    run = _review_run()
     coordinator.store.mark_running(submitted.request_id, run)
     coordinator.store.mark_workflow_succeeded(submitted.request_id, run)
     coordinator.store.mark_review_ready(
@@ -255,7 +238,7 @@ def test_review_ack_transaction_recovers_dispatch_after_process_exit(
     coordinator, github = _runtime(tmp_path)
     submitted = coordinator.submit(_request())
     assert coordinator.store is not None
-    run = _review_run(submitted.request_id)
+    run = _review_run()
     coordinator.store.mark_running(submitted.request_id, run)
     coordinator.store.mark_workflow_succeeded(submitted.request_id, run)
     coordinator.store.mark_review_ready(
@@ -286,7 +269,7 @@ def test_invalid_review_contract_fails_before_delivery_or_implementation(tmp_pat
     coordinator, github = _runtime(tmp_path)
     submitted = coordinator.submit(_request())
     assert coordinator.store is not None
-    run = _review_run(submitted.request_id)
+    run = _review_run()
     coordinator.store.mark_running(submitted.request_id, run)
     coordinator.store.mark_workflow_succeeded(submitted.request_id, run)
     coordinator.store.mark_review_ready(

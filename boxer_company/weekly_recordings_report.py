@@ -4,6 +4,9 @@ from zoneinfo import ZoneInfo
 
 from boxer.core import settings as s
 from boxer.retrieval.connectors.db import _create_db_connection
+from boxer_company.read_routing import (
+    _resolve_weekly_recordings_report_question_target_date as _resolve_weekly_target_date_contract,
+)
 
 _WEEKLY_RECORDINGS_REPORT_TIMEZONE = ZoneInfo("Asia/Seoul")
 _WEEKLY_RECORDINGS_REPORT_TITLE = "주간 초음파 촬영 요약"
@@ -12,92 +15,6 @@ _WEEKLY_RECORDINGS_REPORT_MAX_CHANGE_ROWS = 10
 _WEEKLY_RECORDINGS_REPORT_CHANGE_MIN_DELTA = 20
 _WEEKLY_RECORDINGS_REPORT_SURGE_MIN_RATIO = 2.0
 _WEEKLY_RECORDINGS_REPORT_DROP_MAX_RATIO = 0.5
-
-
-def _is_weekly_recordings_report_request(
-    question: str,
-    *,
-    barcode: str | None,
-    target_date: str | None,
-) -> bool:
-    """주간 리포트 의도 판정은 채널과 무관하게 회사 도메인에서 소유한다."""
-    if barcode:
-        return False
-
-    text = (question or "").strip()
-    if not text:
-        return False
-    lowered = text.lower()
-    has_media_hint = any(
-        token in text
-        for token in ("초음파", "영상", "비디오", "동영상", "녹화")
-    ) or any(token in lowered for token in ("recording", "recordings"))
-    has_summary_hint = any(
-        token in text
-        for token in (
-            "현황",
-            "요약",
-            "리포트",
-            "보고",
-            "집계",
-            "통계",
-            "정리",
-            "병원별",
-        )
-    ) or any(
-        token in lowered
-        for token in ("summary", "report", "overview", "status")
-    )
-    has_week_hint = any(
-        token in text
-        for token in (
-            "주간",
-            "주별",
-            "일주일",
-            "한 주",
-            "지난주",
-            "지난 주",
-            "저번주",
-            "저번 주",
-            "전주",
-            "이번주",
-            "이번 주",
-        )
-    ) or any(token in lowered for token in ("weekly", "week"))
-    if not (has_media_hint and has_summary_hint and has_week_hint):
-        return False
-
-    has_excluded_hint = any(
-        token in text
-        for token in (
-            "바코드",
-            "목록",
-            "리스트",
-            "상세",
-            "길이",
-            "재생시간",
-            "다운로드",
-            "복구",
-            "로그",
-            "캡처",
-            "스냅샷",
-        )
-    ) or any(
-        token in lowered
-        for token in (
-            "list",
-            "detail",
-            "download",
-            "recover",
-            "log",
-            "capture",
-            "captures",
-            "snapshot",
-            "duration",
-            "fileid",
-        )
-    )
-    return not has_excluded_hint
 
 
 def _weekly_recordings_report_timezone() -> ZoneInfo:
@@ -111,6 +28,21 @@ def _coerce_weekly_recordings_report_now(now: datetime | None = None) -> datetim
     if now.tzinfo is None:
         return now.replace(tzinfo=report_tz)
     return now.astimezone(report_tz)
+
+
+def _resolve_weekly_recordings_report_question_target_date(
+    question: str,
+    *,
+    explicit_target_date: date | None,
+    now: datetime | None = None,
+) -> date | None:
+    """순수 계약에 기존 주입 가능한 weekly KST clock을 연결한다."""
+
+    return _resolve_weekly_target_date_contract(
+        question,
+        explicit_target_date=explicit_target_date,
+        now=_coerce_weekly_recordings_report_now(now),
+    )
 
 
 def _weekly_recordings_report_week_start(target_date: date) -> date:
@@ -130,33 +62,6 @@ def _resolve_weekly_recordings_report_target_week(
     current_week_start = _weekly_recordings_report_week_start(local_today)
     target_week_start = current_week_start - timedelta(days=7)
     return target_week_start, target_week_start + timedelta(days=6)
-
-
-def _resolve_weekly_recordings_report_question_target_date(
-    question: str,
-    *,
-    explicit_target_date: date | None,
-    now: datetime | None = None,
-) -> date | None:
-    """질문의 상대 주간을 기존 target-date 계약으로 정규화한다."""
-
-    if explicit_target_date is not None:
-        return explicit_target_date
-    normalized = " ".join(str(question or "").split()).lower()
-    # target_date=None은 완결된 직전 주라는 기존 reporter 의미다. 현재 주를
-    # 명시한 경우에만 KST 오늘을 넘겨 이번 월요일~일요일을 선택한다.
-    if any(
-        hint in normalized
-        for hint in (
-            "이번주",
-            "이번 주",
-            "금주",
-            "this week",
-            "current week",
-        )
-    ):
-        return _coerce_weekly_recordings_report_now(now).date()
-    return None
 
 
 def _weekly_recordings_report_date_range_to_utc_range(
@@ -541,190 +446,3 @@ def _format_weekly_recordings_report(
         lines.append("• 없어")
 
     return "\n".join(lines)
-
-
-def _build_weekly_recordings_report_blocks(
-    report_summary: dict[str, Any],
-    *,
-    now: datetime | None = None,
-    include_header: bool = True,
-) -> list[dict[str, Any]]:
-    local_now = _coerce_weekly_recordings_report_now(now)
-    current_week_label = _format_weekly_recordings_report_range_label(
-        report_summary.get("weekStartDate"),
-        report_summary.get("weekEndDate"),
-    )
-    previous_week_label = _format_weekly_recordings_report_range_label(
-        report_summary.get("previousWeekStartDate"),
-        report_summary.get("previousWeekEndDate"),
-    )
-    hospital_count = int(report_summary.get("hospitalCount") or 0)
-    total_count = int(report_summary.get("totalCount") or 0)
-    previous_total_count = int(report_summary.get("previousTotalCount") or 0)
-    total_delta = int(report_summary.get("totalDelta") or 0)
-    total_change_rate = report_summary.get("totalChangeRate")
-    top_rows = report_summary.get("topRows") if isinstance(report_summary.get("topRows"), list) else []
-    top_rows_limit = int(report_summary.get("topRowsLimit") or _WEEKLY_RECORDINGS_REPORT_TOP_HOSPITALS)
-    surge_rows = report_summary.get("surgeRows") if isinstance(report_summary.get("surgeRows"), list) else []
-    surge_count = int(report_summary.get("surgeCount") or len(surge_rows))
-    drop_rows = report_summary.get("dropRows") if isinstance(report_summary.get("dropRows"), list) else []
-    drop_count = int(report_summary.get("dropCount") or len(drop_rows))
-
-    blocks: list[dict[str, Any]] = []
-    if include_header:
-        blocks.append(
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": _WEEKLY_RECORDINGS_REPORT_TITLE,
-                },
-            }
-        )
-
-    blocks.extend(
-        [
-            {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"기준 주간 `{current_week_label}` | 비교 주간 `{previous_week_label}` | "
-                        f"발송 `{local_now:%Y-%m-%d %H:%M:%S} KST`"
-                    ),
-                }
-            ],
-        },
-            {
-            "type": "section",
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*전체 row*\n`{_format_weekly_recordings_report_count(total_count)}`",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*집계 병원*\n`{hospital_count:,}곳`",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*전주 대비*\n"
-                        f"`{previous_total_count:,} -> {total_count:,}`\n"
-                        f"`{_format_weekly_recordings_report_delta(total_delta)}` "
-                        f"(`{_format_weekly_recordings_report_change_rate_label(total_change_rate)}`)"
-                    ),
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*변화 병원*\n급증 `{surge_count:,}곳` | 급감 `{drop_count:,}곳`",
-                },
-            ],
-        },
-            {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": "기준 주간은 `월요일 ~ 일요일`이고, 변화 기준은 증감 `20개 이상` + 급증 `2배 이상` / 급감 `50% 이하`야",
-                }
-            ],
-        },
-        ]
-    )
-
-    if total_count <= 0:
-        blocks.append({"type": "divider"})
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*결과*\n해당 주간 recordings row가 없어",
-                },
-            }
-        )
-        return blocks
-
-    top_row_lines = _build_weekly_recordings_report_top_row_lines(top_rows)
-    blocks.append({"type": "divider"})
-    blocks.append(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*상위 병원 Top {top_rows_limit}*\n" + "\n".join(top_row_lines),
-            },
-        }
-    )
-    if hospital_count > len(top_rows):
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"상위 `{len(top_rows):,}곳`만 표시",
-                    }
-                ],
-            }
-        )
-
-    surge_lines = _build_weekly_recordings_report_change_lines(surge_rows)
-    drop_lines = _build_weekly_recordings_report_change_lines(drop_rows)
-    blocks.append({"type": "divider"})
-    blocks.append(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*급증*\n" + "\n".join(surge_lines)
-                    if surge_lines
-                    else "*급증*\n없어"
-                ),
-            },
-        }
-    )
-    if surge_count > len(surge_rows):
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"급증은 상위 `{len(surge_rows):,}곳`만 표시",
-                    }
-                ],
-            }
-        )
-
-    blocks.append({"type": "divider"})
-    blocks.append(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*급감*\n" + "\n".join(drop_lines)
-                    if drop_lines
-                    else "*급감*\n없어"
-                ),
-            },
-        }
-    )
-    if drop_count > len(drop_rows):
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"급감은 상위 `{len(drop_rows):,}곳`만 표시",
-                    }
-                ],
-            }
-        )
-
-    return blocks

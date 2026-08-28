@@ -13,23 +13,14 @@ from boxer.core.llm import (
     _check_ollama_health,
 )
 from boxer.retrieval.connectors.s3 import _build_s3_client
-from boxer_company.assistant.barcode_log_route import (
-    match_barcode_log_route,
-)
 from boxer_company.assistant.answer_composer import (
     CompanyEvidenceAnswerComposer,
     CompanyEvidenceAnswerComposerDeps,
-)
-from boxer_company.assistant.barcode_query_route import (
-    match_barcode_query_route,
 )
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantRequest,
     CompanyAssistantResult,
-)
-from boxer_company.assistant.device_led_routes import (
-    match_device_read_route,
 )
 from boxer_company.assistant.device_db_detail_route import (
     DeviceDetailAssistantRoute,
@@ -45,7 +36,6 @@ from boxer_company.assistant.freeform_runtime import (
 from boxer_company.assistant.knowledge_routes import (
     CompanyReadOnlyKnowledgeRouteDeps,
     build_company_read_only_knowledge_routes,
-    match_barcode_evidence_freeform_route,
 )
 from boxer_company.assistant.notion_route import (
     CompanyNotionAssistantRouteDeps,
@@ -56,9 +46,6 @@ from boxer_company.assistant.operational_read_routes import (
 from boxer_company.assistant.operations import (
     build_company_operation_routes,
 )
-from boxer_company.assistant.recording_failure_route import (
-    match_recording_failure_route,
-)
 from boxer_company.assistant.runtime import (
     CompanyAssistantRuntime,
     CompanyAssistantRuntimeDeps,
@@ -67,16 +54,26 @@ from boxer_company.assistant.team_fun_route import (
     CompanyDailyFortuneAssistantRoute,
     CompanyLlmHealthAssistantRoute,
 )
+from boxer_company.assistant.usage_help_route import (
+    UsageHelpAssistantRoute,
+)
 from boxer_company import settings as company_settings
 from boxer_company.notion_playbooks import _select_notion_references
-from boxer_company.routers.box_db import (
-    _load_recordings_context_by_barcode,
-)
-from boxer_company.routers.device_diagnostics import (
+from boxer_company.operation_routing import (
     _extract_device_name_for_diagnostic_freeform,
     _has_device_diagnostic_start_hint,
     _is_device_diagnostic_freeform_request,
     _select_device_diagnostic_followup_command_keys,
+)
+from boxer_company.read_routing import (
+    match_barcode_evidence_freeform_route,
+    match_barcode_log_route,
+    match_barcode_query_route,
+    match_device_read_route,
+    match_recording_failure_route,
+)
+from boxer_company.routers.box_db import (
+    _load_recordings_context_by_barcode,
 )
 
 
@@ -437,6 +434,9 @@ def create_company_assistant_runtime(
                 ),
             ),
             freeform_routes=(
+                # 사용법은 LLM·외부 provider보다 먼저 고정 응답해
+                # Slack이 도메인 가이드 문구를 소유하지 않게 한다.
+                UsageHelpAssistantRoute(),
                 CompanyLlmHealthAssistantRoute(
                     probe_llm_health,
                     logger=app_logger,

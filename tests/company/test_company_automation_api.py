@@ -14,12 +14,9 @@ from pathlib import Path
 import stat
 import threading
 from typing import Any
-from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi.testclient import TestClient
-from pydantic import ValidationError
 
 from boxer_company.automation import (
     AutomationCycleContractError,
@@ -31,27 +28,32 @@ from boxer_company.automation import (
     DeviceHealthMonitorCycleHandler,
 )
 from boxer_company.device_health_monitor_cycle import (
-    build_device_health_monitor_seed_cursor,
+    build_clean_device_health_monitor_cursor,
     DeviceHealthMonitorCycleDeps,
 )
 from boxer_company_api.automation import (
-    AutomationCycleInput,
     AutomationCycleTrigger,
     AutomationCycleUncertainError,
     DurableAutomationCycleCoordinator,
     JsonAutomationCycleStateStore,
-    serialize_automation_cycle_result,
     validate_automation_trigger_admission,
-)
-from boxer_company_api.app import create_company_api_app
-from boxer_company_api.settings import (
-    CompanyApiCallerSettings,
-    CompanyApiSettings,
 )
 
 
 _NOW = datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-_TOKEN = "automation-token-" + ("x" * 40)
+
+
+def _replace_cycle_state(
+    store: JsonAutomationCycleStateStore,
+    key: str,
+    state: dict[str, Any],
+) -> None:
+    """테스트 fixture도 production의 atomic cycle mutation만 사용한다."""
+
+    store.mutate_cycle(
+        key,
+        lambda _exists, _current: (state, None),
+    )
 
 
 @dataclass
@@ -803,17 +805,6 @@ def test_admission_rejects_noncanonical_cycle_keys(
         validate_automation_trigger_admission(trigger)
 
 
-def test_health_input_rejects_slack_owned_alert_delivery_option() -> None:
-    with pytest.raises(ValidationError):
-        AutomationCycleInput(
-            tenantId="T1",
-            cycle="device_health_monitor",
-            cycleKey="continuous",
-            scheduledAt=_NOW,
-            options={"alertDeliveryEnabled": True},
-        )
-
-
 @pytest.mark.parametrize(
     "corruption",
     (
@@ -843,11 +834,8 @@ def test_health_seed_schema_is_validated_before_pending_delivery_replay(
     )
     raw_key = "\0".join(("T1", "device_health_monitor", "continuous"))
     state_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-    cursor = build_device_health_monitor_seed_cursor(
-        legacy_alert_delivery_enabled=True,
-        alert_fingerprints={},
-        pending_alert_fingerprints={},
-        pending_decision="preserve",
+    cursor = build_clean_device_health_monitor_cursor(
+        alert_delivery_enabled=True,
         seeded_at=_NOW,
     )
     if corruption == "missing_seed":
@@ -872,7 +860,8 @@ def test_health_seed_schema_is_validated_before_pending_delivery_replay(
         "kind": "device_health_alert",
         "payload": {"safe": True},
     }
-    store.save(
+    _replace_cycle_state(
+        store,
         state_key,
         {
             "cursor": cursor,
@@ -1057,273 +1046,3 @@ def test_daily_coordinator_accepts_runtime_override_and_seeds_window(
 
     assert len(handler.requests) == 1
     assert handler.requests[0].cursor["windowKey"] == "2026-08-10"
-
-
-def test_cycle_schema_rejects_credentialed_permalink() -> None:
-    with pytest.raises(ValidationError):
-        AutomationCycleInput.model_validate(
-            {
-                "tenantId": "T1",
-                "cycle": "weekly_recordings",
-                "cycleKey": "weekly:2026-08-03",
-                "scheduledAt": _NOW.isoformat(),
-                "deliveryReceipts": [
-                    {
-                        "deliveryId": "weekly_recordings:2026-08-03",
-                        "status": "sent",
-                        "permalink": "https://user:password@example.com/path",
-                    }
-                ],
-                "ackOnly": True,
-            }
-        )
-
-
-def test_wire_result_does_not_expose_server_cursor() -> None:
-    result = AutomationCycleResult(
-        cycle="weekly_recordings",
-        outcome="completed",
-        cursor={"internalState": "must-not-cross-wire"},
-        deliveries=(),
-        metrics={"deliveryCount": 0},
-    )
-
-    payload = serialize_automation_cycle_result(result, "cycle:first")
-
-    assert "cursor" not in payload
-    assert "must-not-cross-wire" not in str(payload)
-
-
-def _api_settings(
-    tmp_path: Path,
-    *,
-    capabilities: frozenset[str],
-    enabled_cycles: frozenset[str] | None = None,
-) -> CompanyApiSettings:
-    return CompanyApiSettings(
-        host="127.0.0.1",
-        port=8010,
-        callers=(
-            CompanyApiCallerSettings(
-                caller_id="slack-automation",
-                token=_TOKEN,
-                tenant_ids=frozenset({"T1"}),
-                channels=frozenset({"slack"}),
-                actor_ids=frozenset({"U1"}),
-                allow_anonymous_actor=False,
-                capabilities=capabilities,
-            ),
-        ),
-        automation_state_path=str(tmp_path / "automation.json"),
-        automation_enabled_cycles=(
-            enabled_cycles
-            if enabled_cycles is not None
-            else frozenset(
-                {
-                    "weekly_recordings",
-                    "daily_device_round",
-                    "device_health_monitor",
-                    "device_notification_alert",
-                    "sms_delivery",
-                }
-            )
-        ),
-    )
-
-
-def _cycle_payload() -> dict[str, Any]:
-    return {
-        "tenantId": "T1",
-        "cycle": "weekly_recordings",
-        "cycleKey": "weekly:2026-08-03",
-        "scheduledAt": _NOW.isoformat(),
-    }
-
-
-def _cycle_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {_TOKEN}",
-        "X-Request-ID": "automation:http:1",
-    }
-
-
-class _CapturingCoordinator:
-    def __init__(self, *, error: Exception | None = None) -> None:
-        self.error = error
-        self.triggers: list[AutomationCycleTrigger] = []
-
-    def run(self, trigger: AutomationCycleTrigger) -> AutomationCycleResult:
-        self.triggers.append(trigger)
-        if self.error is not None:
-            raise self.error
-        return AutomationCycleResult(
-            cycle=trigger.cycle,
-            outcome="completed",
-            cursor={"serverOnly": True},
-            deliveries=(
-                AutomationDelivery(
-                    delivery_id="weekly_recordings:2026-08-03",
-                    kind="weekly_recordings_report",
-                    payload={"totalCount": 12},
-                ),
-            ),
-            metrics={"deliveryCount": 1},
-        )
-
-
-def test_api_cycle_uses_machine_capability_without_human_actor(
-    tmp_path: Path,
-) -> None:
-    coordinator = _CapturingCoordinator()
-    app = create_company_api_app(
-        settings=_api_settings(
-            tmp_path,
-            capabilities=frozenset(
-                {
-                    "assistant.turn.read",
-                    "assistant.automation.execute",
-                }
-            ),
-        ),
-        assistant_runtime=object(),  # type: ignore[arg-type]
-        readiness_probe=lambda: True,
-        automation_coordinator=coordinator,
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/internal/v1/automation/cycles",
-            headers=_cycle_headers(),
-            json=_cycle_payload(),
-        )
-
-    assert response.status_code == 200
-    assert response.json()["autoRetryAllowed"] is False
-    assert "cursor" not in response.json()
-    assert len(coordinator.triggers) == 1
-    assert coordinator.triggers[0].tenant_id == "T1"
-
-
-def test_api_cycle_uses_per_device_ssh_open_budget(
-    tmp_path: Path,
-) -> None:
-    coordinator = _CapturingCoordinator()
-    app = create_company_api_app(
-        settings=_api_settings(
-            tmp_path,
-            capabilities=frozenset(
-                {
-                    "assistant.turn.read",
-                    "assistant.automation.execute",
-                }
-            ),
-        ),
-        assistant_runtime=object(),  # type: ignore[arg-type]
-        readiness_probe=lambda: True,
-        automation_coordinator=coordinator,
-    )
-
-    with patch(
-        "boxer_company_api.app.company_api_device_ssh_context"
-    ) as ssh_context:
-        with TestClient(app) as client:
-            response = client.post(
-                "/internal/v1/automation/cycles",
-                headers=_cycle_headers(),
-                json=_cycle_payload(),
-            )
-
-    assert response.status_code == 200
-    ssh_context.assert_called_once_with(per_device_open_budget=True)
-
-
-def test_api_cycle_rejects_caller_without_automation_capability(
-    tmp_path: Path,
-) -> None:
-    coordinator = _CapturingCoordinator()
-    app = create_company_api_app(
-        settings=_api_settings(
-            tmp_path,
-            capabilities=frozenset({"assistant.turn.read"}),
-        ),
-        assistant_runtime=object(),  # type: ignore[arg-type]
-        readiness_probe=lambda: True,
-        automation_coordinator=coordinator,
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/internal/v1/automation/cycles",
-            headers=_cycle_headers(),
-            json=_cycle_payload(),
-        )
-
-    assert response.status_code == 403
-    assert not coordinator.triggers
-
-
-def test_api_cycle_feature_flag_blocks_capable_caller_before_coordinator(
-    tmp_path: Path,
-) -> None:
-    coordinator = _CapturingCoordinator()
-    app = create_company_api_app(
-        settings=_api_settings(
-            tmp_path,
-            capabilities=frozenset(
-                {
-                    "assistant.turn.read",
-                    "assistant.automation.execute",
-                }
-            ),
-            enabled_cycles=frozenset(),
-        ),
-        assistant_runtime=object(),  # type: ignore[arg-type]
-        readiness_probe=lambda: True,
-        automation_coordinator=coordinator,
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/internal/v1/automation/cycles",
-            headers=_cycle_headers(),
-            json=_cycle_payload(),
-        )
-
-    assert response.status_code == 503
-    assert response.json()["code"] == "service_not_ready"
-    assert response.json()["retryable"] is False
-    assert not coordinator.triggers
-
-
-def test_api_cycle_returns_non_retryable_uncertain_problem(
-    tmp_path: Path,
-) -> None:
-    coordinator = _CapturingCoordinator(
-        error=AutomationCycleUncertainError("private state")
-    )
-    app = create_company_api_app(
-        settings=_api_settings(
-            tmp_path,
-            capabilities=frozenset(
-                {
-                    "assistant.turn.read",
-                    "assistant.automation.execute",
-                }
-            ),
-        ),
-        assistant_runtime=object(),  # type: ignore[arg-type]
-        readiness_probe=lambda: True,
-        automation_coordinator=coordinator,
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/internal/v1/automation/cycles",
-            headers=_cycle_headers(),
-            json=_cycle_payload(),
-        )
-
-    assert response.status_code == 409
-    assert response.json()["code"] == "operation_in_progress"
-    assert response.json()["retryable"] is False
-    assert "private state" not in response.text

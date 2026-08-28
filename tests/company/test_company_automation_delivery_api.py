@@ -75,12 +75,26 @@ class _Broker:
         )
 
 
+class _EmptyBroker(_Broker):
+    def pull(
+        self,
+        *,
+        tenant_id: str,
+        cycle: str | None = None,
+    ) -> None:
+        self.pull_calls.append((tenant_id, cycle))
+        return None
+
+
 def _settings(
     *,
     capabilities: frozenset[str] = frozenset(
         {"assistant.automation.transport"}
     ),
     scheduler_enabled: bool = True,
+    enabled_cycles: frozenset[str] = frozenset(
+        {"device_notification_alert"}
+    ),
 ) -> CompanyApiSettings:
     return CompanyApiSettings(
         host="127.0.0.1",
@@ -92,13 +106,10 @@ def _settings(
                 tenant_ids=frozenset({"T1"}),
                 channels=frozenset({"slack"}),
                 actor_ids=frozenset({"*"}),
-                allow_anonymous_actor=False,
                 capabilities=capabilities,
             ),
         ),
-        automation_enabled_cycles=frozenset(
-            {"device_notification_alert"}
-        ),
+        automation_enabled_cycles=enabled_cycles,
         automation_scheduler_enabled=scheduler_enabled,
     )
 
@@ -226,13 +237,37 @@ def test_transport_requires_capability_and_scheduler_feature() -> None:
     assert statuses == [403, 503]
 
 
-def test_legacy_cycle_execute_is_closed_after_scheduler_cutover() -> None:
+def test_feature_off_cycle_without_pending_returns_empty_batch() -> None:
+    broker = _EmptyBroker()
+    app = create_company_api_app(
+        settings=_settings(enabled_cycles=frozenset()),
+        assistant_runtime=_Runtime(),
+        readiness_probe=lambda: True,
+        automation_coordinator=None,
+        automation_delivery_broker=broker,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/automation/deliveries/pull",
+            headers=_headers("transport:off-empty:1"),
+            json={
+                "tenantId": "T1",
+                "cycle": "device_notification_alert",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["batch"] is None
+    assert broker.pull_calls == [("T1", "device_notification_alert")]
+
+
+def test_removed_cycle_execute_route_is_not_exposed() -> None:
     app = create_company_api_app(
         settings=_settings(
             capabilities=frozenset(
                 {
                     "assistant.automation.transport",
-                    "assistant.automation.execute",
                 }
             )
         ),
@@ -254,5 +289,4 @@ def test_legacy_cycle_execute_is_closed_after_scheduler_cutover() -> None:
             },
         )
 
-    assert response.status_code == 503
-    assert response.json()["retryable"] is False
+    assert response.status_code == 404

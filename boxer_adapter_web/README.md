@@ -12,6 +12,12 @@ pip install -e .
 pip install -e ./boxer_adapter_web
 ```
 
+공개 Web 테스트까지 실행할 개발 환경에서는 TestClient 의존성만 별도 extra로 설치한다.
+
+```bash
+pip install -e "./boxer_adapter_web[test]"
+```
+
 ## Runtime
 
 필수 env:
@@ -25,6 +31,7 @@ pip install -e ./boxer_adapter_web
 - `BOXER_WEB_DATA_PATH`
 - `BOXER_WEB_KNOWLEDGE_SOURCE=markdown|notion`
 - `BOXER_WEB_MARKDOWN_ROOT`
+- `BOXER_WEB_NOTION_PAGE_IDS`
 - `BOXER_WEB_CONFIG_PATH`
 - `BOXER_WEB_ADMIN_DIST_PATH`
 - `BOXER_WEB_ADMIN_COOKIE_SECURE`
@@ -33,6 +40,7 @@ pip install -e ./boxer_adapter_web
 - `BOXER_WEB_WS_RATE_LIMIT_PER_MINUTE`
 - `BOXER_WEB_HANDOFF_ON_MISSING_EVIDENCE`
 - `BOXER_WEB_HANDOFF_PROMPT_BEFORE_QUEUE`
+- `LLM_SYNTHESIS_ENABLED`
 
 Markdown FAQ로 시작할 때:
 
@@ -41,6 +49,12 @@ BOXER_WEB_KNOWLEDGE_SOURCE=markdown
 BOXER_WEB_MARKDOWN_ROOT=examples/web_knowledge/markdown
 BOXER_WEB_CONFIG_PATH=examples/web_config.sample.json
 ```
+
+Notion을 쓸 때는 `BOXER_WEB_NOTION_PAGE_IDS`에 page ID를 쉼표로 나열한다.
+기존 `NOTION_TEST_PAGE_ID`도 호환용 alias로 읽지만 새 Web 이름이 우선한다.
+
+`LLM_SYNTHESIS_ENABLED=false`면 FAQ 검색 근거는 유지하되 provider 호출은 건너뛰고
+근거 합성 실패 안내와 설정된 handoff 정책을 적용한다.
 
 첫 관리자 생성:
 

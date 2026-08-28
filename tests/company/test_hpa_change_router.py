@@ -61,7 +61,6 @@ def _app(
                 tenant_ids=frozenset({"TWORK"}),
                 channels=frozenset({"slack"}),
                 actor_ids=actor_ids,
-                allow_anonymous_actor=False,
                 capabilities=capabilities,
             ),
         )
@@ -201,7 +200,6 @@ def test_company_api_app_wires_hpa_router_and_closes_coordinator() -> None:
         tenant_ids=frozenset({"TWORK"}),
         channels=frozenset({"slack"}),
         actor_ids=frozenset({"U07A5FM5XPD"}),
-        allow_anonymous_actor=False,
         capabilities=frozenset(
             {"assistant.turn.read", HPA_CHANGE_EXECUTE_CAPABILITY}
         ),

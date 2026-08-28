@@ -8,6 +8,8 @@ from boxer.retrieval import (
     KnowledgeSearchResult,
     MarkdownKnowledgeSource,
     NotionKnowledgeSource,
+    score_knowledge_document,
+    tokenize_knowledge_text,
 )
 
 
@@ -71,6 +73,23 @@ class MarkdownKnowledgeSourceTests(unittest.TestCase):
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[0].document.title, "환불 정책")
         self.assertGreater(results[0].score, 0)
+
+    def test_public_scorer_deduplicates_tokens_and_rewards_title_phrase(self) -> None:
+        document = KnowledgeDocument(
+            id="refund",
+            title="Refund policy",
+            content="Refund requests are reviewed in three days.",
+            source_type="markdown",
+            source_uri="refund.md",
+            metadata={},
+        )
+
+        tokens = tokenize_knowledge_text("Refund refund policy")
+        exact_score = score_knowledge_document(document, query="refund policy", tokens=tokens)
+        content_only_score = score_knowledge_document(document, query="three days")
+
+        self.assertEqual(tokens, ["refund", "policy"])
+        self.assertGreater(exact_score, content_only_score)
 
 
 class NotionKnowledgeSourceTests(unittest.TestCase):

@@ -45,11 +45,9 @@ def test_weekly_is_due_at_monday_boundary_for_previous_monday() -> None:
 
     assert before.due is False
     assert before.cycle_key == "weekly:2026-08-17"
-    assert before.next_due_at == _kst(2026, 8, 24, 9, 0)
     assert boundary.due is True
     assert boundary.cycle_key == "weekly:2026-08-17"
     assert boundary.scheduled_at == _kst(2026, 8, 24, 9, 0)
-    assert boundary.eligible_at == _kst(2026, 8, 24, 9, 0)
 
 
 def test_weekly_does_not_catch_up_on_tuesday() -> None:
@@ -64,7 +62,6 @@ def test_weekly_does_not_catch_up_on_tuesday() -> None:
     # 월요일 전체를 놓친 경우 과거 identity를 화요일에 소급 실행하지 않는다.
     assert tuesday.due is False
     assert tuesday.cycle_key is None
-    assert tuesday.next_due_at == _kst(2026, 8, 31, 9, 0)
 
 
 def test_weekly_completed_identity_waits_for_next_monday() -> None:
@@ -77,7 +74,6 @@ def test_weekly_completed_identity_waits_for_next_monday() -> None:
 
     assert decision.due is False
     assert decision.cycle_key == "weekly:2026-08-17"
-    assert decision.next_due_at == _kst(2026, 8, 31, 9, 0)
 
 
 @pytest.mark.parametrize(
@@ -103,8 +99,6 @@ def test_daily_overnight_window_is_start_inclusive_and_crosses_midnight(
 
     assert decision.due is True
     assert decision.cycle_key == expected_key
-    assert decision.eligible_at == _kst(2026, 8, 24, 22, 0)
-    assert decision.window_end_at == _kst(2026, 8, 25, 6, 0)
 
 
 def test_daily_overnight_window_end_is_exclusive() -> None:
@@ -119,8 +113,6 @@ def test_daily_overnight_window_end_is_exclusive() -> None:
 
     assert decision.due is False
     assert decision.cycle_key is None
-    assert decision.window_end_at is None
-    assert decision.next_due_at == _kst(2026, 8, 25, 22, 0)
 
 
 def test_daily_outside_window_pending_ack_is_not_a_planner_run() -> None:
@@ -137,7 +129,6 @@ def test_daily_outside_window_pending_ack_is_not_a_planner_run() -> None:
     # planner는 종료된 window의 새 domain run identity를 다시 내지 않는다.
     assert decision.due is False
     assert decision.cycle_key is None
-    assert decision.next_due_at == _kst(2026, 8, 25, 22, 0)
 
 
 def test_daily_completed_window_identity_waits_for_next_window() -> None:
@@ -153,7 +144,6 @@ def test_daily_completed_window_identity_waits_for_next_window() -> None:
 
     assert decision.due is False
     assert decision.cycle_key == "daily:2026-08-24"
-    assert decision.next_due_at == _kst(2026, 8, 25, 22, 0)
 
 
 def test_daily_equal_start_and_end_is_a_24_hour_calendar_window() -> None:
@@ -175,10 +165,8 @@ def test_daily_equal_start_and_end_is_a_24_hour_calendar_window() -> None:
 
     assert before_midnight.due is True
     assert before_midnight.cycle_key == "daily:2026-08-24"
-    assert before_midnight.window_end_at == _kst(2026, 8, 25, 0, 0)
     assert midnight.due is True
     assert midnight.cycle_key == "daily:2026-08-25"
-    assert midnight.eligible_at == _kst(2026, 8, 25, 0, 0)
 
 
 @pytest.mark.parametrize(
@@ -189,7 +177,7 @@ def test_daily_equal_start_and_end_is_a_24_hour_calendar_window() -> None:
         ("sms_delivery", timedelta(seconds=11)),
     ),
 )
-def test_continuous_cycles_expose_fixed_delay_eligibility(
+def test_continuous_cycles_respect_fixed_delay_boundary(
     cycle: str,
     interval: timedelta,
 ) -> None:
@@ -215,11 +203,8 @@ def test_continuous_cycles_expose_fixed_delay_eligibility(
 
     assert before.due is False
     assert before.cycle_key == "continuous"
-    assert before.fixed_delay == interval
-    assert before.next_due_at == completed_at + interval
     assert boundary.due is True
     assert boundary.scheduled_at == completed_at + interval
-    assert boundary.next_due_at is None
 
 
 def test_continuous_first_run_is_immediately_eligible() -> None:
@@ -233,7 +218,6 @@ def test_continuous_first_run_is_immediately_eligible() -> None:
 
     assert decision.due is True
     assert decision.cycle_key == "continuous"
-    assert decision.eligible_at == now
     assert decision.scheduled_at == now
 
 
@@ -265,7 +249,6 @@ def test_next_fixed_delay_anchors_at_actual_completion_without_catch_up() -> Non
     assert overdue.scheduled_at == restarted_at
     assert next_due == _kst(2026, 8, 24, 12, 1)
     assert after_one_run.due is False
-    assert after_one_run.next_due_at == next_due
 
 
 def test_schedule_rejects_naive_now_and_invalid_config() -> None:

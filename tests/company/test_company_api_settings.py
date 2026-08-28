@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from boxer_company import settings as company_settings
 from boxer_company_api.settings import (
     CompanyApiSettings,
     company_api_local_readiness,
@@ -16,14 +18,6 @@ from boxer_company_api.settings import (
 
 class CompanyApiSettingsTests(unittest.TestCase):
     _AUTOMATION_CAPABILITIES = [
-        "assistant.turn.read",
-        "assistant.device.probe",
-        "assistant.device.ssh.open",
-        "assistant.operation.execute",
-        "assistant.device.alert.execute",
-        "assistant.automation.execute",
-    ]
-    _AUTOMATION_TRANSPORT_CAPABILITIES = [
         "assistant.turn.read",
         "assistant.device.probe",
         "assistant.device.ssh.open",
@@ -52,6 +46,85 @@ class CompanyApiSettingsTests(unittest.TestCase):
             ]
         )
 
+    def test_company_s3_routes_require_both_company_buckets(self) -> None:
+        # 공개 data-source validator와 분리된 회사 bucket 경계가 누락을 막는다.
+        invalid_pairs = (
+            ("", "logs"),
+            ("videos", "   "),
+            ("REPLACE_ME", "logs"),
+            ("videos", "logs-REPLACE_ME"),
+        )
+        for ultrasound_bucket, log_bucket in invalid_pairs:
+            with self.subTest(
+                ultrasound_bucket=ultrasound_bucket,
+                log_bucket=log_bucket,
+            ):
+                with (
+                    patch.object(
+                        company_settings.core_settings,
+                        "S3_QUERY_ENABLED",
+                        True,
+                    ),
+                    patch.object(
+                        company_settings,
+                        "S3_ULTRASOUND_BUCKET",
+                        ultrasound_bucket,
+                    ),
+                    patch.object(
+                        company_settings,
+                        "S3_LOG_BUCKET",
+                        log_bucket,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "bucket configuration",
+                    ):
+                        company_settings.validate_company_data_source_settings()
+
+        with (
+            patch.object(
+                company_settings.core_settings,
+                "S3_QUERY_ENABLED",
+                True,
+            ),
+            patch.object(company_settings, "S3_ULTRASOUND_BUCKET", "videos"),
+            patch.object(company_settings, "S3_LOG_BUCKET", "logs"),
+        ):
+            company_settings.validate_company_data_source_settings()
+
+    def test_api_owned_automation_values_are_not_cached_in_domain_settings(self) -> None:
+        # due/feature/options 값은 API scheduler가 env에서 한 번만 읽는다.
+        # company domain module에 같은 파싱 결과가 생기면 소유권이 다시 갈라진다.
+        for api_owned_setting in (
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
+            "WEEKLY_RECORDINGS_REPORT_ENABLED",
+            "WEEKLY_RECORDINGS_REPORT_CHANNEL_ID",
+            "WEEKLY_RECORDINGS_REPORT_HOUR_KST",
+            "WEEKLY_RECORDINGS_REPORT_MINUTE_KST",
+            "SMS_DELIVERY_REPORTER_ENABLED",
+            "DAILY_DEVICE_ROUND_ENABLED",
+            "DAILY_DEVICE_ROUND_HOUR_KST",
+            "DAILY_DEVICE_ROUND_MINUTE_KST",
+            "DAILY_DEVICE_ROUND_END_HOUR_KST",
+            "DAILY_DEVICE_ROUND_END_MINUTE_KST",
+            "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT",
+            "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX",
+            "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE",
+            "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID",
+            "DAILY_DEVICE_ROUND_AUTO_POWER_OFF",
+            "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN",
+            "DEVICE_HEALTH_MONITOR_ENABLED",
+            "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED",
+            "DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC",
+            "DEVICE_NOTIFICATION_ALERT_ENABLED",
+            "DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC",
+        ):
+            self.assertFalse(
+                hasattr(company_settings, api_owned_setting),
+                api_owned_setting,
+            )
+
     def test_loads_server_side_caller_registry(self) -> None:
         token = "t" * 48
         settings = load_company_api_settings(
@@ -66,7 +139,6 @@ class CompanyApiSettingsTests(unittest.TestCase):
                             "tenantIds": ["TENANT-1"],
                             "channels": ["slack"],
                             "actorIds": ["*"],
-                            "allowAnonymousActor": False,
                             "capabilities": ["assistant.turn.read"],
                         }
                     ]
@@ -454,7 +526,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
             "automation_caller_configuration_invalid",
         )
 
-    def test_scheduler_cutover_replaces_execute_with_transport_capability(
+    def test_automation_requires_transport_and_hpa_capabilities(
         self,
     ) -> None:
         base_env = {
@@ -473,15 +545,19 @@ class CompanyApiSettingsTests(unittest.TestCase):
             {
                 **base_env,
                 "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
-                    capabilities=self._AUTOMATION_TRANSPORT_CAPABILITIES
+                    capabilities=self._AUTOMATION_CAPABILITIES
                 ),
             }
         )
-        stale_execute = load_company_api_settings(
+        missing_transport = load_company_api_settings(
             {
                 **base_env,
                 "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
-                    capabilities=self._AUTOMATION_CAPABILITIES
+                    capabilities=[
+                        capability
+                        for capability in self._AUTOMATION_CAPABILITIES
+                        if capability != "assistant.automation.transport"
+                    ]
                 ),
             }
         )
@@ -491,7 +567,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
                 "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
                     capabilities=[
                         capability
-                        for capability in self._AUTOMATION_TRANSPORT_CAPABILITIES
+                        for capability in self._AUTOMATION_CAPABILITIES
                         if capability != "assistant.hpa.change.execute"
                     ]
                 ),
@@ -501,13 +577,31 @@ class CompanyApiSettingsTests(unittest.TestCase):
         self.assertIsNone(configured.configuration_error)
         self.assertTrue(configured.automation_scheduler_enabled)
         self.assertEqual(
-            stale_execute.configuration_error,
+            missing_transport.configuration_error,
             "automation_caller_configuration_invalid",
         )
         self.assertEqual(
             missing_hpa_capability.configuration_error,
             "automation_caller_configuration_invalid",
         )
+
+    def test_scheduler_keeps_transport_storage_when_all_cycles_are_off(
+        self,
+    ) -> None:
+        configured = load_company_api_settings(
+            {
+                "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
+                    capabilities=self._AUTOMATION_CAPABILITIES
+                ),
+                "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true",
+            }
+        )
+
+        self.assertIsNone(configured.configuration_error)
+        self.assertTrue(configured.automation_scheduler_enabled)
+        self.assertTrue(configured.automation_storage_required)
+        self.assertTrue(configured.enforce_local_readiness)
+        self.assertEqual(configured.automation_enabled_cycles, frozenset())
 
     def test_enabled_sheet_requires_absolute_google_adc_path(self) -> None:
         base_env = {
@@ -582,7 +676,9 @@ class CompanyApiSettingsTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            state_directory = Path(temporary_directory)
+            # macOS의 /var symlink 자체는 protected-parent 검증 대상이므로
+            # 실제 inode 경로를 사용해 Linux StateDirectory 조건을 재현한다.
+            state_directory = Path(temporary_directory).resolve()
             os.chmod(state_directory, 0o700)
             settings = CompanyApiSettings(
                 host="127.0.0.1",
@@ -602,7 +698,10 @@ class CompanyApiSettingsTests(unittest.TestCase):
             self.assertTrue(company_api_local_readiness(settings))
             state_file = Path(settings.automation_state_path)
             sms_file = Path(settings.sms_delivery_outbox_path)
-            state_file.write_text("{}", encoding="utf-8")
+            state_file.write_text(
+                '{"version":1,"cycles":{}}',
+                encoding="utf-8",
+            )
             os.chmod(state_file, 0o400)
             self.assertFalse(company_api_local_readiness(settings))
             os.chmod(state_file, 0o600)
@@ -619,6 +718,84 @@ class CompanyApiSettingsTests(unittest.TestCase):
             os.chmod(sms_file, 0o600)
             os.chmod(state_directory, 0o755)
             self.assertFalse(company_api_local_readiness(settings))
+
+    def test_readiness_rejects_legacy_pending_without_rewriting_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_directory = Path(temporary_directory).resolve()
+            os.chmod(state_directory, 0o700)
+            state_path = state_directory / "automation_state.json"
+            settings = CompanyApiSettings(
+                host="127.0.0.1",
+                port=8010,
+                callers=(),
+                automation_state_path=str(state_path),
+                enforce_local_readiness=True,
+                automation_storage_required=True,
+            )
+            tenant_id = "TENANT-1"
+            cycle = "device_notification_alert"
+            cycle_key = "continuous"
+            delivery_id = "device_notification_alert:event:1"
+            state_key = hashlib.sha256(
+                "\0".join((tenant_id, cycle, cycle_key)).encode("utf-8")
+            ).hexdigest()
+            batch_id = "batch:" + hashlib.sha256(
+                "\0".join(
+                    (tenant_id, cycle, cycle_key, delivery_id)
+                ).encode("utf-8")
+            ).hexdigest()
+            pending = [
+                {
+                    "deliveryId": delivery_id,
+                    "kind": cycle,
+                    "payload": {"alert": {"device": "MB2-TEST"}},
+                }
+            ]
+            current_state = {
+                "identity": {
+                    "tenantId": tenant_id,
+                    "cycle": cycle,
+                    "cycleKey": cycle_key,
+                },
+                "deliveryTarget": {
+                    "channelId": "C123456",
+                    "conversation": {"mode": "root"},
+                },
+                "pendingDeliveries": pending,
+                "pendingScheduledAt": "2026-08-27T14:00:00+09:00",
+                "pendingBatchId": batch_id,
+            }
+
+            def _write_state(state: dict[str, object]) -> bytes:
+                raw = json.dumps(
+                    {"version": 1, "cycles": {state_key: state}},
+                    sort_keys=True,
+                ).encode("utf-8")
+                state_path.write_bytes(raw)
+                os.chmod(state_path, 0o600)
+                return raw
+
+            _write_state(current_state)
+            self.assertTrue(company_api_local_readiness(settings))
+
+            missing_batch = dict(current_state)
+            missing_batch.pop("pendingBatchId")
+            missing_batch_raw = _write_state(missing_batch)
+            self.assertFalse(company_api_local_readiness(settings))
+            self.assertEqual(state_path.read_bytes(), missing_batch_raw)
+
+            # 구 /cycles pending은 identity/target/batch 정본이 없어도 비어
+            # 있다고 간주하지 않고, 운영자가 exact 복원할 때까지 닫는다.
+            legacy_raw = _write_state(
+                {
+                    "pendingDeliveries": pending,
+                    "lastCompletedAt": "2026-08-27T14:00:00+09:00",
+                }
+            )
+            self.assertFalse(company_api_local_readiness(settings))
+            self.assertEqual(state_path.read_bytes(), legacy_raw)
 
     def test_weekly_readiness_does_not_touch_unused_sms_outbox(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -855,7 +1032,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
             },
         )
 
-    def test_anonymous_company_runtime_caller_is_not_configurable_yet(
+    def test_legacy_anonymous_actor_field_is_rejected(
         self,
     ) -> None:
         settings = load_company_api_settings(
@@ -868,7 +1045,7 @@ class CompanyApiSettingsTests(unittest.TestCase):
                             "tenantIds": ["TENANT-1"],
                             "channels": ["web"],
                             "actorIds": ["*"],
-                            "allowAnonymousActor": True,
+                            "allowAnonymousActor": False,
                             "capabilities": [
                                 "assistant.turn.read"
                             ],

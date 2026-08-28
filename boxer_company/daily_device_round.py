@@ -4,7 +4,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from boxer.core import settings as s
-from boxer.core.utils import _display_value, _format_size
+from boxer_company.utils import _display_value, _format_size
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as cs
 from boxer_company.routers.device_status_probe import (
@@ -837,18 +837,6 @@ def _format_daily_device_round_status_badge(label: str) -> str:
     return f"{icon_map.get(normalized, '🟡')} *{normalized}*"
 
 
-def _format_daily_device_round_priority_badge(label: str) -> str:
-    normalized = _display_value(label, default="판단 보류")
-    icon_map = {
-        "높음": "🔴",
-        "중간": "🟠",
-        "낮음": "🟡",
-        "정상": "🟢",
-        "판단 보류": "⚫",
-    }
-    return f"{icon_map.get(normalized, '🟡')} *{normalized}*"
-
-
 def _format_daily_device_round_percent(value: Any) -> str:
     try:
         numeric = float(value)
@@ -1127,59 +1115,6 @@ def _build_daily_device_round_detail_label(device_result: dict[str, Any]) -> str
     if _display_value(status_payload.get("route"), default="") == "daily_device_round_maintenance_probe":
         return "확인"
     return "이슈"
-
-
-def _build_daily_device_round_disk_detail(device_result: dict[str, Any]) -> str:
-    status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
-    overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
-    storage_payload = overview.get("storage") if isinstance(overview.get("storage"), dict) else {}
-    filesystem_used_percent = storage_payload.get("filesystemUsedPercent")
-    filesystem_available_bytes = int(storage_payload.get("filesystemAvailableBytes") or 0)
-    filesystem_size_bytes = int(storage_payload.get("filesystemSizeBytes") or 0)
-
-    parts: list[str] = []
-    if filesystem_used_percent is not None:
-        parts.append(f"사용량 `{_format_daily_device_round_percent(filesystem_used_percent)}`")
-    if filesystem_available_bytes > 0:
-        parts.append(f"여유 `{_format_size(filesystem_available_bytes)}`")
-    if filesystem_size_bytes > 0:
-        parts.append(f"전체 `{_format_size(filesystem_size_bytes)}`")
-
-    if parts:
-        return " / ".join(parts)
-
-    storage_details = device_result.get("storageDetails") if isinstance(device_result.get("storageDetails"), dict) else {}
-    return _display_value(storage_details.get("diskDetail"), default="")
-
-
-def _build_daily_device_round_trashcan_detail(device_result: dict[str, Any]) -> str:
-    status_payload = device_result.get("statusPayload") if isinstance(device_result.get("statusPayload"), dict) else {}
-    overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
-    storage_payload = overview.get("storage") if isinstance(overview.get("storage"), dict) else {}
-    directory_size_bytes = int(storage_payload.get("directorySizeBytes") or 0)
-    directory_share_percent = storage_payload.get("directorySharePercent")
-    file_count = int(storage_payload.get("fileCount") or 0)
-    expired_file_count = int(storage_payload.get("expiredFileCount") or 0)
-    age_days = max(1, int(storage_payload.get("cleanupAgeDays") or cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS))
-
-    parts: list[str] = []
-    if directory_size_bytes > 0:
-        folder_part = f"폴더 `{_format_size(directory_size_bytes)}`"
-        if directory_share_percent is not None:
-            folder_part = f"{folder_part} (`{_format_daily_device_round_percent(directory_share_percent)}`)"
-        parts.append(folder_part)
-    elif directory_share_percent is not None:
-        parts.append(f"비중 `{_format_daily_device_round_percent(directory_share_percent)}`")
-    if file_count > 0:
-        parts.append(f"파일 `{file_count:,}개`")
-    if expired_file_count > 0:
-        parts.append(f"{age_days}일 초과 `{expired_file_count:,}개`")
-
-    if parts:
-        return " / ".join(parts)
-
-    storage_details = device_result.get("storageDetails") if isinstance(device_result.get("storageDetails"), dict) else {}
-    return _display_value(storage_details.get("trashcanDetail"), default="")
 
 
 def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:

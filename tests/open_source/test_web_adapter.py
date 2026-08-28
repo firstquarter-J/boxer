@@ -10,9 +10,16 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import boxer_adapter_web
-from boxer.retrieval import KnowledgeDocument
+from boxer import AnswerResult
+from boxer.core import settings as core_settings
+from boxer.retrieval import (
+    KnowledgeDocument,
+    normalize_knowledge_text,
+    score_knowledge_document,
+)
 from boxer_adapter_web.app import create_web_app
 from boxer_adapter_web.auth import hash_password
+from boxer_adapter_web.settings import get_web_settings
 from boxer_adapter_web.storage import WebChatStore
 from boxer_adapter_web.workflows import WorkflowCatalog
 
@@ -341,8 +348,13 @@ class BoxerWebAdapterTests(unittest.TestCase):
             },
         )
 
-    @patch("boxer_adapter_web.chat._synthesize_retrieval_answer", return_value="Refunds are reviewed within 3 business days.")
-    def test_widget_websocket_roundtrip(self, _mocked_synthesis) -> None:
+    @patch("boxer_adapter_web.chat.create_answer_engine_from_settings")
+    def test_widget_websocket_roundtrip(self, mocked_engine_factory) -> None:
+        mocked_engine_factory.return_value.answer.return_value = AnswerResult(
+            text="Refunds are reviewed within 3 business days.",
+            provider="ollama",
+            used_llm=True,
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._create_client(temp_dir) as client:
                 with client.websocket_connect("/ws/widget") as websocket:
@@ -404,6 +416,61 @@ class BoxerWebAdapterTests(unittest.TestCase):
                     self._assert_conversation_contract(updated_event["payload"])
                     self.assertEqual(updated_event["payload"]["status"], "ai_active")
                     self.assertEqual(len(updated_event["payload"]["messages"]), 2)
+
+    def test_web_notion_page_ids_prefer_new_name_and_keep_legacy_alias(self) -> None:
+        # 새 Web 전용 이름이 있으면 우선하고, 없을 때만 기존 단일 이름을 호환용으로 읽는다.
+        with patch.dict(
+            os.environ,
+            {
+                "BOXER_SKIP_DOTENV": "true",
+                "BOXER_WEB_NOTION_PAGE_IDS": "new-page-1,new-page-2",
+                "NOTION_TEST_PAGE_ID": "legacy-page",
+            },
+            clear=True,
+        ):
+            preferred = get_web_settings()
+        with patch.dict(
+            os.environ,
+            {
+                "BOXER_SKIP_DOTENV": "true",
+                "NOTION_TEST_PAGE_ID": "legacy-page",
+            },
+            clear=True,
+        ):
+            compatible = get_web_settings()
+
+        self.assertEqual(preferred.notion_page_ids, ["new-page-1", "new-page-2"])
+        self.assertEqual(compatible.notion_page_ids, ["legacy-page"])
+
+    @patch.object(core_settings, "LLM_SYNTHESIS_ENABLED", False)
+    @patch.object(core_settings, "LLM_PROVIDER", "ollama")
+    def test_widget_skips_llm_when_synthesis_flag_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._create_client(temp_dir) as client:
+                with client.websocket_connect("/ws/widget") as websocket:
+                    websocket.send_json({"type": "session.init", "payload": {}})
+                    session_id = websocket.receive_json()["payload"]["sessionId"]
+                    websocket.send_json(
+                        {
+                            "type": "message.send",
+                            "payload": {
+                                "sessionId": session_id,
+                                "text": "What is the refund policy?",
+                            },
+                        }
+                    )
+
+                    websocket.receive_json()
+                    assistant_event = websocket.receive_json()
+                    handoff_event = websocket.receive_json()
+                    updated_event = websocket.receive_json()
+
+        self.assertEqual(
+            assistant_event["payload"]["body"],
+            "I found related FAQ content, but I could not produce a grounded answer.",
+        )
+        self.assertEqual(handoff_event["payload"]["senderType"], "assistant")
+        self.assertEqual(updated_event["payload"]["status"], "handoff_pending")
 
     def test_widget_workflow_completion_routes_to_handoff_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1009,11 +1076,43 @@ class BoxerWebAdapterTests(unittest.TestCase):
                 finished_at="2026-04-24T00:00:01+00:00",
             )
 
-            results = store.search_knowledge_documents("환불은 얼마나 걸려?", limit=5)
+            query = "환불은 얼마나 걸려?"
+            results = store.search_knowledge_documents(query, limit=5)
 
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[0].document.title, "환불 정책")
-        self.assertGreater(results[0].score, 0)
+        self.assertEqual(
+            results[0].score,
+            score_knowledge_document(results[0].document, query=query),
+        )
+
+    def test_web_store_search_uses_common_query_normalization(self) -> None:
+        # SQLite 후보 검색과 공통 scorer가 같은 정규화 결과를 사용해야
+        # 대소문자와 바깥 공백이 있는 query도 실제 문서를 찾는다.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WebChatStore(Path(temp_dir) / "web_chat.db")
+            store.initialize()
+            store.replace_knowledge_documents(
+                source_type="markdown",
+                documents=[
+                    KnowledgeDocument(
+                        id="doc-refund",
+                        title="Refund Policy",
+                        content="Refund requests are reviewed in three business days.",
+                        source_type="markdown",
+                        source_uri="memory://refund-policy",
+                        metadata={},
+                    )
+                ],
+                started_at="2026-04-24T00:00:00+00:00",
+                finished_at="2026-04-24T00:00:01+00:00",
+            )
+
+            query = "  REFUND POLICY  "
+            results = store.search_knowledge_documents(query, limit=5)
+
+        self.assertEqual(normalize_knowledge_text(query), "refund policy")
+        self.assertEqual([result.document.id for result in results], ["doc-refund"])
 
     def test_admin_conversations_support_pagination_and_search(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

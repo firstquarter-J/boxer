@@ -11,7 +11,6 @@ from boxer_company.assistant.security_review_route import (
 from boxer_company_adapter_slack.security_review_routes import (
     SecurityReviewMessageContext,
     SecurityReviewRoutesContext,
-    _SECURITY_REVIEW_SESSIONS,
     _handle_security_review_bot_message,
     _handle_security_review_request,
     _post_remote_probe,
@@ -115,7 +114,6 @@ def _logger() -> logging.Logger:
 
 
 def test_remote_mode_keeps_domain_state_and_assessment_out_of_slack() -> None:
-    _SECURITY_REVIEW_SESSIONS.clear()
     api_client = _RouteBackedApiClient()
     slack_client = _FakeSlackClient()
     mention_replies: list[str] = []
@@ -133,13 +131,11 @@ def test_remote_mode_keeps_domain_state_and_assessment_out_of_slack() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 
     assert handled
     assert len(slack_client.posts) == 1
-    assert _SECURITY_REVIEW_SESSIONS == {}
     assert mention_payload["request_log"]["skip_persist"] is True
 
     for index, probe in enumerate(SECURITY_REVIEW_PROBES, start=1):
@@ -157,7 +153,6 @@ def test_remote_mode_keeps_domain_state_and_assessment_out_of_slack() -> None:
                 client=slack_client,
                 logger=_logger(),
                 api_client=api_client,  # type: ignore[arg-type]
-                operations_remote=True,
             )
         )
         assert handled
@@ -167,7 +162,6 @@ def test_remote_mode_keeps_domain_state_and_assessment_out_of_slack() -> None:
     assert message_replies[0][1] is True
     assert "결론: 통과" in message_replies[0][0]
     assert "<@UBUDDY>" in message_replies[0][0]
-    assert _SECURITY_REVIEW_SESSIONS == {}
 
 
 def test_remote_mode_ignores_other_bot_via_api_state() -> None:
@@ -184,7 +178,6 @@ def test_remote_mode_ignores_other_bot_via_api_state() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 
@@ -195,7 +188,6 @@ def test_remote_mode_ignores_other_bot_via_api_state() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 
@@ -217,7 +209,6 @@ def test_remote_probe_uses_deterministic_slack_client_message_id() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
     result = api_client.results[0]
@@ -252,7 +243,6 @@ def test_remote_probe_uses_deterministic_slack_client_message_id() -> None:
 
 
 def test_remote_api_failure_never_starts_local_fallback() -> None:
-    _SECURITY_REVIEW_SESSIONS.clear()
     slack_client = _FakeSlackClient()
     replies: list[str] = []
 
@@ -267,13 +257,11 @@ def test_remote_api_failure_never_starts_local_fallback() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=_FailingApiClient(),  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 
     assert handled
     assert slack_client.posts == []
-    assert _SECURITY_REVIEW_SESSIONS == {}
     assert "local로 실행하지 않고" in replies[0]
 
     leaked_payload = _bot_payload("token=must-not-persist", 7)
@@ -284,16 +272,13 @@ def test_remote_api_failure_never_starts_local_fallback() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=_FailingApiClient(),  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
     assert handled_message is False
     assert leaked_payload["request_log"]["skip_persist"] is True
-    assert _SECURITY_REVIEW_SESSIONS == {}
 
 
 def test_remote_start_fails_closed_when_slack_cannot_confirm_bot_identity() -> None:
-    _SECURITY_REVIEW_SESSIONS.clear()
     api_client = _RouteBackedApiClient()
     slack_client = _UnresolvedBotSlackClient()
     replies: list[str] = []
@@ -309,14 +294,12 @@ def test_remote_start_fails_closed_when_slack_cannot_confirm_bot_identity() -> N
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 
     assert handled
     assert api_client.calls == []
     assert slack_client.posts == []
-    assert _SECURITY_REVIEW_SESSIONS == {}
     assert "봇 정보를 확인할 수 없어" in replies[0]
 
 
@@ -337,7 +320,6 @@ def test_remote_slack_post_failure_cancels_api_session() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 
@@ -356,7 +338,6 @@ def test_remote_slack_post_failure_cancels_api_session() -> None:
             client=slack_client,
             logger=_logger(),
             api_client=api_client,  # type: ignore[arg-type]
-            operations_remote=True,
         )
     )
 

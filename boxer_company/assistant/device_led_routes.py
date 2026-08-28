@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+# LED 실행은 provider-free 정본의 device target parser만 소비한다.
+from boxer_company._operation_routing_device import (
+    _resolve_device_name,
+)
+from boxer_company.operation_routing import (
+    _is_device_led_log_analysis_request,
+    _is_device_led_pattern_help_request,
+)
+from boxer_company.read_routing import (
+    _extract_device_name_scope,
+    _extract_log_date_with_presence,
+)
+
 from dataclasses import replace
 import logging
 import re
@@ -27,19 +40,13 @@ from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
 )
-from boxer_company.routers.barcode_log import (
-    _extract_device_name_scope,
-    _extract_log_date_with_presence,
-)
 from boxer_company.routers.device_led_log import (
     _analyze_device_led_log,
     _format_led_log_date_required_message,
-    _is_device_led_log_analysis_request,
 )
 from boxer_company.routers.device_status_probe import (
     _build_led_pattern_help_evidence,
     _build_led_pattern_help_reply,
-    _is_device_led_pattern_help_request,
 )
 
 
@@ -51,24 +58,6 @@ _LED_PATTERN_REQUIRED_BULLETS = (
     "• 참고 상태:",
     "• 안내:",
 )
-
-
-def match_device_read_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """외부 조회 없이 API 전환 가능한 장비 read-only route만 고른다."""
-
-    question = request.question
-    device_name = _resolve_device_name(request)
-    # 실제 장비 접속이 필요한 진단·상태 probe는 이 matcher에 넣지 않는다.
-    if _is_device_led_log_analysis_request(
-        question,
-        device_name=device_name,
-    ):
-        return "device_led_log_analysis"
-    if _is_device_led_pattern_help_request(question):
-        return "device_led_pattern_guide"
-    return None
 
 
 class DeviceLedLogAssistantRoute:
@@ -309,16 +298,6 @@ class DeviceLedPatternGuideAssistantRoute:
         ][:2]
 
 
-def _resolve_device_name(request: CompanyAssistantRequest) -> str:
-    metadata_name = (
-        request.metadata.get("device_name")
-        or request.metadata.get("deviceName")
-    )
-    return str(
-        metadata_name or _extract_device_name_scope(request.question) or ""
-    ).strip()
-
-
 def _is_valid_led_pattern_answer(answer_text: str) -> bool:
     normalized = (answer_text or "").strip()
     has_title = normalized.startswith(
@@ -446,5 +425,4 @@ __all__ = [
     "DeviceLedPatternGuideAssistantRoute",
     "NotionReferenceLoader",
     "S3ClientProvider",
-    "match_device_read_route",
 ]

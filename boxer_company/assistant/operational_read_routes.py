@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+# 주간 read matcher와 날짜 해석은 transport와 공유하는 순수 정본을 쓴다.
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    WEEKLY_RECORDINGS_SUMMARY_ROUTE,
+    _extract_log_date_with_presence,
+    _is_weekly_recordings_report_request,
+    resolve_assistant_request_scope,
+)
+
 from datetime import date
 import logging
 
@@ -13,47 +22,14 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
-    resolve_assistant_request_scope,
-)
-from boxer_company.routers.barcode_log import (
-    _extract_log_date_with_presence,
 )
 from boxer_company.weekly_recordings_report import (
     _build_weekly_recordings_report_summary,
     _coerce_weekly_recordings_report_now,
     _format_weekly_recordings_report,
-    _is_weekly_recordings_report_request,
     _resolve_weekly_recordings_report_question_target_date,
 )
-
-
-WEEKLY_RECORDINGS_SUMMARY_ROUTE = "weekly_recordings_summary"
-
-
-def match_weekly_recordings_summary_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """외부 조회 없이 mention 기반 주간 녹화 요약 요청만 분류한다."""
-
-    try:
-        barcode = resolve_assistant_request_scope(request).barcode
-    except AssistantRequestScopeMismatch:
-        return None
-
-    try:
-        target_date = _extract_weekly_target_date(request.question)
-    except ValueError:
-        # 잘못된 날짜도 주간 요약 의도가 맞으면 route가 안전한 입력 안내를 반환해야 한다.
-        target_date = None
-    if _is_weekly_recordings_report_request(
-        request.question,
-        barcode=barcode,
-        target_date=(target_date.isoformat() if target_date else None),
-    ):
-        return WEEKLY_RECORDINGS_SUMMARY_ROUTE
-    return None
 
 
 class WeeklyRecordingsSummaryAssistantRoute:
@@ -79,7 +55,6 @@ class WeeklyRecordingsSummaryAssistantRoute:
             if not _is_weekly_recordings_report_request(
                 request.question,
                 barcode=barcode,
-                target_date=None,
             ):
                 return None
             return _result(
@@ -91,7 +66,6 @@ class WeeklyRecordingsSummaryAssistantRoute:
         if not _is_weekly_recordings_report_request(
             request.question,
             barcode=barcode,
-            target_date=(target_date.isoformat() if target_date else None),
         ):
             return None
 
@@ -148,9 +122,9 @@ class WeeklyRecordingsSummaryAssistantRoute:
 
 
 def _extract_weekly_target_date(question: str) -> date | None:
-    parsed_date, has_requested_date = _extract_log_date_with_presence(
-        question
-    )
+    """실행 시각은 기존 weekly runtime의 주입 가능한 KST clock을 유지한다."""
+
+    parsed_date, has_requested_date = _extract_log_date_with_presence(question)
     explicit_target_date = (
         date.fromisoformat(parsed_date) if has_requested_date else None
     )
@@ -181,7 +155,5 @@ def _result(
 
 
 __all__ = [
-    "WEEKLY_RECORDINGS_SUMMARY_ROUTE",
     "WeeklyRecordingsSummaryAssistantRoute",
-    "match_weekly_recordings_summary_route",
 ]

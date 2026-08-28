@@ -45,23 +45,21 @@ from boxer_company.assistant.service import (
     RequestScopedRecordingsContext,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
-    resolve_assistant_request_scope,
 )
 from boxer_company.assistant.structured_route import (
     StructuredAssistantRoute,
 )
 from boxer_company.notion_playbooks import _select_notion_references
-from boxer_company.routers.barcode_log import (
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    _extract_barcode,
     _extract_hospital_room_scope,
     _extract_log_date_with_presence,
+    _has_recording_failure_analysis_hints,
+    resolve_assistant_request_scope,
 )
 from boxer_company.routers.box_db import _load_recordings_context_by_barcode
-from boxer_company.routers.recording_failure_analysis import (
-    _has_recording_failure_analysis_hints,
-)
-from boxer_company.utils import _extract_barcode
 
 
 CompanyAssistantStage = Literal[

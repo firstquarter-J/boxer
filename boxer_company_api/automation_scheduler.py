@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import threading
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 from boxer_company.automation import (
     AutomationCycleName,
@@ -329,6 +329,13 @@ def load_automation_scheduler_settings(
         targets[cycle] = AutomationDeliveryTarget(
             channel_id=str(source.get(channel_key, "")).strip(),
         )
+    # 새 API-owned 이름을 우선하되 기존 운영 env의 조용한 30초 리셋을
+    # 막기 위해 Solapi poll 이름을 한시적 읽기 alias로만 수용한다.
+    sms_poll_interval_key = (
+        "SMS_DELIVERY_REPORTER_POLL_INTERVAL_SEC"
+        if "SMS_DELIVERY_REPORTER_POLL_INTERVAL_SEC" in source
+        else "SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC"
+    )
     schedule = AutomationScheduleConfig(
         weekly_hour=_read_int(
             source,
@@ -393,7 +400,7 @@ def load_automation_scheduler_settings(
         sms_delivery_interval=timedelta(
             seconds=_read_int(
                 source,
-                "SMS_DELIVERY_REPORTER_POLL_INTERVAL_SEC",
+                sms_poll_interval_key,
                 default=30,
                 minimum=1,
                 maximum=86_400,

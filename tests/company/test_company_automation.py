@@ -302,14 +302,12 @@ def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
         "label",
         "summary",
     }
-    from boxer_company_api.automation import serialize_automation_cycle_result
-
     serialized = json.dumps(
-        serialize_automation_cycle_result(result, "cycle:test:1"),
+        [delivery.payload for delivery in result.deliveries],
         ensure_ascii=False,
         sort_keys=True,
     )
-    # 실행용 구조와 synthetic secret은 API delivery 직렬화 전에 사라져야 한다.
+    # 실행용 구조와 synthetic secret은 transport가 받을 domain payload 전에 사라져야 한다.
     for forbidden in (
         "statusPayload",
         '"command"',

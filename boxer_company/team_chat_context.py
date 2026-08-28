@@ -1,4 +1,7 @@
 from boxer_company import settings as cs
+from boxer_company._operation_routing_knowledge import (
+    TEAM_MEMBER_ALIASES_BY_NAME,
+)
 
 TEAM_CHAT_GENERAL_GUIDE = (
     "팀 자유대화는 가벼운 드립과 메타 농담이 자주 오가지만, 한 번 치고 회수하는 톤이 맞아. "
@@ -19,7 +22,7 @@ TEAM_CHAT_FREEFORM_GUARDRAIL = (
 TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     {
         "name": "Mark",
-        "aliases": ("mark", "마크"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Mark"],
         "user_id": cs.MARK_USER_ID,
         "mbti": "ISFJ",
         "profile_fact": "1987 / Clinic & Security & Infra Team / Team Member / 육아휴직 중",
@@ -49,7 +52,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Hyun",
-        "aliases": ("hyun",),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Hyun"],
         "user_id": cs.HYUN_USER_ID,
         "mbti": "ENTJ",
         "profile_fact": "1988 / Clinic & Security & Infra Team / Team Manager",
@@ -75,7 +78,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "DD",
-        "aliases": ("dd", "디디"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["DD"],
         "user_id": cs.DD_USER_ID,
         "mbti": "ENFP",
         "profile_fact": "1987 / Clinic & Security & Infra Team / Security Engineer",
@@ -106,7 +109,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "June",
-        "aliases": ("june",),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["June"],
         "user_id": cs.JUNE_USER_ID,
         "mbti": "ENTJ",
         "profile_fact": "2000 / Core Engineer Team / Server Engineer / 퇴사",
@@ -135,7 +138,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Juno",
-        "aliases": ("juno", "주노"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Juno"],
         "user_id": cs.JUNO_USER_ID,
         "mbti": "ISTJ",
         "profile_fact": "1990 / Core Engineer Team / Server Engineer",
@@ -161,7 +164,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Roy",
-        "aliases": ("roy", "로이"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Roy"],
         "user_id": cs.ROY_USER_ID,
         "mbti": "ISTJ",
         "profile_fact": "1989 / Core Engineer Team / Team Manager / 휴직 중",
@@ -190,7 +193,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Maru",
-        "aliases": ("maru", "마루"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Maru"],
         "user_id": cs.MARU_USER_ID,
         "mbti": "INFJ",
         "profile_fact": "1986 / Core Engineer Team / Server Engineer",
@@ -216,7 +219,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Paul",
-        "aliases": ("paul", "폴"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Paul"],
         "user_id": cs.PAUL_USER_ID,
         "mbti": "INTP",
         "profile_fact": "1995 / Core Engineer Team / Client Engineer",
@@ -242,7 +245,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Danny",
-        "aliases": ("danny", "대니"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Danny"],
         "user_id": cs.DANNY_USER_ID,
         "mbti": "ENFJ",
         "profile_fact": "1987 / Core Engineer Team / Client Engineer",
@@ -268,7 +271,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Luka",
-        "aliases": ("luka", "루카"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Luka"],
         "user_id": cs.LUKA_USER_ID,
         "mbti": "INTP",
         "profile_fact": "1980 / Core Engineer Team / Ai Engineer",
@@ -294,7 +297,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Sage",
-        "aliases": ("sage", "세이지"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Sage"],
         "user_id": cs.SAGE_USER_ID,
         "mbti": "INTJ",
         "profile_fact": "나이미상 / Core Engineer Team / Client Engineer",
@@ -318,7 +321,7 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
     },
     {
         "name": "Olivia",
-        "aliases": ("olivia", "올리비아"),
+        "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Olivia"],
         "user_id": cs.OLIVIA_USER_ID,
         "mbti": "ISTJ",
         "profile_fact": "2001 / Clinic & Security & Infra Team / Infra Engineer",

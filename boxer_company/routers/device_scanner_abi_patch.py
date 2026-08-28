@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from boxer.core.utils import _display_value
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
 from boxer_company.routers.device_ssh_security import (
     _mark_company_api_mutation_attempted,
@@ -25,9 +25,12 @@ from boxer_company.routers.mda_graphql import (
     _send_mda_device_ping,
 )
 from boxer_company.routers.ssh_command import _close_ssh_streams
+from boxer_company.transport_contracts import (
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+    _is_device_scanner_abi_patch_intent,
+)
 
 
-DEVICE_SCANNER_ABI_PATCH_ROUTE = "device_scanner_abi_patch"
 _PATCH_ASSET_PACKAGE = "boxer_company.assets"
 _PATCH_ASSET_NAME = "repair-node-hid-abi.sh"
 _PATCH_ASSET_SHA256 = (
@@ -90,7 +93,7 @@ class _RemoteOutputTail:
 
 
 def _normalize_scanner_patch_intent_question(question: str) -> str:
-    """intent 격리용으로 Slack mention만 제거한다."""
+    """실행 parser도 경량 intent와 같은 mention 제거 규칙을 쓴다."""
 
     text = re.sub(r"<@[^>]+>", " ", str(question or ""))
     return " ".join(text.split()).strip()
@@ -111,35 +114,6 @@ def _normalize_scanner_patch_exact_question(question: str) -> str:
         flags=re.IGNORECASE,
     )
     return " ".join(text.split()).strip()
-
-
-def _is_device_scanner_abi_patch_intent(question: str) -> bool:
-    """generic 박스 업데이트가 스캐너 전용 패치 문구를 선점하지 않게 한다."""
-
-    normalized = _normalize_scanner_patch_intent_question(question)
-    lowered = normalized.casefold()
-    has_scanner = any(
-        hint in lowered for hint in ("스캐너", "scanner", "node-hid")
-    )
-    # 정확한 실행 문구보다 넓게 격리해 `node-hid ABI 적용과
-    # 장비 종료` 같은 혼합 명령이 power/update로 일부 실행되지
-    # 않게 한다. 실제 실행 승인은 아래 exact parser가 다시 한다.
-    has_patch_semantics = any(
-        hint in lowered
-        for hint in (
-            "abi",
-            "패치",
-            "patch",
-            "복구",
-            "호환",
-            "적용",
-            "조치",
-            "수정",
-            "repair",
-            "fix",
-        )
-    )
-    return has_scanner and has_patch_semantics
 
 
 def _extract_device_name_for_scanner_abi_patch(

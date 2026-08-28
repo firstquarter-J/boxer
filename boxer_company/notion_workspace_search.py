@@ -13,34 +13,15 @@ from boxer.retrieval.connectors.notion import (
     _notion_request,
 )
 from boxer_company import settings as cs
+from boxer_company.transport_contracts import (
+    _extract_company_notion_search_query,
+    _looks_like_company_notion_search,
+)
 
 _PARENT_CACHE_TTL_SEC = 300
 _PARENT_CACHE: dict[str, dict[str, Any]] = {}
 _CONTENT_CACHE_TTL_SEC = 300
 _CONTENT_CACHE: dict[str, dict[str, Any]] = {}
-_SEARCH_INTENT_TOKENS = (
-    "노션",
-    "워크보드",
-    "워크 보드",
-    "work board",
-    "회사 문서",
-    "사내 문서",
-)
-_QUERY_NOISE_PATTERNS = (
-    re.compile(r"work\s*board(?:에서|으로|로|의)?", re.IGNORECASE),
-    re.compile(r"워크\s*보드(?:에서|으로|로|의)?"),
-    re.compile(r"(?:회사|사내)\s*노션(?:에서|으로|로|의)?"),
-    re.compile(r"노션(?:에서|으로|로|의)?"),
-    re.compile(r"(?:회사|사내)\s*문서(?:에서|으로|로|의)?"),
-)
-_QUERY_REQUEST_WORDS = re.compile(
-    r"(?:관련\s*)?(?:문서|페이지)(?:를|을)?|"
-    r"찾아\s*줘|찾아줘|찾아|검색해\s*줘|검색해줘|검색|"
-    r"조회해\s*줘|조회해줘|조회|보여\s*줘|보여줘|알려\s*줘|알려줘|"
-    r"요약해\s*줘|요약해줘|정리해\s*줘|정리해줘|답변해\s*줘|답변해줘|"
-    r"답해\s*줘|답해줘|설명해\s*줘|설명해줘|내용(?:을|은|이)?|"
-    r"뭐야|무엇(?:인지|이야)?|어떻게(?:\s*해|\s*해야\s*해)?|왜|좀"
-)
 _LOOKUP_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣_+-]+")
 _COMPANY_NOTION_QUERY_ALIASES = (
     (("커머스",), "Commerce"),
@@ -75,20 +56,6 @@ class CompanyNotionSearchResult:
     title: str
     url: str
     last_edited_time: str
-
-
-def _looks_like_company_notion_search(question: str) -> bool:
-    normalized = re.sub(r"\s+", " ", (question or "").strip().lower())
-    return bool(normalized) and any(token in normalized for token in _SEARCH_INTENT_TOKENS)
-
-
-def _extract_company_notion_search_query(question: str) -> str:
-    query = (question or "").strip()
-    for pattern in _QUERY_NOISE_PATTERNS:
-        query = pattern.sub(" ", query)
-    query = _QUERY_REQUEST_WORDS.sub(" ", query)
-    query = re.sub(r"[?？!！.,:;~]+", " ", query)
-    return re.sub(r"\s+", " ", query).strip()[:120]
 
 
 def _is_company_notion_search_configured() -> bool:
@@ -551,49 +518,8 @@ def _load_company_notion_references(
     return references
 
 
-def _build_company_notion_source_docs(
-    references: list[dict[str, Any]],
-) -> list[dict[str, str]]:
-    docs: list[dict[str, str]] = []
-    for reference in references[:5]:
-        title = str(reference.get("title") or "").strip()
-        url = str(reference.get("url") or "").strip()
-        if not title or not url.startswith(("https://www.notion.so/", "https://app.notion.com/")):
-            continue
-        docs.append({"title": _escape_slack_text(title), "url": url})
-    return docs
-
-
-def _escape_slack_text(text: str) -> str:
-    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "/")
-
-
-def _build_company_notion_search_reply(
-    query: str,
-    results: list[CompanyNotionSearchResult],
-) -> str:
-    safe_query = _escape_slack_text(query).replace("`", "'")
-    if not results:
-        return (
-            f"회사 Work Board에서 `{safe_query}` 제목의 문서를 찾지 못했어. "
-            "지금은 제목 기준 검색이라 다른 핵심 키워드로 다시 찾아줘"
-        )
-
-    lines = ["*회사 Notion 검색*", f"• 키워드: `{safe_query}`"]
-    for result in results:
-        safe_title = _escape_slack_text(result.title)
-        if result.url.startswith(("https://www.notion.so/", "https://app.notion.com/")):
-            lines.append(f"• <{result.url}|{safe_title}>")
-        else:
-            lines.append(f"• {safe_title}")
-    lines.append("_현재는 Work Board 범위의 제목 검색이야._")
-    return "\n".join(lines)
-
-
 __all__ = [
     "CompanyNotionSearchResult",
-    "_build_company_notion_search_reply",
-    "_build_company_notion_source_docs",
     "_extract_company_notion_search_query",
     "_is_company_notion_search_configured",
     "_looks_like_company_notion_search",

@@ -1,7 +1,24 @@
 from __future__ import annotations
 
+# 녹화 실패 read 분류와 follow-up scope 해석은 transport와 같은 정본을 쓴다.
+from boxer_company.read_routing import (
+    AssistantRequestScopeMismatch,
+    _extract_device_name_scope,
+    _is_failure_scope_followup,
+    _has_recording_failure_analysis_hints,
+    _is_recording_failure_analysis_request,
+    _metadata_bool,
+    _metadata_followup_kind,
+    _metadata_text,
+    _recording_failure_context_text as _context_text,
+    _resolve_recording_failure_barcode as _resolve_barcode,
+    _resolve_recording_failure_hospital_room as _resolve_hospital_room,
+    _resolve_recording_failure_log_date as _resolve_log_date,
+    resolve_assistant_request_scope,
+    window_assistant_context_entries,
+)
+
 from dataclasses import replace
-from datetime import date
 import logging
 import re
 from typing import Any, Callable, Mapping
@@ -27,10 +44,7 @@ from boxer_company.assistant.service import (
     RequestScopedRecordingsContext,
 )
 from boxer_company.assistant.scope_guard import (
-    AssistantRequestScopeMismatch,
     build_scope_mismatch_result,
-    resolve_assistant_request_scope,
-    window_assistant_context_entries,
 )
 from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
@@ -40,9 +54,6 @@ from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_errors,
     _analyze_barcode_log_phase1_window,
     _build_phase2_scope_request_message,
-    _extract_device_name_scope,
-    _extract_hospital_room_scope,
-    _extract_log_date_with_presence,
 )
 from boxer_company.routers.box_db import (
     _lookup_device_contexts_by_barcode_on_date,
@@ -50,12 +61,9 @@ from boxer_company.routers.box_db import (
 )
 from boxer_company.routers.recording_failure_analysis import (
     _build_recording_failure_analysis_evidence,
-    _has_recording_failure_analysis_hints,
-    _is_recording_failure_analysis_request,
     _narrow_recording_failure_analysis_evidence,
     _render_recording_failure_analysis_fallback,
 )
-from boxer_company.utils import _extract_barcode
 
 _DEPENDENCY_ERRORS = (
     BotoCoreError,
@@ -430,150 +438,6 @@ class RecordingFailureAssistantRoute:
         )
 
 
-def match_recording_failure_route(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    """DB/S3 호출 전에 녹화 실패 분석 의도와 신뢰 가능한 후속 문맥만 확인한다."""
-
-    try:
-        resolve_assistant_request_scope(request)
-    except AssistantRequestScopeMismatch:
-        return None
-    barcode = _resolve_barcode(request)
-    hospital_name, room_name = _resolve_hospital_room(request)
-    context_text = _context_text(request)
-    direct_match = _is_recording_failure_analysis_request(
-        request.question,
-        barcode,
-    )
-    explicit_followup = _metadata_bool(
-        request,
-        "is_failure_phase2_scope_followup",
-        "isFailurePhase2ScopeFollowup",
-    ) or _metadata_followup_kind(request) == "recording_failure"
-    contextual_followup = bool(
-        barcode
-        and hospital_name
-        and room_name
-        and _has_recording_failure_analysis_hints(context_text)
-    )
-    if direct_match:
-        return "recording_failure_analysis"
-    if not (explicit_followup or contextual_followup):
-        return None
-    try:
-        _, has_requested_date = _resolve_log_date(request)
-    except ValueError:
-        # 잘못된 날짜도 route가 안전한 needs_input 결과로 바꿔야 한다.
-        return "recording_failure_analysis"
-    if _is_failure_scope_followup(
-        request,
-        barcode=barcode,
-        hospital_name=hospital_name,
-        room_name=room_name,
-        has_requested_date=has_requested_date,
-        context_text=context_text,
-    ):
-        return "recording_failure_analysis"
-    return None
-
-
-def _context_text(request: CompanyAssistantRequest) -> str:
-    return "\n".join(
-        str(entry.get("text") or "").strip()
-        for entry in window_assistant_context_entries(request)
-        if (
-            isinstance(entry, Mapping)
-            and request.actor_id
-            and str(entry.get("author_id") or "").strip()
-            == request.actor_id
-            and str(entry.get("text") or "").strip()
-        )
-    )
-
-
-def _metadata_text(
-    request: CompanyAssistantRequest,
-    *keys: str,
-) -> str | None:
-    for key in keys:
-        value = request.metadata.get(key)
-        if isinstance(value, str):
-            normalized = value.strip()
-            if normalized:
-                return normalized
-    return None
-
-
-def _metadata_bool(
-    request: CompanyAssistantRequest,
-    *keys: str,
-) -> bool:
-    return any(request.metadata.get(key) is True for key in keys)
-
-
-def _metadata_followup_kind(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    value = request.metadata.get("followup_kind")
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().lower()
-    return normalized or None
-
-
-def _resolve_barcode(
-    request: CompanyAssistantRequest,
-) -> str | None:
-    explicit = (
-        _metadata_text(request, "barcode")
-        or _extract_barcode(request.question)
-    )
-    if explicit:
-        return explicit
-    # 다른 참여자의 바코드를 현재 요청 범위로 승격하지 않고
-    # 동일 actor가 남긴 최신 메시지만 쓴다.
-    for entry in reversed(window_assistant_context_entries(request)):
-        if not isinstance(entry, Mapping):
-            continue
-        author_id = str(entry.get("author_id") or "").strip()
-        if not request.actor_id or author_id != request.actor_id:
-            continue
-        barcode = _extract_barcode(str(entry.get("text") or ""))
-        if barcode:
-            return barcode
-    return None
-
-
-def _resolve_hospital_room(
-    request: CompanyAssistantRequest,
-) -> tuple[str | None, str | None]:
-    question_hospital, question_room = _extract_hospital_room_scope(
-        request.question
-    )
-    hospital_name = (
-        _metadata_text(
-            request,
-            "hospital_name",
-            "hospitalName",
-            "phase2_hospital_name",
-            "phase2HospitalName",
-        )
-        or question_hospital
-    )
-    room_name = (
-        _metadata_text(
-            request,
-            "room_name",
-            "roomName",
-            "phase2_room_name",
-            "phase2RoomName",
-        )
-        or question_room
-    )
-    return hospital_name, room_name
-
-
 def _resolve_device_name(
     request: CompanyAssistantRequest,
 ) -> str | None:
@@ -582,48 +446,6 @@ def _resolve_device_name(
         "device_name",
         "deviceName",
     ) or _extract_device_name_scope(request.question)
-
-
-def _resolve_log_date(
-    request: CompanyAssistantRequest,
-) -> tuple[str, bool]:
-    log_date, has_requested_date = _extract_log_date_with_presence(
-        request.question
-    )
-    metadata_date = _metadata_text(request, "log_date", "logDate")
-    if has_requested_date or not metadata_date:
-        return log_date, has_requested_date
-
-    try:
-        return date.fromisoformat(metadata_date).isoformat(), True
-    except ValueError as exc:
-        raise ValueError("날짜는 YYYY-MM-DD 형식으로 입력해줘") from exc
-
-
-def _is_failure_scope_followup(
-    request: CompanyAssistantRequest,
-    *,
-    barcode: str | None,
-    hospital_name: str | None,
-    room_name: str | None,
-    has_requested_date: bool,
-    context_text: str,
-) -> bool:
-    explicit_followup = _metadata_bool(
-        request,
-        "is_failure_phase2_scope_followup",
-        "isFailurePhase2ScopeFollowup",
-    ) or _metadata_followup_kind(request) == "recording_failure"
-    return bool(
-        barcode
-        and hospital_name
-        and room_name
-        and has_requested_date
-        and (
-            explicit_followup
-            or _has_recording_failure_analysis_hints(context_text)
-        )
-    )
 
 
 def _selector_text(request: CompanyAssistantRequest) -> str:
@@ -798,5 +620,4 @@ def _result(
 
 __all__ = [
     "RecordingFailureAssistantRoute",
-    "match_recording_failure_route",
 ]

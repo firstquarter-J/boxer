@@ -28,10 +28,10 @@ from boxer_company.assistant.contracts import (
 )
 from boxer_company.assistant.operations import (
     is_uncertain_company_mutation_result,
-    match_company_operation_route,
     match_live_device_company_operation_route,
     match_mutation_capable_company_operation_route,
 )
+from boxer_company.operation_routing import match_company_operation_route
 from boxer_company.assistant.request_log_contract import (
     legacy_company_request_log_route_name,
 )
@@ -44,11 +44,9 @@ from boxer_company.hpa_change_coordinator import (
     create_hpa_change_coordinator,
 )
 from boxer_company_api.automation import (
-    AutomationCycleInput,
     AutomationCycleUncertainError,
     DurableAutomationCycleCoordinator,
     JsonAutomationCycleStateStore,
-    serialize_automation_cycle_result,
 )
 from boxer_company_api.automation_delivery import (
     AutomationDeliveryAckInput,
@@ -62,7 +60,6 @@ from boxer_company_api.hpa_change_router import create_hpa_change_router
 from boxer_company_api.hpa_change_transport import HpaChangeTransportService
 from boxer_company_api.observability import emit_api_event
 from boxer_company_api.policies import (
-    authorize_automation_cycle,
     authorize_automation_transport,
     authorize_turn,
     validate_request_id,
@@ -139,7 +136,6 @@ ReadinessProbe = Callable[[], bool]
 
 _SERVICE_NAME = "boxer-company-api"
 _TURN_PATH = "/internal/v1/assistant/turns"
-_AUTOMATION_CYCLE_PATH = "/internal/v1/automation/cycles"
 _AUTOMATION_DELIVERY_PULL_PATH = (
     "/internal/v1/automation/deliveries/pull"
 )
@@ -198,7 +194,7 @@ def create_company_api_app(
         )
     automation_state_store = (
         JsonAutomationCycleStateStore(api_settings.automation_state_path)
-        if api_settings.automation_enabled_cycles
+        if api_settings.automation_storage_required
         else None
     )
     if automation_coordinator is _AUTOMATION_UNSET:
@@ -207,7 +203,7 @@ def create_company_api_app(
                 build_default_automation_cycle_service(),
                 cast(JsonAutomationCycleStateStore, automation_state_store),
             )
-            if api_settings.automation_enabled_cycles
+            if automation_state_store is not None
             else None
         )
     else:
@@ -222,10 +218,6 @@ def create_company_api_app(
                 cast(
                     DurableAutomationCycleCoordinator,
                     automation_runtime,
-                ),
-                enabled_cycles=frozenset(
-                    api_settings.automation_enabled_cycles
-                    - {"sms_delivery"}
                 ),
             )
             if (
@@ -888,112 +880,6 @@ def create_company_api_app(
 
         return JSONResponse(content=execute_turn())
 
-    @app.post(_AUTOMATION_CYCLE_PATH, response_model=None)
-    def run_automation_cycle(
-        request: Request,
-        cycle: AutomationCycleInput,
-    ) -> JSONResponse:
-        request_id = validate_request_id(
-            request.headers.get("X-Request-ID")
-        )
-        request.state.request_id = request_id
-        traceparent = validate_traceparent(
-            request.headers.get("traceparent"),
-            request_id,
-        )
-        request.state.traceparent = traceparent
-        principal = caller_registry.authenticate(
-            request.headers.get("Authorization"),
-            request_id,
-        )
-        authorize_automation_cycle(
-            principal,
-            cycle.tenantId,
-            request_id,
-        )
-        if (
-            api_settings.automation_scheduler_enabled
-            or cycle.cycle not in api_settings.automation_enabled_cycles
-        ):
-            # capability만으로 feature-off cycle을 실행할 수 없게 운영 flag를
-            # endpoint admission에도 다시 적용한다.
-            raise CompanyApiProblem(
-                status=503,
-                code="service_not_ready",
-                request_id=request_id,
-                retryable=False,
-            )
-        if not is_ready() or automation_runtime is None:
-            raise CompanyApiProblem(
-                status=503,
-                code="service_not_ready",
-                request_id=request_id,
-                retryable=False,
-            )
-
-        started_at = time.monotonic()
-        try:
-            # daily/health는 한 cycle에서 여러 장비를 순회하므로 sshOrder
-            # 예산을 장비별 한 번으로 분리한다.
-            with company_api_device_ssh_context(
-                per_device_open_budget=True,
-            ):
-                result = automation_runtime.run(
-                    cycle.to_trigger(request_id)
-                )
-            payload = serialize_automation_cycle_result(
-                result,
-                request_id,
-            )
-        except AutomationCycleUncertainError:
-            raise CompanyApiProblem(
-                status=409,
-                code="operation_in_progress",
-                request_id=request_id,
-                retryable=False,
-            ) from None
-        except AutomationCycleContractError:
-            raise CompanyApiProblem(
-                status=422,
-                code="validation_failed",
-                request_id=request_id,
-                retryable=False,
-            ) from None
-        except Exception as exc:
-            # cycle은 mutation을 포함할 수 있어 서버가 retryable로 안내하지
-            # 않고, payload나 예외 문자열 대신 안전한 오류 타입만 남긴다.
-            emit_api_event(
-                "company_api_automation_failed",
-                caller_id=principal.caller_id,
-                cycle=cycle.cycle,
-                request_id=request_id,
-                status=500,
-                error_type=type(exc).__name__,
-                duration_ms=int(
-                    (time.monotonic() - started_at) * 1_000
-                ),
-            )
-            raise CompanyApiProblem(
-                status=500,
-                code="internal_error",
-                request_id=request_id,
-                retryable=False,
-            ) from None
-
-        emit_api_event(
-            "company_api_automation_completed",
-            caller_id=principal.caller_id,
-            cycle=cycle.cycle,
-            request_id=request_id,
-            outcome=str(payload["outcome"]),
-            delivery_count=len(payload["deliveries"]),
-            status=200,
-            duration_ms=int(
-                (time.monotonic() - started_at) * 1_000
-            ),
-        )
-        return JSONResponse(content=payload)
-
     @app.post(_AUTOMATION_DELIVERY_PULL_PATH, response_model=None)
     def pull_automation_delivery(
         request: Request,
@@ -1008,17 +894,6 @@ def create_company_api_app(
             not api_settings.automation_scheduler_enabled
             or delivery_runtime is None
             or not is_ready()
-        ):
-            raise CompanyApiProblem(
-                status=503,
-                code="service_not_ready",
-                request_id=request_id,
-                retryable=False,
-            )
-        if (
-            delivery_request.cycle is not None
-            and delivery_request.cycle
-            not in api_settings.automation_enabled_cycles - {"sms_delivery"}
         ):
             raise CompanyApiProblem(
                 status=503,
@@ -1771,6 +1646,9 @@ def _resolve_runtime(
         from boxer_company.assistant.factory import (
             create_company_assistant_runtime,
         )
+        from boxer_company.settings import (
+            validate_company_data_source_settings,
+        )
 
         # 직접 app factory를 쓰는 실행 경로에서도 운영 credential 정책과
         # 기존 데이터 소스 설정 검증을 startup 전에 동일하게 적용한다.
@@ -1779,6 +1657,7 @@ def _resolve_runtime(
             include_llm=True,
             include_data_sources=True,
         )
+        validate_company_data_source_settings()
         return create_company_assistant_runtime(), True
     except Exception:
         emit_api_event(

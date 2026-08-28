@@ -57,7 +57,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -e ./boxer_adapter_slack
-          python -m pip install -e ./boxer_adapter_web
+          # TestClient 의존성은 공개 Web runtime이 아니라 test extra로만 설치한다.
+          python -m pip install -e './boxer_adapter_web[test]'
 
       - name: Assert company packages are unavailable
         working-directory: /tmp/boxer-public-checkout
@@ -174,6 +175,99 @@ jobs:
               if normalized.startswith(forbidden_paths):
                   raise SystemExit(
                       f"adapter source leaked into API wheel: {normalized}"
+                  )
+
+          # API install unit만 company runtime extra를 선택한다.
+          def module_available(name):
+              try:
+                  return importlib.util.find_spec(name) is not None
+              except ModuleNotFoundError:
+                  return False
+
+          for provider_name in (
+              "boto3",
+              "cryptography",
+              "google.auth",
+              "paramiko",
+              "pymysql",
+              "redis",
+          ):
+              if not module_available(provider_name):
+                  raise SystemExit(
+                      f"company API runtime provider is missing: {provider_name}"
+                  )
+          PY
+
+      - name: Verify company Slack provider-light wheel
+        run: |
+          wheel_root="$(mktemp -d)"
+          slack_venv_root="$(mktemp -d)"
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" .
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" ./boxer_adapter_slack
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" ./boxer_company
+          python -m pip wheel --no-deps --wheel-dir "${wheel_root}" ./boxer_company_adapter_slack
+          python -m venv "${slack_venv_root}/venv"
+          "${slack_venv_root}/venv/bin/python" -m pip install \
+            "${wheel_root}"/boxer-*.whl \
+            "${wheel_root}"/boxer_adapter_slack-*.whl \
+            "${wheel_root}"/boxer_company-*.whl \
+            "${wheel_root}"/boxer_company_adapter_slack-*.whl
+          cd "${slack_venv_root}"
+          "${slack_venv_root}/venv/bin/python" - <<'PY'
+          import importlib.util
+          import sys
+
+          import boxer_company_adapter_slack
+
+          if "boxer_company_adapter_slack.company" in sys.modules:
+              raise SystemExit("Slack package facade eagerly loaded production entry")
+
+          from boxer_company_adapter_slack.automation_api_client import (
+              AutomationRemoteDeliveryBatch,
+          )
+
+          if AutomationRemoteDeliveryBatch.__name__ != "AutomationRemoteDeliveryBatch":
+              raise SystemExit("Slack automation transport contract is unavailable")
+
+          # 실제 production 조립부도 provider extra 없이 import되어야 한다.
+          import boxer_company_adapter_slack.company
+
+          for provider_prefix in (
+              "anthropic",
+              "boto3",
+              "botocore",
+              "cryptography",
+              "google.auth",
+              "paramiko",
+              "pymysql",
+              "redis",
+          ):
+              if any(
+                  name == provider_prefix
+                  or name.startswith(provider_prefix + ".")
+                  for name in sys.modules
+              ):
+                  raise SystemExit(
+                      f"domain provider loaded by Slack entry: {provider_prefix}"
+                  )
+
+          def module_available(name):
+              try:
+                  return importlib.util.find_spec(name) is not None
+              except ModuleNotFoundError:
+                  return False
+
+          for provider_name in (
+              "boto3",
+              "cryptography",
+              "google.auth",
+              "paramiko",
+              "pymysql",
+              "redis",
+          ):
+              if module_available(provider_name):
+                  raise SystemExit(
+                      f"domain provider leaked into Slack install: {provider_name}"
                   )
           PY
 

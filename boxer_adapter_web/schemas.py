@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -221,9 +220,3 @@ class AdminMessageCreatedEventDto(BaseModel):
 class AdminConversationUpdatedEventDto(BaseModel):
     type: Literal["conversation.updated"] = "conversation.updated"
     payload: ConversationSnapshotDto
-
-
-def isoformat_utc(value: str | datetime) -> str:
-    if isinstance(value, str):
-        return value
-    return value.replace(microsecond=0).isoformat()

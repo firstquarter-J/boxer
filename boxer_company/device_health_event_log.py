@@ -455,25 +455,6 @@ def archive_device_health_monitor_event_logs(
     return result
 
 
-def archive_device_health_monitor_event_logs_once(
-    *,
-    now: datetime | None = None,
-    logger: logging.Logger | None = None,
-) -> dict[str, Any] | None:
-    """legacy reporter loop처럼 process마다 KST 날짜당 한 번 보관한다."""
-
-    global _ARCHIVE_ATTEMPT_DATE
-    local_now = _coerce_daily_device_round_now(now)
-    attempt_date = local_now.date().isoformat()
-    with _ARCHIVE_ATTEMPT_LOCK:
-        if _ARCHIVE_ATTEMPT_DATE == attempt_date:
-            return None
-        # 같은 날 실패해도 자동 재시도하지 않던 기존 loop 의미를 유지한다.
-        _ARCHIVE_ATTEMPT_DATE = attempt_date
-    return archive_device_health_monitor_event_logs(
-        now=local_now,
-        logger=logger,
-    )
 
 
 def start_device_health_monitor_event_archive_once(
@@ -529,7 +510,6 @@ def start_device_health_monitor_event_archive_once(
 __all__ = [
     "append_device_health_monitor_event",
     "archive_device_health_monitor_event_logs",
-    "archive_device_health_monitor_event_logs_once",
     "device_health_event_log_dir",
     "device_health_event_log_path",
     "start_device_health_monitor_event_archive_once",

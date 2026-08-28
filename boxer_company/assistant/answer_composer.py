@@ -18,6 +18,11 @@ from boxer_company.assistant.contracts import (
 AnswerValidator = Callable[[str], bool]
 ProviderReady = Callable[[], bool]
 
+_COMPANY_EVIDENCE_SCOPE_RULE = (
+    "Do not suggest another barcode or service unless the provided evidence "
+    "explicitly supports it."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CompanyEvidenceAnswerComposerDeps:
@@ -84,7 +89,12 @@ class CompanyEvidenceAnswerComposer:
                         request.context_entries if policy.include_context else ()
                     ),
                     system_prompt=policy.system_prompt,
-                    extra_rules=policy.extra_rules,
+                    # 조회 대상을 다른 바코드·서비스로 바꾸지 않는 회사
+                    # 정책은 공개 synthesis 기본값이 아니라 회사 composer가 소유한다.
+                    extra_rules=(
+                        f"{policy.extra_rules.rstrip()}\n"
+                        f"{_COMPANY_EVIDENCE_SCOPE_RULE}"
+                    ).strip(),
                     evidence_transform=policy.evidence_transform,
                     max_tokens=policy.max_tokens,
                     timeout_sec=policy.timeout_sec,
@@ -241,7 +251,6 @@ class CompanyEvidenceAnswerComposer:
 
 
 __all__ = [
-    "ActorAllowedForLlm",
     "AnswerValidator",
     "CompanyEvidenceAnswerComposer",
     "CompanyEvidenceAnswerComposerDeps",

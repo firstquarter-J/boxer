@@ -7,7 +7,6 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
     SourceReference,
-    SuggestedAction,
 )
 
 # DTO만 필요한 HTTP schema import가 DB/S3 route 의존성까지 당기지 않도록
@@ -194,7 +193,6 @@ __all__ = [
     "RequestScopedRecordingsContext",
     "SourceReference",
     "StructuredAssistantRoute",
-    "SuggestedAction",
     "WeeklyRecordingsSummaryAssistantRoute",
     "build_company_freeform_system_prompt",
     "build_company_read_only_knowledge_routes",

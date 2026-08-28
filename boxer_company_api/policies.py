@@ -29,9 +29,7 @@ _OPERATION_EXECUTE_CAPABILITY = "assistant.operation.execute"
 _DEVICE_HEALTH_ALERT_EXECUTE_CAPABILITY = (
     "assistant.device.alert.execute"
 )
-_AUTOMATION_EXECUTE_CAPABILITY = "assistant.automation.execute"
 _AUTOMATION_TRANSPORT_CAPABILITY = "assistant.automation.transport"
-_EFFECTIVE_ROUTE_UNSET = object()
 
 
 def validate_request_id(value: str | None) -> str:
@@ -75,17 +73,13 @@ def authorize_turn(
     turn: AssistantTurnInput,
     request_id: str | None = None,
     *,
-    effective_route_group: str | None | object = _EFFECTIVE_ROUTE_UNSET,
+    effective_route_group: str | None,
 ) -> CallerPrincipal:
     """서버가 인증한 caller scope와 turn의 actor/channel/context를 교차 검증한다."""
 
-    # HTTP app은 pure pre-match 결과를 명시적으로 넘긴다. 직접 호출하는
-    # 기존 정책 테스트만 wire 값을 기본값으로 사용해 호환한다.
-    route_group = (
-        turn.routeGroup
-        if effective_route_group is _EFFECTIVE_ROUTE_UNSET
-        else effective_route_group
-    )
+    # 민감 capability는 caller의 route hint가 아니라 서버 matcher가 확정한
+    # route만 검사한다. 호출자가 이 값을 생략하는 호환 경로는 두지 않는다.
+    route_group = effective_route_group
     if not _matches_scope(
         _TURN_CAPABILITY,
         principal.capabilities,
@@ -146,25 +140,6 @@ def authorize_turn(
     return principal
 
 
-def authorize_automation_cycle(
-    principal: CallerPrincipal,
-    tenant_id: str,
-    request_id: str | None = None,
-) -> CallerPrincipal:
-    """사람 actor를 가장하지 않는 Slack scheduler caller를 별도로 검증한다."""
-
-    if not _matches_scope(
-        _AUTOMATION_EXECUTE_CAPABILITY,
-        principal.capabilities,
-    ):
-        _raise_not_allowed(request_id)
-    if not _matches_scope(tenant_id, principal.tenant_ids):
-        _raise_not_allowed(request_id)
-    if not _matches_scope("slack", principal.channels):
-        _raise_not_allowed(request_id)
-    return principal
-
-
 def authorize_automation_transport(
     principal: CallerPrincipal,
     tenant_id: str,
@@ -197,7 +172,6 @@ def _raise_not_allowed(request_id: str | None) -> None:
 
 
 __all__ = [
-    "authorize_automation_cycle",
     "authorize_automation_transport",
     "authorize_turn",
     "validate_request_id",

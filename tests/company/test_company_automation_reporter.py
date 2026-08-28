@@ -20,6 +20,7 @@ from boxer_company_adapter_slack.automation_reporter import (
     flush_automation_deliveries,
     remember_automation_delivery,
     remember_automation_deliveries,
+    validate_automation_delivery_journal_preflight,
 )
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiAvailabilityError,
@@ -36,22 +37,10 @@ class _ApiClient:
         *,
         error: Exception | None = None,
         acknowledged: bool = True,
-        legacy_deliveries: tuple[object, ...] = (),
     ) -> None:
-        self.calls: list[dict[str, object]] = []
         self.batch_calls: list[dict[str, object]] = []
         self.error = error
         self.acknowledged = acknowledged
-        self.legacy_deliveries = legacy_deliveries
-
-    def run(self, **kwargs: object) -> SimpleNamespace:
-        self.calls.append(kwargs)
-        if self.error is not None:
-            raise self.error
-        return SimpleNamespace(
-            deliveries=self.legacy_deliveries,
-            metrics={},
-        )
 
     def acknowledge_batch(self, **kwargs: object) -> SimpleNamespace:
         self.batch_calls.append(kwargs)
@@ -78,16 +67,18 @@ def _batch_reference(*delivery_ids: str) -> AutomationRemoteDeliveryBatchRef:
     )
 
 
-def _remember(path: Path) -> None:
+def _remember(path: Path, *, with_batch: bool = False) -> None:
+    delivery_id = "device_health_monitor:abc"
     remember_automation_delivery(
         cycle="device_health_monitor",
         cycle_key="continuous",
         delivery=AutomationSlackDelivery(
-            delivery_id="device_health_monitor:abc",
+            delivery_id=delivery_id,
             external_message_id="1723600000.000100",
             permalink="https://lifex.slack.com/archives/C1/p1",
             delivered_at=_NOW,
         ),
+        batch=_batch_reference(delivery_id) if with_batch else None,
         state_path=path,
     )
 
@@ -121,7 +112,7 @@ def test_delivery_state_contains_receipt_only_and_is_private(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "delivery.json"
-    _remember(path)
+    _remember(path, with_batch=True)
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     serialized = json.dumps(payload)
@@ -133,7 +124,7 @@ def test_delivery_state_contains_receipt_only_and_is_private(
 
 def test_flush_sends_receipt_once_then_clears_state(tmp_path: Path) -> None:
     path = tmp_path / "delivery.json"
-    _remember(path)
+    _remember(path, with_batch=True)
     client = _ApiClient()
 
     flushed = flush_automation_deliveries(
@@ -145,9 +136,8 @@ def test_flush_sends_receipt_once_then_clears_state(tmp_path: Path) -> None:
     )
 
     assert flushed is True
-    assert len(client.calls) == 1
-    call = client.calls[0]
-    assert call["ack_only"] is True
+    assert len(client.batch_calls) == 1
+    call = client.batch_calls[0]
     assert len(call["receipts"]) == 1  # type: ignore[arg-type]
     assert (
         call["receipts"][0].delivery_id  # type: ignore[index,union-attr]
@@ -160,7 +150,7 @@ def test_flush_sends_receipt_once_then_clears_state(tmp_path: Path) -> None:
         scheduled_at=_NOW,
         state_path=path,
     ) is False
-    assert len(client.calls) == 1
+    assert len(client.batch_calls) == 1
 
 
 def test_aggregated_slack_receipts_are_stored_and_flushed_together(
@@ -183,6 +173,10 @@ def test_aggregated_slack_receipts_are_stored_and_flushed_together(
         cycle="device_health_monitor",
         cycle_key="continuous",
         deliveries=deliveries,
+        batch=_batch_reference(
+            "device_health_monitor:abc",
+            "device_health_monitor:def",
+        ),
         state_path=path,
     )
     stored = json.loads(path.read_text(encoding="utf-8"))
@@ -200,7 +194,7 @@ def test_aggregated_slack_receipts_are_stored_and_flushed_together(
     )
     assert {
         receipt.delivery_id
-        for receipt in client.calls[0]["receipts"]  # type: ignore[union-attr]
+        for receipt in client.batch_calls[0]["receipts"]  # type: ignore[union-attr]
     } == {
         "device_health_monitor:abc",
         "device_health_monitor:def",
@@ -211,7 +205,7 @@ def test_flush_failure_preserves_receipt_without_local_fallback(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "delivery.json"
-    _remember(path)
+    _remember(path, with_batch=True)
     client = _ApiClient(
         error=CompanyApiAvailabilityError("unavailable")
     )
@@ -230,16 +224,16 @@ def test_flush_failure_preserves_receipt_without_local_fallback(
     ]["receipts"]
 
 
-def test_legacy_ack_with_pending_delivery_preserves_pre_cutover_journal(
+def test_receipt_without_batch_is_rejected_and_preserved(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "delivery.json"
     _remember(path)
-    client = _ApiClient(legacy_deliveries=(object(),))
+    client = _ApiClient()
 
     with pytest.raises(
         CompanyApiContractError,
-        match="company_api_automation_delivery_ack_incomplete",
+        match="company_api_automation_delivery_batch_missing",
     ):
         flush_automation_deliveries(
             client,  # type: ignore[arg-type]
@@ -258,6 +252,50 @@ def test_legacy_ack_with_pending_delivery_preserves_pre_cutover_journal(
     assert journal.receipt_delivery_ids == (
         "device_health_monitor:abc",
     )
+
+
+def test_startup_preflight_accepts_missing_or_empty_journal(
+    tmp_path: Path,
+) -> None:
+    missing_path = tmp_path / "missing.json"
+    empty_path = tmp_path / "empty.json"
+    empty_path.write_text(
+        json.dumps({"version": 1, "cycles": {}}),
+        encoding="utf-8",
+    )
+
+    validate_automation_delivery_journal_preflight(
+        state_path=missing_path
+    )
+    validate_automation_delivery_journal_preflight(
+        state_path=empty_path
+    )
+
+
+def test_startup_preflight_accepts_current_exact_batch_journal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery.json"
+    _remember(path, with_batch=True)
+
+    validate_automation_delivery_journal_preflight(state_path=path)
+
+
+def test_startup_preflight_rejects_legacy_no_batch_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery.json"
+    _remember(path)
+    original = path.read_bytes()
+
+    with pytest.raises(
+        CompanyApiContractError,
+        match="company_api_automation_delivery_batch_missing",
+    ):
+        validate_automation_delivery_journal_preflight(state_path=path)
+
+    # startup guard는 운영자가 API pending과 대조할 정본을 보존한다.
+    assert path.read_bytes() == original
 
 
 def test_pending_receipt_cannot_be_replaced_by_another_cycle_key(

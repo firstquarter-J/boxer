@@ -129,11 +129,41 @@ def _workflow_run(
         status=status,
         conclusion=conclusion,
         html_url=f"https://github.com/mmtalk-app/boxer-coordinator/actions/runs/{run_id}",
-        display_title="",
-        run_attempt=1,
         created_at=_NOW,
-        updated_at=_NOW,
     )
+
+
+def _begin_review_dispatch(
+    store: HpaChangeJobStore,
+    task_id: str,
+):
+    """테스트 setup도 운영의 원자 claim 경로로 review dispatch를 연다."""
+
+    claimed = store.claim_review_dispatch(task_id)
+    if claimed is None:
+        raise AssertionError("review dispatch claim이 생성되지 않았어")
+    return claimed
+
+
+def _mark_delivery_notified(
+    store: HpaChangeJobStore,
+    task_id: str,
+    state: HpaChangePollState,
+    *,
+    advance_review_posted: bool = False,
+):
+    """전용 legacy facade 대신 실제 exact delivery ACK를 테스트한다."""
+
+    digest = hashlib.sha256(
+        f"{task_id}:{state.value}".encode("utf-8")
+    ).hexdigest()
+    job, _created = store.mark_delivery_notified(
+        task_id,
+        state,
+        f"hpa-delivery:{digest}",
+        advance_review_posted=advance_review_posted,
+    )
+    return job
 
 
 def _mark_store_needs_clarification(
@@ -143,7 +173,7 @@ def _mark_store_needs_clarification(
     """continuation 저장소 테스트가 실제 허용 전이를 따라 부모 상태를 만든다."""
 
     run = _workflow_run()
-    store.begin_dispatch(task_id)
+    _begin_review_dispatch(store, task_id)
     store.mark_dispatched(task_id)
     store.mark_running(task_id, run)
     store.mark_workflow_succeeded(
@@ -154,10 +184,7 @@ def _mark_store_needs_clarification(
         task_id,
         GitHubArtifactArchive(
             artifact_id=10,
-            workflow_run_id=run.run_id,
             name=f"boxer-hpa-result-{task_id}",
-            size_in_bytes=20,
-            sha256="a" * 64,
             content=b"zip",
         ),
     )
@@ -227,7 +254,7 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         self.assertEqual(duplicate.job.task_id, first.job.task_id)
         self.assertTrue(another_workspace.created)
         self.assertNotEqual(another_workspace.job.task_id, first.job.task_id)
-        self.assertEqual(len(self.store.list_jobs()), 2)
+        self.assertEqual(len(self.store.list_reportable_jobs()), 2)
 
     def test_latest_job_by_thread_does_not_return_stale_clarification(self) -> None:
         first = _register(self.store).job
@@ -314,7 +341,7 @@ class HpaChangeJobStoreTests(unittest.TestCase):
                 self.assertEqual(len(created), 1)
                 self.assertEqual(len(rejected), 1)
                 self.assertIsInstance(rejected[0], InvalidHpaChangeContinuation)
-                self.assertEqual(len(first_store.list_jobs()), 2)
+                self.assertEqual(len(first_store.list_reportable_jobs()), 2)
             finally:
                 second_store.close()
                 first_store.close()
@@ -328,7 +355,8 @@ class HpaChangeJobStoreTests(unittest.TestCase):
                 task_id_factory=_TaskIdFactory(),
             )
             registration = _register(first_store)
-            notified = first_store.mark_notified(
+            notified = _mark_delivery_notified(
+                first_store,
                 registration.job.task_id,
                 HpaChangePollState.QUEUED,
             )
@@ -352,7 +380,7 @@ class HpaChangeJobStoreTests(unittest.TestCase):
                 ["https://github.com/mmtalk-app/mmb-hospital-admin-server/pull/1"],
             )
 
-        self.store.begin_dispatch(job.task_id)
+        _begin_review_dispatch(self.store, job.task_id)
         self.store.mark_dispatched(job.task_id)
         self.store.mark_running(job.task_id, _workflow_run())
         self.store.mark_workflow_succeeded(
@@ -361,15 +389,12 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         )
         archive = GitHubArtifactArchive(
             artifact_id=10,
-            workflow_run_id=501,
             name=f"boxer-hpa-result-{job.task_id}",
-            size_in_bytes=20,
-            sha256="a" * 64,
             content=b"zip",
         )
         self.store.mark_result_ready(job.task_id, archive)
         self.store.mark_needs_clarification(job.task_id, "원하는 버튼 정책을 알려줘")
-        redispatching = self.store.begin_dispatch(job.task_id)
+        redispatching = _begin_review_dispatch(self.store, job.task_id)
 
         self.assertEqual(redispatching.status, HpaChangeStatus.DISPATCHING)
         self.assertEqual(redispatching.dispatch_count, 2)
@@ -384,7 +409,7 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         )
         try:
             job = _register(store, event_ts="1720580400.000109").job
-            store.begin_dispatch(job.task_id)
+            _begin_review_dispatch(store, job.task_id)
             store.mark_dispatched(job.task_id)
             store.mark_running(job.task_id, _workflow_run(run_id=501))
             store.mark_workflow_succeeded(
@@ -393,14 +418,16 @@ class HpaChangeJobStoreTests(unittest.TestCase):
             )
             archive = GitHubArtifactArchive(
                 artifact_id=10,
-                workflow_run_id=501,
                 name=f"boxer-hpa-result-{job.task_id}",
-                size_in_bytes=20,
-                sha256="a" * 64,
                 content=b"zip",
             )
             store.mark_review_ready(job.task_id, archive, result={"status": "review_ready"})
-            store.mark_review_posted(job.task_id)
+            _mark_delivery_notified(
+                store,
+                job.task_id,
+                HpaChangePollState.REVIEW_READY,
+                advance_review_posted=True,
+            )
 
             first = store.claim_implementation_dispatch(job.task_id)
             duplicate = store.claim_implementation_dispatch(
@@ -482,14 +509,11 @@ class HpaChangeJobStoreTests(unittest.TestCase):
 
         archive = GitHubArtifactArchive(
             artifact_id=10,
-            workflow_run_id=501,
             name=f"boxer-hpa-result-{clarification.task_id}",
-            size_in_bytes=20,
-            sha256="a" * 64,
             content=b"zip",
         )
         for job in (clarification, pr_created, no_change):
-            self.store.begin_dispatch(job.task_id)
+            _begin_review_dispatch(self.store, job.task_id)
             self.store.mark_dispatched(job.task_id)
             self.store.mark_running(job.task_id, _workflow_run())
             self.store.mark_workflow_succeeded(
@@ -507,10 +531,22 @@ class HpaChangeJobStoreTests(unittest.TestCase):
         before_notification = {job.task_id for job in self.store.list_reportable_jobs()}
         self.assertIn(no_change.task_id, before_notification)
 
-        self.store.mark_notified(pr_created.task_id, HpaChangePollState.PR_OPENED)
-        self.store.mark_notified(no_change.task_id, HpaChangePollState.NO_CHANGE_NEEDED)
+        _mark_delivery_notified(
+            self.store,
+            pr_created.task_id,
+            HpaChangePollState.PR_OPENED,
+        )
+        _mark_delivery_notified(
+            self.store,
+            no_change.task_id,
+            HpaChangePollState.NO_CHANGE_NEEDED,
+        )
         self.store.mark_failed(failed.task_id, "실패")
-        self.store.mark_notified(failed.task_id, HpaChangePollState.FAILED)
+        _mark_delivery_notified(
+            self.store,
+            failed.task_id,
+            HpaChangePollState.FAILED,
+        )
 
         reportable_ids = {job.task_id for job in self.store.list_reportable_jobs()}
 
@@ -625,18 +661,16 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
             self.config,
             StaticGitHubTokenProvider("ghp_abcdefghijklmnopqrstuvwxyz123456"),
             session=session,
-            clock=lambda: _NOW,
         )
 
     def test_dispatch_uses_exact_worker_contract_and_omits_slack_routing_metadata(self) -> None:
         session = _FakeSession(_FakeResponse(204))
         client = self._client(session)
 
-        receipt = client.dispatch_job(self.job)
+        client.dispatch_job(self.job)
 
         call = session.calls[0]
         body = call["json"]
-        self.assertEqual(receipt.event_type, "boxer-hpa-change")
         self.assertEqual(
             call["url"],
             "https://api.github.com/repos/mmtalk-app/boxer-coordinator/dispatches",
@@ -658,10 +692,9 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
         session = _FakeSession(_FakeResponse(204))
         client = self._client(session)
 
-        receipt = client.dispatch_implementation(self.job, review_run_id=501)
+        client.dispatch_implementation(self.job, review_run_id=501)
 
         body = session.calls[0]["json"]
-        self.assertEqual(receipt.event_type, "boxer-hpa-implement")
         self.assertEqual(body["event_type"], "boxer-hpa-implement")
         self.assertEqual(body["client_payload"]["task_id"], self.job.task_id)
         self.assertEqual(body["client_payload"]["review_run_id"], 501)
@@ -801,7 +834,6 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
         result = client.read_result_artifact_json(archive)
 
         self.assertEqual(archive.name, artifact_name)
-        self.assertEqual(archive.sha256, hashlib.sha256(content).hexdigest())
         self.assertEqual(result["status"], "pr_opened")
         self.assertEqual(
             session.calls[2]["url"],
@@ -831,10 +863,7 @@ class GitHubCoordinatorClientTests(unittest.TestCase):
     def test_rejects_invalid_zip_and_duplicate_result_members(self) -> None:
         archive = GitHubArtifactArchive(
             artifact_id=1,
-            workflow_run_id=2,
             name=self.config.result_artifact_name(self.job.task_id),
-            size_in_bytes=3,
-            sha256=hashlib.sha256(b"bad").hexdigest(),
             content=b"bad",
         )
         client = self._client(_FakeSession())
@@ -881,10 +910,7 @@ class _FakeCoordinator:
         content = _zip_result(self.result)
         return GitHubArtifactArchive(
             artifact_id=900,
-            workflow_run_id=run_id,
             name=f"boxer-hpa-result-{task_id}",
-            size_in_bytes=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
             content=content,
         )
 
@@ -1076,7 +1102,11 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         self.assertEqual(completed.state, HpaChangePollState.PR_OPENED)
         self.assertEqual(len(completed.pr_urls), 2)
         self.assertEqual(completed.result["prs"][0]["base"], "develop")
-        notified = self.store.mark_notified(job.task_id, completed.state)
+        notified = _mark_delivery_notified(
+            self.store,
+            job.task_id,
+            completed.state,
+        )
         self.assertEqual(notified.notified_status, "pr_opened")
 
     def test_poll_rejects_pr_from_non_hpa_repository(self) -> None:
@@ -1116,7 +1146,7 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         result = self.service.poll_job(job.task_id)
 
         self.assertEqual(result.state, HpaChangePollState.NEEDS_CLARIFICATION)
-        self.assertIn("Basic", result.message)
+        self.assertIn("Basic", result.job.status_message)
 
     def test_poll_maps_verified_no_change_result_without_pr(self) -> None:
         job, _ = self.service.submit(self.request)
@@ -1142,10 +1172,7 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         )
         archive = GitHubArtifactArchive(
             artifact_id=701,
-            workflow_run_id=501,
             name=f"boxer-hpa-result-{job.task_id}",
-            size_in_bytes=2,
-            sha256=hashlib.sha256(b"{}").hexdigest(),
             content=b"{}",
         )
         self.store.mark_result_ready(
@@ -1168,10 +1195,7 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         )
         archive = GitHubArtifactArchive(
             artifact_id=702,
-            workflow_run_id=501,
             name=f"boxer-hpa-result-{job.task_id}",
-            size_in_bytes=2,
-            sha256=hashlib.sha256(b"{}").hexdigest(),
             content=b"{}",
         )
         self.store.mark_result_ready(
@@ -1205,10 +1229,7 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         )
         archive = GitHubArtifactArchive(
             artifact_id=703,
-            workflow_run_id=501,
             name=f"boxer-hpa-result-{job.task_id}",
-            size_in_bytes=2,
-            sha256=hashlib.sha256(b"{}").hexdigest(),
             content=b"{}",
         )
         self.store.mark_result_ready(
@@ -1249,10 +1270,7 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         )
         archive = GitHubArtifactArchive(
             artifact_id=704,
-            workflow_run_id=501,
             name=f"boxer-hpa-result-{job.task_id}",
-            size_in_bytes=2,
-            sha256=hashlib.sha256(b"{}").hexdigest(),
             content=b"{}",
         )
         self.store.mark_result_ready(
@@ -1330,7 +1348,12 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         with self.assertRaises(InvalidHpaChangeTransition):
             self.service.dispatch_implementation(job.task_id)
 
-        self.store.mark_review_posted(job.task_id)
+        _mark_delivery_notified(
+            self.store,
+            job.task_id,
+            HpaChangePollState.REVIEW_READY,
+            advance_review_posted=True,
+        )
         dispatched = self.service.dispatch_implementation(job.task_id)
 
         self.assertEqual(dispatched.status, HpaChangeStatus.DISPATCHED)
@@ -1353,7 +1376,12 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
             "review": {"summary": "검토 완료"},
         }
         self.service.poll_job(job.task_id)
-        self.store.mark_review_posted(job.task_id)
+        _mark_delivery_notified(
+            self.store,
+            job.task_id,
+            HpaChangePollState.REVIEW_READY,
+            advance_review_posted=True,
+        )
         self.coordinator.implementation_dispatch_error = GitHubApiError(
             "timeout",
             status_code=None,
@@ -1377,7 +1405,12 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
             "review": {"summary": "검토 완료"},
         }
         self.service.poll_job(job.task_id)
-        self.store.mark_review_posted(job.task_id)
+        _mark_delivery_notified(
+            self.store,
+            job.task_id,
+            HpaChangePollState.REVIEW_READY,
+            advance_review_posted=True,
+        )
 
         recovered = self.service.poll_job(job.task_id)
 
@@ -1397,7 +1430,12 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
             "review": {"summary": "검토 완료"},
         }
         self.service.poll_job(job.task_id)
-        self.store.mark_review_posted(job.task_id)
+        _mark_delivery_notified(
+            self.store,
+            job.task_id,
+            HpaChangePollState.REVIEW_READY,
+            advance_review_posted=True,
+        )
         self.service.dispatch_implementation(job.task_id)
         self.coordinator.runs.append(_workflow_run(run_id=502, status="in_progress"))
 
@@ -1422,7 +1460,12 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
             "review": {"summary": "검토 완료"},
         }
         self.service.poll_job(job.task_id)
-        self.store.mark_review_posted(job.task_id)
+        _mark_delivery_notified(
+            self.store,
+            job.task_id,
+            HpaChangePollState.REVIEW_READY,
+            advance_review_posted=True,
+        )
         # 외부 GitHub 호출 직전에 프로세스가 종료된 상태를 만든다.
         self.store.claim_implementation_dispatch(job.task_id)
         now[0] = _NOW + timedelta(seconds=61)
@@ -1463,7 +1506,7 @@ class HpaChangeWorkflowServiceTests(unittest.TestCase):
         result = self.service.poll_job(job.task_id)
 
         self.assertEqual(result.state, HpaChangePollState.FAILED)
-        self.assertNotIn("ghp_", result.message)
+        self.assertNotIn("ghp_", result.job.error_message)
 
 
 if __name__ == "__main__":

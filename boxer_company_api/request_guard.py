@@ -12,7 +12,6 @@ from typing import Any, Literal, Mapping
 class MutationRequestReservation:
     key: tuple[str, str, str]
     fingerprint: str
-    target_key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +25,6 @@ class MutationRequestDecision:
 class _Entry:
     fingerprint: str
     state: Literal["in_flight", "completed", "uncertain"]
-    target_key: str
     expires_at: float
     payload: Mapping[str, Any] | None = None
 
@@ -44,13 +42,9 @@ class MutationRequestGuard:
         *,
         clock: Any = time.monotonic,
         completed_ttl_sec: float = 86_400.0,
-        uncertain_ttl_sec: float | None = None,
     ) -> None:
         self._clock = clock
         self._completed_ttl_sec = max(60.0, float(completed_ttl_sec))
-        # 호환 인자는 받되 결과 불명 mutation은 프로세스 생존 동안 자동
-        # 해제하지 않는다. 재시작 전 운영 확인 없이 TTL로 재실행하면 안 된다.
-        del uncertain_ttl_sec
         self._lock = threading.Lock()
         self._entries: dict[tuple[str, str, str], _Entry] = {}
 
@@ -67,11 +61,9 @@ class MutationRequestGuard:
         if not mutation_capable:
             return MutationRequestDecision(status="bypass")
 
-        route_group = str(getattr(turn, "routeGroup", None) or "").strip()
         tenant_id = str(getattr(turn, "tenantId", "") or "").strip()
         key = (str(caller_id or "").strip(), tenant_id, request_id)
         fingerprint = _turn_fingerprint(turn)
-        target_key = _turn_target_key(turn, route_group=route_group)
         now = float(self._clock())
 
         with self._lock:
@@ -90,12 +82,10 @@ class MutationRequestGuard:
             reservation = MutationRequestReservation(
                 key=key,
                 fingerprint=fingerprint,
-                target_key=target_key,
             )
             self._entries[key] = _Entry(
                 fingerprint=fingerprint,
                 state="in_flight",
-                target_key=target_key,
                 # 실행 중 entry는 정상 완료/불확실 전이 전까지 지우지 않는다.
                 expires_at=float("inf"),
             )
@@ -174,13 +164,6 @@ def _turn_fingerprint(turn: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _turn_target_key(turn: Any, *, route_group: str) -> str:
-    tenant_id = str(getattr(turn, "tenantId", "") or "").strip()
-    # reservation payload 호환용 식별자다. 서로 다른 request ID 사이의
-    # 실행 소유권에는 사용하지 않는다.
-    return f"{tenant_id}:{route_group or 'mutation'}"
 
 
 __all__ = [

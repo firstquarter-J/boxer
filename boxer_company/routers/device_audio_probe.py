@@ -1,41 +1,12 @@
 import re
 from typing import Any
 
-from boxer.core.utils import _display_value, _truncate_text
+from boxer.core.utils import _truncate_text
+from boxer_company.utils import _display_value
 from boxer_company import settings as cs
-from boxer_company.routers.barcode_log import _extract_device_name_scope
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.mda_graphql import _wait_for_mda_device_agent_ssh
 
-_DEVICE_AUDIO_HINTS = (
-    "소리",
-    "오디오",
-    "사운드",
-    "스피커",
-    "음량",
-    "볼륨",
-    "mute",
-    "muted",
-)
-_DEVICE_AUDIO_PROBE_HINTS = (
-    "점검",
-    "체크",
-    "확인",
-    "테스트",
-    "진단",
-    "출력",
-    "재생",
-    "무음",
-    "안나와",
-    "안 나와",
-    "안들려",
-    "안 들려",
-    "문제",
-)
-_LEADING_DEVICE_AUDIO_SCOPE_PATTERN = re.compile(
-    r"^\s*([A-Za-z0-9]+-[A-Za-z0-9-]+)\s+(.+)$",
-    re.IGNORECASE,
-)
 _PLAYBACK_DEVICE_PATTERN = re.compile(
     r"card\s+(?P<card>\d+):\s*(?P<card_label>[^\[]+)\[(?P<card_name>[^\]]+)\],\s*"
     r"device\s+(?P<device>\d+):\s*(?P<device_label>[^\[]+)\[(?P<device_name>[^\]]+)\]",
@@ -109,44 +80,6 @@ _AUDIO_PROBE_COMMANDS = (
         ),
     },
 )
-
-
-def _normalize_device_audio_question(question: str) -> str:
-    text = re.sub(r"<@[^>]+>", " ", str(question or "")).strip()
-    return re.sub(r"[`'\"“”‘’]+", "", text)
-
-
-def _has_device_audio_hint(text: str) -> bool:
-    normalized = str(text or "").strip()
-    lowered = normalized.lower()
-    has_audio = any(token in normalized or token in lowered for token in _DEVICE_AUDIO_HINTS)
-    has_probe = any(token in normalized or token in lowered for token in _DEVICE_AUDIO_PROBE_HINTS)
-    return bool(has_audio and has_probe)
-
-
-def _extract_device_name_for_audio_probe(question: str) -> str | None:
-    normalized = _normalize_device_audio_question(question)
-    extracted = _extract_device_name_scope(normalized)
-    if extracted and _has_device_audio_hint(normalized):
-        return extracted
-
-    matched = _LEADING_DEVICE_AUDIO_SCOPE_PATTERN.search(normalized)
-    if not matched:
-        return None
-
-    candidate = " ".join(str(matched.group(1) or "").split()).strip()
-    remainder = " ".join(str(matched.group(2) or "").split()).strip()
-    if not candidate or not _has_device_audio_hint(remainder):
-        return None
-    return candidate
-
-
-def _is_device_audio_probe_request(question: str, device_name: str | None = None) -> bool:
-    normalized = _normalize_device_audio_question(question)
-    resolved_device_name = str(device_name or _extract_device_name_for_audio_probe(normalized) or "").strip()
-    if not resolved_device_name:
-        return False
-    return _has_device_audio_hint(normalized)
 
 
 def _build_device_audio_probe_config_message() -> str:

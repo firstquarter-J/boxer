@@ -78,7 +78,6 @@ class ThreadPlaybookSaveResult:
     page_id: str
     url: str
     keywords: list[str]
-    rag_index_updated: bool
     created: bool = True
 
 
@@ -100,10 +99,6 @@ class ThreadSourceIndexState:
     insert_after_block_id: str | None
     found_index_heading: bool
     migration_complete: bool
-
-    @property
-    def pending_block_ids(self) -> tuple[str, ...]:
-        return tuple(reservation.block_id for reservation in self.pending_reservations)
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
@@ -195,25 +190,6 @@ def _require_company_notion_token() -> str:
     if not notion_token:
         raise RuntimeError("NOTION_TOKEN_COMPANY가 필요해")
     return notion_token
-
-
-def _is_thread_playbook_learning_request(question: str) -> bool:
-    normalized = re.sub(r"\s+", "", (question or "").strip().lower())
-    if not normalized:
-        return False
-    return any(
-        token in normalized
-        for token in (
-            "이스레드학습",
-            "스레드학습",
-            "스레드학습해",
-            "스레드학습저장",
-            "스레드학습시켜",
-            "thread학습",
-            "thread저장",
-            "쓰레드학습",
-        )
-    )
 
 
 def _clean_text(value: Any, *, max_chars: int = 1000) -> str:
@@ -611,15 +587,6 @@ def _inspect_thread_source_index_state(
     )
 
 
-def _inspect_thread_source_index(
-    blocks: list[dict[str, Any]],
-    *,
-    source_key: str,
-) -> tuple[str | None, str | None, bool]:
-    state = _inspect_thread_source_index_state(blocks, source_key=source_key)
-    return state.page_id, state.insert_after_block_id, state.found_index_heading
-
-
 def _load_company_root_blocks(root_page_id: str) -> list[dict[str, Any]]:
     # source/RAG 인덱스는 200개를 넘을 수 있어서 회사 root만 제한 없이 순회한다.
     return _fetch_all_notion_blocks(
@@ -764,12 +731,6 @@ def _ensure_legacy_thread_sources_migrated(root_page_id: str) -> list[dict[str, 
             lines=migration_lines,
             initial_blocks=root_blocks,
         )
-
-
-def _find_thread_source_page_id(*, root_page_id: str, source_key: str) -> str | None:
-    blocks = _load_company_root_blocks(root_page_id)
-    page_id, _, _ = _inspect_thread_source_index(blocks, source_key=source_key)
-    return page_id
 
 
 def _append_thread_source_index_entry(
@@ -1129,7 +1090,7 @@ def _append_notion_rag_index_entry(
     *,
     root_page_id: str,
     page_id: str,
-) -> bool:
+) -> None:
     normalized_root_page_id = _normalize_notion_id(root_page_id)
     notion_token = _require_company_notion_token()
     index_line = _build_rag_index_line(draft, page_id=page_id)
@@ -1139,7 +1100,7 @@ def _append_notion_rag_index_entry(
             page_id=page_id,
         )
         if contains_page:
-            return False
+            return
 
         children = [_bulleted_item(index_line)]
         payload: dict[str, Any] = {"children": children}
@@ -1160,7 +1121,6 @@ def _append_notion_rag_index_entry(
             token=notion_token,
         )
         _invalidate_notion_playbook_cache(normalized_root_page_id, token=notion_token)
-        return True
 
 
 def _build_existing_thread_playbook_result(
@@ -1183,7 +1143,7 @@ def _build_existing_thread_playbook_result(
         keywords=keywords,
         source_notes=[],
     )
-    rag_index_updated = _append_notion_rag_index_entry(
+    _append_notion_rag_index_entry(
         recovery_draft,
         root_page_id=root_page_id,
         page_id=normalized_page_id,
@@ -1193,7 +1153,6 @@ def _build_existing_thread_playbook_result(
         page_id=normalized_page_id,
         url=str(page_content.get("url") or "").strip(),
         keywords=keywords,
-        rag_index_updated=rag_index_updated,
         created=False,
     )
 
@@ -1242,7 +1201,7 @@ def _save_thread_playbook_to_notion(
                 source_key=source_key,
                 page_id=page_id,
             )
-    rag_index_updated = _append_notion_rag_index_entry(
+    _append_notion_rag_index_entry(
         draft,
         root_page_id=root_page_id,
         page_id=page_id,
@@ -1252,7 +1211,6 @@ def _save_thread_playbook_to_notion(
         page_id=page_id,
         url=str(page_payload.get("url") or "").strip(),
         keywords=_unique_keywords(draft),
-        rag_index_updated=rag_index_updated,
     )
 
 

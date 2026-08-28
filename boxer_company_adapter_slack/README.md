@@ -7,8 +7,9 @@ This package combines:
 - `boxer_adapter_slack`
 - `boxer_company`
 
-The company Notion read-only route can be migrated to the private company API
-with `local`, `shadow`, and `remote` modes. Shadow mode always returns the
-existing local result and only compares safe route metadata in the background.
-Remote availability fallback is disabled by default and must be enabled
-explicitly for the read-only migration window.
+It is a transport-only gateway: it receives Slack events, checks membership,
+collects Slack thread context, calls the private company API, renders the
+validated response, and journals Slack delivery receipts. Company DB, S3,
+Notion, device, provider, HPA, and automation domain work runs only in the
+company API. Local execution, shadow comparison, and local fallback are not
+runtime modes.

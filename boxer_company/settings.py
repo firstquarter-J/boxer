@@ -168,9 +168,40 @@ BOX_UPLOADER_RECORDING_PATH = os.getenv(
 BOX_UPLOADER_TIMEOUT_SEC = int(os.getenv("BOX_UPLOADER_TIMEOUT_SEC", "120"))
 UPLOADER_JWT_SECRET = os.getenv("UPLOADER_JWT_SECRET", "").strip()
 
+# 회사 S3 버킷과 조회 상한은 공개 core의 설치 계약이 아니라 운영 정책이다.
+# 회사 라우터가 이 경계를 직접 참조해 공개 settings 정리와 독립적으로 유지한다.
+S3_ULTRASOUND_BUCKET = os.getenv("S3_ULTRASOUND_BUCKET", "").strip()
+S3_LOG_BUCKET = os.getenv("S3_LOG_BUCKET", "").strip()
+S3_QUERY_MAX_KEYS = int(os.getenv("S3_QUERY_MAX_KEYS", "20000"))
+S3_QUERY_MAX_ITEMS = int(os.getenv("S3_QUERY_MAX_ITEMS", "20"))
+S3_QUERY_MAX_RESULT_CHARS = int(
+    os.getenv("S3_QUERY_MAX_RESULT_CHARS", "3500")
+)
+S3_LOG_TAIL_BYTES = int(os.getenv("S3_LOG_TAIL_BYTES", "50000"))
+S3_LOG_TAIL_LINES = int(os.getenv("S3_LOG_TAIL_LINES", "80"))
+DB_QUERY_MAX_RESULT_CHARS = int(
+    os.getenv("DB_QUERY_MAX_RESULT_CHARS", "2500")
+)
+
+
+def validate_company_data_source_settings() -> None:
+    """활성 회사 S3 route가 두 GetObject bucket 없이 열리지 않게 한다."""
+
+    def _valid_bucket(value: str) -> bool:
+        normalized = str(value or "").strip()
+        return bool(normalized and "REPLACE_ME" not in normalized)
+
+    if core_settings.S3_QUERY_ENABLED and not all(
+        _valid_bucket(value)
+        for value in (S3_ULTRASOUND_BUCKET, S3_LOG_BUCKET)
+    ):
+        # 공개 validator는 provider 공통 설정만 보므로 회사 bucket 계약은
+        # API runtime 조립 직전에 placeholder까지 별도로 fail closed한다.
+        raise ValueError("company S3 bucket configuration is missing")
+
 DEVICE_FILE_DOWNLOAD_BUCKET = (
     os.getenv("DEVICE_FILE_DOWNLOAD_BUCKET", "").strip()
-    or core_settings.S3_ULTRASOUND_BUCKET
+    or S3_ULTRASOUND_BUCKET
 )
 DEVICE_FILE_DOWNLOAD_PREFIX = os.getenv("DEVICE_FILE_DOWNLOAD_PREFIX", "temp").strip().strip("/")
 DEVICE_FILE_DOWNLOAD_PRESIGNED_EXPIRES_SEC = int(
@@ -195,54 +226,13 @@ MOMMYBOX_REF_LEGACY_PATH = os.getenv(
     str(Path(MOMMYBOX_REFERENCE_ROOT) / "legacy"),
 ).strip()
 
-# true이면 automation 일정과 domain 실행은 API companion만 소유하고,
-# Slack reporter는 pending pull·렌더링·receipt ACK만 수행한다.
-BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED = (
-    os.getenv(
-        "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
-        "false",
-    ).strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-
-WEEKLY_RECORDINGS_REPORT_ENABLED = (
-    os.getenv("WEEKLY_RECORDINGS_REPORT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
-WEEKLY_RECORDINGS_REPORT_CHANNEL_ID = os.getenv("WEEKLY_RECORDINGS_REPORT_CHANNEL_ID", "").strip()
-WEEKLY_RECORDINGS_REPORT_HOUR_KST = int(os.getenv("WEEKLY_RECORDINGS_REPORT_HOUR_KST", "9"))
-WEEKLY_RECORDINGS_REPORT_MINUTE_KST = int(os.getenv("WEEKLY_RECORDINGS_REPORT_MINUTE_KST", "0"))
-WEEKLY_RECORDINGS_REPORT_POLL_INTERVAL_SEC = int(
-    os.getenv("WEEKLY_RECORDINGS_REPORT_POLL_INTERVAL_SEC", "30")
-)
-WEEKLY_RECORDINGS_REPORT_STATE_PATH = os.getenv(
-    "WEEKLY_RECORDINGS_REPORT_STATE_PATH",
-    str(core_settings.PROJECT_ROOT / "data" / "weekly_recordings_report_state.json"),
-).strip()
 # remote automation의 Slack 발송 receipt만 보존한다. 도메인 cursor와
 # provider 상태는 공통 API가 소유하고 이 파일에는 payload를 저장하지 않는다.
 AUTOMATION_DELIVERY_STATE_PATH = os.getenv(
     "BOXER_COMPANY_AUTOMATION_DELIVERY_STATE_PATH",
     str(core_settings.PROJECT_ROOT / "data" / "company_automation_delivery_state.json"),
 ).strip()
-# health/notification intake를 끈 뒤에도 이미 접수된 Solapi outbox를 비울 수
-# 있도록 SMS 최종 상태 poller를 독립적으로 유지한다.
-SMS_DELIVERY_REPORTER_ENABLED = (
-    os.getenv("SMS_DELIVERY_REPORTER_ENABLED", "false").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-DAILY_DEVICE_ROUND_ENABLED = (
-    os.getenv("DAILY_DEVICE_ROUND_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
 DAILY_DEVICE_ROUND_CHANNEL_ID = os.getenv("DAILY_DEVICE_ROUND_CHANNEL_ID", "").strip()
-DAILY_DEVICE_ROUND_HOUR_KST = int(os.getenv("DAILY_DEVICE_ROUND_HOUR_KST", "22"))
-DAILY_DEVICE_ROUND_MINUTE_KST = int(os.getenv("DAILY_DEVICE_ROUND_MINUTE_KST", "0"))
-DAILY_DEVICE_ROUND_END_HOUR_KST = int(os.getenv("DAILY_DEVICE_ROUND_END_HOUR_KST", "6"))
-DAILY_DEVICE_ROUND_END_MINUTE_KST = int(os.getenv("DAILY_DEVICE_ROUND_END_MINUTE_KST", "0"))
-DAILY_DEVICE_ROUND_POLL_INTERVAL_SEC = int(os.getenv("DAILY_DEVICE_ROUND_POLL_INTERVAL_SEC", "30"))
-DAILY_DEVICE_ROUND_STATE_PATH = os.getenv(
-    "DAILY_DEVICE_ROUND_STATE_PATH",
-    str(core_settings.PROJECT_ROOT / "data" / "daily_device_round_state.json"),
-).strip()
 _DAILY_DEVICE_ROUND_HOSPITAL_SCOPE = (
     os.getenv("DAILY_DEVICE_ROUND_HOSPITAL_SCOPE", "free_barcode").strip().lower().replace("-", "_")
 )
@@ -259,31 +249,6 @@ DAILY_DEVICE_ROUND_HOSPITAL_ORDER = (
     if _DAILY_DEVICE_ROUND_HOSPITAL_ORDER in {"recordings_month_desc", "recordings_month_asc", "hospital_seq_asc"}
     else "recordings_month_asc"
 )
-DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT = (
-    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
-DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX = (
-    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
-# 마미박스 업데이트는 병원 무료(핑크바코드)/유료 여부로 나눠 켠다. 기존 단일
-# 키는 scope가 무료병원뿐이던 시절 값이라 무료병원 기본값으로만 승계한다.
-DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE = (
-    os.getenv(
-        "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE",
-        os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX", "false"),
-    ).strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID = (
-    os.getenv("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID", "false").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-DAILY_DEVICE_ROUND_AUTO_POWER_OFF = (
-    os.getenv("DAILY_DEVICE_ROUND_AUTO_POWER_OFF", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
-DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN = (
-    os.getenv("DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
 DAILY_DEVICE_ROUND_TRASHCAN_PATH = os.getenv(
     "DAILY_DEVICE_ROUND_TRASHCAN_PATH",
     "/home/mommytalk/AppData/TrashCan",
@@ -294,19 +259,10 @@ DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT = int(
 DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS = int(
     os.getenv("DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS", "30")
 )
-# 상태 이전 호환을 위해 legacy key 이름은 유지하지만 실행 범위는 LED
-# 누락 선별과 LED 전용 SSH 재검증뿐이다.
-DEVICE_HEALTH_MONITOR_ENABLED = (
-    os.getenv("DEVICE_HEALTH_MONITOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
-DEVICE_HEALTH_MONITOR_ALERTS_ENABLED = (
-    os.getenv("DEVICE_HEALTH_MONITOR_ALERTS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-)
 DEVICE_HEALTH_MONITOR_CHANNEL_ID = os.getenv(
     "DEVICE_HEALTH_MONITOR_CHANNEL_ID",
     os.getenv("DAILY_DEVICE_ROUND_CHANNEL_ID", ""),
 ).strip()
-DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC = int(os.getenv("DEVICE_HEALTH_MONITOR_POLL_INTERVAL_SEC", "60"))
 DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS = int(
     os.getenv("DEVICE_HEALTH_MONITOR_ALERT_REMINDER_HOURS", "6")
 )
@@ -318,14 +274,6 @@ DEVICE_HEALTH_MONITOR_REDIS_STANDBY_STALE_SEC = int(
 DEVICE_HEALTH_MONITOR_DEVICE_CACHE_TTL_SEC = int(
     os.getenv("DEVICE_HEALTH_MONITOR_DEVICE_CACHE_TTL_SEC", "86400")
 )
-DEVICE_HEALTH_MONITOR_SSH_OPEN_WAIT_SEC = int(os.getenv("DEVICE_HEALTH_MONITOR_SSH_OPEN_WAIT_SEC", "15"))
-DEVICE_HEALTH_MONITOR_SSH_OPEN_POLL_INTERVAL_SEC = int(
-    os.getenv("DEVICE_HEALTH_MONITOR_SSH_OPEN_POLL_INTERVAL_SEC", "2")
-)
-DEVICE_HEALTH_MONITOR_STATE_PATH = os.getenv(
-    "DEVICE_HEALTH_MONITOR_STATE_PATH",
-    str(core_settings.PROJECT_ROOT / "data" / "device_health_monitor_state.json"),
-).strip()
 DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR = os.getenv(
     "DEVICE_HEALTH_MONITOR_EVENT_LOG_DIR",
     str(core_settings.PROJECT_ROOT / "data"),
@@ -344,17 +292,11 @@ DEVICE_HEALTH_MONITOR_EVENT_LOG_ARCHIVE_S3_PREFIX = os.getenv(
 DEVICE_HEALTH_MONITOR_UNAVAILABLE_EVENT_SUMMARY_HOURS = int(
     os.getenv("DEVICE_HEALTH_MONITOR_UNAVAILABLE_EVENT_SUMMARY_HOURS", "6")
 )
-# MDA가 영속화한 확정 장비 이벤트는 기존 상태 스냅샷 감시와 분리해 증분 처리한다.
-DEVICE_NOTIFICATION_ALERT_ENABLED = (
-    os.getenv("DEVICE_NOTIFICATION_ALERT_ENABLED", "false").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
+# MDA가 영속화한 확정 장비 이벤트의 Slack 대상은 기존 상태 스냅샷 감시와
+# 분리하되, 비어 있으면 같은 운영 채널을 사용한다.
 DEVICE_NOTIFICATION_ALERT_CHANNEL_ID = (
     os.getenv("DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", "").strip()
     or DEVICE_HEALTH_MONITOR_CHANNEL_ID
-)
-DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC = int(
-    os.getenv("DEVICE_NOTIFICATION_ALERT_POLL_INTERVAL_SEC", "30")
 )
 # 캡처보드 반복 이벤트는 Sheet 처리 상태와 분리된 incident로 묶고,
 # 마지막 이벤트 뒤 이 시간 동안만 같은 장애로 판단한다.
@@ -369,10 +311,6 @@ if not 60 <= DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC <= 86_400:
         "DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC must be "
         "between 60 and 86400"
     )
-DEVICE_NOTIFICATION_ALERT_STATE_PATH = os.getenv(
-    "DEVICE_NOTIFICATION_ALERT_STATE_PATH",
-    str(core_settings.PROJECT_ROOT / "data" / "device_notification_alert_state.json"),
-).strip()
 DEVICE_HEALTH_SHEET_ENABLED = (
     os.getenv("DEVICE_HEALTH_SHEET_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -388,26 +326,16 @@ DEVICE_HEALTH_SHEET_TAB_NAME = os.getenv(
 DEVICE_HEALTH_SHEET_TIMEOUT_SEC = int(
     os.getenv("DEVICE_HEALTH_SHEET_TIMEOUT_SEC", "10")
 )
-DEVICE_HEALTH_MONITOR_CONTACT_WEBHOOK_URL = os.getenv(
-    "DEVICE_HEALTH_MONITOR_CONTACT_WEBHOOK_URL",
-    "",
-).strip()
+# API readiness가 검증하는 canonical SMS webhook 키만 사용해
+# 설정과 실제 provider 실행 경계가 갈라지지 않게 한다.
 DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL = os.getenv(
     "DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL",
-    DEVICE_HEALTH_MONITOR_CONTACT_WEBHOOK_URL,
+    "",
 ).strip()
 DEVICE_HEALTH_MONITOR_SMS_PROVIDER = os.getenv(
     "DEVICE_HEALTH_MONITOR_SMS_PROVIDER",
     "webhook" if DEVICE_HEALTH_MONITOR_SMS_WEBHOOK_URL else "none",
 ).strip().lower()
-DEVICE_HEALTH_MONITOR_SMS_TEST_PHONE_NUMBER = os.getenv(
-    "DEVICE_HEALTH_MONITOR_SMS_TEST_PHONE_NUMBER",
-    "",
-).strip()
-DEVICE_HEALTH_MONITOR_VOICE_GUIDE_WEBHOOK_URL = os.getenv(
-    "DEVICE_HEALTH_MONITOR_VOICE_GUIDE_WEBHOOK_URL",
-    "",
-).strip()
 DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC = int(
     os.getenv("DEVICE_HEALTH_MONITOR_ACTION_WEBHOOK_TIMEOUT_SEC", "10")
 )
@@ -418,9 +346,6 @@ SOLAPI_API_KEY = os.getenv("SOLAPI_API_KEY", "").strip()
 SOLAPI_API_SECRET = os.getenv("SOLAPI_API_SECRET", "").strip()
 SOLAPI_FROM_NUMBER = os.getenv("SOLAPI_FROM_NUMBER", "").strip()
 SOLAPI_BASE_URL = os.getenv("SOLAPI_BASE_URL", "https://api.solapi.com").strip()
-SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC = int(
-    os.getenv("SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC", "30")
-)
 SOLAPI_DELIVERY_REPORT_MAX_AGE_HOURS = int(
     os.getenv("SOLAPI_DELIVERY_REPORT_MAX_AGE_HOURS", "48")
 )
@@ -446,7 +371,6 @@ S3_LOG_PATH_PATTERN = re.compile(
 )
 S3_LOG_FILE_TOKEN_PATTERN = re.compile(r"^log-(20\d{2}-\d{2}-\d{2})\.log$", re.IGNORECASE)
 S3_DEVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,}$")
-LOG_DATE_PATTERN = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 
 S3_LOG_RESERVED_TOKENS = {
     "s3",
@@ -491,14 +415,6 @@ SCANNED_TOKEN_PATTERN = re.compile(r"Scanned\s*:\s*([^\s]+)", re.IGNORECASE)
 LOG_LINE_TIME_PATTERN = re.compile(
     r"(?<!\d)(\d{1,2}:\d{2}:\d{2})(?:[.,]\d{1,6})?(?!\d)"
 )
-SCAN_CODE_LABELS: dict[str, str] = {
-    "C_STOPSESS": "녹화 중지",
-    "SPECIAL_RECORD_START_STOP": "녹화 시작/종료",
-    "C_PAUSE": "일시정지",
-    "C_RESUME": "재개",
-    "C_CCLREC": "녹화 취소",
-    "SPECIAL_TAKE_SNAP": "캡처/스냅샷",
-}
 SESSION_STOP_TOKENS = {"C_STOPSESS", "SPECIAL_RECORD_START_STOP"}
 
 VIDEO_HINT_TOKENS = ("영상", "비디오", "동영상", "recording")
@@ -506,7 +422,6 @@ VIDEO_COUNT_HINT_TOKENS = ("몇 개", "몇개", "개수", "갯수", "수", "coun
 
 LOG_ANALYSIS_MAX_DEVICES = int(os.getenv("LOG_ANALYSIS_MAX_DEVICES", "8"))
 LOG_ANALYSIS_MAX_SAMPLES = int(os.getenv("LOG_ANALYSIS_MAX_SAMPLES", "5"))
-LOG_SCAN_MAX_EVENTS = int(os.getenv("LOG_SCAN_MAX_EVENTS", "50"))
 LOG_SESSION_SAFETY_LINES = int(os.getenv("LOG_SESSION_SAFETY_LINES", "20"))
 LOG_POST_STOP_MAX_LINES = int(os.getenv("LOG_POST_STOP_MAX_LINES", "50"))
 LOG_PHASE1_MAX_DAYS = int(os.getenv("LOG_PHASE1_MAX_DAYS", "30"))
@@ -583,12 +498,3 @@ else:
         _FREEFORM_RESPONSE_RULES_PROMPT
         or _DEFAULT_FREEFORM_RESPONSE_RULES_PROMPT
     )
-
-FREEFORM_SYSTEM_PROMPT = "\n\n".join(
-    section
-    for section in (
-        FREEFORM_CORE_IDENTITY_PROMPT,
-        FREEFORM_RESPONSE_RULES_PROMPT,
-    )
-    if section
-).strip()

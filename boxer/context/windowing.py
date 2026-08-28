@@ -1,21 +1,6 @@
 from boxer.context.entries import ContextEntry
 
 
-def _trim_context_lines(lines: list[str], max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    kept: list[str] = []
-    total_chars = 0
-    for line in reversed(lines):
-        next_len = len(line) + (1 if kept else 0)
-        if total_chars + next_len > max_chars:
-            break
-        kept.append(line)
-        total_chars += next_len
-    kept.reverse()
-    return "\n".join(kept)
-
-
 def _limit_context_entries(
     entries: list[ContextEntry],
     max_entries: int,

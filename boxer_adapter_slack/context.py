@@ -4,7 +4,7 @@ from typing import Any
 from boxer.context.entries import ContextEntry
 from boxer.context.windowing import _limit_context_entries, _render_context_text
 from boxer.core import settings as s
-from boxer.core.utils import _safe_float
+from boxer_adapter_slack.utils import _safe_float
 
 
 def _normalize_slack_context_entries(

@@ -266,6 +266,7 @@ def test_settings_require_targets_only_for_slack_delivery_cycles() -> None:
             "DEVICE_HEALTH_MONITOR_ENABLED": "true",
             "DEVICE_HEALTH_MONITOR_CHANNEL_ID": "C123456",
             "SMS_DELIVERY_REPORTER_ENABLED": "true",
+            "SMS_DELIVERY_REPORTER_POLL_INTERVAL_SEC": "17",
         }
     )
 
@@ -274,6 +275,30 @@ def test_settings_require_targets_only_for_slack_delivery_cycles() -> None:
         "sms_delivery",
     )
     assert set(settings.delivery_targets) == {"device_health_monitor"}
+    assert settings.schedule.sms_delivery_interval == timedelta(seconds=17)
+
+    legacy_alias = load_automation_scheduler_settings(
+        {
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true",
+            "BOXER_COMPANY_API_AUTOMATION_TENANT_ID": "T1",
+            "BOXER_COMPANY_API_AUTOMATION_STATE_PATH": "/tmp/state.json",
+            "SMS_DELIVERY_REPORTER_ENABLED": "true",
+            "SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC": "19",
+        }
+    )
+    assert legacy_alias.schedule.sms_delivery_interval == timedelta(seconds=19)
+
+    new_key_wins = load_automation_scheduler_settings(
+        {
+            "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true",
+            "BOXER_COMPANY_API_AUTOMATION_TENANT_ID": "T1",
+            "BOXER_COMPANY_API_AUTOMATION_STATE_PATH": "/tmp/state.json",
+            "SMS_DELIVERY_REPORTER_ENABLED": "true",
+            "SMS_DELIVERY_REPORTER_POLL_INTERVAL_SEC": "23",
+            "SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC": "29",
+        }
+    )
+    assert new_key_wins.schedule.sms_delivery_interval == timedelta(seconds=23)
 
 
 @pytest.mark.parametrize(

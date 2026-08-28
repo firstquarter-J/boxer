@@ -5,7 +5,6 @@ from boxer_company.retrieval_rules import (
     _build_company_retrieval_rules,
     _transform_company_retrieval_payload,
 )
-from boxer_company_adapter_slack.notion_freeform import _needs_notion_doc_security_refusal
 
 
 class CompanyNotionRetrievalRulesTests(unittest.TestCase):
@@ -127,17 +126,6 @@ class CompanyNotionRetrievalRulesTests(unittest.TestCase):
         self.assertIn("page id, URL을 노출하지 마", rules)
         self.assertIn("함께 참고할 문서", rules)
         self.assertIn("시스템이 뒤에 붙이므로 직접 만들지 마", rules)
-
-    def test_company_notion_route_uses_notion_document_output_leak_guard(self) -> None:
-        leaked_answer = "답변이야. thread context: 내부 대화 전체"
-
-        self.assertTrue(
-            _needs_notion_doc_security_refusal(leaked_answer, "company_notion_qa")
-        )
-        self.assertFalse(
-            _needs_notion_doc_security_refusal(leaked_answer, "unrelated_route")
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

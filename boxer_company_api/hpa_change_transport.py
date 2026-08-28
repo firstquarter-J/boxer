@@ -20,11 +20,7 @@ HPA_CHANGE_SUBMIT_PATH = "/internal/v1/hpa-change/requests"
 HPA_CHANGE_LOOKUP_PATH = "/internal/v1/hpa-change/threads/lookup"
 HPA_CHANGE_DELIVERY_PULL_PATH = "/internal/v1/hpa-change/deliveries/pull"
 HPA_CHANGE_DELIVERY_ACK_PATH = "/internal/v1/hpa-change/deliveries/ack"
-_SLACK_TS_RE = re.compile(r"^[0-9]{1,20}(?:\.[0-9]{1,9})?$")
-_SLACK_CHANNEL_RE = re.compile(r"^[CDG][A-Z0-9]{5,30}$")
-_SLACK_USER_RE = re.compile(r"^[UW][A-Z0-9]{5,30}$")
 _TASK_ID_RE = re.compile(r"^hpa-[a-zA-Z0-9-]{8,100}$")
-_DELIVERY_ID_RE = re.compile(r"^hpa-delivery:[0-9a-f]{64}$")
 
 
 class _StrictInput(BaseModel):

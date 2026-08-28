@@ -44,6 +44,11 @@ check_absent \
   boxer/core .env.example
 
 check_absent \
+  "company query limits and barcode policy absent from public runtime" \
+  "DB_QUERY_MAX_RESULT_CHARS|S3_ULTRASOUND_BUCKET|S3_LOG_BUCKET|S3_QUERY_MAX_KEYS|S3_QUERY_MAX_ITEMS|S3_QUERY_MAX_RESULT_CHARS|S3_LOG_TAIL_BYTES|S3_LOG_TAIL_LINES|another barcode|barcode/service" \
+  boxer/core boxer/retrieval boxer_adapter_web .env.example
+
+check_absent \
   "korea-specific defaults absent from open core" \
   "Answer in Korean|Answer briefly in Korean|default=\"Asia/Seoul\"|or \"Asia/Seoul\"|ap-northeast-2" \
   boxer/core boxer/context boxer/observability boxer/retrieval

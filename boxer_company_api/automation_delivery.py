@@ -105,20 +105,10 @@ class AutomationDeliveryBroker:
         state_store: JsonAutomationCycleStateStore,
         coordinator: DurableAutomationCycleCoordinator,
         *,
-        enabled_cycles: frozenset[str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._state_store = state_store
         self._coordinator = coordinator
-        self._enabled_cycles = (
-            frozenset(enabled_cycles)
-            if enabled_cycles is not None
-            else _SUPPORTED_CYCLES
-        )
-        if not self._enabled_cycles.issubset(_SUPPORTED_CYCLES):
-            raise AutomationCycleContractError(
-                "automation delivery cycles are invalid"
-            )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def pull(
@@ -130,15 +120,13 @@ class AutomationDeliveryBroker:
         self._validate_pull_scope(tenant_id, cycle)
         candidates: list[tuple[str, AutomationDeliveryBatch]] = []
         with self._state_store.locked_snapshot() as snapshot:
-            for state in snapshot.document["cycles"].values():
+            for state_key, state in snapshot.document["cycles"].items():
                 if not isinstance(state, Mapping):
                     raise AutomationCycleContractError(
                         "automation delivery state is invalid"
                     )
-                batch = _batch_from_state(state)
+                batch = _batch_from_state(state, state_key=state_key)
                 if batch is None or batch.tenant_id != tenant_id:
-                    continue
-                if batch.cycle not in self._enabled_cycles:
                     continue
                 if cycle is not None and batch.cycle != cycle:
                     continue
@@ -183,15 +171,13 @@ class AutomationDeliveryBroker:
         target: AutomationDeliveryBatch | None = None
         duplicate_cycle: AutomationCycleName | None = None
         with self._state_store.locked_snapshot() as snapshot:
-            for state in snapshot.document["cycles"].values():
+            for state_key, state in snapshot.document["cycles"].items():
                 if not isinstance(state, Mapping):
                     raise AutomationCycleContractError(
                         "automation delivery state is invalid"
                     )
                 identity = _validated_identity(state.get("identity"))
                 if identity is None or identity[0] != tenant_id:
-                    continue
-                if identity[1] not in self._enabled_cycles:
                     continue
                 candidate_id = _build_batch_id(
                     tenant_id=identity[0],
@@ -201,7 +187,10 @@ class AutomationDeliveryBroker:
                 )
                 if candidate_id != batch_id:
                     continue
-                pending_batch = _batch_from_state(state)
+                pending_batch = _batch_from_state(
+                    state,
+                    state_key=state_key,
+                )
                 if pending_batch is not None:
                     pending_ids = {
                         delivery.delivery_id
@@ -267,10 +256,29 @@ class AutomationDeliveryBroker:
             raise AutomationCycleContractError(
                 "automation delivery tenant is invalid"
             )
-        if cycle is not None and cycle not in self._enabled_cycles:
+        # 실행 feature flag는 새 cycle admission만 제어한다. 이미 durable
+        # pending이 생긴 supported Slack cycle은 flag-off 재시작 뒤에도
+        # pull/ACK로 끝까지 drain할 수 있어야 한다.
+        if cycle is not None and cycle not in _SUPPORTED_CYCLES:
             raise AutomationCycleContractError(
                 "automation delivery cycle is invalid"
             )
+
+
+def validate_automation_delivery_state(
+    state_store: JsonAutomationCycleStateStore,
+) -> None:
+    """기존 pending이 transport에서 숨지 않도록 raw state를 무수정 검사한다."""
+
+    with state_store.locked_snapshot() as snapshot:
+        for state_key, state in snapshot.document["cycles"].items():
+            if not isinstance(state, Mapping):
+                raise AutomationCycleContractError(
+                    "automation delivery state is invalid"
+                )
+            # 빈 state와 ACK 완료 state는 transport metadata가 없어도 된다.
+            # non-empty pending만 새 API-owned exact 계약을 반드시 만족한다.
+            _batch_from_state(state, state_key=state_key)
 
 
 def serialize_automation_delivery_batch(
@@ -326,6 +334,8 @@ def serialize_automation_delivery_ack(
 
 def _batch_from_state(
     state: Mapping[str, Any],
+    *,
+    state_key: str | None = None,
 ) -> AutomationDeliveryBatch | None:
     raw_pending = state.get("pendingDeliveries")
     if raw_pending in (None, []):
@@ -337,11 +347,25 @@ def _batch_from_state(
     identity = _validated_identity(state.get("identity"))
     target = state.get("deliveryTarget")
     if identity is None or not isinstance(target, Mapping):
-        # 구 Slack-triggered state에는 transport 정본이 없다. 새 scheduler가
-        # 만든 identity/target 없는 payload를 추측해 외부로 내보내지 않는다.
-        return None
+        # 구 /cycles state를 조용히 숨기면 scheduler도 pending 때문에 skip해
+        # 영구 고립된다. 상태를 추측·수정하지 않고 startup/readiness를 닫는다.
+        raise AutomationCycleContractError(
+            "automation pending delivery metadata is missing"
+        )
+    if set(target) != {"channelId", "conversation"}:
+        raise AutomationCycleContractError(
+            "automation delivery target is invalid"
+        )
+    if state_key is not None and state_key != _build_state_key(
+        tenant_id=identity[0],
+        cycle=identity[1],
+        cycle_key=identity[2],
+    ):
+        raise AutomationCycleContractError(
+            "automation delivery identity does not match state"
+        )
     channel_id = str(target.get("channelId") or "").strip()
-    conversation = target.get("conversation") or {}
+    conversation = target.get("conversation")
     if (
         not _CHANNEL_ID_PATTERN.fullmatch(channel_id)
         or not isinstance(conversation, Mapping)
@@ -350,6 +374,11 @@ def _batch_from_state(
             "automation delivery target is invalid"
         )
     deliveries = tuple(_restore_delivery(item) for item in raw_pending)
+    delivery_ids = tuple(item.delivery_id for item in deliveries)
+    if len(delivery_ids) != len(set(delivery_ids)):
+        raise AutomationCycleContractError(
+            "automation pending deliveries are invalid"
+        )
     scheduled_text = str(
         state.get("pendingScheduledAt")
         or state.get("lastCompletedAt")
@@ -369,10 +398,10 @@ def _batch_from_state(
         tenant_id=identity[0],
         cycle=identity[1],
         cycle_key=identity[2],
-        delivery_ids=tuple(item.delivery_id for item in deliveries),
+        delivery_ids=delivery_ids,
     )
     stored_batch_id = str(state.get("pendingBatchId") or "").strip()
-    if stored_batch_id and stored_batch_id != batch_id:
+    if stored_batch_id != batch_id:
         raise AutomationCycleContractError(
             "automation delivery batch identity changed"
         )
@@ -393,13 +422,24 @@ def _validated_identity(
 ) -> tuple[str, AutomationCycleName, str] | None:
     if value is None:
         return None
-    if not isinstance(value, Mapping):
+    if not isinstance(value, Mapping) or set(value) != {
+        "tenantId",
+        "cycle",
+        "cycleKey",
+    }:
         raise AutomationCycleContractError(
             "automation delivery identity is invalid"
         )
-    tenant_id = str(value.get("tenantId") or "").strip()
-    cycle = str(value.get("cycle") or "").strip()
-    cycle_key = str(value.get("cycleKey") or "").strip()
+    if not all(
+        isinstance(value.get(key), str)
+        for key in ("tenantId", "cycle", "cycleKey")
+    ):
+        raise AutomationCycleContractError(
+            "automation delivery identity is invalid"
+        )
+    tenant_id = value["tenantId"].strip()
+    cycle = value["cycle"].strip()
+    cycle_key = value["cycleKey"].strip()
     if (
         not _IDENTIFIER_PATTERN.fullmatch(tenant_id)
         or cycle not in _SUPPORTED_CYCLES
@@ -441,6 +481,16 @@ def _build_batch_id(
     return f"batch:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
 
+def _build_state_key(
+    *,
+    tenant_id: str,
+    cycle: str,
+    cycle_key: str,
+) -> str:
+    raw = "\0".join((tenant_id, cycle, cycle_key))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 __all__ = [
     "AutomationDeliveryAckInput",
     "AutomationDeliveryBatch",
@@ -448,4 +498,5 @@ __all__ = [
     "AutomationDeliveryPullInput",
     "serialize_automation_delivery_ack",
     "serialize_automation_delivery_batch",
+    "validate_automation_delivery_state",
 ]

@@ -10,7 +10,7 @@ from boxer_company_adapter_slack.hpa_change_api_client import (
     HpaChangeApiClient,
     HpaChangeRemoteDelivery,
 )
-from boxer_company_adapter_slack.hpa_change_reporter import (
+from boxer_company_adapter_slack.hpa_change_renderer import (
     _format_hpa_change_poll_messages,
 )
 

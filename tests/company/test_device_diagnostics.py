@@ -1,43 +1,20 @@
-import logging
 import unittest
 from unittest.mock import patch
 
+from boxer_company.operation_routing import (
+    _extract_device_name_for_diagnostic_start,
+    _is_device_diagnostic_freeform_request,
+    _is_device_diagnostic_start_request,
+    _select_device_diagnostic_followup_command_keys,
+)
+from boxer_company.routers import device_diagnostics as diagnostics_runtime
 from boxer_company.routers.device_diagnostics import (
     _build_device_diagnostic_followup_evidence,
     _build_device_diagnostic_followup_fallback,
     _collect_device_diagnostic_snapshot,
-    _clear_device_diagnostic_snapshots,
-    _extract_device_name_for_diagnostic_start,
-    _is_device_diagnostic_freeform_request,
-    _is_device_diagnostic_start_request,
     _load_device_diagnostic_snapshot,
     _save_device_diagnostic_snapshot,
-    _select_device_diagnostic_followup_command_keys,
 )
-from boxer_company_adapter_slack.device_routes import (
-    DeviceRoutesContext,
-    DeviceRoutesDeps,
-    _handle_device_routes,
-)
-from boxer_company_adapter_slack.knowledge_routes import (
-    KnowledgeRoutesContext,
-    KnowledgeRoutesDeps,
-    _handle_knowledge_routes,
-)
-
-
-def _payload() -> dict[str, object]:
-    return {
-        "text": "핑",
-        "question": "핑",
-        "user_id": "U123",
-        "workspace_id": "W123",
-        "channel_id": "C123",
-        "current_ts": "1.1",
-        "thread_ts": "1.0",
-    }
-
-
 def _diagnostic_snapshot() -> dict[str, object]:
     return {
         "route": "device_diagnostic_snapshot",
@@ -93,10 +70,14 @@ def _diagnostic_snapshot() -> dict[str, object]:
 
 class DeviceDiagnosticRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
-        _clear_device_diagnostic_snapshots()
-
-    def tearDown(self) -> None:
-        _clear_device_diagnostic_snapshots()
+        # 프로덕션에 테스트 전용 reset API를 두지 않고 process-local state를
+        # patcher가 각 테스트 전후로 격리·복원한다.
+        snapshots = patch.dict(
+            diagnostics_runtime._DEVICE_DIAGNOSTIC_SNAPSHOTS,
+            clear=True,
+        )
+        snapshots.start()
+        self.addCleanup(snapshots.stop)
 
     def test_extracts_device_name_for_diagnostic_start(self) -> None:
         self.assertEqual(
@@ -111,82 +92,6 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
         self.assertTrue(_is_device_diagnostic_freeform_request("MB2-C00419 앱 로그 보고 원인 찾아줘"))
         self.assertFalse(_is_device_diagnostic_freeform_request("MB2-C00419 장비 상태"))
         self.assertFalse(_is_device_diagnostic_freeform_request("장비가 왜 꺼졌어?"))
-
-    def test_device_route_starts_diagnostic_snapshot(self) -> None:
-        replies: list[str] = []
-        deps = DeviceRoutesDeps(
-            get_s3_client=lambda: None,
-            get_recordings_context=lambda: {},
-            has_recordings_device_mapping=lambda context: False,
-            send_dm_message=lambda user_id, text: False,
-            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
-        )
-
-        with (
-            patch(
-                "boxer_company_adapter_slack.device_routes._is_device_runtime_configured",
-                return_value=True,
-            ),
-            patch(
-                "boxer_company_adapter_slack.device_routes._start_device_diagnostic_snapshot",
-                return_value=("*장비 진단 스냅샷*\n• 장비: `MB2-C00419`", _diagnostic_snapshot()),
-            ) as start_snapshot,
-        ):
-            handled = _handle_device_routes(
-                DeviceRoutesContext(
-                    question="MB2-C00419 진단 시작",
-                    barcode=None,
-                    phase2_hospital_name=None,
-                    phase2_room_name=None,
-                    payload=_payload(),  # type: ignore[arg-type]
-                    user_id="U123",
-                    workspace_id="W123",
-                    channel_id="C123",
-                    thread_ts="1.0",
-                    reply=lambda text, **kwargs: replies.append(text),
-                    client=None,
-                    logger=logging.getLogger(__name__),
-                ),
-                deps,
-            )
-
-        self.assertTrue(handled)
-        self.assertEqual(replies, ["*장비 진단 스냅샷*\n• 장비: `MB2-C00419`"])
-        self.assertEqual(start_snapshot.call_args.kwargs["device_name"], "MB2-C00419")
-        self.assertEqual(start_snapshot.call_args.kwargs["thread_ts"], "1.0")
-
-    def test_device_route_requires_device_name_for_diagnostic_start(self) -> None:
-        replies: list[str] = []
-        deps = DeviceRoutesDeps(
-            get_s3_client=lambda: None,
-            get_recordings_context=lambda: {},
-            has_recordings_device_mapping=lambda context: False,
-            send_dm_message=lambda user_id, text: False,
-            build_dependency_failure_reply=lambda action, exc: f"{action}: {type(exc).__name__}",
-            reply_with_retrieval_synthesis=lambda *args, **kwargs: None,
-        )
-
-        handled = _handle_device_routes(
-            DeviceRoutesContext(
-                question="진단 시작",
-                barcode=None,
-                phase2_hospital_name=None,
-                phase2_room_name=None,
-                payload=_payload(),  # type: ignore[arg-type]
-                user_id="U123",
-                workspace_id="W123",
-                channel_id="C123",
-                thread_ts="1.0",
-                reply=lambda text, **kwargs: replies.append(text),
-                client=None,
-                logger=logging.getLogger(__name__),
-            ),
-            deps,
-        )
-
-        self.assertTrue(handled)
-        self.assertEqual(replies, ["진단 시작은 장비명이 필요해. 예: `MB2-C00419 진단 시작`"])
 
     def test_saves_and_loads_snapshot_by_thread(self) -> None:
         snapshot = _diagnostic_snapshot()
@@ -253,69 +158,6 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
         self.assertFalse(snapshot["mode"]["mdaPingSent"])  # type: ignore[index]
         self.assertTrue(snapshot["mode"]["sshOpenSent"])  # type: ignore[index]
         self.assertFalse(snapshot["mode"]["mutatingCommandsSent"])  # type: ignore[index]
-
-    def test_knowledge_route_uses_thread_diagnostic_snapshot_before_freeform(self) -> None:
-        synth_calls: list[tuple[str, dict[str, object], str, int | None]] = []
-        _save_device_diagnostic_snapshot(
-            workspace_id="W123",
-            channel_id="C123",
-            thread_ts="1.0",
-            snapshot=_diagnostic_snapshot(),  # type: ignore[arg-type]
-        )
-
-        diagnostic_evidence = _diagnostic_snapshot()
-        diagnostic_evidence["followupLiveCheck"] = {
-            "performed": True,
-            "commandKeys": ["pm2_jlist", "pm2_logs_box"],
-            "capturedAt": "2026-06-17T10:01:00+09:00",
-            "ssh": {"ready": True, "reason": "ready"},
-            "summary": diagnostic_evidence["summary"],
-        }
-
-        with patch(
-            "boxer_company_adapter_slack.knowledge_routes._build_device_diagnostic_followup_evidence",
-            return_value=diagnostic_evidence,
-        ) as build_evidence:
-            handled = _handle_knowledge_routes(
-                KnowledgeRoutesContext(
-                    question="왜 반복 재시작해?",
-                    barcode=None,
-                    user_id="U123",
-                    payload=_payload(),  # type: ignore[arg-type]
-                    thread_ts="1.0",
-                    channel_id="C123",
-                    current_ts="1.1",
-                    reply=lambda *args, **kwargs: None,
-                    logger=logging.getLogger(__name__),
-                    client=None,
-                    claude_client=None,
-                ),
-                KnowledgeRoutesDeps(
-                    reply_with_retrieval_synthesis=lambda fallback_text, evidence_payload, route_name, **kwargs: synth_calls.append(
-                        (fallback_text, evidence_payload, route_name, kwargs.get("max_tokens"))
-                    ),
-                    timeout_reply_text=lambda: "timeout",
-                    llm_unavailable_reply_text=lambda summary=None: "down",
-                    is_timeout_error=lambda exc: False,
-                    build_barcode_fallback_evidence=lambda: None,
-                ),
-            )
-
-        self.assertTrue(handled)
-        # Slack local rollback은 이전과 같이 helper 기본값을 사용해
-        # 필요하면 기존 SSH-open 재전송 흐름까지 그대로 유지한다.
-        build_evidence.assert_called_once()
-        self.assertEqual(
-            build_evidence.call_args.args[0],
-            "왜 반복 재시작해?",
-        )
-        self.assertEqual(build_evidence.call_args.kwargs, {})
-        self.assertEqual(len(synth_calls), 1)
-        self.assertEqual(synth_calls[0][2], "device diagnostic followup")
-        self.assertEqual(synth_calls[0][3], 500)
-        self.assertIn("재시작 7회", synth_calls[0][0])
-        self.assertEqual(synth_calls[0][1]["route"], "device_diagnostic_snapshot")
-        self.assertTrue(synth_calls[0][1]["followupLiveCheck"]["performed"])  # type: ignore[index]
 
     def test_followup_live_evidence_opens_ssh_and_runs_read_only_commands(self) -> None:
         class FakeClient:
@@ -385,62 +227,6 @@ class DeviceDiagnosticRoutingTests(unittest.TestCase):
 
     def test_followup_command_selection_skips_live_for_plain_metadata_question(self) -> None:
         self.assertEqual(_select_device_diagnostic_followup_command_keys("이 장비 어느 병원이야?"), [])
-
-    def test_knowledge_route_auto_starts_device_diagnostic_for_freeform_device_question(self) -> None:
-        synth_calls: list[tuple[str, dict[str, object], str, int | None]] = []
-        evidence = _diagnostic_snapshot()
-        evidence["route"] = "device_diagnostic_freeform"
-        evidence["followupLiveCheck"] = {
-            "performed": True,
-            "commandKeys": ["pm2_jlist", "system_journal_recent"],
-            "capturedAt": "2026-06-17T10:02:00+09:00",
-            "ssh": {"ready": True, "reason": "ready"},
-            "summary": evidence["summary"],
-        }
-
-        with (
-            patch("boxer_company_adapter_slack.knowledge_routes._load_slack_thread_context", return_value=""),
-            patch(
-                "boxer_company_adapter_slack.knowledge_routes._is_device_diagnostic_runtime_configured",
-                return_value=True,
-            ),
-            patch(
-                "boxer_company_adapter_slack.knowledge_routes._start_device_diagnostic_freeform_analysis",
-                return_value=("*장비 진단 답변*\n• 추가 조사: 장비 직접 접속", evidence),
-            ) as start_freeform,
-        ):
-            handled = _handle_knowledge_routes(
-                KnowledgeRoutesContext(
-                    question="MB2-C00419 왜 녹화 중간에 꺼졌어?",
-                    barcode=None,
-                    user_id="U123",
-                    payload=_payload(),  # type: ignore[arg-type]
-                    thread_ts="1.0",
-                    channel_id="C123",
-                    current_ts="1.1",
-                    reply=lambda *args, **kwargs: None,
-                    logger=logging.getLogger(__name__),
-                    client=None,
-                    claude_client=None,
-                ),
-                KnowledgeRoutesDeps(
-                    reply_with_retrieval_synthesis=lambda fallback_text, evidence_payload, route_name, **kwargs: synth_calls.append(
-                        (fallback_text, evidence_payload, route_name, kwargs.get("max_tokens"))
-                    ),
-                    timeout_reply_text=lambda: "timeout",
-                    llm_unavailable_reply_text=lambda summary=None: "down",
-                    is_timeout_error=lambda exc: False,
-                    build_barcode_fallback_evidence=lambda: None,
-                ),
-            )
-
-        self.assertTrue(handled)
-        start_freeform.assert_called_once()
-        self.assertEqual(start_freeform.call_args.kwargs["device_name"], "MB2-C00419")
-        self.assertEqual(len(synth_calls), 1)
-        self.assertEqual(synth_calls[0][2], "device diagnostic freeform")
-        self.assertEqual(synth_calls[0][3], 500)
-        self.assertEqual(synth_calls[0][1]["route"], "device_diagnostic_freeform")
 
     def test_followup_fallback_reports_ssh_not_ready(self) -> None:
         snapshot = _diagnostic_snapshot()

@@ -5,8 +5,9 @@ from typing import Any, Callable, Protocol, TypedDict
 from slack_bolt import App
 
 from boxer.core import settings as s
-from boxer.core.utils import _extract_question, _format_reply_text, _validate_tokens
+from boxer.core.utils import _validate_tokens
 from boxer_adapter_slack import settings as ss
+from boxer_adapter_slack.utils import _extract_question, _format_reply_text
 from boxer.observability.request_log import (
     _initialize_request_log_storage,
     _save_request_log_record,
@@ -104,13 +105,9 @@ def _ensure_request_log_context(
     context = payload.get("request_log")
     if isinstance(context, dict):
         return context
-    legacy_context = payload.get("request_audit")
-    if isinstance(legacy_context, dict):
-        payload["request_log"] = legacy_context
-        return legacy_context
+    # Slack adapter의 요청 관측값은 request_log 하나만 소유한다.
     context = {}
     payload["request_log"] = context
-    payload["request_audit"] = context
     return context
 
 
@@ -608,13 +605,3 @@ __all__ = [
     "set_request_log_skip_persist",
     "set_request_log_status",
 ]
-
-
-SlackRequestAuditContext = SlackRequestLogContext
-_ensure_request_audit_context = _ensure_request_log_context
-_set_request_audit_route = _set_request_log_route
-_set_request_audit_status = _set_request_log_status
-_set_request_audit_skip_persist = _set_request_log_skip_persist
-_merge_request_audit_metadata = _merge_request_log_metadata
-_mark_request_audit_reply = _mark_request_log_reply
-_persist_request_audit = _persist_request_log
