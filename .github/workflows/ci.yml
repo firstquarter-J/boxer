@@ -278,6 +278,7 @@ jobs:
         run: |
           # State/recovery tests intentionally reject world-writable /tmp parents.
           protected_tmp_root="$(mktemp -d "${HOME}/boxer-company-tests.XXXXXX")"
-          python -m pytest -q \
+          # tempfile.TemporaryDirectory도 보호 경로를 쓰게 해 Linux의 /tmp를 우회한다.
+          TMPDIR="${protected_tmp_root}" python -m pytest -q \
             --basetemp="${protected_tmp_root}/pytest" \
             tests/company
