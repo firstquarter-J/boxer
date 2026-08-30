@@ -126,6 +126,7 @@ def _health_delivery(index: int = 1) -> AutomationDelivery:
                 "issue": "LED 이상",
                 "telephone": "031-123-4567",
                 "deviceAlertPhone": "010-1234-5678",
+                "smsMessage": "렌더러로 전달하면 안 되는 자동문자 본문",
                 "alertCategory": "led",
                 "problemComponents": ["LED"],
             }
@@ -367,6 +368,7 @@ def test_health_transport_aggregates_api_deliveries_into_one_slack_message() -> 
     # API delivery의 표시용 연락처가 Slack renderer 앞에서 유실되지 않는다.
     assert device_results[0]["telephone"] == "031-123-4567"
     assert device_results[0]["deviceAlertPhone"] == "010-1234-5678"
+    assert "smsMessage" not in device_results[0]
     assert len(remember.call_args.kwargs["deliveries"]) == 2
     assert remember.call_args.kwargs["batch"] is batch
 

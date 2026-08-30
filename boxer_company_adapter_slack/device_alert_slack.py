@@ -331,8 +331,38 @@ def _alert_action_value(item: Mapping[str, Any]) -> str:
     value = json.dumps(target, ensure_ascii=False, separators=(",", ":"))
     if len(value) <= 1900:
         return value
-    target["issue"] = _text(target.get("issue"), "")[:300]
-    return json.dumps(target, ensure_ascii=False, separators=(",", ":"))[:1900]
+
+    # Slack button value 제한을 넘으면 API action에 필요한 식별 필드는
+    # 유지하고 표시 문자열만 상한 안에서 줄여 항상 유효한 JSON을 보낸다.
+    compact_target = {
+        "hospitalSeq": target["hospitalSeq"],
+        "hospitalName": _text(target.get("hospitalName"), "")[:120],
+        "hospital": _text(target.get("hospital"), "")[:180],
+        "room": _text(target.get("room"), "")[:100],
+        "device": _text(target.get("device"), "")[:100],
+        "issue": _text(target.get("issue"), "")[:300],
+        "alertCategory": _text(target.get("alertCategory"), "")[:80],
+        "problemComponents": [
+            _text(component, "")[:60]
+            for component in (
+                target.get("problemComponents")
+                if isinstance(target.get("problemComponents"), list)
+                else []
+            )[:8]
+            if _text(component, "")
+        ],
+        # 긴 URL은 action 실행에 필수가 아니고 중간 절단하면 오히려
+        # 잘못된 링크가 되므로 축약 payload에서는 제거한다.
+        "mdaUrl": "",
+    }
+    compact_value = json.dumps(
+        compact_target,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(compact_value) > 1900:
+        raise RuntimeError("장비 이상 알림 action payload가 너무 커")
+    return compact_value
 
 
 def attach_device_alert_actions(

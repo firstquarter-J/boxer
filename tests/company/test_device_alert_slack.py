@@ -154,6 +154,36 @@ def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
     ]
 
 
+def test_renderer_keeps_oversized_action_value_as_valid_json() -> None:
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1723000000.000001"}
+    client.chat_getPermalink.return_value = {"permalink": ""}
+    item = {
+        **_item(),
+        "issue": "장비 오류 " * 1_000,
+        "problemComponents": [f"문제 장치 {index} " * 20 for index in range(20)],
+        "mdaUrl": "https://mda.example.com/" + ("path" * 1_000),
+    }
+
+    alert.post_device_alert_summary(
+        client,
+        {"deviceResults": [item]},
+        channel_id="C123456",
+        logger=logging.getLogger("test.alert.large-action"),
+        include_actions=True,
+        include_device_voice_action=False,
+        client_msg_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    # 길이 제한을 맞추더라도 버튼 value는 자르지 않은 JSON이어야 한다.
+    action_block = client.chat_postMessage.call_args.kwargs["blocks"][-1]
+    value = action_block["elements"][0]["value"]
+    parsed = json.loads(value)
+    assert len(value) <= 1900
+    assert parsed["device"] == "MB2-TEST1"
+    assert parsed["mdaUrl"] == ""
+
+
 def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
     app = _App()
     bridge = Mock()
