@@ -16,7 +16,9 @@ from boxer_company_adapter_slack.automation_reporter import (
     build_automation_delivery_client_msg_id,
     build_automation_request_id,
     flush_automation_deliveries,
+    load_automation_thread_receipt,
     remember_automation_delivery,
+    remember_automation_thread_receipt,
 )
 
 
@@ -182,23 +184,37 @@ def _run_daily_device_round_transport(
         _validate_daily_device_round_transport_batch(batch)
     )
     delivery = batch.deliveries[0]
-    # title도 같은 client_msg_id로 매 replay마다 요청한다. 별도 domain state
-    # 파일 없이 Slack dedupe 응답의 thread ts를 transport 정본으로 쓴다.
-    title_response = client.chat_postMessage(
-        channel=batch.channel_id,
-        text=_build_daily_device_round_window_title_text(render_now),
-        unfurl_links=False,
-        unfurl_media=False,
-        client_msg_id=build_automation_delivery_client_msg_id(
+    thread_ts = load_automation_thread_receipt(
+        cycle=batch.cycle,
+        cycle_key=batch.cycle_key,
+        channel_id=batch.channel_id,
+    )
+    if not thread_ts:
+        # API는 병원별 batch를 순차 발행하므로 window root를 transport
+        # receipt로 먼저 보존하고 이후 병원 결과를 같은 thread에 누적한다.
+        title_response = client.chat_postMessage(
+            channel=batch.channel_id,
+            text=_build_daily_device_round_window_title_text(render_now),
+            unfurl_links=False,
+            unfurl_media=False,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle=batch.cycle,
+                cycle_key=batch.cycle_key,
+                delivery_id=(
+                    f"daily_device_round:{window_key}:thread"
+                ),
+                part="title",
+            ),
+        )
+        thread_ts = _extract_daily_device_round_thread_ts(title_response)
+        if not thread_ts:
+            raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+        remember_automation_thread_receipt(
             cycle=batch.cycle,
             cycle_key=batch.cycle_key,
-            delivery_id=delivery.delivery_id,
-            part="title",
-        ),
-    )
-    thread_ts = _extract_daily_device_round_thread_ts(title_response)
-    if not thread_ts:
-        raise RuntimeError("일일 장비 순회 제목 메시지 ts를 받지 못했어")
+            channel_id=batch.channel_id,
+            root_message_id=thread_ts,
+        )
 
     message_text = _build_daily_device_round_report_text(report_summary)
     block_chunks = _split_daily_device_round_blocks(

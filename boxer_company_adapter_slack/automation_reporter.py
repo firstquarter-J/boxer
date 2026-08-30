@@ -31,6 +31,8 @@ _STATE_VERSION = 1
 _IDENTIFIER_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
 )
+_SLACK_CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
+_SLACK_MESSAGE_ID_PATTERN = re.compile(r"^[0-9]{1,20}\.[0-9]{1,20}$")
 _STATE_LOCK = threading.RLock()
 _DELIVERY_MESSAGE_NAMESPACE = UUID("1fd6588a-f7fb-53cf-9216-463095231edd")
 
@@ -103,12 +105,16 @@ def load_automation_delivery_journal(
             return None
         cycle_key = str(cycle_state.get("cycleKey") or "").strip()
         raw_receipts = cycle_state.get("receipts") or []
-        if not raw_receipts:
+        thread_metadata = _thread_receipt_metadata_from_state(cycle_state)
+        if not raw_receipts and not thread_metadata:
             return None
         if not _IDENTIFIER_PATTERN.fullmatch(cycle_key):
             raise CompanyApiContractError(
                 "company_api_automation_delivery_state_invalid"
             )
+        if not raw_receipts:
+            # thread root만 남은 정상 상태는 ACK할 delivery journal이 아니다.
+            return None
         deliveries = tuple(
             _deserialize_delivery(item)
             for item in raw_receipts
@@ -185,6 +191,112 @@ def build_automation_delivery_client_msg_id(
     return str(uuid5(_DELIVERY_MESSAGE_NAMESPACE, raw))
 
 
+def load_automation_thread_receipt(
+    *,
+    cycle: str,
+    cycle_key: str,
+    channel_id: str,
+    state_path: str | Path | None = None,
+) -> str | None:
+    """같은 scheduler window에 이미 만든 Slack root ts를 읽는다."""
+
+    _validate_cycle_identity(cycle, cycle_key)
+    _validate_slack_thread_identity(channel_id=channel_id)
+    path = _delivery_state_path(state_path)
+    with _STATE_LOCK:
+        document = _load_document(path)
+        cycle_state = document["cycles"].get(cycle)
+        if not isinstance(cycle_state, dict):
+            return None
+        metadata = _thread_receipt_metadata_from_state(cycle_state)
+        if not metadata:
+            return None
+        receipt = metadata["threadReceipt"]
+        if (
+            receipt["cycleKey"] != cycle_key
+            or receipt["channelId"] != channel_id
+        ):
+            raw_receipts = cycle_state.get("receipts") or []
+            if not isinstance(raw_receipts, list) or any(
+                not isinstance(item, dict) for item in raw_receipts
+            ):
+                raise CompanyApiContractError(
+                    "company_api_automation_delivery_state_invalid"
+                )
+            if raw_receipts:
+                # 이전 root에 아직 미ACK 결과가 있으면 새 root를 만들기
+                # 전에 중단해 orphan Slack 메시지를 남기지 않는다.
+                raise CompanyApiContractError(
+                    "company_api_automation_delivery_state_conflict"
+                )
+            return None
+        return str(receipt["rootMessageId"])
+
+
+def remember_automation_thread_receipt(
+    *,
+    cycle: str,
+    cycle_key: str,
+    channel_id: str,
+    root_message_id: str,
+    state_path: str | Path | None = None,
+) -> None:
+    """도메인 payload 없이 scheduler window의 Slack root만 저장한다."""
+
+    _validate_cycle_identity(cycle, cycle_key)
+    _validate_slack_thread_identity(
+        channel_id=channel_id,
+        root_message_id=root_message_id,
+    )
+    path = _delivery_state_path(state_path)
+    with _STATE_LOCK:
+        document = _load_document(path)
+        cycles = dict(document["cycles"])
+        raw_cycle = cycles.get(cycle)
+        cycle_state = dict(raw_cycle) if isinstance(raw_cycle, dict) else {}
+        existing_metadata = _thread_receipt_metadata_from_state(cycle_state)
+        existing = existing_metadata.get("threadReceipt")
+        requested = {
+            "cycleKey": cycle_key,
+            "channelId": channel_id,
+            "rootMessageId": root_message_id,
+        }
+        raw_receipts = cycle_state.get("receipts") or []
+        if not isinstance(raw_receipts, list) or any(
+            not isinstance(item, dict) for item in raw_receipts
+        ):
+            raise CompanyApiContractError(
+                "company_api_automation_delivery_state_invalid"
+            )
+        if existing == requested:
+            return
+        if (
+            isinstance(existing, dict)
+            and existing.get("cycleKey") == cycle_key
+            and existing.get("channelId") == channel_id
+        ):
+            # 같은 window/channel에 서로 다른 root가 관측되면 어느 쪽도
+            # 자동 선택하지 않고 분리 스레드 생성을 fail-closed한다.
+            raise CompanyApiContractError(
+                "company_api_automation_delivery_state_conflict"
+            )
+        if raw_receipts:
+            # 아직 ACK하지 않은 Slack delivery가 있으면 그 root를 새
+            # window나 channel 상태로 덮지 않는다.
+            raise CompanyApiContractError(
+                "company_api_automation_delivery_state_conflict"
+            )
+
+        # receipt가 없는 완료 상태만 교체할 수 있으므로 과거 window의
+        # batch metadata는 버리고 새 transport 위치만 남긴다.
+        cycles[cycle] = {
+            "cycleKey": cycle_key,
+            "receipts": [],
+            "threadReceipt": requested,
+        }
+        _write_document(path, {"version": _STATE_VERSION, "cycles": cycles})
+
+
 def remember_automation_delivery(
     *,
     cycle: str,
@@ -231,6 +343,16 @@ def remember_automation_delivery(
             raise CompanyApiContractError(
                 "company_api_automation_delivery_state_conflict"
             )
+        existing_thread_metadata = _thread_receipt_metadata_from_state(
+            cycle_state
+        )
+        thread_metadata = (
+            existing_thread_metadata
+            if not existing_thread_metadata
+            or existing_thread_metadata["threadReceipt"]["cycleKey"]
+            == cycle_key
+            else {}
+        )
         serialized = _serialize_delivery(delivery)
         by_id = {
             str(item.get("deliveryId") or ""): item
@@ -246,6 +368,7 @@ def remember_automation_delivery(
         cycles[cycle] = {
             "cycleKey": cycle_key,
             "receipts": list(by_id.values()),
+            **thread_metadata,
             **batch_metadata,
         }
         _write_document(path, {"version": _STATE_VERSION, "cycles": cycles})
@@ -304,6 +427,16 @@ def remember_automation_deliveries(
             raise CompanyApiContractError(
                 "company_api_automation_delivery_state_conflict"
             )
+        existing_thread_metadata = _thread_receipt_metadata_from_state(
+            cycle_state
+        )
+        thread_metadata = (
+            existing_thread_metadata
+            if not existing_thread_metadata
+            or existing_thread_metadata["threadReceipt"]["cycleKey"]
+            == cycle_key
+            else {}
+        )
         by_id = {
             str(item.get("deliveryId") or ""): item
             for item in receipts
@@ -320,6 +453,7 @@ def remember_automation_deliveries(
         cycles[cycle] = {
             "cycleKey": cycle_key,
             "receipts": list(by_id.values()),
+            **thread_metadata,
             **batch_metadata,
         }
         # 집계 메시지 성공 후 일부 receipt만 남는 crash window가
@@ -353,6 +487,7 @@ def flush_automation_deliveries(
             raise CompanyApiContractError(
                 "company_api_automation_delivery_state_invalid"
             )
+        _thread_receipt_metadata_from_state(cycle_state)
         deliveries = tuple(
             _deserialize_delivery(item)
             for item in raw_receipts
@@ -427,9 +562,11 @@ def flush_automation_deliveries(
             for item in latest_receipts
             if str(item.get("deliveryId") or "") not in acknowledged_ids
         ]
+        thread_metadata = _thread_receipt_metadata_from_state(latest_state)
         cycles[cycle] = {
             "cycleKey": stored_cycle_key,
             "receipts": remaining,
+            **thread_metadata,
         }
         _write_document(path, {"version": _STATE_VERSION, "cycles": cycles})
     (logger or logging.getLogger(__name__)).info(
@@ -482,6 +619,55 @@ def _resolve_batch_metadata(
         "batchId": effective.batch_id,
         "tenantId": effective.tenant_id,
         "deliveryIds": list(effective.delivery_ids),
+    }
+
+
+def _thread_receipt_metadata_from_state(
+    cycle_state: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    """optional Slack thread receipt를 검증하고 보존 가능한 형태로 만든다."""
+
+    raw = cycle_state.get("threadReceipt")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) != {
+        "cycleKey",
+        "channelId",
+        "rootMessageId",
+    }:
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_state_invalid"
+        )
+    cycle_key = str(raw.get("cycleKey") or "").strip()
+    channel_id = str(raw.get("channelId") or "").strip()
+    root_message_id = str(raw.get("rootMessageId") or "").strip()
+    if not _IDENTIFIER_PATTERN.fullmatch(cycle_key):
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_state_invalid"
+        )
+    try:
+        _validate_slack_thread_identity(
+            channel_id=channel_id,
+            root_message_id=root_message_id,
+        )
+    except CompanyApiContractError as exc:
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_state_invalid"
+        ) from exc
+    stored_cycle_key = str(cycle_state.get("cycleKey") or "").strip()
+    if (
+        not _IDENTIFIER_PATTERN.fullmatch(stored_cycle_key)
+        or stored_cycle_key != cycle_key
+    ):
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_state_invalid"
+        )
+    return {
+        "threadReceipt": {
+            "cycleKey": cycle_key,
+            "channelId": channel_id,
+            "rootMessageId": root_message_id,
+        }
     }
 
 
@@ -637,6 +823,22 @@ def _validate_cycle_identity(cycle: str, cycle_key: str) -> None:
         )
 
 
+def _validate_slack_thread_identity(
+    *,
+    channel_id: str,
+    root_message_id: str | None = None,
+) -> None:
+    if not _SLACK_CHANNEL_ID_PATTERN.fullmatch(str(channel_id or "")) or (
+        root_message_id is not None
+        and not _SLACK_MESSAGE_ID_PATTERN.fullmatch(
+            str(root_message_id or "")
+        )
+    ):
+        raise CompanyApiContractError(
+            "company_api_automation_delivery_identity_invalid"
+        )
+
+
 def _validate_delivery(delivery: AutomationSlackDelivery) -> None:
     parsed_permalink = (
         urlsplit(delivery.permalink) if delivery.permalink else None
@@ -702,5 +904,8 @@ __all__ = [
     "build_automation_delivery_client_msg_id",
     "flush_automation_deliveries",
     "load_automation_delivery_journal",
+    "load_automation_thread_receipt",
     "remember_automation_delivery",
+    "remember_automation_deliveries",
+    "remember_automation_thread_receipt",
 ]

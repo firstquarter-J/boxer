@@ -87,6 +87,73 @@ def test_renderer_honors_api_voice_action_hint() -> None:
     assert alert.DEVICE_HEALTH_ALERT_ACTION_MARK_DONE in action_ids
 
 
+def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1723000000.000001"}
+    client.chat_getPermalink.return_value = {"permalink": ""}
+    item = {
+        **_item(),
+        "telephone": "031-123-4567",
+        "deviceAlertPhone": "010-1234-5678",
+        "mdaUrl": "https://mda.example.com/monitoring?device=MB2-TEST1",
+    }
+
+    alert.post_device_alert_summary(
+        client,
+        {"deviceResults": [item]},
+        channel_id="C123456",
+        logger=logging.getLogger("test.alert.rich-card"),
+        include_actions=True,
+        include_device_voice_action=False,
+        client_msg_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    # API 경계 뒤에도 기존 카드의 2열 정보 구조를 exact하게 고정한다.
+    message = client.chat_postMessage.call_args.kwargs
+    assert message["text"] == "\n".join(
+        (
+            ":alert: *LED 연결 확인 필요*",
+            "*#1 테스트병원*",
+            (
+                "⚙️ *장비*  "
+                "*<https://mda.example.com/monitoring?device=MB2-TEST1|MB2-TEST1>*"
+                "  ·  🚪 *병실*  `1진료실`"
+            ),
+            "",
+            ":rotating_light: *문제 장치*\n`LED`",
+            "🔎 *감지 내용*\n`LED 이상`",
+            "",
+            "📞 *전화*\n031-123-4567",
+            "💬 *문자*\n010-1234-5678",
+        )
+    )
+    blocks = message["blocks"]
+    assert [block["type"] for block in blocks] == [
+        "header",
+        "section",
+        "section",
+        "section",
+        "actions",
+    ]
+    assert blocks[0]["text"] == {
+        "type": "plain_text",
+        "text": ":alert: LED 연결 확인 필요",
+        "emoji": True,
+    }
+    assert [field["text"] for field in blocks[1]["fields"]] == [
+        "⚙️ *장비*\n*<https://mda.example.com/monitoring?device=MB2-TEST1|MB2-TEST1>*",
+        "🚪 *병실*\n`1진료실`",
+    ]
+    assert [field["text"] for field in blocks[2]["fields"]] == [
+        ":rotating_light: *문제 장치*\n`LED`",
+        "🔎 *감지 내용*\n`LED 이상`",
+    ]
+    assert [field["text"] for field in blocks[3]["fields"]] == [
+        "📞 *전화*\n031-123-4567",
+        "💬 *문자*\n010-1234-5678",
+    ]
+
+
 def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
     app = _App()
     bridge = Mock()

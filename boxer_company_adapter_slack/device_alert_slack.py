@@ -56,6 +56,7 @@ _ACTION_IDS = frozenset(
     }
 )
 _MOBILE_PHONE_PATTERN = re.compile(r"^(?:\+?82|0)1[016789][0-9]{7,8}$")
+_ALERT_ITEM_LIMIT = 10
 _CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
     "recording_processing": "녹화 파일 처리 확인 필요",
@@ -66,6 +67,13 @@ _CATEGORY_TITLES = {
     "storage": "장비 저장 공간 부족",
     "device_connection": "장비 연결 확인 필요",
     "upload": "영상 업로드 확인 필요",
+}
+_COMPONENT_TITLES = {
+    "captureboard": "캡처보드",
+    "led": "LED",
+    "audio": "스피커",
+    "pm2": "PM2",
+    "storage": "저장 공간",
 }
 
 
@@ -91,76 +99,50 @@ def post_device_alert_summary(
     )
     if not items:
         return None
-    categories = {
-        item["alertCategory"] for item in items if item["alertCategory"]
-    }
-    title = (
-        _CATEGORY_TITLES.get(next(iter(categories)), "장비 상태 확인 필요")
-        if len(categories) == 1
-        else "장비 상태 확인 필요"
+    title = _alert_title(items)
+    # fallback text에는 모든 항목을 남기고 Block Kit만 Slack block 한도에
+    # 맞춰 상위 카드로 제한한다.
+    fallback_text = "\n".join(
+        (
+            f":alert: *{title}*",
+            "\n\n".join(_alert_item_fallback_text(item) for item in items),
+        )
     )
-    text_parts = [f"*{title}*"]
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": title},
+            "text": {
+                "type": "plain_text",
+                "text": f":alert: {title}",
+                "emoji": True,
+            },
         }
     ]
-    for index, item in enumerate(items):
-        hospital = item["hospital"]
-        device_line = (
-            f"*{hospital}*\n"
-            f"*장비* `{item['device']}`\n"
-            f"*병실* `{item['room']}`\n"
-            f"*감지 내용* `{item['issue']}`"
+    for item in items[:_ALERT_ITEM_LIMIT]:
+        # API 분리 전 카드의 식별 정보 → 장애 내용 → 연락처 순서를 유지한다.
+        # 한 줄짜리 section으로 뭉개지지 않게 한다.
+        blocks.extend(
+            _alert_item_blocks(
+                item,
+                include_actions=include_actions,
+                include_device_voice_action=include_device_voice_action,
+            )
         )
-        text_parts.append(device_line)
+    omitted_count = max(0, len(items) - _ALERT_ITEM_LIMIT)
+    if omitted_count:
+        omitted_text = (
+            f"알림 카드는 상위 {_ALERT_ITEM_LIMIT}건만 표시했어. "
+            f"나머지 {omitted_count}건은 본문에서 확인해."
+        )
         blocks.append(
             {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": device_line},
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": omitted_text}],
             }
         )
-        if include_actions and index < 10:
-            value = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-            # API presentation hint만 반영하고 장비 capability를 Slack에서
-            # 다시 조회하거나 추론하지 않는다.
-            action_elements = [
-                {
-                    "type": "button",
-                    "action_id": DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
-                    "text": {"type": "plain_text", "text": "병원 문자 보내기"},
-                    "value": value,
-                }
-            ]
-            if include_device_voice_action:
-                action_elements.append(
-                    {
-                        "type": "button",
-                        "action_id": DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-                        "text": {"type": "plain_text", "text": "장비 음성 안내"},
-                        "value": value,
-                    }
-                )
-            action_elements.append(
-                {
-                    "type": "button",
-                    "action_id": DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
-                    "text": {"type": "plain_text", "text": "확인 완료"},
-                    "value": value,
-                }
-            )
-            blocks.append(
-                {
-                    "type": "actions",
-                    "elements": action_elements,
-                }
-            )
-        if index < len(items) - 1:
-            blocks.append({"type": "divider"})
     response = client.chat_postMessage(
         channel=channel_id,
-        text="\n\n".join(text_parts),
+        text=fallback_text,
         blocks=blocks,
         unfurl_links=False,
         unfurl_media=False,
@@ -184,6 +166,173 @@ def post_device_alert_summary(
             type(exc).__name__,
         )
     return {"messageTs": message_ts, "permalink": permalink}
+
+
+def _alert_title(items: tuple[dict[str, Any], ...]) -> str:
+    categories = [item["alertCategory"] for item in items]
+    # 미분류 항목이나 여러 유형이 섞이면 일부 장애만 대표하지 않는다.
+    if not categories or any(
+        category not in _CATEGORY_TITLES for category in categories
+    ):
+        return "장비 상태 확인 필요"
+    unique_categories = set(categories)
+    if len(unique_categories) != 1:
+        return "장비 상태 확인 필요"
+    return _CATEGORY_TITLES[next(iter(unique_categories))]
+
+
+def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
+    components = _problem_components_text(item.get("problemComponents"))
+    lines = [
+        f"*{item['hospital']}*",
+        (
+            f"⚙️ *장비*  {_device_name_text(item)}  ·  "
+            f"🚪 *병실*  `{item['room']}`"
+        ),
+        "",
+    ]
+    if components:
+        lines.append(f":rotating_light: *문제 장치*\n{components}")
+    lines.extend(
+        (
+            f"🔎 *감지 내용*\n`{item['issue']}`",
+            "",
+            f"📞 *전화*\n{_text(item.get('telephone'), '미확인')}",
+            f"💬 *문자*\n{_sms_contact_text(item)}",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _alert_item_blocks(
+    item: Mapping[str, Any],
+    *,
+    include_actions: bool,
+    include_device_voice_action: bool,
+) -> list[dict[str, Any]]:
+    components = _problem_components_text(item.get("problemComponents"))
+    issue_fields: list[dict[str, str]] = []
+    if components:
+        issue_fields.append(
+            {
+                "type": "mrkdwn",
+                "text": f":rotating_light: *문제 장치*\n{components}",
+            }
+        )
+    issue_fields.append(
+        {
+            "type": "mrkdwn",
+            "text": f"🔎 *감지 내용*\n`{item['issue']}`",
+        }
+    )
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"⚙️ *장비*\n{_device_name_text(item)}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"🚪 *병실*\n`{item['room']}`",
+                },
+            ],
+        },
+        {"type": "section", "fields": issue_fields},
+        {
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"📞 *전화*\n{_text(item.get('telephone'), '미확인')}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"💬 *문자*\n{_sms_contact_text(item)}",
+                },
+            ],
+        },
+    ]
+    if not include_actions:
+        return blocks
+
+    # 버튼에는 현재 API action이 요구하는 exact target만 넣어 Slack value
+    # 제한과 자동문자 본문 노출을 피한다.
+    value = _alert_action_value(item)
+    action_elements = [
+        {
+            "type": "button",
+            "action_id": DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
+            "text": {"type": "plain_text", "text": "병원 문자 보내기"},
+            "value": value,
+            "style": "primary",
+        }
+    ]
+    if include_device_voice_action:
+        action_elements.append(
+            {
+                "type": "button",
+                "action_id": DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
+                "text": {"type": "plain_text", "text": "장비 음성 안내"},
+                "value": value,
+            }
+        )
+    action_elements.append(
+        {
+            "type": "button",
+            "action_id": DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
+            "text": {"type": "plain_text", "text": "확인 완료"},
+            "value": value,
+        }
+    )
+    blocks.append({"type": "actions", "elements": action_elements})
+    return blocks
+
+
+def _device_name_text(item: Mapping[str, Any]) -> str:
+    device = _text(item.get("device"), "장비명 미확인")
+    mda_url = _text(item.get("mdaUrl"), "")
+    if _is_safe_https_url(mda_url):
+        return f"*<{mda_url}|{device}>*"
+    return f"`{device}`"
+
+
+def _problem_components_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    labels = [_text(item, "") for item in value if _text(item, "")]
+    return " ".join(f"`{label}`" for label in labels)
+
+
+def _sms_contact_text(item: Mapping[str, Any]) -> str:
+    return _text(
+        item.get("smsPhoneNumber") or item.get("deviceAlertPhone"),
+        "저장된 번호 없음 · 자동발송 불가",
+    )
+
+
+def _alert_action_value(item: Mapping[str, Any]) -> str:
+    target = {
+        key: item.get(key)
+        for key in (
+            "hospitalSeq",
+            "hospitalName",
+            "hospital",
+            "room",
+            "device",
+            "issue",
+            "alertCategory",
+            "problemComponents",
+            "mdaUrl",
+        )
+    }
+    value = json.dumps(target, ensure_ascii=False, separators=(",", ":"))
+    if len(value) <= 1900:
+        return value
+    target["issue"] = _text(target.get("issue"), "")[:300]
+    return json.dumps(target, ensure_ascii=False, separators=(",", ":"))[:1900]
 
 
 def attach_device_alert_actions(
@@ -282,6 +431,13 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(labels, Mapping)
             else []
         )
+    normalized_components = []
+    for item in components:
+        component = _text(item, "")
+        if component:
+            normalized_components.append(
+                _COMPONENT_TITLES.get(component.casefold(), component)
+            )
     return {
         "hospitalSeq": hospital_seq or 0,
         "hospitalName": hospital_name,
@@ -290,7 +446,13 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
         "device": _text(raw.get("device") or raw.get("deviceName"), "장비명 미확인"),
         "issue": _text(raw.get("issue") or raw.get("priorityReason"), "상세 확인 필요"),
         "alertCategory": _text(raw.get("alertCategory"), "device_connection"),
-        "problemComponents": [_text(item, "") for item in components if _text(item, "")],
+        "problemComponents": normalized_components,
+        "telephone": _text(raw.get("telephone") or raw.get("hospitalTelephone"), ""),
+        "deviceAlertPhone": _text(
+            raw.get("deviceAlertPhone") or raw.get("hospitalDeviceAlertPhone"),
+            "",
+        ),
+        "smsPhoneNumber": _text(raw.get("smsPhoneNumber"), ""),
         "mdaUrl": _text(raw.get("mdaUrl"), ""),
     }
 
@@ -652,6 +814,20 @@ def _is_safe_slack_permalink(value: str, channel_id: str) -> bool:
         parsed.scheme == "https"
         and str(parsed.hostname or "").casefold().endswith(".slack.com")
         and parsed.path.startswith(f"/archives/{channel_id}/p")
+        and not parsed.username
+        and not parsed.password
+        and not parsed.fragment
+    )
+
+
+def _is_safe_https_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
         and not parsed.username
         and not parsed.password
         and not parsed.fragment

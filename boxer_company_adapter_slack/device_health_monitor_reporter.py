@@ -181,6 +181,21 @@ def _build_remote_device_health_alert_device_result(
         "room": room,
         "device": device,
         "issue": issue,
+        # API가 이미 확정한 표시 필드를 Slack 카드까지 보존한다. adapter는
+        # 연락처나 자동문자 상태를 다시 조회하거나 추론하지 않는다.
+        "telephone": str(raw.get("telephone") or "").strip(),
+        "deviceAlertPhone": str(raw.get("deviceAlertPhone") or "").strip(),
+        "deviceVersion": str(raw.get("deviceVersion") or "").strip(),
+        "voiceType": str(raw.get("voiceType") or "").strip(),
+        "smsStatusText": str(raw.get("smsStatusText") or "").strip(),
+        "smsContactActionEnabled": bool(
+            raw.get("smsContactActionEnabled", True)
+        ),
+        "smsDeliveryStatus": str(raw.get("smsDeliveryStatus") or "").strip(),
+        "smsAcceptedAt": str(raw.get("smsAcceptedAt") or "").strip(),
+        "smsPhoneNumber": str(raw.get("smsPhoneNumber") or "").strip(),
+        "smsMessage": str(raw.get("smsMessage") or "").strip(),
+        "smsTemplateId": str(raw.get("smsTemplateId") or "").strip(),
         "alertCategory": str(
             raw.get("alertCategory") or "device_connection"
         ).strip(),

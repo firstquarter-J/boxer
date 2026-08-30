@@ -18,8 +18,10 @@ from boxer_company_adapter_slack.automation_reporter import (
     AutomationSlackDelivery,
     build_automation_request_id,
     flush_automation_deliveries,
+    load_automation_thread_receipt,
     remember_automation_delivery,
     remember_automation_deliveries,
+    remember_automation_thread_receipt,
     validate_automation_delivery_journal_preflight,
 )
 from boxer_company_adapter_slack.company_api_client import (
@@ -49,20 +51,24 @@ class _ApiClient:
         return SimpleNamespace(acknowledged=self.acknowledged)
 
 
-def _batch_reference(*delivery_ids: str) -> AutomationRemoteDeliveryBatchRef:
+def _batch_reference(
+    *delivery_ids: str,
+    cycle: str = "device_health_monitor",
+    cycle_key: str = "continuous",
+) -> AutomationRemoteDeliveryBatchRef:
     raw = "\0".join(
         (
             "T1",
-            "device_health_monitor",
-            "continuous",
+            cycle,
+            cycle_key,
             *sorted(delivery_ids),
         )
     )
     return AutomationRemoteDeliveryBatchRef(
         batch_id="batch:" + hashlib.sha256(raw.encode()).hexdigest(),
         tenant_id="T1",
-        cycle="device_health_monitor",
-        cycle_key="continuous",
+        cycle=cycle,
+        cycle_key=cycle_key,
         delivery_ids=tuple(delivery_ids),
     )
 
@@ -120,6 +126,126 @@ def test_delivery_state_contains_receipt_only_and_is_private(
     assert "phone" not in serialized.lower()
     assert "messageText" not in serialized
     assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+
+def test_thread_receipt_survives_delivery_remember_and_ack(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery.json"
+    cycle = "daily_device_round"
+    cycle_key = "daily:2026-08-14"
+    delivery_id = "daily_device_round:2026-08-14:42"
+    root_message_id = "1723600000.000700"
+
+    # window root는 domain payload가 아니라 Slack 전송 위치만 저장하며,
+    # 병원 delivery ACK 뒤에도 다음 병원이 재사용할 수 있어야 한다.
+    remember_automation_thread_receipt(
+        cycle=cycle,
+        cycle_key=cycle_key,
+        channel_id="C123456",
+        root_message_id=root_message_id,
+        state_path=path,
+    )
+    remember_automation_delivery(
+        cycle=cycle,
+        cycle_key=cycle_key,
+        delivery=AutomationSlackDelivery(
+            delivery_id=delivery_id,
+            external_message_id="1723600000.000701",
+            permalink="",
+            delivered_at=_NOW,
+        ),
+        batch=_batch_reference(
+            delivery_id,
+            cycle=cycle,
+            cycle_key=cycle_key,
+        ),
+        state_path=path,
+    )
+
+    client = _ApiClient()
+    assert flush_automation_deliveries(
+        client,  # type: ignore[arg-type]
+        cycle=cycle,
+        cycle_key="transport:daily",
+        scheduled_at=_NOW,
+        state_path=path,
+    )
+    assert load_automation_thread_receipt(
+        cycle=cycle,
+        cycle_key=cycle_key,
+        channel_id="C123456",
+        state_path=path,
+    ) == root_message_id
+    remember_automation_thread_receipt(
+        cycle=cycle,
+        cycle_key="daily:2026-08-15",
+        channel_id="C123456",
+        root_message_id="1723600000.000702",
+        state_path=path,
+    )
+    assert load_automation_thread_receipt(
+        cycle=cycle,
+        cycle_key=cycle_key,
+        channel_id="C123456",
+        state_path=path,
+    ) is None
+    assert load_automation_thread_receipt(
+        cycle=cycle,
+        cycle_key="daily:2026-08-15",
+        channel_id="C123456",
+        state_path=path,
+    ) == "1723600000.000702"
+    stored = path.read_text(encoding="utf-8")
+    assert '"receipts":[]' in stored
+    assert "payload" not in stored.lower()
+
+
+def test_thread_receipt_does_not_rotate_while_receipt_is_pending(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery.json"
+    remember_automation_thread_receipt(
+        cycle="daily_device_round",
+        cycle_key="daily:2026-08-14",
+        channel_id="C123456",
+        root_message_id="1723600000.000710",
+        state_path=path,
+    )
+    remember_automation_delivery(
+        cycle="daily_device_round",
+        cycle_key="daily:2026-08-14",
+        delivery=AutomationSlackDelivery(
+            delivery_id="daily_device_round:2026-08-14:42",
+            external_message_id="1723600000.000711",
+            permalink="",
+            delivered_at=_NOW,
+        ),
+        state_path=path,
+    )
+
+    # 미ACK 병원 결과가 남은 동안 새 window root로 덮어쓰지 않는다.
+    with pytest.raises(
+        CompanyApiContractError,
+        match="company_api_automation_delivery_state_conflict",
+    ):
+        load_automation_thread_receipt(
+            cycle="daily_device_round",
+            cycle_key="daily:2026-08-15",
+            channel_id="C123456",
+            state_path=path,
+        )
+    with pytest.raises(
+        CompanyApiContractError,
+        match="company_api_automation_delivery_state_conflict",
+    ):
+        remember_automation_thread_receipt(
+            cycle="daily_device_round",
+            cycle_key="daily:2026-08-15",
+            channel_id="C123456",
+            root_message_id="1723600000.000712",
+            state_path=path,
+        )
 
 
 def test_flush_sends_receipt_once_then_clears_state(tmp_path: Path) -> None:
@@ -270,6 +396,22 @@ def test_startup_preflight_accepts_missing_or_empty_journal(
     validate_automation_delivery_journal_preflight(
         state_path=empty_path
     )
+
+
+def test_startup_preflight_accepts_thread_receipt_without_pending_delivery(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery.json"
+    remember_automation_thread_receipt(
+        cycle="daily_device_round",
+        cycle_key="daily:2026-08-14",
+        channel_id="C123456",
+        root_message_id="1723600000.000720",
+        state_path=path,
+    )
+
+    # 완료된 병원 ACK 뒤 root 위치만 남은 상태에서도 재기동할 수 있다.
+    validate_automation_delivery_journal_preflight(state_path=path)
 
 
 def test_startup_preflight_accepts_current_exact_batch_journal(
