@@ -48,6 +48,16 @@ def _receipt_target() -> dict[str, object]:
     }
 
 
+def _ack_receipt(*, created: bool = True) -> dict[str, object]:
+    return {
+        "kind": "device_health_alert_ack",
+        "created": created,
+        "actorUserId": "U-ACTOR",
+        "acknowledgedAt": "2026-08-31T09:07:12+09:00",
+        "target": _receipt_target(),
+    }
+
+
 class _FakeClient:
     def __init__(self, result=None, error: Exception | None = None) -> None:
         self.result = result
@@ -96,6 +106,18 @@ class DeviceHealthAlertApiBridgeTests(unittest.TestCase):
         self.assertNotEqual(first, changed)
         self.assertRegex(first, r"^slack-device-alert-[0-9a-f]{40}$")
         self.assertNotIn("U-ACTOR", first)
+
+        mark_done = build_device_health_alert_request_id(
+            **{
+                **values,
+                "action_name": "device_health_alert_mark_done",
+                "phase": "execute",
+            }
+        )
+        self.assertRegex(
+            mark_done,
+            r"^slack-device-alert-ack-v1-[0-9a-f]{40}$",
+        )
 
     def test_prepare_builds_typed_request_and_calls_api_once(self) -> None:
         result = CompanyAssistantResult(
@@ -225,26 +247,191 @@ class DeviceHealthAlertApiBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(client.calls), 1)
 
-    def test_voice_and_mark_done_reject_unexpected_receipt(self) -> None:
-        for route, method_name in (
-            (DEVICE_HEALTH_ALERT_VOICE_ROUTE, "send_voice_guide"),
-            (DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE, "mark_done"),
-        ):
-            with self.subTest(route=route):
+    def test_voice_rejects_unexpected_receipt(self) -> None:
+        client = _FakeClient(
+            result=CompanyAssistantResult(
+                route=DEVICE_HEALTH_ALERT_VOICE_ROUTE,
+                outcome="answered",
+                messages=(AssistantMessage(body="완료"),),
+                operation_result={"kind": "unexpected"},
+            )
+        )
+
+        with self.assertRaises(CompanyApiContractError):
+            DeviceHealthAlertApiBridge(client).send_voice_guide(
+                **self._kwargs()
+            )
+
+        self.assertEqual(len(client.calls), 1)
+
+    def test_mark_done_accepts_created_and_existing_ack_receipts(self) -> None:
+        # 최초 claim과 재클릭 응답 모두 최초 담당자·시간을 담은 같은 typed
+        # acknowledgement 계약으로 Slack UI까지 전달돼야 한다.
+        for created in (True, False):
+            with self.subTest(created=created):
+                receipt = _ack_receipt(created=created)
                 client = _FakeClient(
                     result=CompanyAssistantResult(
-                        route=route,
+                        route=DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
                         outcome="answered",
-                        messages=(AssistantMessage(body="완료"),),
-                        operation_result={"kind": "unexpected"},
+                        messages=(AssistantMessage(body="확인 완료"),),
+                        operation_result=receipt,
                     )
                 )
-                bridge = DeviceHealthAlertApiBridge(client)
 
-                with self.assertRaises(CompanyApiContractError):
-                    getattr(bridge, method_name)(**self._kwargs())
+                acknowledged = DeviceHealthAlertApiBridge(client).mark_done(
+                    **self._kwargs()
+                )
 
+                self.assertEqual(
+                    acknowledged.route,
+                    DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                )
+                self.assertEqual(acknowledged.operation_result, receipt)
                 self.assertEqual(len(client.calls), 1)
+                request, route_group = client.calls[0]
+                self.assertEqual(route_group, "operations")
+                self.assertEqual(
+                    request.metadata["operation_action"]["name"],
+                    "device_health_alert_mark_done",
+                )
+                self.assertEqual(
+                    request.metadata["operation_action"]["phase"],
+                    "execute",
+                )
+
+    def test_mark_done_failure_keeps_message_without_ack_receipt(self) -> None:
+        # 저장·대상 검증 실패는 완료 영수증이 없어야 하고 Slack은 원래
+        # 실패 안내를 전달한 뒤 버튼을 남겨 재시도할 수 있어야 한다.
+        client = _FakeClient(
+            result=CompanyAssistantResult(
+                route=DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                outcome="failed",
+                messages=(AssistantMessage(body="완료 상태 저장 실패"),),
+            )
+        )
+
+        failed = DeviceHealthAlertApiBridge(client).mark_done(
+            **self._kwargs()
+        )
+
+        self.assertEqual(failed.outcome, "failed")
+        self.assertEqual(failed.messages, ("완료 상태 저장 실패",))
+        self.assertIsNone(failed.operation_result)
+
+    def test_mark_done_accepts_legacy_api_response_without_receipt(self) -> None:
+        # API를 먼저 배포하지 못한 순차 배포 창에는 구 응답을 그대로
+        # 전달하고 카드 UI만 다음 신 API 응답까지 유지한다.
+        client = _FakeClient(
+            result=CompanyAssistantResult(
+                route=DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                outcome="answered",
+                messages=(AssistantMessage(body="확인 완료"),),
+            )
+        )
+
+        legacy = DeviceHealthAlertApiBridge(client).mark_done(
+            **self._kwargs()
+        )
+
+        self.assertEqual(legacy.outcome, "answered")
+        self.assertIsNone(legacy.operation_result)
+
+    def test_mark_done_rejects_invalid_ack_receipts(self) -> None:
+        valid = _ack_receipt()
+        missing_created = dict(valid)
+        missing_created.pop("created")
+        mismatched_target = _receipt_target()
+        mismatched_target["device"] = "MB2-C00999"
+        cases = (
+            (
+                "wrong_kind",
+                {**valid, "kind": "unexpected"},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "missing_field",
+                missing_created,
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "unexpected_field",
+                {**valid, "unexpected": True},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "created_not_boolean",
+                {**valid, "created": 1},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "actor_missing",
+                {**valid, "actorUserId": "  "},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "actor_markup_injection",
+                {**valid, "actorUserId": "U1> <!channel"},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "timestamp_without_timezone",
+                {**valid, "acknowledgedAt": "2026-08-31T09:07:12"},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "timestamp_invalid",
+                {**valid, "acknowledgedAt": "not-a-timestamp"},
+                "device_health_alert_ack_receipt_invalid",
+            ),
+            (
+                "target_mismatch",
+                {**valid, "target": mismatched_target},
+                "device_health_alert_receipt_target_mismatch",
+            ),
+        )
+
+        # 형식이 모호한 receipt를 일부 수용하면 잘못된 담당자·시간으로
+        # 버튼을 제거할 수 있으므로 모든 계약 위반을 fail-closed한다.
+        for name, receipt, error_code in cases:
+            with self.subTest(name=name):
+                client = _FakeClient(
+                    result=CompanyAssistantResult(
+                        route=DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                        outcome="answered",
+                        messages=(AssistantMessage(body="확인 완료"),),
+                        operation_result=receipt,
+                    )
+                )
+
+                with self.assertRaises(CompanyApiContractError) as raised:
+                    DeviceHealthAlertApiBridge(client).mark_done(
+                        **self._kwargs()
+                    )
+
+                self.assertEqual(str(raised.exception), error_code)
+                self.assertEqual(len(client.calls), 1)
+
+    def test_new_mark_done_ack_must_name_current_actor(self) -> None:
+        client = _FakeClient(
+            result=CompanyAssistantResult(
+                route=DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
+                outcome="answered",
+                messages=(AssistantMessage(body="확인 완료"),),
+                operation_result={
+                    **_ack_receipt(created=True),
+                    "actorUserId": "U-OTHER",
+                },
+            )
+        )
+
+        with self.assertRaises(CompanyApiContractError) as raised:
+            DeviceHealthAlertApiBridge(client).mark_done(**self._kwargs())
+
+        self.assertEqual(
+            str(raised.exception),
+            "device_health_alert_ack_actor_mismatch",
+        )
 
     def test_receipt_target_mismatch_is_fail_closed(self) -> None:
         mismatched_target = _receipt_target()

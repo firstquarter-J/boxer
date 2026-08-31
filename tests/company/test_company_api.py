@@ -25,11 +25,13 @@ from boxer_company_adapter_slack.company_api_client import (
     _deserialize_result,
 )
 from boxer_company_api.app import (
+    _RUNTIME_UNSET,
     _initialize_request_log_readiness,
+    _resolve_runtime,
     _secure_request_log_leaf,
     create_company_api_app,
 )
-from boxer_company_api.schemas import AssistantTurnInput
+from boxer_company_api.schemas import AssistantTurnInput, serialize_result
 from boxer_company_api.settings import (
     CompanyApiCallerSettings,
     CompanyApiSettings,
@@ -237,6 +239,89 @@ def _direct_turn_request(
 
 
 class CompanyApiContractTests(unittest.TestCase):
+    def test_default_runtime_ack_claim_uses_api_request_log_settings(
+        self,
+    ) -> None:
+        settings = _settings(
+            request_log_enabled=True,
+            request_log_path="/tmp/injected-request-log.db",
+        )
+        runtime_sentinel = _FakeRuntime()
+        acknowledgement_sentinel = object()
+
+        with patch(
+            "boxer_company_api.app.validate_company_api_runtime_security"
+        ), patch(
+            "boxer.core.utils._validate_tokens"
+        ), patch(
+            "boxer_company.settings.validate_company_data_source_settings"
+        ), patch(
+            "boxer_company.assistant.factory.create_company_assistant_runtime",
+            return_value=runtime_sentinel,
+        ) as create_runtime, patch(
+            "boxer_company_api.app._secure_request_log_leaf",
+            return_value=True,
+        ) as secure_leaf, patch(
+            "boxer_company_api.app.claim_device_health_alert_acknowledgement",
+            return_value=acknowledgement_sentinel,
+        ) as claim_ack:
+            runtime, ready = _resolve_runtime(settings, _RUNTIME_UNSET)
+            deps = create_runtime.call_args.kwargs[
+                "device_health_alert_action_deps"
+            ]
+            claimed = deps.claim_mark_done(test_key="value")
+
+        self.assertIs(runtime, runtime_sentinel)
+        self.assertTrue(ready)
+        self.assertIs(claimed, acknowledgement_sentinel)
+        secure_leaf.assert_called_once_with(
+            Path("/tmp/injected-request-log.db")
+        )
+        claim_ack.assert_called_once_with(
+            test_key="value",
+            db_path=Path("/tmp/injected-request-log.db"),
+            schema_prepared=True,
+        )
+
+    def test_default_runtime_ack_claim_rejects_unsafe_runtime_leaf(
+        self,
+    ) -> None:
+        settings = _settings(
+            request_log_enabled=True,
+            request_log_path="/tmp/injected-request-log.db",
+        )
+
+        with patch(
+            "boxer_company_api.app.validate_company_api_runtime_security"
+        ), patch(
+            "boxer.core.utils._validate_tokens"
+        ), patch(
+            "boxer_company.settings.validate_company_data_source_settings"
+        ), patch(
+            "boxer_company.assistant.factory.create_company_assistant_runtime",
+            return_value=_FakeRuntime(),
+        ) as create_runtime, patch(
+            "boxer_company_api.app._secure_request_log_leaf",
+            return_value=False,
+        ), patch(
+            "boxer_company_api.app.claim_device_health_alert_acknowledgement"
+        ) as claim_ack:
+            _runtime, ready = _resolve_runtime(settings, _RUNTIME_UNSET)
+            deps = create_runtime.call_args.kwargs[
+                "device_health_alert_action_deps"
+            ]
+
+            # startup 이후 삭제·symlink·권한 교체된 중앙 DB는 새 파일로
+            # 대체하지 않고 완료 처리 자체를 fail-closed한다.
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ack storage is disabled",
+            ):
+                deps.claim_mark_done(test_key="value")
+
+        self.assertTrue(ready)
+        claim_ack.assert_not_called()
+
     def test_audit_context_and_request_log_receipt_reject_loose_wire_types(
         self,
     ) -> None:
@@ -1399,6 +1484,165 @@ class CompanyApiContractTests(unittest.TestCase):
         self.assertEqual(second.status_code, 500)
         self.assertTrue(second.json()["retryable"])
         self.assertEqual(len(runtime.requests), 2)
+
+    def test_mark_done_ack_storage_failure_releases_same_request_id(self) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_health_alert_mark_done",
+                outcome="failed",
+                messages=(AssistantMessage(body="완료 상태 저장 실패"),),
+                fallback_reason="device_health_alert_ack_store_failed",
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                    "assistant.device.alert.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="device health alert action",
+            conversationId="1788134832.709819",
+            routeGroup="operations",
+            contextEntries=[],
+            scope={"channelContextId": "C01"},
+            operationAction={
+                "name": "device_health_alert_mark_done",
+                "phase": "execute",
+                "target": {
+                    "hospitalSeq": 84,
+                    "hospitalName": "한국의료재단(영등포)",
+                    "roomName": "4층 초음파실9",
+                    "deviceName": "MB2-A00140",
+                    "issue": "녹화 파일 증가 정지",
+                    "alertCategory": "recording",
+                    "problemComponents": [],
+                },
+            },
+        )
+
+        with TestClient(app) as client:
+            first = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(
+                    request_id="slack-device-alert-ack-v1-test"
+                ),
+                json=payload,
+            )
+            replay = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(
+                    request_id="slack-device-alert-ack-v1-test"
+                ),
+                json=payload,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_serialize_result_preserves_device_health_alert_ack(self) -> None:
+        receipt = {
+            "kind": "device_health_alert_ack",
+            "created": True,
+            "actorUserId": "ACTOR-1",
+            "acknowledgedAt": "2026-08-31T00:07:12+00:00",
+            "target": {
+                "hospital": "한국의료재단(영등포)",
+                "room": "4층 초음파실9",
+                "device": "MB2-A00140",
+                "components": [],
+                "issue": "녹화 파일 증가 정지",
+            },
+        }
+
+        payload = serialize_result(
+            CompanyAssistantResult(
+                route="device_health_alert_mark_done",
+                outcome="answered",
+                messages=(AssistantMessage(body="확인 완료"),),
+                operation_result=receipt,
+            ),
+            "slack-device-alert-ack-v1-serialize",
+        )
+
+        # API allowlist에서 완료 영수증이 누락되면 Slack은 담당자·시간을
+        # 표시하거나 해당 카드의 버튼을 안전하게 제거할 수 없다.
+        self.assertEqual(payload["operationResult"], receipt)
+
+    def test_mark_done_ack_receipt_survives_http_response(self) -> None:
+        request_id = "slack-device-alert-ack-v1-http"
+        receipt = {
+            "kind": "device_health_alert_ack",
+            "created": True,
+            "actorUserId": "ACTOR-1",
+            "acknowledgedAt": "2026-08-31T00:07:12+00:00",
+            "target": {
+                "hospital": "한국의료재단(영등포)",
+                "room": "4층 초음파실9",
+                "device": "MB2-A00140",
+                "components": [],
+                "issue": "녹화 파일 증가 정지",
+            },
+        }
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="device_health_alert_mark_done",
+                outcome="answered",
+                messages=(AssistantMessage(body="확인 완료"),),
+                operation_result=receipt,
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(
+                capabilities=(
+                    "assistant.turn.read",
+                    "assistant.operation.execute",
+                    "assistant.device.alert.execute",
+                ),
+            ),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+        payload = _payload(
+            question="device health alert action",
+            conversationId="1788134832.709819",
+            routeGroup="operations",
+            contextEntries=[],
+            scope={"channelContextId": "C01"},
+            operationAction={
+                "name": "device_health_alert_mark_done",
+                "phase": "execute",
+                "target": {
+                    "hospitalSeq": 84,
+                    "hospitalName": "한국의료재단(영등포)",
+                    "roomName": "4층 초음파실9",
+                    "deviceName": "MB2-A00140",
+                    "issue": "녹화 파일 증가 정지",
+                    "alertCategory": "recording",
+                    "problemComponents": [],
+                },
+            },
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id=request_id),
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["operationResult"], receipt)
+        self.assertEqual(
+            _deserialize_result(response, request_id).operation_result,
+            receipt,
+        )
 
     def test_read_only_operation_failure_does_not_lock_later_mutation(self) -> None:
         # app-user/S3/admin 조회 예외는 mutation registry를 만들지 않고,

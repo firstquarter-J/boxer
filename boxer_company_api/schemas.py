@@ -7,7 +7,14 @@ import re
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from boxer.context.entries import (
     ContextEntry,
@@ -1099,6 +1106,36 @@ class SmsContactPreparationOutput(_StrictInputModel):
     target: SmsDeliveryTargetOutput
 
 
+class DeviceHealthAlertAcknowledgementOutput(_StrictInputModel):
+    """Slack 카드 갱신에 필요한 최초 담당자·시간만 내보낸다."""
+
+    kind: Literal["device_health_alert_ack"]
+    created: StrictBool
+    actorUserId: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    acknowledgedAt: str = Field(min_length=1, max_length=64)
+    target: SmsDeliveryTargetOutput
+
+    @field_validator("acknowledgedAt")
+    @classmethod
+    def _validate_acknowledged_at(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            parsed = datetime.fromisoformat(
+                normalized.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "acknowledgedAt must be ISO-8601"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise ValueError("acknowledgedAt must include timezone")
+        return normalized
+
+
 class SecurityReviewStepOutput(_StrictInputModel):
     """Slack renderer가 다음 probe 또는 최종 report만 전달받는 안전한 DTO다."""
 
@@ -1204,6 +1241,7 @@ class AssistantTurnOutput(BaseModel):
         | DeviceOperationDeliveryOutput
         | SmsDeliveryOperationResultOutput
         | SmsContactPreparationOutput
+        | DeviceHealthAlertAcknowledgementOutput
         | SecurityReviewStepOutput
         | None
     ) = None
@@ -1216,6 +1254,7 @@ def _serialize_operation_result(
     | DeviceOperationDeliveryOutput
     | SmsDeliveryOperationResultOutput
     | SmsContactPreparationOutput
+    | DeviceHealthAlertAcknowledgementOutput
     | SecurityReviewStepOutput
     | None
 ):
@@ -1231,6 +1270,8 @@ def _serialize_operation_result(
         return SmsDeliveryOperationResultOutput.model_validate(value)
     if value.get("kind") == "sms_contact_preparation":
         return SmsContactPreparationOutput.model_validate(value)
+    if value.get("kind") == "device_health_alert_ack":
+        return DeviceHealthAlertAcknowledgementOutput.model_validate(value)
     if value.get("kind") == "security_review_step":
         return SecurityReviewStepOutput.model_validate(value)
     return None

@@ -9,6 +9,7 @@ from boxer_company.assistant.contracts import (
 from boxer_company.assistant.operations import (
     build_company_operation_routes,
     company_operation_route_names,
+    is_retryable_company_mutation_result,
     is_uncertain_company_mutation_result,
     match_live_device_company_operation_route,
     match_mutation_capable_company_operation_route,
@@ -372,6 +373,20 @@ def test_explicit_mutation_commands_keep_their_operation_routes() -> None:
     for question, route in expected.items():
         assert match_company_operation_route(_request(question)) == route
         assert match_mutation_capable_company_operation_route(_request(question))
+
+
+def test_mark_done_ack_storage_failure_releases_request_guard() -> None:
+    # durable unique claim은 commit 여부가 애매해도 같은 request ID로 row를
+    # 다시 읽을 수 있어 transient 저장 실패를 완료 cache로 고정하지 않는다.
+    assert is_retryable_company_mutation_result(
+        mutation_route="device_health_alert_mark_done",
+        result=CompanyAssistantResult(
+            route="device_health_alert_mark_done",
+            outcome="failed",
+            messages=(AssistantMessage(body="저장 실패"),),
+            fallback_reason="device_health_alert_ack_store_failed",
+        ),
+    )
 
 
 def test_read_only_operations_do_not_enter_mutation_guard() -> None:

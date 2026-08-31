@@ -144,6 +144,15 @@ _SMS_CONTACT_PREPARATION_KEYS = frozenset(
 _SMS_OPERATION_TARGET_KEYS = frozenset(
     {"hospital", "room", "device", "components", "issue"}
 )
+_DEVICE_HEALTH_ALERT_ACK_RESULT_KEYS = frozenset(
+    {
+        "kind",
+        "created",
+        "actorUserId",
+        "acknowledgedAt",
+        "target",
+    }
+)
 _SECURITY_REVIEW_RESULT_KEYS = frozenset(
     {
         "kind",
@@ -2414,6 +2423,32 @@ def _deserialize_operation_result(
         return json.loads(json.dumps(value, ensure_ascii=False))
     if kind == "device_operation_delivery":
         _validate_device_operation_delivery_result(value, request_id)
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    if kind == "device_health_alert_ack":
+        acknowledged_at = str(value.get("acknowledgedAt") or "")
+        try:
+            parsed_acknowledged_at = datetime.fromisoformat(
+                acknowledged_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise CompanyApiContractError(
+                "company_api_operation_result_invalid",
+                request_id=request_id,
+            ) from exc
+        if (
+            frozenset(value) != _DEVICE_HEALTH_ALERT_ACK_RESULT_KEYS
+            or type(value.get("created")) is not bool
+            or not isinstance(value.get("actorUserId"), str)
+            or _IDENTIFIER_PATTERN.fullmatch(value["actorUserId"])
+            is None
+            or len(acknowledged_at) > 64
+            or parsed_acknowledged_at.tzinfo is None
+        ):
+            raise CompanyApiContractError(
+                "company_api_operation_result_invalid",
+                request_id=request_id,
+            )
+        _validate_sms_operation_target(value.get("target"), request_id)
         return json.loads(json.dumps(value, ensure_ascii=False))
     if kind == "sms_delivery":
         if (

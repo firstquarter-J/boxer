@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import re
 from typing import Any, Mapping, Protocol
@@ -10,6 +11,7 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
 )
 from boxer_company.transport_contracts import (
+    DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX,
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
     DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -28,6 +30,7 @@ from boxer_company_adapter_slack.company_api_client import (
 
 _FIXED_ACTION_QUESTION = "device health alert action"
 _SMS_PHONE_PATTERN = re.compile(r"^[+0-9() -]{10,24}$")
+_SCOPED_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 _ACTION_ROUTES = {
     (DEVICE_HEALTH_ALERT_SMS_ACTION, "prepare"): (
         DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE
@@ -164,7 +167,15 @@ def build_device_health_alert_request_id(
             "device_health_alert_action_invalid"
         )
     digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
-    return f"slack-device-alert-{digest[:40]}"
+    prefix = (
+        DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX
+        if (
+            action_name == DEVICE_HEALTH_ALERT_MARK_DONE_ACTION
+            and phase == "execute"
+        )
+        else "slack-device-alert-"
+    )
+    return f"{prefix}{digest[:40]}"
 
 
 class DeviceHealthAlertApiBridge:
@@ -361,11 +372,25 @@ class DeviceHealthAlertApiBridge:
         # CompanyAssistantApiClient는 operations를 0 retry로 전송한다. 이
         # bridge도 예외를 잡아 local 실행하거나 같은 요청을 다시 보내지 않는다.
         result = self._client.answer(request, route_group="operations")
-        return _validate_device_health_alert_api_result(
+        validated = _validate_device_health_alert_api_result(
             result,
             expected_route=expected_route,
             target=target,
         )
+        receipt = validated.operation_result
+        if (
+            expected_route == DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE
+            and isinstance(receipt, Mapping)
+            and receipt.get("created") is True
+            and str(receipt.get("actorUserId") or "").strip()
+            != str(actor_user_id or "").strip()
+        ):
+            # 최초 claim은 현재 요청자여야 한다. 재클릭(created=false)만
+            # 앞선 담당자의 ID를 합법적으로 돌려줄 수 있다.
+            raise CompanyApiContractError(
+                "device_health_alert_ack_actor_mismatch"
+            )
+        return validated
 
 
 def _validate_device_health_alert_api_result(
@@ -421,6 +446,35 @@ def _validate_device_health_alert_api_result(
                 raise CompanyApiContractError(
                     "device_health_alert_receipt_leaked"
                 )
+    elif expected_route == DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE:
+        if result.outcome == "answered" and receipt is not None:
+            if (
+                not isinstance(receipt, Mapping)
+                or frozenset(receipt)
+                != {
+                    "kind",
+                    "created",
+                    "actorUserId",
+                    "acknowledgedAt",
+                    "target",
+                }
+                or receipt.get("kind") != "device_health_alert_ack"
+                or not isinstance(receipt.get("created"), bool)
+                or not _valid_scoped_id(receipt.get("actorUserId"))
+                or not _valid_acknowledged_at(
+                    receipt.get("acknowledgedAt")
+                )
+            ):
+                raise CompanyApiContractError(
+                    "device_health_alert_ack_receipt_invalid"
+                )
+            _validate_receipt_target(receipt, target)
+        elif result.outcome != "answered" and receipt is not None:
+            # 실패·거절 응답이 완료 상태를 섞어 보내면 버튼 제거 여부를
+            # 판단할 수 없으므로 fail-closed한다.
+            raise CompanyApiContractError(
+                "device_health_alert_ack_receipt_invalid"
+            )
     elif receipt is not None:
         raise CompanyApiContractError(
             "device_health_alert_unexpected_receipt"
@@ -451,6 +505,20 @@ def _validate_receipt_target(
 
 def _normalized_text(value: Any) -> str:
     return " ".join(str(value or "").split())
+
+
+def _valid_scoped_id(value: Any) -> bool:
+    return _SCOPED_ID_PATTERN.fullmatch(str(value or "").strip()) is not None
+
+
+def _valid_acknowledged_at(value: Any) -> bool:
+    try:
+        parsed = datetime.fromisoformat(
+            str(value or "").strip().replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _normalized_components(value: Any) -> tuple[str, ...]:

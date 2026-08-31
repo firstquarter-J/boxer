@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime
+import hashlib
 import json
 import logging
 import re
+import threading
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -57,6 +61,9 @@ _ACTION_IDS = frozenset(
 )
 _MOBILE_PHONE_PATTERN = re.compile(r"^(?:\+?82|0)1[016789][0-9]{7,8}$")
 _ALERT_ITEM_LIMIT = 10
+_MARK_DONE_CARD_STATE_LIMIT = 4_096
+_MARK_DONE_MESSAGE_LOCK_STRIPES = 64
+_MARK_DONE_STATUS_PREFIX = "✅ *확인 완료*"
 _CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
     "recording_processing": "녹화 파일 처리 확인 필요",
@@ -75,6 +82,158 @@ _COMPONENT_TITLES = {
     "pm2": "PM2",
     "storage": "저장 공간",
 }
+
+
+class _DeviceAlertMarkDoneCoordinator:
+    """같은 카드의 완료 실행과 한 메시지의 Block Kit 갱신을 직렬화한다."""
+
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._card_states: OrderedDict[str, str] = OrderedDict()
+        # 네트워크 호출은 메시지별 stripe에서만 직렬화해 느린 Slack root
+        # 하나가 다른 모든 알림 카드의 완료 표시를 막지 않게 한다.
+        self._message_locks = tuple(
+            threading.Lock()
+            for _index in range(_MARK_DONE_MESSAGE_LOCK_STRIPES)
+        )
+
+    def reserve(self, card_key: str) -> bool:
+        with self._state_lock:
+            if card_key in self._card_states:
+                return False
+            self._card_states[card_key] = "in_flight"
+            self._prune_card_states()
+            return True
+
+    def complete(self, card_key: str) -> None:
+        with self._state_lock:
+            if self._card_states.get(card_key) != "in_flight":
+                return
+            self._card_states[card_key] = "completed"
+            self._card_states.move_to_end(card_key)
+            self._prune_card_states()
+
+    def release(self, card_key: str) -> None:
+        with self._state_lock:
+            if self._card_states.get(card_key) == "in_flight":
+                self._card_states.pop(card_key, None)
+
+    def update_message(
+        self,
+        client: Any,
+        identity: Mapping[str, Any],
+        *,
+        actor_user_id: str,
+        completed_at: datetime,
+        logger: logging.Logger,
+    ) -> bool:
+        channel_id = _text(identity.get("channelId"), "")
+        message_ts = _text(identity.get("messageTs"), "")
+
+        # payload의 message snapshot은 이미 오래됐을 수 있다. 같은 메시지의
+        # 완료 갱신을 직렬화하고 Slack root를 매번 한 번 읽은 뒤 그 최신
+        # blocks에만 완료 상태를 병합한다.
+        with self._message_lock(identity):
+            try:
+                response = client.conversations_replies(
+                    channel=channel_id,
+                    ts=message_ts,
+                    limit=1,
+                )
+                response_get = getattr(response, "get", None)
+                raw_messages = (
+                    response_get("messages")
+                    if callable(response_get)
+                    else None
+                )
+                if not isinstance(raw_messages, list):
+                    raise RuntimeError("Slack root messages are missing")
+                root_message = next(
+                    (
+                        message
+                        for message in raw_messages
+                        if isinstance(message, Mapping)
+                        and _text(message.get("ts"), "") == message_ts
+                    ),
+                    None,
+                )
+                if root_message is None:
+                    raise RuntimeError("Slack root message is missing")
+                raw_blocks = root_message.get("blocks")
+                root_text = root_message.get("text")
+                if not isinstance(raw_blocks, list) or not isinstance(
+                    root_text,
+                    str,
+                ):
+                    raise RuntimeError("Slack root presentation is invalid")
+                source_blocks = deepcopy(raw_blocks)
+            except Exception as exc:
+                logger.warning(
+                    "Device alert mark-done root read failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+            updated_blocks = _mark_done_blocks(
+                source_blocks,
+                clicked_block_id=_text(identity.get("blockId"), ""),
+                clicked_value=_text(identity.get("actionValue"), ""),
+                actor_user_id=actor_user_id,
+                completed_at=completed_at,
+            )
+            if updated_blocks is None:
+                logger.warning(
+                    "Device alert mark-done block not found channel=%s message_ts=%s",
+                    channel_id,
+                    message_ts,
+                )
+                return False
+            if updated_blocks == source_blocks:
+                # 최신 root에 이미 같은 카드의 완료 field가 있으면 replay는
+                # Slack mutation 없이 성공으로 끝낸다.
+                return True
+            try:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    text=root_text,
+                    blocks=updated_blocks,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Device alert mark-done UI update failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+            return True
+
+    def _message_lock(
+        self,
+        identity: Mapping[str, Any],
+    ) -> threading.Lock:
+        message_key = "\x1f".join(
+            (
+                _text(identity.get("workspaceId"), ""),
+                _text(identity.get("channelId"), ""),
+                _text(identity.get("messageTs"), ""),
+            )
+        )
+        digest = hashlib.sha256(message_key.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") % len(self._message_locks)
+        return self._message_locks[index]
+
+    def _prune_card_states(self) -> None:
+        while len(self._card_states) > _MARK_DONE_CARD_STATE_LIMIT:
+            completed_key = next(
+                (
+                    key
+                    for key, state in self._card_states.items()
+                    if state == "completed"
+                ),
+                None,
+            )
+            if completed_key is None:
+                return
+            self._card_states.pop(completed_key, None)
 
 
 def post_device_alert_summary(
@@ -118,12 +277,13 @@ def post_device_alert_summary(
             },
         }
     ]
-    for item in items[:_ALERT_ITEM_LIMIT]:
+    for card_index, item in enumerate(items[:_ALERT_ITEM_LIMIT]):
         # API 분리 전 카드의 식별 정보 → 장애 내용 → 연락처 순서를 유지한다.
         # 한 줄짜리 section으로 뭉개지지 않게 한다.
         blocks.extend(
             _alert_item_blocks(
                 item,
+                card_index=card_index,
                 include_actions=include_actions,
                 include_device_voice_action=include_device_voice_action,
             )
@@ -207,6 +367,7 @@ def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
 def _alert_item_blocks(
     item: Mapping[str, Any],
     *,
+    card_index: int,
     include_actions: bool,
     include_device_voice_action: bool,
 ) -> list[dict[str, Any]]:
@@ -287,8 +448,21 @@ def _alert_item_blocks(
             "value": value,
         }
     )
-    blocks.append({"type": "actions", "elements": action_elements})
+    blocks.append(
+        {
+            "type": "actions",
+            "block_id": _alert_action_block_id(item, card_index),
+            "elements": action_elements,
+        }
+    )
     return blocks
+
+
+def _alert_action_block_id(item: Mapping[str, Any], card_index: int) -> str:
+    digest = hashlib.sha256(
+        _alert_action_value(item).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"device_alert_actions_{card_index}_{digest}"
 
 
 def _device_name_text(item: Mapping[str, Any]) -> str:
@@ -373,6 +547,8 @@ def attach_device_alert_actions(
 ) -> None:
     """Slack action/modal을 membership 검사 뒤 API bridge에만 연결한다."""
 
+    mark_done_coordinator = _DeviceAlertMarkDoneCoordinator()
+
     def action_handler(action_id: str) -> Callable[..., None]:
         def handle(ack: Any, body: dict[str, Any], client: Any) -> None:
             ack()
@@ -405,6 +581,7 @@ def attach_device_alert_actions(
                 logger,
                 action_api_bridge,
                 action_id=action_id,
+                mark_done_coordinator=mark_done_coordinator,
             )
 
         return handle
@@ -514,16 +691,32 @@ def _action_identity(body: Mapping[str, Any]) -> dict[str, Any]:
     team = body.get("team") if isinstance(body.get("team"), Mapping) else {}
     user = body.get("user") if isinstance(body.get("user"), Mapping) else {}
     channel = body.get("channel") if isinstance(body.get("channel"), Mapping) else {}
+    container = (
+        body.get("container")
+        if isinstance(body.get("container"), Mapping)
+        else {}
+    )
     message = body.get("message") if isinstance(body.get("message"), Mapping) else {}
-    message_ts = _text(message.get("ts"), "")
+    message_ts = _text(
+        message.get("ts") or container.get("message_ts"),
+        "",
+    )
     return {
         "workspaceId": _text(team.get("id") or body.get("team_id"), ""),
         "actorUserId": _text(user.get("id"), ""),
-        "channelId": _text(channel.get("id"), ""),
+        "channelId": _text(
+            channel.get("id") or container.get("channel_id"),
+            "",
+        ),
         "messageTs": message_ts,
-        "threadTs": _text(message.get("thread_ts"), message_ts),
+        "threadTs": _text(
+            message.get("thread_ts") or container.get("thread_ts"),
+            message_ts,
+        ),
         "interactionId": _text(action.get("action_ts"), ""),
         "triggerId": _text(body.get("trigger_id"), ""),
+        "blockId": _text(action.get("block_id"), ""),
+        "actionValue": _text(action.get("value"), ""),
         "item": _parse_json_mapping(action.get("value")),
     }
 
@@ -624,8 +817,17 @@ def _execute_remote_action(
     bridge: DeviceHealthAlertApiBridge,
     *,
     action_id: str,
+    mark_done_coordinator: _DeviceAlertMarkDoneCoordinator,
 ) -> None:
     identity = _action_identity(body)
+    is_mark_done = action_id == DEVICE_HEALTH_ALERT_ACTION_MARK_DONE
+    mark_done_key = _mark_done_card_key(identity) if is_mark_done else ""
+    if is_mark_done and (
+        not mark_done_key or not mark_done_coordinator.reserve(mark_done_key)
+    ):
+        # Slack redelivery와 동시에 들어온 두 번째 클릭은 같은 카드에서
+        # API 실행·감사 이벤트·스레드 답글을 다시 만들지 않는다.
+        return
     try:
         target = build_device_health_alert_api_target(identity["item"])
         request_id = build_device_health_alert_request_id(
@@ -647,11 +849,55 @@ def _execute_remote_action(
             workspace_id=identity["workspaceId"],
             actor_user_id=identity["actorUserId"],
             channel_id=identity["channelId"],
-            conversation_id=identity["threadTs"],
+            conversation_id=(
+                identity["messageTs"]
+                if is_mark_done
+                else identity["threadTs"]
+            ),
             target=target,
         )
         messages = result.messages
+        if is_mark_done:
+            if str(result.outcome or "").strip() == "answered":
+                if result.operation_result is None:
+                    # Slack을 API보다 먼저 배포한 호환 창에는 구 API의 완료
+                    # 댓글 동작을 유지하고 새 카드 상태는 아직 만들지 않는다.
+                    mark_done_coordinator.release(mark_done_key)
+                else:
+                    acknowledgement = _mark_done_receipt(
+                        result.operation_result
+                    )
+                    if acknowledgement is None:
+                        raise RuntimeError(
+                            "device health alert ack receipt is invalid"
+                        )
+                    actor_user_id, completed_at, _created = acknowledgement
+                    ui_updated = mark_done_coordinator.update_message(
+                        client,
+                        identity,
+                        actor_user_id=actor_user_id,
+                        completed_at=completed_at,
+                        logger=logger,
+                    )
+                    if ui_updated:
+                        mark_done_coordinator.complete(mark_done_key)
+                        # 성공 상태는 root 카드가 정본이다. 새 receipt와 replay
+                        # 모두 완료 스레드 댓글을 추가하지 않는다.
+                        messages = ()
+                    else:
+                        # API claim은 되돌리지 않는다. 가드는 풀어 다음 클릭이
+                        # 최초 receipt로 UI만 복구할 수 있게 한다.
+                        mark_done_coordinator.release(mark_done_key)
+                        warning = (
+                            "확인 완료 기록은 남겼지만 카드 표시를 갱신하지 "
+                            "못했어. 잠시 후 다시 눌러 표시만 복구해줘"
+                        )
+                        messages = (warning,)
+            else:
+                mark_done_coordinator.release(mark_done_key)
     except Exception as exc:
+        if is_mark_done and mark_done_key:
+            mark_done_coordinator.release(mark_done_key)
         logger.warning(
             "Device alert remote action failed error_type=%s",
             type(exc).__name__,
@@ -662,6 +908,148 @@ def _execute_remote_action(
         )
     for message in messages:
         _post_thread_reply(client, identity, message, logger)
+
+
+def _mark_done_card_key(identity: Mapping[str, Any]) -> str:
+    parts = (
+        _text(identity.get("workspaceId"), ""),
+        _text(identity.get("channelId"), ""),
+        _text(identity.get("messageTs"), ""),
+    )
+    item = identity.get("item")
+    if any(not part for part in parts) or not isinstance(item, Mapping):
+        return ""
+    block_id = _text(identity.get("blockId"), "")
+    canonical_item = json.dumps(
+        dict(item),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(
+        "\x1f".join((*parts, block_id, canonical_item)).encode("utf-8")
+    ).hexdigest()
+
+
+def _mark_done_receipt(
+    value: Any,
+) -> tuple[str, datetime, bool] | None:
+    if not isinstance(value, Mapping):
+        return None
+    actor_user_id = _text(value.get("actorUserId"), "")
+    try:
+        acknowledged_at = datetime.fromisoformat(
+            _text(value.get("acknowledgedAt"), "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+    created = value.get("created")
+    if (
+        value.get("kind") != "device_health_alert_ack"
+        or not actor_user_id
+        or acknowledged_at.tzinfo is None
+        or not isinstance(created, bool)
+    ):
+        return None
+    return actor_user_id, acknowledged_at.astimezone(_KST), created
+
+
+def _mark_done_time_text(completed_at: datetime) -> str:
+    return completed_at.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+def _mark_done_blocks(
+    blocks: list[dict[str, Any]],
+    *,
+    clicked_block_id: str,
+    clicked_value: str,
+    actor_user_id: str,
+    completed_at: datetime,
+) -> list[dict[str, Any]] | None:
+    exact_matches: list[int] = []
+    legacy_matches: list[int] = []
+    for index, raw_block in enumerate(blocks):
+        block = raw_block if isinstance(raw_block, Mapping) else {}
+        elements = block.get("elements")
+        if block.get("type") != "actions" or not isinstance(elements, list):
+            continue
+        has_clicked_value = any(
+            isinstance(element, Mapping)
+            and _text(element.get("value"), "") == clicked_value
+            for element in elements
+        )
+        if not has_clicked_value:
+            continue
+        if clicked_block_id and _text(block.get("block_id"), "") == clicked_block_id:
+            exact_matches.append(index)
+        elif not _text(block.get("block_id"), ""):
+            legacy_matches.append(index)
+
+    matches = exact_matches if clicked_block_id else legacy_matches
+    if clicked_block_id and not exact_matches:
+        # 명시 block_id가 없는 구 카드에만 value unique fallback을 허용한다.
+        matches = legacy_matches
+    if len(matches) != 1:
+        return None
+    matched_index = matches[0]
+    if matched_index <= 0:
+        return None
+    raw_contact_block = blocks[matched_index - 1]
+    if not isinstance(raw_contact_block, Mapping) or raw_contact_block.get(
+        "type"
+    ) != "section":
+        return None
+    raw_fields = raw_contact_block.get("fields")
+    if not isinstance(raw_fields, list):
+        return None
+
+    updated_blocks = deepcopy(blocks)
+    action_block = updated_blocks[matched_index]
+    contact_block = updated_blocks[matched_index - 1]
+    if not isinstance(action_block, dict) or not isinstance(contact_block, dict):
+        return None
+    elements = action_block.get("elements")
+    fields = contact_block.get("fields")
+    if not isinstance(elements, list) or not isinstance(fields, list):
+        return None
+
+    status_exists = any(
+        isinstance(field, Mapping)
+        and _text(field.get("text"), "").startswith(_MARK_DONE_STATUS_PREFIX)
+        for field in fields
+    )
+    mark_done_indexes = [
+        index
+        for index, element in enumerate(elements)
+        if isinstance(element, Mapping)
+        and element.get("action_id") == DEVICE_HEALTH_ALERT_ACTION_MARK_DONE
+        and _text(element.get("value"), "") == clicked_value
+    ]
+    if len(mark_done_indexes) > 1 or (
+        not mark_done_indexes and not status_exists
+    ):
+        return None
+
+    # 같은 actions block의 문자·음성 버튼은 유지하고 완료 버튼 하나만
+    # 제거한다. 완료 표시는 직전 연락처 section의 field에 넣어 메시지
+    # block 수를 늘리지 않는다.
+    if mark_done_indexes:
+        del elements[mark_done_indexes[0]]
+    if not elements:
+        return None
+    if not status_exists:
+        fields.append(
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"{_MARK_DONE_STATUS_PREFIX}\n"
+                    f"담당자 <@{actor_user_id}>\n"
+                    "처리 시간 "
+                    f"`{_mark_done_time_text(completed_at)}`"
+                ),
+            }
+        )
+    return updated_blocks
 
 
 def _send_remote_sms(

@@ -26,6 +26,9 @@ from boxer_company.assistant.device_db_detail_route import (
     DeviceDetailAssistantRoute,
     DeviceDbDetailAssistantRoute,
 )
+from boxer_company.assistant.device_health_alert_action_route import (
+    DeviceHealthAlertActionRouteDeps,
+)
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
 )
@@ -255,6 +258,9 @@ def _create_provider_ready(
 def create_company_assistant_runtime(
     *,
     diagnostic_snapshot_loader: DiagnosticSnapshotLoader | None = None,
+    device_health_alert_action_deps: (
+        DeviceHealthAlertActionRouteDeps | None
+    ) = None,
     logger: logging.Logger | None = None,
 ) -> CompanyAssistantRuntime:
     """Slack/Web adapter 없이 회사 내부 assistant runtime을 조립한다."""
@@ -431,6 +437,9 @@ def create_company_assistant_runtime(
                     answer_composer=operation_answer_composer,
                     timeout_message=timeout_message,
                     logger=app_logger,
+                    device_health_alert_action_deps=(
+                        device_health_alert_action_deps
+                    ),
                 ),
             ),
             freeform_routes=(

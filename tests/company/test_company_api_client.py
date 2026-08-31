@@ -219,6 +219,22 @@ def _success_response(
     )
 
 
+def _device_health_alert_ack_result() -> dict[str, Any]:
+    return {
+        "kind": "device_health_alert_ack",
+        "created": True,
+        "actorUserId": "U-ACTOR",
+        "acknowledgedAt": "2026-08-31T00:07:12+00:00",
+        "target": {
+            "hospital": "한국의료재단(영등포)",
+            "room": "4층 초음파실9",
+            "device": "MB2-A00140",
+            "components": [],
+            "issue": "녹화 파일 증가 정지가 120초 동안 지속됐어",
+        },
+    }
+
+
 def _download_delivery_result() -> dict[str, Any]:
     return {
         "kind": "device_file_download_delivery",
@@ -1103,6 +1119,74 @@ class CompanyApiClientContractTests(unittest.TestCase):
             "01012345678",
         )
         self.assertEqual(sent.operation_result["groupId"], "GROUP-1")
+
+    def test_deserializes_exact_device_health_alert_ack_receipt(self) -> None:
+        request = _request()
+        payload = _success_payload(request.request_id)
+        receipt = _device_health_alert_ack_result()
+        payload.update(
+            {
+                "route": "device_health_alert_mark_done",
+                "sources": [],
+                "usedLlm": False,
+                "operationResult": receipt,
+            }
+        )
+        session = _FakeSession(
+            _FakeResponse(200, payload, "application/json")
+        )
+
+        result = _client(session).answer(request, route_group="operations")
+
+        self.assertEqual(result.operation_result, receipt)
+        self.assertIsNot(result.operation_result, receipt)
+
+    def test_rejects_invalid_device_health_alert_ack_receipts(self) -> None:
+        request = _request()
+        valid = _device_health_alert_ack_result()
+        invalid_target = dict(valid["target"])
+        invalid_target["phoneNumber"] = "01012345678"
+        cases = {
+            "unexpected_field": {**valid, "unexpected": True},
+            "created_integer": {**valid, "created": 1},
+            "actor_markup_injection": {
+                **valid,
+                "actorUserId": "U1> <!channel",
+            },
+            "timestamp_without_timezone": {
+                **valid,
+                "acknowledgedAt": "2026-08-31T09:07:12",
+            },
+            "sensitive_target_field": {**valid, "target": invalid_target},
+        }
+
+        # 담당자·시간·대상 중 하나라도 wire 계약을 벗어나면 Slack 카드가
+        # 잘못 완료될 수 있으므로 HTTP client에서 모두 fail-closed한다.
+        for name, receipt in cases.items():
+            with self.subTest(name=name):
+                payload = _success_payload(request.request_id)
+                payload.update(
+                    {
+                        "route": "device_health_alert_mark_done",
+                        "sources": [],
+                        "usedLlm": False,
+                        "operationResult": receipt,
+                    }
+                )
+                session = _FakeSession(
+                    _FakeResponse(200, payload, "application/json")
+                )
+
+                with self.assertRaises(CompanyApiContractError) as raised:
+                    _client(session).answer(
+                        request,
+                        route_group="operations",
+                    )
+
+                self.assertEqual(
+                    str(raised.exception),
+                    "company_api_operation_result_invalid",
+                )
 
     def test_rejects_unknown_or_sensitive_operation_receipt_shape(self) -> None:
         request = _request()

@@ -26,6 +26,7 @@ from boxer_company.assistant.device_health_alert_action_route import (
     DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
     DEVICE_HEALTH_ALERT_VOICE_ROUTE,
     DeviceHealthAlertActionAssistantRoute,
+    DeviceHealthAlertActionRouteDeps,
 )
 from boxer_company.assistant.device_operations_route import (
     DEVICE_OPERATION_DELIVERY_ACTION,
@@ -116,6 +117,7 @@ _MUTATION_CAPABLE_OPERATION_ROUTES = _MUTATING_OPERATION_ROUTES | frozenset(
         SECURITY_REVIEW_ROUTE,
         DEVICE_HEALTH_ALERT_SMS_ROUTE,
         DEVICE_HEALTH_ALERT_VOICE_ROUTE,
+        DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
         # Slack UI POST 결과도 같은 request-id guard 아래 한 번만 JSONL에 쓴다.
         DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
         # 조회 응답 자체는 read-only여도 endpoint가 없으면 sshOrder(open)으로
@@ -296,6 +298,21 @@ def is_uncertain_company_mutation_result(
     )
 
 
+def is_retryable_company_mutation_result(
+    *,
+    mutation_route: str,
+    result: CompanyAssistantResult,
+) -> bool:
+    """영속 unique claim을 다시 읽어도 안전한 저장소 실패만 해제한다."""
+
+    return bool(
+        mutation_route == DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE
+        and result.outcome == "failed"
+        and str(result.fallback_reason or "").strip()
+        == "device_health_alert_ack_store_failed"
+    )
+
+
 def build_company_operation_routes(
     *,
     context_max_chars: int,
@@ -303,6 +320,9 @@ def build_company_operation_routes(
     answer_composer: CompanyEvidenceAnswerComposer | None = None,
     timeout_message: str | None = None,
     logger: logging.Logger | None = None,
+    device_health_alert_action_deps: (
+        DeviceHealthAlertActionRouteDeps | None
+    ) = None,
 ) -> tuple[Any, ...]:
     """공통 API 프로세스에서만 operation 구현을 고정 순서로 조립한다."""
 
@@ -322,7 +342,10 @@ def build_company_operation_routes(
         if route.name not in _LEGACY_PRE_DEVICE_PRIVATE_ROUTES
     )
     security_route = SecurityReviewAssistantRoute()
-    alert_route = DeviceHealthAlertActionAssistantRoute(logger=logger)
+    alert_route = DeviceHealthAlertActionAssistantRoute(
+        deps=device_health_alert_action_deps,
+        logger=logger,
+    )
     learning_route = ThreadPlaybookLearningAssistantRoute(
         context_max_chars=context_max_chars,
         claude_client=claude_client,
@@ -386,6 +409,7 @@ def build_company_operation_routes(
 __all__ = [
     "build_company_operation_routes",
     "company_operation_route_names",
+    "is_retryable_company_mutation_result",
     "is_uncertain_company_mutation_result",
     "match_live_device_company_operation_route",
     "match_mutation_capable_company_operation_route",

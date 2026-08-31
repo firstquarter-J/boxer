@@ -6,7 +6,7 @@ from boxer_company.operation_routing import (
     match_device_health_alert_action_route,
 )
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import logging
 import re
@@ -18,6 +18,10 @@ import requests
 from boxer.core import settings as core_settings
 from boxer.retrieval.connectors.db import _create_db_connection
 from boxer_company import settings as company_settings
+from boxer_company.device_health_alert_ack import (
+    DeviceHealthAlertAcknowledgement,
+    claim_device_health_alert_acknowledgement,
+)
 from boxer_company.device_health_event_log import (
     append_device_health_monitor_event,
 )
@@ -48,6 +52,7 @@ from boxer_company.sms_delivery_cycle import (
     remember_sms_delivery_sheet_record,
 )
 from boxer_company.transport_contracts import (
+    DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX,
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
     DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
     DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -153,6 +158,9 @@ class DeviceHealthAlertActionRouteDeps:
         event_type,
         payload,
         now=now,
+    )
+    claim_mark_done: Callable[..., DeviceHealthAlertAcknowledgement] = (
+        claim_device_health_alert_acknowledgement
     )
 
 
@@ -266,7 +274,40 @@ class DeviceHealthAlertActionAssistantRoute:
                 self._send_voice(request, action),
             )
         if action.name == DEVICE_HEALTH_ALERT_MARK_DONE_ACTION:
-            return self._record_action_result(
+            acknowledged_at = self._deps.now()
+            try:
+                acknowledgement = self._deps.claim_mark_done(
+                    workspace_id=request.tenant_id,
+                    channel_id=str(
+                        request.metadata.get("channel_id") or ""
+                    ),
+                    # 새 Slack은 mark-done 요청의 conversation ID에 실제
+                    # 클릭 메시지 ts를 보내고 구 Slack은 기존 root ts를 보낸다.
+                    message_ts=request.conversation_id,
+                    target=_ack_target(action.target),
+                    actor_user_id=str(request.actor_id or ""),
+                    acknowledged_at=acknowledged_at,
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "Device health alert acknowledgement failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return self._record_action_result(
+                    request,
+                    action,
+                    _result(
+                        route=route,
+                        outcome="failed",
+                        body=(
+                            "확인 완료 상태를 저장하지 못해 처리하지 않았어"
+                        ),
+                        fallback_reason=(
+                            "device_health_alert_ack_store_failed"
+                        ),
+                    ),
+                )
+            recorded = self._record_action_result(
                 request,
                 action,
                 _result(
@@ -277,8 +318,19 @@ class DeviceHealthAlertActionAssistantRoute:
                         f"• 작업: **확인 완료**\n"
                         f"• 대상: `{_format_target(action.target)}`"
                     ),
+                    operation_result=_ack_operation_result(
+                        action.target,
+                        acknowledgement,
+                    ),
                 ),
             )
+            if not request.request_id.startswith(
+                DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX
+            ):
+                # 구 Slack은 operationResult가 있으면 계약 오류로 막으므로
+                # capability prefix가 없는 요청에는 기존 응답 모양을 유지한다.
+                return replace(recorded, operation_result=None)
+            return recorded
         return None
 
     def _record_action_result(
@@ -289,6 +341,16 @@ class DeviceHealthAlertActionAssistantRoute:
     ) -> CompanyAssistantResult:
         """API가 실행한 action을 health JSONL 정본에 best-effort로 남긴다."""
 
+        if (
+            action.name == DEVICE_HEALTH_ALERT_MARK_DONE_ACTION
+            and isinstance(result.operation_result, Mapping)
+            and result.operation_result.get("kind")
+            == "device_health_alert_ack"
+            and result.operation_result.get("created") is False
+        ):
+            # 영속 claim이 기존 완료를 돌려준 재클릭은 최초 담당자·시간만
+            # 재사용하고 JSONL 완료 이벤트를 한 줄 더 만들지 않는다.
+            return result
         occurred_at = self._deps.now()
         try:
             self._deps.write_event(
@@ -1250,6 +1312,38 @@ def _format_target(target: DeviceHealthAlertActionTarget) -> str:
     return " / ".join(
         (target.hospital_name, target.room_name, target.device_name)
     )
+
+
+def _ack_target(target: DeviceHealthAlertActionTarget) -> dict[str, Any]:
+    return {
+        "hospitalSeq": target.hospital_seq,
+        "hospitalName": target.hospital_name,
+        "hospital": target.hospital_label,
+        "room": target.room_name,
+        "device": target.device_name,
+        "issue": target.issue,
+    }
+
+
+def _ack_operation_result(
+    target: DeviceHealthAlertActionTarget,
+    acknowledgement: DeviceHealthAlertAcknowledgement,
+) -> dict[str, Any]:
+    """Slack UI가 최초 담당자·시간만 표시하도록 고정 receipt를 만든다."""
+
+    return {
+        "kind": "device_health_alert_ack",
+        "created": acknowledgement.created,
+        "actorUserId": acknowledgement.actor_user_id,
+        "acknowledgedAt": acknowledgement.acknowledged_at.isoformat(),
+        "target": {
+            "hospital": target.hospital_name,
+            "room": target.room_name,
+            "device": target.device_name,
+            "components": list(target.problem_components),
+            "issue": target.issue,
+        },
+    }
 
 
 def _build_sms_operation_result(

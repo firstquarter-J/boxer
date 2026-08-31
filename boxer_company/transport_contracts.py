@@ -34,6 +34,11 @@ DEVICE_HEALTH_ALERT_SMS_ROUTE = "device_health_alert_sms"
 DEVICE_HEALTH_ALERT_VOICE_ROUTE = "device_health_alert_voice_guide"
 DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE = "device_health_alert_mark_done"
 DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE = "device_health_alert_ui_receipt"
+# request ID prefix가 구/신 API 사이의 wire capability 역할을 해 두 서버를
+# 순차 배포하는 동안에도 구 mark-done 응답 계약을 깨지 않는다.
+DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX = (
+    "slack-device-alert-ack-v1-"
+)
 
 HPA_CHANGE_POLICY_ALLOWED_CHANNEL_IDS = frozenset(
     {"C02C08K7YEN", "C068FVD5V7Y"}
@@ -348,6 +353,7 @@ def _has_hospital_room(question: str) -> bool:
 
 __all__ = [
     "DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION",
+    "DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX",
     "DEVICE_HEALTH_ALERT_MARK_DONE_ACTION",
     "DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE",
     "DEVICE_HEALTH_ALERT_SMS_ACTION",

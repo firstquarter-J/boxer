@@ -27,6 +27,7 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
 )
 from boxer_company.assistant.operations import (
+    is_retryable_company_mutation_result,
     is_uncertain_company_mutation_result,
     match_live_device_company_operation_route,
     match_mutation_capable_company_operation_route,
@@ -38,6 +39,10 @@ from boxer_company.assistant.request_log_contract import (
 from boxer_company.automation import (
     AutomationCycleContractError,
     build_default_automation_cycle_service,
+)
+from boxer_company.device_health_alert_ack import (
+    claim_device_health_alert_acknowledgement,
+    ensure_device_health_alert_ack_schema,
 )
 from boxer_company.hpa_change_coordinator import (
     HpaChangeCoordinator,
@@ -688,8 +693,15 @@ def create_company_api_app(
                 ) from None
 
             mutation_result_uncertain = False
+            mutation_result_retryable = False
             if reservation is not None:
                 assert mutation_route is not None
+                mutation_result_retryable = (
+                    is_retryable_company_mutation_result(
+                        mutation_route=mutation_route,
+                        result=result,
+                    )
+                )
                 mutation_result_uncertain = (
                     is_uncertain_company_mutation_result(
                         mutation_route=mutation_route,
@@ -737,9 +749,14 @@ def create_company_api_app(
                 request_log_state["ready"] = False
             if reservation is not None and not mutation_result_uncertain:
                 if request_log_persisted:
-                    # pending_delivery가 transaction으로 보인 뒤에만 replay에
-                    # final payload를 공개해 receipt가 missing row를 보지 않게 한다.
-                    mutation_request_guard.complete(reservation, payload)
+                    if mutation_result_retryable:
+                        # unique ACK claim은 같은 request ID로 다시 읽어도
+                        # 중복 side effect가 없어 transient SQLite 실패를 고정하지 않는다.
+                        mutation_request_guard.release(reservation)
+                    else:
+                        # pending_delivery가 transaction으로 보인 뒤에만 replay에
+                        # final payload를 공개해 receipt가 missing row를 보지 않게 한다.
+                        mutation_request_guard.complete(reservation, payload)
                 else:
                     mutation_request_guard.mark_uncertain(reservation)
 
@@ -1556,6 +1573,9 @@ def _initialize_request_log_readiness(
         # 마지막 ensure로 schema 존재를 확인한다.
         _initialize_request_log_storage(db_path=path)
         _ensure_request_log_schema(path)
+        # 확인 완료는 같은 SQLite 안의 회사 전용 unique claim을 정본으로
+        # 쓴다. 서비스가 요청을 받기 전에 두 스키마를 함께 준비한다.
+        ensure_device_health_alert_ack_schema(path)
         if was_missing:
             # restore/schema가 만든 leaf만 소유자·파일 종류를 먼저 확인한 뒤
             # 권한을 축소한다. 기존 unsafe leaf는 위 선검사에서 그대로 거부한다.
@@ -1646,6 +1666,9 @@ def _resolve_runtime(
         from boxer_company.assistant.factory import (
             create_company_assistant_runtime,
         )
+        from boxer_company.assistant.device_health_alert_action_route import (
+            DeviceHealthAlertActionRouteDeps,
+        )
         from boxer_company.settings import (
             validate_company_data_source_settings,
         )
@@ -1658,7 +1681,32 @@ def _resolve_runtime(
             include_data_sources=True,
         )
         validate_company_data_source_settings()
-        return create_company_assistant_runtime(), True
+
+        def claim_mark_done_with_api_storage(**kwargs: Any) -> Any:
+            # startup readiness와 실제 claim이 같은 settings 객체의 exact
+            # SQLite를 쓰고, startup 뒤 삭제·symlink 교체된 leaf는 기존
+            # 감사 저장과 같이 fail-closed해 중복 방지 이력을 초기화하지 않는다.
+            request_log_path = Path(settings.request_log_path)
+            if (
+                not settings.request_log_enabled
+                or not _secure_request_log_leaf(request_log_path)
+            ):
+                raise RuntimeError(
+                    "device health alert ack storage is disabled"
+                )
+            return claim_device_health_alert_acknowledgement(
+                **kwargs,
+                db_path=request_log_path,
+                schema_prepared=True,
+            )
+
+        return create_company_assistant_runtime(
+            device_health_alert_action_deps=(
+                DeviceHealthAlertActionRouteDeps(
+                    claim_mark_done=claim_mark_done_with_api_storage,
+                )
+            ),
+        ), True
     except Exception:
         emit_api_event(
             "company_api_runtime_initialization_failed",

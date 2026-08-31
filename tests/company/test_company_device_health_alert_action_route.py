@@ -29,10 +29,17 @@ from boxer_company.assistant.device_health_alert_action_route import (
 )
 from boxer_company.assistant.operations import (
     company_operation_route_names,
+    match_mutation_capable_company_operation_route,
+)
+from boxer_company.device_health_alert_ack import (
+    DeviceHealthAlertAcknowledgement,
 )
 from boxer_company.operation_routing import match_company_operation_route
 from boxer_company.routers.device_ssh_security import (
     company_api_device_ssh_context,
+)
+from boxer_company.transport_contracts import (
+    DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX,
 )
 from boxer_company_api.auth import CallerPrincipal
 from boxer_company_api.policies import authorize_turn
@@ -67,16 +74,24 @@ def _action_metadata(
             "phone_number": "01012345678",
             "message": "직접 작성한 안내 문자입니다.",
         }
-    return {"route_group": "operations", "operation_action": action}
+    return {
+        "route_group": "operations",
+        "channel_id": "C-HEALTH",
+        "operation_action": action,
+    }
 
 
 def _request(name: str, *, include_sms: bool = False) -> CompanyAssistantRequest:
     return CompanyAssistantRequest(
-        request_id="REQ-ALERT-ACTION-1",
+        request_id=(
+            f"{DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX}test"
+            if name == DEVICE_HEALTH_ALERT_MARK_DONE_ACTION
+            else "REQ-ALERT-ACTION-1"
+        ),
         tenant_id="TENANT-1",
         actor_id="ACTOR-1",
         channel="slack",
-        conversation_id="THREAD-1",
+        conversation_id="3000.001",
         # Typed action route가 질문 문구를 실행 명령으로 해석하지 않는지 고정한다.
         question="이 문구는 실행 명령이 아니야",
         locale="ko",
@@ -434,16 +449,28 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
                     command="voice_guide",
                 )
 
-    def test_mark_done_does_not_call_mda_or_sms(self) -> None:
+    def test_mark_done_claims_ack_and_returns_canonical_receipt(self) -> None:
         get_mda = Mock()
         send_command = Mock()
         send_sms = Mock()
+        write_event = Mock(return_value=True)
+        acknowledged_at = datetime(2026, 8, 31, 0, 12, 34, tzinfo=timezone.utc)
+        claim_mark_done = Mock(
+            return_value=DeviceHealthAlertAcknowledgement(
+                created=True,
+                actor_user_id="ACTOR-1",
+                acknowledged_at=acknowledged_at,
+            )
+        )
         deps = replace(
             DeviceHealthAlertActionRouteDeps(),
             load_exact_target=Mock(return_value=_exact_target()),
             get_mda_device=get_mda,
             send_mda_command=send_command,
             send_sms=send_sms,
+            now=Mock(return_value=acknowledged_at),
+            write_event=write_event,
+            claim_mark_done=claim_mark_done,
         )
 
         result = DeviceHealthAlertActionAssistantRoute(deps).handle(
@@ -453,9 +480,198 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.outcome, "answered")
+        self.assertEqual(
+            result.operation_result,
+            {
+                "kind": "device_health_alert_ack",
+                "created": True,
+                "actorUserId": "ACTOR-1",
+                "acknowledgedAt": "2026-08-31T00:12:34+00:00",
+                "target": {
+                    "hospital": "분당제일병원",
+                    "room": "2진료실",
+                    "device": "MB2-C00419",
+                    "components": ["캡처보드"],
+                    "issue": "캡처보드 연결 확인 필요",
+                },
+            },
+        )
+        claim_mark_done.assert_called_once_with(
+            workspace_id="TENANT-1",
+            channel_id="C-HEALTH",
+            message_ts="3000.001",
+            target={
+                "hospitalSeq": 31,
+                "hospitalName": "분당제일병원",
+                "hospital": "",
+                "room": "2진료실",
+                "device": "MB2-C00419",
+                "issue": "캡처보드 연결 확인 필요",
+            },
+            actor_user_id="ACTOR-1",
+            acknowledged_at=acknowledged_at,
+        )
+        write_event.assert_called_once()
         get_mda.assert_not_called()
         send_command.assert_not_called()
         send_sms.assert_not_called()
+
+    def test_duplicate_mark_done_reuses_first_ack_without_event(self) -> None:
+        first_acknowledged_at = datetime(
+            2026,
+            8,
+            31,
+            0,
+            12,
+            34,
+            tzinfo=timezone.utc,
+        )
+        duplicate_requested_at = datetime(
+            2026,
+            8,
+            31,
+            0,
+            20,
+            tzinfo=timezone.utc,
+        )
+        claim_mark_done = Mock(
+            return_value=DeviceHealthAlertAcknowledgement(
+                created=False,
+                actor_user_id="ACTOR-FIRST",
+                acknowledged_at=first_acknowledged_at,
+            )
+        )
+        write_event = Mock(return_value=True)
+        deps = replace(
+            DeviceHealthAlertActionRouteDeps(),
+            load_exact_target=Mock(return_value=_exact_target()),
+            now=Mock(return_value=duplicate_requested_at),
+            write_event=write_event,
+            claim_mark_done=claim_mark_done,
+        )
+        request = replace(
+            _request(DEVICE_HEALTH_ALERT_MARK_DONE_ACTION),
+            actor_id="ACTOR-SECOND",
+        )
+
+        result = DeviceHealthAlertActionAssistantRoute(deps).handle(request)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.outcome, "answered")
+        self.assertFalse(result.operation_result["created"])
+        self.assertEqual(
+            result.operation_result["actorUserId"],
+            "ACTOR-FIRST",
+        )
+        self.assertEqual(
+            result.operation_result["acknowledgedAt"],
+            "2026-08-31T00:12:34+00:00",
+        )
+        claim_mark_done.assert_called_once()
+        self.assertEqual(
+            claim_mark_done.call_args.kwargs["actor_user_id"],
+            "ACTOR-SECOND",
+        )
+        self.assertEqual(
+            claim_mark_done.call_args.kwargs["acknowledged_at"],
+            duplicate_requested_at,
+        )
+        # duplicate는 최초 완료 정보를 UI에 재사용할 뿐 JSONL 이벤트를
+        # 하나 더 만들어서는 안 된다.
+        write_event.assert_not_called()
+
+    def test_legacy_mark_done_request_omits_new_ack_receipt(self) -> None:
+        # 구 Slack은 mark-done의 non-null operationResult를 거절하므로 새
+        # API를 먼저 배포해도 capability prefix 전에는 기존 응답을 유지한다.
+        acknowledged_at = datetime(
+            2026,
+            8,
+            31,
+            0,
+            12,
+            34,
+            tzinfo=timezone.utc,
+        )
+        claim_mark_done = Mock(
+            return_value=DeviceHealthAlertAcknowledgement(
+                created=True,
+                actor_user_id="ACTOR-1",
+                acknowledged_at=acknowledged_at,
+            )
+        )
+        deps = replace(
+            DeviceHealthAlertActionRouteDeps(),
+            load_exact_target=Mock(return_value=_exact_target()),
+            now=Mock(return_value=acknowledged_at),
+            write_event=Mock(return_value=True),
+            claim_mark_done=claim_mark_done,
+        )
+        request = replace(
+            _request(DEVICE_HEALTH_ALERT_MARK_DONE_ACTION),
+            request_id="slack-device-alert-legacy-request",
+        )
+
+        result = DeviceHealthAlertActionAssistantRoute(deps).handle(request)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.outcome, "answered")
+        self.assertIsNone(result.operation_result)
+        claim_mark_done.assert_called_once()
+
+    def test_mark_done_store_failure_returns_failed_without_device_action(
+        self,
+    ) -> None:
+        get_mda = Mock()
+        send_command = Mock()
+        send_sms = Mock()
+        write_event = Mock(return_value=True)
+        claim_mark_done = Mock(side_effect=OSError("storage unavailable"))
+        deps = replace(
+            DeviceHealthAlertActionRouteDeps(),
+            load_exact_target=Mock(return_value=_exact_target()),
+            get_mda_device=get_mda,
+            send_mda_command=send_command,
+            send_sms=send_sms,
+            now=Mock(
+                return_value=datetime(
+                    2026,
+                    8,
+                    31,
+                    0,
+                    12,
+                    34,
+                    tzinfo=timezone.utc,
+                )
+            ),
+            write_event=write_event,
+            claim_mark_done=claim_mark_done,
+        )
+
+        result = DeviceHealthAlertActionAssistantRoute(deps).handle(
+            _request(DEVICE_HEALTH_ALERT_MARK_DONE_ACTION)
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(
+            result.fallback_reason,
+            "device_health_alert_ack_store_failed",
+        )
+        self.assertIsNone(result.operation_result)
+        claim_mark_done.assert_called_once()
+        get_mda.assert_not_called()
+        send_command.assert_not_called()
+        send_sms.assert_not_called()
+        write_event.assert_called_once()
+        event_payload = write_event.call_args.args[2]
+        self.assertEqual(event_payload["result"]["status"], "failed")
+        self.assertEqual(
+            event_payload["result"]["fallbackReason"],
+            "device_health_alert_ack_store_failed",
+        )
 
     def test_sms_transport_timeout_is_called_once_and_marked_uncertain(self) -> None:
         payload = {
@@ -530,6 +746,16 @@ class DeviceHealthAlertActionRouteTests(unittest.TestCase):
                 DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
                 DEVICE_HEALTH_ALERT_UI_RECEIPT_ROUTE,
             }.issubset(company_operation_route_names())
+        )
+
+    def test_mark_done_enters_request_id_mutation_guard(self) -> None:
+        # Slack redelivery는 영속 target claim에 도달하기 전에도 같은
+        # interaction request ID에서 한 번만 실행돼야 한다.
+        request = _request(DEVICE_HEALTH_ALERT_MARK_DONE_ACTION)
+
+        self.assertEqual(
+            match_mutation_capable_company_operation_route(request),
+            DEVICE_HEALTH_ALERT_MARK_DONE_ROUTE,
         )
 
 
@@ -702,6 +928,40 @@ class DeviceHealthAlertActionApiContractTests(unittest.TestCase):
         self.assertNotIn("01012345678", json.dumps(payload["operationResult"], ensure_ascii=False))
         self.assertNotIn("직접 작성한", json.dumps(payload["operationResult"], ensure_ascii=False))
         self.assertNotIn("GROUP-1", payload["messages"][0]["body"])
+
+    def test_api_serializes_mark_done_ack_receipt_without_loss(self) -> None:
+        acknowledged_at = datetime(
+            2026,
+            8,
+            31,
+            0,
+            12,
+            34,
+            tzinfo=timezone.utc,
+        )
+        result = DeviceHealthAlertActionAssistantRoute(
+            replace(
+                DeviceHealthAlertActionRouteDeps(),
+                load_exact_target=Mock(return_value=_exact_target()),
+                now=Mock(return_value=acknowledged_at),
+                write_event=Mock(return_value=True),
+                claim_mark_done=Mock(
+                    return_value=DeviceHealthAlertAcknowledgement(
+                        created=True,
+                        actor_user_id="ACTOR-1",
+                        acknowledged_at=acknowledged_at,
+                    )
+                ),
+            )
+        ).handle(_request(DEVICE_HEALTH_ALERT_MARK_DONE_ACTION))
+        assert result is not None
+
+        payload = serialize_result(result, result.route)
+
+        self.assertEqual(
+            payload["operationResult"],
+            result.operation_result,
+        )
 
     def test_prepare_receipt_is_requester_private_and_not_in_body(self) -> None:
         result = DeviceHealthAlertActionAssistantRoute(
