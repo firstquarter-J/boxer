@@ -195,16 +195,30 @@ def _mark_done_result(
     )
 
 
-def _status_texts(blocks: object) -> list[str]:
+def _completion_rows(blocks: object) -> list[tuple[str, str]]:
+    """완료 담당자와 시간을 기존 카드의 한 쌍 field로 검증한다."""
+
     assert isinstance(blocks, list)
-    return [
-        str(field.get("text") or "")
-        for block in blocks
-        if isinstance(block, dict) and block.get("type") == "section"
-        for field in block.get("fields", [])
-        if isinstance(field, dict)
-        and str(field.get("text") or "").startswith("✅ *확인 완료*")
-    ]
+    rows: list[tuple[str, str]] = []
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "section":
+            continue
+        fields = block.get("fields")
+        if not isinstance(fields, list):
+            continue
+        for index, field in enumerate(fields):
+            if not isinstance(field, dict):
+                continue
+            status_text = str(field.get("text") or "")
+            if not status_text.startswith("✅ *확인 완료*"):
+                continue
+            assert index + 1 < len(fields)
+            time_field = fields[index + 1]
+            assert isinstance(time_field, dict)
+            time_text = str(time_field.get("text") or "")
+            assert time_text.startswith("🕒 *처리 시간*")
+            rows.append((status_text, time_text))
+    return rows
 
 
 def _card_action_ids(blocks: object, *, device: str) -> set[str]:
@@ -388,11 +402,11 @@ def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
         alert.DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
         alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     }
-    assert _status_texts(updated_blocks) == [
+    assert _completion_rows(updated_blocks) == [
         (
-            "✅ *확인 완료*\n담당자 <@U1>\n"
-            "처리 시간 `2026-08-31 09:07:12 KST`"
-        )
+            "✅ *확인 완료*\n담당자 <@U1>",
+            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
+        ),
     ]
     assert client.chat_update.call_args.kwargs["text"] == message["text"]
     assert "\n" in client.chat_update.call_args.kwargs["text"]
@@ -602,7 +616,7 @@ def test_mark_done_preserves_prior_completion_from_stale_multi_card_body() -> No
     assert client.conversations_replies.call_count == 2
     assert client.chat_update.call_count == 2
     first_blocks = client.chat_update.call_args_list[0].kwargs["blocks"]
-    assert len(_status_texts(first_blocks)) == 1
+    assert len(_completion_rows(first_blocks)) == 1
     assert sum(block["type"] == "actions" for block in first_blocks) == 2
     final_blocks = client.chat_update.call_args_list[1].kwargs["blocks"]
     assert sum(block["type"] == "actions" for block in final_blocks) == 2
@@ -614,14 +628,14 @@ def test_mark_done_preserves_prior_completion_from_stale_multi_card_body() -> No
         alert.DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
         alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     }
-    assert _status_texts(final_blocks) == [
+    assert _completion_rows(final_blocks) == [
         (
-            "✅ *확인 완료*\n담당자 <@U1>\n"
-            "처리 시간 `2026-08-31 09:07:12 KST`"
+            "✅ *확인 완료*\n담당자 <@U1>",
+            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
         ),
         (
-            "✅ *확인 완료*\n담당자 <@U2>\n"
-            "처리 시간 `2026-08-31 09:08:13 KST`"
+            "✅ *확인 완료*\n담당자 <@U2>",
+            "🕒 *처리 시간*\n`2026-08-31 09:08:13 KST`",
         ),
     ]
     assert client.root["blocks"] == final_blocks
@@ -664,11 +678,11 @@ def test_mark_done_recovers_ui_after_slack_update_failure_without_new_reply() ->
     assert bridge.mark_done.call_count == 2
     assert client.conversations_replies.call_count == 2
     assert client.chat_update.call_count == 2
-    assert _status_texts(client.chat_update.call_args.kwargs["blocks"]) == [
+    assert _completion_rows(client.chat_update.call_args.kwargs["blocks"]) == [
         (
-            "✅ *확인 완료*\n담당자 <@U1>\n"
-            "처리 시간 `2026-08-31 09:07:12 KST`"
-        )
+            "✅ *확인 완료*\n담당자 <@U1>",
+            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
+        ),
     ]
     # API 완료 댓글은 만들지 않고 첫 Slack 갱신 실패 경고만 한 번 남긴다.
     assert [
@@ -768,7 +782,7 @@ def test_mark_done_replay_accepts_existing_status_without_slack_update() -> None
         stale_body,
         client,
     )
-    assert len(_status_texts(client.root["blocks"])) == 1
+    assert len(_completion_rows(client.root["blocks"])) == 1
 
     # 프로세스가 바뀐 뒤 오래된 클릭 payload가 와도 최신 root의 기존
     # status를 읽으면 같은 blocks를 다시 쓰지 않고 성공으로 끝낸다.
@@ -835,13 +849,13 @@ def test_mark_done_updates_legacy_card_without_explicit_block_id() -> None:
 
     bridge.mark_done.assert_called_once()
     client.chat_update.assert_called_once()
-    assert _status_texts(client.root["blocks"]) == [
+    assert _completion_rows(client.root["blocks"]) == [
         (
-            "✅ *확인 완료*\n담당자 <@U1>\n"
-            "처리 시간 `2026-08-31 09:07:12 KST`"
-        )
+            "✅ *확인 완료*\n담당자 <@U1>",
+            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
+        ),
     ]
-    assert len(_status_texts(client.root["blocks"])) == 1
+    assert len(_completion_rows(client.root["blocks"])) == 1
 
 
 def test_action_fails_closed_when_membership_is_missing() -> None:

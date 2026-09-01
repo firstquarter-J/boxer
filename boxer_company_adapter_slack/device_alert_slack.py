@@ -1031,23 +1031,30 @@ def _mark_done_blocks(
         return None
 
     # 같은 actions block의 문자·음성 버튼은 유지하고 완료 버튼 하나만
-    # 제거한다. 완료 표시는 직전 연락처 section의 field에 넣어 메시지
-    # block 수를 늘리지 않는다.
+    # 제거한다. 전화·문자 아래에 담당자와 시간을 2열 field로 맞춰 기존
+    # 카드 문법을 유지하면서 메시지 block 수도 늘리지 않는다.
     if mark_done_indexes:
         del elements[mark_done_indexes[0]]
     if not elements:
         return None
     if not status_exists:
-        fields.append(
-            {
-                "type": "mrkdwn",
-                "text": (
-                    f"{_MARK_DONE_STATUS_PREFIX}\n"
-                    f"담당자 <@{actor_user_id}>\n"
-                    "처리 시간 "
-                    f"`{_mark_done_time_text(completed_at)}`"
-                ),
-            }
+        fields.extend(
+            (
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"{_MARK_DONE_STATUS_PREFIX}\n"
+                        f"담당자 <@{actor_user_id}>"
+                    ),
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "🕒 *처리 시간*\n"
+                        f"`{_mark_done_time_text(completed_at)}`"
+                    ),
+                },
+            )
         )
     return updated_blocks
 
