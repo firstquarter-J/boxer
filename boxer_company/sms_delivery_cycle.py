@@ -1577,7 +1577,18 @@ def _reconcile_sms_delivery_outbox_once(
         items = _load_sms_delivery_outbox_items(outbox_path=outbox_path)
         if not items:
             return 0
-        sheet_rows = _load_device_health_sheet_sms_delivery_rows()
+        try:
+            sheet_rows = _load_device_health_sheet_sms_delivery_rows()
+        except Exception as exc:
+            # outbox 처리의 첫 외부 호출은 변경 전 Sheets GET이다. 이
+            # 순수 읽기 실패를 coordinator까지 올리면 inFlight가 남아
+            # 전체 SMS 후처리가 잠기므로 outbox를 보존하고 다음 poll로 넘긴다.
+            logger.warning(
+                "문자 발송 결과 시트를 조회하지 못했어 "
+                "phase=outbox_reconcile error_type=%s",
+                type(exc).__name__,
+            )
+            return 0
         changed_count = 0
 
         for snapshot_item in items:
@@ -1774,7 +1785,17 @@ def _run_sms_delivery_reporter_once(
         item["smsGroupId"]
         for item in _load_sms_delivery_outbox_items()
     }
-    pending_deliveries = _load_device_health_sheet_pending_sms_deliveries()
+    try:
+        pending_deliveries = _load_device_health_sheet_pending_sms_deliveries()
+    except Exception as exc:
+        # outbox reconcile이 끝난 뒤의 B2:T scan도 외부 변경 전 읽기다.
+        # 완료된 reconcile 수는 보존하고 조회만 다음 fixed-delay에 재시도한다.
+        logger.warning(
+            "문자 발송 후처리 대상을 조회하지 못했어 "
+            "phase=pending_scan error_type=%s",
+            type(exc).__name__,
+        )
+        return updated_count
     if not pending_deliveries:
         return updated_count
 

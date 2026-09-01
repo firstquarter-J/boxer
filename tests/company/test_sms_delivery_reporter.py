@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from requests.exceptions import ReadTimeout
+
 from boxer_company import sms_delivery_cycle as sms_delivery_reporter
 
 
@@ -812,6 +814,154 @@ class SmsDeliveryReporterTests(unittest.TestCase):
             sms_delivery_reporter._load_sms_delivery_outbox_items(),
             [],
         )
+
+    def test_outbox_sheet_read_timeout_defers_before_provider_lookup(self) -> None:
+        logger = logging.getLogger("test.sms_delivery_reporter.outbox-timeout")
+        self._remember_accepted()
+
+        with (
+            patch.object(
+                sms_delivery_reporter,
+                "_load_device_health_sheet_sms_delivery_rows",
+                side_effect=ReadTimeout("private Sheets response"),
+            ),
+            patch.object(
+                sms_delivery_reporter,
+                "_load_solapi_group_info",
+            ) as load_group_mock,
+            self.assertLogs(logger.name, level="WARNING") as captured,
+        ):
+            changed = sms_delivery_reporter._reconcile_sms_delivery_outbox_once(
+                logger
+            )
+
+        # 변경 전 GET 실패는 outbox와 provider 실행을 그대로 보존하고
+        # 예외를 cycle coordinator까지 올리지 않아 다음 poll을 허용한다.
+        self.assertEqual(changed, 0)
+        load_group_mock.assert_not_called()
+        self.assertEqual(
+            len(sms_delivery_reporter._load_sms_delivery_outbox_items()),
+            1,
+        )
+        self.assertIn("phase=outbox_reconcile", captured.output[0])
+        self.assertIn("error_type=ReadTimeout", captured.output[0])
+        self.assertNotIn("private Sheets response", captured.output[0])
+
+    def test_outbox_durable_write_failure_still_raises(self) -> None:
+        logger = logging.getLogger("test.sms_delivery_reporter.write-failure")
+        self._remember_accepted()
+        accepted_row = {
+            "G-ACCEPTED": {
+                "rowNumber": 11,
+                "groupId": "G-ACCEPTED",
+                "smsStatus": "접수됨",
+            }
+        }
+
+        with (
+            patch.object(
+                sms_delivery_reporter,
+                "_load_device_health_sheet_sms_delivery_rows",
+                return_value=accepted_row,
+            ),
+            patch.object(
+                sms_delivery_reporter,
+                "_load_solapi_group_info",
+                return_value={
+                    "status": "COMPLETE",
+                    "count": {
+                        "sentSuccess": 1,
+                        "sentFailed": 0,
+                        "sentPending": 0,
+                    },
+                },
+            ),
+            patch.object(
+                sms_delivery_reporter,
+                "_set_sms_delivery_outbox_status",
+                side_effect=RuntimeError("private durable write failure"),
+            ),
+        ):
+            # 순수 GET만 지연 대상으로 좁혔으므로 provider 확인 뒤 durable
+            # 상태 저장 실패는 계속 전파돼 coordinator fail-closed를 유지한다.
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "private durable write failure",
+            ):
+                sms_delivery_reporter._run_sms_delivery_reporter_once(logger)
+
+    def test_empty_outbox_pending_sheet_read_timeout_returns_zero(self) -> None:
+        logger = logging.getLogger("test.sms_delivery_reporter.empty-timeout")
+        sms_delivery_reporter._mutate_sms_delivery_outbox(
+            lambda _items: None
+        )
+        self.assertTrue(self.outbox_path.exists())
+
+        with (
+            patch.object(
+                sms_delivery_reporter,
+                "_load_device_health_sheet_pending_sms_deliveries",
+                side_effect=ReadTimeout("private Sheets response"),
+            ),
+            patch.object(
+                sms_delivery_reporter,
+                "_load_solapi_group_info",
+            ) as load_group_mock,
+            patch.object(
+                sms_delivery_reporter,
+                "_update_device_health_sheet_sms_status_by_group_id",
+            ) as update_mock,
+            self.assertLogs(logger.name, level="WARNING") as captured,
+        ):
+            changed = sms_delivery_reporter._run_sms_delivery_reporter_once(
+                logger
+            )
+
+        # 운영 장애와 같은 initialized empty outbox에서도 순수 read
+        # timeout은 결과 0으로 닫혀 coordinator marker를 남기지 않는다.
+        self.assertEqual(changed, 0)
+        load_group_mock.assert_not_called()
+        update_mock.assert_not_called()
+        self.assertEqual(
+            sms_delivery_reporter._load_sms_delivery_outbox_items(),
+            [],
+        )
+        self.assertIn("phase=pending_scan", captured.output[0])
+        self.assertIn("error_type=ReadTimeout", captured.output[0])
+        self.assertNotIn("private Sheets response", captured.output[0])
+
+    def test_pending_sheet_read_timeout_preserves_reconciled_count(self) -> None:
+        logger = logging.getLogger("test.sms_delivery_reporter.pending-timeout")
+
+        with (
+            patch.object(
+                sms_delivery_reporter,
+                "_reconcile_sms_delivery_outbox_once",
+                return_value=2,
+            ) as reconcile_mock,
+            patch.object(
+                sms_delivery_reporter,
+                "_load_device_health_sheet_pending_sms_deliveries",
+                side_effect=ReadTimeout("private Sheets response"),
+            ),
+            patch.object(
+                sms_delivery_reporter,
+                "_load_solapi_group_info",
+            ) as load_group_mock,
+            self.assertLogs(logger.name, level="WARNING") as captured,
+        ):
+            changed = sms_delivery_reporter._run_sms_delivery_reporter_once(
+                logger
+            )
+
+        # 앞 단계에서 확정된 변경은 성공 결과에 포함하고, 실패한 순수
+        # read scan만 다음 fixed-delay에 다시 수행하게 한다.
+        self.assertEqual(changed, 2)
+        reconcile_mock.assert_called_once()
+        load_group_mock.assert_not_called()
+        self.assertIn("phase=pending_scan", captured.output[0])
+        self.assertIn("error_type=ReadTimeout", captured.output[0])
+        self.assertNotIn("private Sheets response", captured.output[0])
 
     def test_sheet_only_pending_uses_accepted_at_max_age(self) -> None:
         logger = logging.getLogger("test.sms_delivery_reporter")

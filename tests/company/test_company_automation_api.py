@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
 import json
+import logging
 from pathlib import Path
 import stat
 import threading
@@ -17,7 +18,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from requests.exceptions import ReadTimeout
 
+from boxer_company import sms_delivery_cycle
 from boxer_company.automation import (
     AutomationCycleContractError,
     AutomationCycleRequest,
@@ -26,6 +29,7 @@ from boxer_company.automation import (
     AutomationDelivery,
     AutomationDeliveryReceipt,
     DeviceHealthMonitorCycleHandler,
+    SmsDeliveryCycleHandler,
 )
 from boxer_company.device_health_monitor_cycle import (
     build_clean_device_health_monitor_cursor,
@@ -435,6 +439,82 @@ def test_failed_handler_leaves_durable_uncertain_guard(
         coordinator.run(_trigger("cycle:second"))
 
     assert handler.calls == 1
+
+
+def test_sms_safe_sheet_read_timeout_finalizes_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_attempts = 0
+
+    def _empty_reconcile(*_args: Any, **_kwargs: Any) -> int:
+        return 0
+
+    def _load_pending() -> list[dict[str, Any]]:
+        nonlocal scan_attempts
+        scan_attempts += 1
+        if scan_attempts == 1:
+            raise ReadTimeout("private Sheets response")
+        return []
+
+    monkeypatch.setattr(
+        sms_delivery_cycle,
+        "_reconcile_sms_delivery_outbox_once",
+        _empty_reconcile,
+    )
+    monkeypatch.setattr(
+        sms_delivery_cycle,
+        "_load_sms_delivery_outbox_items",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        sms_delivery_cycle,
+        "_load_device_health_sheet_pending_sms_deliveries",
+        _load_pending,
+    )
+
+    state_path = tmp_path / "sms-safe-read.json"
+    state_store = JsonAutomationCycleStateStore(state_path)
+    coordinator = DurableAutomationCycleCoordinator(
+        AutomationCycleService(
+            (
+                SmsDeliveryCycleHandler(
+                    logger=logging.getLogger("test.sms-safe-read")
+                ),
+            )
+        ),
+        state_store,
+        clock=lambda: _NOW,
+    )
+
+    def _sms_trigger(request_id: str) -> AutomationCycleTrigger:
+        return AutomationCycleTrigger(
+            request_id=request_id,
+            tenant_id="T1",
+            cycle="sms_delivery",
+            cycle_key="continuous",
+            scheduled_at=_NOW,
+        )
+
+    first = _sms_trigger("cycle:sms-safe-read:first")
+    first_result = coordinator.run(first)
+    first_state = state_store.load(_state_key(first))
+
+    # 순수 Sheet GET timeout은 no_change로 finalize돼 inFlight를 닫고
+    # 같은 continuous cycle의 다음 fixed-delay 실행을 허용한다.
+    assert first_result.outcome == "no_change"
+    assert first_result.metrics == {"updatedCount": 0, "deliveryCount": 0}
+    assert "inFlight" not in first_state
+    assert first_state["lastCompletedAt"] == _NOW.isoformat()
+
+    second = _sms_trigger("cycle:sms-safe-read:second")
+    second_result = coordinator.run(second)
+    second_state = state_store.load(_state_key(second))
+
+    assert second_result.outcome == "no_change"
+    assert scan_attempts == 2
+    assert "inFlight" not in second_state
+    assert second_state["lastRequestId"] == second.request_id
 
 
 def test_concurrent_coordinator_store_instances_reserve_run_once(
