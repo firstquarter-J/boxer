@@ -61,6 +61,11 @@ _ACTION_IDS = frozenset(
 )
 _MOBILE_PHONE_PATTERN = re.compile(r"^(?:\+?82|0)1[016789][0-9]{7,8}$")
 _ALERT_ITEM_LIMIT = 10
+_ALERT_ACTION_BLOCK_ID_PATTERN = re.compile(
+    r"^device_alert_actions_"
+    r"(?P<card_index>0|[1-9][0-9]{0,2})_"
+    r"(?P<digest>[0-9a-f]{16})$"
+)
 _MARK_DONE_CARD_STATE_LIMIT = 4_096
 _MARK_DONE_MESSAGE_LOCK_STRIPES = 64
 _MARK_DONE_STATUS_PREFIX = "✅ *확인 완료*"
@@ -176,7 +181,7 @@ class _DeviceAlertMarkDoneCoordinator:
             updated_blocks = _mark_done_blocks(
                 source_blocks,
                 clicked_block_id=_text(identity.get("blockId"), ""),
-                clicked_value=_text(identity.get("actionValue"), ""),
+                clicked_value=_raw_action_value(identity.get("actionValue")),
                 actor_user_id=actor_user_id,
                 completed_at=completed_at,
             )
@@ -278,8 +283,8 @@ def post_device_alert_summary(
         }
     ]
     for card_index, item in enumerate(items[:_ALERT_ITEM_LIMIT]):
-        # API 분리 전 카드의 식별 정보 → 장애 내용 → 연락처 순서를 유지한다.
-        # 한 줄짜리 section으로 뭉개지지 않게 한다.
+        # 장비 식별 정보 → 장애 내용 → 연락처 순서의 현재 카드 구조를
+        # 한 줄짜리 section으로 뭉개지지 않게 고정한다.
         blocks.extend(
             _alert_item_blocks(
                 item,
@@ -451,18 +456,60 @@ def _alert_item_blocks(
     blocks.append(
         {
             "type": "actions",
-            "block_id": _alert_action_block_id(item, card_index),
+            "block_id": _build_alert_action_block_id(
+                card_index=card_index,
+                action_value=value,
+            ),
             "elements": action_elements,
         }
     )
     return blocks
 
 
-def _alert_action_block_id(item: Mapping[str, Any], card_index: int) -> str:
-    digest = hashlib.sha256(
-        _alert_action_value(item).encode("utf-8")
-    ).hexdigest()[:16]
+def _build_alert_action_block_id(
+    *,
+    card_index: int,
+    action_value: str,
+) -> str:
+    """현재 카드 index와 실제 Slack value를 하나의 불변 ID로 묶는다."""
+
+    if (
+        type(card_index) is not int
+        or not 0 <= card_index < _ALERT_ITEM_LIMIT
+        or not isinstance(action_value, str)
+        or not action_value
+        or len(action_value) > 1900
+    ):
+        raise ValueError("장비 이상 알림 action block identity가 올바르지 않아")
+    digest = hashlib.sha256(action_value.encode("utf-8")).hexdigest()[:16]
     return f"device_alert_actions_{card_index}_{digest}"
+
+
+def _parse_current_alert_action_block_id(
+    *,
+    block_id: str,
+    action_value: str,
+) -> int | None:
+    """현재 renderer가 발급한 exact block ID만 card index로 복원한다."""
+
+    if (
+        not isinstance(block_id, str)
+        or not isinstance(action_value, str)
+        or not action_value
+        or len(action_value) > 1900
+    ):
+        return None
+    matched = _ALERT_ACTION_BLOCK_ID_PATTERN.fullmatch(block_id)
+    if matched is None:
+        return None
+    card_index = int(matched.group("card_index"))
+    if not 0 <= card_index < _ALERT_ITEM_LIMIT:
+        return None
+    expected = _build_alert_action_block_id(
+        card_index=card_index,
+        action_value=action_value,
+    )
+    return card_index if block_id == expected else None
 
 
 def _device_name_text(item: Mapping[str, Any]) -> str:
@@ -716,7 +763,9 @@ def _action_identity(body: Mapping[str, Any]) -> dict[str, Any]:
         "interactionId": _text(action.get("action_ts"), ""),
         "triggerId": _text(body.get("trigger_id"), ""),
         "blockId": _text(action.get("block_id"), ""),
-        "actionValue": _text(action.get("value"), ""),
+        # block ID digest는 Slack에 실린 value 원문을 기준으로 하므로
+        # 공통 공백 정규화를 거치지 않고 interaction 전체에서 보존한다.
+        "actionValue": _raw_action_value(action.get("value")),
         "item": _parse_json_mapping(action.get("value")),
     }
 
@@ -821,6 +870,16 @@ def _execute_remote_action(
 ) -> None:
     identity = _action_identity(body)
     is_mark_done = action_id == DEVICE_HEALTH_ALERT_ACTION_MARK_DONE
+    if is_mark_done and _parse_current_alert_action_block_id(
+        block_id=_text(identity.get("blockId"), ""),
+        action_value=_raw_action_value(identity.get("actionValue")),
+    ) is None:
+        # 과거 카드의 버튼은 이미 운영 대상이 아니다. 현재 renderer가
+        # 발급한 identity가 아니면 coordinator나 API mutation 전에 닫는다.
+        logger.info(
+            "Device alert mark-done ignored unsupported_card_format"
+        )
+        return
     mark_done_key = _mark_done_card_key(identity) if is_mark_done else ""
     if is_mark_done and (
         not mark_done_key or not mark_done_coordinator.reserve(mark_done_key)
@@ -920,6 +979,12 @@ def _mark_done_card_key(identity: Mapping[str, Any]) -> str:
     if any(not part for part in parts) or not isinstance(item, Mapping):
         return ""
     block_id = _text(identity.get("blockId"), "")
+    action_value = _raw_action_value(identity.get("actionValue"))
+    if _parse_current_alert_action_block_id(
+        block_id=block_id,
+        action_value=action_value,
+    ) is None:
+        return ""
     canonical_item = json.dumps(
         dict(item),
         ensure_ascii=False,
@@ -966,29 +1031,26 @@ def _mark_done_blocks(
     actor_user_id: str,
     completed_at: datetime,
 ) -> list[dict[str, Any]] | None:
-    exact_matches: list[int] = []
-    legacy_matches: list[int] = []
+    if _parse_current_alert_action_block_id(
+        block_id=clicked_block_id,
+        action_value=clicked_value,
+    ) is None:
+        return None
+    matches: list[int] = []
     for index, raw_block in enumerate(blocks):
         block = raw_block if isinstance(raw_block, Mapping) else {}
         elements = block.get("elements")
         if block.get("type") != "actions" or not isinstance(elements, list):
             continue
+        if _text(block.get("block_id"), "") != clicked_block_id:
+            continue
         has_clicked_value = any(
             isinstance(element, Mapping)
-            and _text(element.get("value"), "") == clicked_value
+            and _raw_action_value(element.get("value")) == clicked_value
             for element in elements
         )
-        if not has_clicked_value:
-            continue
-        if clicked_block_id and _text(block.get("block_id"), "") == clicked_block_id:
-            exact_matches.append(index)
-        elif not _text(block.get("block_id"), ""):
-            legacy_matches.append(index)
-
-    matches = exact_matches if clicked_block_id else legacy_matches
-    if clicked_block_id and not exact_matches:
-        # 명시 block_id가 없는 구 카드에만 value unique fallback을 허용한다.
-        matches = legacy_matches
+        if has_clicked_value:
+            matches.append(index)
     if len(matches) != 1:
         return None
     matched_index = matches[0]
@@ -1023,7 +1085,7 @@ def _mark_done_blocks(
         for index, element in enumerate(elements)
         if isinstance(element, Mapping)
         and element.get("action_id") == DEVICE_HEALTH_ALERT_ACTION_MARK_DONE
-        and _text(element.get("value"), "") == clicked_value
+        and _raw_action_value(element.get("value")) == clicked_value
     ]
     if len(mark_done_indexes) > 1 or (
         not mark_done_indexes and not status_exists
@@ -1280,6 +1342,12 @@ def _positive_int(value: Any) -> int | None:
 def _text(value: Any, default: str) -> str:
     normalized = " ".join(str(value or "").split())
     return normalized or default
+
+
+def _raw_action_value(value: Any) -> str:
+    """block identity용 Slack action value는 공백까지 원문 그대로 보존한다."""
+
+    return value if isinstance(value, str) else ""
 
 
 __all__ = [

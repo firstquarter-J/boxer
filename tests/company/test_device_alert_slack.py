@@ -364,6 +364,12 @@ def test_renderer_keeps_oversized_action_value_as_valid_json() -> None:
     assert len(value) <= 1900
     assert parsed["device"] == "MB2-TEST1"
     assert parsed["mdaUrl"] == ""
+    # block identity는 축약 전 원본 item이 아니라 Slack에 실제 실린
+    # compact value와 결합돼 클릭 payload를 그대로 검증할 수 있어야 한다.
+    assert action_block["block_id"] == alert._build_alert_action_block_id(
+        card_index=0,
+        action_value=value,
+    )
 
 
 def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
@@ -377,7 +383,9 @@ def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
         bridge,
     )
     ack = Mock()
-    message = _rendered_message(_item())
+    # action value 내부 연속 공백도 digest 계산 전 정규화하지 않고
+    # Slack renderer가 발급한 현재 카드 identity 그대로 통과시킨다.
+    message = _rendered_message({**_item(), "issue": "LED  연결 이상"})
     client = _StatefulSlackClient(message)
     body = _rendered_action_body(message, device="MB2-TEST1")
 
@@ -811,13 +819,13 @@ def test_mark_done_replay_accepts_existing_status_without_slack_update() -> None
     client.chat_postMessage.assert_not_called()
 
 
-def test_mark_done_updates_legacy_card_without_explicit_block_id() -> None:
+def test_mark_done_ignores_card_without_current_block_id_before_api() -> None:
     app = _App()
     bridge = Mock()
     bridge.mark_done.return_value = _mark_done_result()
     alert.attach_device_alert_actions(
         app,
-        logging.getLogger("test.alert.mark-done-legacy-card"),
+        logging.getLogger("test.alert.mark-done-missing-block-id"),
         lambda _workspace_id, _actor_id: True,
         bridge,
     )
@@ -832,8 +840,8 @@ def test_mark_done_updates_legacy_card_without_explicit_block_id() -> None:
     action_block.pop("block_id")
     client = _StatefulSlackClient(message)
 
-    # API 분리 전에 발송돼 명시 block_id가 없는 카드도 버튼 value가
-    # 유일하면 같은 완료 UI로 안전하게 갱신한다.
+    # 현재 renderer가 발급한 block identity가 없는 과거 카드는 더 이상
+    # 운영 대상이 아니므로 API ACK나 Slack 갱신을 만들지 않는다.
     body = _action_body(DEVICE_HEALTH_ALERT_MARK_DONE_ACTION)
     elements = action_block["elements"]
     assert isinstance(elements, list)
@@ -847,15 +855,53 @@ def test_mark_done_updates_legacy_card_without_explicit_block_id() -> None:
     body["actions"][0]["value"] = mark_done_button["value"]  # type: ignore[index]
     app.actions[DEVICE_HEALTH_ALERT_MARK_DONE_ACTION](Mock(), body, client)
 
+    bridge.mark_done.assert_not_called()
+    client.conversations_replies.assert_not_called()
+    client.chat_update.assert_not_called()
+    client.chat_postMessage.assert_not_called()
+
+
+def test_mark_done_rejects_mismatched_block_id_without_poisoning_guard() -> None:
+    app = _App()
+    bridge = Mock()
+    bridge.mark_done.return_value = _mark_done_result()
+    alert.attach_device_alert_actions(
+        app,
+        logging.getLogger("test.alert.mark-done-mismatched-block-id"),
+        lambda _workspace_id, _actor_id: True,
+        bridge,
+    )
+    message = _rendered_message(_item())
+    client = _StatefulSlackClient(message)
+    invalid_body = _rendered_action_body(
+        message,
+        device="MB2-TEST1",
+        action_ts="1788134832.709819",
+    )
+    valid_body = _rendered_action_body(
+        message,
+        device="MB2-TEST1",
+        action_ts="1788134833.709819",
+    )
+    invalid_action = invalid_body["actions"][0]
+    assert isinstance(invalid_action, dict)
+    # 현재 형식처럼 보이더라도 value digest가 다르면 coordinator 예약 전
+    # 거부해 뒤따르는 정상 클릭의 중복 방지 상태를 오염시키지 않는다.
+    invalid_action["block_id"] = "device_alert_actions_0_0000000000000000"
+
+    handler = app.actions[DEVICE_HEALTH_ALERT_MARK_DONE_ACTION]
+    handler(Mock(), invalid_body, client)
+
+    bridge.mark_done.assert_not_called()
+    client.conversations_replies.assert_not_called()
+    client.chat_update.assert_not_called()
+
+    handler(Mock(), valid_body, client)
+
     bridge.mark_done.assert_called_once()
+    client.conversations_replies.assert_called_once()
     client.chat_update.assert_called_once()
-    assert _completion_rows(client.root["blocks"]) == [
-        (
-            "✅ *확인 완료*\n담당자 <@U1>",
-            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
-        ),
-    ]
-    assert len(_completion_rows(client.root["blocks"])) == 1
+    client.chat_postMessage.assert_not_called()
 
 
 def test_action_fails_closed_when_membership_is_missing() -> None:
