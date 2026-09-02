@@ -2373,6 +2373,85 @@ class CompanyApiContractTests(unittest.TestCase):
         )
         self.assertEqual(runtime.requests, [])
 
+    def test_server_prematch_keeps_explicit_barcode_log_in_log_stage(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime(
+            CompanyAssistantResult(
+                route="barcode_log_analysis",
+                outcome="answered",
+                messages=(AssistantMessage(body="로그 분석 결과"),),
+            )
+        )
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(request_id="req-prematch-barcode-log"),
+                json=_payload(
+                    question=(
+                        "MB2-C00419 2026-09-02 "
+                        "12345678910 로그분석"
+                    ),
+                    routeGroup="log",
+                    scope={
+                        "barcode": "12345678910",
+                        "deviceName": "MB2-C00419",
+                        "channelContextId": "C01",
+                    },
+                    contextEntries=[],
+                ),
+            )
+
+        # 넓은 장비 진단 후보 대신 adapter와 같은 DB/S3 log stage를 유지한다.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["route"], "barcode_log_analysis")
+        self.assertEqual(runtime.stages, ["log"])
+        self.assertEqual(
+            runtime.requests[0].metadata["route_group"],
+            "log",
+        )
+
+    def test_server_prematch_protects_operation_mixed_with_barcode_log(
+        self,
+    ) -> None:
+        runtime = _FakeRuntime()
+        app = create_company_api_app(
+            settings=_settings(),
+            assistant_runtime=runtime,
+            readiness_probe=lambda: True,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/internal/v1/assistant/turns",
+                headers=_headers(
+                    request_id="req-prematch-barcode-log-operation"
+                ),
+                json=_payload(
+                    question=(
+                        "MB2-C00419 2026-09-02 12345678910 "
+                        "로그분석하고 장비 종료해줘"
+                    ),
+                    routeGroup="log",
+                    scope={
+                        "barcode": "12345678910",
+                        "deviceName": "MB2-C00419",
+                    },
+                    contextEntries=[],
+                ),
+            )
+
+        # 명시적 장비 명령은 log hint로 권한 경계를 낮출 수 없다.
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "caller_not_allowed")
+        self.assertEqual(runtime.requests, [])
+
     def test_server_prematch_runs_and_replays_unhinted_mutation_once(
         self,
     ) -> None:

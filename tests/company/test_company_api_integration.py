@@ -953,10 +953,17 @@ class CompanyApiRuntimeIntegrationTests(unittest.TestCase):
                         "actorId": "ACTOR-1",
                         "channel": "slack",
                         "conversationId": "THREAD-LOG-1",
-                        "question": "12345678910 2026-08-04 로그 분석",
+                        "question": (
+                            "MB2-C00419 2026-08-04 "
+                            "12345678910 로그 분석"
+                        ),
                         "locale": "ko",
                         "contextEntries": [],
-                        "scope": {"barcode": "12345678910"},
+                        "scope": {
+                            "barcode": "12345678910",
+                            "deviceName": "MB2-C00419",
+                        },
+                        "routeGroup": "log",
                     },
                 )
                 undated = client.post(

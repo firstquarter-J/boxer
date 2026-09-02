@@ -31,6 +31,7 @@ from boxer_company._operation_routing_common import (
     _extract_hospital_room_scope,
     _extract_log_date_with_presence,
     _extract_relative_day_offset,
+    _is_barcode_log_analysis_request,
     _normalize_spaces,
     _normalize_year,
     _parse_explicit_date_expression,
@@ -241,19 +242,6 @@ def _extract_year_filter(question: str) -> int | None:
 
     bare_year_match = _BARE_YEAR_ONLY_PATTERN.search(text)
     return int(bare_year_match.group(1)) if bare_year_match else None
-
-
-def _is_barcode_log_analysis_request(
-    question: str,
-    barcode: str | None,
-) -> bool:
-    if not barcode:
-        return False
-    text = (question or "").strip()
-    lowered = text.lower()
-    return ("로그" in text and "로그인" not in text) or bool(
-        re.search(r"\blog\b", lowered)
-    )
 
 
 def _extract_capture_seq_filters(

@@ -201,7 +201,7 @@ class CompanyApiRemoteRolloutTests(unittest.TestCase):
             ),
             (
                 CompanyBarcodeLogApiRolloutService,
-                "12345678910 2026-07-01 로그 분석",
+                "MB2-C00419 2026-07-01 12345678910 로그 분석",
                 "barcode_log_analysis",
                 "log",
                 False,

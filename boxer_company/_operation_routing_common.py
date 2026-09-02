@@ -42,6 +42,30 @@ def _extract_barcode(text: str) -> str | None:
     return match.group(1)
 
 
+def _is_barcode_log_analysis_request(
+    question: str,
+    barcode: str | None,
+) -> bool:
+    """바코드 범위가 있는 현재 문장의 명시적 로그 조회 의도를 고른다."""
+
+    if not barcode:
+        return False
+    text = (question or "").strip()
+    lowered = text.lower()
+    return ("로그" in text and "로그인" not in text) or bool(
+        re.search(r"\blog\b", lowered)
+    )
+
+
+def _is_explicit_barcode_log_analysis_request(question: str) -> bool:
+    """operation 완화에는 metadata·thread가 아닌 현재 질문 바코드만 쓴다."""
+
+    return _is_barcode_log_analysis_request(
+        question,
+        _extract_barcode(question),
+    )
+
+
 def _normalize_spaces(text: str) -> str:
     return " ".join((text or "").strip().split())
 

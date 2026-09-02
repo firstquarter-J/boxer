@@ -247,6 +247,45 @@ def test_diagnostic_candidates_keep_their_legacy_knowledge_precedence() -> None:
     assert match_company_operation_route(playbook_question) is None
 
 
+def test_explicit_barcode_log_only_demotes_broad_diagnostic_candidates() -> None:
+    question = "MB2-C00419 2026-09-02 12345678910 로그분석"
+    diagnostic_context = (
+        {
+            "kind": "message",
+            "source": "slack",
+            "author_id": "U1",
+            "text": "MB2-C00419 진단 시작",
+        },
+    )
+
+    # 현재 질문의 바코드 로그 의도가 generic 진단과 thread 진단 후속을
+    # 모두 이기지만, 구체적인 operation까지 read route로 낮추지는 않는다.
+    assert match_company_operation_route(_request(question)) is None
+    assert (
+        match_company_operation_route(
+            _request(question, context_entries=diagnostic_context)
+        )
+        is None
+    )
+    for suffix, expected_route in (
+        ("장비 종료해줘", "device_power_off"),
+        ("PM2 상태 확인", "device_pm2_probe"),
+        ("진단 시작", "device_diagnostic_snapshot"),
+        ("장비 파일 다운로드해줘", "device_file_download"),
+        ("이 스레드 학습해줘", "thread_playbook_learning"),
+    ):
+        assert (
+            match_company_operation_route(_request(f"{question} {suffix}"))
+            == expected_route
+        )
+    assert (
+        match_company_operation_route(
+            _request("s3 로그 MB2-C00419 2026-09-02 12345678910 분석")
+        )
+        == "admin_s3_device_log"
+    )
+
+
 def test_streaming_restore_keeps_the_legacy_pre_device_guard() -> None:
     for question in (
         (

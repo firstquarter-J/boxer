@@ -6,7 +6,10 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal
 
-from boxer_company._operation_routing_common import CompanyOperationRequestContract
+from boxer_company._operation_routing_common import (
+    CompanyOperationRequestContract,
+    _is_explicit_barcode_log_analysis_request,
+)
 from boxer_company._operation_routing_device import (
     DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
     DEVICE_OPERATION_DELIVERY_ACTION,
@@ -247,6 +250,10 @@ def match_company_operation_route(
         # 앞이었다. 이 요청은 API barcode stage가 먼저 소유한다.
         if private_route is not None:
             return private_route
+        if _is_explicit_barcode_log_analysis_request(scoped.question):
+            # 현재 질문이 직접 지정한 바코드 로그 조회는 DB/S3 read stage가
+            # 소유한다. 앞에서 확정한 mutation·live probe에는 적용하지 않는다.
+            return None
         if (
             device_route == "device_diagnostic_analysis"
             and match_notion_playbook_route(scoped) is not None
