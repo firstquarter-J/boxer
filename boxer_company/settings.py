@@ -4,6 +4,22 @@ from pathlib import Path
 
 from boxer.core import settings as core_settings
 
+
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _strict_bool_env(name: str, default: str = "false") -> bool:
+    """상태 소유권을 바꾸는 신규 flag의 오타를 조용한 false로 만들지 않는다."""
+
+    raw_value = os.getenv(name, default).strip().lower()
+    if raw_value in _TRUE_ENV_VALUES:
+        return True
+    if raw_value in _FALSE_ENV_VALUES:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 # 기본 사용 권한 관리자는 이름이나 배포 env만 신뢰하지 않고 고정 Slack ID와도 교차 검증한다.
 BOXER_ACCESS_ADMIN_USER_ID = "U0629HDSJHG"
 HYUN_USER_ID = os.getenv("HYUN_USER_ID", "").strip()
@@ -171,6 +187,10 @@ UPLOADER_JWT_SECRET = os.getenv("UPLOADER_JWT_SECRET", "").strip()
 # 회사 S3 버킷과 조회 상한은 공개 core의 설치 계약이 아니라 운영 정책이다.
 # 회사 라우터가 이 경계를 직접 참조해 공개 settings 정리와 독립적으로 유지한다.
 S3_ULTRASOUND_BUCKET = os.getenv("S3_ULTRASOUND_BUCKET", "").strip()
+S3_ULTRASOUND_BUCKET_OWNER_ID = os.getenv(
+    "S3_ULTRASOUND_BUCKET_OWNER_ID",
+    "",
+).strip()
 S3_LOG_BUCKET = os.getenv("S3_LOG_BUCKET", "").strip()
 S3_QUERY_MAX_KEYS = int(os.getenv("S3_QUERY_MAX_KEYS", "20000"))
 S3_QUERY_MAX_ITEMS = int(os.getenv("S3_QUERY_MAX_ITEMS", "20"))
@@ -298,6 +318,50 @@ DEVICE_NOTIFICATION_ALERT_CHANNEL_ID = (
     os.getenv("DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", "").strip()
     or DEVICE_HEALTH_MONITOR_CHANNEL_ID
 )
+# 길이 mismatch는 단말 파일 duration을 읽은 직후, 중앙 업로드보다 먼저 온다.
+# 별도 rollout flag와 유예를 둬 중앙 객체가 정상화된 짧은 영상은 알리지 않는다.
+DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED = _strict_bool_env(
+    "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED"
+)
+DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC = int(
+    os.getenv(
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+        "1800",
+    )
+)
+if not 60 <= DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC <= 86_400:
+    raise ValueError(
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC must be "
+        "between 60 and 86400"
+    )
+# 영상 시간과 무관하게 MommyBox uploader가 전송 전에 적용하는 파일 하한이다.
+DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES = int(
+    os.getenv("DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES", "128000")
+)
+if not 1 <= DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES <= 10_000_000:
+    raise ValueError(
+        "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES must be between "
+        "1 and 10000000"
+    )
+if DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED and (
+    not core_settings.AWS_REGION
+    or not (
+        3 <= len(S3_ULTRASOUND_BUCKET) <= 63
+        and re.fullmatch(
+            r"[a-z0-9][a-z0-9.-]*[a-z0-9]",
+            S3_ULTRASOUND_BUCKET,
+        )
+        and ".." not in S3_ULTRASOUND_BUCKET
+        and ".-" not in S3_ULTRASOUND_BUCKET
+        and "-." not in S3_ULTRASOUND_BUCKET
+    )
+    or re.fullmatch(r"[0-9]{12}", S3_ULTRASOUND_BUCKET_OWNER_ID) is None
+):
+    # scheduler companion도 이 module을 직접 읽으므로 readiness와 별개로
+    # unsafe 설정에서는 import 단계에서 fail-closed한다.
+    raise ValueError(
+        "video duration mismatch S3 configuration is invalid"
+    )
 # 캡처보드 반복 이벤트는 Sheet 처리 상태와 분리된 incident로 묶고,
 # 마지막 이벤트 뒤 이 시간 동안만 같은 장애로 판단한다.
 DEVICE_NOTIFICATION_CAPTUREBOARD_INCIDENT_QUIET_SEC = int(

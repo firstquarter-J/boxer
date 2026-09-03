@@ -420,6 +420,61 @@ class CompanyApiSettingsTests(unittest.TestCase):
         )
         self.assertNotIn("not-logged", repr(configured))
 
+    def test_video_mismatch_alert_requires_parent_cycle_and_fixed_s3_scope(
+        self,
+    ) -> None:
+        base_env = {
+            "BOXER_COMPANY_API_CALLERS_JSON": self._registry(
+                capabilities=self._AUTOMATION_CAPABILITIES
+            ),
+            "DEVICE_NOTIFICATION_ALERT_ENABLED": "true",
+            "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED": "true",
+            "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC": "1800",
+            "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES": "128000",
+            "SMS_DELIVERY_OUTBOX_PATH": (
+                "/var/lib/boxer-company-api/sms_delivery_outbox.json"
+            ),
+            "DB_QUERY_ENABLED": "true",
+            "DB_HOST": "db.internal",
+            "DB_USERNAME": "readonly",
+            "DB_PASSWORD": "not-logged",
+            "DB_DATABASE": "box",
+            "AWS_REGION": "ap-northeast-2",
+            "S3_ULTRASOUND_BUCKET": "ultrasound-prod-kr",
+            "S3_ULTRASOUND_BUCKET_OWNER_ID": "123456789012",
+        }
+
+        configured = load_company_api_settings(base_env)
+        invalid_variants = (
+            {
+                **base_env,
+                "DEVICE_NOTIFICATION_ALERT_ENABLED": "false",
+            },
+            {**base_env, "S3_ULTRASOUND_BUCKET": ""},
+            {**base_env, "S3_ULTRASOUND_BUCKET_OWNER_ID": "not-an-owner"},
+            {
+                **base_env,
+                "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC": "59",
+            },
+            {
+                **base_env,
+                "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES": "0",
+            },
+        )
+
+        self.assertIsNone(configured.configuration_error)
+        self.assertEqual(
+            configured.automation_enabled_cycles,
+            frozenset({"device_notification_alert"}),
+        )
+        for invalid in invalid_variants:
+            with self.subTest(invalid=invalid):
+                settings = load_company_api_settings(invalid)
+                self.assertEqual(
+                    settings.configuration_error,
+                    "automation_dependency_configuration_invalid",
+                )
+
     def test_health_automation_requires_redis_and_mda_ssh_config(
         self,
     ) -> None:

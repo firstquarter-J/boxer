@@ -4,8 +4,11 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import os
+import subprocess
+import sys
 from typing import Callable
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -83,6 +86,31 @@ def _recording_stall_event(
     }
 
 
+def _video_duration_mismatch_event(
+    notification_id: int = 80,
+    *,
+    occurred_at: str = "2026-08-14T00:59:00+00:00",
+) -> dict:
+    """단말 원문 식별자가 deferred cursor에서 제거되는 입력을 만든다."""
+
+    return {
+        **_captureboard_event(notification_id),
+        "code": "video_duration_mismatch",
+        "message": "비디오 길이 불일치: 예상 600초, 실제 120초 (20%)",
+        "fileId": "private-file-id",
+        "barcode": "81000000000",
+        "occurredAt": occurred_at,
+        "details": {
+            "voiceType": "s",
+            "fileId": "private-file-id",
+            "barcode": "81000000000",
+            "expectedDuration": 600,
+            "actualDuration": 120,
+            "ratio": 0.2,
+        },
+    }
+
+
 def _deps(
     *,
     latest_id: int = 0,
@@ -109,11 +137,13 @@ def _deps(
         ),
         "claim_sms": Mock(return_value=True),
         "remember_sms": Mock(return_value=True),
+        "verify_video": Mock(),
     }
     return (
         DeviceNotificationCycleDeps(
             load_latest_id=mocks["latest"],
             load_next_event=mocks["next"],
+            verify_video_duration_mismatch=mocks["verify_video"],
             append_sheet_alerts=mocks["append_sheet"],
             send_sms=mocks["send_sms"],
             claim_sms_delivery=mocks["claim_sms"],
@@ -209,6 +239,654 @@ def test_production_cycle_loads_one_fixed_legacy_batch_then_drains_receipts(
     assert second.deliveries[0].delivery_id == "device_notification:14"
     assert load_batch.call_count == 1
     mocks["next"].assert_not_called()
+
+
+def test_production_batch_query_includes_video_duration_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {"latestId": 80}
+    cursor.fetchall.return_value = [_video_duration_mismatch_event(80)]
+    monkeypatch.setattr(
+        cycle,
+        "_create_db_connection",
+        Mock(return_value=connection),
+    )
+
+    next_cursor, events = cycle._load_device_notification_batch(79)
+
+    assert next_cursor == 80
+    assert [item["code"] for item in events] == ["video_duration_mismatch"]
+    sql, params = cursor.execute.call_args_list[1].args
+    assert "n.code IN (%s, %s, %s, %s)" in sql
+    assert "video_duration_mismatch" in params
+    connection.close.assert_called_once_with()
+
+
+def test_duration_mismatch_inside_grace_is_deferred_without_identifiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+        1800,
+    )
+    deps, mocks = _deps(
+        next_result=(80, _video_duration_mismatch_event(80)),
+    )
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=79))
+    )
+
+    assert result.outcome == "no_change"
+    assert result.deliveries == ()
+    assert result.cursor["pendingEvents"] == []
+    deferred = result.cursor["pendingVideoVerifications"]
+    assert deferred["80"]["notificationId"] == 80
+    assert deferred["80"]["attemptCount"] == 0
+    assert deferred["80"]["verifyAfter"] == (
+        datetime(2026, 8, 14, 1, 29, tzinfo=timezone.utc).isoformat()
+    )
+    serialized = json.dumps(result.cursor, ensure_ascii=False)
+    assert "private-file-id" not in serialized
+    assert "81000000000" not in serialized
+    assert "010-1234-5678" not in serialized
+    mocks["verify_video"].assert_not_called()
+    mocks["send_sms"].assert_not_called()
+
+
+def test_duration_mismatch_rollout_off_ignores_new_and_pauses_existing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        False,
+    )
+    deps, mocks = _deps(
+        next_result=(80, _video_duration_mismatch_event(80)),
+    )
+    cursor = {
+        **_initialized_cursor(last_seen_id=79),
+        "pendingVideoVerifications": {
+            "78": {
+                "notificationId": 78,
+                "verifyAfter": "2026-08-14T00:00:00+00:00",
+                "attemptCount": 2,
+                "lastAttemptAt": "2026-08-13T23:00:00+00:00",
+                "lastReason": "provider_error",
+            }
+        },
+    }
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=cursor)
+    )
+
+    assert result.deliveries == ()
+    assert result.cursor["pendingEvents"] == []
+    assert tuple(result.cursor["pendingVideoVerifications"]) == ("78",)
+    assert result.cursor["videoVerificationDisabledCount"] == 1
+    assert result.cursor["videoVerificationLastDisabledNotificationId"] == 80
+    mocks["verify_video"].assert_not_called()
+    mocks["send_sms"].assert_not_called()
+
+
+def test_duration_mismatch_rollout_flag_rejects_ambiguous_value() -> None:
+    # scheduler도 같은 module constant를 읽으므로 오타를 false로 축약하지 않는다.
+    completed = subprocess.run(
+        [sys.executable, "-c", "import boxer_company.settings"],
+        cwd=str(cycle.core_settings.PROJECT_ROOT),
+        env={
+            **os.environ,
+            "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED": "maybe",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "must be a boolean" in completed.stderr
+
+
+def test_deferred_mismatch_survives_restart_and_normalized_upload_suppresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+        1800,
+    )
+    event = _video_duration_mismatch_event(81)
+    deps, mocks = _deps(next_result=(81, event))
+    handler = DeviceNotificationAlertCycleHandler(deps)
+    deferred = handler.run(
+        _request(cursor=_initialized_cursor(last_seen_id=80))
+    )
+    mocks["next"].return_value = (81, None)
+    mocks["verify_video"].return_value = (
+        cycle.VideoDurationMismatchVerification(
+            status=cycle._VIDEO_UPLOAD_NORMALIZED,
+            reason="central_object_available",
+            event=event,
+        )
+    )
+
+    result = handler.run(
+        _request(
+            cursor=json.loads(json.dumps(deferred.cursor)),
+            scheduled_at=_NOW + timedelta(minutes=31),
+        )
+    )
+
+    assert result.outcome == "no_change"
+    assert result.deliveries == ()
+    assert result.cursor["pendingVideoVerifications"] == {}
+    assert result.metrics["processedCount"] == 1
+    mocks["verify_video"].assert_called_once_with(81)
+    mocks["send_sms"].assert_not_called()
+    mocks["append_sheet"].assert_not_called()
+
+
+def test_missing_central_video_builds_slack_only_upload_alert_and_ack_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+        1800,
+    )
+    event = _video_duration_mismatch_event(
+        82,
+        occurred_at="2026-08-14T00:00:00+00:00",
+    )
+    # recordings row가 없는 실제 알림은 감지 시각과 예상 길이로 시작을 추정한다.
+    event["sessionBarcode"] = "81000000000"
+    event["expectedDuration"] = 600
+    deps, mocks = _deps(next_result=(82, event), sheet_rows=1)
+    mocks["verify_video"].return_value = (
+        cycle.VideoDurationMismatchVerification(
+            status=cycle._VIDEO_UPLOAD_UNAVAILABLE,
+            reason=cycle._VIDEO_UPLOAD_MISSING_RECORDING,
+            event=event,
+        )
+    )
+    handler = DeviceNotificationAlertCycleHandler(deps)
+
+    result = handler.run(
+        _request(cursor=_initialized_cursor(last_seen_id=81))
+    )
+
+    assert len(result.deliveries) == 1
+    delivery = result.deliveries[0]
+    assert delivery.kind == "device_notification_alert"
+    assert delivery.payload["code"] == "video_duration_mismatch"
+    assert delivery.payload["render"] == {
+        "type": "device_health_abnormal_alert",
+        "includeActions": False,
+        "includeDeviceVoiceAction": False,
+    }
+    device_result = delivery.payload["alertSummary"]["deviceResults"][0]
+    assert device_result["alertCategory"] == "upload"
+    assert device_result["barcode"] == "81000000000"
+    assert device_result["sessionAtLabel"] == "세션 시작(추정)"
+    assert device_result["sessionAt"] == "2026-08-14 08:50:00 KST"
+    assert "영상 업로드가 확인되지 않았어" in device_result[
+        "priorityReason"
+    ]
+    assert delivery.payload["smsReceipt"]["status"] == "not_applicable"
+    assert result.cursor["pendingVideoVerifications"] == {}
+    assert delivery.delivery_id in result.cursor["pendingDeliveryContexts"]
+    mocks["send_sms"].assert_not_called()
+    mocks["claim_sms"].assert_not_called()
+    mocks["remember_sms"].assert_not_called()
+
+    failed = handler.acknowledge(
+        _request(cursor=dict(result.cursor)),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=delivery.delivery_id,
+                status="failed",
+            ),
+        ),
+    )
+    assert delivery.delivery_id in failed["pendingDeliveryContexts"]
+    assert failed["pendingVideoVerifications"] == {}
+
+    acknowledged = handler.acknowledge(
+        _request(cursor=dict(failed)),
+        (
+            AutomationDeliveryReceipt(
+                delivery_id=delivery.delivery_id,
+                status="sent",
+                external_message_id="1710000000.082",
+                permalink="https://lifexio.slack.com/archives/C1/p82",
+                delivered_at=_NOW,
+            ),
+        ),
+    )
+    assert acknowledged["pendingDeliveryContexts"] == {}
+    assert acknowledged["pendingVideoVerifications"] == {}
+    mocks["append_sheet"].assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_text"),
+    (
+        (
+            cycle._VIDEO_UPLOAD_MISSING_RECORDING,
+            "영상 업로드가 확인되지 않았어",
+        ),
+        (
+            cycle._VIDEO_UPLOAD_MISSING_OBJECT,
+            "업로드된 영상 파일을 찾을 수 없어",
+        ),
+        (
+            cycle._VIDEO_UPLOAD_UNDERSIZED_OBJECT,
+            "업로드된 영상 파일의 크기가 비정상적으로 작아",
+        ),
+    ),
+)
+def test_video_mismatch_alert_copy_avoids_internal_storage_terms(
+    reason: str,
+    expected_text: str,
+) -> None:
+    # 같은 업로드 경고라도 비개발자가 조치 대상을 바로 이해하는 문구를 유지한다.
+    summary, sheet_item, _recording_context = cycle._build_root_alert(
+        {
+            **_video_duration_mismatch_event(820),
+            "videoAvailabilityReason": reason,
+        }
+    )
+
+    priority_reason = summary["deviceResults"][0]["priorityReason"]
+    assert expected_text in priority_reason
+    assert "중앙 녹화" not in priority_reason
+    assert "S3" not in priority_reason
+    assert sheet_item["problemComponents"] == ["영상 업로드"]
+
+
+def test_due_missing_video_waits_behind_following_device_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+        1800,
+    )
+    mismatch = _video_duration_mismatch_event(
+        83,
+        occurred_at="2026-08-14T00:00:00+00:00",
+    )
+    captureboard = _captureboard_event(84)
+    load_batch = Mock(return_value=(84, [mismatch, captureboard]))
+    base_deps, mocks = _deps()
+    mocks["verify_video"].return_value = (
+        cycle.VideoDurationMismatchVerification(
+            status=cycle._VIDEO_UPLOAD_UNAVAILABLE,
+            reason=cycle._VIDEO_UPLOAD_MISSING_RECORDING,
+            event=mismatch,
+        )
+    )
+    deps = DeviceNotificationCycleDeps(
+        load_latest_id=base_deps.load_latest_id,
+        load_next_event=cycle._load_next_device_notification,
+        load_event_batch=load_batch,
+        verify_video_duration_mismatch=mocks["verify_video"],
+        append_sheet_alerts=base_deps.append_sheet_alerts,
+        send_sms=base_deps.send_sms,
+        claim_sms_delivery=base_deps.claim_sms_delivery,
+        hold_sms_delivery_claim=base_deps.hold_sms_delivery_claim,
+        clock=base_deps.clock,
+        remember_sms_delivery=base_deps.remember_sms_delivery,
+    )
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=82))
+    )
+
+    assert result.deliveries[0].payload["code"] == (
+        "captureboard_connection_error"
+    )
+    retry = result.cursor["pendingVideoVerifications"]["83"]
+    assert retry["attemptCount"] == 0
+    assert retry["lastReason"] == ""
+    assert load_batch.call_count == 1
+    mocks["verify_video"].assert_not_called()
+
+
+def test_verification_provider_error_is_retried_without_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        True,
+    )
+    deps, mocks = _deps(next_result=(83, None))
+    mocks["verify_video"].side_effect = TimeoutError("private S3 timeout")
+    cursor = {
+        **_initialized_cursor(last_seen_id=83),
+        "pendingVideoVerifications": {
+            "83": {
+                "notificationId": 83,
+                "verifyAfter": "2026-08-14T00:00:00+00:00",
+                "attemptCount": 0,
+                "lastAttemptAt": "",
+                "lastReason": "",
+            }
+        },
+    }
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=cursor)
+    )
+
+    assert result.deliveries == ()
+    retry = result.cursor["pendingVideoVerifications"]["83"]
+    assert retry["attemptCount"] == 1
+    assert retry["lastReason"] == "provider_error"
+    assert "private S3 timeout" not in json.dumps(result.cursor)
+    mocks["verify_video"].assert_called_once_with(83)
+
+
+def test_full_video_verification_queue_drops_only_overflow_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+        True,
+    )
+    pending_verifications = {
+        str(notification_id): {
+            "notificationId": notification_id,
+            "verifyAfter": (_NOW + timedelta(days=1)).isoformat(),
+            "attemptCount": 1,
+            "lastAttemptAt": _NOW.isoformat(),
+            "lastReason": "provider_error",
+        }
+        for notification_id in range(1, 501)
+    }
+    mismatch = _video_duration_mismatch_event(
+        600,
+        occurred_at="2026-08-14T00:00:00+00:00",
+    )
+    captureboard = _captureboard_event(601)
+    load_batch = Mock(return_value=(601, [mismatch, captureboard]))
+    base_deps, mocks = _deps()
+    deps = DeviceNotificationCycleDeps(
+        load_latest_id=base_deps.load_latest_id,
+        load_next_event=cycle._load_next_device_notification,
+        load_event_batch=load_batch,
+        verify_video_duration_mismatch=mocks["verify_video"],
+        append_sheet_alerts=base_deps.append_sheet_alerts,
+        send_sms=base_deps.send_sms,
+        claim_sms_delivery=base_deps.claim_sms_delivery,
+        hold_sms_delivery_claim=base_deps.hold_sms_delivery_claim,
+        clock=base_deps.clock,
+        remember_sms_delivery=base_deps.remember_sms_delivery,
+    )
+    caplog.set_level(logging.ERROR)
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(
+            cursor={
+                **_initialized_cursor(last_seen_id=599),
+                "pendingVideoVerifications": pending_verifications,
+            }
+        )
+    )
+
+    assert result.deliveries[0].payload["code"] == (
+        "captureboard_connection_error"
+    )
+    assert len(result.cursor["pendingVideoVerifications"]) == 500
+    assert "600" not in result.cursor["pendingVideoVerifications"]
+    assert result.cursor["videoVerificationDroppedCount"] == 1
+    assert result.cursor["videoVerificationLastDroppedNotificationId"] == 600
+    assert result.metrics["droppedVideoVerificationCount"] == 1
+    assert "verification dropped queue_full" in caplog.text
+    mocks["verify_video"].assert_not_called()
+
+
+def test_cursor_normalization_records_deferred_overflow_without_identifiers(
+) -> None:
+    raw_verifications = {
+        str(notification_id): {
+            "notificationId": notification_id,
+            "verifyAfter": (_NOW + timedelta(days=1)).isoformat(),
+            "attemptCount": 0,
+            "lastAttemptAt": "",
+            "lastReason": "",
+        }
+        for notification_id in range(1, 502)
+    }
+    raw_verifications["999"] = {"notificationId": 999}
+
+    normalized = cycle._normalize_cursor(
+        {
+            **_initialized_cursor(last_seen_id=999),
+            "pendingVideoVerifications": raw_verifications,
+        },
+        now=_NOW,
+    )
+
+    assert len(normalized["pendingVideoVerifications"]) == 500
+    assert normalized["videoVerificationDroppedCount"] == 2
+    assert normalized["videoVerificationLastDroppedNotificationId"] == 999
+    assert normalized["videoVerificationFirstDroppedAt"] == (
+        _NOW.astimezone(timezone.utc).isoformat()
+    )
+    assert "fileId" not in json.dumps(normalized)
+
+
+def test_video_verifier_uses_exact_join_for_short_duration_central_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [
+        {
+            **_video_duration_mismatch_event(85),
+            "deviceSeq": None,
+            "hasFileId": 1,
+            "recordingSeq": 9001,
+            "recordingDeviceSeq": 992,
+            "recordingRecordedAt": datetime(2026, 8, 14, 0, 49),
+            "streamingStatus": "AVAILABLE",
+            "s3Bucket": "ultrasound-prod-kr",
+            "s3FileKey": "81000000000/private-file-id.mp4",
+        }
+    ]
+    s3_client = Mock()
+    # 재생 시간이 짧아도 uploader의 파일 크기 invariant를 만족하면 억제한다.
+    s3_client.head_object.return_value = {
+        "ContentLength": 128_000,
+        "StorageClass": "STANDARD",
+    }
+    monkeypatch.setattr(
+        cycle,
+        "_create_db_connection",
+        Mock(return_value=connection),
+    )
+    monkeypatch.setattr(cycle, "_build_s3_client", Mock(return_value=s3_client))
+    monkeypatch.setattr(
+        cycle.cs,
+        "S3_ULTRASOUND_BUCKET",
+        "ultrasound-prod-kr",
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "S3_ULTRASOUND_BUCKET_OWNER_ID",
+        "123456789012",
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES",
+        128_000,
+    )
+
+    result = cycle._verify_video_duration_mismatch(85)
+
+    assert result.status == cycle._VIDEO_UPLOAD_NORMALIZED
+    assert result.event["sessionBarcode"] == "81000000000"
+    assert result.event["recordingRecordedAt"] == "2026-08-14T00:49:00+00:00"
+    sql, params = cursor.execute.call_args.args
+    assert "ON r.fileId = n.fileId" in sql
+    assert "n.fileId AS" not in sql
+    assert params == (85, "video_duration_mismatch")
+    s3_client.head_object.assert_called_once_with(
+        Bucket="ultrasound-prod-kr",
+        Key="81000000000/private-file-id.mp4",
+        ExpectedBucketOwner="123456789012",
+    )
+    connection.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    (
+        "recording_seq",
+        "recording_device_seq",
+        "s3_error_code",
+        "content_length",
+        "expected_status",
+        "expected_reason",
+    ),
+    (
+        (None, None, "", 128_000, "unavailable", "missing_recording"),
+        (9001, 992, "404", 128_000, "unavailable", "missing_object"),
+        (9001, 992, "", 127_999, "unavailable", "undersized_object"),
+        (9001, 993, "", 128_000, "unknown", "recording_device_mismatch"),
+    ),
+)
+def test_video_verifier_only_marks_confirmed_absence_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_seq: int | None,
+    recording_device_seq: int | None,
+    s3_error_code: str,
+    content_length: int,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [
+        {
+            **_video_duration_mismatch_event(86),
+            "hasFileId": 1,
+            "recordingSeq": recording_seq,
+            "recordingDeviceSeq": recording_device_seq,
+            "streamingStatus": "AVAILABLE",
+            "s3Bucket": "ultrasound-prod-kr",
+            "s3FileKey": "81000000000/private-file-id.mp4",
+        }
+    ]
+    s3_client = Mock()
+    s3_client.head_object.return_value = {
+        "ContentLength": content_length,
+        "StorageClass": "STANDARD",
+    }
+    if s3_error_code:
+        error = RuntimeError("private provider message")
+        error.response = {"Error": {"Code": s3_error_code}}
+        s3_client.head_object.side_effect = error
+    monkeypatch.setattr(
+        cycle,
+        "_create_db_connection",
+        Mock(return_value=connection),
+    )
+    build_s3 = Mock(return_value=s3_client)
+    monkeypatch.setattr(cycle, "_build_s3_client", build_s3)
+    monkeypatch.setattr(
+        cycle.cs,
+        "S3_ULTRASOUND_BUCKET",
+        "ultrasound-prod-kr",
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "S3_ULTRASOUND_BUCKET_OWNER_ID",
+        "123456789012",
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES",
+        128_000,
+    )
+
+    result = cycle._verify_video_duration_mismatch(86)
+
+    assert result.status == expected_status
+    assert result.reason == expected_reason
+    if recording_seq is None:
+        # 업로드 row가 없어도 notification 원문으로 세션 식별값을 복원한다.
+        assert result.event["sessionBarcode"] == "81000000000"
+        assert result.event["expectedDuration"] == 600
+        build_s3.assert_not_called()
+
+
+def test_video_verifier_does_not_turn_s3_access_denied_into_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [
+        {
+            **_video_duration_mismatch_event(87),
+            "hasFileId": 1,
+            "recordingSeq": 9001,
+            "recordingDeviceSeq": 992,
+            "streamingStatus": "AVAILABLE",
+            "s3Bucket": "ultrasound-prod-kr",
+            "s3FileKey": "81000000000/private-file-id.mp4",
+        }
+    ]
+    error = RuntimeError("private access detail")
+    error.response = {"Error": {"Code": "AccessDenied"}}
+    s3_client = Mock()
+    s3_client.head_object.side_effect = error
+    monkeypatch.setattr(
+        cycle,
+        "_create_db_connection",
+        Mock(return_value=connection),
+    )
+    monkeypatch.setattr(cycle, "_build_s3_client", Mock(return_value=s3_client))
+    monkeypatch.setattr(
+        cycle.cs,
+        "S3_ULTRASOUND_BUCKET",
+        "ultrasound-prod-kr",
+    )
+    monkeypatch.setattr(
+        cycle.cs,
+        "S3_ULTRASOUND_BUCKET_OWNER_ID",
+        "123456789012",
+    )
+    with pytest.raises(RuntimeError, match="private access detail"):
+        cycle._verify_video_duration_mismatch(87)
 
 
 def test_persisted_cursor_processes_gap_instead_of_skipping_to_latest() -> None:

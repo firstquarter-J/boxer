@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from boxer.core import settings as core_settings
 from boxer.retrieval.connectors.db import _create_db_connection
+from boxer.retrieval.connectors.s3 import _build_s3_client
 from boxer_company import settings as cs
 from boxer_company.assistant.device_health_alert_action_route import (
     DeviceHealthAlertActionTarget,
@@ -51,10 +52,12 @@ from boxer_company.sms_delivery_cycle import (
 _CAPTUREBOARD_CONNECTION_ERROR = "captureboard_connection_error"
 _RECORDING_CRITICALLY_STALLED = "recording_critically_stalled"
 _SEGMENTED_RECORDINGS_MERGE_ERROR = "segmented_recordings_merge_error"
+_VIDEO_DURATION_MISMATCH = "video_duration_mismatch"
 _SUPPORTED_CODES = (
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
     _SEGMENTED_RECORDINGS_MERGE_ERROR,
+    _VIDEO_DURATION_MISMATCH,
 )
 _CAPTUREBOARD_INCIDENT_CODES = {
     _CAPTUREBOARD_CONNECTION_ERROR,
@@ -64,6 +67,16 @@ _KST = ZoneInfo("Asia/Seoul")
 _RECORDING_STALL_MIN_DURATION_SECONDS = 120
 _RECORDING_STALL_MAX_EVENT_GAP_SECONDS = 300
 _DEVICE_NOTIFICATION_BATCH_SIZE = 200
+_VIDEO_VERIFICATION_QUEUE_LIMIT = 500
+_VIDEO_VERIFICATION_RETRY_SECONDS = 300
+_VIDEO_UPLOAD_NORMALIZED = "normalized"
+_VIDEO_UPLOAD_UNAVAILABLE = "unavailable"
+_VIDEO_UPLOAD_UNKNOWN = "unknown"
+_VIDEO_UPLOAD_MISSING_RECORDING = "missing_recording"
+_VIDEO_UPLOAD_MISSING_OBJECT = "missing_object"
+_VIDEO_UPLOAD_UNDERSIZED_OBJECT = "undersized_object"
+_VIDEO_UPLOAD_PROVIDER_ERROR = "provider_error"
+_S3_ARCHIVE_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE"})
 _AUTO_SMS_DEDUPE_WINDOW_SECONDS = 60
 _AUTO_SMS_ACCEPTED_TEXT = "문자 발송 접수"
 _AUTO_SMS_CONFIRM_REQUIRED_TEXT = "문자 발송 여부 확인 필요"
@@ -139,7 +152,7 @@ def _load_next_device_notification(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s, %s) "
+                "AND n.code IN (%s, %s, %s, %s) "
                 "ORDER BY n.id ASC "
                 "LIMIT 1",
                 (
@@ -148,6 +161,7 @@ def _load_next_device_notification(
                     _CAPTUREBOARD_CONNECTION_ERROR,
                     _RECORDING_CRITICALLY_STALLED,
                     _SEGMENTED_RECORDINGS_MERGE_ERROR,
+                    _VIDEO_DURATION_MISMATCH,
                 ),
             )
             row = cursor.fetchone() or None
@@ -206,7 +220,7 @@ def _load_device_notification_batch(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s, %s) "
+                "AND n.code IN (%s, %s, %s, %s) "
                 "ORDER BY n.id ASC "
                 "LIMIT %s",
                 (
@@ -215,6 +229,7 @@ def _load_device_notification_batch(
                     _CAPTUREBOARD_CONNECTION_ERROR,
                     _RECORDING_CRITICALLY_STALLED,
                     _SEGMENTED_RECORDINGS_MERGE_ERROR,
+                    _VIDEO_DURATION_MISMATCH,
                     normalized_batch_size,
                 ),
             )
@@ -233,6 +248,195 @@ def _load_device_notification_batch(
 
 
 @dataclass(frozen=True, slots=True)
+class VideoDurationMismatchVerification:
+    """중앙 업로드 정상화 판정과 지연 알림에 필요한 안전한 이벤트다."""
+
+    status: str
+    reason: str
+    event: Mapping[str, Any]
+
+
+def _verify_video_duration_mismatch(
+    notification_id: int,
+) -> VideoDurationMismatchVerification:
+    """단말 ffprobe 경고 뒤 같은 파일의 중앙 업로드 결과만 확인한다.
+
+    mismatch 이벤트는 단말에서 MP4 duration을 읽은 뒤에만 생성된다. 따라서
+    Boxer는 큰 영상을 다시 내려받지 않고, uploader가 성공 뒤 생성한 DB row와
+    exact S3 객체를 함께 확인해 중앙 업로드가 정상화됐는지만 판정한다.
+    """
+
+    normalized_notification_id = max(0, _coerce_int(notification_id))
+    if normalized_notification_id <= 0:
+        raise ValueError("video mismatch notification id is invalid")
+
+    connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            # fileId는 JOIN 안에서만 사용하고 SELECT 결과나 durable cursor에는
+            # 싣지 않는다. 삭제된 장비의 nullable FK 대신 globally unique fileId를
+            # 우선하고, 충돌·장비 불일치는 아래에서 unknown으로 막는다.
+            cursor.execute(
+                "SELECT "
+                "n.id AS notificationId, "
+                "n.deviceSeq AS deviceSeq, "
+                "n.deviceName AS deviceName, "
+                "n.code AS code, "
+                "n.message AS message, "
+                "n.details AS details, "
+                "n.barcode AS barcode, "
+                "n.occurredAt AS occurredAt, "
+                "d.hospitalSeq AS hospitalSeq, "
+                "d.hospitalRoomSeq AS hospitalRoomSeq, "
+                "d.version AS deviceVersion, "
+                "h.hospitalName AS hospitalName, "
+                "h.telephone AS hospitalTelephone, "
+                "h.deviceAlertPhone AS hospitalDeviceAlertPhone, "
+                "hr.roomName AS roomName, "
+                "CASE WHEN n.fileId IS NULL OR TRIM(n.fileId) = '' "
+                "THEN 0 ELSE 1 END AS hasFileId, "
+                "r.seq AS recordingSeq, "
+                "r.deviceSeq AS recordingDeviceSeq, "
+                "r.recordedAt AS recordingRecordedAt, "
+                "r.streamingStatus AS streamingStatus, "
+                "r.s3Bucket AS s3Bucket, "
+                "r.s3FileKey AS s3FileKey "
+                "FROM device_notification n "
+                "LEFT JOIN devices d ON n.deviceSeq = d.seq "
+                "LEFT JOIN hospitals h ON d.hospitalSeq = h.seq "
+                "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
+                "LEFT JOIN recordings r "
+                "ON r.fileId = n.fileId "
+                "WHERE n.id = %s AND n.code = %s "
+                "ORDER BY r.seq DESC "
+                "LIMIT 2",
+                (
+                    normalized_notification_id,
+                    _VIDEO_DURATION_MISMATCH,
+                ),
+            )
+            rows = cursor.fetchall() or []
+    finally:
+        connection.close()
+
+    if not rows:
+        # 원본 notification 자체가 사라진 경우에는 대상 식별을 확정할 수 없다.
+        raise RuntimeError("video mismatch notification is unavailable")
+    event = _normalize_event(rows[0])
+    if event is None:
+        raise RuntimeError("video mismatch notification is invalid")
+    event = _enrich_video_verification_event(rows[0], event)
+    if len(rows) != 1:
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNKNOWN,
+            reason="ambiguous_recording",
+            event=event,
+        )
+
+    row = rows[0]
+    if not bool(_coerce_int(row.get("hasFileId"))):
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNKNOWN,
+            reason="notification_file_id_missing",
+            event=event,
+        )
+    if _coerce_optional_int(row.get("recordingSeq")) is None:
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNAVAILABLE,
+            reason=_VIDEO_UPLOAD_MISSING_RECORDING,
+            event=event,
+        )
+    notification_device_seq = _coerce_optional_int(row.get("deviceSeq"))
+    recording_device_seq = _coerce_optional_int(row.get("recordingDeviceSeq"))
+    if (
+        notification_device_seq is not None
+        and recording_device_seq is not None
+        and notification_device_seq != recording_device_seq
+    ):
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNKNOWN,
+            reason="recording_device_mismatch",
+            event=event,
+        )
+
+    # AVAILABLE 이외 상태와 잘못된 위치 정보는 일시적 상태일 수 있으므로
+    # 실제 누락으로 단정하지 않고 다음 poll에서 다시 확인한다.
+    if str(row.get("streamingStatus") or "").strip().upper() != "AVAILABLE":
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNKNOWN,
+            reason="streaming_not_available",
+            event=event,
+        )
+    expected_bucket = str(cs.S3_ULTRASOUND_BUCKET or "").strip()
+    bucket = str(row.get("s3Bucket") or "").strip()
+    key = str(row.get("s3FileKey") or "").strip()
+    owner_id = str(cs.S3_ULTRASOUND_BUCKET_OWNER_ID or "").strip()
+    if (
+        not expected_bucket
+        or bucket != expected_bucket
+        or not key.lower().endswith(".mp4")
+        or not re.fullmatch(r"[0-9]{12}", owner_id)
+    ):
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNKNOWN,
+            reason="invalid_s3_location",
+            event=event,
+        )
+
+    s3_client = _build_s3_client()
+    try:
+        # DB에서 확인한 exact key만 HEAD하고 bucket owner까지 고정한다. 영상
+        # download/restore/list 같은 확대 권한은 이 판정 경로에서 사용하지 않는다.
+        head = s3_client.head_object(
+            Bucket=bucket,
+            Key=key,
+            ExpectedBucketOwner=owner_id,
+        )
+    except Exception as exc:
+        error_code = _aws_error_code(exc)
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            return VideoDurationMismatchVerification(
+                status=_VIDEO_UPLOAD_UNAVAILABLE,
+                reason=_VIDEO_UPLOAD_MISSING_OBJECT,
+                event=event,
+            )
+        # 403은 없는 key와 권한/owner 오류를 구분할 수 없다. 재생 가능한
+        # 영상을 누락으로 오판하지 않도록 provider unknown으로 재시도한다.
+        raise
+
+    storage_class = str(head.get("StorageClass") or "STANDARD").strip().upper()
+    archive_status = str(head.get("ArchiveStatus") or "").strip().upper()
+    restore = str(head.get("Restore") or "").strip().lower()
+    content_length = max(0, _coerce_int(head.get("ContentLength")))
+    if content_length < max(
+        1,
+        int(cs.DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES),
+    ):
+        # 이 값은 재생 시간이 아니라 MommyBox uploader가 원본 전송 전에
+        # 적용하는 파일 크기 invariant다. 짧아도 온전한 영상은 그대로 허용한다.
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNAVAILABLE,
+            reason=_VIDEO_UPLOAD_UNDERSIZED_OBJECT,
+            event=event,
+        )
+    if (
+        storage_class in _S3_ARCHIVE_STORAGE_CLASSES
+        or bool(archive_status)
+        or 'ongoing-request="true"' in restore
+    ):
+        return VideoDurationMismatchVerification(
+            status=_VIDEO_UPLOAD_UNKNOWN,
+            reason="object_not_ready",
+            event=event,
+        )
+    return VideoDurationMismatchVerification(
+        status=_VIDEO_UPLOAD_NORMALIZED,
+        reason="central_object_available",
+        event=event,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceNotificationCycleDeps:
     """DB, Sheets, SMS mutation을 주입해 cycle 계약을 단위 검증한다."""
 
@@ -243,6 +447,9 @@ class DeviceNotificationCycleDeps:
     load_event_batch: Callable[..., tuple[int, list[dict[str, Any]]]] = (
         _load_device_notification_batch
     )
+    verify_video_duration_mismatch: Callable[
+        [int], VideoDurationMismatchVerification
+    ] = _verify_video_duration_mismatch
     append_sheet_alerts: Callable[..., int | None] = (
         _append_device_health_sheet_alerts
     )
@@ -300,10 +507,11 @@ class DeviceNotificationAlertCycleHandler:
             )
             return _cycle_result(state, deliveries=(), processed_count=0)
 
-        if self._deps.load_next_event is _load_next_device_notification:
-            # production은 legacy처럼 한 번 읽은 최대 200건을 cursor queue에
-            # 보존하고, Slack receipt마다 앞에서 한 건씩 확정한다.
-            if not state["pendingEvents"]:
+        processed_count = 0
+        if not state["pendingEvents"]:
+            if self._deps.load_next_event is _load_next_device_notification:
+                # production은 legacy처럼 한 번 읽은 최대 200건을 cursor queue에
+                # 보존하고, Slack receipt마다 일반 알림 한 건씩 확정한다.
                 next_cursor, events = self._deps.load_event_batch(
                     int(state["lastSeenId"]),
                     batch_size=_DEVICE_NOTIFICATION_BATCH_SIZE,
@@ -314,25 +522,124 @@ class DeviceNotificationAlertCycleHandler:
                 )
                 state["pendingEvents"] = list(events)
                 state["lastPolledAt"] = request.scheduled_at.isoformat()
-            raw_event = (
-                state["pendingEvents"][0]
+            else:
+                # 주입형 단위 테스트와 이전 custom port도 조회한 한 건을 먼저
+                # queue로 옮겨 유예·재시작 중 cursor가 앞서가며 잃지 않게 한다.
+                next_cursor, raw_event = self._deps.load_next_event(
+                    int(state["lastSeenId"])
+                )
+                state["lastSeenId"] = max(
+                    int(state["lastSeenId"]),
+                    int(next_cursor),
+                )
+                normalized_event = _normalize_event(raw_event)
+                state["pendingEvents"] = (
+                    [normalized_event] if normalized_event is not None else []
+                )
+                state["lastPolledAt"] = request.scheduled_at.isoformat()
+
+        # 길이 mismatch는 일반 delivery queue에서 즉시 분리한다. 지연 검증이
+        # 뒤의 캡처보드·녹화 정체 알림과 다음 DB batch를 막지 않게 하기 위함이다.
+        if cs.DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED:
+            processed_count += _defer_video_duration_mismatch_events(
+                state,
+                now=request.scheduled_at,
+                logger=self._logger,
+            )
+            # 기존 캡처보드·녹화 장애를 영상 검증 backlog보다 우선한다.
+            # 일반 queue가 비었을 때만 due mismatch 한 건을 확인한다.
+            verification = (
+                None
                 if state["pendingEvents"]
-                else None
+                else _next_due_video_verification(
+                    state,
+                    now=request.scheduled_at,
+                )
             )
+            if verification is not None:
+                notification_id = int(verification["notificationId"])
+                try:
+                    verified = self._deps.verify_video_duration_mismatch(
+                        notification_id
+                    )
+                except Exception as exc:
+                    # DB/S3 권한·timeout을 파일 누락으로 바꾸지 않는다. 안전한
+                    # retry marker만 갱신하고 같은 poll에서 일반 알림은 계속 처리한다.
+                    self._logger.warning(
+                        "Video duration mismatch verification deferred "
+                        "notification_id=%s error_type=%s",
+                        notification_id,
+                        type(exc).__name__,
+                    )
+                    _reschedule_video_verification(
+                        state,
+                        notification_id,
+                        now=request.scheduled_at,
+                        reason=_VIDEO_UPLOAD_PROVIDER_ERROR,
+                    )
+                else:
+                    if verified.status == _VIDEO_UPLOAD_NORMALIZED:
+                        _remove_video_verification(state, notification_id)
+                        processed_count += 1
+                    elif verified.status == _VIDEO_UPLOAD_UNAVAILABLE:
+                        alert_event = {
+                            **dict(verified.event),
+                            "videoAvailabilityReason": verified.reason,
+                        }
+                        delivery, context = self._build_delivery(
+                            request,
+                            state,
+                            alert_event,
+                        )
+                        if delivery is None or context is None:
+                            raise AutomationCycleContractError(
+                                "video mismatch alert could not be built"
+                            )
+                        # deferred entry와 pending delivery가 동시에 같은 이벤트를
+                        # 소유하지 않게 원자적으로 owner를 넘겨 recovery 재알림을 막는다.
+                        _remove_video_verification(state, notification_id)
+                        state["pendingDeliveryContexts"][
+                            delivery.delivery_id
+                        ] = context
+                        return _cycle_result(
+                            state,
+                            deliveries=(delivery,),
+                            processed_count=processed_count + 1,
+                        )
+                    else:
+                        _reschedule_video_verification(
+                            state,
+                            notification_id,
+                            now=request.scheduled_at,
+                            reason=verified.reason,
+                        )
         else:
-            # 주입형 단위 테스트와 이전 custom port는 기존 단건 계약을
-            # 유지해 별도 DB batch dependency를 요구하지 않는다.
-            next_cursor, raw_event = self._deps.load_next_event(
-                int(state["lastSeenId"])
+            # rollout off 동안 새 mismatch만 관측 marker와 함께 건너뛴다.
+            # 이미 검증 queue가 소유한 항목은 pause해 재활성화 때 이어간다.
+            processed_count += _discard_disabled_video_duration_mismatches(
+                state,
+                now=request.scheduled_at,
             )
-            state["lastSeenId"] = max(
-                int(state["lastSeenId"]),
-                int(next_cursor),
-            )
-            state["lastPolledAt"] = request.scheduled_at.isoformat()
+
+        raw_event = next(
+            (
+                item
+                for item in state["pendingEvents"]
+                if not (
+                    cs.DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED
+                    and isinstance(item, Mapping)
+                    and item.get("code") == _VIDEO_DURATION_MISMATCH
+                )
+            ),
+            None,
+        )
         event = _normalize_event(raw_event)
         if event is None:
-            return _cycle_result(state, deliveries=(), processed_count=0)
+            return _cycle_result(
+                state,
+                deliveries=(),
+                processed_count=processed_count,
+            )
 
         if _should_suppress_open_captureboard_event(
             state,
@@ -345,7 +652,11 @@ class DeviceNotificationAlertCycleHandler:
                 now=request.scheduled_at,
             )
             _consume_pending_event(state, event["notificationId"])
-            return _cycle_result(state, deliveries=(), processed_count=1)
+            return _cycle_result(
+                state,
+                deliveries=(),
+                processed_count=processed_count + 1,
+            )
 
         delivery, context = self._build_delivery(
             request,
@@ -354,12 +665,16 @@ class DeviceNotificationAlertCycleHandler:
         )
         if delivery is None or context is None:
             _consume_pending_event(state, event["notificationId"])
-            return _cycle_result(state, deliveries=(), processed_count=1)
+            return _cycle_result(
+                state,
+                deliveries=(),
+                processed_count=processed_count + 1,
+            )
         state["pendingDeliveryContexts"][delivery.delivery_id] = context
         return _cycle_result(
             state,
             deliveries=(delivery,),
-            processed_count=1,
+            processed_count=processed_count + 1,
         )
 
     def acknowledge(
@@ -508,13 +823,24 @@ class DeviceNotificationAlertCycleHandler:
                 return None, None
 
         alert_summary, alert_item, recording_context = _build_root_alert(event)
-        alert_summary, alert_item, sms_receipt = self._apply_auto_sms(
-            request,
-            state,
-            event,
-            alert_summary,
-            alert_item,
-        )
+        if event["code"] == _VIDEO_DURATION_MISMATCH:
+            # 중앙 영상 누락은 CX가 확인할 운영 알림이다. 병원 문자나 장비 음성
+            # 안내로 연결하면 현장 조치가 불필요한 장애를 병원에 전파하게 된다.
+            sms_receipt = {
+                "attempted": False,
+                "status": "not_applicable",
+                "ok": False,
+                "contactActionEnabled": False,
+                "deliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            }
+        else:
+            alert_summary, alert_item, sms_receipt = self._apply_auto_sms(
+                request,
+                state,
+                event,
+                alert_summary,
+                alert_item,
+            )
         delivery_id = f"device_notification:{event['notificationId']}"
         delivery = AutomationDelivery(
             delivery_id=delivery_id,
@@ -528,8 +854,10 @@ class DeviceNotificationAlertCycleHandler:
                 # 실행하며 DB/SMS/Sheets 판단은 다시 하지 않는다.
                 "render": {
                     "type": "device_health_abnormal_alert",
-                    "includeActions": True,
-                    "includeDeviceVoiceAction": True,
+                    "includeActions": event["code"]
+                    != _VIDEO_DURATION_MISMATCH,
+                    "includeDeviceVoiceAction": event["code"]
+                    != _VIDEO_DURATION_MISMATCH,
                 },
                 # alertSummary에는 legacy 자동발송 확인 action의 번호·본문을
                 # 유지하고, 별도 receipt에는 provider 식별값을 싣지 않는다.
@@ -1022,6 +1350,17 @@ def _cycle_result(
             "processedCount": max(0, int(processed_count)),
             "deliveryCount": len(deliveries),
             "lastSeenId": max(0, _coerce_int(cursor.get("lastSeenId"))),
+            "pendingVideoVerificationCount": len(
+                cursor.get("pendingVideoVerifications") or {}
+            ),
+            "droppedVideoVerificationCount": max(
+                0,
+                _coerce_int(cursor.get("videoVerificationDroppedCount")),
+            ),
+            "disabledVideoVerificationCount": max(
+                0,
+                _coerce_int(cursor.get("videoVerificationDisabledCount")),
+            ),
         },
     )
 
@@ -1049,6 +1388,64 @@ def _normalize_cursor(
         for key, item in (source.get("captureboardIncidents") or {}).items()
         if str(key or "").strip() and isinstance(item, Mapping)
     } if isinstance(source.get("captureboardIncidents"), Mapping) else {}
+    pending_video_verifications: dict[str, dict[str, Any]] = {}
+    normalized_video_verification_drop_count = 0
+    normalized_video_verification_last_dropped_id = 0
+    raw_video_verifications = source.get("pendingVideoVerifications")
+    if isinstance(raw_video_verifications, Mapping):
+        for raw_key, raw_item in sorted(
+            raw_video_verifications.items(),
+            key=lambda item: _coerce_int(item[0]),
+        ):
+            if len(pending_video_verifications) >= _VIDEO_VERIFICATION_QUEUE_LIMIT:
+                normalized_video_verification_drop_count += 1
+                normalized_video_verification_last_dropped_id = max(
+                    normalized_video_verification_last_dropped_id,
+                    _coerce_int(raw_key),
+                )
+                continue
+            if not isinstance(raw_item, Mapping):
+                normalized_video_verification_drop_count += 1
+                normalized_video_verification_last_dropped_id = max(
+                    normalized_video_verification_last_dropped_id,
+                    _coerce_int(raw_key),
+                )
+                continue
+            notification_id = _coerce_int(
+                raw_item.get("notificationId") or raw_key
+            )
+            verify_after = _parse_event_datetime(raw_item.get("verifyAfter"))
+            if notification_id <= 0 or verify_after is None:
+                normalized_video_verification_drop_count += 1
+                normalized_video_verification_last_dropped_id = max(
+                    normalized_video_verification_last_dropped_id,
+                    notification_id,
+                )
+                continue
+            if str(notification_id) in pending_video_verifications:
+                normalized_video_verification_drop_count += 1
+                normalized_video_verification_last_dropped_id = max(
+                    normalized_video_verification_last_dropped_id,
+                    notification_id,
+                )
+                continue
+            last_attempt_at = _parse_event_datetime(
+                raw_item.get("lastAttemptAt")
+            )
+            pending_video_verifications[str(notification_id)] = {
+                "notificationId": notification_id,
+                "verifyAfter": verify_after.isoformat(),
+                "attemptCount": max(
+                    0,
+                    min(100_000, _coerce_int(raw_item.get("attemptCount"))),
+                ),
+                "lastAttemptAt": (
+                    last_attempt_at.isoformat()
+                    if last_attempt_at is not None
+                    else ""
+                ),
+                "lastReason": str(raw_item.get("lastReason") or "")[:64],
+            }
     pending_events = [
         event
         for item in (
@@ -1058,6 +1455,21 @@ def _normalize_cursor(
         )
         if (event := _normalize_event(item)) is not None
     ][:_DEVICE_NOTIFICATION_BATCH_SIZE]
+    first_video_verification_dropped_at = _parse_event_datetime(
+        source.get("videoVerificationFirstDroppedAt")
+    )
+    last_video_verification_dropped_at = _parse_event_datetime(
+        source.get("videoVerificationLastDroppedAt")
+    )
+    last_video_verification_disabled_at = _parse_event_datetime(
+        source.get("videoVerificationLastDisabledAt")
+    )
+    if normalized_video_verification_drop_count:
+        normalized_at = _coerce_aware_datetime(now, fallback=_utc_now())
+        first_video_verification_dropped_at = (
+            first_video_verification_dropped_at or normalized_at
+        )
+        last_video_verification_dropped_at = normalized_at
     recent_alerts = {
         str(key): dict(item)
         for key, item in (source.get("recentCaptureboardAlerts") or {}).items()
@@ -1124,6 +1536,54 @@ def _normalize_cursor(
         "recordingStallIncidents": recording_incidents,
         "captureboardIncidents": captureboard_incidents,
         "pendingEvents": pending_events,
+        # 지연 검증에는 notification ID와 timing/status만 보존하고 원본
+        # barcode/fileId/연락처는 due 시점의 exact DB JOIN으로 다시 읽는다.
+        "pendingVideoVerifications": pending_video_verifications,
+        # queue 포화 시 기존 장비 알림을 막지 않기 위해 overflow mismatch만
+        # 버리되, PII 없는 누적 marker를 남겨 운영 알람이 잡을 수 있게 한다.
+        "videoVerificationDroppedCount": max(
+            0,
+            min(
+                1_000_000_000,
+                _coerce_int(source.get("videoVerificationDroppedCount"))
+                + normalized_video_verification_drop_count,
+            ),
+        ),
+        "videoVerificationFirstDroppedAt": (
+            first_video_verification_dropped_at.isoformat()
+            if first_video_verification_dropped_at is not None
+            else ""
+        ),
+        "videoVerificationLastDroppedAt": (
+            last_video_verification_dropped_at.isoformat()
+            if last_video_verification_dropped_at is not None
+            else ""
+        ),
+        "videoVerificationLastDroppedNotificationId": max(
+            0,
+            _coerce_int(
+                source.get("videoVerificationLastDroppedNotificationId")
+            ),
+            normalized_video_verification_last_dropped_id,
+        ),
+        "videoVerificationDisabledCount": max(
+            0,
+            min(
+                1_000_000_000,
+                _coerce_int(source.get("videoVerificationDisabledCount")),
+            ),
+        ),
+        "videoVerificationLastDisabledAt": (
+            last_video_verification_disabled_at.isoformat()
+            if last_video_verification_disabled_at is not None
+            else ""
+        ),
+        "videoVerificationLastDisabledNotificationId": max(
+            0,
+            _coerce_int(
+                source.get("videoVerificationLastDisabledNotificationId")
+            ),
+        ),
         "recentCaptureboardAlerts": recent_alerts,
         # 이 표식은 delivery 재발송을 막지 않고 durable outbox repair가 진행
         # 중임을 cursor에서 확인할 수 있게 최대 72시간만 유지한다.
@@ -1237,6 +1697,286 @@ def _consume_pending_event(
     ]
 
 
+def _defer_video_duration_mismatch_events(
+    state: dict[str, Any],
+    *,
+    now: datetime,
+    logger: logging.Logger,
+) -> int:
+    """mismatch를 PII 없는 검증 queue로 옮겨 일반 알림 순서를 연다."""
+
+    pending = state.get("pendingEvents") or []
+    remaining: list[dict[str, Any]] = []
+    dropped_count = 0
+    current_at = _coerce_aware_datetime(now, fallback=_utc_now())
+    for raw_event in pending:
+        event = _normalize_event(raw_event)
+        if event is None:
+            continue
+        if event["code"] != _VIDEO_DURATION_MISMATCH:
+            remaining.append(event)
+            continue
+        notification_id = int(event["notificationId"])
+        key = str(notification_id)
+        verifications = state["pendingVideoVerifications"]
+        if key in verifications:
+            continue
+        if len(verifications) >= _VIDEO_VERIFICATION_QUEUE_LIMIT:
+            # verifier 장애로 queue가 찼을 때 overflow mismatch 한 건 때문에
+            # 뒤의 캡처보드 등 기존 알림까지 막지 않는다. 원문 대신 누적 marker와
+            # ERROR 로그를 남겨 운영 감시가 provider 장애로 처리하게 한다.
+            logger.error(
+                "Video duration mismatch verification dropped queue_full "
+                "notification_id=%s",
+                notification_id,
+            )
+            _record_dropped_video_verification(
+                state,
+                notification_id,
+                now=current_at,
+            )
+            dropped_count += 1
+            continue
+        occurred_at = _parse_event_datetime(event.get("occurredAt"))
+        # 장비 시계가 미래이거나 깨졌다면 관찰 시각을 기준으로 온전한 유예를 준다.
+        base_at = (
+            occurred_at
+            if occurred_at is not None and occurred_at <= current_at
+            else current_at
+        )
+        verify_after = base_at + timedelta(
+            seconds=max(
+                1,
+                int(cs.DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC),
+            )
+        )
+        verifications[key] = {
+            "notificationId": notification_id,
+            "verifyAfter": verify_after.isoformat(),
+            "attemptCount": 0,
+            "lastAttemptAt": "",
+            "lastReason": "",
+        }
+    state["pendingEvents"] = remaining
+    return dropped_count
+
+
+def _record_dropped_video_verification(
+    state: dict[str, Any],
+    notification_id: int,
+    *,
+    now: datetime,
+) -> None:
+    """queue overflow를 식별자 원문 없이 durable 운영 지표로 남긴다."""
+
+    dropped_at = _coerce_aware_datetime(now, fallback=_utc_now()).isoformat()
+    previous_count = max(
+        0,
+        _coerce_int(state.get("videoVerificationDroppedCount")),
+    )
+    state["videoVerificationDroppedCount"] = min(
+        1_000_000_000,
+        previous_count + 1,
+    )
+    if not str(state.get("videoVerificationFirstDroppedAt") or "").strip():
+        state["videoVerificationFirstDroppedAt"] = dropped_at
+    state["videoVerificationLastDroppedAt"] = dropped_at
+    state["videoVerificationLastDroppedNotificationId"] = max(
+        0,
+        _coerce_int(notification_id),
+    )
+
+
+def _next_due_video_verification(
+    state: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """검증 시각이 지난 가장 오래된 notification 하나만 고른다."""
+
+    current_at = _coerce_aware_datetime(now, fallback=_utc_now())
+    candidates: list[tuple[datetime, int, dict[str, Any]]] = []
+    raw_items = state.get("pendingVideoVerifications")
+    if not isinstance(raw_items, Mapping):
+        return None
+    for raw_item in raw_items.values():
+        if not isinstance(raw_item, Mapping):
+            continue
+        notification_id = _coerce_int(raw_item.get("notificationId"))
+        verify_after = _parse_event_datetime(raw_item.get("verifyAfter"))
+        if (
+            notification_id <= 0
+            or verify_after is None
+            or verify_after > current_at
+        ):
+            continue
+        candidates.append(
+            (verify_after, notification_id, dict(raw_item))
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _reschedule_video_verification(
+    state: dict[str, Any],
+    notification_id: int,
+    *,
+    now: datetime,
+    reason: str,
+) -> None:
+    """불명확한 외부 조회를 누락으로 바꾸지 않고 bounded backoff한다."""
+
+    key = str(max(0, _coerce_int(notification_id)))
+    raw_item = state["pendingVideoVerifications"].get(key)
+    if not isinstance(raw_item, Mapping):
+        return
+    attempt_count = min(
+        100_000,
+        max(0, _coerce_int(raw_item.get("attemptCount"))) + 1,
+    )
+    retry_seconds = min(
+        3600,
+        _VIDEO_VERIFICATION_RETRY_SECONDS
+        * (2 ** min(max(0, attempt_count - 1), 3)),
+    )
+    current_at = _coerce_aware_datetime(now, fallback=_utc_now())
+    safe_reasons = {
+        _VIDEO_UPLOAD_PROVIDER_ERROR,
+        "ambiguous_recording",
+        "notification_file_id_missing",
+        "recording_device_mismatch",
+        "streaming_not_available",
+        "invalid_s3_location",
+        "object_not_ready",
+    }
+    state["pendingVideoVerifications"][key] = {
+        "notificationId": int(key),
+        "verifyAfter": (current_at + timedelta(seconds=retry_seconds)).isoformat(),
+        "attemptCount": attempt_count,
+        "lastAttemptAt": current_at.isoformat(),
+        "lastReason": reason if reason in safe_reasons else "indeterminate",
+    }
+
+
+def _remove_video_verification(
+    state: dict[str, Any],
+    notification_id: int,
+) -> None:
+    state["pendingVideoVerifications"].pop(
+        str(max(0, _coerce_int(notification_id))),
+        None,
+    )
+
+
+def _discard_disabled_video_duration_mismatches(
+    state: dict[str, Any],
+    *,
+    now: datetime,
+) -> int:
+    """rollout off의 새 mismatch만 건너뛰고 기존 deferred는 pause한다."""
+
+    discarded = 0
+    remaining: list[dict[str, Any]] = []
+    for raw_event in state.get("pendingEvents") or []:
+        event = _normalize_event(raw_event)
+        if event is None:
+            continue
+        if event["code"] == _VIDEO_DURATION_MISMATCH:
+            discarded += 1
+            state["videoVerificationDisabledCount"] = min(
+                1_000_000_000,
+                max(
+                    0,
+                    _coerce_int(state.get("videoVerificationDisabledCount")),
+                )
+                + 1,
+            )
+            state["videoVerificationLastDisabledAt"] = (
+                _coerce_aware_datetime(now, fallback=_utc_now()).isoformat()
+            )
+            state["videoVerificationLastDisabledNotificationId"] = int(
+                event["notificationId"]
+            )
+        else:
+            remaining.append(event)
+    state["pendingEvents"] = remaining
+    return discarded
+
+
+def _enrich_video_verification_event(
+    row: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """due 시점 조회값에서 Slack에 필요한 최소 세션 정보만 추린다."""
+
+    details = _normalize_json_object(row.get("details"))
+    raw_barcode = str(row.get("barcode") or details.get("barcode") or "").strip()
+    barcode = raw_barcode if re.fullmatch(r"[0-9]{11}", raw_barcode) else ""
+    expected_duration = _coerce_optional_float(details.get("expectedDuration"))
+    if (
+        expected_duration is None
+        or expected_duration <= 0
+        or expected_duration > 86_400
+    ):
+        expected_duration = None
+    return {
+        **dict(event),
+        "sessionBarcode": barcode,
+        "recordingRecordedAt": _serialize_datetime(
+            row.get("recordingRecordedAt")
+        ),
+        "expectedDuration": expected_duration,
+    }
+
+
+def _video_session_fields(event: Mapping[str, Any]) -> dict[str, str]:
+    """실제 녹화 시작 시각을 우선하고, DB row가 없으면 시작을 추정한다."""
+
+    details = (
+        event.get("details")
+        if isinstance(event.get("details"), Mapping)
+        else {}
+    )
+    raw_barcode = str(
+        event.get("sessionBarcode")
+        or event.get("barcode")
+        or details.get("barcode")
+        or ""
+    ).strip()
+    barcode = raw_barcode if re.fullmatch(r"[0-9]{11}", raw_barcode) else "미확인"
+
+    recorded_at = _parse_event_datetime(event.get("recordingRecordedAt"))
+    if recorded_at is not None:
+        return {
+            "barcode": barcode,
+            "sessionAtLabel": "세션 시작",
+            "sessionAt": _format_occurred_at(recorded_at),
+        }
+
+    expected_duration = _coerce_optional_float(
+        event.get("expectedDuration") or details.get("expectedDuration")
+    )
+    occurred_at = _parse_event_datetime(event.get("occurredAt"))
+    if (
+        occurred_at is not None
+        and expected_duration is not None
+        and 0 < expected_duration <= 86_400
+    ):
+        return {
+            "barcode": barcode,
+            "sessionAtLabel": "세션 시작(추정)",
+            "sessionAt": _format_occurred_at(
+                occurred_at - timedelta(seconds=expected_duration)
+            ),
+        }
+    return {
+        "barcode": barcode,
+        "sessionAtLabel": "영상 이상 감지 시각",
+        "sessionAt": _format_occurred_at(event.get("occurredAt")),
+    }
+
+
 def _build_root_alert(
     event: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
@@ -1245,7 +1985,11 @@ def _build_root_alert(
     hospital_name = str(event.get("hospitalName") or "").strip() or "병원 미확인"
     room_name = str(event.get("roomName") or "").strip() or "병실 미확인"
     device_name = str(event.get("deviceName") or "").strip() or "장비명 미확인"
-    details = event.get("details") if isinstance(event.get("details"), Mapping) else {}
+    details = (
+        event.get("details")
+        if isinstance(event.get("details"), Mapping)
+        else {}
+    )
     problem_components: list[str] = []
     recording_context: dict[str, Any] | None = None
 
@@ -1292,6 +2036,33 @@ def _build_root_alert(
             "captureboard": "정상",
             "led": "정상",
         }
+    elif code == _VIDEO_DURATION_MISMATCH:
+        unavailable_reason = str(
+            event.get("videoAvailabilityReason") or ""
+        ).strip()
+        # DB row나 S3 객체 같은 구현 용어를 노출하지 않고, CX가 확인해야 할
+        # 업로드 결과와 실제 영상 파일 상태로 설명한다.
+        if unavailable_reason == _VIDEO_UPLOAD_MISSING_RECORDING:
+            unavailable_text = "영상 업로드가 확인되지 않았어"
+        elif unavailable_reason == _VIDEO_UPLOAD_UNDERSIZED_OBJECT:
+            unavailable_text = "업로드된 영상 파일의 크기가 비정상적으로 작아"
+        else:
+            unavailable_text = "업로드된 영상 파일을 찾을 수 없어"
+        issue = _format_issue(
+            "영상 길이 이상을 감지한 뒤 업로드 완료를 기다렸지만 "
+            + unavailable_text,
+            event.get("occurredAt"),
+        )
+        alert_category = "upload"
+        problem_components = ["영상 업로드"]
+        component_labels = {
+            "audio": "정상",
+            "pm2": "정상",
+            "storage": "정상",
+            "captureboard": "정상",
+            "led": "정상",
+        }
+        video_session_fields = _video_session_fields(event)
     else:
         duration_seconds = max(0, _coerce_int(details.get("durationSeconds")))
         growth_rate = _coerce_optional_float(details.get("growthRate"))
@@ -1344,6 +2115,9 @@ def _build_root_alert(
         "alertCategory": alert_category,
         "componentLabels": component_labels,
     }
+    if code == _VIDEO_DURATION_MISMATCH:
+        # 병원·병실·장비와 같은 카드에서 문제 영상을 바로 특정할 수 있게 한다.
+        device_result.update(video_session_fields)
     if code == _CAPTUREBOARD_CONNECTION_ERROR:
         device_result["statusPayload"] = {
             "overview": {
@@ -1697,6 +2471,18 @@ def _normalize_json_object(value: Any) -> dict[str, Any]:
     return dict(parsed) if isinstance(parsed, dict) else {}
 
 
+def _aws_error_code(exc: Exception) -> str:
+    """botocore import 없이 provider 오류의 공개 code만 추출한다."""
+
+    response = getattr(exc, "response", None)
+    if not isinstance(response, Mapping):
+        return ""
+    error = response.get("Error")
+    if not isinstance(error, Mapping):
+        return ""
+    return str(error.get("Code") or "").strip()
+
+
 def _serialize_datetime(value: Any) -> str:
     if isinstance(value, datetime):
         actual = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
@@ -1787,4 +2573,5 @@ def _coerce_optional_float(value: Any) -> float | None:
 __all__ = [
     "DeviceNotificationAlertCycleHandler",
     "DeviceNotificationCycleDeps",
+    "VideoDurationMismatchVerification",
 ]

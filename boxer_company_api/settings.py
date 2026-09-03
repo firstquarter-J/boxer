@@ -455,6 +455,7 @@ def _load_automation_dependency_settings(
         *_AUTOMATION_FEATURE_FLAGS,
         "DEVICE_HEALTH_MONITOR_ALERTS_ENABLED",
         "DEVICE_HEALTH_SHEET_ENABLED",
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
     ):
         enabled, error = _strict_optional_bool(env, key)
         if error is not None:
@@ -472,6 +473,9 @@ def _load_automation_dependency_settings(
     notification_enabled = feature_flags[
         "DEVICE_NOTIFICATION_ALERT_ENABLED"
     ]
+    video_duration_mismatch_enabled = feature_flags[
+        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED"
+    ]
     sms_delivery_enabled = feature_flags[
         "SMS_DELIVERY_REPORTER_ENABLED"
     ]
@@ -488,6 +492,10 @@ def _load_automation_dependency_settings(
             sms_delivery_enabled,
         )
     )
+    if video_duration_mismatch_enabled and not notification_enabled:
+        return _automation_dependency_error(
+            sheet_enabled=sheet_enabled,
+        )
 
     # Assistant-only API는 과거 자동화 env가 남아 있어도 자동화 의존성 때문에
     # 기동이 막히지 않는다. 실제 cycle·alert·Sheet 기능이 켜질 때만 아래의
@@ -526,6 +534,44 @@ def _load_automation_dependency_settings(
             "DB_QUERY_ENABLED",
         )
         if db_flag_error is not None or not db_enabled:
+            return _automation_dependency_error(
+                sheet_enabled=sheet_enabled,
+            )
+
+    if video_duration_mismatch_enabled:
+        # 이 opt-in 경로는 DB의 arbitrary bucket을 신뢰하지 않고, 배포자가
+        # 고정한 중앙 영상 bucket/owner에 exact HeadObject만 허용한다.
+        bucket = str(env.get("S3_ULTRASOUND_BUCKET", "")).strip()
+        owner_id = str(
+            env.get("S3_ULTRASOUND_BUCKET_OWNER_ID", "")
+        ).strip()
+        try:
+            grace_seconds = int(
+                str(
+                    env.get(
+                        "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+                        "1800",
+                    )
+                ).strip()
+            )
+            minimum_object_bytes = int(
+                str(
+                    env.get(
+                        "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES",
+                        "128000",
+                    )
+                ).strip()
+            )
+        except (TypeError, ValueError):
+            grace_seconds = 0
+            minimum_object_bytes = 0
+        if (
+            not _required_env_values(env, {"AWS_REGION"})
+            or not _valid_s3_bucket_name(bucket)
+            or re.fullmatch(r"[0-9]{12}", owner_id) is None
+            or not 60 <= grace_seconds <= 86_400
+            or not 1 <= minimum_object_bytes <= 10_000_000
+        ):
             return _automation_dependency_error(
                 sheet_enabled=sheet_enabled,
             )

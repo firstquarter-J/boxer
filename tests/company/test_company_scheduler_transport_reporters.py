@@ -412,6 +412,58 @@ def test_notification_transport_uses_api_render_hint_and_exact_batch_receipt() -
     assert remember.call_args.kwargs["batch"] is batch
 
 
+def test_video_mismatch_notification_renders_without_hospital_or_voice_actions(
+) -> None:
+    delivery = _notification_delivery()
+    delivery.payload["alertSummary"]["deviceResults"][0].update(
+        {
+            "priorityReason": "영상 업로드가 확인되지 않았어",
+            "alertCategory": "upload",
+            "problemComponents": ["영상 업로드"],
+            "barcode": "81000000000",
+            "sessionAtLabel": "세션 시작(추정)",
+            "sessionAt": "2026-08-14 08:50:00 KST",
+        }
+    )
+    delivery.payload["render"].update(
+        {
+            "includeActions": False,
+            "includeDeviceVoiceAction": False,
+        }
+    )
+    batch = _batch(
+        "device_notification_alert",
+        "notification:video-mismatch",
+        (delivery,),
+    )
+    api = Mock(pull_pending=Mock(return_value=batch))
+    client = _SlackClient()
+
+    with (
+        patch.object(notification, "flush_automation_deliveries"),
+        patch.object(notification, "remember_automation_delivery"),
+    ):
+        sent = notification._run_device_notification_alert_once(
+            client,
+            logging.getLogger("test.notification.video-mismatch"),
+            now=_NOW,
+            automation_client=api,
+        )
+
+    assert sent is True
+    assert all(
+        block["type"] != "actions" for block in client.messages[0]["blocks"]
+    )
+    assert "업로드 실패 영상 감지" in client.messages[0]["text"]
+    field_texts = [
+        field["text"]
+        for block in client.messages[0]["blocks"]
+        for field in block.get("fields", [])
+    ]
+    assert "🏷️ *바코드*\n`81000000000`" in field_texts
+    assert "🕐 *세션 시작(추정)*\n2026-08-14 08:50:00 KST" in field_texts
+
+
 def test_notification_transport_rejects_non_boolean_render_hint_before_slack() -> None:
     delivery = _notification_delivery()
     delivery.payload["render"]["includeActions"] = "true"

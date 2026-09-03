@@ -91,12 +91,16 @@ class OpenCoreSettingsBoundaryTests(unittest.TestCase):
         for company_setting in (
             "DB_QUERY_MAX_RESULT_CHARS",
             "S3_ULTRASOUND_BUCKET",
+            "S3_ULTRASOUND_BUCKET_OWNER_ID",
             "S3_LOG_BUCKET",
             "S3_QUERY_MAX_KEYS",
             "S3_QUERY_MAX_ITEMS",
             "S3_QUERY_MAX_RESULT_CHARS",
             "S3_LOG_TAIL_BYTES",
             "S3_LOG_TAIL_LINES",
+            "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_ENABLED",
+            "DEVICE_NOTIFICATION_VIDEO_DURATION_MISMATCH_GRACE_SEC",
+            "DEVICE_NOTIFICATION_VIDEO_MIN_OBJECT_BYTES",
         ):
             self.assertFalse(hasattr(settings, company_setting), company_setting)
 

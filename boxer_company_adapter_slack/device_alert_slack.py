@@ -78,7 +78,8 @@ _CATEGORY_TITLES = {
     "application": "장비 앱 실행 확인 필요",
     "storage": "장비 저장 공간 부족",
     "device_connection": "장비 연결 확인 필요",
-    "upload": "영상 업로드 확인 필요",
+    # 업로드 내부 상태보다 CX가 바로 이해할 수 있는 장애 결과를 제목으로 쓴다.
+    "upload": "업로드 실패 영상 감지",
 }
 _COMPONENT_TITLES = {
     "captureboard": "캡처보드",
@@ -356,6 +357,17 @@ def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
         ),
         "",
     ]
+    if item.get("barcode") or item.get("sessionAt"):
+        lines.extend(
+            (
+                f"🏷️ *바코드*  `{_text(item.get('barcode'), '미확인')}`",
+                (
+                    f"🕐 *{_text(item.get('sessionAtLabel'), '세션 시각')}*  "
+                    f"{_text(item.get('sessionAt'), '미확인')}"
+                ),
+                "",
+            )
+        )
     if components:
         lines.append(f":rotating_light: *문제 장치*\n{components}")
     lines.extend(
@@ -391,20 +403,41 @@ def _alert_item_blocks(
             "text": f"🔎 *감지 내용*\n`{item['issue']}`",
         }
     )
+    identity_fields = [
+        {
+            "type": "mrkdwn",
+            "text": f"⚙️ *장비*\n{_device_name_text(item)}",
+        },
+        {
+            "type": "mrkdwn",
+            "text": f"🚪 *병실*\n`{item['room']}`",
+        },
+    ]
+    # 업로드 실패 영상은 바코드와 세션 시각까지 같은 식별 영역에 표시한다.
+    if item.get("barcode") or item.get("sessionAt"):
+        identity_fields.extend(
+            (
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "🏷️ *바코드*\n"
+                        f"`{_text(item.get('barcode'), '미확인')}`"
+                    ),
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"🕐 *{_text(item.get('sessionAtLabel'), '세션 시각')}*\n"
+                        f"{_text(item.get('sessionAt'), '미확인')}"
+                    ),
+                },
+            )
+        )
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"⚙️ *장비*\n{_device_name_text(item)}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"🚪 *병실*\n`{item['room']}`",
-                },
-            ],
+            "fields": identity_fields,
         },
         {"type": "section", "fields": issue_fields},
         {
@@ -708,6 +741,9 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "smsPhoneNumber": _text(raw.get("smsPhoneNumber"), ""),
         "mdaUrl": _text(raw.get("mdaUrl"), ""),
+        "barcode": _text(raw.get("barcode"), ""),
+        "sessionAtLabel": _text(raw.get("sessionAtLabel"), ""),
+        "sessionAt": _text(raw.get("sessionAt"), ""),
     }
 
 
