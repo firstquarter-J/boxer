@@ -7,6 +7,7 @@ from boxer_company.routers.barcode_log import (
     _analyze_barcode_log_scan_events,
     _append_session_card,
     _build_log_analysis_record,
+    _build_scan_only_reason_text,
     _build_session_card_context,
     _build_session_recording_result_text,
     _extract_motion_events_with_line_no,
@@ -14,6 +15,7 @@ from boxer_company.routers.barcode_log import (
     _extract_restart_events_with_line_no,
     _extract_scan_events_with_line_no,
     _fetch_device_os_lifecycle_events_for_sessions,
+    _find_barcode_scan_block_context,
     _find_recording_recovery_context,
     _is_normal_video_status,
     _match_recordings_rows_to_sessions,
@@ -135,6 +137,87 @@ class BarcodeLogVideoStatusTests(unittest.TestCase):
         recovery_context = _find_recording_recovery_context(source_lines, sessions[0])
         self.assertIsNotNone(recovery_context)
         self.assertEqual(recovery_context["fileId"], "tcetslmmgzn1s8v3")
+
+    def test_free_barcode_allowed_then_motion_canceled_is_analyzed_as_session(self) -> None:
+        # 무료 여부 안내 뒤 VALID가 나온 실제 순서를 재현해 모션 취소까지 분석한다.
+        source_lines = [
+            "[13:42:25] [app] info: Scanned : 74286017771",
+            "[13:42:25] [BarcodeManager] info: Free barcode detected: 74286017771, "
+            "but pink barcode check is disabled. Continuing date validation.",
+            "[13:42:25] [app] info: Barcode validation result: barcode=74286017771, result=VALID",
+            "[13:42:26] [SqliteStorage] info: addRecording(motioncancel123)",
+            "[13:42:26] [Recorder] info: Starting motion detection <- cmd_processBarcodeScan.",
+            "[13:42:26] [FfmpegController] info: Spawned MOTION ffmpeg with command: "
+            "ffmpeg /home/mommytalk/AppData/Videos/motioncancel123.motion.mp4",
+            "[13:44:20] [app] info: Scanned : C_STOPSESS",
+            "[13:44:20] [Recorder] info: Stopping motion detection. "
+            "Motion detected: false, Error: false. Current state: MOTION_DETECT",
+            "[13:44:21] [app] warn: Motion detection ended abnormally, moving to trash can",
+        ]
+        with patch(
+            "boxer_company.routers.barcode_log._fetch_s3_device_log_lines",
+            return_value={
+                "found": True,
+                "lines": source_lines,
+                "key": "MB2-C01395/log-2026-09-11.log",
+            },
+        ):
+            result_text, payload = _analyze_barcode_log_scan_events(
+                None,
+                "74286017771",
+                "2026-09-11",
+                device_contexts=[{"deviceName": "MB2-C01395"}],
+            )
+
+        self.assertEqual(payload["summary"]["sessionCount"], 1)
+        detail = payload["records"][0]["sessionDetails"][0]
+        self.assertEqual(detail["terminationKind"], "pre_recording_stop")
+        self.assertEqual(detail["fileId"], "motioncancel123")
+        self.assertIn("모션 감지 단계에서", result_text)
+        self.assertNotIn("무료 바코드로 검증되어 장비가 녹화를 차단", result_text)
+        self.assertNotIn("result=FREE", result_text)
+        self.assertNotIn("Blocking recording", result_text)
+
+    def test_barcode_block_context_requires_explicit_block_evidence(self) -> None:
+        # FREE 안내와 실제 차단을 구분하고, 근거에 없는 결과/문구를 만들어내지 않는다.
+        barcode = "74286017771"
+        allowed_notice = f"Free barcode detected: {barcode}, but pink barcode check is disabled."
+        valid_result = f"Barcode validation result: barcode={barcode}, result=VALID"
+        cases = [
+            ([allowed_notice], None, []),
+            ([allowed_notice, valid_result], None, []),
+            ([f"Free Barcode: {barcode}"], None, []),
+            ([f"Free barcode detected: {barcode}. Blocking recording.", valid_result], None, []),
+        ]
+        for result in ("FREE", "REFUND", "INVALID"):
+            cases.extend([
+                ([f"Barcode validation result: barcode={barcode}, result={result}"], result, [f"result={result}"]),
+                ([f"{result} barcode detected: {barcode}. Blocking recording."], result, ["Blocking recording"]),
+            ])
+        for messages, expected_result, expected_markers in cases:
+            with self.subTest(messages=messages):
+                source_lines = [f"[13:42:25] Scanned : {barcode}", *messages]
+                event = _extract_scan_events_with_line_no(source_lines)[0]
+                context = _find_barcode_scan_block_context(source_lines, event, barcode)
+                if expected_result is None:
+                    self.assertIsNone(context)
+                    continue
+                self.assertEqual(context["result"], expected_result)
+                reason = _build_scan_only_reason_text([context])
+                for marker in (f"result={expected_result}", "Blocking recording"):
+                    self.assertEqual(marker in reason, marker in expected_markers)
+
+    def test_block_verdict_does_not_include_the_next_scan_of_same_barcode(self) -> None:
+        # 같은 바코드 재스캔의 VALID가 앞선 차단 시도 판정을 덮어쓰면 안 된다.
+        source_lines = [
+            "[13:42:25] Scanned : 74286017771",
+            "[13:42:25] Barcode validation result: barcode=74286017771, result=FREE",
+            "[13:42:30] Scanned : 74286017771",
+            "[13:42:30] Barcode validation result: barcode=74286017771, result=VALID",
+        ]
+        events = _extract_scan_events_with_line_no(source_lines)
+        self.assertTrue(_scan_event_is_blocked_before_recording(source_lines, events[0], "74286017771"))
+        self.assertFalse(_scan_event_is_blocked_before_recording(source_lines, events[1], "74286017771"))
 
     def test_blocking_special_barcode_context_explains_empty_bounded_logs(self) -> None:
         # GetObject-only 경계 안에서 MDA 제한 목록으로 FREE 차단 원인을 설명한다.

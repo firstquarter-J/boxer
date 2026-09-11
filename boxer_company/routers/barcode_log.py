@@ -262,14 +262,17 @@ def _find_barcode_scan_block_context(
         stripped = _strip_leading_log_timestamp(raw_line)
         lowered = stripped.lower()
         parsed_scan = _parse_scanned_event(raw_line)
-        if line_no > start_line_no and parsed_scan and parsed_scan != normalized_barcode:
+        # 같은 바코드 재스캔도 별도 검증 시도이므로 다음 스캔의 결과를 섞지 않는다.
+        if line_no > start_line_no and parsed_scan:
             break
 
         line_mentions_barcode = normalized_barcode in stripped
         validation_match = _BARCODE_VALIDATION_RESULT_PATTERN.search(stripped)
         if validation_match and validation_match.group(1) == normalized_barcode:
             normalized_result = _normalize_blocking_barcode_result(validation_match.group(2))
-            # VALID는 녹화 진행 신호다. 차단 결과만 scan-only 차단 컨텍스트로 남긴다.
+            # 해당 스캔의 최종 VALID는 앞선 무료 여부 안내나 차단 후보보다 우선한다.
+            if normalized_result == "VALID":
+                return None
             if normalized_result not in _BLOCKING_BARCODE_RESULTS:
                 continue
             result = normalized_result
@@ -309,17 +312,7 @@ def _find_barcode_scan_block_context(
             )
             continue
 
-        if line_mentions_barcode and "free barcode" in lowered:
-            if not result:
-                result = "FREE"
-            raw_lines.append(
-                {
-                    "lineNo": line_no,
-                    "timeLabel": _extract_time_label_from_line(raw_line),
-                    "rawLine": stripped,
-                }
-            )
-
+    # 무료 여부 안내만으로는 차단하지 않는다. 명시 검증 결과나 차단 로그가 필요하다.
     if not result and block_line_no is None:
         return None
 
@@ -2376,12 +2369,22 @@ def _build_scan_only_reason_text(block_contexts: list[dict[str, Any]]) -> str:
         if result and result not in results:
             results.append(result)
 
-    if "FREE" in results:
-        return "무료 바코드로 검증되어 장비가 녹화를 차단했어 (`result=FREE`, `Blocking recording`)"
-    if "REFUND" in results:
-        return "환불 처리 바코드로 검증되어 장비가 녹화를 차단했어 (`result=REFUND`, `Blocking recording`)"
-    if "INVALID" in results:
-        return "유효하지 않은 바코드로 검증되어 장비가 녹화를 차단했어 (`result=INVALID`, `Blocking recording`)"
+    for result in ("FREE", "REFUND", "INVALID"):
+        if result not in results:
+            continue
+        contexts = [
+            context
+            for context in block_contexts
+            if _normalize_blocking_barcode_result(context.get("result")) == result
+        ]
+        # 괄호 속 근거도 실제 로그에 있는 표식만 표시한다.
+        evidence = []
+        if any(context.get("resultLineNo") for context in contexts):
+            evidence.append(f"`result={result}`")
+        if any(context.get("blockLineNo") for context in contexts):
+            evidence.append("`Blocking recording`")
+        suffix = f" ({', '.join(evidence)})" if evidence else ""
+        return f"{_blocking_barcode_result_label(result)}로 검증되어 장비가 녹화를 차단했어{suffix}"
     if results:
         rendered = " / ".join(f"`{result}`" for result in results)
         return f"바코드 검증 결과 {rendered}로 녹화가 차단됐어"
