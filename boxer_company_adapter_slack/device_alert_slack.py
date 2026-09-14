@@ -18,8 +18,10 @@ from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_UI_RECEIPT_ACTION,
     DEVICE_HEALTH_ALERT_VOICE_ACTION,
 )
+from boxer_company_adapter_slack.assistant_bridge import _commonmark_to_slack
 from boxer_company_adapter_slack.device_health_alert_api import (
     DeviceHealthAlertApiBridge,
+    DeviceHealthAlertApiTarget,
     build_device_health_alert_api_target,
     build_device_health_alert_request_id,
 )
@@ -952,6 +954,17 @@ def _execute_remote_action(
             target=target,
         )
         messages = result.messages
+        if (
+            action_id == DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE
+            and result.outcome == "answered"
+        ):
+            # API가 전송 성공을 확인한 경우에만 클릭한 사람과 대상을 카드로
+            # 표시한다. 명령 전송 결과를 실제 음성 재생 완료로 표현하지 않는다.
+            text, blocks = _voice_guide_success_reply(
+                target, actor_user_id=identity["actorUserId"]
+            )
+            _post_thread_reply(client, identity, text, logger, blocks=blocks)
+            return
         if is_mark_done:
             if str(result.outcome or "").strip() == "answered":
                 if result.operation_result is None:
@@ -1295,7 +1308,14 @@ def _post_thread_reply(
     identity: Mapping[str, Any],
     text: str,
     logger: logging.Logger,
+    *,
+    blocks: list[dict[str, Any]] | None = None,
 ) -> None:
+    # API 본문은 줄바꿈을 유지해 Slack 문법으로 변환한다. 카드가 있으면
+    # renderer가 만든 Slack 본문과 요청자 멘션을 그대로 사용한다.
+    reply_text = str(text or "").strip() or "장비 이상 알림 작업 결과를 확인해줘"
+    if blocks is None:
+        reply_text = _commonmark_to_slack(reply_text)
     try:
         client.chat_postMessage(
             channel=_text(identity.get("channelId"), ""),
@@ -1303,15 +1323,42 @@ def _post_thread_reply(
                 identity.get("threadTs"),
                 _text(identity.get("messageTs"), ""),
             ),
-            text=_text(text, "장비 이상 알림 작업 결과를 확인해줘"),
+            text=reply_text,
             unfurl_links=False,
             unfurl_media=False,
+            **({"blocks": blocks} if blocks is not None else {}),
         )
     except Exception as exc:
         logger.warning(
             "Device alert action reply failed error_type=%s",
             type(exc).__name__,
         )
+
+
+def _voice_guide_success_reply(
+    target: DeviceHealthAlertApiTarget,
+    *,
+    actor_user_id: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    title = "📣 장비 음성 안내 명령 전송 완료"
+    # 대상 문자열은 일반 본문처럼 escape하고, 인증된 Slack 클릭 사용자만
+    # 멘션으로 만든다. 알림 미리보기에도 카드와 같은 정보를 남긴다.
+    fields = [
+        _commonmark_to_slack(f"🏥 **병원**\n{target.hospital_name}"),
+        _commonmark_to_slack(f"🚪 **진료실**\n{target.room_name}"),
+        _commonmark_to_slack(f"⚙️ **장비**\n`{target.device_name}`"),
+        f"👤 *요청자*\n<@{actor_user_id}>",
+    ]
+    return (
+        "\n\n".join((f"*{title}*", *fields)),
+        [
+            {"type": "header", "text": {"type": "plain_text", "text": title}},
+            {
+                "type": "section",
+                "fields": [{"type": "mrkdwn", "text": field} for field in fields],
+            },
+        ],
+    )
 
 
 def _response_value(response: Any, key: str) -> str:
