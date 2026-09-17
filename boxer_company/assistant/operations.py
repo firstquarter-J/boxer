@@ -3,6 +3,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from boxer_company._operation_routing_automation import DAILY_AUTO_UPDATE_ROUTE
+from boxer_company.assistant.daily_auto_update_route import (
+    DailyAutoUpdateAssistantRoute,
+    DailyAutoUpdateControl,
+)
 from boxer_company.assistant.contracts import (
     AssistantMessage,
     CompanyAssistantRequest,
@@ -59,6 +64,7 @@ from boxer_company.transport_contracts import company_operation_route_names
 
 _MUTATING_OPERATION_ROUTES = frozenset(
     {
+        DAILY_AUTO_UPDATE_ROUTE,
         "thread_playbook_learning",
         "recording_streaming_restore",
         DEVICE_LOG_UPLOAD_ROUTE,
@@ -163,6 +169,8 @@ _LIVE_DEVICE_OPERATION_ROUTES = frozenset(
 )
 _UNCERTAIN_MUTATION_FALLBACK_REASONS = frozenset(
     {
+        # 원자 교체 이후 fsync 실패일 수도 있어 같은 요청을 자동 재실행하지 않는다.
+        "daily_auto_update_save_failed",
         "sms_delivery_receipt_persist_failed",
         "sms_delivery_confirmation_required",
         "voice_guide_dispatch_uncertain",
@@ -323,6 +331,7 @@ def build_company_operation_routes(
     device_health_alert_action_deps: (
         DeviceHealthAlertActionRouteDeps | None
     ) = None,
+    daily_auto_update_control: DailyAutoUpdateControl | None = None,
 ) -> tuple[Any, ...]:
     """공통 API 프로세스에서만 operation 구현을 고정 순서로 조립한다."""
 
@@ -375,6 +384,11 @@ def build_company_operation_routes(
 
     return (
         exact(security_route, frozenset({SECURITY_REVIEW_ROUTE})),
+        # API-owned 설정 route도 공통 matcher와 request-ID guard를 공유한다.
+        exact(
+            DailyAutoUpdateAssistantRoute(daily_auto_update_control, logger=logger),
+            frozenset({DAILY_AUTO_UPDATE_ROUTE}),
+        ),
         exact(
             alert_route,
             frozenset(

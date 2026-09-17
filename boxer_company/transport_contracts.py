@@ -206,6 +206,7 @@ def company_operation_route_names() -> frozenset[str]:
     return frozenset(
         {
             "security_review",
+            "daily_auto_update_control",
             DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
             DEVICE_HEALTH_ALERT_SMS_ROUTE,
             DEVICE_HEALTH_ALERT_VOICE_ROUTE,

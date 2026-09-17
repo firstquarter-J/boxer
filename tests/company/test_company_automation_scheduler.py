@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from boxer_company.automation_schedule import AutomationScheduleConfig
+from boxer_company.protected_json import create_protected_json_file
 from boxer_company_api.automation import JsonAutomationCycleStateStore
 from boxer_company_api.automation_scheduler import (
     AutomationDeliveryTarget,
@@ -36,6 +37,13 @@ def _settings(
     *cycles: str,
     schedule: AutomationScheduleConfig | None = None,
 ) -> AutomationSchedulerSettings:
+    # 운영은 CLI로 생성한 파일만 사용한다. daily 설정이 사라진 파일을
+    # 환경 기본값으로 되돌리지 않도록 테스트에도 초기 revision을 준비한다.
+    state_path = tmp_path / "automation.json"
+    if not state_path.exists():
+        create_protected_json_file(
+            state_path, {"version": 1, "cycles": {}}, label="automation",
+        )
     return AutomationSchedulerSettings(
         tenant_id=_TENANT,
         state_path=str(tmp_path / "automation.json"),

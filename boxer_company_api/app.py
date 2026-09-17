@@ -1672,6 +1672,10 @@ def _resolve_runtime(
         from boxer_company.settings import (
             validate_company_data_source_settings,
         )
+        from boxer_company_api.daily_auto_update import (
+            DailyAutoUpdateController,
+            load_daily_auto_update_defaults,
+        )
 
         # 직접 app factory를 쓰는 실행 경로에서도 운영 credential 정책과
         # 기존 데이터 소스 설정 검증을 startup 전에 동일하게 적용한다.
@@ -1701,6 +1705,25 @@ def _resolve_runtime(
             )
 
         return create_company_assistant_runtime(
+            # Slack은 설정 파일에 접근하지 않는다. API와 companion만 동일한
+            # 보호 상태 파일을 읽고 scheduler tenant의 override를 적용한다.
+            daily_auto_update_control=(
+                DailyAutoUpdateController(
+                    JsonAutomationCycleStateStore(settings.automation_state_path),
+                    tenant_id=os.environ.get(
+                        "BOXER_COMPANY_API_AUTOMATION_TENANT_ID", "",
+                    ),
+                    defaults=load_daily_auto_update_defaults(),
+                    daily_enabled=(
+                        "daily_device_round" in settings.automation_enabled_cycles
+                    ),
+                )
+                if (
+                    settings.automation_scheduler_enabled
+                    and settings.automation_storage_required
+                )
+                else None
+            ),
             device_health_alert_action_deps=(
                 DeviceHealthAlertActionRouteDeps(
                     claim_mark_done=claim_mark_done_with_api_storage,

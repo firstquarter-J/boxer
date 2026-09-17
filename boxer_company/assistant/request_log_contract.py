@@ -38,6 +38,8 @@ _LEGACY_COMPANY_REQUEST_LOG_ROUTE_NAMES = {
     "device_remote_access_probe": "device remote access probe",
     "device_status_probe": "device status probe",
     "device_update_status": "device update status",
+    # 복구된 설정 제어도 중앙 감사 로그에서 이전 명령과 같은 이름으로 추적한다.
+    "daily_auto_update_control": "daily device round auto update control",
     "device_voice_catalog": "device voice catalog",
     "device_voice_change": "device voice change",
     "notion_playbook_qa": "notion playbook qa",

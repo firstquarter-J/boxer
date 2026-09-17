@@ -208,6 +208,7 @@ class JsonAutomationCycleStateStore:
         ],
         *,
         expected_document_digest: str | None = None,
+        require_existing_document: bool = False,
     ) -> _MutationResult:
         """한 flock 안에서 exact revision을 읽고 cycle 하나를 원자 교체한다."""
 
@@ -215,6 +216,10 @@ class JsonAutomationCycleStateStore:
         with self._lock:
             with self._exclusive_file_lock():
                 snapshot = self._load_snapshot_unlocked()
+                # 사람 설정 변경은 운영 파일이 사라져도 빈 automation state를
+                # 만들지 않는다. 초기 생성은 기존 운영자 CLI에만 맡긴다.
+                if require_existing_document and not snapshot.exists:
+                    raise AutomationCycleContractError("automation state is missing")
                 if (
                     expected_document_digest is not None
                     and snapshot.digest != expected_document_digest

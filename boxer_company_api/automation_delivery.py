@@ -276,6 +276,14 @@ def validate_automation_delivery_state(
                 raise AutomationCycleContractError(
                     "automation delivery state is invalid"
                 )
+            if state.get("kind") == "daily_auto_update_control":
+                # 설정 slot도 readiness에서 검증해 손상된 override를 환경
+                # 기본값으로 조용히 되돌린 채 순회하지 않게 한다.
+                from boxer_company_api.daily_auto_update import (
+                    validate_daily_auto_update_state,
+                )
+
+                validate_daily_auto_update_state(state, state_key)
             # 빈 state와 ACK 완료 state는 transport metadata가 없어도 된다.
             # non-empty pending만 새 API-owned exact 계약을 반드시 만족한다.
             _batch_from_state(state, state_key=state_key)

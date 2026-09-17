@@ -26,6 +26,7 @@ from boxer_company.assistant.device_db_detail_route import (
     DeviceDetailAssistantRoute,
     DeviceDbDetailAssistantRoute,
 )
+from boxer_company.assistant.daily_auto_update_route import DailyAutoUpdateControl
 from boxer_company.assistant.device_health_alert_action_route import (
     DeviceHealthAlertActionRouteDeps,
 )
@@ -261,6 +262,7 @@ def create_company_assistant_runtime(
     device_health_alert_action_deps: (
         DeviceHealthAlertActionRouteDeps | None
     ) = None,
+    daily_auto_update_control: DailyAutoUpdateControl | None = None,
     logger: logging.Logger | None = None,
 ) -> CompanyAssistantRuntime:
     """Slack/Web adapter 없이 회사 내부 assistant runtime을 조립한다."""
@@ -440,6 +442,7 @@ def create_company_assistant_runtime(
                     device_health_alert_action_deps=(
                         device_health_alert_action_deps
                     ),
+                    daily_auto_update_control=daily_auto_update_control,
                 ),
             ),
             freeform_routes=(

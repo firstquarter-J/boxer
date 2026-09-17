@@ -82,6 +82,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
                 "company_team_fun",
                 "company_freeform",
                 "security_review",
+                "daily_auto_update_control",
                 "device_health_alert_action",
                 "thread_playbook_learning",
                 "admin_s3_ultrasound",
@@ -116,6 +117,7 @@ class CompanyAssistantRuntimeFactoryTests(unittest.TestCase):
             turn.service_for_stage("operations").route_names,
             (
                 "security_review",
+                "daily_auto_update_control",
                 "device_health_alert_action",
                 "thread_playbook_learning",
                 "admin_s3_ultrasound",

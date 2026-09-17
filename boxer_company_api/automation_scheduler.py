@@ -9,6 +9,7 @@ import re
 import threading
 from typing import Any, Callable, Mapping
 
+from boxer_company._operation_routing_automation import AUTO_UPDATE_OPTION_KEYS
 from boxer_company.automation import (
     AutomationCycleName,
     build_default_automation_cycle_service,
@@ -22,6 +23,10 @@ from boxer_company_api.automation import (
     AutomationCycleTrigger,
     DurableAutomationCycleCoordinator,
     JsonAutomationCycleStateStore,
+)
+from boxer_company_api.daily_auto_update import (
+    load_daily_auto_update_defaults,
+    resolve_daily_auto_update_options,
 )
 from boxer_company_api.security import validate_company_api_runtime_security
 
@@ -247,7 +252,11 @@ class AutomationScheduler:
             cycle_key=decision.cycle_key,
             scheduled_at=decision.scheduled_at,
             options=(
-                self._settings.daily_options
+                resolve_daily_auto_update_options(
+                    self._state_store,
+                    self._settings.tenant_id,
+                    self._settings.daily_options,
+                )
                 if cycle == "daily_device_round"
                 else {}
             ),
@@ -419,21 +428,10 @@ def load_automation_scheduler_settings(
         schedule=schedule,
         delivery_targets=targets,
         daily_options={
-            "autoUpdateAgent": _read_bool(
-                source,
-                "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT",
-                default=False,
-            ),
-            "autoUpdateBoxFree": _read_bool(
-                source,
-                "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE",
-                default=False,
-            ),
-            "autoUpdateBoxPaid": _read_bool(
-                source,
-                "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID",
-                default=False,
-            ),
+            **{
+                AUTO_UPDATE_OPTION_KEYS[target]: enabled
+                for target, enabled in load_daily_auto_update_defaults(source).items()
+            },
             "autoCleanupTrashCan": _read_bool(
                 source,
                 "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN",

@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal
 
+from boxer_company._operation_routing_automation import (
+    DAILY_AUTO_UPDATE_ROUTE,
+    parse_daily_auto_update_command,
+)
 from boxer_company._operation_routing_common import (
     CompanyOperationRequestContract,
     _is_explicit_barcode_log_analysis_request,
@@ -208,6 +212,10 @@ def match_company_operation_route(
         # knowledge 위치에서 adapter가 보낸 typed snapshot probe는 질문에
         # 섞인 다른 자연어 matcher보다 정확한 route를 먼저 확정한다.
         return "device_diagnostic_followup"
+    # 자동화 설정은 장비 mutation·문서 검색보다 먼저 잡되, 실제 변경은
+    # 전용 parser가 전체 명령을 검증한 경우에만 API에서 실행한다.
+    if parse_daily_auto_update_command(scoped.question) is not None:
+        return DAILY_AUTO_UPDATE_ROUTE
     learning_route = match_thread_playbook_learning_route(scoped)
     if learning_route is not None:
         return learning_route
@@ -286,6 +294,7 @@ def company_operation_legacy_stage(
     if matched in (
         {
             SECURITY_REVIEW_ROUTE,
+            DAILY_AUTO_UPDATE_ROUTE,
             "thread_playbook_learning",
         }
         | set(_LEGACY_PRE_DEVICE_PRIVATE_ROUTES)
