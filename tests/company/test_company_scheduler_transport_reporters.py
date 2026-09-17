@@ -187,6 +187,96 @@ def test_weekly_transport_ignores_removed_local_feature_gate() -> None:
     assert remember.call_args.kwargs["batch"] is batch
 
 
+def test_weekly_transport_preserves_api_week_over_week_changes() -> None:
+    # 실제 전송 경로에서 API의 급증·급감이 알림 텍스트와 화면 블록 모두에 남아야 한다.
+    delivery = _weekly_delivery()
+    delivery.payload.update(
+        {
+            "hospitalCount": 2,
+            "totalCount": 150,
+            "previousTotalCount": 250,
+            "totalDelta": -100,
+            "totalChangeRate": -40.0,
+            "topRows": [{"hospitalName": "증가병원", "rowCount": 120}],
+            "surgeRows": [
+                {"hospitalName": "증가병원", "previousCount": 10,
+                 "currentCount": 120, "delta": 110, "changeRate": 1100.0},
+                {"hospitalName": "신규병원", "previousCount": 0,
+                 "currentCount": 30, "delta": 30, "changeRate": None},
+            ],
+            "surgeCount": 2,
+            "dropRows": [
+                {"hospitalName": "감소병원", "previousCount": 240,
+                 "currentCount": 0, "delta": -240, "changeRate": -100.0},
+            ],
+            "dropCount": 1,
+        }
+    )
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (delivery,))
+    api = Mock(pull_pending=Mock(return_value=batch))
+    client = _SlackClient()
+    with (
+        patch.object(weekly, "flush_automation_deliveries"),
+        patch.object(weekly, "remember_automation_delivery"),
+    ):
+        assert weekly._run_weekly_recordings_report_if_due(
+            client, logging.getLogger("test.weekly.changes"),
+            now=_NOW, automation_client=api,
+        )
+
+    message = client.messages[1]
+    assert message["thread_ts"] == "1723000000.000001"
+    block_text = "\n\n".join(block["text"]["text"] for block in message["blocks"])
+    assert block_text == message["text"]
+    assert "*비교 기간* `2026-07-27 ~ 2026-08-02`" in block_text
+    assert "증감 `-100건` (`-40.0%`)" in block_text
+    assert "*급증 병원* `2곳`" in block_text
+    assert "증가병원 `10건 → 120건` · `+110건` (`+1100.0%`)" in block_text
+    assert "신규병원 `0건 → 30건` · `+30건` (`신규/비교불가`)" in block_text
+    assert "*급감 병원* `1곳`" in block_text
+    assert "감소병원 `240건 → 0건` · `-240건` (`-100.0%`)" in block_text
+
+
+def test_weekly_report_shows_empty_change_groups_and_zero_previous_count() -> None:
+    summary = _weekly_delivery().payload
+    summary.update(previousTotalCount=0, totalDelta=3, totalChangeRate=None)
+
+    text = weekly._format_weekly_recordings_report(summary)
+
+    assert "증감 `+3건` (`신규/비교불가`)" in text
+    assert "*급증 병원* `0곳`\n• 없어" in text
+    assert "*급감 병원* `0곳`\n• 없어" in text
+
+
+def test_weekly_change_lists_fit_slack_sections_without_losing_hospitals() -> None:
+    # 상위·급증·급감 각 10개 목록과 긴 병원명이 함께 와도 블록 제한을 넘지 않는다.
+    summary = _weekly_delivery().payload
+    for rows_key, count_key, previous_count, current_count, rate in (
+        ("surgeRows", "surgeCount", 20, 40, 100.0),
+        ("dropRows", "dropCount", 40, 20, -50.0),
+    ):
+        summary[rows_key] = [
+            {"hospitalName": f"{rows_key}-{index}-" + "긴병원명" * 80,
+             "previousCount": previous_count, "currentCount": current_count,
+             "delta": current_count - previous_count, "changeRate": rate}
+            for index in range(10)
+        ]
+        summary[count_key] = 12
+    summary["topRows"] = [
+        {"hospitalName": row["hospitalName"], "rowCount": 40}
+        for row in summary["surgeRows"]
+    ]
+    blocks = weekly._build_weekly_recordings_report_blocks(summary, include_header=True)
+
+    assert blocks[0]["type"] == "header"
+    section_texts = [block["text"]["text"] for block in blocks[1:]]
+    assert all(0 < len(text) <= 3000 for text in section_texts)
+    # 분할 과정에서 줄이나 마지막 병원을 누락하지 않았는지 전체 표시 내용을 비교한다.
+    expected = weekly._format_weekly_recordings_report(summary)
+    assert "\n".join(section_texts).splitlines() == [line for line in expected.splitlines() if line]
+    assert expected.count("• 상위 `10곳`만 표시") == 2
+
+
 def test_daily_transport_uses_api_presentation_without_domain_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -21,6 +21,7 @@ from boxer_company_adapter_slack.automation_reporter import (
 
 _KST = ZoneInfo("Asia/Seoul")
 _WEEKLY_RECORDINGS_REPORT_TITLE = "주간 초음파 촬영 요약"
+_SLACK_SECTION_TEXT_LIMIT = 3000
 _WEEKLY_RECORDINGS_REPORT_THREAD: threading.Thread | None = None
 _WEEKLY_RECORDINGS_REPORT_THREAD_LOCK = threading.Lock()
 _WEEKLY_TRANSPORT_CYCLE_KEY_PATTERN = re.compile(
@@ -54,10 +55,13 @@ def _format_weekly_recordings_report(
     lines.extend(
         (
             f"*기간* `{summary['weekStartDate']} ~ {summary['weekEndDate']}`",
+            f"*비교 기간* `{summary['previousWeekStartDate']} ~ "
+            f"{summary['previousWeekEndDate']}`",
             f"*총 촬영* `{summary['totalCount']:,}건` · "
             f"병원 `{summary['hospitalCount']:,}곳`",
             f"*전주 촬영* `{summary['previousTotalCount']:,}건` · "
-            f"증감 `{summary['totalDelta']:+,}건`",
+            f"증감 `{summary['totalDelta']:+,}건` "
+            f"(`{_format_weekly_change_rate(summary.get('totalChangeRate'))}`)",
         )
     )
     top_rows = summary.get("topRows") or []
@@ -68,7 +72,38 @@ def _format_weekly_recordings_report(
                 f"{index}. {row.get('hospitalName') or '병원 미확인'} "
                 f"`{int(row.get('rowCount') or 0):,}건`"
             )
+
+    # API가 판정한 급증·급감 DTO를 그대로 표시해 집계 기준을 Slack에서 재계산하지 않는다.
+    for title, rows_key, count_key in (
+        ("급증", "surgeRows", "surgeCount"),
+        ("급감", "dropRows", "dropCount"),
+    ):
+        rows = summary.get(rows_key) or []
+        count = int(summary.get(count_key) or 0)
+        lines.append(f"\n*{title} 병원* `{count:,}곳`")
+        if not rows:
+            lines.append("• 없어")
+            continue
+        for index, row in enumerate(rows, 1):
+            lines.append(
+                f"{index}. {row.get('hospitalName') or '병원 미확인'} "
+                f"`{int(row.get('previousCount') or 0):,}건 → "
+                f"{int(row.get('currentCount') or 0):,}건` · "
+                f"`{int(row.get('delta') or 0):+,}건` "
+                f"(`{_format_weekly_change_rate(row.get('changeRate'))}`)"
+            )
+        if count > len(rows):
+            lines.append(f"• 상위 `{len(rows):,}곳`만 표시")
     return "\n".join(lines)
+
+
+def _format_weekly_change_rate(value: float | None) -> str:
+    """전주 촬영이 없어 비율을 계산할 수 없는 경우를 구분한다."""
+
+    if value is None:
+        return "신규/비교불가"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.1f}%"
 
 
 def _build_weekly_recordings_report_blocks(
@@ -76,7 +111,7 @@ def _build_weekly_recordings_report_blocks(
     *,
     include_header: bool = False,
 ) -> list[dict[str, Any]]:
-    """같은 fallback text를 Slack section block으로 안전하게 감싼다."""
+    """전체 요약을 항목별로 나눠 Slack section의 길이 제한 안에 담는다."""
 
     blocks: list[dict[str, Any]] = []
     if include_header:
@@ -89,18 +124,22 @@ def _build_weekly_recordings_report_blocks(
                 },
             }
         )
-    blocks.append(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": _format_weekly_recordings_report(
-                    summary,
-                    include_title=False,
-                ),
-            },
-        }
-    )
+    # 급증·급감 목록까지 합치면 한 section 제한을 넘을 수 있으므로 줄 경계에서 분할한다.
+    report_text = _format_weekly_recordings_report(summary, include_title=False)
+    for section in report_text.split("\n\n"):
+        while section:
+            split_at = len(section)
+            if split_at > _SLACK_SECTION_TEXT_LIMIT:
+                split_at = section.rfind("\n", 0, _SLACK_SECTION_TEXT_LIMIT + 1)
+                if split_at <= 0:
+                    split_at = _SLACK_SECTION_TEXT_LIMIT
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": section[:split_at]},
+                }
+            )
+            section = section[split_at:].lstrip("\n")
     return blocks
 
 
