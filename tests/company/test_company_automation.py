@@ -143,6 +143,7 @@ def test_weekly_cycle_returns_channel_neutral_summary(
     )
 
     assert len(calls) == 1
+    assert calls[0]["include_new_barcodes"] is True
     assert result.outcome == "completed"
     assert result.auto_retry_allowed is False
     assert result.cursor["lastReportedWeekStartDate"] == "2026-08-03"

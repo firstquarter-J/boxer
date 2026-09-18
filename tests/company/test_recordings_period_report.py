@@ -3,6 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,6 +13,12 @@ from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.factory import create_company_assistant_runtime
 from boxer_company.assistant.operational_read_routes import (
     WeeklyRecordingsSummaryAssistantRoute,
+)
+from boxer_company.automation import WeeklyRecordingsCycleHandler
+from boxer_company.automation_contracts import AutomationCycleRequest
+from boxer_company.automation_schedule import (
+    AutomationScheduleConfig,
+    plan_automation_cycle,
 )
 from boxer_company.read_routing import (
     WEEKLY_RECORDINGS_SUMMARY_ROUTE,
@@ -23,7 +30,11 @@ from boxer_company.recordings_report_options import (
     RecordingsReportOptionsError,
     parse_recordings_report_options,
 )
+from boxer_company_adapter_slack import weekly_recordings_reporter as weekly
 from boxer_company_adapter_slack.assistant_bridge import render_company_assistant_result
+from boxer_company_adapter_slack.automation_api_client import (
+    AutomationRemoteDeliveryBatch,
+)
 from boxer_company_adapter_slack.company_api_rollout import (
     CompanyWeeklySummaryApiRolloutService,
 )
@@ -350,3 +361,44 @@ def test_empty_resolved_hospital_scope_cannot_mean_all():
           pytest.raises(RecordingsReportOptionsError)):
         report._load_weekly_recordings_report(hospital_seqs=())
     db.assert_not_called()
+
+
+def test_next_monday_cycle_uses_real_queries_and_renders_four_replies(recordings_db):
+    # 실제 월요일 일정 → DB 집계 → 중립 delivery → Slack mock까지 한 번에 검증한다.
+    monday = datetime(2026, 9, 21, 9, tzinfo=ZoneInfo("Asia/Seoul"))
+    config = AutomationScheduleConfig()
+    assert not plan_automation_cycle(
+        "weekly_recordings", now=monday.replace(hour=8, minute=59), config=config,
+    ).due
+    plan = plan_automation_cycle("weekly_recordings", now=monday, config=config)
+    assert plan.due and plan.cycle_key == "weekly:2026-09-14"
+    result = WeeklyRecordingsCycleHandler().run(AutomationCycleRequest(
+        request_id="weekly-next-monday", tenant_id="T1", cycle="weekly_recordings",
+        scheduled_at=plan.scheduled_at,
+    ))
+    assert len(recordings_db) == 4
+    summary = result.deliveries[0].payload
+    assert summary["weekStartDate"] == "2026-09-14" and summary["weekEndDate"] == "2026-09-20"
+    assert summary["previousWeekStartDate"] == "2026-09-07"
+    assert summary["previousWeekEndDate"] == "2026-09-13"
+    assert summary["newBarcodes"]["previousTotalCount"] == 2
+    assert summary["newBarcodes"]["totalCount"] == 0
+    assert summary["queryOptions"]["hospitalRecordingMinimumDrop"] == 3
+    batch = AutomationRemoteDeliveryBatch(
+        batch_id="batch:" + "a" * 64, tenant_id="T1", cycle="weekly_recordings",
+        cycle_key=plan.cycle_key, scheduled_at=monday, channel_id="C035M22H5TR",
+        deliveries=result.deliveries,
+    )
+    client = Mock()
+    client.chat_postMessage.side_effect = [{"ts": f"1723000000.{i:06d}"} for i in range(1, 6)]
+    with patch.object(weekly, "flush_automation_deliveries"), patch.object(weekly, "remember_automation_delivery"):
+        assert weekly._run_weekly_recordings_report_if_due(
+            client, logging.getLogger(__name__), now=monday,
+            automation_client=Mock(pull_pending=Mock(return_value=batch)),
+        )
+    sent = [call.kwargs for call in client.chat_postMessage.call_args_list]
+    assert len(sent) == 5 and all(message["channel"] == "C035M22H5TR" for message in sent)
+    assert sent[0]["text"] == "주간 초음파 녹화 & 신규 바코드 요약"
+    assert all(message["thread_ts"] == "1723000000.000001" for message in sent[1:])
+    assert "*총 신규 바코드* `0개`" in sent[3]["text"]
+    assert "*급감 진료실* `0곳`" in sent[4]["text"]

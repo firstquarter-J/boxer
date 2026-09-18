@@ -204,6 +204,8 @@ class WeeklyRecordingsCycleHandler:
         summary = _build_weekly_recordings_report_summary(
             target_date=week_start,
             now=request.scheduled_at,
+            # 정기 보고도 요청형과 같은 네 지표·급감 기본값을 API에서 집계한다.
+            include_new_barcodes=True,
         )
         safe_summary = _redact_cycle_payload(summary)
         return AutomationCycleResult(

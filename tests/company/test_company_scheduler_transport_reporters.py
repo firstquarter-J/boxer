@@ -261,6 +261,122 @@ def _room_drop_row(index: int = 1) -> dict[str, object]:
     }
 
 
+def _weekly_activity_delivery() -> AutomationDelivery:
+    delivery = _weekly_delivery()
+    room = _room_drop_row()
+    hospital = {key: value for key, value in room.items() if key not in {"hospitalRoomSeq", "roomName"}}
+    delivery.payload.update(
+        totalCount=3, previousTotalCount=6, totalDelta=-3, totalChangeRate=-50.0,
+        dropRows=[hospital], dropCount=1, roomDropRows=[room], roomDropCount=1,
+        queryOptions={"hospitalNames": [], "dropPercent": 50, "minimumDrop": 3,
+                      "hospitalRecordingMinimumDrop": 3},
+        newBarcodes={
+            "hospitalCount": 1, "totalCount": 3, "previousTotalCount": 6,
+            "totalDelta": -3, "totalChangeRate": -50.0,
+            "topRows": [{"hospitalSeq": 1, "hospitalName": "테스트병원", "rowCount": 3}],
+            "dropRows": [hospital], "dropCount": 1, "roomDropRows": [room], "roomDropCount": 1,
+        },
+    )
+    return delivery
+
+
+def test_weekly_activity_posts_title_and_four_sections_in_one_thread() -> None:
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (_weekly_activity_delivery(),))
+    client = _SlackClient()
+    with (
+        patch.object(weekly, "flush_automation_deliveries"),
+        patch.object(weekly, "remember_automation_delivery") as remember,
+    ):
+        weekly._run_weekly_recordings_report_if_due(
+            client, logging.getLogger(__name__), now=_NOW,
+            automation_client=Mock(pull_pending=Mock(return_value=batch)),
+        )
+    assert len(client.messages) == 5
+    assert client.messages[0]["text"] == "주간 초음파 녹화 & 신규 바코드 요약"
+    titles = ("① 병원별 녹화 요약", "② 진료실별 녹화 급감", "③ 병원별 신규 바코드 요약", "④ 진료실별 신규 바코드 급감")
+    for title, message in zip(titles, client.messages[1:], strict=True):
+        assert message["text"].startswith(f"*{title}*")
+        assert message["thread_ts"] == "1723000000.000001"
+        assert "50% 이상 · 감소량 3" in message["text"]
+        assert "2026-08-03 ~ 2026-08-09" in message["text"]
+        assert "2026-07-27 ~ 2026-08-02" in message["text"]
+    assert len({m["client_msg_id"] for m in client.messages}) == 5
+    remember.assert_called_once()
+    assert remember.call_args.kwargs["delivery"].external_message_id == "1723000000.000005"
+
+
+def test_weekly_activity_splits_long_new_barcode_list_without_losing_rows() -> None:
+    delivery = _weekly_activity_delivery()
+    new = delivery.payload["newBarcodes"]
+    new.update(roomDropRows=[_room_drop_row(i) for i in range(1, 601)], roomDropCount=600)
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (delivery,))
+    client = _SlackClient()
+    with patch.object(weekly, "flush_automation_deliveries"), patch.object(weekly, "remember_automation_delivery"):
+        weekly._run_weekly_recordings_report_if_due(
+            client, logging.getLogger(__name__), now=_NOW,
+            automation_client=Mock(pull_pending=Mock(return_value=batch)),
+        )
+    # 마지막 항목만 추가 댓글로 나누고 병원/진료실 600곳을 모두 보존한다.
+    texts = []
+    assert len(client.messages) > 5
+    for message in client.messages[4:]:
+        assert message["thread_ts"] == "1723000000.000001"
+        assert len(message["blocks"]) <= 40 and len(message["text"]) <= 12000
+        assert all(len(block["text"]["text"]) <= 3000 for block in message["blocks"])
+        texts.append(message["text"])
+    combined = "\n".join(texts)
+    assert len([line for line in combined.splitlines() if "테스트병원 ·" in line]) == 600
+    assert "600. 테스트병원 · 600진료실 `6개 → 3개`" in combined
+
+
+def test_weekly_activity_partial_failure_preserves_ids_and_report_time() -> None:
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (_weekly_activity_delivery(),))
+    api = Mock(pull_pending=Mock(return_value=batch))
+    failed, replay = _SlackClient(fail_on=4), _SlackClient()
+    with (
+        patch.object(weekly, "flush_automation_deliveries"),
+        patch.object(weekly, "remember_automation_delivery") as remember,
+    ):
+        with pytest.raises(RuntimeError, match="ambiguous Slack POST"):
+            weekly._run_weekly_recordings_report_if_due(failed, logging.getLogger(__name__), now=_NOW, automation_client=api)
+        remember.assert_not_called()
+        weekly._run_weekly_recordings_report_if_due(
+            replay, logging.getLogger(__name__), now=_NOW.replace(hour=10), automation_client=api,
+        )
+        remember.assert_called_once()
+    assert failed.messages == replay.messages[:4]
+
+
+@pytest.mark.parametrize("fields", [
+    {"totalCount": True}, {"totalDelta": 123}, {"totalChangeRate": float("nan")},
+    {"roomDropCount": 10}, {"dropCount": 10}, {"topRows": [{}]},
+    {"roomDropRows": [{**_room_drop_row(), "roomName": None}]},
+    {"roomDropRows": [{**_room_drop_row(), "currentCount": 5}]},
+    {"unexpected": True},
+])
+def test_weekly_activity_rejects_invalid_new_barcode_data_before_title(fields) -> None:
+    delivery = _weekly_activity_delivery()
+    delivery.payload["newBarcodes"].update(fields)
+    client = _SlackClient()
+    with patch.object(weekly, "flush_automation_deliveries"):
+        with pytest.raises(RuntimeError, match="계약"):
+            weekly._run_weekly_recordings_report_if_due(
+                client, logging.getLogger(__name__), now=_NOW,
+                automation_client=Mock(pull_pending=Mock(return_value=_batch(
+                    "weekly_recordings", "weekly:2026-08-03", (delivery,),
+                ))),
+            )
+    assert client.messages == []
+
+
+@pytest.mark.parametrize("missing", ["newBarcodes", "queryOptions", "roomDropRows", "roomDropCount"])
+def test_weekly_activity_requires_complete_contract(missing) -> None:
+    delivery = _weekly_activity_delivery()
+    del delivery.payload[missing]
+    with pytest.raises(RuntimeError, match="계약"):
+        weekly._validate_weekly_transport_batch(_batch("weekly_recordings", "weekly:2026-08-03", (delivery,)))
+
+
 def test_weekly_transport_renders_all_room_drops_across_messages() -> None:
     # 급감 기준을 충족한 많은 진료실도 동일 thread에서 빠짐없이 전달한다.
     delivery = _weekly_delivery()
