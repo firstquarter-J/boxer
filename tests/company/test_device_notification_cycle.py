@@ -138,12 +138,18 @@ def _deps(
         "claim_sms": Mock(return_value=True),
         "remember_sms": Mock(return_value=True),
         "verify_video": Mock(),
+        "media_session": Mock(return_value={
+            "barcode": "81000000000",
+            "sessionAtLabel": "세션 시작",
+            "sessionAt": "2026-08-14 09:49:00 KST",
+        }),
     }
     return (
         DeviceNotificationCycleDeps(
             load_latest_id=mocks["latest"],
             load_next_event=mocks["next"],
             verify_video_duration_mismatch=mocks["verify_video"],
+            load_recording_media_session=mocks["media_session"],
             append_sheet_alerts=mocks["append_sheet"],
             send_sms=mocks["send_sms"],
             claim_sms_delivery=mocks["claim_sms"],
@@ -259,8 +265,229 @@ def test_production_batch_query_includes_video_duration_mismatch(
     assert next_cursor == 80
     assert [item["code"] for item in events] == ["video_duration_mismatch"]
     sql, params = cursor.execute.call_args_list[1].args
-    assert "n.code IN (%s, %s, %s, %s)" in sql
+    assert "n.code IN (%s, %s, %s, %s, %s)" in sql
     assert "video_duration_mismatch" in params
+    connection.close.assert_called_once_with()
+
+
+def _media_quality_event(
+    notification_id: int = 90,
+    *,
+    media_type: str = "video",
+    issues: object = None,
+) -> dict:
+    # 실제 MommyBox 알림처럼 같은 파일에서도 매체별 notification이 발생한다.
+    return {
+        **_captureboard_event(notification_id),
+        "code": "recording_media_quality_issue",
+        "fileId": "private-media-file",
+        "barcode": "81000000000",
+        "details": {
+            "mediaType": media_type,
+            "issues": ["video_uniform_color"] if issues is None else issues,
+            "recordedAt": int((_NOW - timedelta(minutes=11)).timestamp() * 1000),
+            "durationSec": 600,
+            "expectedDurationSec": 600,
+            "voiceType": "n",
+            "video": {"path": "/private/video.mp4", "diagnostic": "raw-log"},
+        },
+    }
+
+
+@pytest.mark.parametrize("batch", [True, False])
+def test_media_quality_is_selected_from_notification_db(
+    monkeypatch: pytest.MonkeyPatch, batch: bool,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    row = _media_quality_event()
+    cursor.fetchone.side_effect = [{"latestId": 90}, row]
+    cursor.fetchall.return_value = [row]
+    monkeypatch.setattr(cycle, "_create_db_connection", Mock(return_value=connection))
+
+    next_id, result = (
+        cycle._load_device_notification_batch(89)
+        if batch else cycle._load_next_device_notification(89)
+    )
+
+    assert next_id == 90
+    event = result[0] if batch else result
+    assert event["code"] == "recording_media_quality_issue"
+    sql, params = cursor.execute.call_args_list[1].args
+    assert "recording_media_quality_issue" in params
+    assert sql.count("%s") == len(params)
+    assert "SELECT " in sql
+    connection.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(("media_type", "issue", "expected_text"), [
+    ("video", "video_file_missing", "녹화 파일 없음"),
+    ("video", "video_metadata_unreadable", "영상 파일 정보 읽기 실패"),
+    ("video", "video_stream_missing", "영상 트랙 없음"),
+    ("video", "video_decode_failed", "영상 디코딩 실패"),
+    ("video", "video_no_decodable_frames", "재생 가능한 영상 프레임 없음"),
+    ("video", "video_frozen", "화면 정지 구간 감지"),
+    ("video", "video_uniform_color", "단색 화면 구간 감지"),
+    ("audio", "audio_stream_missing", "오디오 트랙 없음"),
+    ("audio", "audio_decode_failed", "오디오 디코딩 실패"),
+    ("audio", "audio_duration_mismatch", "영상 길이 대비 오디오 길이 부족"),
+    ("audio", "audio_silent", "오디오 전체가 완전 무음"),
+])
+def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
+    media_type: str, issue: str, expected_text: str,
+) -> None:
+    event = _media_quality_event(media_type=media_type, issues=[issue])
+    deps, mocks = _deps(next_result=(90, event))
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=89))
+    )
+
+    delivery, = result.deliveries
+    assert delivery.delivery_id == "device_notification:90"
+    assert delivery.payload["render"] == {
+        "type": "device_health_abnormal_alert",
+        "includeActions": False,
+        "includeDeviceVoiceAction": False,
+    }
+    item = delivery.payload["alertSummary"]["deviceResults"][0]
+    assert item["alertCategory"] == f"recording_{media_type}"
+    assert expected_text in item["priorityReason"]
+    assert item["barcode"] == "81000000000"
+    assert item["sessionAt"] == "2026-08-14 09:49:00 KST"
+    assert item["componentLabels"] == {}
+    assert delivery.payload["smsReceipt"]["status"] == "not_applicable"
+    mocks["media_session"].assert_called_once_with(90)
+    for name in ("send_sms", "claim_sms", "remember_sms", "verify_video"):
+        mocks[name].assert_not_called()
+    # 원본 식별자와 분석 로그는 대기/ACK cursor에 복제하지 않는다.
+    saved = json.dumps(result.cursor)
+    for private_value in ("private-media-file", "81000000000", "/private/", "raw-log"):
+        assert private_value not in saved
+
+
+@pytest.mark.parametrize(("media_type", "issues"), [
+    ("video", []), ("audio", []), ("video", "video_frozen"),
+    ("video", ["audio_silent"]), ("audio", ["audio_timeout"]),
+    ("video", [None, {}, "unknown"]), ("unknown", ["video_frozen"]),
+])
+def test_media_quality_without_confirmed_issues_does_not_alert(
+    media_type: str, issues: object,
+) -> None:
+    deps, mocks = _deps(next_result=(90, _media_quality_event(
+        media_type=media_type, issues=issues,
+    )))
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=89))
+    )
+    assert result.deliveries == ()
+    assert result.cursor["pendingEvents"] == []
+    mocks["send_sms"].assert_not_called()
+    mocks["media_session"].assert_not_called()
+
+
+def test_same_recording_video_and_audio_survive_cursor_reload_and_ack() -> None:
+    deps, mocks = _deps()
+    video = _media_quality_event(90, issues=["video_frozen", "video_uniform_color"])
+    audio = _media_quality_event(91, media_type="audio", issues=["audio_silent"])
+    cursor = {**_initialized_cursor(91), "pendingEvents": [video, audio]}
+    for event_id, category in [(90, "recording_video"), (91, "recording_audio")]:
+        # 프로세스 재시작처럼 JSON으로 복원한 뒤에도 두 매체를 각기 전달한다.
+        handler = DeviceNotificationAlertCycleHandler(deps)
+        result = handler.run(_request(cursor=json.loads(json.dumps(cursor))))
+        delivery, = result.deliveries
+        assert delivery.delivery_id == f"device_notification:{event_id}"
+        item = delivery.payload["alertSummary"]["deviceResults"][0]
+        assert item["alertCategory"] == category
+        if event_id == 90:
+            assert "화면 정지 구간 감지, 단색 화면 구간 감지" in item["priorityReason"]
+        failed = handler.acknowledge(
+            _request(cursor=dict(result.cursor)),
+            (AutomationDeliveryReceipt(delivery_id=delivery.delivery_id, status="failed"),),
+        )
+        assert delivery.delivery_id in failed["pendingDeliveryContexts"]
+        cursor = dict(handler.acknowledge(
+            _request(cursor=failed),
+            (AutomationDeliveryReceipt(
+                delivery_id=delivery.delivery_id, status="sent",
+                external_message_id=f"1710000000.{event_id}", delivered_at=_NOW,
+            ),),
+        ))
+    assert cursor["pendingEvents"] == []
+    assert cursor["pendingDeliveryContexts"] == {}
+    assert cursor["lastSentNotificationId"] == 91
+    assert mocks["append_sheet"].call_count == 2
+    mocks["send_sms"].assert_not_called()
+    mocks["next"].assert_not_called()
+
+
+@pytest.mark.parametrize(("media_type", "issue", "title"), [
+    ("video", "video_uniform_color", "녹화 영상 이상 감지"),
+    ("audio", "audio_silent", "녹화 오디오 이상 감지"),
+])
+def test_media_quality_delivery_reaches_slack_renderer(
+    media_type: str, issue: str, title: str,
+) -> None:
+    from boxer_company_adapter_slack.device_notification_alert_reporter import (
+        _post_remote_device_notification_delivery,
+    )
+
+    # API 판정 결과를 실제 Slack transport/Block renderer까지 전달하되
+    # 외부 Slack 호출만 mock하여 실제 채널에 테스트 메시지를 보내지 않는다.
+    deps, _mocks = _deps(next_result=(90, _media_quality_event(
+        media_type=media_type, issues=[issue],
+    )))
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=89))
+    )
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1710000000.090"}
+    client.chat_getPermalink.return_value = {"permalink": "https://slack.example/p90"}
+    receipt = _post_remote_device_notification_delivery(
+        client, logging.getLogger("test.media-quality"),
+        delivery=result.deliveries[0], channel_id="C123456",
+        cycle_key="transport:notification",
+    )
+
+    assert receipt["messageTs"] == "1710000000.090"
+    client.chat_postMessage.assert_called_once()
+    message = client.chat_postMessage.call_args.kwargs
+    assert message["channel"] == "C123456"
+    assert title in message["text"]
+    rendered = json.dumps(message["blocks"], ensure_ascii=False)
+    for text in (title, "뉴서울여성의원(인천)", "1진료실", "MB2-C00992", "81000000000"):
+        assert text in rendered
+    assert "2026-08-14 09:49:00 KST" in rendered
+    assert all(block["type"] != "actions" for block in message["blocks"])
+    assert message["client_msg_id"]
+
+
+@pytest.mark.parametrize("recorded_at", [
+    int((_NOW - timedelta(minutes=11)).timestamp() * 1000),
+    "2026-08-14T00:49:00+00:00",
+    None, "invalid", float("inf"),
+])
+def test_media_session_reads_only_exact_event_and_handles_recording_time(
+    monkeypatch: pytest.MonkeyPatch, recorded_at: object,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {
+        "barcode": "81000000000", "occurredAt": _NOW,
+        "details": json.dumps({"recordedAt": recorded_at, "expectedDurationSec": 600}),
+    }
+    monkeypatch.setattr(cycle, "_create_db_connection", Mock(return_value=connection))
+    result = cycle._load_recording_media_session(90)
+    assert result["barcode"] == "81000000000"
+    if recorded_at is None or recorded_at in ("invalid", float("inf")):
+        # 검사 큐 대기 시간을 모르므로 영상 길이로 시작 시각을 역산하지 않는다.
+        assert result["sessionAtLabel"] == "영상 이상 감지 시각"
+        assert result["sessionAt"] == "2026-08-14 10:00:00 KST"
+    else:
+        assert result["sessionAtLabel"] == "세션 시작"
+        assert result["sessionAt"] == "2026-08-14 09:49:00 KST"
+    sql, params = cursor.execute.call_args.args
+    assert "WHERE id = %s AND code = %s LIMIT 1" in sql
+    assert params == (90, "recording_media_quality_issue")
     connection.close.assert_called_once_with()
 
 

@@ -82,6 +82,9 @@ _CATEGORY_TITLES = {
     "device_connection": "장비 연결 확인 필요",
     # 업로드 내부 상태보다 CX가 바로 이해할 수 있는 장애 결과를 제목으로 쓴다.
     "upload": "업로드 실패 영상 감지",
+    # 완성 파일의 영상/오디오 이상을 장비 연결·스피커 장애와 구분한다.
+    "recording_video": "녹화 영상 이상 감지",
+    "recording_audio": "녹화 오디오 이상 감지",
 }
 _COMPONENT_TITLES = {
     "captureboard": "캡처보드",
@@ -415,7 +418,7 @@ def _alert_item_blocks(
             "text": f"🚪 *병실*\n`{item['room']}`",
         },
     ]
-    # 업로드 실패 영상은 바코드와 세션 시각까지 같은 식별 영역에 표시한다.
+    # 녹화 파일 알림은 바코드와 세션 시각까지 같은 식별 영역에 표시한다.
     if item.get("barcode") or item.get("sessionAt"):
         identity_fields.extend(
             (

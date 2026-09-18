@@ -53,12 +53,30 @@ _CAPTUREBOARD_CONNECTION_ERROR = "captureboard_connection_error"
 _RECORDING_CRITICALLY_STALLED = "recording_critically_stalled"
 _SEGMENTED_RECORDINGS_MERGE_ERROR = "segmented_recordings_merge_error"
 _VIDEO_DURATION_MISMATCH = "video_duration_mismatch"
+_RECORDING_MEDIA_QUALITY_ISSUE = "recording_media_quality_issue"
 _SUPPORTED_CODES = (
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
     _SEGMENTED_RECORDINGS_MERGE_ERROR,
     _VIDEO_DURATION_MISMATCH,
+    _RECORDING_MEDIA_QUALITY_ISSUE,
 )
+# 완성 파일의 판정은 장비 검사기가 소유한다. 박서는 확정된 사유를 번역해
+# 전달하며 무음 비율·시간 초과·검사 생략을 새 이상으로 판정하지 않는다.
+_MEDIA_ISSUE_LABELS = {
+    "video_file_missing": "녹화 파일 없음",
+    "video_metadata_unreadable": "영상 파일 정보 읽기 실패",
+    "video_stream_missing": "영상 트랙 없음",
+    "video_decode_failed": "영상 디코딩 실패",
+    "video_no_decodable_frames": "재생 가능한 영상 프레임 없음",
+    "video_frozen": "화면 정지 구간 감지",
+    "video_uniform_color": "단색 화면 구간 감지",
+    "audio_stream_missing": "오디오 트랙 없음",
+    "audio_decode_failed": "오디오 디코딩 실패",
+    "audio_duration_mismatch": "영상 길이 대비 오디오 길이 부족",
+    "audio_silent": "오디오 전체가 완전 무음",
+}
+_SLACK_ONLY_CODES = {_VIDEO_DURATION_MISMATCH, _RECORDING_MEDIA_QUALITY_ISSUE}
 _CAPTUREBOARD_INCIDENT_CODES = {
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
@@ -152,7 +170,7 @@ def _load_next_device_notification(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s, %s, %s) "
+                "AND n.code IN (%s, %s, %s, %s, %s) "
                 "ORDER BY n.id ASC "
                 "LIMIT 1",
                 (
@@ -162,6 +180,7 @@ def _load_next_device_notification(
                     _RECORDING_CRITICALLY_STALLED,
                     _SEGMENTED_RECORDINGS_MERGE_ERROR,
                     _VIDEO_DURATION_MISMATCH,
+                    _RECORDING_MEDIA_QUALITY_ISSUE,
                 ),
             )
             row = cursor.fetchone() or None
@@ -220,7 +239,7 @@ def _load_device_notification_batch(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s, %s, %s) "
+                "AND n.code IN (%s, %s, %s, %s, %s) "
                 "ORDER BY n.id ASC "
                 "LIMIT %s",
                 (
@@ -230,6 +249,7 @@ def _load_device_notification_batch(
                     _RECORDING_CRITICALLY_STALLED,
                     _SEGMENTED_RECORDINGS_MERGE_ERROR,
                     _VIDEO_DURATION_MISMATCH,
+                    _RECORDING_MEDIA_QUALITY_ISSUE,
                     normalized_batch_size,
                 ),
             )
@@ -436,6 +456,36 @@ def _verify_video_duration_mismatch(
     )
 
 
+def _load_recording_media_session(notification_id: int) -> dict[str, str]:
+    """발송 시 원본 알림에서만 바코드·촬영 시각을 읽어 대기 cursor와 분리한다."""
+
+    connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT barcode, details, occurredAt FROM device_notification "
+                "WHERE id = %s AND code = %s LIMIT 1",
+                (notification_id, _RECORDING_MEDIA_QUALITY_ISSUE),
+            )
+            row = cursor.fetchone() or {}
+    finally:
+        connection.close()
+    details = _normalize_json_object(row.get("details"))
+    recorded_at = details.get("recordedAt")
+    # MommyBox의 startedAt은 JavaScript 밀리초 시각이다. 조회/검사 대기가
+    # 길어질 수 있으므로 감지 시각에서 영상 길이를 빼 시작 시각을 추정하지 않는다.
+    if isinstance(recorded_at, (int, float)) and not isinstance(recorded_at, bool):
+        try:
+            recorded_at = datetime.fromtimestamp(recorded_at / 1000, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            recorded_at = None
+    return _video_session_fields({
+        "sessionBarcode": row.get("barcode") or details.get("barcode"),
+        "recordingRecordedAt": recorded_at,
+        "occurredAt": row.get("occurredAt"),
+    })
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceNotificationCycleDeps:
     """DB, Sheets, SMS mutation을 주입해 cycle 계약을 단위 검증한다."""
@@ -450,6 +500,9 @@ class DeviceNotificationCycleDeps:
     verify_video_duration_mismatch: Callable[
         [int], VideoDurationMismatchVerification
     ] = _verify_video_duration_mismatch
+    load_recording_media_session: Callable[[int], dict[str, str]] = (
+        _load_recording_media_session
+    )
     append_sheet_alerts: Callable[..., int | None] = (
         _append_device_health_sheet_alerts
     )
@@ -790,6 +843,19 @@ class DeviceNotificationAlertCycleHandler:
         state: dict[str, Any],
         event: dict[str, Any],
     ) -> tuple[AutomationDelivery | None, dict[str, Any] | None]:
+        if event["code"] == _RECORDING_MEDIA_QUALITY_ISSUE:
+            details = event["details"]
+            if not details.get("mediaType") or not details.get("issues"):
+                # 이상 사유가 없는 정상·미완료 payload는 소비만 하고 알리지 않는다.
+                return None, None
+            # 업로드 완료나 S3 재검증을 기다리지 않는다. 영상/오디오별 알림 ID가
+            # 각각 delivery를 소유하므로 같은 파일의 다른 매체를 중복으로 지우지 않는다.
+            event = {
+                **event,
+                "mediaSessionFields": self._deps.load_recording_media_session(
+                    int(event["notificationId"])
+                ),
+            }
         if event["code"] == _RECORDING_CRITICALLY_STALLED:
             continuation = _build_recording_stall_continuation(
                 state,
@@ -823,9 +889,9 @@ class DeviceNotificationAlertCycleHandler:
                 return None, None
 
         alert_summary, alert_item, recording_context = _build_root_alert(event)
-        if event["code"] == _VIDEO_DURATION_MISMATCH:
-            # 중앙 영상 누락은 CX가 확인할 운영 알림이다. 병원 문자나 장비 음성
-            # 안내로 연결하면 현장 조치가 불필요한 장애를 병원에 전파하게 된다.
+        if event["code"] in _SLACK_ONLY_CODES:
+            # 영상 업로드·완성 파일 품질은 CX가 확인할 운영 알림이다.
+            # 자동 병원 문자와 장비 음성 안내로 확대하지 않는다.
             sms_receipt = {
                 "attempted": False,
                 "status": "not_applicable",
@@ -854,10 +920,8 @@ class DeviceNotificationAlertCycleHandler:
                 # 실행하며 DB/SMS/Sheets 판단은 다시 하지 않는다.
                 "render": {
                     "type": "device_health_abnormal_alert",
-                    "includeActions": event["code"]
-                    != _VIDEO_DURATION_MISMATCH,
-                    "includeDeviceVoiceAction": event["code"]
-                    != _VIDEO_DURATION_MISMATCH,
+                    "includeActions": event["code"] not in _SLACK_ONLY_CODES,
+                    "includeDeviceVoiceAction": event["code"] not in _SLACK_ONLY_CODES,
                 },
                 # alertSummary에는 legacy 자동발송 확인 action의 번호·본문을
                 # 유지하고, 별도 receipt에는 provider 식별값을 싣지 않는다.
@@ -1625,6 +1689,20 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
         "fileType": str(details.get("fileType") or "").strip().lower(),
         "errorDetail": error_detail,
     }
+    if code == _RECORDING_MEDIA_QUALITY_ISSUE:
+        # 전체 분석 로그·파일 경로 대신 알림에 필요한 판정만 보존한다.
+        # 재시작 후 pendingEvents를 다시 정규화해도 같은 사유가 유지된다.
+        media_type = details.get("mediaType")
+        media_type = media_type if media_type in ("video", "audio") else ""
+        raw_issues = details.get("issues")
+        safe_details.update({
+            "mediaType": media_type,
+            "issues": list(dict.fromkeys(
+                issue for issue in (raw_issues if isinstance(raw_issues, list) else [])
+                if isinstance(issue, str) and issue in _MEDIA_ISSUE_LABELS
+                and media_type and issue.startswith(f"{media_type}_")
+            )),
+        })
     return {
         "notificationId": notification_id,
         "deviceSeq": _coerce_optional_int(value.get("deviceSeq")),
@@ -2036,6 +2114,19 @@ def _build_root_alert(
             "captureboard": "정상",
             "led": "정상",
         }
+    elif code == _RECORDING_MEDIA_QUALITY_ISSUE:
+        media_type = details.get("mediaType")
+        media_label = "영상" if media_type == "video" else "오디오"
+        issue = _format_issue(
+            f"녹화 파일 {media_label} 이상: " + ", ".join(
+                _MEDIA_ISSUE_LABELS[item] for item in details.get("issues", [])
+                if item in _MEDIA_ISSUE_LABELS
+            ),
+            event.get("occurredAt"),
+        )
+        alert_category = f"recording_{media_type}"
+        # 파일 이상만으로 캡처보드·스피커 고장을 단정하지 않는다.
+        component_labels = {}
     elif code == _VIDEO_DURATION_MISMATCH:
         unavailable_reason = str(
             event.get("videoAvailabilityReason") or ""
@@ -2118,6 +2209,8 @@ def _build_root_alert(
     if code == _VIDEO_DURATION_MISMATCH:
         # 병원·병실·장비와 같은 카드에서 문제 영상을 바로 특정할 수 있게 한다.
         device_result.update(video_session_fields)
+    elif code == _RECORDING_MEDIA_QUALITY_ISSUE:
+        device_result.update(event.get("mediaSessionFields") or {})
     if code == _CAPTUREBOARD_CONNECTION_ERROR:
         device_result["statusPayload"] = {
             "overview": {
