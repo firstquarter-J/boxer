@@ -248,6 +248,96 @@ def test_weekly_report_shows_empty_change_groups_and_zero_previous_count() -> No
     assert "*급감 병원* `0곳`\n• 없어" in text
 
 
+def _room_drop_row(index: int = 1) -> dict[str, object]:
+    return {
+        "hospitalSeq": 1,
+        "hospitalRoomSeq": index,
+        "hospitalName": "테스트병원",
+        "roomName": f"{index}진료실",
+        "previousCount": 6,
+        "currentCount": 3,
+        "delta": -3,
+        "changeRate": -50.0,
+    }
+
+
+def test_weekly_transport_renders_all_room_drops_across_messages() -> None:
+    # 급감 기준을 충족한 많은 진료실도 동일 thread에서 빠짐없이 전달한다.
+    delivery = _weekly_delivery()
+    delivery.payload.update(roomDropRows=[_room_drop_row(i) for i in range(1, 601)], roomDropCount=600)
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (delivery,))
+    api = Mock(pull_pending=Mock(return_value=batch))
+    client = _SlackClient()
+    with (
+        patch.object(weekly, "flush_automation_deliveries"),
+        patch.object(weekly, "remember_automation_delivery") as remember,
+    ):
+        assert weekly._run_weekly_recordings_report_if_due(
+            client, logging.getLogger("test.weekly.rooms"), now=_NOW, automation_client=api,
+        )
+
+    assert len(client.messages) > 2
+    texts = []
+    for message in client.messages[1:]:
+        assert message["thread_ts"] == "1723000000.000001"
+        assert len(message["blocks"]) <= 40
+        assert len(message["text"]) <= 12000
+        assert all(len(block["text"]["text"]) <= 3000 for block in message["blocks"])
+        texts.append(message["text"])
+    combined = "\n".join(texts)
+    assert "*진료실별 녹화 급감* `600곳` (전주 대비 50% 이상·3건 이상 감소)" in combined
+    assert len([line for line in combined.splitlines() if "테스트병원 ·" in line]) == 600
+    assert "600. 테스트병원 · 600진료실 `6건 → 3건` · `-3건` (`-50.0%`)" in combined
+    remember.assert_called_once()
+
+
+def test_weekly_split_failure_is_not_acknowledged_and_reuses_message_ids() -> None:
+    # 뒷부분 전송이 실패하면 delivery 완료를 남기지 않고 같은 part ID로 재개한다.
+    delivery = _weekly_delivery()
+    delivery.payload.update(roomDropRows=[_room_drop_row(i) for i in range(1, 601)], roomDropCount=600)
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (delivery,))
+    api = Mock(pull_pending=Mock(return_value=batch))
+    failed, replay = _SlackClient(fail_on=3), _SlackClient()
+    with (
+        patch.object(weekly, "flush_automation_deliveries"),
+        patch.object(weekly, "remember_automation_delivery") as remember,
+    ):
+        with pytest.raises(RuntimeError, match="ambiguous Slack POST"):
+            weekly._run_weekly_recordings_report_if_due(
+                failed, logging.getLogger("test.weekly.partial"), now=_NOW, automation_client=api,
+            )
+        remember.assert_not_called()
+        assert weekly._run_weekly_recordings_report_if_due(
+            replay, logging.getLogger("test.weekly.replay"), now=_NOW, automation_client=api,
+        )
+        remember.assert_called_once()
+    assert [item["client_msg_id"] for item in failed.messages] == [
+        item["client_msg_id"] for item in replay.messages[:len(failed.messages)]
+    ]
+
+
+@pytest.mark.parametrize("fields", [
+    {"roomDropRows": []},
+    {"roomDropRows": [], "roomDropCount": 1},
+    {"roomDropRows": [], "roomDropCount": False},
+    {"roomDropRows": "invalid", "roomDropCount": 0},
+    {"roomDropRows": [{**_room_drop_row(), "previousCount": "2"}], "roomDropCount": 1},
+    {"roomDropRows": [{**_room_drop_row(), "roomName": None}], "roomDropCount": 1},
+])
+def test_weekly_rejects_malformed_room_drop_payload_before_posting(fields) -> None:
+    delivery = _weekly_delivery()
+    delivery.payload.update(fields)
+    batch = _batch("weekly_recordings", "weekly:2026-08-03", (delivery,))
+    client = _SlackClient()
+    with patch.object(weekly, "flush_automation_deliveries"):
+        with pytest.raises(RuntimeError, match="계약"):
+            weekly._run_weekly_recordings_report_if_due(
+                client, logging.getLogger("test.weekly.invalid"), now=_NOW,
+                automation_client=Mock(pull_pending=Mock(return_value=batch)),
+            )
+    assert client.messages == []
+
+
 def test_weekly_change_lists_fit_slack_sections_without_losing_hospitals() -> None:
     # 상위·급증·급감 각 10개 목록과 긴 병원명이 함께 와도 블록 제한을 넘지 않는다.
     summary = _weekly_delivery().payload

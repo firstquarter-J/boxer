@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from boxer_company import settings as cs
+from boxer_company.recordings_report_options import has_recordings_report_options
 from boxer_company._operation_routing_common import (
     AssistantRequestScopeMismatch,
     _COMPACT_MMDD_PATTERN,
@@ -947,20 +948,58 @@ def is_safe_baby_magic_source_uri(value: object) -> bool:
     )
 
 
+_RECORDINGS_REPORT_DATE_TOKEN = r"(?<!\d)\d{4}[-./]\d{1,2}[-./]\d{1,2}(?!\d)"
+_RECORDINGS_REPORT_DATES = re.compile(_RECORDINGS_REPORT_DATE_TOKEN)
+_RECORDINGS_REPORT_RANGE = re.compile(
+    rf"({_RECORDINGS_REPORT_DATE_TOKEN})\s*(?:~|～|〜|–|—|-|부터|to)\s*"
+    rf"({_RECORDINGS_REPORT_DATE_TOKEN})(?:\s*까지)?",
+    re.IGNORECASE,
+)
+
+
+def _extract_recordings_report_date_range(question: str) -> tuple[date, date] | None:
+    """명시한 두 날짜를 주간으로 바꾸지 않고 양 끝 날짜를 포함해 검증한다."""
+
+    text = str(question or "").replace("`", "")
+    dates = _RECORDINGS_REPORT_DATES.findall(text)
+    match = _RECORDINGS_REPORT_RANGE.search(text)
+    if match is None and len(dates) < 2:
+        # 끝 날짜가 빠진 요청을 첫 날짜가 속한 주의 조회로 실행하지 않는다.
+        if re.search(rf"{_RECORDINGS_REPORT_DATE_TOKEN}\s*(?:~|～|〜|–|—|부터|to)", text):
+            raise ValueError("시작일과 종료일을 YYYY-MM-DD ~ YYYY-MM-DD로 알려줘")
+        return None
+    if match is None or len(dates) != 2:
+        raise ValueError("조회할 기간 하나를 YYYY-MM-DD ~ YYYY-MM-DD로 알려줘")
+    try:
+        start, end = (
+            date(*(int(part) for part in re.split(r"[-./]", value)))
+            for value in match.groups()
+        )
+    except ValueError as exc:
+        raise ValueError("날짜 형식을 확인해줘: 실제 존재하는 날짜여야 해") from exc
+    if start > end:
+        raise ValueError("시작일은 종료일보다 늦을 수 없어")
+    # 직전 같은 길이의 기간과 종료일 다음 날을 표현할 수 있어야 한다.
+    if (end - start).days + 1 >= start.toordinal() or end == date.max:
+        raise ValueError("조회 기간과 비교 기간의 날짜 범위를 확인해줘")
+    return start, end
+
+
 def _is_weekly_recordings_report_request(
     question: str,
     *,
     barcode: str | None,
 ) -> bool:
-    """주간 리포트 의도를 외부 조회 없이 판정한다."""
+    """주간·지정 기간 요약을 Slack과 API에서 같은 기준으로 판정한다."""
 
     if barcode:
         return False
-    text = (question or "").strip()
+    text = re.sub(r"<@[A-Z0-9]+>", "", question or "").replace("`", "").strip()
     if not text:
         return False
     lowered = text.lower()
-    has_media_hint = any(
+    has_new_barcode_hint = bool(re.search(r"신규\s*바코드", text))
+    has_media_hint = has_new_barcode_hint or any(
         token in text for token in ("초음파", "영상", "비디오", "동영상", "녹화")
     ) or any(token in lowered for token in ("recording", "recordings"))
     has_summary_hint = any(
@@ -974,6 +1013,8 @@ def _is_weekly_recordings_report_request(
             "통계",
             "정리",
             "병원별",
+            "진료실별",
+            "병실별",
         )
     ) or any(
         token in lowered
@@ -993,14 +1034,30 @@ def _is_weekly_recordings_report_request(
             "전주",
             "이번주",
             "이번 주",
+            "금주",
         )
     ) or any(token in lowered for token in ("weekly", "week"))
-    if not (has_media_hint and has_summary_hint and has_week_hint):
+    has_range_hint = bool(_RECORDINGS_REPORT_RANGE.search(text)) or len(
+        _RECORDINGS_REPORT_DATES.findall(text)
+    ) >= 2 or bool(re.search(rf"{_RECORDINGS_REPORT_DATE_TOKEN}\s*(?:~|～|〜|부터|to)", text))
+    # 멘션 뒤 날짜 범위만 적어도 전체 병원·진료실 리포트로 해석한다.
+    bare_range = bool(_RECORDINGS_REPORT_RANGE.fullmatch(text)) or (
+        has_range_hint
+        and re.fullmatch(r"[\s~～〜–—./\-]*", _RECORDINGS_REPORT_DATES.sub("", text)) is not None
+    )
+    # 기간과 조회 조건만 적은 요청도 같은 리포트로 처리한다.
+    has_options = has_recordings_report_options(text)
+    if not (
+        bare_range
+        or (has_options and (has_range_hint or has_week_hint))
+        or (has_media_hint and has_summary_hint and (has_week_hint or has_range_hint))
+    ):
+        return False
+    if "바코드" in text and not has_new_barcode_hint:
         return False
     has_excluded_hint = any(
         token in text
         for token in (
-            "바코드",
             "목록",
             "리스트",
             "상세",
@@ -1011,6 +1068,8 @@ def _is_weekly_recordings_report_request(
             "로그",
             "캡처",
             "스냅샷",
+            "장비",
+            "디바이스",
         )
     ) or any(
         token in lowered
@@ -1025,6 +1084,7 @@ def _is_weekly_recordings_report_request(
             "snapshot",
             "duration",
             "fileid",
+            "device",
         )
     )
     return not has_excluded_hint
@@ -1136,6 +1196,9 @@ def _build_structured_query_match(
         return None
     if match_barcode_timeline_route(request) is not None:
         return None
+    # 병원 조건이 있는 기간 리포트를 일반 병원 목록 조회가 선점하지 않게 한다.
+    if is_weekly_report_request(question, barcode=barcode):
+        return None
 
     try:
         parsed_date, has_requested_date = _extract_log_date_with_presence(
@@ -1191,11 +1254,6 @@ def _build_structured_query_match(
         install_flag=install_flag,
     ):
         route = "devices_filter"
-    elif is_weekly_report_request(
-        question,
-        barcode=barcode,
-    ):
-        return None
     elif _is_ultrasound_capture_filter_query_request(
         question,
         barcode=barcode,

@@ -1,16 +1,7 @@
 from __future__ import annotations
 
-# 주간 read matcher와 날짜 해석은 transport와 공유하는 순수 정본을 쓴다.
-from boxer_company.read_routing import (
-    AssistantRequestScopeMismatch,
-    WEEKLY_RECORDINGS_SUMMARY_ROUTE,
-    _extract_log_date_with_presence,
-    _is_weekly_recordings_report_request,
-    resolve_assistant_request_scope,
-)
-
-from datetime import date
 import logging
+from datetime import date
 
 import pymysql
 
@@ -21,8 +12,25 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
+from boxer_company.assistant.recordings_report_format import (
+    format_recordings_report_sections,
+)
 from boxer_company.assistant.scope_guard import (
     build_scope_mismatch_result,
+)
+
+# 주간 read matcher와 날짜 해석은 transport와 공유하는 순수 정본을 쓴다.
+from boxer_company.read_routing import (
+    WEEKLY_RECORDINGS_SUMMARY_ROUTE,
+    AssistantRequestScopeMismatch,
+    _extract_log_date_with_presence,
+    _extract_recordings_report_date_range,
+    _is_weekly_recordings_report_request,
+    resolve_assistant_request_scope,
+)
+from boxer_company.recordings_report_options import (
+    RecordingsReportOptionsError,
+    parse_recordings_report_options,
 )
 from boxer_company.weekly_recordings_report import (
     _build_weekly_recordings_report_summary,
@@ -50,7 +58,8 @@ class WeeklyRecordingsSummaryAssistantRoute:
             return build_scope_mismatch_result(mismatch)
 
         try:
-            target_date = _extract_weekly_target_date(request.question)
+            date_range = _extract_recordings_report_date_range(request.question)
+            target_date = None if date_range else _extract_weekly_target_date(request.question)
         except ValueError as exc:
             if not _is_weekly_recordings_report_request(
                 request.question,
@@ -59,7 +68,7 @@ class WeeklyRecordingsSummaryAssistantRoute:
                 return None
             return _result(
                 outcome="needs_input",
-                body=f"주간 영상 현황 요청 형식 오류: {exc}",
+                body=f"녹화·신규 바코드 요약 요청 형식 오류: {exc}",
                 fallback_reason="invalid_date",
             )
 
@@ -76,12 +85,22 @@ class WeeklyRecordingsSummaryAssistantRoute:
             summary = _build_weekly_recordings_report_summary(
                 target_date=target_date,
                 now=local_now,
+                include_new_barcodes=True,
+                options=parse_recordings_report_options(request.question),
+                **({"start_date": date_range[0], "end_date": date_range[1]} if date_range else {}),
             )
-            body = slack_mrkdwn_to_commonmark(
-                _format_weekly_recordings_report(
-                    summary,
-                    now=local_now,
-                )
+            if "newBarcodes" in summary:
+                bodies = format_recordings_report_sections(summary, now=local_now)
+            else:
+                # 구 summary를 주입하는 호출도 기존 응답 형식으로 처리한다.
+                bodies = (slack_mrkdwn_to_commonmark(
+                    _format_weekly_recordings_report(summary, now=local_now)
+                ),)
+        except RecordingsReportOptionsError as exc:
+            # 잘못된 조건이나 모호한 병원명을 전체 병원·기본 조건 조회로 바꾸지 않는다.
+            return _result(
+                outcome="needs_input", body=f"녹화·신규 바코드 조회 조건을 확인해줘: {exc}",
+                fallback_reason="invalid_report_options",
             )
         except (pymysql.MySQLError, RuntimeError) as exc:
             self._logger.warning(
@@ -92,7 +111,7 @@ class WeeklyRecordingsSummaryAssistantRoute:
             return _result(
                 outcome="failed",
                 body=(
-                    "주간 영상 현황 조회 중 오류가 발생했어. "
+                    "녹화·신규 바코드 요약 조회 중 오류가 발생했어. "
                     "DB 연결 정보와 네트워크 상태를 확인해줘"
                 ),
                 fallback_reason="dependency_error",
@@ -107,17 +126,22 @@ class WeeklyRecordingsSummaryAssistantRoute:
             return _result(
                 outcome="failed",
                 body=(
-                    "주간 영상 현황 조회 중 오류가 발생했어. "
+                    "녹화·신규 바코드 요약 조회 중 오류가 발생했어. "
                     "잠시 후 다시 시도해줘"
                 ),
                 fallback_reason="query_error",
             )
 
-        has_recordings = int(summary.get("totalCount") or 0) > 0
+        # 이번 주 전체가 0건이어도 전주 대비 진료실 급감은 조회된 근거가 있는 답변이다.
+        has_evidence = (
+            int(summary.get("totalCount") or 0) > 0
+            or int(summary.get("previousTotalCount") or 0) > 0
+            or bool(summary.get("roomDropRows"))
+        )
         return _result(
-            outcome="answered" if has_recordings else "no_evidence",
-            body=body,
-            fallback_reason=None if has_recordings else "recordings_not_found",
+            outcome="answered" if has_evidence else "no_evidence",
+            bodies=bodies,
+            fallback_reason=None if has_evidence else "recordings_not_found",
         )
 
 
@@ -137,18 +161,20 @@ def _extract_weekly_target_date(question: str) -> date | None:
 def _result(
     *,
     outcome: AssistantOutcome,
-    body: str,
+    body: str = "",
+    bodies: tuple[str, ...] = (),
     fallback_reason: str | None = None,
 ) -> CompanyAssistantResult:
     return CompanyAssistantResult(
         route=WEEKLY_RECORDINGS_SUMMARY_ROUTE,
         outcome=outcome,
-        messages=(
+        messages=tuple(
             AssistantMessage(
-                body=body,
+                body=message_body,
                 mention_actor=False,
                 format="commonmark",
-            ),
+            )
+            for message_body in (bodies or (body,))
         ),
         fallback_reason=fallback_reason,
     )

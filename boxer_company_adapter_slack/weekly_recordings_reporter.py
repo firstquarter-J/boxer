@@ -22,6 +22,8 @@ from boxer_company_adapter_slack.automation_reporter import (
 _KST = ZoneInfo("Asia/Seoul")
 _WEEKLY_RECORDINGS_REPORT_TITLE = "주간 초음파 촬영 요약"
 _SLACK_SECTION_TEXT_LIMIT = 3000
+_SLACK_REPORT_BLOCK_LIMIT = 40
+_SLACK_REPORT_TEXT_LIMIT = 12_000
 _WEEKLY_RECORDINGS_REPORT_THREAD: threading.Thread | None = None
 _WEEKLY_RECORDINGS_REPORT_THREAD_LOCK = threading.Lock()
 _WEEKLY_TRANSPORT_CYCLE_KEY_PATTERN = re.compile(
@@ -94,6 +96,19 @@ def _format_weekly_recordings_report(
             )
         if count > len(rows):
             lines.append(f"• 상위 `{len(rows):,}곳`만 표시")
+
+    # 진료실 급감은 API가 반환한 전체 목록을 표시하고 장비나 병원 합계로 다시 거르지 않는다.
+    if "roomDropRows" in summary:
+        room_rows = summary["roomDropRows"]
+        lines.append(f"\n*진료실별 녹화 급감* `{summary['roomDropCount']:,}곳` (전주 대비 50% 이상·3건 이상 감소)")
+        for index, row in enumerate(room_rows, 1):
+            lines.append(
+                f"{index}. {row['hospitalName']} · {row['roomName']} "
+                f"`{row['previousCount']:,}건 → {row['currentCount']:,}건` · "
+                f"`{row['delta']:+,}건` (`{_format_weekly_change_rate(row['changeRate'])}`)"
+            )
+        if not room_rows:
+            lines.append("• 없어")
     return "\n".join(lines)
 
 
@@ -141,6 +156,30 @@ def _build_weekly_recordings_report_blocks(
             )
             section = section[split_at:].lstrip("\n")
     return blocks
+
+
+def _split_weekly_report_blocks(
+    blocks: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """급감 진료실이 많아도 목록을 자르지 않고 같은 스레드의 여러 메시지로 나눈다."""
+
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    text_size = 0
+    for block in blocks:
+        block_size = len(block["text"]["text"]) + 2
+        if current and (
+            len(current) >= _SLACK_REPORT_BLOCK_LIMIT
+            or text_size + block_size > _SLACK_REPORT_TEXT_LIMIT
+        ):
+            chunks.append(current)
+            current = []
+            text_size = 0
+        current.append(block)
+        text_size += block_size
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _run_weekly_recordings_report_if_due(
@@ -192,13 +231,8 @@ def _run_weekly_recordings_report_transport(
 
     report_summary = _validate_weekly_transport_batch(batch)
     delivery = batch.deliveries[0]
-    message_text = _format_weekly_recordings_report(
-        report_summary,
-        include_title=False,
-    )
-    message_blocks = _build_weekly_recordings_report_blocks(
-        report_summary,
-        include_header=False,
+    block_chunks = _split_weekly_report_blocks(
+        _build_weekly_recordings_report_blocks(report_summary, include_header=False)
     )
     title_response = client.chat_postMessage(
         channel=batch.channel_id,
@@ -215,29 +249,31 @@ def _run_weekly_recordings_report_transport(
     thread_ts = _extract_weekly_recordings_message_ts(title_response)
     if not thread_ts:
         raise RuntimeError("주간 recordings 리포트 제목 메시지 ts를 받지 못했어")
-    report_response = client.chat_postMessage(
-        channel=batch.channel_id,
-        text=message_text,
-        blocks=message_blocks,
-        thread_ts=thread_ts,
-        unfurl_links=False,
-        unfurl_media=False,
-        client_msg_id=build_automation_delivery_client_msg_id(
-            cycle=batch.cycle,
-            cycle_key=batch.cycle_key,
-            delivery_id=delivery.delivery_id,
-            part="report",
-        ),
-    )
+    last_message_ts = thread_ts
+    for index, message_blocks in enumerate(block_chunks):
+        message_text = "\n\n".join(block["text"]["text"] for block in message_blocks)
+        report_response = client.chat_postMessage(
+            channel=batch.channel_id,
+            text=message_text,
+            blocks=message_blocks,
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle=batch.cycle,
+                cycle_key=batch.cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="report" if index == 0 else f"report:{index}",
+            ),
+        )
+        last_message_ts = _extract_weekly_recordings_message_ts(report_response) or last_message_ts
+    # 모든 분할 메시지가 성공한 뒤에만 API delivery 전체를 완료 처리한다.
     remember_automation_delivery(
         cycle=batch.cycle,
         cycle_key=batch.cycle_key,
         delivery=AutomationSlackDelivery(
             delivery_id=delivery.delivery_id,
-            external_message_id=(
-                _extract_weekly_recordings_message_ts(report_response)
-                or thread_ts
-            ),
+            external_message_id=last_message_ts,
             permalink="",
             delivered_at=poll_now,
         ),
@@ -321,7 +357,8 @@ def _validate_weekly_transport_batch(
         or delivery.delivery_id
         != f"weekly_recordings:{week_start.isoformat()}"
         or not isinstance(payload, dict)
-        or set(payload) != expected_keys
+        # 배포 전에 생성된 pending도 처리하되 새 필드는 둘 다 있어야 한다.
+        or set(payload) not in (expected_keys, expected_keys | {"roomDropRows", "roomDropCount"})
         or payload.get("weekStartDate") != week_start.isoformat()
         or payload.get("weekEndDate") != week_end.isoformat()
         or payload.get("previousWeekStartDate")
@@ -344,6 +381,28 @@ def _validate_weekly_transport_batch(
         )
     ):
         raise RuntimeError("주간 recordings transport batch 계약이 올바르지 않아")
+    if "roomDropRows" in payload:
+        rows = payload["roomDropRows"]
+        row_keys = {
+            "hospitalSeq", "hospitalRoomSeq", "hospitalName", "roomName",
+            "previousCount", "currentCount", "delta", "changeRate",
+        }
+        if (
+            not isinstance(rows, list)
+            or type(payload["roomDropCount"]) is not int
+            or payload["roomDropCount"] != len(rows)
+            or any(
+                not isinstance(row, dict)
+                or set(row) != row_keys
+                or any(type(row[key]) is not int or row[key] <= 0 for key in ("hospitalSeq", "hospitalRoomSeq", "previousCount"))
+                or type(row["currentCount"]) is not int or row["currentCount"] < 0
+                or type(row["delta"]) is not int
+                or type(row["changeRate"]) not in {int, float}
+                or any(not isinstance(row[key], str) or not row[key].strip() for key in ("hospitalName", "roomName"))
+                for row in rows
+            )
+        ):
+            raise RuntimeError("주간 recordings 진료실 급감 계약이 올바르지 않아")
     return dict(payload)
 
 

@@ -140,6 +140,23 @@ class WeeklyRecordingsSummaryAssistantRouteTests(unittest.TestCase):
         self.assertEqual(result.outcome, "no_evidence")
         self.assertEqual(result.fallback_reason, "recordings_not_found")
 
+    def test_zero_current_recordings_with_room_drop_is_answered(self) -> None:
+        # 이번 주 0건은 전주 대비 감소 근거이므로 no_evidence로 숨기지 않는다.
+        with (
+            patch(
+                "boxer_company.assistant.operational_read_routes._build_weekly_recordings_report_summary",
+                return_value={"totalCount": 0, "roomDropRows": [{"currentCount": 0}]},
+            ),
+            patch(
+                "boxer_company.assistant.operational_read_routes._format_weekly_recordings_report",
+                return_value="*진료실별 녹화 급감* 3건 → 0건",
+            ),
+        ):
+            result = self.route.handle(_request("지난주 초음파 영상 현황"))
+
+        self.assertEqual(result.outcome, "answered")
+        self.assertIsNone(result.fallback_reason)
+
     def test_current_week_question_passes_kst_today_as_target(self) -> None:
         with (
             patch(

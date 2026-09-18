@@ -1,4 +1,6 @@
+import sqlite3
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from unittest.mock import patch
 
@@ -71,6 +73,92 @@ class WeeklyRecordingsReportLoadTests(unittest.TestCase):
 
 
 class WeeklyRecordingsReportSummaryTests(unittest.TestCase):
+    def test_room_drops_survive_device_changes_and_hospital_growth(self) -> None:
+        # 실제 GROUP BY를 실행해 여러 장비 합산, 같은 이름의 다른 병원 진료실,
+        # 이번 주 0건과 KST 주간 경계를 한 번에 확인한다.
+        def connect(_timeout):
+            db = sqlite3.connect(":memory:")
+            db.row_factory = sqlite3.Row
+            db.executescript("""
+                CREATE TABLE hospitals (seq INTEGER, hospitalName TEXT);
+                CREATE TABLE hospital_rooms (seq INTEGER, hospitalSeq INTEGER, roomName TEXT);
+                CREATE TABLE recordings (hospitalSeq INTEGER, hospitalRoomSeq INTEGER,
+                    deviceSeq INTEGER, recordedAt TEXT);
+                INSERT INTO hospitals VALUES (1, 'A병원'), (2, 'B병원');
+                INSERT INTO hospital_rooms VALUES
+                    (11, 1, '1진료실'), (12, 1, '2진료실'),
+                    (13, 1, '3진료실'), (21, 2, '1진료실');
+            """)
+            for hospital, room, device, previous, current in (
+                (1, 11, 101, 6, 0),
+                (1, 11, 102, 0, 2),
+                (1, 11, 103, 0, 1),
+                (1, 12, 104, 3, 0),
+                (1, 13, 105, 10, 20),
+                (2, 21, 106, 1, 1),
+                (1, None, 107, 0, 1),
+                (1, 0, 108, 1, 0),
+            ):
+                for count, recorded_at in (
+                    (previous, "2026-03-16 03:00:00"),
+                    (current, "2026-03-23 03:00:00"),
+                ):
+                    db.executemany("INSERT INTO recordings VALUES (?, ?, ?, ?)",
+                                   [(hospital, room, device, recorded_at)] * count)
+            db.execute("INSERT INTO recordings VALUES (1, 11, 102, '2026-03-29 15:00:00')")
+
+            class Connection:
+                @contextmanager
+                def cursor(self):
+                    class Cursor:
+                        def execute(self, sql, params):
+                            self.result = db.execute(sql.replace("%s", "?"), tuple(
+                                value.isoformat(sep=" ") if isinstance(value, datetime) else value
+                                for value in params
+                            ))
+
+                        def fetchall(self):
+                            return [dict(row) for row in self.result.fetchall()]
+                    yield Cursor()
+
+                def close(self):
+                    db.close()
+            return Connection()
+
+        with patch.object(report, "_create_db_connection", side_effect=connect):
+            summary = report._build_weekly_recordings_report_summary(target_date=date(2026, 3, 23))
+
+        self.assertEqual(summary["totalCount"], 25)
+        self.assertEqual(summary["previousTotalCount"], 21)
+        self.assertEqual(summary["hospitalCount"], 2)
+        self.assertEqual(summary["topRows"][0]["rowCount"], 24)
+        self.assertEqual(summary["dropCount"], 0)
+        self.assertEqual(summary["roomDropCount"], 2)
+        self.assertEqual(
+            [(row["hospitalSeq"], row["hospitalRoomSeq"], row["previousCount"], row["currentCount"])
+             for row in summary["roomDropRows"]],
+            [(1, 11, 6, 3), (1, 12, 3, 0)],
+        )
+
+    def test_room_drop_requires_fifty_percent_and_at_least_three_fewer_recordings(self) -> None:
+        # 감소 비율만 큰 1~2건 변동은 제외하고 두 조건의 경계값을 확인한다.
+        for previous, current, included in (
+            (1, 0, False), (2, 0, False), (2, 1, False),
+            (3, 0, True), (3, 1, False), (3, 2, False), (4, 2, False),
+            (5, 2, True), (6, 3, True), (7, 4, False),
+            (20, 10, True), (20, 11, False), (0, 0, False), (0, 1, False),
+        ):
+            with self.subTest(previous=previous, current=current):
+                room = {"hospitalSeq": 1, "hospitalRoomSeq": 11,
+                        "hospitalName": "A병원", "roomName": "이전 이름"}
+                rows = report._build_weekly_recordings_room_drop_rows(
+                    {"roomRows": [{**room, "roomName": "바뀐 이름", "rowCount": current}]},
+                    {"roomRows": [{**room, "rowCount": previous}]},
+                )
+                self.assertEqual(bool(rows), included)
+                if included:
+                    self.assertEqual(rows[0]["roomName"], "바뀐 이름")
+
     def test_builds_summary_with_top_rows_and_week_over_week_changes(self) -> None:
         with patch(
             "boxer_company.weekly_recordings_report._load_weekly_recordings_report",
@@ -241,11 +329,21 @@ class WeeklyRecordingsReportFormatTests(unittest.TestCase):
                 "surgeCount": 0,
                 "dropRows": [],
                 "dropCount": 0,
+                "roomDropRows": [{
+                    "hospitalSeq": 1, "hospitalRoomSeq": 11,
+                    "hospitalName": "A병원", "roomName": "1진료실",
+                    "previousCount": 3, "currentCount": 0, "delta": -3, "changeRate": -100.0,
+                }],
+                "roomDropCount": 1,
             },
             now=datetime(2026, 4, 6, 9, 0, 0),
         )
 
         self.assertIn("• 결과: 해당 주간 recordings row가 없어", message)
+        self.assertIn("*진료실별 녹화 급감* `1곳`", message)
+        self.assertIn("전주 대비 50% 이상·3건 이상 감소", message)
+        self.assertIn("A병원 · 1진료실", message)
+        self.assertIn("`3건 → 0건` · `-3건` (`-100.0%`)", message)
 
 
 
