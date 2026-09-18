@@ -212,6 +212,37 @@ class JsonAutomationCycleStateStore:
     ) -> _MutationResult:
         """한 flock 안에서 exact revision을 읽고 cycle 하나를 원자 교체한다."""
 
+        def update(snapshot: AutomationStateSnapshot) -> tuple[Mapping[str, Any], _MutationResult]:
+            next_state, result = updater(*snapshot.cycle(key))
+            # 기존 cycle updater의 계약은 mapping 반환이다. 쓰기 생략은
+            # snapshot updater만 명시적으로 사용할 수 있게 유지한다.
+            if not isinstance(next_state, Mapping):
+                raise AutomationCycleContractError("automation state update is invalid")
+            return next_state, result
+
+        return self.mutate_cycle_from_snapshot(
+            key,
+            update,
+            expected_document_digest=expected_document_digest,
+            require_existing_document=require_existing_document,
+        )
+
+    def mutate_cycle_from_snapshot(
+        self,
+        key: str,
+        updater: Callable[
+            [AutomationStateSnapshot],
+            tuple[Mapping[str, Any] | None, _MutationResult],
+        ],
+        *,
+        expected_document_digest: str | None = None,
+        require_existing_document: bool = False,
+    ) -> _MutationResult:
+        """다른 날짜의 상태 판정과 현재 cycle 예약도 같은 flock으로 묶는다.
+
+        updater가 None을 반환하면 새 cycle을 만들거나 기존 상태를 쓰지 않는다.
+        """
+
         self._validate_state_key(key)
         with self._lock:
             with self._exclusive_file_lock():
@@ -228,7 +259,9 @@ class JsonAutomationCycleStateStore:
                         "automation state changed"
                     )
                 exists, current = snapshot.cycle(key)
-                next_state, result = updater(exists, current)
+                next_state, result = updater(snapshot)
+                if next_state is None:
+                    return result
                 if not isinstance(next_state, Mapping):
                     raise AutomationCycleContractError(
                         "automation state update is invalid"
@@ -500,15 +533,28 @@ class DurableAutomationCycleCoordinator:
         while True:
             # 현재 revision 판정과 marker 예약을 한 flock 안에서 끝내 별도
             # coordinator/process가 같은 외부 mutation을 함께 시작하지 못한다.
-            transition = self._state_store.mutate_cycle(
-                state_key,
-                lambda _exists, current: self._reserve_transition(
-                    current=current,
-                    state_key=state_key,
-                    trigger=trigger,
-                    admission_now=admission_now,
-                ),
-            )
+            if trigger.cycle == "daily_device_round" and not trigger.ack_only:
+                # 날짜별 delivery identity는 유지하면서 이전 순회의 진행 위치를
+                # 새 marker와 함께 예약한다. 이전 ACK와의 경쟁도 이 lock이 막는다.
+                transition = self._state_store.mutate_cycle_from_snapshot(
+                    state_key,
+                    lambda snapshot: self._reserve_daily_transition(
+                        snapshot=snapshot,
+                        state_key=state_key,
+                        trigger=trigger,
+                        admission_now=admission_now,
+                    ),
+                )
+            else:
+                transition = self._state_store.mutate_cycle(
+                    state_key,
+                    lambda _exists, current: self._reserve_transition(
+                        current=current,
+                        state_key=state_key,
+                        trigger=trigger,
+                        admission_now=admission_now,
+                    ),
+                )
             if transition.kind == "return":
                 if transition.result is None:
                     raise AutomationCycleContractError(
@@ -563,6 +609,94 @@ class DurableAutomationCycleCoordinator:
                 len(result.deliveries),
             )
             return result
+
+    def _reserve_daily_transition(
+        self,
+        *,
+        snapshot: AutomationStateSnapshot,
+        state_key: str,
+        trigger: AutomationCycleTrigger,
+        admission_now: datetime,
+    ) -> tuple[Mapping[str, Any] | None, _CoordinatorTransition]:
+        _, current = snapshot.cycle(state_key)
+        previous: list[tuple[str, dict[str, Any]]] = []
+        for key, state in snapshot.document["cycles"].items():
+            identity = state.get("identity")
+            if not isinstance(identity, dict) or (
+                identity.get("tenantId") != trigger.tenant_id
+                or identity.get("cycle") != "daily_device_round"
+                or key == state_key
+            ):
+                continue
+            cycle_key = identity.get("cycleKey")
+            if not isinstance(cycle_key, str) or not re.fullmatch(
+                r"daily:\d{4}-\d{2}-\d{2}", cycle_key
+            ):
+                raise AutomationCycleContractError("daily progress identity is invalid")
+            try:
+                datetime.strptime(cycle_key.removeprefix("daily:"), "%Y-%m-%d")
+            except ValueError as exc:
+                raise AutomationCycleContractError(
+                    "daily progress date is invalid"
+                ) from exc
+            expected_key = hashlib.sha256(
+                f"{trigger.tenant_id}\0daily_device_round\0{cycle_key}".encode()
+            ).hexdigest()
+            if key != expected_key or cycle_key > trigger.cycle_key:
+                raise AutomationCycleContractError("daily progress identity conflicts")
+            # 과거 날짜에 남은 불명 실행도 새 날짜라는 이유로 우회하지 않는다.
+            if "inFlight" in state or "ackInFlight" in state:
+                raise AutomationCycleUncertainError(
+                    "previous daily device round execution is uncertain"
+                )
+            if state.get("pendingDeliveries"):
+                return None, _CoordinatorTransition(
+                    kind="return",
+                    result=AutomationCycleResult(
+                        cycle=trigger.cycle,
+                        outcome="no_change",
+                        metrics={"deliveryCount": 0},
+                    ),
+                )
+            previous.append((cycle_key, state))
+
+        if not current and previous:
+            # 운영에 남아 있는 가장 최근 날짜의 확정 cursor를 그대로 이어받는다.
+            # 전체를 완료한 경우에만 다음 야간 창에서 새 순회를 시작한다.
+            _, latest = max(previous, key=lambda item: item[0])
+            cursor = latest.get("cursor")
+            if not isinstance(cursor, dict):
+                raise AutomationCycleContractError("daily progress cursor is missing")
+            if latest.get("cycleCompleted") is not True:
+                processed = cursor.get("processedHospitalSeqs")
+                if "processedHospitalSeqs" not in cursor and cursor.get("activeHospitalSeq"):
+                    # 첫 병원에서 실패한 뒤 운영자가 exact marker를 retry로
+                    # 해제한 경우에도 그 병원 위치를 유지한다.
+                    processed = []
+                if not isinstance(processed, list) or any(
+                    type(seq) is not int or seq <= 0 for seq in processed
+                ):
+                    raise AutomationCycleContractError(
+                        "daily progress hospitals are invalid"
+                    )
+                carried: dict[str, Any] = {"processedHospitalSeqs": list(processed)}
+                for name in ("lastHospitalSeq", "nextHospitalSeq", "activeHospitalSeq"):
+                    value = cursor.get(name)
+                    if value is not None and (type(value) is not int or value <= 0):
+                        raise AutomationCycleContractError(
+                            "daily progress position is invalid"
+                        )
+                    carried[name] = value
+                # 보고서 날짜와 발송 ID는 새 야간 창에 속한다. 이전 날짜의
+                # pending/result/receipt와 병원별 집계는 복제하지 않는다.
+                carried["windowKey"] = trigger.cycle_key.removeprefix("daily:")
+                current = {"cursor": carried}
+        return self._reserve_transition(
+            current=current,
+            state_key=state_key,
+            trigger=trigger,
+            admission_now=admission_now,
+        )
 
     def _reserve_transition(
         self,

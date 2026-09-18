@@ -324,7 +324,8 @@ class DailyDeviceRoundCycleHandler:
             hospital_seq is None
             or (
                 candidate_count > 0
-                and len(processed_hospital_seqs) >= candidate_count
+                # 순회 도중 제외된 병원 수로 아직 남은 병원을 건너뛰지 않는다.
+                and int(summary.get("processedCandidateCount") or 0) >= candidate_count
             )
         )
         cursor = {

@@ -1417,8 +1417,9 @@ def _build_daily_device_round_summary(
             "deviceResults": [],
             "nextHospitalSeq": None,
             "candidateHospitalCount": len(candidate_hospital_seqs),
+            "processedCandidateCount": processed_candidate_count,
             "summaryLine": (
-                "이번 야간 업데이트 창에서 처리할 병원을 모두 끝냈어"
+                "이번 순회에서 처리할 병원을 모두 끝냈어"
                 if candidate_hospital_seqs and processed_candidate_count >= len(candidate_hospital_seqs)
                 else _daily_device_round_empty_scope_summary_line(hospital_scope)
             ),
@@ -1577,6 +1578,9 @@ def _build_daily_device_round_summary(
         "deviceResults": device_results,
         "nextHospitalSeq": next_hospital_seq,
         "candidateHospitalCount": len(candidate_hospital_seqs),
+        # 여러 날짜에 걸친 순회에서는 과거 처리 병원이 현재 대상에서 빠질
+        # 수 있으므로 현재 후보와 겹치는 병원만 완료 판정에 센다.
+        "processedCandidateCount": processed_candidate_count + 1,
         "summaryLine": (
             f"정상 {status_counts['정상']} / 확인 필요 {status_counts['확인 필요']} / "
             f"이상 {status_counts['이상']} / 점검 불가 {status_counts['점검 불가']}"
