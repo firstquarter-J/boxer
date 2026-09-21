@@ -289,7 +289,13 @@ def _media_quality_event(
             "durationSec": 600,
             "expectedDurationSec": 600,
             "voiceType": "n",
-            "video": {"path": "/private/video.mp4", "diagnostic": "raw-log"},
+            "video": {
+                "path": "/private/video.mp4", "diagnostic": "raw-log",
+                "visualAnalysis": {"freeze": {
+                    "detected": True, "maxDurationSec": 270.933,
+                    "thresholdSec": 60, "firstDetectedAtSec": 802.067,
+                }},
+            },
         },
     }
 
@@ -346,8 +352,8 @@ def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
     assert delivery.delivery_id == "device_notification:90"
     assert delivery.payload["render"] == {
         "type": "device_health_abnormal_alert",
-        "includeActions": False,
-        "includeDeviceVoiceAction": False,
+        "includeActions": media_type == "video",
+        "includeDeviceVoiceAction": media_type == "video",
     }
     item = delivery.payload["alertSummary"]["deviceResults"][0]
     assert item["alertCategory"] == f"recording_{media_type}"
@@ -356,6 +362,7 @@ def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
     assert item["sessionAt"] == "2026-08-14 09:49:00 KST"
     assert item["componentLabels"] == {}
     assert delivery.payload["smsReceipt"]["status"] == "not_applicable"
+    assert delivery.payload["smsReceipt"]["contactActionEnabled"] is (media_type == "video")
     mocks["media_session"].assert_called_once_with(90)
     for name in ("send_sms", "claim_sms", "remember_sms", "verify_video"):
         mocks[name].assert_not_called()
@@ -363,6 +370,61 @@ def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
     saved = json.dumps(result.cursor)
     for private_value in ("private-media-file", "81000000000", "/private/", "raw-log"):
         assert private_value not in saved
+
+
+@pytest.mark.parametrize(("duration", "expected"), [
+    (270.933, "최장 연속 정지 4분 30.933초"),
+    (120, "최장 연속 정지 2분"),
+    (59.999, "최장 연속 정지 59.999초"),
+    (60.001, "최장 연속 정지 1분 0.001초"),
+    (3601.25, "최장 연속 정지 60분 1.25초"),
+    (None, "정지 시간 확인 필요"),
+    (0, "정지 시간 확인 필요"),
+    (-60, "정지 시간 확인 필요"),
+    (True, "정지 시간 확인 필요"),
+    ("unknown", "정지 시간 확인 필요"),
+    (float("nan"), "정지 시간 확인 필요"),
+    (float("inf"), "정지 시간 확인 필요"),
+    (10 ** 400, "정지 시간 확인 필요"),
+])
+def test_freeze_duration_survives_cursor_reload_without_guessing(
+    duration: object, expected: str,
+) -> None:
+    # 실측값이 없으면 영상 길이·감지 기준·세션 경과 시간으로 대체하지 않는다.
+    event = _media_quality_event(issues=["video_frozen"])
+    event["details"]["video"]["visualAnalysis"]["freeze"]["maxDurationSec"] = duration
+    normalized = cycle._normalize_event(event)
+    restored = json.loads(json.dumps(normalized, allow_nan=False))
+    deps, mocks = _deps()
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor={
+        **_initialized_cursor(90), "pendingEvents": [restored],
+    }))
+
+    delivery, = result.deliveries
+    issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    assert expected in issue
+    assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id][
+        "sheetAlertItem"
+    ]["issue"] == issue
+    assert mocks["send_sms"].call_count == 0
+    saved = json.dumps(result.cursor)
+    for private_value in ("private-media-file", "81000000000", "/private/", "raw-log"):
+        assert private_value not in saved
+
+
+@pytest.mark.parametrize("video", [None, [], {}, {"visualAnalysis": []}, {
+    "visualAnalysis": {"freeze": "invalid"},
+}])
+def test_freeze_alert_with_missing_or_malformed_metrics_still_delivers(video: object) -> None:
+    event = _media_quality_event(issues=["video_frozen"])
+    event["details"]["video"] = video
+    deps, _mocks = _deps(next_result=(90, event))
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(89))
+    )
+    assert "정지 시간 확인 필요" in result.deliveries[0].payload[
+        "alertSummary"
+    ]["deviceResults"][0]["priorityReason"]
 
 
 @pytest.mark.parametrize(("media_type", "issues"), [
@@ -399,7 +461,9 @@ def test_same_recording_video_and_audio_survive_cursor_reload_and_ack() -> None:
         item = delivery.payload["alertSummary"]["deviceResults"][0]
         assert item["alertCategory"] == category
         if event_id == 90:
-            assert "화면 정지 구간 감지, 단색 화면 구간 감지" in item["priorityReason"]
+            assert (
+                "화면 정지 구간 감지 (최장 연속 정지 4분 30.933초), 단색 화면 구간 감지"
+            ) in item["priorityReason"]
         failed = handler.acknowledge(
             _request(cursor=dict(result.cursor)),
             (AutomationDeliveryReceipt(delivery_id=delivery.delivery_id, status="failed"),),
@@ -421,6 +485,7 @@ def test_same_recording_video_and_audio_survive_cursor_reload_and_ack() -> None:
 
 
 @pytest.mark.parametrize(("media_type", "issue", "title"), [
+    ("video", "video_frozen", "녹화 영상 이상 감지"),
     ("video", "video_uniform_color", "녹화 영상 이상 감지"),
     ("audio", "audio_silent", "녹화 오디오 이상 감지"),
 ])
@@ -433,9 +498,12 @@ def test_media_quality_delivery_reaches_slack_renderer(
 
     # API 판정 결과를 실제 Slack transport/Block renderer까지 전달하되
     # 외부 Slack 호출만 mock하여 실제 채널에 테스트 메시지를 보내지 않는다.
-    deps, _mocks = _deps(next_result=(90, _media_quality_event(
+    event = _media_quality_event(
         media_type=media_type, issues=[issue],
-    )))
+    )
+    # 등록된 번호가 없어도 문자 입력창을 여는 버튼은 제공한다.
+    event["hospitalDeviceAlertPhone"] = ""
+    deps, _mocks = _deps(next_result=(90, event))
     result = DeviceNotificationAlertCycleHandler(deps).run(
         _request(cursor=_initialized_cursor(last_seen_id=89))
     )
@@ -457,7 +525,33 @@ def test_media_quality_delivery_reaches_slack_renderer(
     for text in (title, "뉴서울여성의원(인천)", "1진료실", "MB2-C00992", "81000000000"):
         assert text in rendered
     assert "2026-08-14 09:49:00 KST" in rendered
-    assert all(block["type"] != "actions" for block in message["blocks"])
+    actions = [block for block in message["blocks"] if block["type"] == "actions"]
+    if media_type == "video":
+        from boxer_company.transport_contracts import (
+            DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
+            DEVICE_HEALTH_ALERT_SMS_ACTION,
+            DEVICE_HEALTH_ALERT_VOICE_ACTION,
+        )
+
+        action_block, = actions
+        assert [button["action_id"] for button in action_block["elements"]] == [
+            DEVICE_HEALTH_ALERT_SMS_ACTION,
+            DEVICE_HEALTH_ALERT_VOICE_ACTION,
+            DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
+        ]
+        assert [button["text"]["text"] for button in action_block["elements"]] == [
+            "병원 문자 보내기", "장비 음성 안내", "확인 완료",
+        ]
+        assert action_block["block_id"]
+        for button in action_block["elements"]:
+            target = json.loads(button["value"])
+            assert target["alertCategory"] == "recording_video"
+            assert target["device"] == "MB2-C00992"
+        if issue == "video_frozen":
+            assert "최장 연속 정지 4분 30.933초" in rendered
+            assert "최장 연속 정지 4분 30.933초" in message["text"]
+    else:
+        assert actions == []
     assert message["client_msg_id"]
 
 

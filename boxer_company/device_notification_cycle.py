@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 import re
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -76,7 +77,7 @@ _MEDIA_ISSUE_LABELS = {
     "audio_duration_mismatch": "영상 길이 대비 오디오 길이 부족",
     "audio_silent": "오디오 전체가 완전 무음",
 }
-_SLACK_ONLY_CODES = {_VIDEO_DURATION_MISMATCH, _RECORDING_MEDIA_QUALITY_ISSUE}
+_AUTO_SMS_EXCLUDED_CODES = {_VIDEO_DURATION_MISMATCH, _RECORDING_MEDIA_QUALITY_ISSUE}
 _CAPTUREBOARD_INCIDENT_CODES = {
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
@@ -889,14 +890,22 @@ class DeviceNotificationAlertCycleHandler:
                 return None, None
 
         alert_summary, alert_item, recording_context = _build_root_alert(event)
-        if event["code"] in _SLACK_ONLY_CODES:
-            # 영상 업로드·완성 파일 품질은 CX가 확인할 운영 알림이다.
-            # 자동 병원 문자와 장비 음성 안내로 확대하지 않는다.
+        # 영상 품질 알림은 사람이 문자·음성·확인 완료를 선택할 수 있다.
+        # 업로드·오디오 알림은 기존 표시 전용 동작을 유지한다.
+        include_actions = (
+            event["code"] not in _AUTO_SMS_EXCLUDED_CODES
+            or (
+                event["code"] == _RECORDING_MEDIA_QUALITY_ISSUE
+                and event["details"].get("mediaType") == "video"
+            )
+        )
+        if event["code"] in _AUTO_SMS_EXCLUDED_CODES:
+            # 완성 영상의 수동 버튼을 열어도 자동 문자는 발송하지 않는다.
             sms_receipt = {
                 "attempted": False,
                 "status": "not_applicable",
                 "ok": False,
-                "contactActionEnabled": False,
+                "contactActionEnabled": include_actions,
                 "deliveryStatus": _SMS_DELIVERY_NOT_SENT,
             }
         else:
@@ -920,8 +929,8 @@ class DeviceNotificationAlertCycleHandler:
                 # 실행하며 DB/SMS/Sheets 판단은 다시 하지 않는다.
                 "render": {
                     "type": "device_health_abnormal_alert",
-                    "includeActions": event["code"] not in _SLACK_ONLY_CODES,
-                    "includeDeviceVoiceAction": event["code"] not in _SLACK_ONLY_CODES,
+                    "includeActions": include_actions,
+                    "includeDeviceVoiceAction": include_actions,
                 },
                 # alertSummary에는 legacy 자동발송 확인 action의 번호·본문을
                 # 유지하고, 별도 receipt에는 provider 식별값을 싣지 않는다.
@@ -1703,6 +1712,14 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
                 and media_type and issue.startswith(f"{media_type}_")
             )),
         })
+        if "video_frozen" in safe_details["issues"]:
+            # 원본과 재시작한 cursor에 같은 구조를 사용하며, 분석 로그 대신
+            # 장비가 측정한 최장 연속 정지 시간 하나만 보존한다.
+            safe_details["video"] = {
+                "visualAnalysis": {"freeze": {
+                    "maxDurationSec": _recording_freeze_duration(details),
+                }},
+            }
     return {
         "notificationId": notification_id,
         "deviceSeq": _coerce_optional_int(value.get("deviceSeq")),
@@ -2119,7 +2136,7 @@ def _build_root_alert(
         media_label = "영상" if media_type == "video" else "오디오"
         issue = _format_issue(
             f"녹화 파일 {media_label} 이상: " + ", ".join(
-                _MEDIA_ISSUE_LABELS[item] for item in details.get("issues", [])
+                _format_media_issue(item, details) for item in details.get("issues", [])
                 if item in _MEDIA_ISSUE_LABELS
             ),
             event.get("occurredAt"),
@@ -2617,6 +2634,36 @@ def _format_occurred_at(value: Any) -> str:
 
 def _format_issue(issue: str, occurred_at: Any) -> str:
     return f"{issue} (발생 {_format_occurred_at(occurred_at)})"
+
+
+def _recording_freeze_duration(details: Mapping[str, Any]) -> float | None:
+    """검사기의 실측값만 읽고 세션 경과 시간이나 감지 기준으로 추정하지 않는다."""
+
+    value: Any = details
+    for key in ("video", "visualAnalysis", "freeze", "maxDurationSec"):
+        value = value.get(key) if isinstance(value, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        duration = float(value)
+    except OverflowError:
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _format_media_issue(issue: str, details: Mapping[str, Any]) -> str:
+    label = _MEDIA_ISSUE_LABELS[issue]
+    if issue != "video_frozen":
+        return label
+    duration = _recording_freeze_duration(details)
+    if duration is None:
+        return f"{label} (정지 시간 확인 필요)"
+    # 검사기의 밀리초 정밀도를 유지하면서 분·초로 읽기 쉽게 표현한다.
+    minutes, seconds = divmod(round(duration, 3), 60)
+    parts = [f"{int(minutes)}분"] if minutes else []
+    if seconds or not parts:
+        parts.append(f"{seconds:.3f}".rstrip("0").rstrip(".") + "초")
+    return f"{label} (최장 연속 정지 {' '.join(parts)})"
 
 
 def _format_duration(duration_seconds: int) -> str:

@@ -74,8 +74,9 @@ _DEVICE_HEALTH_ALERT_ACTION_LABELS = {
 _DEVICE_HEALTH_ALERT_VOICE_MINIMUM_VERSION = (2, 11, 308)
 _DEVICE_HEALTH_ALERT_VOICE_MINIMUM_VERSION_TEXT = "2.11.308"
 _DEVICE_HEALTH_ALERT_SMS_GREETING = "안녕하세요 마미톡입니다. 🌷"
+# 완성 영상 알림의 버튼도 기존 버전·연결·중복 재생 가드를 거쳐 실행한다.
 _DEVICE_HEALTH_ALERT_VOICE_CATEGORIES = frozenset(
-    {"recording", "recording_processing", "video_signal"}
+    {"recording", "recording_processing", "recording_video", "video_signal"}
 )
 _DEVICE_HEALTH_ALERT_PHONE_PATTERN = re.compile(r"^(?:\+82|82|0)1[016789]\d{7,8}$")
 _DEVICE_HEALTH_ALERT_VOICE_CLAIMS: dict[str, datetime] = {}
@@ -979,6 +980,18 @@ def _build_device_health_alert_sms_guide(
         f"{_DEVICE_HEALTH_ALERT_SMS_GREETING}\n\n"
         f"{target.room_name} {target.device_name}"
     )
+    if target.alert_category == "recording_video":
+        # 파일 검사 결과를 캡처보드 연결 불량으로 단정하지 않고, 담당자가
+        # 번호와 본문을 확인·수정해 보낼 수 있는 영상 점검 문구를 제공한다.
+        return {
+            "supported": True,
+            "templateId": "recording_video_quality",
+            "message": (
+                f"{prefix}에서 녹화 영상 이상이 감지되었습니다.\n\n"
+                "초음파 화면과 마미박스의 영상 입력 상태를 확인해 주세요.\n"
+                "문제가 반복되면 마미톡 담당자에게 알려 주세요."
+            ),
+        }
     if target.alert_category == "recording_processing" or any(
         marker in lowered for marker in ("병합", "ffmpeg", "merge")
     ):

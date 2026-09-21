@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 import json
 import logging
 import unittest
@@ -111,6 +111,102 @@ def _exact_target() -> dict[str, object]:
 
 
 class DeviceHealthAlertActionRouteTests(unittest.TestCase):
+    def test_recording_video_buttons_execute_through_existing_api_actions(self) -> None:
+        # 영상 알림의 세 버튼을 실제 route에 넣고 외부 발송·상태 기록만 mock한다.
+        now = datetime(2026, 9, 21, tzinfo=UTC)
+        for name, execute_sms in (
+            (DEVICE_HEALTH_ALERT_SMS_ACTION, False),
+            (DEVICE_HEALTH_ALERT_SMS_ACTION, True),
+            (DEVICE_HEALTH_ALERT_VOICE_ACTION, False),
+            (DEVICE_HEALTH_ALERT_MARK_DONE_ACTION, False),
+        ):
+            with self.subTest(name=name, execute_sms=execute_sms):
+                request = _request(name, include_sms=execute_sms)
+                target = request.metadata["operation_action"]["target"]
+                target.update({
+                    "alert_category": "recording_video",
+                    "issue": "녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 4분 30.933초)",
+                    "problem_components": [],
+                })
+                send_sms = Mock(return_value={
+                    "ok": True, "status": "sent", "groupId": "media-sms-group",
+                    "smsDeliveryStatus": "accepted",
+                })
+                send_command = Mock(return_value={"status": True})
+                claim = Mock(return_value=DeviceHealthAlertAcknowledgement(
+                    created=True, actor_user_id="ACTOR-1", acknowledged_at=now,
+                ))
+                route = DeviceHealthAlertActionAssistantRoute(replace(
+                    DeviceHealthAlertActionRouteDeps(),
+                    load_exact_target=Mock(return_value={
+                        **_exact_target(), "deviceAlertPhone": "",
+                    }),
+                    get_mda_device=Mock(return_value={
+                        "version": "2.11.310", "deviceIsConnected": True,
+                    }),
+                    send_sms=send_sms,
+                    remember_sms_delivery=Mock(return_value=True),
+                    send_mda_command=send_command,
+                    claim_voice_guide=Mock(return_value={"claimed": True}),
+                    claim_mark_done=claim,
+                    write_event=Mock(return_value=True),
+                    now=lambda: now,
+                ))
+                result = route.handle(request)
+                self.assertIsNotNone(result)
+                self.assertEqual(result.outcome, "answered")
+                if name == DEVICE_HEALTH_ALERT_SMS_ACTION and not execute_sms:
+                    self.assertEqual(result.operation_result["phoneNumber"], "")
+                    self.assertEqual(
+                        result.operation_result["templateId"], "recording_video_quality",
+                    )
+                    self.assertIn("녹화 영상 이상", result.operation_result["message"])
+                    self.assertNotIn("캡처보드", result.operation_result["message"])
+                if execute_sms:
+                    # 저장 번호가 없어도 모달에서 입력한 번호·본문으로만 발송한다.
+                    payload = send_sms.call_args.args[0]
+                    self.assertEqual(payload["sms"]["to"], "01012345678")
+                    self.assertEqual(payload["sms"]["message"], "직접 작성한 안내 문자입니다.")
+                    send_sms.assert_called_once()
+                else:
+                    send_sms.assert_not_called()
+                if name == DEVICE_HEALTH_ALERT_VOICE_ACTION:
+                    send_command.assert_called_once_with("MB2-C00419", command="voice_guide")
+                else:
+                    send_command.assert_not_called()
+                if name == DEVICE_HEALTH_ALERT_MARK_DONE_ACTION:
+                    claim.assert_called_once()
+                    self.assertEqual(result.operation_result["actorUserId"], "ACTOR-1")
+                else:
+                    claim.assert_not_called()
+
+    def test_recording_video_voice_preserves_version_connection_and_cooldown_guards(self) -> None:
+        for version, connected, claimed, reason in (
+            ("2.11.307", True, True, "voice_guide_unsupported_version"),
+            ("2.11.310", False, True, "voice_guide_device_offline"),
+            ("2.11.310", True, False, "voice_guide_cooldown"),
+        ):
+            with self.subTest(reason=reason):
+                request = _request(DEVICE_HEALTH_ALERT_VOICE_ACTION)
+                request.metadata["operation_action"]["target"].update({
+                    "alert_category": "recording_video", "problem_components": [],
+                })
+                send_command = Mock()
+                route = DeviceHealthAlertActionAssistantRoute(replace(
+                    DeviceHealthAlertActionRouteDeps(),
+                    load_exact_target=Mock(return_value=_exact_target()),
+                    get_mda_device=Mock(return_value={
+                        "version": version, "deviceIsConnected": connected,
+                    }),
+                    claim_voice_guide=Mock(return_value={"claimed": claimed, "remainingSeconds": 60}),
+                    send_mda_command=send_command,
+                    write_event=Mock(return_value=True),
+                ))
+                result = route.handle(request)
+                self.assertEqual(result.outcome, "denied")
+                self.assertEqual(result.fallback_reason, reason)
+                send_command.assert_not_called()
+
     def test_sms_guide_uses_led_category_without_issue_keyword(self) -> None:
         guide = action_route._build_device_health_alert_sms_guide(
             action_route.DeviceHealthAlertActionTarget(
