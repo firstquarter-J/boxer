@@ -8,6 +8,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
 )
@@ -195,29 +197,17 @@ def _mark_done_result(
     )
 
 
-def _completion_rows(blocks: object) -> list[tuple[str, str]]:
-    """완료 담당자와 시간을 기존 카드의 한 쌍 field로 검증한다."""
+def _completion_rows(blocks: object) -> list[str]:
+    """카드 식별 정보보다 먼저 나오는 완료 담당자와 시간을 검증한다."""
 
     assert isinstance(blocks, list)
-    rows: list[tuple[str, str]] = []
+    rows: list[str] = []
     for block in blocks:
         if not isinstance(block, dict) or block.get("type") != "section":
             continue
-        fields = block.get("fields")
-        if not isinstance(fields, list):
-            continue
-        for index, field in enumerate(fields):
-            if not isinstance(field, dict):
-                continue
-            status_text = str(field.get("text") or "")
-            if not status_text.startswith("✅ *확인 완료*"):
-                continue
-            assert index + 1 < len(fields)
-            time_field = fields[index + 1]
-            assert isinstance(time_field, dict)
-            time_text = str(time_field.get("text") or "")
-            assert time_text.startswith("🕒 *처리 시간*")
-            rows.append((status_text, time_text))
+        text = block.get("text", {}).get("text", "")
+        if text.startswith("✅ *확인 완료*"):
+            rows.append(text.split("\n\n", 1)[0])
     return rows
 
 
@@ -411,13 +401,17 @@ def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
         alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     }
     assert _completion_rows(updated_blocks) == [
-        (
-            "✅ *확인 완료*\n담당자 <@U1>",
-            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
-        ),
+        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
     ]
-    assert client.chat_update.call_args.kwargs["text"] == message["text"]
-    assert "\n" in client.chat_update.call_args.kwargs["text"]
+    assert updated_blocks[0]["text"]["text"] == "✅ 확인 완료 · LED 연결"
+    updated_text = client.chat_update.call_args.kwargs["text"]
+    assert updated_text == (
+        "*✅ 확인 완료 · LED 연결*\n" + message["text"].split("\n", 1)[1]
+    )
+    assert updated_blocks[1]["text"]["text"].endswith("\n\n*#1 테스트병원*")
+    assert updated_blocks[1]["fields"] == message["blocks"][1]["fields"]
+    assert updated_blocks[2:4] == message["blocks"][2:4]
+    assert all("style" not in element for element in updated_blocks[4]["elements"])
     client.chat_postMessage.assert_not_called()
 
 
@@ -446,6 +440,95 @@ def test_mark_done_keeps_actions_when_remote_result_is_not_answered() -> None:
     assert client.chat_postMessage.call_args.kwargs["text"] == (
         "확인 완료 상태를 저장하지 못했어"
     )
+
+
+@pytest.mark.parametrize("include_voice", [True, False])
+def test_mark_done_highlights_video_alert_without_losing_session_details(
+    include_voice: bool,
+) -> None:
+    app = _App()
+    bridge = Mock()
+    # 클릭자와 API의 최초 담당자가 다르면 최초 receipt가 표시돼야 한다.
+    bridge.mark_done.return_value = _mark_done_result(created=False)
+    alert.attach_device_alert_actions(
+        app,
+        logging.getLogger("test.alert.video-completion"),
+        lambda _workspace_id, _actor_id: True,
+        bridge,
+    )
+    message = _rendered_message(
+        {
+            **_item(),
+            "alertCategory": "recording_video",
+            "barcode": "12345678901",
+            "sessionAtLabel": "세션 시작",
+            "sessionAt": "2026-08-31 08:37:41 KST",
+            "issue": "화면 정지 구간 감지",
+        },
+        include_device_voice_action=include_voice,
+    )
+    client = _StatefulSlackClient(message)
+
+    app.actions[DEVICE_HEALTH_ALERT_MARK_DONE_ACTION](
+        Mock(),
+        _rendered_action_body(message, device="MB2-TEST1", actor_id="U2"),
+        client,
+    )
+
+    blocks = client.root["blocks"]
+    assert blocks[0]["text"]["text"] == "✅ 확인 완료 · 녹화 영상 이상"
+    assert blocks[1]["text"]["text"] == (
+        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
+        "*#1 테스트병원*"
+    )
+    assert blocks[1]["fields"] == message["blocks"][1]["fields"]
+    assert "12345678901" in json.dumps(blocks[1], ensure_ascii=False)
+    assert blocks[2:4] == message["blocks"][2:4]
+    expected_actions = {alert.DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL}
+    if include_voice:
+        expected_actions.add(alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE)
+    assert _card_action_ids(blocks, device="MB2-TEST1") == expected_actions
+    assert all("style" not in element for element in blocks[4]["elements"])
+    client.chat_postMessage.assert_not_called()
+
+
+def test_mark_done_promotes_existing_footer_and_keeps_original_receipt() -> None:
+    app = _App()
+    bridge = Mock()
+    bridge.mark_done.return_value = _mark_done_result(
+        actor_id="U2", acknowledged_at="2026-08-31T00:08:13+00:00",
+    )
+    alert.attach_device_alert_actions(
+        app,
+        logging.getLogger("test.alert.legacy-completion"),
+        lambda _workspace_id, _actor_id: True,
+        bridge,
+    )
+    message = _rendered_message(_item())
+    stale_body = _rendered_action_body(message, device="MB2-TEST1", actor_id="U2")
+    client = _StatefulSlackClient(message)
+    # 이전 배포가 남긴 하단 완료 표시를 재현한다. 오래된 payload가
+    # 재전달돼도 최초 담당자와 시간을 그대로 옮겨야 한다.
+    client.root["blocks"][3]["fields"].extend([
+        {"type": "mrkdwn", "text": "✅ *확인 완료*\n담당자 <@U1>"},
+        {"type": "mrkdwn", "text": "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`"},
+    ])
+    client.root["blocks"][4]["elements"] = [
+        element for element in client.root["blocks"][4]["elements"]
+        if element["action_id"] != DEVICE_HEALTH_ALERT_MARK_DONE_ACTION
+    ]
+
+    app.actions[DEVICE_HEALTH_ALERT_MARK_DONE_ACTION](Mock(), stale_body, client)
+
+    blocks = client.root["blocks"]
+    assert _completion_rows(blocks) == [
+        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
+    ]
+    assert blocks[0]["text"]["text"] == "✅ 확인 완료 · LED 연결"
+    assert blocks[3]["fields"] == message["blocks"][3]["fields"]
+    assert all("style" not in element for element in blocks[4]["elements"])
+    client.chat_update.assert_called_once()
+    client.chat_postMessage.assert_not_called()
 
 
 def test_mark_done_keeps_legacy_api_success_until_receipt_is_available() -> None:
@@ -625,6 +708,10 @@ def test_mark_done_preserves_prior_completion_from_stale_multi_card_body() -> No
     assert client.chat_update.call_count == 2
     first_blocks = client.chat_update.call_args_list[0].kwargs["blocks"]
     assert len(_completion_rows(first_blocks)) == 1
+    # 공통 renderer의 별도 점검 요약은 기존 제목을 유지한다.
+    assert first_blocks[0] == message["blocks"][0]
+    assert first_blocks[5:] == message["blocks"][5:]
+    assert client.chat_update.call_args_list[0].kwargs["text"] == message["text"]
     assert sum(block["type"] == "actions" for block in first_blocks) == 2
     final_blocks = client.chat_update.call_args_list[1].kwargs["blocks"]
     assert sum(block["type"] == "actions" for block in final_blocks) == 2
@@ -637,15 +724,11 @@ def test_mark_done_preserves_prior_completion_from_stale_multi_card_body() -> No
         alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     }
     assert _completion_rows(final_blocks) == [
-        (
-            "✅ *확인 완료*\n담당자 <@U1>",
-            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
-        ),
-        (
-            "✅ *확인 완료*\n담당자 <@U2>",
-            "🕒 *처리 시간*\n`2026-08-31 09:08:13 KST`",
-        ),
+        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
+        "✅ *확인 완료*\n담당자 <@U2> · `2026-08-31 09:08:13 KST`",
     ]
+    assert final_blocks[0] == message["blocks"][0]
+    assert client.root["text"] == message["text"]
     assert client.root["blocks"] == final_blocks
     client.chat_postMessage.assert_not_called()
 
@@ -687,10 +770,7 @@ def test_mark_done_recovers_ui_after_slack_update_failure_without_new_reply() ->
     assert client.conversations_replies.call_count == 2
     assert client.chat_update.call_count == 2
     assert _completion_rows(client.chat_update.call_args.kwargs["blocks"]) == [
-        (
-            "✅ *확인 완료*\n담당자 <@U1>",
-            "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`",
-        ),
+        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
     ]
     # API 완료 댓글은 만들지 않고 첫 Slack 갱신 실패 경고만 한 번 남긴다.
     assert [
@@ -771,7 +851,10 @@ def test_mark_done_uses_container_identity_when_optional_fields_are_missing() ->
     client.chat_postMessage.assert_not_called()
 
 
-def test_mark_done_replay_accepts_existing_status_without_slack_update() -> None:
+@pytest.mark.parametrize("escaped_emoji", [True, False])
+def test_mark_done_replay_accepts_existing_status_without_slack_update(
+    escaped_emoji: bool,
+) -> None:
     message = _rendered_message(_item())
     client = _StatefulSlackClient(message)
     stale_body = _rendered_action_body(message, device="MB2-TEST1")
@@ -791,6 +874,13 @@ def test_mark_done_replay_accepts_existing_status_without_slack_update() -> None
         client,
     )
     assert len(_completion_rows(client.root["blocks"])) == 1
+    if escaped_emoji:
+        # 실제 Slack 조회처럼 이모지 표현이 바뀌어도 완료 기록은 동일하다.
+        client.root = json.loads(
+            json.dumps(client.root, ensure_ascii=False).replace(
+                "✅", ":white_check_mark:",
+            )
+        )
 
     # 프로세스가 바뀐 뒤 오래된 클릭 payload가 와도 최신 root의 기존
     # status를 읽으면 같은 blocks를 다시 쓰지 않고 성공으로 끝낸다.

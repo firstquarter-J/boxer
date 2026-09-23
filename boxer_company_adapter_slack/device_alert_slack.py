@@ -71,6 +71,7 @@ _ALERT_ACTION_BLOCK_ID_PATTERN = re.compile(
 _MARK_DONE_CARD_STATE_LIMIT = 4_096
 _MARK_DONE_MESSAGE_LOCK_STRIPES = 64
 _MARK_DONE_STATUS_PREFIX = "✅ *확인 완료*"
+_MARK_DONE_TIME_PREFIX = "🕒 *처리 시간*"
 _CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
     "recording_processing": "녹화 파일 처리 확인 필요",
@@ -198,15 +199,26 @@ class _DeviceAlertMarkDoneCoordinator:
                     message_ts,
                 )
                 return False
-            if updated_blocks == source_blocks:
-                # 최신 root에 이미 같은 카드의 완료 field가 있으면 replay는
-                # Slack mutation 없이 성공으로 끝낸다.
+            # 단일 이상 알림의 제목을 바꿀 때 미리보기도 함께 갱신한다.
+            # 별도 점검 요약처럼 제목을 유지하는 메시지는 원문을 보존한다.
+            updated_text = root_text
+            if updated_blocks[0]["text"] != source_blocks[0]["text"]:
+                _, separator, body = root_text.partition("\n")
+                updated_text = (
+                    f"*{updated_blocks[0]['text']['text']}*{separator}{body}"
+                )
+            if updated_blocks == source_blocks and (
+                _normalize_status_emoji(updated_text)
+                == _normalize_status_emoji(root_text)
+            ):
+                # 최신 root에 같은 완료 상태가 있으면 replay는 Slack
+                # mutation 없이 성공으로 끝낸다.
                 return True
             try:
                 client.chat_update(
                     channel=channel_id,
                     ts=message_ts,
-                    text=root_text,
+                    text=updated_text,
                     blocks=updated_blocks,
                 )
             except Exception as exc:
@@ -1075,6 +1087,15 @@ def _mark_done_time_text(completed_at: datetime) -> str:
     return completed_at.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
 
 
+def _normalize_status_emoji(text: str) -> str:
+    # Slack이 이모지를 :name: 형식으로 돌려줘도 같은 상태로 판정해
+    # 완료 문구가 중복되거나 replay가 불필요한 갱신을 만들지 않게 한다.
+    return (
+        text.replace(":white_check_mark:", "✅")
+        .replace(":clock3:", "🕒")
+    )
+
+
 def _mark_done_blocks(
     blocks: list[dict[str, Any]],
     *,
@@ -1106,9 +1127,17 @@ def _mark_done_blocks(
     if len(matches) != 1:
         return None
     matched_index = matches[0]
-    if matched_index <= 0:
+    if matched_index < 3:
         return None
+    raw_identity_block = blocks[matched_index - 3]
     raw_contact_block = blocks[matched_index - 1]
+    if (
+        not isinstance(raw_identity_block, Mapping)
+        or raw_identity_block.get("type") != "section"
+        or not isinstance(raw_identity_block.get("text"), Mapping)
+        or not isinstance(raw_identity_block["text"].get("text"), str)
+    ):
+        return None
     if not isinstance(raw_contact_block, Mapping) or raw_contact_block.get(
         "type"
     ) != "section":
@@ -1119,6 +1148,7 @@ def _mark_done_blocks(
 
     updated_blocks = deepcopy(blocks)
     action_block = updated_blocks[matched_index]
+    identity_block = updated_blocks[matched_index - 3]
     contact_block = updated_blocks[matched_index - 1]
     if not isinstance(action_block, dict) or not isinstance(contact_block, dict):
         return None
@@ -1127,11 +1157,7 @@ def _mark_done_blocks(
     if not isinstance(elements, list) or not isinstance(fields, list):
         return None
 
-    status_exists = any(
-        isinstance(field, Mapping)
-        and _text(field.get("text"), "").startswith(_MARK_DONE_STATUS_PREFIX)
-        for field in fields
-    )
+    status_text = _mark_done_card_status(identity_block, contact_block)
     mark_done_indexes = [
         index
         for index, element in enumerate(elements)
@@ -1140,37 +1166,106 @@ def _mark_done_blocks(
         and _raw_action_value(element.get("value")) == clicked_value
     ]
     if len(mark_done_indexes) > 1 or (
-        not mark_done_indexes and not status_exists
+        not mark_done_indexes and not status_text
     ):
         return None
 
-    # 같은 actions block의 문자·음성 버튼은 유지하고 완료 버튼 하나만
-    # 제거한다. 전화·문자 아래에 담당자와 시간을 2열 field로 맞춰 기존
-    # 카드 문법을 유지하면서 메시지 block 수도 늘리지 않는다.
+    # 완료 기록은 API의 최초 receipt를 쓰고, 문자·음성은 보조 동작으로
+    # 남긴다. 기존 section 안에서 담당자·시간을 상세 정보 위로 올린다.
     if mark_done_indexes:
         del elements[mark_done_indexes[0]]
     if not elements:
         return None
-    if not status_exists:
-        fields.extend(
-            (
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"{_MARK_DONE_STATUS_PREFIX}\n"
-                        f"담당자 <@{actor_user_id}>"
-                    ),
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "🕒 *처리 시간*\n"
-                        f"`{_mark_done_time_text(completed_at)}`"
-                    ),
-                },
-            )
+    if not status_text:
+        status_text = (
+            f"{_MARK_DONE_STATUS_PREFIX}\n담당자 <@{actor_user_id}> · "
+            f"`{_mark_done_time_text(completed_at)}`"
         )
+    _promote_mark_done_status(identity_block, contact_block, elements, status_text)
+    if not _refresh_mark_done_header(updated_blocks):
+        return None
     return updated_blocks
+
+
+def _mark_done_card_status(
+    identity_block: Mapping[str, Any],
+    contact_block: Mapping[str, Any],
+) -> str:
+    text = identity_block.get("text", {}).get("text", "")
+    if _normalize_status_emoji(text).startswith(_MARK_DONE_STATUS_PREFIX):
+        return text.split("\n\n", 1)[0]
+    # 같은 block identity로 이미 완료된 구형 카드도 최초 담당자·시간을
+    # 읽어 새 상단 표시로 옮긴다. 재클릭한 사람으로 덮어쓰지 않는다.
+    fields = contact_block.get("fields", [])
+    status = next(
+        (
+            field["text"] for field in fields
+            if isinstance(field, Mapping)
+            and _normalize_status_emoji(str(field.get("text", ""))).startswith(
+                _MARK_DONE_STATUS_PREFIX
+            )
+        ),
+        "",
+    )
+    time = next(
+        (
+            field["text"] for field in fields
+            if isinstance(field, Mapping)
+            and _normalize_status_emoji(str(field.get("text", ""))).startswith(
+                _MARK_DONE_TIME_PREFIX
+            )
+        ),
+        "",
+    )
+    if status and time:
+        completed_at = time.partition("\n")[2]
+        return f"{status} · {completed_at}"
+    return ""
+
+
+def _promote_mark_done_status(
+    identity_block: dict[str, Any],
+    contact_block: dict[str, Any],
+    elements: list[dict[str, Any]],
+    status_text: str,
+) -> None:
+    # 병원·장비·감지 내용은 유지하고 완료 정보만 식별 영역 맨 위로 옮긴다.
+    text = identity_block["text"]["text"]
+    if not _normalize_status_emoji(text).startswith(_MARK_DONE_STATUS_PREFIX):
+        identity_block["text"]["text"] = f"{status_text}\n\n{text}"
+    contact_block["fields"] = [
+        field for field in contact_block["fields"]
+        if not _normalize_status_emoji(str(field.get("text", ""))).startswith(
+            (_MARK_DONE_STATUS_PREFIX, _MARK_DONE_TIME_PREFIX)
+        )
+    ]
+    for element in elements:
+        element.pop("style", None)
+
+
+def _refresh_mark_done_header(blocks: list[dict[str, Any]]) -> bool:
+    if not blocks or blocks[0].get("type") != "header":
+        return False
+    header = blocks[0].get("text")
+    if not isinstance(header, dict) or not isinstance(header.get("text"), str):
+        return False
+
+    # notification 이상 알림은 한 메시지에 한 카드다. 같은 renderer를
+    # 쓰는 별도 점검 요약에는 메시지 전체의 완료 상태를 새로 도입하지 않는다.
+    if sum(block.get("type") == "actions" for block in blocks) != 1:
+        return True
+
+    current_title = _normalize_status_emoji(header["text"])
+    title = (
+        current_title.removeprefix(":alert: ")
+        .removeprefix("✅ 확인 완료 · ")
+        .removesuffix(" 확인 필요")
+        .removesuffix(" 감지")
+    )
+    updated_title = f"✅ 확인 완료 · {title}"
+    if updated_title != current_title:
+        header["text"] = updated_title
+    return True
 
 
 def _send_remote_sms(
