@@ -1,6 +1,7 @@
 """요청형 주별 추이와 연속 감소를 recordings의 단일 read-only 집계로 계산한다."""
 
 from datetime import UTC, datetime
+from itertools import pairwise
 from typing import Any
 
 from boxer_company import weekly_recordings_report as report
@@ -84,6 +85,17 @@ def build_recordings_trend_report(
     minimum = 1 if options.minimum_drop is None else options.minimum_drop
     percent = 0 if options.drop_percent is None else options.drop_percent
     complete_weeks = [week for week in weeks if week["complete"]]
+    # 감소 필터와 별개로 모든 병원·병실의 두 지표를 분석해 증가·유지도 보존한다.
+    streaks = {
+        metric: {
+            group: _consecutive_declines(
+                complete_weeks, group=group, metric=metric,
+                required=1, minimum=minimum, percent=percent,
+            )
+            for group in ("hospitals", "rooms")
+        }
+        for metric in ("totalCount", "newBarcodeCount")
+    }
     return {
         "startDate": query.start.isoformat(), "endDate": query.end.isoformat(),
         "totalCount": sum(week["totalCount"] for week in weeks), "weeks": weeks,
@@ -91,15 +103,58 @@ def build_recordings_trend_report(
         "declineWeeks": query.decline_weeks, "minimumDrop": minimum, "dropPercent": percent,
         "declines": {
             metric: {
-                group: _consecutive_declines(
-                    complete_weeks, group=group, metric=metric,
-                    required=query.decline_weeks or 1, minimum=minimum, percent=percent,
-                )
+                group: [row for row in streaks[metric][group] if row["streak"] >= (query.decline_weeks or 1)]
+                for group in ("hospitals", "rooms")
+            }
+            for metric in ("totalCount", "newBarcodeCount")
+        },
+        "entityTrends": {
+            metric: {
+                group: _entity_trends(weeks, group=group, metric=metric, streaks=streaks[metric][group])
                 for group in ("hospitals", "rooms")
             }
             for metric in ("totalCount", "newBarcodeCount")
         },
     }
+
+
+def _entity_trends(
+    weeks: list[dict[str, Any]], *, group: str, metric: str, streaks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """불변 ID로 주별 수량을 연결하고 부분 주를 제외한 변화만 분석한다."""
+
+    labels = {key: row["name"] for week in weeks for key, row in week[group].items()}
+    streak_by_key = {row["key"]: row["streak"] for row in streaks}
+    result = []
+    for key, name in labels.items():
+        counts = [week[group].get(key, {}).get(metric, 0) for week in weeks]
+        complete = [count for week, count in zip(weeks, counts, strict=True) if week["complete"]]
+        comparable = len(complete) >= 2
+        changes = [right - left for left, right in pairwise(complete)]
+        if not comparable:
+            direction = "비교 불가"
+        elif all(change > 0 for change in changes):
+            direction = "계속 증가"
+        elif all(change < 0 for change in changes):
+            direction = "계속 감소"
+        elif all(change == 0 for change in changes):
+            direction = "유지"
+        elif all(change >= 0 for change in changes):
+            direction = "증가·보합"
+        elif all(change <= 0 for change in changes):
+            direction = "감소·보합"
+        else:
+            direction = "증감 혼재"
+        result.append({
+            "key": key, "name": name, "counts": counts, "direction": direction,
+            "netDelta": complete[-1] - complete[0] if comparable else None,
+            "netRate": report._weekly_recordings_report_change_rate(complete[-1], complete[0]) if comparable else None,
+            "latestDelta": complete[-1] - complete[-2] if comparable else None,
+            "latestRate": report._weekly_recordings_report_change_rate(complete[-1], complete[-2]) if comparable else None,
+            "declineStreak": streak_by_key.get(key, 0),
+        })
+    # 증가·감소를 모두 포함해 첫 완료 주 대비 변화량이 큰 대상부터 보여준다.
+    return sorted(result, key=lambda row: (-abs(row["netDelta"] or 0), -sum(row["counts"]), row["name"], str(row["key"])))
 
 
 def _consecutive_declines(
@@ -122,7 +177,7 @@ def _consecutive_declines(
         if streak >= required:
             first = counts[-streak - 1]
             result.append({
-                "name": name, "streak": streak, "counts": counts[-streak - 1:],
+                "key": key, "name": name, "streak": streak, "counts": counts[-streak - 1:],
                 "startDate": weeks[-streak - 1]["startDate"], "endDate": weeks[-1]["endDate"],
                 "delta": counts[-1] - first,
                 "changeRate": report._weekly_recordings_report_change_rate(counts[-1], first),

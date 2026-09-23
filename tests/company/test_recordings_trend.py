@@ -1,6 +1,7 @@
 """기간 해석부터 실제 집계 SQL, 인증 API와 Slack mock까지 추이 계약을 검증한다."""
 
 import logging
+from copy import deepcopy
 from datetime import UTC, date, datetime
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from boxer_company import weekly_recordings_report as report
+from boxer_company.assistant.contracts import AssistantMessage, CompanyAssistantResult
 from boxer_company.assistant.factory import create_company_assistant_runtime
 from boxer_company.assistant.operational_read_routes import (
     WeeklyRecordingsSummaryAssistantRoute,
@@ -22,6 +24,7 @@ from boxer_company.recordings_trend_query import (
 )
 from boxer_company.recordings_trend_report import (
     _consecutive_declines,
+    _entity_trends,
     build_recordings_trend_report,
 )
 from boxer_company_adapter_slack.assistant_bridge import render_company_assistant_result
@@ -29,6 +32,7 @@ from boxer_company_adapter_slack.company_api_rollout import (
     CompanyWeeklySummaryApiRolloutService,
 )
 from boxer_company_api.app import create_company_api_app
+from boxer_company_api.schemas import serialize_result
 from boxer_company_api.settings import CompanyApiCallerSettings, CompanyApiSettings
 from tests.company import test_recordings_period_report as period_tests
 
@@ -202,6 +206,7 @@ def test_authenticated_api_and_slack_use_same_trend_contract(recordings_db):
     assert response.status_code == 200, response.text
     assert response.json()["route"] == "weekly_recordings_summary"
     assert response.json()["outcome"] == "answered" and not response.json()["usedLlm"]
+    assert len(response.json()["messages"]) == 4
     assert "**대상 병원** A병원" in result.messages[0].body
     assert "연속 감소" in result.messages[1].body
     api, next_service = Mock(), Mock()
@@ -214,4 +219,142 @@ def test_authenticated_api_and_slack_use_same_trend_contract(recordings_db):
     next_service.answer.assert_not_called()
     reply = Mock()
     assert render_company_assistant_result(result, reply=reply, actor_id="U1", client=None,
-                                          logger=logging.getLogger(__name__)) == 2
+                                          logger=logging.getLogger(__name__)) == 4
+
+
+@pytest.fixture
+def breakdown_summary():
+    # 녹화 유지/신규 감소, 녹화 증가, 신규 0개, 동명 병원·병실을 한 조회에 담는다.
+    series = [
+        (1, 11, "동명병원", "1병실", [60, 60, 60, 60], [30, 20, 10, 0]),
+        (1, 12, "동명병원", "2병실", [40, 40, 40, 40], [10, 10, 10, 10]),
+        (2, 21, "동명병원", "1병실", [10, 20, 30, 40], [2, 4, 6, 8]),
+        (3, 31, "감소병원", "1병실", [40, 30, 20, 10], [0, 0, 0, 0]),
+    ]
+    rows = [
+        {"periodIndex": index, "hospitalSeq": hospital, "hospitalRoomSeq": room,
+         "hospitalName": name, "roomName": room_name, "rowCount": count,
+         "newBarcodeCount": new_counts[index]}
+        for hospital, room, name, room_name, counts, new_counts in series
+        for index, count in enumerate(counts)
+    ]
+    connection = Mock()
+    cursor = Mock()
+    connection.cursor.return_value.__enter__ = Mock(return_value=cursor)
+    connection.cursor.return_value.__exit__ = Mock(return_value=False)
+    cursor.fetchall.return_value = rows
+    with patch.object(report, "_create_db_connection", return_value=connection):
+        summary = build_recordings_trend_report(
+            parse_recordings_trend_query("최근 4주 녹화 추이", now=NOW),
+            now=NOW, options=RecordingsReportOptions(),
+        )
+    cursor.execute.assert_called_once()
+    connection.close.assert_called_once()
+    return summary
+
+
+def test_all_four_metrics_have_independent_entity_series(breakdown_summary):
+    trends = breakdown_summary["entityTrends"]
+    hospital_recordings = {row["key"]: row for row in trends["totalCount"]["hospitals"]}
+    hospital_new = {row["key"]: row for row in trends["newBarcodeCount"]["hospitals"]}
+    room_recordings = {row["key"]: row for row in trends["totalCount"]["rooms"]}
+    room_new = {row["key"]: row for row in trends["newBarcodeCount"]["rooms"]}
+    assert hospital_recordings[1]["counts"] == [100, 100, 100, 100]
+    assert hospital_recordings[1]["direction"] == "유지"
+    assert hospital_recordings[2]["direction"] == "계속 증가"
+    assert hospital_new[1]["counts"] == [40, 30, 20, 10]
+    assert hospital_new[1]["netRate"] == -75 and hospital_new[1]["declineStreak"] == 3
+    assert room_recordings[(1, 11)]["direction"] == "유지"
+    assert room_new[(1, 11)]["counts"] == [30, 20, 10, 0]
+    assert room_new[(1, 12)]["direction"] == "유지"
+    assert room_new[(2, 21)]["counts"] == [2, 4, 6, 8]
+    assert room_new[(3, 31)]["counts"] == [0, 0, 0, 0]
+    assert room_new[(1, 11)]["latestDelta"] == -10
+    assert room_new[(1, 11)]["latestRate"] == -100
+
+
+def test_format_has_four_sections_with_increasing_and_unchanged_entities(breakdown_summary):
+    bodies = format_recordings_trend(breakdown_summary, now=NOW)
+    assert [body.splitlines()[0] for body in bodies] == [
+        "**① 병원별 녹화 추이**", "**② 병원별 신규 바코드 추이**",
+        "**③ 병실별 녹화 추이**", "**④ 병실별 신규 바코드 추이**",
+    ]
+    assert "100건 → 100건 → 100건 → 100건" in bodies[0]
+    assert "40개 → 30개 → 20개 → 10개" in bodies[1]
+    assert "60건 → 60건 → 60건 → 60건" in bodies[2]
+    assert "30개 → 20개 → 10개 → 0개" in bodies[3]
+    assert "**계속 증가**" in bodies[0] and "**유지**" in bodies[0]
+    assert "병원 #1 · 병실 #11" in bodies[3] and "병원 #2 · 병실 #21" in bodies[3]
+    assert "최근 전주 대비 `-10개` (`-100.0%`)" in bodies[3]
+    assert "첫 완료 주 대비 `-30개` (`-100.0%`)" in bodies[3]
+
+
+def test_decline_filter_is_independent_for_each_of_four_metrics(breakdown_summary):
+    breakdown_summary["declineWeeks"] = 2
+    bodies = format_recordings_trend(breakdown_summary, now=NOW)
+    assert "**감소병원**" in bodies[0] and "**동명병원**" not in bodies[0]
+    assert "**동명병원**" in bodies[1] and "**감소병원**" not in bodies[1]
+    assert "병원 #3 · 병실 #31" in bodies[2] and "병원 #1 · 병실 #11" not in bodies[2]
+    assert "병원 #1 · 병실 #11" in bodies[3] and "병원 #3 · 병실 #31" not in bodies[3]
+    assert "**분석 대상 주별 합계** `40개 → 30개 → 20개 → 10개`" in bodies[1]
+
+
+def test_entity_series_fill_zero_and_keep_unassigned_out_of_rooms(recordings_db):
+    summary = build_recordings_trend_report(
+        parse_recordings_trend_query("최근 4주 녹화 추이", now=NOW), now=NOW,
+        options=RecordingsReportOptions(),
+    )
+    rooms = {row["key"]: row for row in summary["entityTrends"]["totalCount"]["rooms"]}
+    assert rooms[(1, 12)]["counts"] == [6, 0, 0, 0]
+    assert rooms[(1, 12)]["declineStreak"] == 0  # 감소 이후의 0건 유지는 연속 감소가 아니다.
+    assert rooms[(1, 12)]["direction"] == "감소·보합"
+    bodies = format_recordings_trend(summary, now=NOW)
+    assert "병원·병실 미지정 주별 수량: `0건 → 1건 → 0건 → 0건`" in bodies[2]
+    assert "병원·병실 미지정 주별 수량: `0개 → 1개 → 0개 → 0개`" in bodies[3]
+    assert len(recordings_db) == 1
+
+
+def test_partial_counts_do_not_turn_an_increase_into_a_decline():
+    # 부분 주 수량이 작아도 완료된 두 주의 증가와 증감률은 바뀌지 않아야 한다.
+    weeks = [
+        {"complete": complete, "hospitals": {1: {"name": "A병원", "totalCount": count}}}
+        for count, complete in ((1, False), (10, True), (20, True), (2, False))
+    ]
+    row = _entity_trends(weeks, group="hospitals", metric="totalCount", streaks=[])[0]
+    assert row["counts"] == [1, 10, 20, 2]
+    assert row["direction"] == "계속 증가"
+    assert row["netDelta"] == row["latestDelta"] == 10
+    assert row["netRate"] == row["latestRate"] == 100
+
+
+def test_partial_weeks_display_counts_without_changing_entity_analysis(recordings_db):
+    summary = build_recordings_trend_report(
+        parse_recordings_trend_query("8월부터 지금까지 녹화 추이", now=NOW), now=NOW,
+        options=RecordingsReportOptions(),
+    )
+    bodies = format_recordings_trend(summary, now=NOW)
+    assert all("2026-08-01~2026-08-02` (부분 주/진행 중)" in body for body in bodies)
+    assert all("2026-09-21~2026-09-23` (부분 주/진행 중)" in body for body in bodies)
+    assert all("**최근 전주 비교** `2026-09-07 ~ 2026-09-13` → `2026-09-14 ~ 2026-09-20`" in body for body in bodies)
+
+
+def test_large_response_preserves_all_four_sections_through_api(breakdown_summary):
+    # 병실 수가 많아도 API의 8개 메시지 제한 때문에 마지막 지표 전체가 사라지면 안 된다.
+    breakdown_summary["hospitalNames"] = ["긴 이름 " * 30 for _ in range(200)]
+    for groups in breakdown_summary["entityTrends"].values():
+        for group, rows in groups.items():
+            example = rows[0]
+            groups[group] = [dict(deepcopy(example), name=f"대상 {i}병원 · 1병실") for i in range(1000)]
+    bodies = format_recordings_trend(breakdown_summary, now=NOW)
+    result = CompanyAssistantResult(
+        route="weekly_recordings_summary", outcome="answered",
+        messages=tuple(AssistantMessage(body=body, format="commonmark") for body in bodies),
+    )
+    payload = serialize_result(result, "large-trend")
+    serialized = "\n".join(message["body"] for message in payload["messages"])
+    assert len(payload["messages"]) == 8
+    assert "...(truncated)" not in serialized
+    assert all(body.splitlines()[0] in serialized for body in bodies)
+    assert all("1,000곳 중" in body and "응답 길이 제한" in body for body in bodies)
+    assert all("선택한 200개 병원" in body for body in bodies)
+    assert "④ 병실별 신규 바코드 추이" in serialized
