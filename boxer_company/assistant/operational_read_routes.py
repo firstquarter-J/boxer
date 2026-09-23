@@ -15,6 +15,7 @@ from boxer_company.assistant.contracts import (
 from boxer_company.assistant.recordings_report_format import (
     format_recordings_report_sections,
 )
+from boxer_company.assistant.recordings_trend_format import format_recordings_trend
 from boxer_company.assistant.scope_guard import (
     build_scope_mismatch_result,
 )
@@ -32,6 +33,12 @@ from boxer_company.recordings_report_options import (
     RecordingsReportOptionsError,
     parse_recordings_report_options,
 )
+from boxer_company.recordings_trend_query import (
+    has_recordings_trend_intent,
+    parse_recordings_trend_query,
+    strip_trend_periods,
+)
+from boxer_company.recordings_trend_report import build_recordings_trend_report
 from boxer_company.weekly_recordings_report import (
     _build_weekly_recordings_report_summary,
     _coerce_weekly_recordings_report_now,
@@ -57,9 +64,11 @@ class WeeklyRecordingsSummaryAssistantRoute:
         except AssistantRequestScopeMismatch as mismatch:
             return build_scope_mismatch_result(mismatch)
 
+        is_trend = has_recordings_trend_intent(request.question)
         try:
-            date_range = _extract_recordings_report_date_range(request.question)
-            target_date = None if date_range else _extract_weekly_target_date(request.question)
+            # 추이의 열린 기간·연속 감소 횟수는 기존 단일 주 날짜 파서에 넘기지 않는다.
+            date_range = None if is_trend else _extract_recordings_report_date_range(request.question)
+            target_date = None if date_range or is_trend else _extract_weekly_target_date(request.question)
         except ValueError as exc:
             if not _is_weekly_recordings_report_request(
                 request.question,
@@ -82,20 +91,28 @@ class WeeklyRecordingsSummaryAssistantRoute:
             # 기존 Slack helper처럼 한 시각을 집계와 formatter에 함께 넘겨
             # 주간 경계와 표시 시각이 요청 도중 갈리지 않게 한다.
             local_now = _coerce_weekly_recordings_report_now()
-            summary = _build_weekly_recordings_report_summary(
-                target_date=target_date,
-                now=local_now,
-                include_new_barcodes=True,
-                options=parse_recordings_report_options(request.question),
-                **({"start_date": date_range[0], "end_date": date_range[1]} if date_range else {}),
-            )
-            if "newBarcodes" in summary:
-                bodies = format_recordings_report_sections(summary, now=local_now)
+            if is_trend:
+                query = parse_recordings_trend_query(request.question, now=local_now)
+                summary = build_recordings_trend_report(
+                    query, now=local_now,
+                    options=parse_recordings_report_options(strip_trend_periods(request.question)),
+                )
+                bodies = format_recordings_trend(summary, now=local_now)
             else:
-                # 구 summary를 주입하는 호출도 기존 응답 형식으로 처리한다.
-                bodies = (slack_mrkdwn_to_commonmark(
-                    _format_weekly_recordings_report(summary, now=local_now)
-                ),)
+                summary = _build_weekly_recordings_report_summary(
+                    target_date=target_date,
+                    now=local_now,
+                    include_new_barcodes=True,
+                    options=parse_recordings_report_options(request.question),
+                    **({"start_date": date_range[0], "end_date": date_range[1]} if date_range else {}),
+                )
+                if "newBarcodes" in summary:
+                    bodies = format_recordings_report_sections(summary, now=local_now)
+                else:
+                    # 구 summary를 주입하는 호출도 기존 응답 형식으로 처리한다.
+                    bodies = (slack_mrkdwn_to_commonmark(
+                        _format_weekly_recordings_report(summary, now=local_now)
+                    ),)
         except RecordingsReportOptionsError as exc:
             # 잘못된 조건이나 모호한 병원명을 전체 병원·기본 조건 조회로 바꾸지 않는다.
             return _result(

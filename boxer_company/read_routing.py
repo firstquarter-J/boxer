@@ -15,6 +15,10 @@ from zoneinfo import ZoneInfo
 
 from boxer_company import settings as cs
 from boxer_company.recordings_report_options import has_recordings_report_options
+from boxer_company.recordings_trend_query import (
+    has_recordings_trend_intent,
+    is_bare_recordings_trend_request,
+)
 from boxer_company._operation_routing_common import (
     AssistantRequestScopeMismatch,
     _COMPACT_MMDD_PATTERN,
@@ -1047,16 +1051,27 @@ def _is_weekly_recordings_report_request(
     )
     # 기간과 조회 조건만 적은 요청도 같은 리포트로 처리한다.
     has_options = has_recordings_report_options(text)
+    # 기간+추이와 연속 감소는 지정 기간 합계와 별개로 주별 분석에 연결한다.
+    has_trend = has_recordings_trend_intent(text)
+    if has_trend and not has_media_hint and re.search(r"매출|방문|예약|환자|가입|유저", text):
+        return False
+    trend_request = has_trend and (
+        has_media_hint or is_bare_recordings_trend_request(text)
+        or bool(re.search(r"병원|진료실|병실", text))
+    )
     if not (
         bare_range
+        or trend_request
         or (has_options and (has_range_hint or has_week_hint))
         or (has_media_hint and has_summary_hint and (has_week_hint or has_range_hint))
     ):
         return False
     if "바코드" in text and not has_new_barcode_hint:
         return False
+    # 감소 대상 목록은 집계 결과이며 개별 영상 목록과 구별한다.
+    exclusion_text = re.sub(r"목록|리스트", "", text) if trend_request else text
     has_excluded_hint = any(
-        token in text
+        token in exclusion_text
         for token in (
             "목록",
             "리스트",

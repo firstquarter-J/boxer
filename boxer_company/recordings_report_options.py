@@ -42,7 +42,8 @@ _HOSPITAL_LABEL = r"(?:대상\s*병원|병원\s*제한|병원명|병원)"
 _NATURAL_HOSPITAL = re.compile(
     r"(?<![^\s,，])([^\s,:，]+?(?:병원|의원)(?:\([^)]*\))?)(?:만)?(?=\s|$|[,，])"
 )
-_REPORT_WORDS = r"(?:녹화|신규\s*바코드|초음파|영상|요약|리포트|현황|보고|집계|통계)"
+# 병원 필드 뒤에 붙인 분석 요청을 병원명 일부로 해석하지 않는다.
+_REPORT_WORDS = r"(?:녹화|신규\s*바코드|초음파|영상|요약|리포트|현황|보고|집계|통계|추이|추세|주간|주별|데이터|조회)"
 _HOSPITAL_FIELD = re.compile(
     rf"{_HOSPITAL_LABEL}\s*[:：=]\s*(.*?)"
     rf"(?=[\s,;]*(?:{_RATE_LABEL}|{_COUNT_LABEL})|\s+{_REPORT_WORDS}|\n|$|"
