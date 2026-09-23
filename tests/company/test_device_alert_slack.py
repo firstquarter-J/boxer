@@ -206,7 +206,7 @@ def _completion_rows(blocks: object) -> list[str]:
         if not isinstance(block, dict) or block.get("type") != "section":
             continue
         text = block.get("text", {}).get("text", "")
-        if text.startswith("✅ *확인 완료*"):
+        if text.startswith(("✅ *확인 완료*", "담당자 <@")):
             rows.append(text.split("\n\n", 1)[0])
     return rows
 
@@ -401,7 +401,7 @@ def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
         alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
     }
     assert _completion_rows(updated_blocks) == [
-        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
+        "담당자 <@U1> · `2026-08-31 09:07:12 KST`",
     ]
     assert updated_blocks[0]["text"]["text"] == "✅ 확인 완료 · LED 연결"
     updated_text = client.chat_update.call_args.kwargs["text"]
@@ -478,9 +478,11 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
     blocks = client.root["blocks"]
     assert blocks[0]["text"]["text"] == "✅ 확인 완료 · 녹화 영상 이상"
     assert blocks[1]["text"]["text"] == (
-        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
+        "담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
         "*#1 테스트병원*"
     )
+    # 사용자가 보는 카드 전체에서 완료 문구는 제목에 딱 한 번만 나온다.
+    assert json.dumps(blocks, ensure_ascii=False).count("확인 완료") == 1
     assert blocks[1]["fields"] == message["blocks"][1]["fields"]
     assert "12345678901" in json.dumps(blocks[1], ensure_ascii=False)
     assert blocks[2:4] == message["blocks"][2:4]
@@ -492,7 +494,10 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
     client.chat_postMessage.assert_not_called()
 
 
-def test_mark_done_promotes_existing_footer_and_keeps_original_receipt() -> None:
+@pytest.mark.parametrize("previous_layout", ["footer", "duplicate_heading"])
+def test_mark_done_updates_existing_layout_and_keeps_original_receipt(
+    previous_layout: str,
+) -> None:
     app = _App()
     bridge = Mock()
     bridge.mark_done.return_value = _mark_done_result(
@@ -507,12 +512,21 @@ def test_mark_done_promotes_existing_footer_and_keeps_original_receipt() -> None
     message = _rendered_message(_item())
     stale_body = _rendered_action_body(message, device="MB2-TEST1", actor_id="U2")
     client = _StatefulSlackClient(message)
-    # 이전 배포가 남긴 하단 완료 표시를 재현한다. 오래된 payload가
-    # 재전달돼도 최초 담당자와 시간을 그대로 옮겨야 한다.
-    client.root["blocks"][3]["fields"].extend([
-        {"type": "mrkdwn", "text": "✅ *확인 완료*\n담당자 <@U1>"},
-        {"type": "mrkdwn", "text": "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`"},
-    ])
+    # 하단 표시와 제목·본문 중복 표시를 모두 지원하면서 최초 기록을 보존한다.
+    if previous_layout == "footer":
+        client.root["blocks"][3]["fields"].extend([
+            {"type": "mrkdwn", "text": "✅ *확인 완료*\n담당자 <@U1>"},
+            {"type": "mrkdwn", "text": "🕒 *처리 시간*\n`2026-08-31 09:07:12 KST`"},
+        ])
+    else:
+        client.root["blocks"][0]["text"]["text"] = "✅ 확인 완료 · LED 연결"
+        client.root["blocks"][1]["text"]["text"] = (
+            "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
+            "*#1 테스트병원*"
+        )
+        client.root["text"] = (
+            "*✅ 확인 완료 · LED 연결*\n" + message["text"].split("\n", 1)[1]
+        )
     client.root["blocks"][4]["elements"] = [
         element for element in client.root["blocks"][4]["elements"]
         if element["action_id"] != DEVICE_HEALTH_ALERT_MARK_DONE_ACTION
@@ -522,8 +536,9 @@ def test_mark_done_promotes_existing_footer_and_keeps_original_receipt() -> None
 
     blocks = client.root["blocks"]
     assert _completion_rows(blocks) == [
-        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
+        "담당자 <@U1> · `2026-08-31 09:07:12 KST`",
     ]
+    assert json.dumps(blocks, ensure_ascii=False).count("확인 완료") == 1
     assert blocks[0]["text"]["text"] == "✅ 확인 완료 · LED 연결"
     assert blocks[3]["fields"] == message["blocks"][3]["fields"]
     assert all("style" not in element for element in blocks[4]["elements"])
@@ -770,7 +785,7 @@ def test_mark_done_recovers_ui_after_slack_update_failure_without_new_reply() ->
     assert client.conversations_replies.call_count == 2
     assert client.chat_update.call_count == 2
     assert _completion_rows(client.chat_update.call_args.kwargs["blocks"]) == [
-        "✅ *확인 완료*\n담당자 <@U1> · `2026-08-31 09:07:12 KST`",
+        "담당자 <@U1> · `2026-08-31 09:07:12 KST`",
     ]
     # API 완료 댓글은 만들지 않고 첫 Slack 갱신 실패 경고만 한 번 남긴다.
     assert [

@@ -71,6 +71,7 @@ _ALERT_ACTION_BLOCK_ID_PATTERN = re.compile(
 _MARK_DONE_CARD_STATE_LIMIT = 4_096
 _MARK_DONE_MESSAGE_LOCK_STRIPES = 64
 _MARK_DONE_STATUS_PREFIX = "✅ *확인 완료*"
+_MARK_DONE_RECEIPT_PREFIX = "담당자 <@"
 _MARK_DONE_TIME_PREFIX = "🕒 *처리 시간*"
 _CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
@@ -1178,10 +1179,20 @@ def _mark_done_blocks(
         return None
     if not status_text:
         status_text = (
-            f"{_MARK_DONE_STATUS_PREFIX}\n담당자 <@{actor_user_id}> · "
+            f"담당자 <@{actor_user_id}> · "
             f"`{_mark_done_time_text(completed_at)}`"
         )
-    _promote_mark_done_status(identity_block, contact_block, elements, status_text)
+    _promote_mark_done_status(
+        identity_block,
+        contact_block,
+        elements,
+        status_text,
+        # 단일 알림은 제목에서 완료를 표시하므로 본문에는 담당자·시간만
+        # 남긴다. 별도 점검 요약은 기존 카드별 완료 표시를 유지한다.
+        include_status_label=(
+            sum(block.get("type") == "actions" for block in updated_blocks) != 1
+        ),
+    )
     if not _refresh_mark_done_header(updated_blocks):
         return None
     return updated_blocks
@@ -1193,6 +1204,9 @@ def _mark_done_card_status(
 ) -> str:
     text = identity_block.get("text", {}).get("text", "")
     if _normalize_status_emoji(text).startswith(_MARK_DONE_STATUS_PREFIX):
+        # 앞선 배포의 중복 제목은 버리고 최초 담당자·시간만 복원한다.
+        return text.partition("\n")[2].split("\n\n", 1)[0]
+    if text.startswith(_MARK_DONE_RECEIPT_PREFIX):
         return text.split("\n\n", 1)[0]
     # 같은 block identity로 이미 완료된 구형 카드도 최초 담당자·시간을
     # 읽어 새 상단 표시로 옮긴다. 재클릭한 사람으로 덮어쓰지 않는다.
@@ -1218,8 +1232,9 @@ def _mark_done_card_status(
         "",
     )
     if status and time:
+        actor = status.partition("\n")[2]
         completed_at = time.partition("\n")[2]
-        return f"{status} · {completed_at}"
+        return f"{actor} · {completed_at}"
     return ""
 
 
@@ -1228,11 +1243,22 @@ def _promote_mark_done_status(
     contact_block: dict[str, Any],
     elements: list[dict[str, Any]],
     status_text: str,
+    *,
+    include_status_label: bool,
 ) -> None:
     # 병원·장비·감지 내용은 유지하고 완료 정보만 식별 영역 맨 위로 옮긴다.
     text = identity_block["text"]["text"]
-    if not _normalize_status_emoji(text).startswith(_MARK_DONE_STATUS_PREFIX):
-        identity_block["text"]["text"] = f"{status_text}\n\n{text}"
+    if _normalize_status_emoji(text).startswith(
+        (_MARK_DONE_STATUS_PREFIX, _MARK_DONE_RECEIPT_PREFIX)
+    ):
+        text = text.partition("\n\n")[2]
+    if include_status_label:
+        status_text = f"{_MARK_DONE_STATUS_PREFIX}\n{status_text}"
+    updated_text = f"{status_text}\n\n{text}"
+    if _normalize_status_emoji(updated_text) != _normalize_status_emoji(
+        identity_block["text"]["text"]
+    ):
+        identity_block["text"]["text"] = updated_text
     contact_block["fields"] = [
         field for field in contact_block["fields"]
         if not _normalize_status_emoji(str(field.get("text", ""))).startswith(
