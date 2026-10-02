@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import json
 import logging
 import re
 import threading
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.slack_response import SlackResponse
 
 from boxer_company_adapter_slack.automation_api_client import (
     CompanyAutomationApiClient,
@@ -21,7 +24,6 @@ from boxer_company_adapter_slack.automation_reporter import (
     remember_automation_thread_receipt,
 )
 
-
 _KST = ZoneInfo("Asia/Seoul")
 _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
 _DAILY_DEVICE_ROUND_THREAD_LOCK = threading.Lock()
@@ -32,6 +34,85 @@ _DAILY_TRANSPORT_CYCLE_KEY_PATTERN = re.compile(
 )
 _SLACK_TRANSPORT_CHANNEL_ID_PATTERN = re.compile(
     r"^[CGD][A-Z0-9]{5,31}$"
+)
+# 공식 chat.postMessage 오류표만 허용해 snake_case 형태의 민감 원문도
+# 진단 코드로 오인하지 않는다: https://docs.slack.dev/reference/methods/chat.postMessage/
+_SLACK_POST_MESSAGE_ERROR_CODES = frozenset(
+    {
+        "access_denied",
+        "accesslimited",
+        "account_inactive",
+        "agent_prompt_display_not_allowed",
+        "app_access_restricted",
+        "as_user_not_supported",
+        "attachment_payload_limit_exceeded",
+        "cannot_reply_to_message",
+        "channel_not_found",
+        "deprecated_endpoint",
+        "draft_already_deleted",
+        "draft_already_sent",
+        "draft_has_conflict",
+        "draft_not_found",
+        "duplicate_channel_not_found",
+        "duplicate_message_not_found",
+        "ekm_access_denied",
+        "enterprise_is_restricted",
+        "fatal_error",
+        "internal_error",
+        "invalid_arg_name",
+        "invalid_arguments",
+        "invalid_array_arg",
+        "invalid_auth",
+        "invalid_blocks",
+        "invalid_blocks_format",
+        "invalid_charset",
+        "invalid_form_data",
+        "invalid_metadata_format",
+        "invalid_metadata_schema",
+        "invalid_post_type",
+        "is_archived",
+        "markdown_text_conflict",
+        "message_limit_exceeded",
+        "messages_tab_disabled",
+        "metadata_must_be_sent_from_app",
+        "metadata_too_large",
+        "method_deprecated",
+        "missing_file_data",
+        "missing_post_type",
+        "missing_scope",
+        "msg_blocks_too_long",
+        "no_permission",
+        "no_text",
+        "not_allowed_token_type",
+        "not_authed",
+        "not_in_channel",
+        "org_login_required",
+        "rate_limited",
+        "ratelimited",
+        "request_timeout",
+        "restricted_action",
+        "restricted_action_non_threadable_channel",
+        "restricted_action_read_only_channel",
+        "restricted_action_thread_locked",
+        "restricted_action_thread_only_channel",
+        "send_on_behalf_not_allowed",
+        "service_unavailable",
+        "slack_connect_canvas_sharing_blocked",
+        "slack_connect_file_link_sharing_blocked",
+        "slack_connect_lists_sharing_blocked",
+        "team_access_not_granted",
+        "team_added_to_org",
+        "team_not_found",
+        "token_expired",
+        "token_revoked",
+        "too_many_attachments",
+        "too_many_contact_cards",
+        "two_factor_setup_required",
+    }
+)
+_SLACK_REQUEST_ID_PATTERN = re.compile(
+    r"(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})"
 )
 
 
@@ -378,11 +459,75 @@ def _daily_device_round_loop(
                 automation_client=automation_client,
             )
         except Exception as exc:
-            logger.warning(
-                "Daily device round transport failed error_type=%s",
-                type(exc).__name__,
-            )
+            if isinstance(exc, SlackApiError):
+                # Slack 거부 원인은 정형 식별자만 남긴다. 예외 문자열에는
+                # 응답 원문이 들어 있으므로 본문·메시지·헤더 전체는 기록하지 않는다.
+                try:
+                    error_code, status_code, request_id = (
+                        _daily_device_round_slack_error_metadata(exc)
+                    )
+                except Exception:  # noqa: BLE001
+                    # 진단 필드가 비정상이어도 transport poll은 계속 유지한다.
+                    error_code, status_code, request_id = "unknown", "none", "none"
+                logger.warning(
+                    "Daily device round transport failed error_type=%s "
+                    "slack_error_code=%s status_code=%s slack_request_id=%s",
+                    type(exc).__name__,
+                    error_code,
+                    status_code,
+                    request_id,
+                )
+            else:
+                logger.warning(
+                    "Daily device round transport failed error_type=%s",
+                    type(exc).__name__,
+                )
         threading.Event().wait(30)
+
+
+def _daily_device_round_slack_error_metadata(
+    exc: SlackApiError,
+) -> tuple[str, int | str, str]:
+    """SDK 응답에서 길이와 형식이 확인된 진단 식별자 세 개만 추출한다."""
+
+    response = exc.response
+    if not isinstance(response, SlackResponse):
+        return "unknown", "none", "none"
+
+    # 입력을 문자열로 강제 변환하지 않아 임의 객체·민감 원문이 로그로
+    # 확장되지 않게 하고, HTTP 상태와 request ID도 허용된 형식만 사용한다.
+    data = response.data
+    error_code = data.get("error") if isinstance(data, dict) else None
+    safe_error_code = (
+        error_code
+        if type(error_code) is str
+        and error_code in _SLACK_POST_MESSAGE_ERROR_CODES
+        else "unknown"
+    )
+    status_code = response.status_code
+    safe_status_code = (
+        status_code
+        if type(status_code) is int and 100 <= status_code <= 599
+        else "none"
+    )
+    headers = response.headers
+    request_ids = (
+        [
+            value
+            for key, value in headers.items()
+            if type(key) is str and key.lower() == "x-slack-req-id"
+        ]
+        if isinstance(headers, dict)
+        else []
+    )
+    request_id = request_ids[0] if len(request_ids) == 1 else None
+    safe_request_id = (
+        request_id
+        if type(request_id) is str
+        and _SLACK_REQUEST_ID_PATTERN.fullmatch(request_id)
+        else "none"
+    )
+    return safe_error_code, safe_status_code, safe_request_id
 
 
 def attach_daily_device_round_reporter(
