@@ -71,6 +71,7 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
                 "boxer[db,s3]>=0.1.0",
                 "cryptography>=43,<49",
                 "google-auth>=2.38,<3",
+                "openpyxl>=3.1.5,<4",
                 "paramiko==3.5.1",
                 "redis==5.0.8",
                 "requests==2.32.3",
@@ -240,6 +241,8 @@ import boxer_company_adapter_slack.company
 
 assert "boxer_company.read_routing" in sys.modules
 for prefix in (
+    "openpyxl",
+    "boxer_company.recordings_trend_excel",
     "pymysql",
     "boto3",
     "botocore",

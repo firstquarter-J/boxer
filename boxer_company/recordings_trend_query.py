@@ -27,10 +27,20 @@ def has_recordings_trend_intent(question: str) -> bool:
     return bool(re.search(r"추이|추세|트렌드|trend", question, re.IGNORECASE) or _DECLINE.search(question))
 
 
+def strip_recordings_export_words(question: str) -> str:
+    """엑셀에 붙은 다운로드 표현만 제거하고 영상·장비 다운로드는 그대로 둔다."""
+
+    return re.sub(
+        r"(?:엑셀|\bexcel\b|\bxlsx\b)(?:\s*파일)?(?:로|도|을|를)?"
+        r"(?:\s*(?:다운로드|download|내보내기|저장|출력|첨부))?(?:\s*해\s*줘)?",
+        "", question, flags=re.IGNORECASE,
+    )
+
+
 def is_bare_recordings_trend_request(question: str) -> bool:
     """지표를 생략한 기간+추이 요청만 허용해 다른 도메인의 추이를 선점하지 않는다."""
 
-    text = re.sub(r"<@[A-Z0-9]+>", "", question).replace("`", "")
+    text = re.sub(r"<@[A-Z0-9]+>", "", strip_recordings_export_words(question)).replace("`", "")
     text = _RANGE.sub("", text)
     text = _RECENT.sub("", text)
     text = _DECLINE.sub("", text)
@@ -42,7 +52,7 @@ def is_bare_recordings_trend_request(question: str) -> bool:
 def strip_trend_periods(question: str) -> str:
     """병원 필드 뒤 기간이 병원명으로 붙지 않도록 해석한 시간 표현만 제거한다."""
 
-    text = _DECLINE.sub("", _RECENT.sub("", _RANGE.sub("", question)))
+    text = _DECLINE.sub("", _RECENT.sub("", _RANGE.sub("", strip_recordings_export_words(question))))
     return re.sub(r"이번\s*달|지난\s*달|이번\s*주|지난\s*주", "", text)
 
 

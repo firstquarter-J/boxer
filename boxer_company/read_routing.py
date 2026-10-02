@@ -18,6 +18,7 @@ from boxer_company.recordings_report_options import has_recordings_report_option
 from boxer_company.recordings_trend_query import (
     has_recordings_trend_intent,
     is_bare_recordings_trend_request,
+    strip_recordings_export_words,
 )
 from boxer_company._operation_routing_common import (
     AssistantRequestScopeMismatch,
@@ -999,6 +1000,9 @@ def _is_weekly_recordings_report_request(
     if barcode:
         return False
     text = re.sub(r"<@[A-Z0-9]+>", "", question or "").replace("`", "").strip()
+    if has_recordings_trend_intent(text):
+        # 보고서 엑셀 다운로드를 장비 영상 다운로드 제외어와 구분한다.
+        text = strip_recordings_export_words(text)
     if not text:
         return False
     lowered = text.lower()

@@ -24,6 +24,12 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
+from boxer_company.assistant.file_contracts import (
+    MAX_REPORT_BASE64_CHARS,
+    MAX_REPORT_FILE_BYTES,
+    XLSX_MEDIA_TYPE,
+    serialize_report_files,
+)
 
 
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$"
@@ -1217,6 +1223,17 @@ class DeviceOperationDeliveryOutput(_StrictInputModel):
     delivery: DeviceOperationDeliveryManifestInput
 
 
+class AssistantFileOutput(_StrictInputModel):
+    """요청자에게만 전달할 단일 엑셀 파일이며 URL·로컬 경로를 받지 않는다."""
+
+    filename: str = Field(pattern=r"^recordings-trend-\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}\.xlsx$")
+    mediaType: Literal["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] = XLSX_MEDIA_TYPE
+    deliveryScope: Literal["requester"]
+    sizeBytes: int = Field(ge=4, le=MAX_REPORT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    contentBase64: str = Field(min_length=8, max_length=MAX_REPORT_BASE64_CHARS, repr=False)
+
+
 class AssistantTurnOutput(BaseModel):
     requestId: str = Field(min_length=1, max_length=128)
     route: str = Field(min_length=1, max_length=256)
@@ -1236,6 +1253,7 @@ class AssistantTurnOutput(BaseModel):
     )
     usedLlm: bool
     fallbackReason: str | None = Field(default=None, max_length=256)
+    files: list[AssistantFileOutput] = Field(default_factory=list, max_length=1)
     operationResult: (
         DeviceFileDownloadDeliveryOutput
         | DeviceOperationDeliveryOutput
@@ -1337,6 +1355,8 @@ def serialize_result(
         sources=sources,
         usedLlm=result.used_llm,
         fallbackReason=result.fallback_reason,
+        files=[AssistantFileOutput.model_validate(file)
+               for file in serialize_report_files(result.files, route=result.route)],
         operationResult=_serialize_operation_result(
             result.operation_result
         ),
@@ -1469,13 +1489,15 @@ def _dump_turn_output(payload: AssistantTurnOutput) -> dict[str, Any]:
     if serialized.get("operationResult") is None:
         # 기존 read-only client에는 action 전용 확장 키를 내보내지 않는다.
         serialized.pop("operationResult", None)
+    if not serialized.get("files"):
+        serialized.pop("files", None)
     return serialized
 
 
 def _fit_response_byte_budget(
     payload: AssistantTurnOutput,
 ) -> AssistantTurnOutput:
-    """UTF-8 JSON 본문이 client의 1MiB 상한을 넘지 않게 줄인다."""
+    """파일과 독립된 UTF-8 JSON 본문의 기존 1MiB 예산을 유지한다."""
 
     messages = list(payload.messages)
     fitted = payload
@@ -1539,7 +1561,8 @@ def _without_truncated_marker(body: str) -> str:
 def _serialized_response_size(payload: AssistantTurnOutput) -> int:
     return len(
         json.dumps(
-            payload.model_dump(mode="json"),
+            # 파일은 4MiB 별도 상한이며 첨부 때문에 뒤쪽 분석 항목을 생략하지 않는다.
+            payload.model_dump(mode="json", exclude={"files"}),
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),

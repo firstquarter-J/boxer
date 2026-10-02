@@ -127,6 +127,8 @@ class CompanyAssistantServiceTests(unittest.TestCase):
                 "used_llm",
                 "fallback_reason",
                 "operation_result",
+                # 파일은 Slack 채널 정보 없는 requester 전용 DTO다.
+                "files",
             ],
         )
 

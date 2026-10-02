@@ -24,6 +24,10 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantResult,
     SourceReference,
 )
+from boxer_company.assistant.file_contracts import (
+    MAX_FILE_RESPONSE_BYTES,
+    deserialize_report_files,
+)
 
 
 _REQUEST_ID_PATTERN = re.compile(
@@ -2287,6 +2291,7 @@ def _load_json_object(
     response: Any,
     *,
     expected_media_type: str,
+    maximum_bytes: int = _MAX_RESPONSE_BYTES,
 ) -> dict[str, Any]:
     content_type = _response_media_type(response)
     if content_type != expected_media_type:
@@ -2294,7 +2299,7 @@ def _load_json_object(
             "company_api_response_content_type_invalid"
         )
     content = getattr(response, "content", b"")
-    if isinstance(content, (bytes, bytearray)) and len(content) > _MAX_RESPONSE_BYTES:
+    if isinstance(content, (bytes, bytearray)) and len(content) > maximum_bytes:
         raise CompanyApiContractError(
             "company_api_response_too_large"
         )
@@ -2346,7 +2351,11 @@ def _deserialize_result(
     payload = _load_json_object(
         response,
         expected_media_type="application/json",
+        maximum_bytes=MAX_FILE_RESPONSE_BYTES,
     )
+    # 파일이 없는 기존 응답은 계속 1MiB로 제한한다.
+    if "files" not in payload and len(getattr(response, "content", b"")) > _MAX_RESPONSE_BYTES:
+        raise CompanyApiContractError("company_api_response_too_large", request_id=request_id)
     return _deserialize_result_payload(payload, request_id)
 
 
@@ -2355,7 +2364,7 @@ def _deserialize_result_payload(
     request_id: str,
 ) -> CompanyAssistantResult:
     if (
-        frozenset(payload)
+        frozenset(payload) - {"files"}
         not in {_TURN_KEYS, _TURN_WITH_OPERATION_RESULT_KEYS}
         or payload.get("requestId") != request_id
         or not _safe_text(payload.get("route"), maximum=256)
@@ -2394,6 +2403,15 @@ def _deserialize_result_payload(
         if "operationResult" in payload
         else None
     )
+    try:
+        files = deserialize_report_files(payload["files"], route=payload["route"]) if "files" in payload else ()
+    except ValueError as exc:
+        raise CompanyApiContractError("company_api_report_file_invalid", request_id=request_id) from exc
+    if files:
+        # base64가 있어도 본문·출처는 기존 예산을 넘길 수 없다.
+        body_payload = {key: value for key, value in payload.items() if key != "files"}
+        if len(json.dumps(body_payload, ensure_ascii=False, separators=(",", ":")).encode()) > _MAX_RESPONSE_BYTES:
+            raise CompanyApiContractError("company_api_response_too_large", request_id=request_id)
     return CompanyAssistantResult(
         route=payload["route"],
         outcome=payload["outcome"],
@@ -2402,6 +2420,7 @@ def _deserialize_result_payload(
         used_llm=payload["usedLlm"],
         fallback_reason=payload["fallbackReason"],
         operation_result=operation_result,
+        files=files,
     )
 
 

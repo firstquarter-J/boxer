@@ -56,6 +56,16 @@ class AssistantMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class AssistantFile:
+    """API가 생성한 보고서 파일을 요청자에게 전달하는 메모리 전용 DTO다."""
+
+    filename: str
+    content: bytes = field(repr=False)
+    media_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    delivery_scope: Literal["requester"] = "requester"
+
+
+@dataclass(frozen=True, slots=True)
 class CompanyAssistantResult:
     route: str
     outcome: AssistantOutcome
@@ -66,10 +76,12 @@ class CompanyAssistantResult:
     # 실행 receipt는 대화 본문에 섞지 않고 adapter의 후속 추적 저장에만 쓴다.
     # transport는 route별 고정 schema로 다시 검증해야 한다.
     operation_result: Mapping[str, Any] | None = None
+    files: tuple[AssistantFile, ...] = field(default_factory=tuple)
 
 
 __all__ = [
     "AssistantChannel",
+    "AssistantFile",
     "AssistantLink",
     "AssistantMessage",
     "AssistantOutcome",

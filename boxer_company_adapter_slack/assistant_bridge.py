@@ -14,6 +14,7 @@ from boxer_company.assistant.contracts import (
     SourceReference,
 )
 from boxer_company.assistant.commonmark import transform_outside_code
+from boxer_company.assistant.file_contracts import validate_report_file
 from boxer_company.assistant.request_log_contract import (
     legacy_company_request_log_route_name,
 )
@@ -119,7 +120,41 @@ def render_company_assistant_result(
             reply(text, mention_user=False)
         conversation_message_index += 1
         sent_count += 1
+    if result.files:
+        # 공개 채널에는 결과만 남기고 파일은 인증된 요청자의 DM에만 업로드한다.
+        delivered = _send_report_file_dm(result, client=client, actor_id=actor_id, logger=logger)
+        notice = ("전체 분석 결과 엑셀 파일을 DM으로 보냈어. 첨부 파일에서 다운로드할 수 있어."
+                  if delivered else "분석 결과는 조회했지만 엑셀 파일을 DM으로 보내지 못했어. 파일 전송 권한과 DM 설정을 확인해줘.")
+        reply(notice, mention_user=False)
+        sent_count += 1
+        if delivered:
+            sent_count += 1
     return sent_count
+
+
+def _send_report_file_dm(
+    result: CompanyAssistantResult, *, client: Any | None, actor_id: str | None, logger: logging.Logger,
+) -> bool:
+    if client is None or not actor_id or result.route != "weekly_recordings_summary" or len(result.files) != 1:
+        return False
+    try:
+        file = result.files[0]
+        validate_report_file(file)
+        response = client.conversations_open(users=[actor_id])
+        dm_channel = str(((response or {}).get("channel") or {}).get("id") or "")
+        if not re.fullmatch(r"D[A-Z0-9]+", dm_channel):
+            return False
+        # API가 만든 bytes만 전달하며 서버 파일 경로·외부 URL은 열지 않는다.
+        uploaded = client.files_upload_v2(
+            channel=dm_channel, file=file.content, filename=file.filename,
+            title="녹화·신규 바코드 추이 분석",
+            initial_comment="조회 조건에 맞는 전체 분석 결과야. 조회 조건과 네 분석 항목을 시트별로 담았어.",
+        )
+        return bool(uploaded and uploaded.get("ok") is True)
+    except Exception as exc:  # noqa: BLE001 - 전송 실패는 본문 응답을 보존한 채 안내한다.
+        # 업로드 실패를 공개 업로드나 자동 재발송으로 우회하지 않는다.
+        logger.warning("Report file DM failed error_type=%s", type(exc).__name__)
+        return False
 
 
 def render_device_file_download_delivery(

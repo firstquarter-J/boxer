@@ -7,6 +7,7 @@ import pymysql
 
 from boxer_company.assistant.commonmark import slack_mrkdwn_to_commonmark
 from boxer_company.assistant.contracts import (
+    AssistantFile,
     AssistantMessage,
     AssistantOutcome,
     CompanyAssistantRequest,
@@ -32,6 +33,10 @@ from boxer_company.read_routing import (
 from boxer_company.recordings_report_options import (
     RecordingsReportOptionsError,
     parse_recordings_report_options,
+)
+from boxer_company.recordings_trend_excel import (
+    ReportFileTooLargeError,
+    build_recordings_trend_excel,
 )
 from boxer_company.recordings_trend_query import (
     has_recordings_trend_intent,
@@ -155,10 +160,23 @@ class WeeklyRecordingsSummaryAssistantRoute:
             or int(summary.get("previousTotalCount") or 0) > 0
             or bool(summary.get("roomDropRows"))
         )
+        files: tuple[AssistantFile, ...] = ()
+        if is_trend:
+            # 표시용 목록을 재조회하거나 잘라서 내보내지 않고 동일 집계의 전체 행을 사용한다.
+            try:
+                files = (build_recordings_trend_excel(summary, now=local_now),)
+            except Exception as exc:  # noqa: BLE001 - 파일 생성 실패가 성공한 DB 분석을 없애지 않도록 격리한다.
+                self._logger.warning("Recordings trend export failed request_id=%s error_type=%s",
+                                     request.request_id, type(exc).__name__)
+                notice = ("엑셀 파일 크기 제한을 넘었어. 병원이나 기간을 좁혀서 다시 요청해줘."
+                          if isinstance(exc, ReportFileTooLargeError)
+                          else "엑셀 파일을 생성하지 못했어. 분석 결과는 아래에서 확인하고 파일은 다시 요청해줘.")
+                bodies = (notice + "\n\n" + bodies[0], *bodies[1:])
         return _result(
             outcome="answered" if has_evidence else "no_evidence",
             bodies=bodies,
             fallback_reason=None if has_evidence else "recordings_not_found",
+            files=files,
         )
 
 
@@ -181,6 +199,7 @@ def _result(
     body: str = "",
     bodies: tuple[str, ...] = (),
     fallback_reason: str | None = None,
+    files: tuple[AssistantFile, ...] = (),
 ) -> CompanyAssistantResult:
     return CompanyAssistantResult(
         route=WEEKLY_RECORDINGS_SUMMARY_ROUTE,
@@ -194,6 +213,7 @@ def _result(
             for message_body in (bodies or (body,))
         ),
         fallback_reason=fallback_reason,
+        files=files,
     )
 
 

@@ -203,10 +203,14 @@ def test_authenticated_api_and_slack_use_same_trend_contract(recordings_db):
                                headers={"Authorization": f"Bearer {token}", "X-Request-ID": "trend-http"})
         result = WeeklyRecordingsSummaryAssistantRoute().handle(request(question))
     assert denied.status_code == 401
+    assert "files" not in denied.json()
     assert response.status_code == 200, response.text
     assert response.json()["route"] == "weekly_recordings_summary"
     assert response.json()["outcome"] == "answered" and not response.json()["usedLlm"]
     assert len(response.json()["messages"]) == 4
+    # 인증된 API 응답에만 동일 조회 결과를 담은 requester 전용 엑셀을 붙인다.
+    assert response.json()["files"][0]["deliveryScope"] == "requester"
+    assert response.json()["files"][0]["filename"].endswith(".xlsx")
     assert "**대상 병원** A병원" in result.messages[0].body
     assert "연속 감소" in result.messages[1].body
     api, next_service = Mock(), Mock()
@@ -219,7 +223,7 @@ def test_authenticated_api_and_slack_use_same_trend_contract(recordings_db):
     next_service.answer.assert_not_called()
     reply = Mock()
     assert render_company_assistant_result(result, reply=reply, actor_id="U1", client=None,
-                                          logger=logging.getLogger(__name__)) == 4
+                                          logger=logging.getLogger(__name__)) == 5
 
 
 @pytest.fixture

@@ -378,6 +378,14 @@ def is_device_file_download_delivery_receipt(
 
 
 def _is_missing_barcode_device_download_request(question: str) -> bool:
+    from boxer_company.recordings_trend_query import (
+        has_recordings_trend_intent,
+        strip_recordings_export_words,
+    )
+
+    # 추이 엑셀 내보내기는 DB 보고서 경로가 소유하며 장비 다운로드로 선점하지 않는다.
+    if has_recordings_trend_intent(question):
+        question = strip_recordings_export_words(question)
     if _single_explicit_barcode(question) is not None:
         return False
     if not _should_download_device_files(question):

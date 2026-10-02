@@ -19,6 +19,8 @@ runtime = [
   "boxer[db,s3]>=0.1.0",
   "cryptography>=43,<49",
   "google-auth>=2.38,<3",
+  # 추이 엑셀 생성은 API runtime에만 설치하고 Slack은 완성된 파일을 전달한다.
+  "openpyxl>=3.1.5,<4",
   "paramiko==3.5.1",
   "redis==5.0.8",
   "requests==2.32.3",

@@ -2,6 +2,7 @@ from importlib import import_module
 from typing import Any
 
 from boxer_company.assistant.contracts import (
+    AssistantFile,
     AssistantLink,
     AssistantMessage,
     CompanyAssistantRequest,
@@ -159,6 +160,7 @@ def __getattr__(name: str) -> Any:
     return value
 
 __all__ = [
+    "AssistantFile",
     "AssistantLink",
     "AssistantMessage",
     "BarcodeEvidenceFreeformAssistantRoute",
