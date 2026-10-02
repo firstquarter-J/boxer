@@ -27,8 +27,10 @@ from boxer_company_adapter_slack.automation_reporter import (
 _KST = ZoneInfo("Asia/Seoul")
 _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
 _DAILY_DEVICE_ROUND_THREAD_LOCK = threading.Lock()
-_DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 40
-_DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE = 12_000
+# Slack의 전체 block 길이 거절을 피하기 위한 보수적인 transport 예산이다.
+# SDK는 한글·emoji를 ASCII escape하므로 화면 글자 수로 크기를 계산하지 않는다.
+_DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE = 12
+_DAILY_DEVICE_ROUND_MAX_BLOCK_BYTES_PER_MESSAGE = 8_000
 _DAILY_TRANSPORT_CYCLE_KEY_PATTERN = re.compile(
     r"^daily:(\d{4}-\d{2}-\d{2})$"
 )
@@ -138,23 +140,27 @@ def _coerce_int(value: Any) -> int | None:
 def _split_daily_device_round_blocks(
     blocks: list[dict[str, Any]],
 ) -> list[list[dict[str, Any]]]:
-    """Slack block 수와 직렬화 크기를 동시에 제한한다."""
+    """block을 보존하면서 SDK 직렬화 크기와 block 수로 나눈다."""
 
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
-    current_size = 0
+    current_size = 2  # blocks 배열의 여는·닫는 괄호도 전송 예산에 포함한다.
     for block in blocks:
-        block_size = len(json.dumps(block, ensure_ascii=False))
+        block_size = len(json.dumps(block, ensure_ascii=True).encode("utf-8"))
+        if block_size + 2 > _DAILY_DEVICE_ROUND_MAX_BLOCK_BYTES_PER_MESSAGE:
+            # API presentation을 잘라 버리거나 일부만 전송하지 않는다. 단일
+            # block도 예산을 넘으면 보고서 전체를 전송 전에 거절한다.
+            raise RuntimeError("일일 장비 순회 단일 블록이 메시지 크기 제한을 넘었어")
+        next_size = current_size + block_size + (2 if current else 0)
         if current and (
             len(current) >= _DAILY_DEVICE_ROUND_MAX_BLOCKS_PER_MESSAGE
-            or current_size + block_size
-            > _DAILY_DEVICE_ROUND_MAX_BLOCK_CHARS_PER_MESSAGE
+            or next_size > _DAILY_DEVICE_ROUND_MAX_BLOCK_BYTES_PER_MESSAGE
         ):
             chunks.append(current)
             current = []
-            current_size = 0
+            current_size = 2
         current.append(block)
-        current_size += block_size
+        current_size += block_size + (2 if len(current) > 1 else 0)
     if current:
         chunks.append(current)
     return chunks or [[]]
@@ -163,12 +169,45 @@ def _split_daily_device_round_blocks(
 def _build_daily_device_round_chunk_text(
     base_text: str,
     *,
+    blocks: list[dict[str, Any]],
     chunk_index: int,
     chunk_count: int,
 ) -> str:
     if chunk_count <= 1:
         return base_text
-    return f"{base_text} | 계속 {chunk_index + 1}/{chunk_count}"
+    # 알림·screen reader용 text도 해당 조각의 API presentation만 담는다.
+    # 전체 fallback을 매번 반복하면 분할해도 요청 크기가 계속 커진다.
+    chunk_text = "\n\n".join(
+        text
+        for block in blocks
+        if (text := _daily_device_round_block_fallback_text(block))
+    )
+    return f"{chunk_text}\n\n계속 {chunk_index + 1}/{chunk_count}"
+
+
+def _daily_device_round_block_fallback_text(block: dict[str, Any]) -> str:
+    """API가 만든 block의 text만 읽어 원래 순서대로 fallback에 담는다."""
+
+    parts: list[str] = []
+    text = block.get("text")
+    if isinstance(text, str):
+        parts.append(text)
+    elif isinstance(text, dict):
+        parts.append(_daily_device_round_block_fallback_text(text))
+    for key in ("elements", "fields"):
+        children = block.get(key)
+        if isinstance(children, list):
+            # rich_text_section 안의 text 조각은 한 문장이다. list/context의
+            # 각 항목은 줄을 나눠 표시하되 block 내용 자체는 바꾸지 않는다.
+            separator = "" if block.get("type") == "rich_text_section" else "\n"
+            parts.append(
+                separator.join(
+                    _daily_device_round_block_fallback_text(child)
+                    for child in children
+                    if isinstance(child, dict)
+                )
+            )
+    return "\n".join(part for part in parts if part)
 
 
 def _build_daily_device_round_window_title_text(
@@ -265,6 +304,12 @@ def _run_daily_device_round_transport(
         _validate_daily_device_round_transport_batch(batch)
     )
     delivery = batch.deliveries[0]
+    # 분할 가능한 보고서인지 먼저 확인해 유효하지 않은 presentation 때문에
+    # 제목만 새로 발송되거나 전체 delivery가 완료로 기록되지 않게 한다.
+    message_text = _build_daily_device_round_report_text(report_summary)
+    block_chunks = _split_daily_device_round_blocks(
+        _build_remote_daily_device_round_blocks(report_summary)
+    )
     thread_ts = load_automation_thread_receipt(
         cycle=batch.cycle,
         cycle_key=batch.cycle_key,
@@ -296,17 +341,18 @@ def _run_daily_device_round_transport(
             channel_id=batch.channel_id,
             root_message_id=thread_ts,
         )
+        # Slack의 같은 채널 초당 1건 기준에 맞춰 제목 직후 본문도 간격을 둔다.
+        threading.Event().wait(1)
 
-    message_text = _build_daily_device_round_report_text(report_summary)
-    block_chunks = _split_daily_device_round_blocks(
-        _build_remote_daily_device_round_blocks(report_summary)
-    )
     last_message_ts = ""
     for index, block_chunk in enumerate(block_chunks):
+        if index:
+            threading.Event().wait(1)
         response = client.chat_postMessage(
             channel=batch.channel_id,
             text=_build_daily_device_round_chunk_text(
                 message_text,
+                blocks=block_chunk,
                 chunk_index=index,
                 chunk_count=len(block_chunks),
             ),
@@ -318,7 +364,13 @@ def _run_daily_device_round_transport(
                 cycle=batch.cycle,
                 cycle_key=batch.cycle_key,
                 delivery_id=delivery.delivery_id,
-                part=f"chunk:{index}",
+                # 새 분할 정책은 이전 전체 보고서와 다른 payload다. 새 정책
+                # 안에서는 재시도해도 같은 조각에 같은 ID를 사용한다.
+                part=(
+                    f"chunk:v2:{index}"
+                    if len(block_chunks) > 1
+                    else f"chunk:{index}"
+                ),
             ),
         )
         last_message_ts = (
