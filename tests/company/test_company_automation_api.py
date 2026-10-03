@@ -6,7 +6,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -902,6 +902,9 @@ def test_health_seed_schema_is_validated_before_pending_delivery_replay(
     external_calls: list[str] = []
     deps = DeviceHealthMonitorCycleDeps(
         load_devices=lambda: external_calls.append("load_devices") or [],
+        load_current_devices=lambda names: (
+            external_calls.append("load_current_devices") or []
+        ),
     )
     handler = DeviceHealthMonitorCycleHandler(deps=deps)
     store = JsonAutomationCycleStateStore(tmp_path / "automation.json")
@@ -964,6 +967,106 @@ def test_health_seed_schema_is_validated_before_pending_delivery_replay(
 
     assert external_calls == []
     assert store.load(state_key)["pendingDeliveries"] == [pending]
+
+
+def test_health_pending_replay_and_ack_do_not_recheck_current_device_eligibility(
+    tmp_path: Path,
+) -> None:
+    external_calls: list[str] = []
+    deps = DeviceHealthMonitorCycleDeps(
+        load_devices=lambda: pytest.fail("pending 재전달에서 discovery를 실행했어"),
+        load_current_devices=lambda names: pytest.fail(
+            "pending/ACK에서 현재 대상을 재검증했어"
+        ),
+        append_sheet_alerts=lambda items, detected_at, permalink: (
+            external_calls.append("sheet") or 1
+        ),
+        write_event=lambda event_type, now, payload: True,
+        start_event_archive=lambda now, logger: False,
+    )
+    store = JsonAutomationCycleStateStore(tmp_path / "health-pending.json")
+    trigger = AutomationCycleTrigger(
+        request_id="cycle:health:pending-replay",
+        tenant_id="T1",
+        cycle="device_health_monitor",
+        cycle_key="continuous",
+        scheduled_at=_NOW,
+    )
+    cursor = build_clean_device_health_monitor_cursor(
+        alert_delivery_enabled=True,
+        seeded_at=_NOW,
+    )
+    pending = {
+        "deliveryId": "device_health_monitor:already-created",
+        "kind": "device_health_alert",
+        "payload": {"alert": {"device": "MB2-X00001", "hospitalName": "개발실"}},
+    }
+    # 이미 SMS/발송 준비가 끝난 delivery는 DB 이름 변경으로 자동 취소하지 않는다.
+    cursor["pendingSheetAlerts"] = {
+        pending["deliveryId"]: {
+            "detectedAt": _NOW.isoformat(),
+            "item": {
+                "hospitalSeq": "20",
+                "hospitalName": "개발실",
+                "hospital": "#20 개발실",
+                "room": "1진료실",
+                "device": "MB2-X00001",
+                "issue": "LED USB 장치를 찾지 못했어",
+                "problemComponents": ["LED"],
+                "alertCategory": "led",
+            },
+        }
+    }
+    state_key = _state_key(trigger)
+    _replace_cycle_state(
+        store,
+        state_key,
+        {
+            "cursor": cursor,
+            "pendingDeliveries": [pending],
+            "domainCycleComplete": False,
+            "cycleCompleted": False,
+        },
+    )
+    coordinator = DurableAutomationCycleCoordinator(
+        AutomationCycleService((DeviceHealthMonitorCycleHandler(deps=deps),)),
+        store,
+        clock=lambda: _NOW,
+    )
+
+    replay = coordinator.run(trigger)
+    assert replay.deliveries[0].delivery_id == pending["deliveryId"]
+    assert replay.deliveries[0].payload == pending["payload"]
+    assert store.load(state_key)["pendingDeliveries"] == [pending]
+    assert external_calls == []
+
+    ack_trigger = replace(
+        trigger,
+        request_id="cycle:health:pending-ack",
+        ack_only=True,
+        delivery_receipts=(
+            AutomationDeliveryReceipt(
+                delivery_id=pending["deliveryId"],
+                status="sent",
+                external_message_id="1790956916.353909",
+                permalink="https://example.slack.com/archives/C1/p1790956916353909",
+                delivered_at=_NOW,
+            ),
+        ),
+    )
+    acknowledged = coordinator.run(ack_trigger)
+    duplicate = coordinator.run(
+        replace(ack_trigger, request_id="cycle:health:pending-ack-again")
+    )
+
+    assert acknowledged.deliveries == duplicate.deliveries == ()
+    assert external_calls == ["sheet"]
+    state = store.load(state_key)
+    assert state["pendingDeliveries"] == []
+    assert state["acknowledgedDeliveryIds"] == [pending["deliveryId"]]
+    assert state["cursor"]["pendingSheetAlerts"] == {}
+    assert "inFlight" not in state
+    assert "ackInFlight" not in state
 
 
 def test_daily_admission_uses_slack_window_key_and_runtime_options() -> None:

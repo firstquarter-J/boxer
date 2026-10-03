@@ -120,6 +120,9 @@ class DeviceHealthMonitorCycleDeps:
     load_devices: Callable[[], list[dict[str, Any]]] = (
         lambda: _load_device_health_monitor_devices()
     )
+    load_current_devices: Callable[
+        [Sequence[str]], list[dict[str, Any]]
+    ] = lambda names: _load_device_health_monitor_devices(device_names=names)
     load_redis_snapshot: Callable[
         [Sequence[str]], Mapping[str, Mapping[str, Any]]
     ] = lambda names: _load_device_health_monitor_redis_snapshot(names)
@@ -305,8 +308,8 @@ def run_device_health_monitor_cycle(
     )
 
     try:
-        # legacy monitor와 같이 장비 목록은 TTL 동안 DB를 다시
-        # 읽지 않고, 갱신 실패 시 기존 cache로 순회를 계속한다.
+        # 전체 대상 탐색은 TTL cache를 사용하고, 실제 LED 이상 후보의
+        # 현재 소속·제외 여부는 SSH와 알림 전에 별도로 확인한다.
         devices, cache_state = _load_device_candidates_cached(
             state,
             now=local_now,
@@ -348,12 +351,32 @@ def run_device_health_monitor_cycle(
             checked_device_count=0,
         )
 
+    try:
+        # 병원명 변경과 장비 해제를 24시간 cache가 가리지 않도록 한다.
+        # 확인 실패 시 stale 대상에 SSH·문자·새 Slack 알림을 실행하지 않는다.
+        monitor_devices = _refresh_led_candidate_devices(
+            devices,
+            redis_snapshot,
+            now=local_now,
+            load_current_devices=actual_deps.load_current_devices,
+        )
+    except Exception as exc:  # noqa: BLE001 - 조회 오류는 marker를 남기지 않고 다음 poll에서 복구한다.
+        return _unavailable_cycle_run(
+            now=local_now,
+            state=state,
+            reason="device_eligibility_unavailable",
+            error_type=type(exc).__name__,
+            error_detail=type(exc).__name__,
+            deps=actual_deps,
+            logger=actual_logger,
+        )
+
     device_results: list[dict[str, Any]] = []
     verification_error_count = 0
     ssh_verified_count = 0
     ssh_records = dict(state.get("sshTunnelRecords") or {})
     abnormal_candidate_count = 0
-    for device in devices:
+    for device in monitor_devices:
         device_name = _text(device.get("deviceName"))
         redis_result, requires_ssh = _result_from_redis(
             device,
@@ -504,7 +527,7 @@ def run_device_health_monitor_cycle(
         status_counts=status_counts,
         state=state,
         now=local_now,
-        checked_device_count=len(devices),
+        checked_device_count=len(monitor_devices),
         abnormal_candidate_count=abnormal_candidate_count,
         ssh_verified_candidate_count=ssh_verified_count,
         alertable_fingerprints=alertable,
@@ -539,7 +562,7 @@ def run_device_health_monitor_cycle(
     next_cursor = {
         "lastRunAt": local_now.isoformat(),
         "cycleCompleted": False,
-        "checkedDeviceCount": len(devices),
+        "checkedDeviceCount": len(monitor_devices),
         "abnormalCandidateCount": abnormal_candidate_count,
         "sshVerifiedCandidateCount": ssh_verified_count,
         "monitorUnavailableReason": "",
@@ -569,7 +592,7 @@ def run_device_health_monitor_cycle(
             payload=_delivery_payload(
                 item,
                 now=local_now,
-                checked_device_count=len(devices),
+                checked_device_count=len(monitor_devices),
                 abnormal_candidate_count=abnormal_candidate_count,
             ),
         )
@@ -579,7 +602,7 @@ def run_device_health_monitor_cycle(
         cursor=next_cursor,
         deliveries=deliveries,
         metrics={
-            "checkedDeviceCount": len(devices),
+            "checkedDeviceCount": len(monitor_devices),
             "abnormalCandidateCount": abnormal_candidate_count,
             "sshVerifiedCandidateCount": ssh_verified_count,
             "verificationErrorCount": verification_error_count,
@@ -882,14 +905,25 @@ def _validate_raw_monitor_cursor(value: Mapping[str, Any] | None) -> None:
         )
 
 
-def _load_device_health_monitor_devices() -> list[dict[str, Any]]:
+def _load_device_health_monitor_devices(
+    *,
+    device_names: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    # 전체 탐색과 후보 재검증이 같은 대상 제외 조건을 사용한다.
+    names = tuple(
+        dict.fromkeys(
+            _text(name) for name in (device_names or ()) if _text(name)
+        )
+    )
+    if device_names is not None and not names:
+        return []
     if not core_settings.DB_QUERY_ENABLED:
         raise RuntimeError("DB query is disabled")
     connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
     try:
         with connection.cursor() as cursor:
             # 자동문자는 전용 번호만 내부에서 사용하고 API delivery에는 싣지 않는다.
-            cursor.execute(
+            query = (
                 "SELECT d.seq AS deviceSeq, d.deviceName, d.hospitalSeq, "
                 "d.hospitalRoomSeq, h.hospitalName, h.telephone AS hospitalTelephone, "
                 "h.deviceAlertPhone AS hospitalDeviceAlertPhone, hr.roomName "
@@ -901,9 +935,16 @@ def _load_device_health_monitor_devices() -> list[dict[str, Any]]:
                 "AND COALESCE(h.hospitalName, '') NOT REGEXP '^[0-9]+_' "
                 "AND COALESCE(d.activeFlag, 1) = 1 "
                 "AND COALESCE(d.installFlag, 1) = 1 "
+            )
+            if device_names is not None:
+                # DB에는 LED 후보만 한 번에 조회하고 장비명은 값으로 바인딩한다.
+                placeholders = ", ".join("%s" for _ in names)
+                query += f"AND d.deviceName IN ({placeholders}) "
+            query += (
                 "ORDER BY d.hospitalSeq ASC, COALESCE(hr.roomName, '') ASC, "
                 "d.deviceName ASC, d.seq DESC"
             )
+            cursor.execute(query, names)
             rows = cursor.fetchall() or []
     finally:
         connection.close()
@@ -930,6 +971,45 @@ def _load_device_health_monitor_devices() -> list[dict[str, Any]]:
                 "roomName": _text(row.get("roomName")) or "미확인",
             }
         )
+    return result
+
+
+def _refresh_led_candidate_devices(
+    devices: Sequence[dict[str, Any]],
+    redis_snapshot: Mapping[str, Mapping[str, Any]],
+    *,
+    now: datetime,
+    load_current_devices: Callable[[Sequence[str]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """LED 후보의 현재 DB 소속만 재검증하고 전체 탐색 cache는 유지한다."""
+
+    candidate_names = [
+        _text(device.get("deviceName"))
+        for device in devices
+        if _result_from_redis(
+            device,
+            redis_snapshot.get(_text(device.get("deviceName")), {}),
+            now=now,
+        )[1]
+    ]
+    if not candidate_names:
+        return list(devices)
+    candidates = set(candidate_names)
+    current_by_name = {
+        _text(device.get("deviceName")): _safe_device_cache_item(device)
+        for device in load_current_devices(candidate_names)
+        if _text(device.get("deviceName")) in candidates
+        and not re.match(r"^\d+_", _text(device.get("hospitalName")))
+    }
+    # DB에서 빠진 후보는 제외하고 병원·병실·연락처를 함께 갱신한다.
+    # 기존 discovery cache는 보존해 다음 poll에도 최신 제외 여부를 확인한다.
+    result: list[dict[str, Any]] = []
+    for device in devices:
+        name = _text(device.get("deviceName"))
+        if name not in candidates:
+            result.append(device)
+        elif name in current_by_name:
+            result.append(current_by_name[name])
     return result
 
 

@@ -159,6 +159,8 @@ def _health_deps(
 
     return DeviceHealthMonitorCycleDeps(
         load_devices=lambda: [device],
+        # eligibility 조회는 mock으로 고정하고 실제 SMS claim/outbox 경계만 검증한다.
+        load_current_devices=lambda names: [device] if _DEVICE_NAME in names else [],
         load_redis_snapshot=lambda names: {
             _DEVICE_NAME: {
                 "deviceState": {

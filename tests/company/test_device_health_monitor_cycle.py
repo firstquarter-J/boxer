@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Self, Sequence
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -152,16 +152,19 @@ def test_explicit_led_missing_usb_list_requires_led_ssh_verification() -> None:
         {"acme": {"usbList": "invalid"}}
     ) is None
     # LED가 단어 일부일 뿐인 일반 제품명은 연결된 LED로 오인하지 않는다.
-    assert cycle.redis_device_led_usb_presence(
-        {
-            "acme": {
-                "usbList": [
-                    {"name": "OLED display"},
-                    {"name": "Ledger security key"},
-                ]
+    assert (
+        cycle.redis_device_led_usb_presence(
+            {
+                "acme": {
+                    "usbList": [
+                        {"name": "OLED display"},
+                        {"name": "Ledger security key"},
+                    ]
+                }
             }
-        }
-    ) is False
+        )
+        is False
+    )
 
 
 def test_first_led_poll_drops_legacy_captureboard_pending_without_delivery() -> None:
@@ -238,6 +241,10 @@ def _deps(
 
     return DeviceHealthMonitorCycleDeps(
         load_devices=lambda: [_device()],
+        # 현재 대상 재검증도 로컬 fixture로 고정해 운영 DB를 호출하지 않는다.
+        load_current_devices=lambda names: (
+            calls.setdefault("current_devices", []).append(list(names)) or [_device()]
+        ),
         load_redis_snapshot=lambda names: (
             calls.setdefault("redis", []).append(list(names)) or _redis_snapshot()
         ),
@@ -300,6 +307,7 @@ def test_captureboard_and_disk_signals_with_led_do_not_probe_or_deliver() -> Non
     assert result.metrics["sshVerifiedCandidateCount"] == 0
     assert result.deliveries == ()
     assert calls.get("verify", []) == []
+    assert calls.get("current_devices", []) == []
     assert calls.get("sms", []) == []
     assert calls.get("sheet", []) == []
 
@@ -343,6 +351,287 @@ def test_device_candidate_cache_falls_back_to_stale_state_on_db_failure() -> Non
     # legacy monitor처럼 TTL 갱신이 실패해도 기존 목록으로 계속한다.
     assert devices[0]["deviceName"] == "MB2-CYCLE"
     assert cache_state["source"] == "stale_state_cache"
+
+
+def _cached_led_cursor() -> dict[str, Any]:
+    """DB 이름 변경 전에 만들어진 대상 캐시와 재알림 만료 상태를 재현한다."""
+
+    last_alerted = (_NOW - timedelta(hours=7)).isoformat()
+    cursor = _seed_cursor(
+        alerts={
+            "#20 테스트병원|2진료실|MB2-CYCLE|LED USB 장치를 찾지 못했어": {
+                "firstAlertedAt": last_alerted,
+                "lastAlertedAt": last_alerted,
+                "lastSeenAt": last_alerted,
+                "count": 1,
+            }
+        }
+    )
+    cursor["deviceCandidateCache"] = [_device()]
+    cursor["deviceCandidateCachedAt"] = (_NOW - timedelta(minutes=1)).isoformat()
+    return cursor
+
+
+@pytest.mark.parametrize("hospital_name", (None, "0_개발실", "123_미설치"))
+def test_cached_led_reminder_skips_device_no_longer_eligible(
+    hospital_name: str | None,
+) -> None:
+    calls: dict[str, Any] = {}
+    cursor = _cached_led_cursor()
+
+    def current_devices(names: Sequence[str]) -> list[dict[str, Any]]:
+        calls.setdefault("current_devices", []).append(list(names))
+        # 기본 loader의 제외/누락과 주입된 numeric-prefix row 모두 닫혀야 한다.
+        return (
+            []
+            if hospital_name is None
+            else [{**_device(), "hospitalName": hospital_name}]
+        )
+
+    deps = replace(
+        _deps(calls=calls),
+        load_devices=lambda: pytest.fail("유효한 discovery 캐시를 다시 읽었어"),
+        load_current_devices=current_devices,
+        claim_sms_delivery=lambda *args, **kwargs: (
+            calls.setdefault("claim", []).append((args, kwargs)) or True
+        ),
+    )
+    result = run_device_health_monitor_cycle(
+        request_id="health:excluded-reminder",
+        now=_NOW,
+        cursor=cursor,
+        deps=deps,
+    )
+
+    assert calls["current_devices"] == [["MB2-CYCLE"]]
+    assert calls.get("verify", []) == []
+    assert calls.get("claim", []) == []
+    assert calls.get("sms", []) == []
+    assert result.deliveries == ()
+    assert result.metrics["checkedDeviceCount"] == 0
+    assert result.cursor["pendingSheetAlerts"] == {}
+    # discovery TTL/list를 바꾸지 않고 현재 실행 대상만 제외한다.
+    assert result.cursor["deviceCandidateCache"] == cursor["deviceCandidateCache"]
+    assert result.cursor["deviceCandidateCachedAt"] == cursor["deviceCandidateCachedAt"]
+
+
+def test_current_device_db_failure_preserves_reminder_then_recovers() -> None:
+    calls: dict[str, Any] = {}
+    cursor = _cached_led_cursor()
+    fingerprint = next(iter(cursor["alertFingerprints"]))
+    cursor["pendingAlertFingerprints"] = {
+        fingerprint: {
+            "firstSeenAt": (_NOW - timedelta(minutes=2)).isoformat(),
+            "lastSeenAt": (_NOW - timedelta(minutes=1)).isoformat(),
+            "count": 1,
+        }
+    }
+    cursor["pendingSheetAlerts"] = {
+        "device_health_monitor:previous": {
+            "detectedAt": (_NOW - timedelta(minutes=2)).isoformat(),
+            "item": {"device": "MB2-PREVIOUS", "issue": "LED 미감지"},
+        }
+    }
+
+    def current_devices(names: Sequence[str]) -> list[dict[str, Any]]:
+        calls.setdefault("current_devices", []).append(list(names))
+        if len(calls["current_devices"]) == 1:
+            raise TimeoutError("private eligibility detail")
+        return [_device()]
+
+    deps = replace(_deps(calls=calls), load_current_devices=current_devices)
+    failed = run_device_health_monitor_cycle(
+        request_id="health:eligibility-failed",
+        now=_NOW,
+        cursor=cursor,
+        deps=deps,
+    )
+
+    assert failed.cursor["monitorUnavailableReason"] == "device_eligibility_unavailable"
+    assert failed.cursor["monitorUnavailableErrorType"] == "TimeoutError"
+    assert failed.cursor["alertFingerprints"] == cursor["alertFingerprints"]
+    assert (
+        failed.cursor["pendingAlertFingerprints"] == cursor["pendingAlertFingerprints"]
+    )
+    assert failed.cursor["pendingSheetAlerts"] == cursor["pendingSheetAlerts"]
+    assert failed.cursor["deviceCandidateCachedAt"] == cursor["deviceCandidateCachedAt"]
+    assert failed.deliveries == ()
+    assert calls.get("verify", []) == []
+    assert calls.get("sms", []) == []
+    assert "private eligibility detail" not in repr(failed)
+
+    # 읽기 실패는 재알림을 소진하지 않아 다음 정상 poll에서 한 번 전달한다.
+    recovered_at = _NOW + timedelta(minutes=1)
+    recovered = run_device_health_monitor_cycle(
+        request_id="health:eligibility-recovered",
+        now=recovered_at,
+        cursor=failed.cursor,
+        deps=deps,
+    )
+
+    assert calls["current_devices"] == [["MB2-CYCLE"], ["MB2-CYCLE"]]
+    assert recovered.cursor["monitorUnavailableReason"] == ""
+    assert (
+        recovered.cursor["alertFingerprints"][fingerprint]["lastAlertedAt"]
+        == recovered_at.isoformat()
+    )
+    assert len(calls["verify"]) == 1
+    assert len(calls["sms"]) == 1
+    assert len(recovered.deliveries) == 1
+
+
+def test_current_device_metadata_updates_verification_fingerprint_and_sms() -> None:
+    calls: dict[str, Any] = {}
+    cursor = _cached_led_cursor()
+    current = {
+        **_device(),
+        "hospitalSeq": 21,
+        "hospitalName": "현재병원",
+        "hospitalRoomSeq": 31,
+        "roomName": "3진료실",
+        "hospitalTelephone": "0298765432",
+        "hospitalDeviceAlertPhone": "01087654321",
+    }
+    deps = replace(
+        _deps(calls=calls),
+        load_devices=lambda: pytest.fail("유효한 discovery 캐시를 다시 읽었어"),
+        load_current_devices=lambda names: (
+            calls.setdefault("current_devices", []).append(list(names)) or [current]
+        ),
+    )
+    first = run_device_health_monitor_cycle(
+        request_id="health:fresh-metadata:1",
+        now=_NOW,
+        cursor=cursor,
+        deps=deps,
+    )
+    fingerprint = "#21 현재병원|3진료실|MB2-CYCLE|LED USB 장치를 찾지 못했어"
+    assert first.deliveries == ()
+    assert set(first.cursor["pendingAlertFingerprints"]) == {fingerprint}
+
+    second = run_device_health_monitor_cycle(
+        request_id="health:fresh-metadata:2",
+        now=_NOW + timedelta(minutes=1),
+        cursor=first.cursor,
+        deps=deps,
+    )
+
+    assert [device for device, _now in calls["verify"]] == [current, current]
+    assert set(second.cursor["alertFingerprints"]) == {fingerprint}
+    assert calls["sms"][0]["sms"]["to"] == "01087654321"
+    alert = second.deliveries[0].payload["alert"]
+    assert alert["hospitalSeq"] == "21"
+    assert alert["hospitalName"] == "현재병원"
+    assert alert["room"] == "3진료실"
+    assert alert["telephone"] == "0298765432"
+    assert alert["deviceAlertPhone"] == "01087654321"
+    assert second.cursor["deviceCandidateCache"] == cursor["deviceCandidateCache"]
+    assert second.cursor["deviceCandidateCachedAt"] == cursor["deviceCandidateCachedAt"]
+
+
+def test_current_device_lookup_batches_led_candidates_and_preserves_order() -> None:
+    calls: dict[str, Any] = {}
+    devices = [
+        {**_device(), "deviceSeq": index + 10, "deviceName": name}
+        for index, name in enumerate(("MB2-A", "MB2-EXCLUDED", "MB2-C", "MB2-HEALTHY"))
+    ]
+    snapshots = {
+        device["deviceName"]: json.loads(json.dumps(_redis_snapshot()["MB2-CYCLE"]))
+        for device in devices
+    }
+    snapshots["MB2-HEALTHY"]["deviceState"]["acme"]["usbList"] = [
+        {"ID": "1a86:7523", "Name": "마미톡 LED"}
+    ]
+    cursor = _seed_cursor()
+    cursor["deviceCandidateCache"] = devices
+    cursor["deviceCandidateCachedAt"] = (_NOW - timedelta(minutes=1)).isoformat()
+    deps = replace(
+        _deps(calls=calls),
+        load_redis_snapshot=lambda names: snapshots,
+        # DB 반환 순서에 의존하지 않고 discovery 순서를 유지해야 한다.
+        load_current_devices=lambda names: (
+            calls.setdefault("current_devices", []).append(list(names))
+            or [devices[2], devices[0]]
+        ),
+    )
+
+    result = run_device_health_monitor_cycle(
+        request_id="health:batched-eligibility",
+        now=_NOW,
+        cursor=cursor,
+        deps=deps,
+    )
+
+    assert calls["current_devices"] == [["MB2-A", "MB2-EXCLUDED", "MB2-C"]]
+    assert [device["deviceName"] for device, _now in calls["verify"]] == [
+        "MB2-A",
+        "MB2-C",
+    ]
+    assert result.metrics["checkedDeviceCount"] == 3
+    assert result.metrics["sshVerifiedCandidateCount"] == 2
+    assert result.deliveries == ()
+    assert calls.get("sms", []) == []
+    assert result.cursor["deviceCandidateCache"] == devices
+
+
+def test_current_device_lookup_empty_names_never_opens_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cycle.core_settings, "DB_QUERY_ENABLED", True)
+    monkeypatch.setattr(
+        cycle,
+        "_create_db_connection",
+        lambda timeout: pytest.fail("빈 대상 재검증에서 DB를 열었어"),
+    )
+
+    # 빈 IN 목록을 전체 장비 조회로 바꾸면 제외 정책의 의미가 달라진다.
+    assert cycle._load_device_health_monitor_devices(device_names=()) == []
+
+
+def test_current_device_lookup_uses_bound_names_and_keeps_exclusion_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class Cursor:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def execute(self, sql: str, parameters: Any = None) -> None:
+            calls["query"] = (sql, parameters)
+
+        def fetchall(self) -> list[dict[str, Any]]:
+            # Python 방어도 numeric-prefix row를 제외하는지 함께 확인한다.
+            return [
+                _device(),
+                {**_device(), "deviceName": "MB2-EXCLUDED", "hospitalName": "0_개발실"},
+            ]
+
+    class Connection:
+        def cursor(self) -> Cursor:
+            return Cursor()
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    monkeypatch.setattr(cycle.core_settings, "DB_QUERY_ENABLED", True)
+    monkeypatch.setattr(cycle, "_create_db_connection", lambda timeout: Connection())
+    names = ("MB2-CYCLE", "MB2-X' OR 1=1 --")
+    result = cycle._load_device_health_monitor_devices(device_names=names)
+
+    sql, parameters = calls["query"]
+    assert set(parameters) == set(names)
+    assert sql.count("%s") == len(names)
+    assert names[1] not in sql
+    assert "d.deviceName IN" in sql
+    assert "NOT REGEXP '^[0-9]+_'" in sql
+    assert "COALESCE(d.activeFlag, 1) = 1" in sql
+    assert "COALESCE(d.installFlag, 1) = 1" in sql
+    assert result == [_device()]
+    assert calls["closed"] is True
 
 
 def test_cycle_confirms_hardware_twice_then_preserves_legacy_contact_card() -> None:
@@ -928,6 +1217,7 @@ def test_redis_failure_does_not_fallback_to_mda_or_ssh() -> None:
 
     deps = DeviceHealthMonitorCycleDeps(
         load_devices=deps.load_devices,
+        load_current_devices=deps.load_current_devices,
         load_redis_snapshot=_redis_failure,
         verify_device=deps.verify_device,
         ssh_verification_configured=deps.ssh_verification_configured,
