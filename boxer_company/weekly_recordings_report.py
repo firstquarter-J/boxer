@@ -120,14 +120,18 @@ def _load_weekly_recordings_report(
         hospital_filter = "AND r.hospitalSeq IN (" + ", ".join("%s" for _ in hospital_seqs) + ") "
         params += hospital_seqs
     if new_barcodes_only:
-        # 병원·진료실·장비가 바뀌어도 신규는 한 번뿐이다. 같은 촬영 시각의
-        # 중복 row는 seq가 작은 한 건에 귀속하고 삭제 표시 이력도 비교한다.
+        # (fullBarcode, recordedAt) 인덱스에서 최초 시각만 읽는다. 과거 전체와
+        # OR 비교하거나 createdAt 뒤의 seq까지 정렬하면 대량 이력에서 느려진다.
+        # 같은 시각은 최소 seq에 귀속하며 병원·삭제 여부로 과거를 제한하지 않는다.
         first_recording_filter = (
             "AND r.fullBarcode IS NOT NULL AND r.fullBarcode <> '' "
-            "AND NOT EXISTS (SELECT 1 FROM recordings history "
+            "AND r.recordedAt = (SELECT history.recordedAt FROM recordings history "
             "WHERE history.fullBarcode = r.fullBarcode "
-            "AND (history.recordedAt < r.recordedAt "
-            "OR (history.recordedAt = r.recordedAt AND history.seq < r.seq))) "
+            "AND history.recordedAt IS NOT NULL "
+            "ORDER BY history.recordedAt LIMIT 1) "
+            "AND NOT EXISTS (SELECT 1 FROM recordings earlier "
+            "WHERE earlier.fullBarcode = r.fullBarcode "
+            "AND earlier.recordedAt = r.recordedAt AND earlier.seq < r.seq) "
         )
     try:
         with connection.cursor() as cursor:

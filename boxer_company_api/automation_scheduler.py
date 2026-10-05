@@ -57,6 +57,7 @@ _IDENTIFIER_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$"
 )
 _CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
+_WEEKLY_QUERY_RETRY_DELAY = timedelta(minutes=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +212,17 @@ class AutomationScheduler:
             # 불명 marker와 아직 전달하지 않은 payload는 operator/transport가
             # 닫기 전까지 scheduler가 같은 domain target을 재실행하지 않는다.
             return AutomationSchedulerTick()
+        if (
+            cycle == "weekly_recordings"
+            and (state.get("cursor") or {}).get("queryRetryable") is True
+        ):
+            # 읽기 실패를 정상 finalize한 해당 주차만 5분 뒤 다시 집계한다.
+            # 완료 시각은 durable state에 있어 재시작해도 DB에 즉시 재요청하지 않는다.
+            completed_at = _parse_state_datetime(state.get("lastCompletedAt"))
+            if completed_at is None:
+                raise ValueError("weekly query retry completion time is missing")
+            if actual_now < completed_at + _WEEKLY_QUERY_RETRY_DELAY:
+                return AutomationSchedulerTick()
         decision = plan_automation_cycle(
             cycle,
             now=actual_now,

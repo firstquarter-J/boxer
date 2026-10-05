@@ -154,6 +154,50 @@ def test_weekly_cycle_returns_channel_neutral_summary(
     assert "channel" not in result.deliveries[0].payload
 
 
+@pytest.mark.parametrize("code", [1205, 1213, 2003, 2006, 2013, 3024])
+def test_weekly_read_failure_defers_without_partial_delivery(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, code: int,
+) -> None:
+    from pymysql.err import OperationalError
+
+    # 집계 도중 실패해도 부분 보고서나 원문 오류를 저장·발송하지 않는다.
+    def fail(**_kwargs: Any) -> None:
+        raise OperationalError(code, "private-db-error")
+
+    monkeypatch.setattr(automation, "_build_weekly_recordings_report_summary", fail)
+    result = WeeklyRecordingsCycleHandler().run(_request("weekly_recordings"))
+    assert result.outcome == "no_change"
+    assert result.cursor == {"cycleCompleted": False, "queryRetryable": True}
+    assert result.deliveries == ()
+    assert result.auto_retry_allowed is False
+    assert result.metrics == {"queryErrorCode": code, "deliveryCount": 0}
+    assert "private-db-error" not in caplog.text
+    assert f"error_code={code}" in caplog.text
+
+
+@pytest.mark.parametrize("error", [ValueError("invalid summary"), RuntimeError("unknown failure")])
+def test_weekly_unknown_failure_is_not_reclassified_as_retryable(
+    monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    def fail(**_kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(automation, "_build_weekly_recordings_report_summary", fail)
+    with pytest.raises(type(error)):
+        WeeklyRecordingsCycleHandler().run(_request("weekly_recordings"))
+
+
+def test_weekly_database_auth_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pymysql.err import OperationalError
+
+    def fail(**_kwargs: Any) -> None:
+        raise OperationalError(1045, "private-db-auth")
+
+    monkeypatch.setattr(automation, "_build_weekly_recordings_report_summary", fail)
+    with pytest.raises(OperationalError):
+        WeeklyRecordingsCycleHandler().run(_request("weekly_recordings"))
+
+
 def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

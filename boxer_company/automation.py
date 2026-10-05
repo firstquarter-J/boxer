@@ -189,6 +189,7 @@ class AutomationCycleService:
 
 class WeeklyRecordingsCycleHandler:
     name: AutomationCycleName = "weekly_recordings"
+    _RETRYABLE_DB_ERRORS = frozenset({1205, 1213, 2003, 2006, 2013, 3024})
 
     def validate(self, request: AutomationCycleRequest) -> None:
         if request.options:
@@ -197,16 +198,36 @@ class WeeklyRecordingsCycleHandler:
             )
 
     def run(self, request: AutomationCycleRequest) -> AutomationCycleResult:
+        # 실행 provider는 API runtime에서만 불러오고 DTO/Slack import에 섞지 않는다.
+        from pymysql.err import OperationalError
+
         self.validate(request)
         week_start, week_end = _resolve_weekly_recordings_report_target_week(
             now=request.scheduled_at
         )
-        summary = _build_weekly_recordings_report_summary(
-            target_date=week_start,
-            now=request.scheduled_at,
-            # 정기 보고도 요청형과 같은 네 지표·급감 기본값을 API에서 집계한다.
-            include_new_barcodes=True,
-        )
+        try:
+            summary = _build_weekly_recordings_report_summary(
+                target_date=week_start,
+                now=request.scheduled_at,
+                # 정기 보고도 요청형과 같은 네 지표·급감 기본값을 API에서 집계한다.
+                include_new_barcodes=True,
+            )
+        except OperationalError as exc:
+            code = exc.args[0] if exc.args else None
+            if code not in self._RETRYABLE_DB_ERRORS:
+                raise
+            # 이 범위는 DB 읽기뿐이며 아직 delivery가 없다. 확인된 조회 실패만
+            # 정상 finalize해 잠금을 닫고, scheduler가 완료 시각부터 간격을 둔다.
+            # 기존 불명 marker·ACK·다른 mutation cycle은 이 경로로 해제하지 않는다.
+            logging.getLogger(__name__).warning(
+                "Weekly recordings query deferred error_code=%s", code,
+            )
+            return AutomationCycleResult(
+                cycle=self.name,
+                outcome="no_change",
+                cursor={"cycleCompleted": False, "queryRetryable": True},
+                metrics={"queryErrorCode": code, "deliveryCount": 0},
+            )
         safe_summary = _redact_cycle_payload(summary)
         return AutomationCycleResult(
             cycle=self.name,

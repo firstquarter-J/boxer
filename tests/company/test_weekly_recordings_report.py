@@ -1,3 +1,4 @@
+import random
 import sqlite3
 import unittest
 from contextlib import contextmanager
@@ -38,6 +39,77 @@ class _FakeConnection:
 
 
 class WeeklyRecordingsReportLoadTests(unittest.TestCase):
+    def test_new_barcode_query_preserves_global_first_recording_semantics(self) -> None:
+        # NULL 시각·삭제 이력·역순 입력·병원 이동·동시각 중복을 섞어 기존
+        # 전역 최초 판정과 새 쿼리의 병원/진료실별 결과를 실제 SQL로 대조한다.
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.executescript("""
+            CREATE TABLE hospitals (seq INTEGER, hospitalName TEXT);
+            CREATE TABLE hospital_rooms (seq INTEGER, hospitalSeq INTEGER, roomName TEXT);
+            CREATE TABLE recordings (seq INTEGER PRIMARY KEY, fullBarcode TEXT,
+                recordedAt TEXT, createdAt TEXT, hospitalSeq INTEGER,
+                hospitalRoomSeq INTEGER, deleteFlag INTEGER);
+            INSERT INTO hospitals VALUES (1, 'A'), (2, 'B');
+            INSERT INTO hospital_rooms VALUES (11, 1, 'A1'), (21, 2, 'B1');
+        """)
+        rng = random.Random(42)
+        rows = [
+            (1, "null-history", None, "2026-10-01", 2, 21, 1),
+            (2, "null-history", "2026-09-28 00:00:00", "2026-09-01", 1, 11, 0),
+            (3, "tied", "2026-09-28 00:00:00", "2026-10-01", 2, 21, 1),
+            (4, "tied", "2026-09-28 00:00:00", "2026-09-01", 1, 11, 0),
+        ]
+        for seq in range(5, 1005):
+            hospital = rng.choice([1, 2])
+            rows.append((
+                seq, rng.choice([None, "", *(str(i) for i in range(150))]),
+                rng.choice([None, "2025-01-01 00:00:00", "2026-09-27 14:59:59",
+                            "2026-09-27 15:00:00", "2026-09-28 00:00:00",
+                            "2026-10-04 14:59:59", "2026-10-04 15:00:00"]),
+                "2026-10-05", hospital, rng.choice([hospital * 10 + 1, None]),
+                rng.choice([0, 1]),
+            ))
+        rng.shuffle(rows)
+        db.executemany("INSERT INTO recordings VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+
+        class Connection:
+            @contextmanager
+            def cursor(self):
+                class Cursor:
+                    def execute(self, sql, params):
+                        params = tuple(str(value) if isinstance(value, datetime) else value for value in params)
+                        self.rows = [dict(row) for row in db.execute(sql.replace("%s", "?"), params)]
+                        # 별도 정의한 구 판정식을 적용해 결과 row 전체를 대조한다.
+                        prefix, tail = sql.split("AND r.recordedAt = (SELECT", 1)
+                        _, suffix = tail.split("GROUP BY", 1)
+                        legacy = prefix + (
+                            "AND NOT EXISTS (SELECT 1 FROM recordings history "
+                            "WHERE history.fullBarcode = r.fullBarcode "
+                            "AND (history.recordedAt < r.recordedAt OR "
+                            "(history.recordedAt = r.recordedAt AND history.seq < r.seq))) GROUP BY"
+                        ) + suffix
+                        expected = [dict(row) for row in db.execute(legacy.replace("%s", "?"), params)]
+                        assert self.rows == expected
+
+                    def fetchall(self):
+                        return self.rows
+                yield Cursor()
+
+            def close(self):
+                pass
+
+        try:
+            with patch.object(report, "_create_db_connection", return_value=Connection()):
+                for scope in (None, (1,), (2,), (1, 2)):
+                    with self.subTest(scope=scope):
+                        report._load_weekly_recordings_report(
+                            start_date=date(2026, 9, 28), end_date=date(2026, 10, 4),
+                            new_barcodes_only=True, hospital_seqs=scope,
+                        )
+        finally:
+            db.close()
+
     def test_loads_previous_week_rows_grouped_by_hospital(self) -> None:
         connection = _FakeConnection(
             [

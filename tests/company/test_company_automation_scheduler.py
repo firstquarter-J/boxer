@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import hashlib
-from pathlib import Path
 import threading
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -19,7 +19,6 @@ from boxer_company_api.automation_scheduler import (
     ScheduledAutomationRun,
     load_automation_scheduler_settings,
 )
-
 
 _KST = ZoneInfo("Asia/Seoul")
 _TENANT = "T1"
@@ -118,6 +117,122 @@ def test_scheduler_does_not_run_weekly_catchup_on_tuesday(
 
     assert tick.attempted == ()
     assert runs == []
+
+
+def test_weekly_query_retry_survives_restart_and_stops_after_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pymysql.err import OperationalError
+
+    from boxer_company import automation
+    from boxer_company.automation import (
+        AutomationCycleService,
+        AutomationDeliveryReceipt,
+        WeeklyRecordingsCycleHandler,
+    )
+    from boxer_company_api.automation import (
+        AutomationCycleTrigger,
+        DurableAutomationCycleCoordinator,
+    )
+
+    # 실제 handler/coordinator/scheduler를 연결해 실패 완료와 발송 ACK를 구분한다.
+    now = datetime(2026, 10, 5, 9, 0, tzinfo=_KST)
+    calls = 0
+
+    def summary(**_kwargs: Any) -> dict[str, Any]:
+        nonlocal calls, now
+        calls += 1
+        if calls == 1:
+            now += timedelta(seconds=25)
+            raise OperationalError(3024, "private-db-timeout")
+        return {"weekStartDate": "2026-09-28", "weekEndDate": "2026-10-04", "totalCount": 3}
+
+    monkeypatch.setattr(automation, "_build_weekly_recordings_report_summary", summary)
+    settings = _settings(tmp_path, "weekly_recordings")
+    store = JsonAutomationCycleStateStore(settings.state_path)
+    coordinator = DurableAutomationCycleCoordinator(
+        AutomationCycleService((WeeklyRecordingsCycleHandler(),)), store, clock=lambda: now,
+    )
+    triggers = []
+
+    def run_cycle(run: ScheduledAutomationRun) -> None:
+        trigger = AutomationCycleTrigger(
+            request_id=run.request_id, tenant_id=run.tenant_id, cycle=run.cycle,
+            cycle_key=run.cycle_key, scheduled_at=run.scheduled_at,
+            delivery_target={"channelId": "C123456", "conversation": {}},
+        )
+        triggers.append(trigger)
+        coordinator.run(trigger)
+
+    scheduler = AutomationScheduler(settings, store, run_cycle)
+    scheduler.run_once(now=now)
+    key = _state_key("weekly_recordings", "weekly:2026-09-28")
+    failed_state = store.load(key)
+    assert calls == 1
+    assert "inFlight" not in failed_state
+    assert failed_state["cycleCompleted"] is False
+    assert failed_state["pendingDeliveries"] == []
+    assert failed_state["cursor"]["queryRetryable"] is True
+    assert failed_state["lastCompletedAt"] == now.isoformat()
+
+    # 재시작 후에도 시작 시각이 아닌 실패 완료 시각부터 정확히 5분을 기다린다.
+    scheduler = AutomationScheduler(settings, JsonAutomationCycleStateStore(settings.state_path), run_cycle)
+    assert scheduler.run_once(now=now + timedelta(minutes=5, microseconds=-1)).attempted == ()
+    assert calls == 1
+    now += timedelta(minutes=5)
+    assert scheduler.run_once(now=now).attempted == ("weekly_recordings",)
+    state = store.load(key)
+    assert calls == 2
+    assert triggers[0].request_id != triggers[1].request_id
+    assert "queryRetryable" not in state["cursor"]
+    assert "inFlight" not in state
+    assert len(state["pendingDeliveries"]) == 1
+    assert state["cycleCompleted"] is False
+    assert scheduler.run_once(now=now + timedelta(minutes=6)).attempted == ()
+
+    coordinator.run(AutomationCycleTrigger(
+        request_id="weekly:ack", tenant_id=_TENANT, cycle="weekly_recordings",
+        cycle_key="weekly:2026-09-28", scheduled_at=now, ack_only=True,
+        delivery_receipts=(AutomationDeliveryReceipt(
+            delivery_id="weekly_recordings:2026-09-28", status="sent", delivered_at=now,
+        ),),
+    ))
+    assert store.load(key)["cycleCompleted"] is True
+    assert scheduler.run_once(now=now + timedelta(minutes=7)).attempted == ()
+    assert calls == 2
+
+
+@pytest.mark.parametrize("marker", ["inFlight", "ackInFlight", "pendingDeliveries"])
+def test_weekly_retry_never_clears_uncertain_or_pending_state(tmp_path: Path, marker: str) -> None:
+    settings = _settings(tmp_path, "weekly_recordings")
+    store = JsonAutomationCycleStateStore(settings.state_path)
+    state = {
+        "cursor": {"queryRetryable": True},
+        "lastCompletedAt": "2026-10-05T09:00:00+09:00",
+        marker: [{"deliveryId": "existing"}] if marker == "pendingDeliveries" else {"requestId": "existing"},
+    }
+    key = _state_key("weekly_recordings", "weekly:2026-09-28")
+    store.mutate_cycle(key, lambda *_: (state, None))
+    runs = []
+    scheduler = AutomationScheduler(settings, store, runs.append)
+    assert scheduler.run_once(now=datetime(2026, 10, 5, 10, 0, tzinfo=_KST)).attempted == ()
+    assert runs == []
+    assert store.load(key) == state
+
+
+@pytest.mark.parametrize("completed_at", [None, "invalid", "2026-10-05T09:00:00"])
+def test_weekly_retry_requires_valid_durable_completion_time(tmp_path: Path, completed_at: str | None) -> None:
+    settings = _settings(tmp_path, "weekly_recordings")
+    store = JsonAutomationCycleStateStore(settings.state_path)
+    key = _state_key("weekly_recordings", "weekly:2026-09-28")
+    state = {"cursor": {"queryRetryable": True}, "lastCompletedAt": completed_at}
+    store.mutate_cycle(key, lambda *_: (state, None))
+    runs = []
+    scheduler = AutomationScheduler(settings, store, runs.append)
+    with pytest.raises(ValueError):
+        scheduler.run_once(now=datetime(2026, 10, 5, 10, 0, tzinfo=_KST))
+    assert runs == []
+    assert store.load(key) == state
 
 
 def test_daily_scheduler_uses_server_options_and_window_identity(
