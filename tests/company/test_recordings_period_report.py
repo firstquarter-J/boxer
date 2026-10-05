@@ -398,7 +398,10 @@ def test_next_monday_cycle_uses_real_queries_and_renders_four_replies(recordings
         )
     sent = [call.kwargs for call in client.chat_postMessage.call_args_list]
     assert len(sent) == 5 and all(message["channel"] == "C035M22H5TR" for message in sent)
-    assert sent[0]["text"] == "주간 초음파 녹화 & 신규 바코드 요약"
+    # 정기 보고서의 제목과 네 댓글은 같은 API 집계 기간을 표시한다.
+    assert sent[0]["text"] == (
+        "주간 초음파 녹화 & 신규 바코드 요약\n2026-09-14 ~ 2026-09-20"
+    )
     assert all(message["thread_ts"] == "1723000000.000001" for message in sent[1:])
     assert "*총 신규 바코드* `0개`" in sent[3]["text"]
     assert "*급감 진료실* `0곳`" in sent[4]["text"]
