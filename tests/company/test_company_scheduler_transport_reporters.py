@@ -183,6 +183,9 @@ def test_weekly_transport_ignores_removed_local_feature_gate() -> None:
     flush.assert_called_once()
     api.run.assert_not_called()
     assert len(client.messages) == 2
+    assert client.messages[0]["text"] == (
+        "주간 초음파 촬영 요약\n2026-08-03 ~ 2026-08-09"
+    )
     remember.assert_called_once()
     assert remember.call_args.kwargs["batch"] is batch
 
@@ -288,11 +291,14 @@ def test_weekly_activity_posts_title_and_four_sections_in_one_thread() -> None:
         patch.object(weekly, "remember_automation_delivery") as remember,
     ):
         weekly._run_weekly_recordings_report_if_due(
-            client, logging.getLogger(__name__), now=_NOW,
+            # 다음 날 전달하더라도 제목과 댓글에는 원래 집계 주간을 유지한다.
+            client, logging.getLogger(__name__), now=_NOW.replace(day=11),
             automation_client=Mock(pull_pending=Mock(return_value=batch)),
         )
     assert len(client.messages) == 5
-    assert client.messages[0]["text"] == "주간 초음파 녹화 & 신규 바코드 요약"
+    assert client.messages[0]["text"] == (
+        "주간 초음파 녹화 & 신규 바코드 요약\n2026-08-03 ~ 2026-08-09"
+    )
     titles = ("① 병원별 녹화 요약", "② 진료실별 녹화 급감", "③ 병원별 신규 바코드 요약", "④ 진료실별 신규 바코드 급감")
     for title, message in zip(titles, client.messages[1:], strict=True):
         assert message["text"].startswith(f"*{title}*")

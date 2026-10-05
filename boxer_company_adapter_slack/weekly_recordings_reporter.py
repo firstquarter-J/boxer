@@ -270,11 +270,16 @@ def _run_weekly_recordings_report_transport(
     report_summary = _validate_weekly_transport_batch(batch)
     delivery = batch.deliveries[0]
     parts = _build_weekly_report_parts(report_summary, scheduled_at=batch.scheduled_at)
+    # 지연 전달·재시도에도 제목에는 API가 확정한 집계 기간을 표시한다.
+    report_title = (
+        _WEEKLY_ACTIVITY_REPORT_TITLE if "newBarcodes" in report_summary
+        else _WEEKLY_RECORDINGS_REPORT_TITLE
+    )
     title_response = client.chat_postMessage(
         channel=batch.channel_id,
         text=(
-            _WEEKLY_ACTIVITY_REPORT_TITLE if "newBarcodes" in report_summary
-            else _WEEKLY_RECORDINGS_REPORT_TITLE
+            f"{report_title}\n"
+            f"{report_summary['weekStartDate']} ~ {report_summary['weekEndDate']}"
         ),
         unfurl_links=False,
         unfurl_media=False,
