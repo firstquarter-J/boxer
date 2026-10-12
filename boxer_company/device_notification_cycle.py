@@ -31,6 +31,14 @@ from boxer_company.automation import (
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
 )
+from boxer_company.recording_audio_summary import (
+    format_recording_audio_summary,
+    normalize_recording_audio_details,
+)
+from boxer_company.recording_video_summary import (
+    format_recording_video_summary,
+    normalize_recording_video_details,
+)
 from boxer_company.sms_delivery import (
     _SMS_DELIVERY_ACCEPTED,
     _SMS_DELIVERY_CONFIRM_REQUIRED,
@@ -62,8 +70,9 @@ _SUPPORTED_CODES = (
     _VIDEO_DURATION_MISMATCH,
     _RECORDING_MEDIA_QUALITY_ISSUE,
 )
-# 완성 파일의 판정은 장비 검사기가 소유한다. 박서는 확정된 사유를 번역해
-# 전달하며 무음 비율·시간 초과·검사 생략을 새 이상으로 판정하지 않는다.
+# 완성 파일의 판정은 장비 검사기가 소유한다. 무음은 조용한 진료와 입력
+# 장애를 구분하지 못하므로 구형 장비의 audio_silent 단독 알림도 제외한다.
+# 시간 초과·검사 생략 역시 새 이상으로 판정하지 않는다.
 _MEDIA_ISSUE_LABELS = {
     "video_file_missing": "녹화 파일 없음",
     "video_metadata_unreadable": "영상 파일 정보 읽기 실패",
@@ -75,7 +84,6 @@ _MEDIA_ISSUE_LABELS = {
     "audio_stream_missing": "오디오 트랙 없음",
     "audio_decode_failed": "오디오 디코딩 실패",
     "audio_duration_mismatch": "영상 길이 대비 오디오 길이 부족",
-    "audio_silent": "오디오 전체가 완전 무음",
 }
 _AUTO_SMS_EXCLUDED_CODES = {_VIDEO_DURATION_MISMATCH, _RECORDING_MEDIA_QUALITY_ISSUE}
 _CAPTUREBOARD_INCIDENT_CODES = {
@@ -1720,6 +1728,13 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
                     "maxDurationSec": _recording_freeze_duration(details),
                 }},
             }
+        if "video_uniform_color" in safe_details["issues"]:
+            # 정지 지표를 보존하면서 단색 실측 구간만 추가한다. 파일 경로·로그는 제외한다.
+            visual = safe_details.setdefault("video", {}).setdefault("visualAnalysis", {})
+            visual.update(normalize_recording_video_details(details)["video"]["visualAnalysis"])
+        if media_type == "audio":
+            # 재시작·ACK에도 구간과 전체 합계를 유지하되 원본 로그는 저장하지 않는다.
+            safe_details.update(normalize_recording_audio_details(details))
     return {
         "notificationId": notification_id,
         "deviceSeq": _coerce_optional_int(value.get("deviceSeq")),
@@ -2141,6 +2156,10 @@ def _build_root_alert(
             ),
             event.get("occurredAt"),
         )
+        if media_type == "audio":
+            issue += "\n" + format_recording_audio_summary(details)
+        elif "video_uniform_color" in details.get("issues", []):
+            issue += "\n" + format_recording_video_summary(details)
         alert_category = f"recording_{media_type}"
         # 파일 이상만으로 캡처보드·스피커 고장을 단정하지 않는다.
         component_labels = {}

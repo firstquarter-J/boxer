@@ -9,7 +9,7 @@ import logging
 import re
 import threading
 from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from boxer_company.transport_contracts import (
@@ -73,6 +73,7 @@ _MARK_DONE_MESSAGE_LOCK_STRIPES = 64
 _MARK_DONE_STATUS_PREFIX = "✅ *확인 완료*"
 _MARK_DONE_RECEIPT_PREFIX = "담당자 <@"
 _MARK_DONE_TIME_PREFIX = "🕒 *처리 시간*"
+_MDA_MONITORING_URL = "https://mda.kr.mmtalkbox.com/monitoring"
 _CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
     "recording_processing": "녹화 파일 처리 확인 필요",
@@ -390,13 +391,18 @@ def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
         lines.append(f":rotating_light: *문제 장치*\n{components}")
     lines.extend(
         (
-            f"🔎 *감지 내용*\n`{item['issue']}`",
+            _alert_issue_mrkdwn(item),
             "",
             f"📞 *전화*\n{_text(item.get('telephone'), '미확인')}",
             f"💬 *문자*\n{_sms_contact_text(item)}",
         )
     )
     return "\n".join(lines)
+
+
+def _alert_issue_mrkdwn(item: Mapping[str, Any]) -> str:
+    # 분석 구간·합계·기준을 줄별로 보여주고 각 줄의 코드 표시는 닫아 둔다.
+    return "🔎 *감지 내용*\n" + "\n".join(f"`{line}`" for line in item["issue"].splitlines())
 
 
 def _alert_item_blocks(
@@ -418,7 +424,7 @@ def _alert_item_blocks(
     issue_fields.append(
         {
             "type": "mrkdwn",
-            "text": f"🔎 *감지 내용*\n`{item['issue']}`",
+            "text": _alert_issue_mrkdwn(item),
         }
     )
     identity_fields = [
@@ -743,13 +749,25 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
             normalized_components.append(
                 _COMPONENT_TITLES.get(component.casefold(), component)
             )
+    issue = raw.get("issue") or raw.get("priorityReason")
+    # API가 작성한 녹화 매체 분석의 줄 구분을 보존하고 기존 카드 정규화는 유지한다.
+    issue_text = (
+        "\n".join(_text(line, "") for line in str(issue or "").splitlines() if line.strip())
+        if raw.get("alertCategory") in {"recording_audio", "recording_video"} else _text(issue, "")
+    )
+    device = _text(raw.get("device") or raw.get("deviceName"), "")
+    mda_url = _text(raw.get("mdaUrl"), "")
+    if not _is_safe_https_url(mda_url) and hospital_seq and device:
+        # MDA 장비 검색과 동일하게 병원 선택과 장비 focus를 함께 전달한다.
+        # 공통 카드에서 만들면 알림 종류·구형 pending의 URL 누락과 무관하게 적용된다.
+        mda_url = f"{_MDA_MONITORING_URL}?{urlencode({'hospitalSeq': hospital_seq, 'focusDevice': device})}"
     return {
         "hospitalSeq": hospital_seq or 0,
         "hospitalName": hospital_name,
         "hospital": hospital_label,
         "room": _text(raw.get("room") or raw.get("roomName"), "병실 미확인"),
-        "device": _text(raw.get("device") or raw.get("deviceName"), "장비명 미확인"),
-        "issue": _text(raw.get("issue") or raw.get("priorityReason"), "상세 확인 필요"),
+        "device": device or "장비명 미확인",
+        "issue": issue_text or "상세 확인 필요",
         "alertCategory": _text(raw.get("alertCategory"), "device_connection"),
         "problemComponents": normalized_components,
         "telephone": _text(raw.get("telephone") or raw.get("hospitalTelephone"), ""),
@@ -758,7 +776,7 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
             "",
         ),
         "smsPhoneNumber": _text(raw.get("smsPhoneNumber"), ""),
-        "mdaUrl": _text(raw.get("mdaUrl"), ""),
+        "mdaUrl": mda_url,
         "barcode": _text(raw.get("barcode"), ""),
         "sessionAtLabel": _text(raw.get("sessionAtLabel"), ""),
         "sessionAt": _text(raw.get("sessionAt"), ""),

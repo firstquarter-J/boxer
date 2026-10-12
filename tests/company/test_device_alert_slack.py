@@ -7,6 +7,7 @@ import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -324,6 +325,42 @@ def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
         "📞 *전화*\n031-123-4567",
         "💬 *문자*\n010-1234-5678",
     ]
+
+
+@pytest.mark.parametrize("category", [
+    "recording", "recording_processing", "video_signal", "led", "audio",
+    "application", "storage", "device_connection", "upload", "recording_video", "recording_audio",
+])
+def test_all_alert_categories_link_device_to_mda_search_in_blocks_and_text(category: str) -> None:
+    # MDA 검색창이 쓰는 두 파라미터를 본문·카드·action target에서 함께 유지한다.
+    item = {**_item(), "hospitalSeq": 43, "device": "MB2-A00071", "alertCategory": category}
+    message = _rendered_message(item)
+    url = "https://mda.kr.mmtalkbox.com/monitoring?hospitalSeq=43&focusDevice=MB2-A00071"
+    link = f"*<{url}|MB2-A00071>*"
+    assert link in message["text"]
+    assert message["blocks"][1]["fields"][0]["text"] == f"⚙️ *장비*\n{link}"
+    action = next(block for block in message["blocks"] if block["type"] == "actions")
+    target = json.loads(action["elements"][0]["value"])
+    assert target["device"] == "MB2-A00071"
+    assert target["mdaUrl"] == url
+
+
+def test_notification_device_name_alias_and_encoded_search_value_preserve_target() -> None:
+    # notification은 deviceName을 쓰며 검색값 안의 공백·&를 쿼리로 분리하면 안 된다.
+    item = {**_item(), "device": None, "deviceName": "BOX TEST&A", "mdaUrl": "http://invalid.example"}
+    normalized = alert._normalize_alert_item(item)
+    parsed = urlsplit(normalized["mdaUrl"])
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "mda.kr.mmtalkbox.com"
+    assert parsed.path == "/monitoring"
+    assert parse_qs(parsed.query) == {"hospitalSeq": ["1"], "focusDevice": ["BOX TEST&A"]}
+
+
+@pytest.mark.parametrize(("hospital_seq", "device"), [(None, "MB2-A00071"), (0, "MB2-A00071"), (43, "")])
+def test_missing_device_identity_does_not_invent_monitoring_target(hospital_seq: object, device: str) -> None:
+    item = alert._normalize_alert_item({"hospitalSeq": hospital_seq, "device": device})
+    assert item["mdaUrl"] == ""
+    assert "<https://" not in alert._device_name_text(item)
 
 
 def test_renderer_keeps_oversized_action_value_as_valid_json() -> None:

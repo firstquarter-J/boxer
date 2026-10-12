@@ -337,7 +337,6 @@ def test_media_quality_is_selected_from_notification_db(
     ("audio", "audio_stream_missing", "오디오 트랙 없음"),
     ("audio", "audio_decode_failed", "오디오 디코딩 실패"),
     ("audio", "audio_duration_mismatch", "영상 길이 대비 오디오 길이 부족"),
-    ("audio", "audio_silent", "오디오 전체가 완전 무음"),
 ])
 def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
     media_type: str, issue: str, expected_text: str,
@@ -429,7 +428,7 @@ def test_freeze_alert_with_missing_or_malformed_metrics_still_delivers(video: ob
 
 @pytest.mark.parametrize(("media_type", "issues"), [
     ("video", []), ("audio", []), ("video", "video_frozen"),
-    ("video", ["audio_silent"]), ("audio", ["audio_timeout"]),
+    ("video", ["audio_silent"]), ("audio", ["audio_silent"]), ("audio", ["audio_timeout"]),
     ("video", [None, {}, "unknown"]), ("unknown", ["video_frozen"]),
 ])
 def test_media_quality_without_confirmed_issues_does_not_alert(
@@ -447,10 +446,26 @@ def test_media_quality_without_confirmed_issues_does_not_alert(
     mocks["media_session"].assert_not_called()
 
 
+def test_legacy_silence_reason_does_not_hide_confirmed_audio_data_issue() -> None:
+    # 구형 장비가 무음을 함께 보고해도 실제 길이 부족만 남겨 전달한다.
+    event = _media_quality_event(
+        media_type="audio", issues=["audio_silent", "audio_duration_mismatch"],
+    )
+    deps, mocks = _deps(next_result=(90, event))
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor(last_seen_id=89))
+    )
+    delivery, = result.deliveries
+    issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    assert "영상 길이 대비 오디오 길이 부족" in issue
+    assert "무음" not in issue
+    mocks["send_sms"].assert_not_called()
+
+
 def test_same_recording_video_and_audio_survive_cursor_reload_and_ack() -> None:
     deps, mocks = _deps()
     video = _media_quality_event(90, issues=["video_frozen", "video_uniform_color"])
-    audio = _media_quality_event(91, media_type="audio", issues=["audio_silent"])
+    audio = _media_quality_event(91, media_type="audio", issues=["audio_duration_mismatch"])
     cursor = {**_initialized_cursor(91), "pendingEvents": [video, audio]}
     for event_id, category in [(90, "recording_video"), (91, "recording_audio")]:
         # 프로세스 재시작처럼 JSON으로 복원한 뒤에도 두 매체를 각기 전달한다.
@@ -484,10 +499,102 @@ def test_same_recording_video_and_audio_survive_cursor_reload_and_ack() -> None:
     mocks["next"].assert_not_called()
 
 
+def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload() -> None:
+    from boxer_company_adapter_slack.device_notification_alert_reporter import (
+        _post_remote_device_notification_delivery,
+    )
+
+    # 단색·정지 혼합 알림을 저장·복원해도 각 지표와 줄 구분을 보존한다.
+    event = _media_quality_event(issues=["video_frozen", "video_uniform_color"])
+    event["details"]["video"]["visualAnalysis"]["uniformColor"] = {
+        "thresholdSec": 10, "firstDetectedAtSec": 8, "maxDurationSec": 30,
+        "timeline": {"status": "complete", "videoDurationSec": 600,
+                     "intervals": [{"startSec": 8, "endSec": 18}, {"startSec": 200, "endSec": 230}],
+                     "intervalCount": 2, "durationSec": 40},
+    }
+    normalized = json.loads(json.dumps(cycle._normalize_event(event), allow_nan=False))
+    deps, mocks = _deps()
+    handler = DeviceNotificationAlertCycleHandler(deps)
+    result = handler.run(_request(cursor={**_initialized_cursor(90), "pendingEvents": [normalized]}))
+    delivery, = result.deliveries
+    issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    assert "최장 연속 정지 4분 30.933초" in issue
+    assert "단색 감지 합계 00:40 (전체의 6.7%)" in issue
+    assert "00:08~00:18, 03:20~03:50" in issue
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1710000000.090"}
+    client.chat_getPermalink.return_value = {"permalink": "https://slack.example/p90"}
+    _post_remote_device_notification_delivery(
+        client, logging.getLogger("test.uniform-intervals"), delivery=delivery,
+        channel_id="C123456", cycle_key="transport:notification",
+    )
+    message = client.chat_postMessage.call_args.kwargs
+    for line in issue.splitlines():
+        assert f"`{line}`" in message["text"]
+    rendered = json.dumps(message["blocks"], ensure_ascii=False)
+    assert "00:08~00:18, 03:20~03:50" in rendered
+    assert "focusDevice=MB2-C00992" in rendered
+    assert len(issue) < 1000
+    assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
+    handler.acknowledge(_request(cursor=dict(result.cursor)), (AutomationDeliveryReceipt(
+        delivery_id=delivery.delivery_id, status="sent", external_message_id="1710000000.090", delivered_at=_NOW,
+    ),))
+    mocks["append_sheet"].assert_called_once()
+    mocks["send_sms"].assert_not_called()
+    assert "raw-log" not in json.dumps(result.cursor)
+    assert "/private/" not in json.dumps(result.cursor)
+
+
+def test_audio_intervals_survive_cursor_and_reach_slack_and_sheet_without_sending() -> None:
+    from boxer_company_adapter_slack.device_notification_alert_reporter import (
+        _post_remote_device_notification_delivery,
+    )
+
+    # 장비 분석 → API cursor 재시작 → 실제 Block renderer/ACK 경로를 mock으로 검증한다.
+    event = _media_quality_event(media_type="audio", issues=["audio_duration_mismatch"])
+    summary = {"intervals": [{"startSec": 174, "endSec": 179}], "intervalCount": 1, "durationSec": 5}
+    event["details"]["audio"] = {
+        "audioDurationSec": 595, "path": "/private/file.mp4", "stderr": "raw-log",
+        "timeline": {
+            "status": "complete", "videoDurationSec": 600,
+            "gapToleranceSec": 0.005,
+            "missing": summary,
+        },
+    }
+    normalized = json.loads(json.dumps(cycle._normalize_event(event), allow_nan=False))
+    deps, mocks = _deps()
+    handler = DeviceNotificationAlertCycleHandler(deps)
+    result = handler.run(_request(cursor={**_initialized_cursor(90), "pendingEvents": [normalized]}))
+    delivery, = result.deliveries
+    issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    assert "02:54~02:59" in issue
+    assert "00:05 (전체의 0.8%)" in issue
+    assert len(issue) < 1000
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1710000000.090"}
+    client.chat_getPermalink.return_value = {"permalink": "https://slack.example/p90"}
+    _post_remote_device_notification_delivery(
+        client, logging.getLogger("test.audio-intervals"), delivery=delivery,
+        channel_id="C123456", cycle_key="transport:notification",
+    )
+    message = client.chat_postMessage.call_args.kwargs
+    for line in issue.splitlines():
+        assert f"`{line}`" in message["text"]
+    assert "02:54~02:59" in json.dumps(message["blocks"], ensure_ascii=False)
+    assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
+    handler.acknowledge(_request(cursor=dict(result.cursor)), (AutomationDeliveryReceipt(
+        delivery_id=delivery.delivery_id, status="sent", external_message_id="1710000000.090", delivered_at=_NOW,
+    ),))
+    mocks["append_sheet"].assert_called_once()
+    mocks["send_sms"].assert_not_called()
+    for value in ("/private/", "raw-log", "private-media-file", "81000000000"):
+        assert value not in json.dumps(result.cursor)
+
+
 @pytest.mark.parametrize(("media_type", "issue", "title"), [
     ("video", "video_frozen", "녹화 영상 이상 감지"),
     ("video", "video_uniform_color", "녹화 영상 이상 감지"),
-    ("audio", "audio_silent", "녹화 오디오 이상 감지"),
+    ("audio", "audio_duration_mismatch", "녹화 오디오 이상 감지"),
 ])
 def test_media_quality_delivery_reaches_slack_renderer(
     media_type: str, issue: str, title: str,
