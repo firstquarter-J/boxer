@@ -1,26 +1,30 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
-from dataclasses import dataclass
 import logging
 import os
+import unittest
+from contextlib import ExitStack
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
-import unittest
 from unittest.mock import Mock, patch
 
 from boxer_company.assistant import (
     AssistantMessage,
     CompanyAssistantResult,
 )
+from boxer_company.base_access import BaseAccessSeedMember, LocalFileBaseAccessStore
 from boxer_company_adapter_slack import company
 from boxer_company_adapter_slack.access_routes import (
     BASE_ACCESS_DENIED_REPLY,
+    BASE_ACCESS_HELP_REPLY,
+    SlackBaseAccessRuntime,
 )
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiClientSettings,
 )
-
 
 _TOKEN = "service-token-" + ("x" * 40)
 _READ_STAGES = (
@@ -116,6 +120,11 @@ class CompanyRouteContractTests(unittest.TestCase):
         render_error: Exception | None = None,
         operation_ack_error: Exception | None = None,
         download_ack_error: Exception | None = None,
+        raw_text: str = "",
+        actor_user_id: str = "U1",
+        current_ts: str = "1785312000.000001",
+        base_access_runtime: SlackBaseAccessRuntime | None = None,
+        slack_client: Any = None,
     ) -> _Invocation:
         settings = CompanyApiClientSettings(
             base_url="http://127.0.0.1:8010",
@@ -150,12 +159,13 @@ class CompanyRouteContractTests(unittest.TestCase):
 
         replies: list[tuple[str, dict[str, Any]]] = []
         payload: dict[str, Any] = {
+            "raw_text": raw_text,
             "text": question,
             "question": question,
-            "user_id": "U1",
+            "user_id": actor_user_id,
             "workspace_id": "T1",
             "channel_id": "C123456",
-            "current_ts": "1785312000.000001",
+            "current_ts": current_ts,
             "thread_ts": "1785312000.000001",
             "request_log": {
                 "request_key": "slack:T1:C123456:1785312000.000001",
@@ -213,7 +223,7 @@ class CompanyRouteContractTests(unittest.TestCase):
                 patch.object(
                     company,
                     "build_slack_base_access_runtime",
-                    return_value=SimpleNamespace(
+                    return_value=base_access_runtime or SimpleNamespace(
                         is_allowed=Mock(return_value=access_allowed)
                     ),
                 )
@@ -262,13 +272,6 @@ class CompanyRouteContractTests(unittest.TestCase):
                 "attach_daily_device_round_reporter",
             ):
                 stack.enter_context(patch.object(company, name))
-            stack.enter_context(
-                patch.object(
-                    company,
-                    "handle_base_access_management_command",
-                    return_value=False,
-                )
-            )
             stack.enter_context(
                 patch.object(
                     company,
@@ -354,7 +357,7 @@ class CompanyRouteContractTests(unittest.TestCase):
             captured_handlers["mention"](
                 payload,
                 reply,
-                Mock(),
+                slack_client if slack_client is not None else Mock(),
                 logging.getLogger(f"{__name__}.route"),
             )
 
@@ -376,6 +379,103 @@ class CompanyRouteContractTests(unittest.TestCase):
             all(not service.calls for service in invocation.read_services.values())
         )
         self.assertFalse(invocation.operation_service.answer_calls)
+
+    def test_access_guidance_stops_before_remote_api_or_llm(self) -> None:
+        for question in (
+            "<@U2> 로그 조회 권한 부여",
+            "<@U2> 장비 조회 권한 부여",
+            "<@U2> 로그 조회 권한 주라고. 무슨 권한을 부여했다고 답했니?",
+        ):
+            with self.subTest(question=question):
+                invocation = self._invoke_mention(
+                    question=question,
+                    raw_text=f"<@U08MWNAD5TM> {question}",
+                    read_stage="knowledge",
+                    read_result=_result("company_freeform", body="권한 부여했어"),
+                )
+                self.assertEqual(invocation.replies, [(BASE_ACCESS_HELP_REPLY, {})])
+                self.assertEqual(
+                    invocation.payload["request_log"]["route_name"],
+                    "base_access_management",
+                )
+                self.assertTrue(
+                    all(not service.calls for service in invocation.read_services.values())
+                )
+                self.assertFalse(invocation.operation_service.answer_calls)
+                self.assertFalse(invocation.operation_service.progress_calls)
+                self.assertFalse(invocation.api_client.mock_calls)
+
+    def test_grant_persists_and_next_log_query_passes_without_restart(self) -> None:
+        # 사용자 대화 전체를 실제 파일 정본과 Slack 진입점으로 재현하고 외부 호출만 mock한다.
+        hyun_id = "U0629HDSJHG"
+        target_id = "U07L4R7DWAU"
+        boxer_id = "U08MWNAD5TM"
+        log_question = "54262656384 2026-10-08 로그 분석"
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(company.cs, "HYUN_USER_ID", hyun_id),
+        ):
+            path = Path(directory) / "access.json"
+            store = LocalFileBaseAccessStore(state_path=path)
+            store.seed_members(
+                "T1", [BaseAccessSeedMember(user_id=hyun_id, display_name="Hyun")], hyun_id,
+            )
+            runtime = SlackBaseAccessRuntime(
+                store=store, logger=logging.getLogger(__name__),
+            )
+            client = Mock()
+            client.auth_test.return_value = {"team_id": "T1", "user_id": boxer_id}
+            client.users_info.return_value = {
+                "user": {
+                    "id": target_id, "team_id": "T1", "profile": {"display_name": "Beau"},
+                },
+            }
+
+            def invoke(
+                question: str,
+                *,
+                actor: str = target_id,
+                ts: str = "1785312000.000001",
+            ) -> _Invocation:
+                return self._invoke_mention(
+                    question=question,
+                    raw_text=f"<@{boxer_id}> {question}",
+                    actor_user_id=actor,
+                    current_ts=ts,
+                    base_access_runtime=runtime,
+                    slack_client=client,
+                    read_stage="log",
+                    read_result=_result("barcode_log_analysis", body="로그 분석 결과"),
+                )
+
+            denied = invoke(log_question)
+            self.assertEqual(denied.replies, [(BASE_ACCESS_DENIED_REPLY, {})])
+            self.assertFalse(denied.read_services["log"].calls)
+            grant = invoke(f"<@{target_id}> 권한 부여", actor=hyun_id)
+            self.assertEqual(grant.replies, [(f"<@{target_id}> 박서 사용을 허용했어", {})])
+            self.assertFalse(grant.api_client.mock_calls)
+            self.assertTrue(
+                LocalFileBaseAccessStore(state_path=path).is_allowed("T1", target_id)
+            )
+
+            allowed = invoke(log_question)
+            self.assertEqual(allowed.replies, [("로그 분석 결과", {})])
+            self.assertEqual(len(allowed.read_services["log"].calls), 1)
+
+            status = invoke("나한테 무슨 권한이 있니?")
+            self.assertIn("박서 사용 권한이 있어", status.replies[0][0])
+            self.assertFalse(status.api_client.mock_calls)
+            invoke(f"<@{target_id}> 권한 회수", actor=hyun_id, ts="1785312001.000001")
+            stale = invoke(f"<@{target_id}> 권한 부여", actor=hyun_id)
+            self.assertIn("현재 상태는 박서 사용 불가", stale.replies[0][0])
+            self.assertFalse(
+                LocalFileBaseAccessStore(state_path=path).is_allowed("T1", target_id)
+            )
+            self.assertEqual(invoke(log_question).replies, [(BASE_ACCESS_DENIED_REPLY, {})])
+            self.assertEqual(
+                invoke("나한테 무슨 권한이 있니?").replies,
+                [(BASE_ACCESS_DENIED_REPLY, {})],
+            )
 
     def test_remote_read_stages_keep_existing_order(self) -> None:
         route_by_stage = {

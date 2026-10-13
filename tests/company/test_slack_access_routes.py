@@ -10,7 +10,6 @@ from boxer_company.base_access import (
 )
 from boxer_company_adapter_slack import access_routes
 
-
 _HYUN_USER_ID = "U0629HDSJHG"
 _TARGET_USER_ID = "U037PL53L76"
 _BOXER_USER_ID = "U08MWNAD5TM"
@@ -180,7 +179,7 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
                 runtime=self.runtime,
             )
 
-    def test_only_exact_name_or_mention_commands_are_matched(self) -> None:
+    def test_only_exact_name_or_mention_commands_can_mutate(self) -> None:
         for question in (
             f"<@{_TARGET_USER_ID}> 박서 사용자 추가",
             "박서 사용자 목록",
@@ -190,12 +189,128 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
             "박서 사용 가능",
         ):
             with self.subTest(question=question):
-                self.assertFalse(self._handle(question))
+                self.assertTrue(self._handle(question))
+                self.assertEqual(self.replies[-1][0], access_routes.BASE_ACCESS_HELP_REPLY)
+
+        self.store.set_allowed.assert_not_called()
 
         self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 박서 사용 가능"))
         self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 박서 사용 불가"))
         self.assertTrue(self._handle("Zion 박서 사용 가능"))
         self.assertTrue(self._handle("Zion 박서 사용 불가"))
+
+    def test_permission_aliases_use_the_same_membership_mutation(self) -> None:
+        for target in (f"<@{_TARGET_USER_ID}>", "Zion"):
+            for scope in ("", "박서 ", "박서 사용 "):
+                for action, allowed in (("부여", True), ("허용", True), ("회수", False), ("해제", False)):
+                    with self.subTest(target=target, scope=scope, action=action):
+                        self.store.reset_mock()
+                        self.store.set_allowed.return_value = BaseAccessMutationResult(
+                            allowed=allowed, changed=True, stale=False,
+                        )
+                        self.assertTrue(self._handle(f"{target} {scope}권한 {action}"))
+                        self.store.set_allowed.assert_called_once_with(
+                            _WORKSPACE_ID, _TARGET_USER_ID, allowed, "Zion",
+                            _HYUN_USER_ID, "00000000001784800000.000002",
+                        )
+                        self.assertIn(_TARGET_USER_ID, self.replies[-1][0])
+
+    def test_scoped_or_ambiguous_requests_end_with_guidance_without_mutation(self) -> None:
+        # 문제 대화의 세부 권한·후속 항의와 질문·부정문을 LLM 성공 답변으로 보내지 않는다.
+        for question in (
+            f"<@{_TARGET_USER_ID}> 로그 조회 권한 부여",
+            f"<@{_TARGET_USER_ID}> 장비 조회 권한 부여",
+            f"<@{_TARGET_USER_ID}> 로그 조회 권한 주라고. 무슨 권한을 부여했다고 답했니?",
+            "Zion 로그 조회 권한 부여",
+            "Zion 장비 조회 권한 부여",
+            "Zion 권한 부여?",
+            "Zion 권한 부여하지 마",
+            f"<@{_TARGET_USER_ID}> 권한 부여?",
+            f"<@{_TARGET_USER_ID}> 권한 부여하지 마",
+            f"<@{_TARGET_USER_ID}> 권한 부여하고 회수해",
+            f"<@{_TARGET_USER_ID}> <@U0999999999> 권한 부여",
+            "권한 부여",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(self._handle(question))
+                self.assertEqual(self.replies[-1][0], access_routes.BASE_ACCESS_HELP_REPLY)
+        self.store.set_allowed.assert_not_called()
+        self.client.auth_test.assert_not_called()
+        self.client.users_info.assert_not_called()
+        self.client.users_list.assert_not_called()
+
+    def test_unrelated_permission_questions_and_log_queries_remain_domain_requests(self) -> None:
+        for question in (
+            "54262656384 2026-10-08 로그 분석",
+            "AWS IAM 권한 설정 방법 알려줘",
+            "S3 AccessDenied 원인 확인",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(self._handle(question))
+        self.store.set_allowed.assert_not_called()
+
+    def test_self_status_reads_only_the_request_actor_and_handles_store_failure(self) -> None:
+        for allowed in (True, False):
+            with self.subTest(allowed=allowed):
+                self.store.is_allowed.return_value = allowed
+                self.store.is_allowed.reset_mock()
+                self.assertTrue(self._handle("나한테 무슨 권한이 있니?", actor_user_id=_TARGET_USER_ID))
+                self.store.is_allowed.assert_called_once_with(_WORKSPACE_ID, _TARGET_USER_ID)
+                self.assertEqual(
+                    self.replies[-1][0],
+                    "박서 사용 권한이 있어. 로그·장비 조회 권한은 따로 나누지 않아"
+                    if allowed else access_routes.BASE_ACCESS_DENIED_REPLY,
+                )
+        self.store.is_allowed.side_effect = StoreUnavailable("down")
+        self.assertTrue(self._handle("내 권한 확인", actor_user_id=_TARGET_USER_ID))
+        self.assertEqual(self.replies[-1][0], access_routes.BASE_ACCESS_UNAVAILABLE_REPLY)
+        self.store.set_allowed.assert_not_called()
+        self.client.users_info.assert_not_called()
+
+    def test_self_status_requires_actor_workspace_and_store(self) -> None:
+        for missing in ("user_id", "workspace_id", "store"):
+            with self.subTest(missing=missing):
+                payload = _payload("내 권한 확인")
+                runtime = self.runtime
+                if missing == "store":
+                    runtime = _runtime(None)
+                else:
+                    payload[missing] = ""
+                replies: list[str] = []
+                self.assertTrue(access_routes.handle_base_access_management_command(
+                    payload, replies.append, self.client,
+                    logging.getLogger(__name__), runtime=runtime,
+                ))
+                self.assertEqual(replies, [access_routes.BASE_ACCESS_UNAVAILABLE_REPLY])
+                self.assertEqual(payload["request_log"]["status"], "error")
+        self.store.is_allowed.assert_not_called()
+        self.store.set_allowed.assert_not_called()
+
+    def test_aliases_preserve_admin_target_and_storage_guards(self) -> None:
+        self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 권한 부여", actor_user_id=_TARGET_USER_ID))
+        self.assertTrue(self._handle(f"<@{_HYUN_USER_ID}> 권한 회수"))
+        self.store.set_allowed.assert_not_called()
+        self.client.auth_test.assert_not_called()
+
+        self.client.users_info.return_value = {"user": _active_internal_user(is_bot=True)}
+        self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 권한 부여"))
+        self.store.set_allowed.assert_not_called()
+
+        self.client.users_info.return_value = {"user": _active_internal_user()}
+        self.store.set_allowed.side_effect = StoreUnavailable("down")
+        self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 권한 부여"))
+        self.assertEqual(self.replies[-1][0], access_routes.BASE_ACCESS_UNAVAILABLE_REPLY)
+
+    def test_alias_reply_reflects_stale_or_unchanged_store_result(self) -> None:
+        # 늦게 도착한 부여가 더 최신 회수를 되돌리지 않았으면 현재 불가 상태만 안내한다.
+        for stale in (True, False):
+            with self.subTest(stale=stale):
+                self.store.set_allowed.return_value = BaseAccessMutationResult(
+                    allowed=False, changed=False, stale=stale,
+                )
+                self.assertTrue(self._handle(f"<@{_TARGET_USER_ID}> 권한 부여"))
+                self.assertIn("박서 사용 불가", self.replies[-1][0])
+                self.assertNotIn("허용했어", self.replies[-1][0])
 
     def test_first_mention_must_be_the_authenticated_boxer_user(self) -> None:
         payload = _payload(f"<@{_TARGET_USER_ID}> 박서 사용 가능")

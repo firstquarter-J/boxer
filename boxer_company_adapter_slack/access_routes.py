@@ -24,20 +24,45 @@ from boxer_company.base_access import (
     slack_ts_to_ordering_key,
 )
 
-
+# 변경은 완결된 명령만 허용하고, 질문·부정·복합 지시는 안내 경로로 보낸다.
+_BASE_ACCESS_COMMAND_SUFFIX = (
+    r"(?:박서\s+사용\s+(?P<state>가능|불가)|"
+    r"(?:박서\s+(?:사용\s+)?)?권한\s+(?P<action>부여|허용|회수|해제))"
+)
 _BASE_ACCESS_MENTION_COMMAND_RE = re.compile(
     r"^<@(?P<boxer_user_id>[UW][A-Z0-9]+)>\s+"
-    r"<@(?P<target_user_id>[UW][A-Z0-9]+)>\s+박서\s+사용\s+(?P<state>가능|불가)$"
+    r"<@(?P<target_user_id>[UW][A-Z0-9]+)>\s+" + _BASE_ACCESS_COMMAND_SUFFIX + r"$"
 )
 _BASE_ACCESS_NAME_COMMAND_RE = re.compile(
     r"^<@(?P<boxer_user_id>[UW][A-Z0-9]+)>\s+"
-    r"(?P<target_name>[^<>\r\n]{1,80}?)\s+박서\s+사용\s+(?P<state>가능|불가)$"
+    r"(?P<target_name>[^<>\r\n]{1,80}?)\s+" + _BASE_ACCESS_COMMAND_SUFFIX + r"$"
+)
+_BASE_ACCESS_SCOPED_REQUEST_RE = re.compile(
+    r"(?:로그|장비)\s*(?:(?:조회|분석)\s*)?권한"
+)
+_BASE_ACCESS_REFERENCE_RE = re.compile(
+    r"(?:박서|boxer)\s*(?:사용\s*)?권한|박서\s*(?:사용자|사용\s*(?:가능|불가))",
+    re.IGNORECASE,
+)
+_BASE_ACCESS_ACTION_INQUIRY_RE = re.compile(
+    r"권한\s*(?:부여|허용|회수|해제)(?:\s*(?:해줘|하지\s*마))?[?!.]*$"
+)
+_BASE_ACCESS_SELF_STATUS_RE = re.compile(
+    r"^(?:내(?:가|게)?|나(?:는|한테|에게)?)\s*"
+    r"(?:(?:박서|boxer)\s*(?:사용\s*)?)?(?:무슨\s*)?권한(?:이|은)?"
+    r"(?:\s*(?:있(?:니|어)?|뭐(?:야)?|알려줘|확인(?:해줘)?|보여줘))?\??$",
+    re.IGNORECASE,
 )
 _SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
 _MAX_USERS_LIST_PAGES = 100
 
 BASE_ACCESS_DENIED_REPLY = "박서 사용 권한이 없어. 현에게 요청해줘"
 BASE_ACCESS_UNAVAILABLE_REPLY = "박서 사용 권한을 확인할 수 없어. 잠시 후 다시 시도해줘"
+BASE_ACCESS_HELP_REPLY = (
+    "권한은 변경하지 않았어. 박서 사용 권한 하나로 관리하고 로그·장비 조회 권한은 따로 없어. "
+    "현이 `@Boxer @대상 박서 사용 가능` 또는 `@Boxer @대상 박서 사용 불가`로 변경할 수 있어. "
+    "`@Boxer @대상 권한 부여` / `@Boxer @대상 권한 회수`도 같은 명령이야"
+)
 
 
 @dataclass(slots=True)
@@ -97,13 +122,19 @@ def _parse_base_access_management_command(
 ) -> _BaseAccessManagementCommand | None:
     # 공개 adapter의 question은 모든 멘션을 제거하므로 Boxer 멘션이 남은 원문만 파싱한다.
     normalized_text = str(raw_text or "").strip()
+    if _BASE_ACCESS_SCOPED_REQUEST_RE.search(normalized_text):
+        # 로그·장비만 요청한 권한을 전체 Boxer 사용 권한으로 조용히 확대하지 않는다.
+        return None
     mention_match = _BASE_ACCESS_MENTION_COMMAND_RE.fullmatch(normalized_text)
     if mention_match is not None:
         return _BaseAccessManagementCommand(
             boxer_user_id=mention_match.group("boxer_user_id"),
             target_user_id=mention_match.group("target_user_id"),
             target_name=None,
-            allowed=mention_match.group("state") == "가능",
+            allowed=(
+                mention_match.group("state") == "가능"
+                or mention_match.group("action") in {"부여", "허용"}
+            ),
         )
 
     name_match = _BASE_ACCESS_NAME_COMMAND_RE.fullmatch(normalized_text)
@@ -116,8 +147,62 @@ def _parse_base_access_management_command(
         boxer_user_id=name_match.group("boxer_user_id"),
         target_user_id=None,
         target_name=target_name,
-        allowed=name_match.group("state") == "가능",
+        allowed=(
+            name_match.group("state") == "가능"
+            or name_match.group("action") in {"부여", "허용"}
+        ),
     )
+
+
+def _handle_base_access_inquiry(
+    payload: MentionPayload,
+    reply: SlackReplyFn,
+    *,
+    runtime: SlackBaseAccessRuntime,
+) -> bool:
+    # 현재 메시지만 판단한다. 스레드의 이전 권한 명령을 새 변경 근거로 쓰지 않는다.
+    text = re.sub(
+        r"^\s*<@[UW][A-Z0-9]+>\s*",
+        "",
+        str(payload.get("raw_text") or ""),
+    ).strip()
+    if _BASE_ACCESS_SELF_STATUS_RE.fullmatch(text):
+        _set_request_log_route(payload, "base_access_status")
+        workspace_id = str(payload.get("workspace_id") or "").strip()
+        actor_user_id = str(payload.get("user_id") or "").strip()
+        try:
+            if not workspace_id or not actor_user_id or runtime.store is None:
+                raise StoreUnavailable("기본 권한 조회 식별자나 저장소가 없어")
+            # 비회원도 자기 상태만 확인할 수 있고, 다른 사용자의 membership은 노출하지 않는다.
+            allowed = runtime.store.is_allowed(workspace_id, actor_user_id)
+        except Exception as exc:  # noqa: BLE001 - 권한 조회는 예상 밖 오류도 fail-closed한다.
+            runtime.logger.warning(
+                "Boxer 본인 사용 권한 조회에 실패했어 error_type=%s",
+                type(exc).__name__,
+            )
+            _set_request_log_status(payload, "error")
+            reply(BASE_ACCESS_UNAVAILABLE_REPLY)
+            return True
+        reply(
+            "박서 사용 권한이 있어. 로그·장비 조회 권한은 따로 나누지 않아"
+            if allowed
+            else BASE_ACCESS_DENIED_REPLY
+        )
+        return True
+
+    if not (
+        _BASE_ACCESS_SCOPED_REQUEST_RE.search(text)
+        or _BASE_ACCESS_REFERENCE_RE.search(text)
+        or _BASE_ACCESS_ACTION_INQUIRY_RE.search(text)
+        or ("권한" in text and re.search(r"<@[UW][A-Z0-9]+(?:\|[^>]+)?>", text))
+        or re.fullmatch(r"권한(?:\s.*)?", text, re.DOTALL)
+    ):
+        return False
+    # 인식하지 못한 권한 요청은 LLM이 실행 성공이나 별도 권한을 만들어내지 못하게 끝낸다.
+    _set_request_log_route(payload, "base_access_management")
+    _set_request_log_status(payload, "needs_input")
+    reply(BASE_ACCESS_HELP_REPLY)
+    return True
 
 
 def _slack_response_data(response: Any) -> dict[str, Any] | None:
@@ -353,11 +438,11 @@ def handle_base_access_management_command(
     *,
     runtime: SlackBaseAccessRuntime,
 ) -> bool:
-    """Hyun의 exact 사용 가능/불가 명령을 이름 또는 멘션 대상으로 적용한다."""
+    """권한 명령·안내·본인 조회를 처리하고 변경은 Hyun의 완결된 명령만 적용한다."""
 
     command = _parse_base_access_management_command(payload.get("raw_text") or "")
     if command is None:
-        return False
+        return _handle_base_access_inquiry(payload, reply, runtime=runtime)
 
     _set_request_log_route(payload, "base_access_management")
     actor_user_id = str(payload.get("user_id") or "").strip()
