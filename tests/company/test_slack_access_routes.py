@@ -258,7 +258,7 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
                 self.store.is_allowed.assert_called_once_with(_WORKSPACE_ID, _TARGET_USER_ID)
                 self.assertEqual(
                     self.replies[-1][0],
-                    "박서 사용 권한이 있어. 로그·장비 조회 권한은 따로 나누지 않아"
+                    "박서 사용 권한이 있어. 장비 조회와 로그 조회·분석을 요청할 수 있어"
                     if allowed else access_routes.BASE_ACCESS_DENIED_REPLY,
                 )
         self.store.is_allowed.side_effect = StoreUnavailable("down")
@@ -266,6 +266,55 @@ class SlackBaseAccessManagementTests(unittest.TestCase):
         self.assertEqual(self.replies[-1][0], access_routes.BASE_ACCESS_UNAVAILABLE_REPLY)
         self.store.set_allowed.assert_not_called()
         self.client.users_info.assert_not_called()
+
+    def test_scoped_self_status_answers_from_membership_without_mutation(self) -> None:
+        # Beau의 실제 질문과 같은 자기 조회는 부여 안내가 아니라 파일의 허용 여부로 답한다.
+        for question in (
+            "내가 장비의 로그 조회 권한 있는지 확인",
+            "내가 장비 로그 조회 권한이 있는지 확인해줘",
+            "나도 로그 분석 권한 있어?",
+            "내 장비 조회 권한 확인",
+            "내가 로그 조회할 권한이 있는지 알려줘",
+            "현재 내가 어떤 권한이 있는지 확인해줘",
+            "저도 박서 사용 권한 있나요?",
+            "나한테 로그 조회 권한이 없는지 확인해줘",
+        ):
+            for allowed in (True, False):
+                with self.subTest(question=question, allowed=allowed):
+                    self.store.is_allowed.reset_mock()
+                    self.store.is_allowed.return_value = allowed
+                    self.assertTrue(self._handle(question, actor_user_id=_TARGET_USER_ID))
+                    self.store.is_allowed.assert_called_once_with(_WORKSPACE_ID, _TARGET_USER_ID)
+                    self.assertEqual(
+                        self.replies[-1][0],
+                        "박서 사용 권한이 있어. 장비 조회와 로그 조회·분석을 요청할 수 있어"
+                        if allowed else access_routes.BASE_ACCESS_DENIED_REPLY,
+                    )
+        self.store.set_allowed.assert_not_called()
+        self.client.auth_test.assert_not_called()
+        self.client.users_info.assert_not_called()
+        self.client.users_list.assert_not_called()
+
+    def test_scoped_self_status_does_not_reinterpret_changes_or_other_users(self) -> None:
+        for question in (
+            "내가 장비의 로그 조회 권한 부여",
+            "나한테 로그 조회 권한 부여해줘",
+            "내 로그 조회 권한 회수",
+            f"내가 <@{_TARGET_USER_ID}> 로그 조회 권한 있는지 확인",
+            "내가 Beau 로그 조회 권한 있는지 확인",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(self._handle(question))
+                self.assertEqual(self.replies[-1][0], access_routes.BASE_ACCESS_HELP_REPLY)
+        for question in (
+            "내가 AWS IAM 권한 있는지 확인",
+            "내가 S3 접근 권한 있는지 확인",
+            "내가 DB 조회 권한 있는지 확인",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(self._handle(question))
+        self.store.is_allowed.assert_not_called()
+        self.store.set_allowed.assert_not_called()
 
     def test_self_status_requires_actor_workspace_and_store(self) -> None:
         for missing in ("user_id", "workspace_id", "store"):

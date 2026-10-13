@@ -462,9 +462,22 @@ class CompanyRouteContractTests(unittest.TestCase):
             self.assertEqual(allowed.replies, [("로그 분석 결과", {})])
             self.assertEqual(len(allowed.read_services["log"].calls), 1)
 
-            status = invoke("나한테 무슨 권한이 있니?")
-            self.assertIn("박서 사용 권한이 있어", status.replies[0][0])
-            self.assertFalse(status.api_client.mock_calls)
+            # 권한 부여 뒤 기능명을 섞어 자기 상태를 물어도 membership만 읽고 끝낸다.
+            granted_state = path.read_bytes()
+            for question in (
+                "나한테 무슨 권한이 있니?",
+                "내가 장비의 로그 조회 권한 있는지 확인",
+            ):
+                status = invoke(question)
+                self.assertEqual(status.replies, [(
+                    "박서 사용 권한이 있어. 장비 조회와 로그 조회·분석을 요청할 수 있어", {},
+                )])
+                self.assertEqual(status.payload["request_log"]["route_name"], "base_access_status")
+                self.assertFalse(status.api_client.mock_calls)
+                self.assertFalse(status.operation_service.answer_calls)
+                self.assertFalse(status.operation_service.progress_calls)
+                self.assertTrue(all(not service.calls for service in status.read_services.values()))
+                self.assertEqual(path.read_bytes(), granted_state)
             invoke(f"<@{target_id}> 권한 회수", actor=hyun_id, ts="1785312001.000001")
             stale = invoke(f"<@{target_id}> 권한 부여", actor=hyun_id)
             self.assertIn("현재 상태는 박서 사용 불가", stale.replies[0][0])
@@ -474,6 +487,10 @@ class CompanyRouteContractTests(unittest.TestCase):
             self.assertEqual(invoke(log_question).replies, [(BASE_ACCESS_DENIED_REPLY, {})])
             self.assertEqual(
                 invoke("나한테 무슨 권한이 있니?").replies,
+                [(BASE_ACCESS_DENIED_REPLY, {})],
+            )
+            self.assertEqual(
+                invoke("내가 장비의 로그 조회 권한 있는지 확인").replies,
                 [(BASE_ACCESS_DENIED_REPLY, {})],
             )
 
