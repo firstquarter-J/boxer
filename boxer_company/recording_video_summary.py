@@ -39,12 +39,19 @@ def normalize_recording_video_details(details: Mapping[str, Any]) -> dict[str, A
     visual = _mapping(_mapping(details.get("video")).get("visualAnalysis"))
     uniform = _mapping(visual.get("uniformColor"))
     threshold = bounded_seconds(uniform.get("thresholdSec"))
-    return {"video": {"visualAnalysis": {"uniformColor": {
+    return {"durationSec": bounded_seconds(details.get("durationSec")),
+            "video": {"visualAnalysis": {"uniformColor": {
         "thresholdSec": threshold,
         "firstDetectedAtSec": bounded_seconds(uniform.get("firstDetectedAtSec")),
         "maxDurationSec": bounded_seconds(uniform.get("maxDurationSec")),
         "timeline": _timeline(uniform.get("timeline"), threshold),
     }}}}
+
+
+def format_recording_video_length(details: Mapping[str, Any]) -> str:
+    # 예상 녹화 시간이나 알림 발생 시각 대신 파일 검사기의 실측 길이만 쓴다.
+    duration = bounded_seconds(details.get("durationSec"))
+    return f"영상 길이 {format_time(duration)}" if duration else "영상 길이 확인 필요"
 
 
 def format_recording_video_summary(details: Mapping[str, Any]) -> str:
@@ -61,7 +68,7 @@ def format_recording_video_summary(details: Mapping[str, Any]) -> str:
         ])
 
     # 최초 시작 시각과 최장 시간은 서로 다른 구간일 수 있어 더해서 끝을 만들지 않는다.
-    lines = []
+    lines = [format_recording_video_length(details)]
     first = uniform["firstDetectedAtSec"]
     longest = uniform["maxDurationSec"]
     if first is not None:

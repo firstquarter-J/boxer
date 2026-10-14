@@ -426,6 +426,33 @@ def test_freeze_alert_with_missing_or_malformed_metrics_still_delivers(video: ob
     ]["deviceResults"][0]["priorityReason"]
 
 
+@pytest.mark.parametrize(("duration", "expected"), [
+    (3600, "영상 길이 60:00"), (600.125, "영상 길이 10:00.125"),
+    (None, "영상 길이 확인 필요"), (0, "영상 길이 확인 필요"),
+    (-1, "영상 길이 확인 필요"), (True, "영상 길이 확인 필요"),
+    ("600", "영상 길이 확인 필요"), (float("nan"), "영상 길이 확인 필요"),
+    (float("inf"), "영상 길이 확인 필요"), (10 ** 400, "영상 길이 확인 필요"),
+])
+@pytest.mark.parametrize("issue_code", ["video_frozen", "video_uniform_color", "video_decode_failed"])
+def test_video_length_survives_cursor_reload_without_using_expected_duration(
+    duration: object, expected: str, issue_code: str,
+) -> None:
+    # 총길이가 없는 구형 알림은 예상 길이 600초로 대체하지 않는다.
+    event = _media_quality_event(issues=[issue_code])
+    event["details"]["durationSec"] = duration
+    normalized = cycle._normalize_event(event)
+    restored = json.loads(json.dumps(normalized, allow_nan=False))
+    assert cycle._normalize_event(restored) == normalized
+    deps, _ = _deps()
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor={
+        **_initialized_cursor(90), "pendingEvents": [restored],
+    }))
+    delivery, = result.deliveries
+    issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    assert expected in issue
+    assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
+
+
 @pytest.mark.parametrize(("media_type", "issues"), [
     ("video", []), ("audio", []), ("video", "video_frozen"),
     ("video", ["audio_silent"]), ("audio", ["audio_silent"]), ("audio", ["audio_timeout"]),
@@ -634,6 +661,9 @@ def test_media_quality_delivery_reaches_slack_renderer(
     assert "2026-08-14 09:49:00 KST" in rendered
     actions = [block for block in message["blocks"] if block["type"] == "actions"]
     if media_type == "video":
+        # API에서 추가한 총길이가 카드와 알림 미리보기에 모두 전달된다.
+        assert "영상 길이 10:00" in rendered
+        assert "영상 길이 10:00" in message["text"]
         from boxer_company.transport_contracts import (
             DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
             DEVICE_HEALTH_ALERT_SMS_ACTION,

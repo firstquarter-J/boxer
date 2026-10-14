@@ -71,7 +71,7 @@ def test_invalid_measurements_are_not_displayed(value: object) -> None:
         "thresholdSec": value, "firstDetectedAtSec": value, "maxDurationSec": value, "timeline": value,
     }}}}
     text = format_recording_video_summary(details)
-    assert text == "전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
+    assert text == "영상 길이 확인 필요\n전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
     json.dumps(normalize_recording_video_details(details), allow_nan=False)
 
 

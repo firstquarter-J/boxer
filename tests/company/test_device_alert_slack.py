@@ -500,7 +500,7 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
             "barcode": "12345678901",
             "sessionAtLabel": "세션 시작",
             "sessionAt": "2026-08-31 08:37:41 KST",
-            "issue": "화면 정지 구간 감지",
+            "issue": "화면 정지 구간 감지\n영상 길이 60:00",
         },
         include_device_voice_action=include_voice,
     )
@@ -514,6 +514,8 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
 
     blocks = client.root["blocks"]
     assert blocks[0]["text"]["text"] == "✅ 확인 완료 · 녹화 영상 이상"
+    # 확인 완료 전환도 감지 내용의 총길이를 유지한다.
+    assert "영상 길이 60:00" in json.dumps(blocks, ensure_ascii=False)
     assert blocks[1]["text"]["text"] == (
         "담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
         "*#1 테스트병원*"

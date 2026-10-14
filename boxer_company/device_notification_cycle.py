@@ -36,6 +36,7 @@ from boxer_company.recording_audio_summary import (
     normalize_recording_audio_details,
 )
 from boxer_company.recording_video_summary import (
+    format_recording_video_length,
     format_recording_video_summary,
     normalize_recording_video_details,
 )
@@ -1720,6 +1721,9 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
                 and media_type and issue.startswith(f"{media_type}_")
             )),
         })
+        if media_type == "video":
+            # 장비가 보고한 파일 총길이를 재시작 후에도 유지한다.
+            safe_details["durationSec"] = normalize_recording_video_details(details)["durationSec"]
         if "video_frozen" in safe_details["issues"]:
             # 원본과 재시작한 cursor에 같은 구조를 사용하며, 분석 로그 대신
             # 장비가 측정한 최장 연속 정지 시간 하나만 보존한다.
@@ -2160,6 +2164,9 @@ def _build_root_alert(
             issue += "\n" + format_recording_audio_summary(details)
         elif "video_uniform_color" in details.get("issues", []):
             issue += "\n" + format_recording_video_summary(details)
+        else:
+            # 정지·디코딩 오류 등 단색 이외의 영상 알림에도 총길이를 표시한다.
+            issue += "\n" + format_recording_video_length(details)
         alert_category = f"recording_{media_type}"
         # 파일 이상만으로 캡처보드·스피커 고장을 단정하지 않는다.
         component_labels = {}
