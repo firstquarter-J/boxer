@@ -41,6 +41,89 @@ def _second_item() -> dict[str, object]:
     }
 
 
+def test_audio_alert_prioritizes_length_difference_and_uses_full_width() -> None:
+    # 실제 구형 알림의 길이 차이를 누락 합계로 단정하지 않고 비교해서 보여준다.
+    item = {**_item(), "alertCategory": "recording_audio", "problemComponents": [], "issue": (
+        "녹화 파일 오디오 이상: 영상 길이 대비 오디오 길이 부족 (발생 2026-10-14 15:17:03 KST)\n"
+        "파일 길이 02:59.727 · 디코딩 오디오 02:21.397\n"
+        "오디오 길이 차이 00:38.33 (21.3%)\n"
+        "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)"
+    )}
+    text = alert._alert_issue_mrkdwn(item)
+    assert text.startswith("*오디오 길이 차이: 38.33초 (파일 길이의 21.3%)*")
+    assert "• 영상 파일: *2분 59.727초*\n• 확인된 오디오: *2분 21.397초*" in text
+    assert "길이 차이가 실제 누락 구간의 합계를 뜻하지는 않아" in text
+    assert text.endswith("감지 시각: 2026-10-14 15:17:03 KST")
+    assert "`" not in text
+    blocks = alert._alert_item_blocks(item, card_index=0, include_actions=False, include_device_voice_action=False)
+    assert blocks[1] == {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+    assert text in alert._alert_item_fallback_text(item)
+
+
+def test_audio_alert_keeps_other_failures_and_future_api_descriptions() -> None:
+    # 디코딩 실패 등 복수 원인과 새 설명을 수치 요약 때문에 숨기지 않는다.
+    text = alert._recording_media_issue_mrkdwn(
+        "녹화 파일 오디오 이상: 오디오 디코딩 실패, 영상 길이 대비 오디오 길이 부족\n"
+        "영상 길이 05:00\n오디오 데이터 누락 합계 00:10 (전체의 3.3%)\n"
+        "오디오 데이터 누락 구간: 04:50~05:00\n추가 분석 정보"
+    )
+    assert text.startswith("*오디오 데이터 누락: 10초 (영상의 3.3%)*")
+    for value in ("오디오 디코딩 실패", "영상 총길이: *5분*", "04:50~05:00", "추가 분석 정보"):
+        assert value in text
+    assert "확인 필요" not in text
+
+
+@pytest.mark.parametrize("reason", [
+    "녹화 파일 없음", "영상 파일 정보 읽기 실패", "영상 트랙 없음",
+    "영상 디코딩 실패", "재생 가능한 영상 프레임 없음",
+    "화면 정지 구간 감지 (정지 시간 확인 필요)", "단색 화면 구간 감지",
+])
+def test_video_inspection_failures_use_same_full_width_layout(reason: str) -> None:
+    # 지표가 없는 판정도 원인을 보존하고 총길이를 추측하지 않는다.
+    item = {**_item(), "alertCategory": "recording_video", "problemComponents": [], "issue": (
+        f"녹화 파일 영상 이상: {reason} (발생 2026-10-14 15:17:03 KST)\n영상 길이 확인 필요"
+    )}
+    text = alert._alert_issue_mrkdwn(item)
+    assert reason.split(" (")[0] in text
+    assert "• 영상 총길이: *확인 필요*" in text
+    assert text.endswith("감지 시각: 2026-10-14 15:17:03 KST")
+    assert "`" not in text
+    blocks = alert._alert_item_blocks(item, card_index=0, include_actions=False, include_device_voice_action=False)
+    assert blocks[1] == {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+    assert text in alert._alert_item_fallback_text(item)
+
+
+def test_video_freeze_and_legacy_uniform_metrics_remain_separate() -> None:
+    # 최초 시작과 최장 구간이 다를 수 있어 끝 시각·합계·비율을 만들지 않는다.
+    text = alert._recording_media_issue_mrkdwn(
+        "녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 50분 31.8초), 단색 화면 구간 감지\n"
+        "영상 길이 60:00\n첫 단색 감지 시작: 00:08.333 (영상 시작 기준)\n"
+        "최장 연속 단색: 00:10.9\n전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
+    )
+    assert "*최장 연속 정지: 50분 31.8초*" in text
+    assert "*최장 연속 단색: 10.9초*" in text
+    assert "• 첫 단색 시작: *00:08.333* (영상 시작 기준)" in text
+    assert "• 영상 총길이: *60분*" in text
+    assert "전체 단색 구간·합계·비율은 아직 확인되지 않았어" in text
+    assert "~" not in text
+    assert "%" not in text
+
+
+def test_complete_uniform_summary_preserves_ranges_and_additional_failures() -> None:
+    # 복수 판정과 생략된 구간 수까지 유지하며 전체 합계만 강조한다.
+    text = alert._recording_media_issue_mrkdwn(
+        "녹화 파일 영상 이상: 영상 디코딩 실패, 단색 화면 구간 감지\n영상 길이 20:00\n"
+        "단색 감지 합계 16:40 (전체의 83.3%)\n"
+        "단색 감지 구간: 00:00~00:10, 00:12~00:22 외 98구간 (합계에 포함)\n"
+        "감지 기준: 연속 10초 이상 · 구간은 영상 시작 기준\n추가 영상 정보"
+    )
+    assert text.startswith("*단색 화면 합계: 16분 40초 (영상의 83.3%)*")
+    for value in ("*영상 디코딩 실패*", "영상 총길이: *20분*", "외 98구간 (합계에 포함)",
+                  "단색 화면 구간 (영상 시작 기준)", "감지 기준: 연속 10초 이상", "추가 영상 정보"):
+        assert value in text
+    assert "확인 필요" not in text
+
+
 class _App:
     def __init__(self) -> None:
         self.actions: dict[str, object] = {}
@@ -515,7 +598,7 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
     blocks = client.root["blocks"]
     assert blocks[0]["text"]["text"] == "✅ 확인 완료 · 녹화 영상 이상"
     # 확인 완료 전환도 감지 내용의 총길이를 유지한다.
-    assert "영상 길이 60:00" in json.dumps(blocks, ensure_ascii=False)
+    assert "영상 총길이: *60분*" in json.dumps(blocks, ensure_ascii=False)
     assert blocks[1]["text"]["text"] == (
         "담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
         "*#1 테스트병원*"

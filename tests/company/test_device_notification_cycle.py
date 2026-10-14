@@ -556,8 +556,10 @@ def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload()
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    for line in issue.splitlines():
-        assert f"`{line}`" in message["text"]
+    assert "*단색 화면 합계: 40초 (영상의 6.7%)*" in message["text"]
+    assert "*최장 연속 정지: 4분 30.933초*" in message["text"]
+    assert "• 영상 총길이: *10분*" in message["text"]
+    assert "감지 기준: 연속 10초 이상" in message["text"]
     rendered = json.dumps(message["blocks"], ensure_ascii=False)
     assert "00:08~00:18, 03:20~03:50" in rendered
     assert "focusDevice=MB2-C00992" in rendered
@@ -605,8 +607,8 @@ def test_audio_intervals_survive_cursor_and_reach_slack_and_sheet_without_sendin
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    for line in issue.splitlines():
-        assert f"`{line}`" in message["text"]
+    assert "*오디오 데이터 누락: 5초 (영상의 0.8%)*" in message["text"]
+    assert "*누락 구간 (영상 시작 기준)*" in message["text"]
     assert "02:54~02:59" in json.dumps(message["blocks"], ensure_ascii=False)
     assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
     handler.acknowledge(_request(cursor=dict(result.cursor)), (AutomationDeliveryReceipt(
@@ -662,8 +664,8 @@ def test_media_quality_delivery_reaches_slack_renderer(
     actions = [block for block in message["blocks"] if block["type"] == "actions"]
     if media_type == "video":
         # API에서 추가한 총길이가 카드와 알림 미리보기에 모두 전달된다.
-        assert "영상 길이 10:00" in rendered
-        assert "영상 길이 10:00" in message["text"]
+        assert "영상 총길이: *10분*" in rendered
+        assert "영상 총길이: *10분*" in message["text"]
         from boxer_company.transport_contracts import (
             DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
             DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -685,8 +687,8 @@ def test_media_quality_delivery_reaches_slack_renderer(
             assert target["alertCategory"] == "recording_video"
             assert target["device"] == "MB2-C00992"
         if issue == "video_frozen":
-            assert "최장 연속 정지 4분 30.933초" in rendered
-            assert "최장 연속 정지 4분 30.933초" in message["text"]
+            assert "최장 연속 정지: 4분 30.933초" in rendered
+            assert "최장 연속 정지: 4분 30.933초" in message["text"]
     else:
         assert actions == []
     assert message["client_msg_id"]

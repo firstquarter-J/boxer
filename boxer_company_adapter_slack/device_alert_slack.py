@@ -401,8 +401,93 @@ def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
 
 
 def _alert_issue_mrkdwn(item: Mapping[str, Any]) -> str:
+    if item.get("alertCategory") in {"recording_audio", "recording_video"}:
+        return _recording_media_issue_mrkdwn(str(item["issue"]))
     # 분석 구간·합계·기준을 줄별로 보여주고 각 줄의 코드 표시는 닫아 둔다.
     return "🔎 *감지 내용*\n" + "\n".join(f"`{line}`" for line in item["issue"].splitlines())
+
+
+def _recording_media_issue_mrkdwn(issue: str) -> str:
+    """API의 판정·수치는 유지하고 비교값과 미확인 정보를 나눠 표시한다."""
+
+    def duration(value: str) -> str:
+        # 재생 시각 표기만 분·초로 바꾸며 값이나 비율을 다시 계산하지 않는다.
+        match = re.fullmatch(r"(\d+):(\d{2}(?:\.\d+)?)", value)
+        if not match:
+            return value
+        minutes, seconds = match.groups()
+        parts = [f"{int(minutes)}분"] if int(minutes) else []
+        seconds = seconds.lstrip("0") or "0"
+        if seconds.startswith("."):
+            seconds = "0" + seconds
+        if seconds != "0" or not parts:
+            parts.append(f"{seconds}초")
+        return " ".join(parts)
+
+    headline, comparisons, notes, other = [], [], [], []
+    detected_at = ""
+    reason = ""
+    summarized_reasons = set()
+    for line in issue.splitlines():
+        if line.startswith(("녹화 파일 오디오 이상: ", "녹화 파일 영상 이상: ")):
+            reason = line.split(": ", 1)[1]
+            match = re.search(r" \(발생 ([^)]+)\)$", reason)
+            if match:
+                detected_at = match.group(1)
+                reason = reason[:match.start()]
+        elif line.startswith("파일 길이 ") and " · 디코딩 오디오 " in line:
+            video, audio = line.removeprefix("파일 길이 ").split(" · 디코딩 오디오 ", 1)
+            comparisons.extend([f"• 영상 파일: *{duration(video)}*", f"• 확인된 오디오: *{duration(audio)}*"])
+        elif line == "영상 길이 확인 필요":
+            comparisons.append("• 영상 총길이: *확인 필요*")
+        elif line.startswith("영상 길이 "):
+            comparisons.append(f"• 영상 총길이: *{duration(line.removeprefix('영상 길이 '))}*")
+        elif (match := re.fullmatch(r"오디오 길이 차이 (\S+) \(([^)]+)\)", line)):
+            headline.append(f"*오디오 길이 차이: {duration(match[1])} (파일 길이의 {match[2]})*")
+            summarized_reasons.add("영상 길이 대비 오디오 길이 부족")
+        elif (match := re.fullmatch(r"오디오 데이터 누락 합계 (\S+) \(전체의 ([^)]+)\)", line)):
+            headline.append(f"*오디오 데이터 누락: {duration(match[1])} (영상의 {match[2]})*")
+            summarized_reasons.add("영상 길이 대비 오디오 길이 부족")
+        elif line.startswith("오디오 데이터 누락 구간: "):
+            notes.append("*누락 구간 (영상 시작 기준)*\n" + line.removeprefix("오디오 데이터 누락 구간: "))
+        elif line == "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)":
+            notes.append("*확인 필요*\n정확한 누락 구간·비율은 아직 확인되지 않았어. 길이 차이가 실제 누락 구간의 합계를 뜻하지는 않아.")
+        elif (match := re.fullmatch(r"단색 감지 합계 (\S+) \(전체의 ([^)]+)\)", line)):
+            headline.append(f"*단색 화면 합계: {duration(match[1])} (영상의 {match[2]})*")
+            summarized_reasons.add("단색 화면 구간 감지")
+        elif line.startswith("단색 감지 구간: "):
+            notes.append("*단색 화면 구간 (영상 시작 기준)*\n" + line.removeprefix("단색 감지 구간: "))
+        elif line.startswith("감지 기준: "):
+            notes.append(line.removesuffix(" · 구간은 영상 시작 기준"))
+        elif (match := re.fullmatch(r"첫 단색 감지 시작: (\S+) \(영상 시작 기준\)", line)):
+            comparisons.append(f"• 첫 단색 시작: *{match[1]}* (영상 시작 기준)")
+        elif line.startswith("최장 연속 단색: "):
+            headline.append(f"*최장 연속 단색: {duration(line.removeprefix('최장 연속 단색: '))}*")
+            summarized_reasons.add("단색 화면 구간 감지")
+        elif line == "전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)":
+            notes.append("*확인 필요*\n전체 단색 구간·합계·비율은 아직 확인되지 않았어.")
+        else:
+            # 새로운 API 설명도 버리지 않고 그대로 표시한다.
+            other.append(line)
+
+    # 정지는 최장 연속 시간만 보고되므로 단색 합계와 합산하거나 비율을 추정하지 않는다.
+    reasons = []
+    for item in reason.split(", ") if reason else []:
+        match = re.fullmatch(r"화면 정지 구간 감지 \(최장 연속 정지 ([^)]+)\)", item)
+        if match:
+            reasons.append(f"*최장 연속 정지: {match[1]}*")
+        elif item == "화면 정지 구간 감지 (정지 시간 확인 필요)":
+            reasons.append("*화면 정지 구간 감지*")
+            notes.append("*확인 필요*\n정지 시간은 아직 확인되지 않았어.")
+        elif item not in summarized_reasons:
+            reasons.append(f"*{item}*")
+    sections = headline + reasons
+    if comparisons:
+        sections.append("\n".join(comparisons))
+    sections.extend(other + notes)
+    if detected_at:
+        sections.append(f"감지 시각: {detected_at}")
+    return "\n\n".join(sections)
 
 
 def _alert_item_blocks(
@@ -463,7 +548,10 @@ def _alert_item_blocks(
             "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
             "fields": identity_fields,
         },
-        {"type": "section", "fields": issue_fields},
+        # 영상·오디오 분석은 전체 폭을 써서 비교·주의 문구를 읽기 쉽게 한다.
+        ({"type": "section", "text": issue_fields[-1]}
+         if item.get("alertCategory") in {"recording_audio", "recording_video"} and not components
+         else {"type": "section", "fields": issue_fields}),
         {
             "type": "section",
             "fields": [
