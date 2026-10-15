@@ -71,6 +71,7 @@ def test_bad_audio_metrics_remain_serializable_and_do_not_guess(value: object) -
     normalized = normalize_recording_audio_details(details)
     json.dumps(normalized, allow_nan=False)
     assert format_recording_audio_summary(normalized) == (
+        "영상 길이 확인 필요\n디코딩 오디오 확인 필요\n"
         "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)"
     )
 

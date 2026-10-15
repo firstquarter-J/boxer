@@ -35,7 +35,9 @@ from boxer_company.recording_audio_summary import (
     format_recording_audio_summary,
     normalize_recording_audio_details,
 )
+from boxer_company.recording_issue_explanation import format_recording_issue_explanation
 from boxer_company.recording_video_summary import (
+    format_recording_freeze_summary,
     format_recording_video_length,
     format_recording_video_summary,
     normalize_recording_video_details,
@@ -87,6 +89,21 @@ _MEDIA_ISSUE_LABELS = {
     "audio_duration_mismatch": "영상 길이 대비 오디오 길이 부족",
 }
 _AUTO_SMS_EXCLUDED_CODES = {_VIDEO_DURATION_MISMATCH, _RECORDING_MEDIA_QUALITY_ISSUE}
+# 종료 신호는 중단 사실만 설명한다. 신호를 보낸 주체나 원본 손상은 추측하지 않는다.
+_MERGE_FAILURES = {
+    "sigterm": "병합 프로세스가 종료 신호(SIGTERM)로 중단됐어. 종료 요청의 원인은 확인 필요해.",
+    "sigkill": "병합 프로세스가 강제 종료(SIGKILL)됐어. 강제 종료의 원인은 확인 필요해.",
+    "no_space": "병합 중 저장공간 부족 오류가 발생했어.",
+    "permission_denied": "병합에 필요한 파일 접근 권한이 없어.",
+    "input_missing": "병합에 필요한 파일을 찾지 못했어.",
+    "invalid_media_data": "병합 도구가 처리할 수 없는 파일 데이터를 만났어.",
+    "unknown": "병합 도구가 실패했어. 제공된 정보만으로 세부 원인은 확인 필요해.",
+}
+_MERGE_FAILURE_PATTERNS = (
+    ("sigterm", r"\bSIGTERM\b"), ("sigkill", r"\bSIGKILL\b"),
+    ("no_space", r"No space left on device"), ("permission_denied", r"Permission denied"),
+    ("input_missing", r"No such file or directory"), ("invalid_media_data", r"Invalid data found"),
+)
 _CAPTUREBOARD_INCIDENT_CODES = {
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
@@ -1690,10 +1707,11 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
     error_detail = str(
         details.get("errorDetail") or details.get("error") or ""
     ).strip()
-    if len(error_detail) > 300:
-        error_detail = f"{error_detail[:297]}..."
-    # path/barcode 원문은 cursor에 보존하지 않고, 기존 Slack
-    # 병합 실패 카드가 보여주던 오류 요약만 300자로 유지한다.
+    # 파일 경로 등이 섞인 병합 오류 원문 대신 정해진 원인만 cursor에 보존한다.
+    merge_failure = details.get("mergeFailureCode")
+    if not isinstance(merge_failure, str) or merge_failure not in _MERGE_FAILURES:
+        merge_failure = next((key for key, pattern in _MERGE_FAILURE_PATTERNS
+                              if re.search(pattern, error_detail, re.IGNORECASE)), "unknown")
     safe_details = {
         "voiceType": _normalize_voice_type(details.get("voiceType")),
         "segmentCount": _coerce_optional_int(details.get("segmentCount")),
@@ -1705,7 +1723,7 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
         ),
         "currentSize": _coerce_optional_int(details.get("currentSize")),
         "fileType": str(details.get("fileType") or "").strip().lower(),
-        "errorDetail": error_detail,
+        "mergeFailureCode": merge_failure,
     }
     if code == _RECORDING_MEDIA_QUALITY_ISSUE:
         # 전체 분석 로그·파일 경로 대신 알림에 필요한 판정만 보존한다.
@@ -1722,20 +1740,8 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
             )),
         })
         if media_type == "video":
-            # 장비가 보고한 파일 총길이를 재시작 후에도 유지한다.
-            safe_details["durationSec"] = normalize_recording_video_details(details)["durationSec"]
-        if "video_frozen" in safe_details["issues"]:
-            # 원본과 재시작한 cursor에 같은 구조를 사용하며, 분석 로그 대신
-            # 장비가 측정한 최장 연속 정지 시간 하나만 보존한다.
-            safe_details["video"] = {
-                "visualAnalysis": {"freeze": {
-                    "maxDurationSec": _recording_freeze_duration(details),
-                }},
-            }
-        if "video_uniform_color" in safe_details["issues"]:
-            # 정지 지표를 보존하면서 단색 실측 구간만 추가한다. 파일 경로·로그는 제외한다.
-            visual = safe_details.setdefault("video", {}).setdefault("visualAnalysis", {})
-            visual.update(normalize_recording_video_details(details)["video"]["visualAnalysis"])
+            # 실측 지표와 허용된 원인 코드만 재시작·ACK 뒤에도 유지한다.
+            safe_details.update(normalize_recording_video_details(details))
         if media_type == "audio":
             # 재시작·ACK에도 구간과 전체 합계를 유지하되 원본 로그는 저장하지 않는다.
             safe_details.update(normalize_recording_audio_details(details))
@@ -2113,6 +2119,11 @@ def _build_root_alert(
             or "캡처보드 연결 장애가 발생했어",
             event.get("occurredAt"),
         )
+        issue += (
+            "\n확인된 내용: 장비가 캡처보드 연결 이상을 보고했어. 케이블·입력·보드 중 원인은 확인 필요해."
+            "\n영향: 진료 화면 입력이나 녹화가 중단됐을 수 있어."
+            "\n다음 확인: 현재 화면 입력, 캡처보드 전원·USB·영상 케이블 연결을 확인해."
+        )
         alert_category = "video_signal"
         problem_components = ["캡처보드"]
         component_labels = {
@@ -2135,12 +2146,14 @@ def _build_root_alert(
         ]
         if segment_text:
             issue_parts.append(segment_text.removeprefix(" / "))
-        error_detail = str(details.get("errorDetail") or "").strip()
-        if error_detail:
-            issue_parts.append(f"오류: {error_detail}")
         issue = _format_issue(
             " / ".join(issue_parts),
             event.get("occurredAt"),
+        )
+        issue += (
+            "\n확인된 내용: " + _MERGE_FAILURES.get(details.get("mergeFailureCode"), _MERGE_FAILURES["unknown"])
+            + "\n영향: 분할 녹화가 하나의 최종 파일로 완성되지 않았을 수 있어."
+            "\n다음 확인: 원본 분할 파일과 병합 종료 로그, 최종 파일·업로드 상태를 확인해."
         )
         alert_category = "recording_processing"
         component_labels = {
@@ -2167,6 +2180,9 @@ def _build_root_alert(
         else:
             # 정지·디코딩 오류 등 단색 이외의 영상 알림에도 총길이를 표시한다.
             issue += "\n" + format_recording_video_length(details)
+        if "video_frozen" in details.get("issues", []):
+            issue += "\n" + format_recording_freeze_summary(details)
+        issue += "\n" + format_recording_issue_explanation(details)
         alert_category = f"recording_{media_type}"
         # 파일 이상만으로 캡처보드·스피커 고장을 단정하지 않는다.
         component_labels = {}
@@ -2187,6 +2203,10 @@ def _build_root_alert(
             + unavailable_text,
             event.get("occurredAt"),
         )
+        issue += (
+            "\n영향: 현재 업로드된 영상으로 정상 재생 가능한지 확인하지 못했어."
+            "\n다음 확인: 장비의 원본 파일과 업로드 결과를 확인해."
+        )
         alert_category = "upload"
         problem_components = ["영상 업로드"]
         component_labels = {
@@ -2205,6 +2225,17 @@ def _build_root_alert(
             f"{_format_duration(duration_seconds)} 동안 지속됐어: "
             f"{_format_growth_rate(growth_rate)}",
             event.get("occurredAt"),
+        )
+        # 녹화 중 파일 증가 정지는 완성 파일 검사와 구분하고 현재 측정값을 함께 표시한다.
+        size = _coerce_optional_int(details.get("currentSize"))
+        minimum = _coerce_optional_float(details.get("expectedMinGrowth"))
+        if size is not None and size >= 0:
+            issue += f"\n현재 파일 크기: {size:,}바이트" + (" (빈 파일)" if size == 0 else "")
+        if minimum is not None and minimum > 0:
+            issue += f"\n기대 최소 증가량: {_format_growth_rate(minimum)}"
+        issue += (
+            "\n영향: 감지 시점에 녹화 데이터가 파일에 추가되지 않았어. 이후 복구 여부는 확인 필요해."
+            "\n다음 확인: 현재 녹화 상태, 파일 크기 변화와 녹화 프로세스·저장공간을 확인해."
         )
         alert_category = "recording"
         component_labels = {

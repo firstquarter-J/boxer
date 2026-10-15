@@ -362,6 +362,8 @@ def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
     assert item["componentLabels"] == {}
     assert delivery.payload["smsReceipt"]["status"] == "not_applicable"
     assert delivery.payload["smsReceipt"]["contactActionEnabled"] is (media_type == "video")
+    for label in ("확인된 내용:", "영향:", "다음 확인:"):
+        assert label in item["priorityReason"]
     mocks["media_session"].assert_called_once_with(90)
     for name in ("send_sms", "claim_sms", "remember_sms", "verify_video"):
         mocks[name].assert_not_called()
@@ -1490,7 +1492,75 @@ def test_notification_delivery_keeps_legacy_event_message_and_merge_error() -> N
     ][0]["priorityReason"]
     assert "녹화 병합 실패" in merge_issue
     assert "분할 파일 3개" in merge_issue
-    assert "ffmpeg exit 17" in merge_issue
+    # 알려지지 않은 종료 번호에서 원인을 추정하거나 원문 오류를 전달하지 않는다.
+    assert "세부 원인은 확인 필요" in merge_issue
+    assert "ffmpeg exit 17" not in merge_issue
+
+
+@pytest.mark.parametrize(("media_type", "issue_code", "media", "expected"), [
+    ("video", "video_metadata_unreadable", {"diagnosticCode": "mp4_metadata_missing"}, "MP4 재생 정보(moov)를 찾지 못했어"),
+    ("video", "video_decode_failed", {"diagnosticCode": "invalid_media_data"}, "처리할 수 없는 영상·오디오 데이터"),
+    ("audio", "audio_decode_failed", {"diagnosticCode": "unsupported_codec"}, "검사기에 필요한 디코더가 없어"),
+    ("audio", "audio_decode_failed", {"reason": "no_decodable_audio_samples"}, "디코딩된 샘플이 0개"),
+    ("video", "video_metadata_unreadable", {"reason": "metadata_unreadable"}, "장비가 상세 오류를 보내지 않아"),
+    ("video", "video_metadata_unreadable", {"diagnosticCode": ["mp4_metadata_missing"]}, "장비가 상세 오류를 보내지 않아"),
+])
+def test_media_explanation_survives_cursor_reload_and_reaches_slack(
+    media_type: str, issue_code: str, media: dict, expected: str,
+) -> None:
+    from boxer_company_adapter_slack.device_alert_slack import (
+        _alert_issue_mrkdwn,
+        _normalize_alert_item,
+    )
+
+    # 신형 원인 코드와 구형 사유를 같은 경로로 처리하되 로그·경로는 복제하지 않는다.
+    event = _media_quality_event(media_type=media_type, issues=[issue_code])
+    event["details"][media_type] = {**media, "stderr": "/private/secret", "path": "/private/secret"}
+    event["details"]["errorDetail"] = "/private/secret"
+    normalized = cycle._normalize_event(event)
+    restored = json.loads(json.dumps(normalized, allow_nan=False))
+    assert cycle._normalize_event(restored) == normalized
+    deps, _ = _deps()
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor={
+        **_initialized_cursor(90), "pendingEvents": [restored],
+    }))
+    delivery, = result.deliveries
+    rendered = _alert_issue_mrkdwn(_normalize_alert_item(delivery.payload["alertSummary"]["deviceResults"][0]))
+    for value in (expected, "*확인된 내용*", "*영향*", "*다음 확인*", "• 영상 총길이: *10분*"):
+        assert value in rendered
+    if media_type == "audio":
+        assert "• 확인된 오디오: *확인 필요*" in rendered
+    assert "/private/secret" not in json.dumps([result.cursor, delivery.payload])
+
+
+@pytest.mark.parametrize(("error", "expected"), [
+    ("ffmpeg was killed with signal SIGTERM", "종료 신호(SIGTERM)로 중단"),
+    ("No space left on device", "저장공간 부족"),
+    ("unknown private failure", "세부 원인은 확인 필요"),
+])
+def test_merge_error_explains_cause_without_raw_path_after_reload(error: str, expected: str) -> None:
+    event = {**_captureboard_event(90), "code": "segmented_recordings_merge_error",
+             "details": {"segmentCount": 2, "error": f"/private/file.mp4: {error}"}}
+    normalized = cycle._normalize_event(event)
+    restored = cycle._normalize_event(json.loads(json.dumps(normalized)))
+    assert restored == normalized
+    result, _, _ = cycle._build_root_alert(restored)
+    issue = result["deviceResults"][0]["priorityReason"]
+    for value in (expected, "분할 파일 2개", "영향:", "다음 확인:"):
+        assert value in issue
+    assert "/private/" not in json.dumps([restored, result])
+
+
+def test_stalled_empty_file_exposes_measurements_and_preserves_incident_identity() -> None:
+    # 0바이트와 증가량 0은 서로 다른 관측값이다. 세션 길이·최종 손상을 추정하지 않는다.
+    event = _recording_stall_event(90, duration_seconds=120, occurred_at=_NOW.isoformat())
+    event["details"].update({"currentSize": 0, "expectedMinGrowth": 178399})
+    normalized = cycle._normalize_event(event)
+    result, _, recording = cycle._build_root_alert(normalized)
+    issue = result["deviceResults"][0]["priorityReason"]
+    for value in ("120초 (2분)", "0.00 KB/sec", "0바이트 (빈 파일)", "174.22 KB/sec", "이후 복구 여부는 확인 필요", "다음 확인:"):
+        assert value in issue
+    assert recording["incidentKey"] == normalized["incidentDiscriminator"]
 
 
 def test_merge_error_ack_does_not_open_captureboard_incident() -> None:

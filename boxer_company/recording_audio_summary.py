@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from boxer_company.recording_issue_explanation import normalize_media_diagnostic
 from boxer_company.recording_media_timeline import (
     bounded_seconds,
     format_ranges,
@@ -38,6 +39,7 @@ def normalize_recording_audio_details(details: Mapping[str, Any]) -> dict[str, A
     return {
         "durationSec": bounded_seconds(details.get("durationSec")),
         "audio": {
+            **normalize_media_diagnostic(audio),
             "audioDurationSec": bounded_seconds(audio.get("audioDurationSec")),
             "timeline": _timeline(audio.get("timeline")),
         },
@@ -68,5 +70,9 @@ def format_recording_audio_summary(details: Mapping[str, Any]) -> str:
         if audio_duration < duration:
             shortfall = duration - audio_duration
             lines.append(f"오디오 길이 차이 {format_time(shortfall)} ({100 * shortfall / duration:.1f}%)")
+    else:
+        # 한쪽 검사 실패가 다른 쪽에서 확인한 길이까지 숨기지 않도록 따로 표시한다.
+        lines.append(f"영상 길이 {format_time(duration)}" if duration else "영상 길이 확인 필요")
+        lines.append(f"디코딩 오디오 {format_time(audio_duration)}" if audio_duration is not None else "디코딩 오디오 확인 필요")
     lines.append("오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)")
     return "\n".join(lines)

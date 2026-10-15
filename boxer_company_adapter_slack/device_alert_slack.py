@@ -403,8 +403,32 @@ def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
 def _alert_issue_mrkdwn(item: Mapping[str, Any]) -> str:
     if item.get("alertCategory") in {"recording_audio", "recording_video"}:
         return _recording_media_issue_mrkdwn(str(item["issue"]))
+    issue = str(item["issue"])
+    if item.get("alertGuidance"):
+        issue += "\n" + str(item["alertGuidance"])
+    if "\n" in issue:
+        # 원인·영향·다음 확인은 별도 문단으로 표시하며 발생 시각은 맨 아래로 보낸다.
+        lines = issue.splitlines()
+        match = re.search(r" \(발생 ([^)]+)\)$", lines[0])
+        detected_at = match.group(1) if match else ""
+        if match:
+            lines[0] = lines[0][:match.start()]
+        sections = [f"*{lines[0]}*"] + [_alert_detail_line(line) for line in lines[1:]]
+        if detected_at:
+            sections.append(f"감지 시각: {detected_at}")
+        return "\n\n".join(sections)
     # 분석 구간·합계·기준을 줄별로 보여주고 각 줄의 코드 표시는 닫아 둔다.
     return "🔎 *감지 내용*\n" + "\n".join(f"`{line}`" for line in item["issue"].splitlines())
+
+
+def _alert_detail_line(line: str) -> str:
+    for label in ("확인된 내용", "영향", "다음 확인"):
+        if line.startswith(f"{label}: "):
+            return f"*{label}*\n{line.removeprefix(f'{label}: ')}"
+    if ": " in line:
+        label, value = line.split(": ", 1)
+        return f"• {label}: *{value}*"
+    return line
 
 
 def _recording_media_issue_mrkdwn(issue: str) -> str:
@@ -424,7 +448,7 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
             parts.append(f"{seconds}초")
         return " ".join(parts)
 
-    headline, comparisons, notes, other = [], [], [], []
+    headline, comparisons, notes, other, guidance = [], [], [], [], []
     detected_at = ""
     reason = ""
     summarized_reasons = set()
@@ -442,6 +466,8 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
             comparisons.append("• 영상 총길이: *확인 필요*")
         elif line.startswith("영상 길이 "):
             comparisons.append(f"• 영상 총길이: *{duration(line.removeprefix('영상 길이 '))}*")
+        elif line.startswith("디코딩 오디오 "):
+            comparisons.append(f"• 확인된 오디오: *{duration(line.removeprefix('디코딩 오디오 '))}*")
         elif (match := re.fullmatch(r"오디오 길이 차이 (\S+) \(([^)]+)\)", line)):
             headline.append(f"*오디오 길이 차이: {duration(match[1])} (파일 길이의 {match[2]})*")
             summarized_reasons.add("영상 길이 대비 오디오 길이 부족")
@@ -466,6 +492,14 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
             summarized_reasons.add("단색 화면 구간 감지")
         elif line == "전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)":
             notes.append("*확인 필요*\n전체 단색 구간·합계·비율은 아직 확인되지 않았어.")
+        elif (match := re.fullmatch(r"첫 정지 감지 시작: (\S+) \(영상 시작 기준\)", line)):
+            comparisons.append(f"• 첫 정지 시작: *{match[1]}* (영상 시작 기준)")
+        elif (match := re.fullmatch(r"정지 감지 기준: 연속 (\S+) 이상", line)):
+            notes.append(f"정지 감지 기준: 연속 {duration(match[1])} 이상")
+        elif line == "전체 정지 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)":
+            notes.append("*확인 필요*\n전체 정지 구간·합계·비율은 아직 확인되지 않았어. 최초 시작과 최장 시간은 서로 다른 구간일 수 있어.")
+        elif line.startswith(("확인된 내용: ", "영향: ", "다음 확인: ")):
+            guidance.append(_alert_detail_line(line))
         else:
             # 새로운 API 설명도 버리지 않고 그대로 표시한다.
             other.append(line)
@@ -484,7 +518,7 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
     sections = headline + reasons
     if comparisons:
         sections.append("\n".join(comparisons))
-    sections.extend(other + notes)
+    sections.extend(other + notes + guidance)
     if detected_at:
         sections.append(f"감지 시각: {detected_at}")
     return "\n\n".join(sections)
@@ -548,9 +582,9 @@ def _alert_item_blocks(
             "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
             "fields": identity_fields,
         },
-        # 영상·오디오 분석은 전체 폭을 써서 비교·주의 문구를 읽기 쉽게 한다.
-        ({"type": "section", "text": issue_fields[-1]}
-         if item.get("alertCategory") in {"recording_audio", "recording_video"} and not components
+        # 상세 설명은 전체 폭을 쓰되 카드 수·버튼 위치는 유지해 확인 완료 처리를 보존한다.
+        ({"type": "section", "text": {"type": "mrkdwn", "text": "\n\n".join(field["text"] for field in issue_fields)}}
+         if item.get("alertCategory") in {"recording_audio", "recording_video"} or "\n" in item["issue"] or item.get("alertGuidance")
          else {"type": "section", "fields": issue_fields}),
         {
             "type": "section",
@@ -838,11 +872,8 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
                 _COMPONENT_TITLES.get(component.casefold(), component)
             )
     issue = raw.get("issue") or raw.get("priorityReason")
-    # API가 작성한 녹화 매체 분석의 줄 구분을 보존하고 기존 카드 정규화는 유지한다.
-    issue_text = (
-        "\n".join(_text(line, "") for line in str(issue or "").splitlines() if line.strip())
-        if raw.get("alertCategory") in {"recording_audio", "recording_video"} else _text(issue, "")
-    )
+    # API가 작성한 원인·영향·다음 확인의 줄 구분을 알림 종류와 무관하게 보존한다.
+    issue_text = "\n".join(_text(line, "") for line in str(issue or "").splitlines() if line.strip())
     device = _text(raw.get("device") or raw.get("deviceName"), "")
     mda_url = _text(raw.get("mdaUrl"), "")
     if not _is_safe_https_url(mda_url) and hospital_seq and device:
@@ -856,6 +887,7 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
         "room": _text(raw.get("room") or raw.get("roomName"), "병실 미확인"),
         "device": device or "장비명 미확인",
         "issue": issue_text or "상세 확인 필요",
+        "alertGuidance": "\n".join(_text(line, "") for line in str(raw.get("alertGuidance") or "").splitlines() if line.strip()),
         "alertCategory": _text(raw.get("alertCategory"), "device_connection"),
         "problemComponents": normalized_components,
         "telephone": _text(raw.get("telephone") or raw.get("hospitalTelephone"), ""),

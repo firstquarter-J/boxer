@@ -106,6 +106,28 @@ def _verified_abnormal(
     }
 
 
+def test_led_guidance_reaches_slack_without_changing_incident_fingerprint() -> None:
+    from boxer_company_adapter_slack.device_alert_slack import (
+        _alert_issue_mrkdwn,
+        _normalize_alert_item,
+    )
+    from boxer_company_adapter_slack.device_health_monitor_reporter import (
+        _build_remote_device_health_alert_device_result,
+    )
+
+    # 표시용 안내는 API delivery에만 추가해 기존 장애의 중복 억제 키를 유지한다.
+    item, = cycle._collect_alert_items([_verified_abnormal(_device(), _NOW)])
+    fingerprint = cycle._alert_fingerprint(item)
+    payload = cycle._delivery_payload(item, now=_NOW, checked_device_count=1, abnormal_candidate_count=1)
+    restored = json.loads(json.dumps(payload))
+    assert cycle._alert_fingerprint(restored["alert"]) == fingerprint
+    assert restored["alert"]["issue"] == item["issue"]
+    rendered = _alert_issue_mrkdwn(_normalize_alert_item(_build_remote_device_health_alert_device_result(restored)))
+    assert "LED USB 장치를 찾지 못했어" in rendered
+    assert "이 감지만으로 녹화 실패를 뜻하지는 않아" in rendered
+    assert "*다음 확인*\nLED 케이블과 USB 연결 상태를 확인해" in rendered
+
+
 @pytest.mark.parametrize(
     "usb_item",
     (

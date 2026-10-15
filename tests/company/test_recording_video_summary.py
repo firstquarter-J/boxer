@@ -3,9 +3,28 @@ import json
 import pytest
 
 from boxer_company.recording_video_summary import (
+    format_recording_freeze_summary,
     format_recording_video_summary,
     normalize_recording_video_details,
 )
+
+
+def test_freeze_preserves_first_detection_and_threshold_without_inventing_ranges() -> None:
+    # 처음 감지된 구간과 최장 구간의 동일성을 알 수 없으므로 합쳐서 끝 시각을 만들지 않는다.
+    details = {"durationSec": 600, "video": {"visualAnalysis": {"freeze": {
+        "firstDetectedAtSec": 8.333, "maxDurationSec": 270.933, "thresholdSec": 60,
+    }}}}
+    normalized = normalize_recording_video_details(details)
+    restored = json.loads(json.dumps(normalized))
+    assert normalize_recording_video_details(restored) == normalized
+    text = format_recording_freeze_summary(restored)
+    assert "첫 정지 감지 시작: 00:08.333" in text
+    assert "정지 감지 기준: 연속 01:00 이상" in text
+    assert "전체 정지 구간·합계·비율: 확인 필요" in text
+    assert "~" not in text
+    assert "%" not in text
+    restored["video"]["visualAnalysis"]["freeze"]["firstDetectedAtSec"] = 601
+    assert "첫 정지 감지 시작" not in format_recording_freeze_summary(restored)
 
 
 def video_details() -> dict:

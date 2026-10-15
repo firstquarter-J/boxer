@@ -181,6 +181,8 @@ def _build_remote_device_health_alert_device_result(
         "room": room,
         "device": device,
         "issue": issue,
+        # API의 표시용 안내는 장애 식별용 issue와 분리해 카드까지 전달한다.
+        "alertGuidance": str(raw.get("alertGuidance") or "").strip(),
         # API가 이미 확정한 표시용 연락처만 Slack 카드까지 보존한다.
         # 렌더링하지 않는 자동문자 본문·장비 상태는 adapter로 복제하지 않는다.
         "telephone": str(raw.get("telephone") or "").strip(),

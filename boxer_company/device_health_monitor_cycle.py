@@ -1902,6 +1902,12 @@ def _delivery_payload(
             "issue": _text(item.get("issue")),
             "problemComponents": list(item.get("problemComponents") or []),
             "alertCategory": _text(item.get("alertCategory")),
+            # 안내 추가 때문에 같은 LED 장애가 재발송되지 않도록 fingerprint의 issue는 유지한다.
+            "alertGuidance": (
+                "영향: LED로 녹화 상태를 확인하기 어려울 수 있어. 이 감지만으로 녹화 실패를 뜻하지는 않아."
+                "\n다음 확인: LED 케이블과 USB 연결 상태를 확인해."
+                if item.get("alertCategory") == "led" else ""
+            ),
             "smsStatusText": _text(item.get("smsStatusText")),
             "smsContactActionEnabled": bool(item.get("smsContactActionEnabled", True)),
             "smsDeliveryStatus": _text(item.get("smsDeliveryStatus")),
