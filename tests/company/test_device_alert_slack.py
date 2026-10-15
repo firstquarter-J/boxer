@@ -459,7 +459,7 @@ def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
     message = client.chat_postMessage.call_args.kwargs
     assert message["text"] == ":alert: *LED 연결 확인 필요*\n" + "\n\n".join(
         (
-            "*#1 테스트병원*",
+            "🏥 *1 테스트병원*",
             (
                 "⚙️ *장비*\n"
                 "*<https://mda.example.com/monitoring?device=MB2-TEST1|MB2-TEST1>*"
@@ -627,7 +627,7 @@ def test_action_is_membership_guarded_and_calls_remote_bridge_only() -> None:
     assert updated_text == (
         "*✅ 확인 완료 · LED 연결*\n" + message["text"].split("\n", 1)[1]
     )
-    assert updated_blocks[1]["text"]["text"].endswith("\n\n*#1 테스트병원*")
+    assert updated_blocks[1]["text"]["text"].endswith("\n\n🏥 *1 테스트병원*")
     assert updated_blocks[1]["fields"] == message["blocks"][1]["fields"]
     assert updated_blocks[2:4] == message["blocks"][2:4]
     assert all("style" not in element for element in updated_blocks[4]["elements"])
@@ -700,7 +700,7 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
     assert "영상 총길이: *60분*" in json.dumps(blocks, ensure_ascii=False)
     assert blocks[1]["text"]["text"] == (
         "담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
-        "*#1 테스트병원*"
+        "🏥 *1 테스트병원*"
     )
     # 사용자가 보는 카드 전체에서 완료 문구는 제목에 딱 한 번만 나온다.
     assert json.dumps(blocks, ensure_ascii=False).count("확인 완료") == 1

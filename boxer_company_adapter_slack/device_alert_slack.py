@@ -567,10 +567,12 @@ def _alert_item_blocks(
                 },
             )
         )
+    # 병원 번호와 action 원본은 유지하고 제목의 #만 병원 아이콘으로 바꾼다.
+    hospital_title = item["hospital"].removeprefix("#")
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
+            "text": {"type": "mrkdwn", "text": f"🏥 *{hospital_title}*"},
             "fields": identity_fields,
         },
         # 모든 감지 내용은 전체 폭과 같은 문단 간격을 쓴다. 식별·연락처는
