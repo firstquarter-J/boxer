@@ -41,24 +41,49 @@ def _second_item() -> dict[str, object]:
     }
 
 
-def test_audio_alert_prioritizes_length_difference_and_uses_full_width() -> None:
-    # 실제 구형 알림의 길이 차이를 누락 합계로 단정하지 않고 비교해서 보여준다.
+def test_audio_alert_matches_approved_two_column_comparison() -> None:
+    # 승인한 실측 예시의 두 길이를 먼저 나란히 표시하고 차이·주석은 아래에 둔다.
     item = {**_item(), "alertCategory": "recording_audio", "problemComponents": [], "issue": (
-        "녹화 파일 오디오 이상: 영상 길이 대비 오디오 길이 부족 (발생 2026-10-14 15:17:03 KST)\n"
-        "파일 길이 02:59.727 · 디코딩 오디오 02:21.397\n"
-        "오디오 길이 차이 00:38.33 (21.3%)\n"
+        "녹화 파일 오디오 이상: 영상 길이 대비 오디오 길이 부족 (발생 2026-10-15 15:42:25 KST)\n"
+        "파일 길이 03:06.803 · 디코딩 오디오 00:34.219\n"
+        "오디오 길이 차이 02:32.584 (81.7%)\n"
         "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)"
     )}
+    message = _rendered_message(item)
     text = alert._alert_issue_mrkdwn(item)
-    assert text.startswith("🔎 *감지 내용*\n오디오 길이 차이 *38.33초* (파일 길이의 21.3%)")
-    assert "확인된 오디오 *2분 21.397초* / 영상 전체 *2분 59.727초*" in text
-    assert "길이 차이만으로 실제 누락 구간·합계·비율을 알 수 없어" in text
-    assert text.endswith("🕒 *감지 시각*\n2026-10-14 15:17:03 KST")
-    assert "`" not in text
-    blocks = alert._alert_item_blocks(item, card_index=0, include_actions=False, include_device_voice_action=False)
-    assert blocks[1]["text"]["text"] == text.split("\n\n")[0]
-    assert blocks[1]["fields"] == [{"type": "mrkdwn", "text": "🕒 *감지 시각*\n2026-10-14 15:17:03 KST"}]
-    assert text in alert._alert_item_fallback_text(item)
+    comparison_fields = [
+        {"type": "mrkdwn", "text": "확인된 오디오\n*34.2초*"},
+        {"type": "mrkdwn", "text": "영상 전체\n*3분 6.8초*"},
+    ]
+    footer = (
+        "길이 차이 *2분 32.6초 · 81.7%*\n"
+        "※ 길이 기준 비교이며 실제 누락 구간은 미확인\n\n"
+        "🕒 *감지 시각*\n2026-10-15 15:42:25 KST"
+    )
+    assert message["blocks"][2] == {
+        "type": "section", "text": {"type": "mrkdwn", "text": "🔎 *감지 내용*"},
+        "fields": comparison_fields,
+    }
+    assert message["blocks"][3]["text"]["text"] == footer
+    assert text == "\n\n".join(["🔎 *감지 내용*", *(field["text"] for field in comparison_fields), footer])
+    assert text in message["text"]
+    assert len(message["blocks"]) == 5
+    # 화면에서만 반올림하며 API action의 길이·비율과 장애 식별은 바꾸지 않는다.
+    target = json.loads(message["blocks"][-1]["elements"][0]["value"])
+    assert target["issue"] == item["issue"]
+
+
+@pytest.mark.parametrize(("length", "expected"), [
+    ("00:59.999", "1분"), ("01:59.95", "2분"), ("00:34.25", "34.3초"),
+    ("00:00", "0초"), ("확인 필요", "확인 필요"),
+])
+def test_audio_display_rounds_once_and_preserves_unknown_lengths(length: str, expected: str) -> None:
+    # 분 경계와 반올림 경계를 검증하고 미확인 길이를 0으로 만들어 표시하지 않는다.
+    text = alert._recording_media_issue_mrkdwn(
+        f"녹화 파일 오디오 이상: 오디오 디코딩 실패\n영상 길이 05:00\n디코딩 오디오 {length}"
+    )
+    assert f"확인된 오디오\n*{expected}*" in text
+    assert "영상 전체\n*5분*" in text
 
 
 def test_audio_alert_keeps_other_failures_and_future_api_descriptions() -> None:
@@ -684,8 +709,9 @@ def test_mark_done_keeps_actions_when_remote_result_is_not_answered() -> None:
 
 
 @pytest.mark.parametrize("include_voice", [True, False])
-def test_mark_done_highlights_video_alert_without_losing_session_details(
-    include_voice: bool,
+@pytest.mark.parametrize("media_type", ["video", "audio"])
+def test_mark_done_highlights_media_alert_without_losing_session_details(
+    include_voice: bool, media_type: str,
 ) -> None:
     app = _App()
     bridge = Mock()
@@ -700,13 +726,17 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
     message = _rendered_message(
         {
             **_item(),
-            "alertCategory": "recording_video",
+            "alertCategory": f"recording_{media_type}",
             "barcode": "12345678901",
             "sessionAtLabel": "세션 시작",
             "sessionAt": "2026-08-31 08:37:41 KST",
             "issue": (
                 "화면 정지 구간 감지\n영상 길이 60:00\n"
                 "정지 감지 기준: 연속 10:00 이상\n감지 시각: 2026-08-31 09:00:00 KST"
+            ) if media_type == "video" else (
+                "녹화 파일 오디오 이상: 영상 길이 대비 오디오 길이 부족\n"
+                "파일 길이 60:00 · 디코딩 오디오 59:00\n오디오 길이 차이 01:00 (1.7%)\n"
+                "감지 시각: 2026-08-31 09:00:00 KST"
             ),
         },
         include_device_voice_action=include_voice,
@@ -720,9 +750,12 @@ def test_mark_done_highlights_video_alert_without_losing_session_details(
     )
 
     blocks = client.root["blocks"]
-    assert blocks[0]["text"]["text"] == "✅ 확인 완료 · 녹화 영상 이상"
-    # 확인 완료 전환도 감지 내용의 총길이를 유지한다.
-    assert "영상 전체 *60분*" in json.dumps(blocks, ensure_ascii=False)
+    media_label = "영상" if media_type == "video" else "오디오"
+    assert blocks[0]["text"]["text"] == f"✅ 확인 완료 · 녹화 {media_label} 이상"
+    # 완료 처리 뒤에도 오디오의 두 열과 그 아래 차이·시각 본문이 그대로 남는다.
+    assert "60분" in json.dumps(blocks, ensure_ascii=False)
+    if media_type == "audio":
+        assert "길이 차이 *1분 · 1.7%*" in blocks[3]["text"]["text"]
     assert blocks[1]["text"]["text"] == (
         "담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
         "🏥 *1 테스트병원*"

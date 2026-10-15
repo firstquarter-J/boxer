@@ -1526,12 +1526,13 @@ def test_media_explanation_survives_cursor_reload_and_reaches_slack(
     delivery, = result.deliveries
     rendered = _alert_issue_mrkdwn(_normalize_alert_item(delivery.payload["alertSummary"]["deviceResults"][0]))
     # 일반 안내를 생략해도 원인 코드·검사 결과와 확인된 길이는 남는다.
-    for value in (expected, "영상 전체 *10분*"):
-        assert value in rendered
+    assert expected in rendered
     for label in ("*확인된 내용*", "*영향*", "*다음 확인*", "*측정 정보*"):
         assert label not in rendered
     if media_type == "audio":
-        assert "확인된 오디오 *확인 필요* / 영상 전체 *10분*" in rendered
+        assert "확인된 오디오\n*확인 필요*\n\n영상 전체\n*10분*" in rendered
+    else:
+        assert "영상 전체 *10분*" in rendered
     assert "/private/secret" not in json.dumps([result.cursor, delivery.payload])
 
 
