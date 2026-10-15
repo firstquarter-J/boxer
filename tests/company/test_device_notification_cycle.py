@@ -558,9 +558,8 @@ def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload()
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    assert "*단색 화면 합계: 40초 (영상의 6.7%)*" in message["text"]
-    assert "*최장 연속 정지: 4분 30.933초*" in message["text"]
-    assert "• 영상 총길이: *10분*" in message["text"]
+    assert "단색 화면 합계 *40초* (영상의 6.7%) / 영상 전체 *10분*" in message["text"]
+    assert "최장 연속 정지 *4분 30.933초* / 영상 전체 *10분*" in message["text"]
     assert "📏 *감지 기준*\n단색: 연속 10초 이상" in message["text"]
     rendered = json.dumps(message["blocks"], ensure_ascii=False)
     assert "00:08~00:18, 03:20~03:50" in rendered
@@ -609,8 +608,8 @@ def test_audio_intervals_survive_cursor_and_reach_slack_and_sheet_without_sendin
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    assert "*오디오 데이터 누락: 5초 (영상의 0.8%)*" in message["text"]
-    assert "🎞️ *분석 구간*\n• 오디오 누락: 02:54~02:59 (영상 시작 기준)" in message["text"]
+    assert "오디오 데이터 누락 *5초* (영상의 0.8%) / 영상 전체 *10분*" in message["text"]
+    assert "오디오 누락 구간 02:54~02:59 (영상 시작 기준)" in message["text"]
     assert "02:54~02:59" in json.dumps(message["blocks"], ensure_ascii=False)
     assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
     handler.acknowledge(_request(cursor=dict(result.cursor)), (AutomationDeliveryReceipt(
@@ -666,8 +665,8 @@ def test_media_quality_delivery_reaches_slack_renderer(
     actions = [block for block in message["blocks"] if block["type"] == "actions"]
     if media_type == "video":
         # API에서 추가한 총길이가 카드와 알림 미리보기에 모두 전달된다.
-        assert "영상 총길이: *10분*" in rendered
-        assert "영상 총길이: *10분*" in message["text"]
+        assert "영상 전체 *10분*" in rendered
+        assert "영상 전체 *10분*" in message["text"]
         from boxer_company.transport_contracts import (
             DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
             DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -689,8 +688,8 @@ def test_media_quality_delivery_reaches_slack_renderer(
             assert target["alertCategory"] == "recording_video"
             assert target["device"] == "MB2-C00992"
         if issue == "video_frozen":
-            assert "최장 연속 정지: 4분 30.933초" in rendered
-            assert "최장 연속 정지: 4분 30.933초" in message["text"]
+            assert "최장 연속 정지 *4분 30.933초*" in rendered
+            assert "최장 연속 정지 *4분 30.933초*" in message["text"]
     else:
         assert actions == []
     assert message["client_msg_id"]
@@ -1526,10 +1525,13 @@ def test_media_explanation_survives_cursor_reload_and_reaches_slack(
     }))
     delivery, = result.deliveries
     rendered = _alert_issue_mrkdwn(_normalize_alert_item(delivery.payload["alertSummary"]["deviceResults"][0]))
-    for value in (expected, "*확인된 내용*", "*영향*", "*다음 확인*", "• 영상 총길이: *10분*"):
+    # 일반 안내를 생략해도 원인 코드·검사 결과와 확인된 길이는 남는다.
+    for value in (expected, "영상 전체 *10분*"):
         assert value in rendered
+    for label in ("*확인된 내용*", "*영향*", "*다음 확인*", "*측정 정보*"):
+        assert label not in rendered
     if media_type == "audio":
-        assert "• 확인된 오디오: *확인 필요*" in rendered
+        assert "확인된 오디오 *확인 필요* / 영상 전체 *10분*" in rendered
     assert "/private/secret" not in json.dumps([result.cursor, delivery.payload])
 
 
