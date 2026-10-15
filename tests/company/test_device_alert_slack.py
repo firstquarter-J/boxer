@@ -53,7 +53,7 @@ def test_audio_alert_prioritizes_length_difference_and_uses_full_width() -> None
     assert text.startswith("🔎 *감지 내용*\n*오디오 길이 차이: 38.33초 (파일 길이의 21.3%)*")
     assert "• 영상 파일: *2분 59.727초*\n• 확인된 오디오: *2분 21.397초*" in text
     assert "길이 차이가 실제 누락 구간의 합계를 뜻하지는 않아" in text
-    assert text.endswith("감지 시각: 2026-10-14 15:17:03 KST")
+    assert text.endswith("🕒 *감지 시각*\n2026-10-14 15:17:03 KST")
     assert "`" not in text
     blocks = alert._alert_item_blocks(item, card_index=0, include_actions=False, include_device_voice_action=False)
     assert blocks[1] == {"type": "section", "text": {"type": "mrkdwn", "text": text}}
@@ -67,7 +67,7 @@ def test_audio_alert_keeps_other_failures_and_future_api_descriptions() -> None:
         "영상 길이 05:00\n오디오 데이터 누락 합계 00:10 (전체의 3.3%)\n"
         "오디오 데이터 누락 구간: 04:50~05:00\n추가 분석 정보"
     )
-    assert text.startswith("*오디오 데이터 누락: 10초 (영상의 3.3%)*")
+    assert text.startswith("🔎 *감지 내용*\n*오디오 데이터 누락: 10초 (영상의 3.3%)*")
     for value in ("오디오 디코딩 실패", "영상 총길이: *5분*", "04:50~05:00", "추가 분석 정보"):
         assert value in text
     assert "확인 필요" not in text
@@ -86,7 +86,7 @@ def test_video_inspection_failures_use_same_full_width_layout(reason: str) -> No
     text = alert._alert_issue_mrkdwn(item)
     assert reason.split(" (")[0] in text
     assert "• 영상 총길이: *확인 필요*" in text
-    assert text.endswith("감지 시각: 2026-10-14 15:17:03 KST")
+    assert text.endswith("🕒 *감지 시각*\n2026-10-14 15:17:03 KST")
     assert "`" not in text
     blocks = alert._alert_item_blocks(item, card_index=0, include_actions=False, include_device_voice_action=False)
     assert blocks[1] == {"type": "section", "text": {"type": "mrkdwn", "text": text}}
@@ -117,9 +117,9 @@ def test_complete_uniform_summary_preserves_ranges_and_additional_failures() -> 
         "단색 감지 구간: 00:00~00:10, 00:12~00:22 외 98구간 (합계에 포함)\n"
         "감지 기준: 연속 10초 이상 · 구간은 영상 시작 기준\n추가 영상 정보"
     )
-    assert text.startswith("*단색 화면 합계: 16분 40초 (영상의 83.3%)*")
+    assert text.startswith("🔎 *감지 내용*\n*단색 화면 합계: 16분 40초 (영상의 83.3%)*")
     for value in ("*영상 디코딩 실패*", "영상 총길이: *20분*", "외 98구간 (합계에 포함)",
-                  "단색 화면 구간 (영상 시작 기준)", "감지 기준: 연속 10초 이상", "추가 영상 정보"):
+                  "🎞️ *분석 구간*\n• 단색 화면:", "📏 *감지 기준*\n단색: 연속 10초 이상", "추가 영상 정보"):
         assert value in text
     assert "확인 필요" not in text
 
@@ -142,7 +142,7 @@ def test_captureboard_alert_keeps_same_emphasis_and_time_with_or_without_guidanc
         ":rotating_light: *문제 장치*\n`캡처보드`\n\n"
         "🔎 *감지 내용*\n*캡처보드 연결 이상으로 녹화가 중단됐어.*"
     )
-    assert detail.endswith("\n\n감지 시각: 2026-10-15 10:11:31 KST")
+    assert detail.endswith("\n\n🕒 *감지 시각*\n2026-10-15 10:11:31 KST")
     assert "(발생 " not in detail
     assert ("*다음 확인*\n캡처 입력을 확인해." in detail) == bool(guidance)
     assert detail in message["text"]
@@ -164,9 +164,55 @@ def test_recording_alert_groups_measurements_and_preserves_guidance() -> None:
     }
     text = alert._alert_issue_mrkdwn(item)
     assert "• 현재 파일 크기: *0바이트 (빈 파일)*\n• 기대 최소 증가량: *1,024바이트/초*" in text
-    assert "\n\n*영향*\n데이터가 추가되지 않았어.\n\n추가 분석 정보" in text
-    assert text.endswith("\n\n*다음 확인*\n현재 녹화 상태를 확인해.")
+    assert "\n\n💥 *영향*\n데이터가 추가되지 않았어.\n\nℹ️ *추가 정보*\n추가 분석 정보" in text
+    assert text.endswith("\n\n🛠️ *다음 확인*\n현재 녹화 상태를 확인해.")
     assert "감지 시각" not in text
+
+
+def test_reported_freeze_alert_uses_icon_labels_for_every_detail_section() -> None:
+    # 사용자가 지적한 정지 알림을 재현해 제목 없는 수치·기준·시간 문단이 없게 한다.
+    issue = (
+        "녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 29분 59.5초) (발생 2026-10-15 13:46:05 KST)\n"
+        "영상 길이 60:01.967\n첫 정지 감지 시작: 11:31.667 (영상 시작 기준)\n"
+        "정지 감지 기준: 연속 10:00 이상\n"
+        "전체 정지 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)\n"
+        "확인된 내용: 화면 변화가 없는 연속 구간을 감지했어.\n"
+        "영향: 해당 구간의 움직임이 기록되지 않았을 수 있어.\n"
+        "다음 확인: 표시된 시점의 원본 화면과 캡처 입력 상태를 확인해."
+    )
+    message = _rendered_message({**_item(), "alertCategory": "recording_video", "problemComponents": [], "issue": issue})
+    detail = message["blocks"][2]["text"]["text"]
+    paragraphs = detail.split("\n\n")
+    assert [paragraph.split("\n")[0] for paragraph in paragraphs] == [
+        "🔎 *감지 내용*", "📊 *측정 정보*", "📏 *감지 기준*", "📝 *확인된 내용*",
+        "💥 *영향*", "⚠️ *확인 필요*", "🛠️ *다음 확인*", "🕒 *감지 시각*",
+    ]
+    assert paragraphs[0] == "🔎 *감지 내용*\n*최장 연속 정지: 29분 59.5초*"
+    assert paragraphs[1] == (
+        "📊 *측정 정보*\n• 영상 총길이: *60분 1.967초*\n"
+        "• 첫 정지 시작: *11:31.667* (영상 시작 기준)"
+    )
+    assert paragraphs[2] == "📏 *감지 기준*\n정지: 연속 10분 이상"
+    assert paragraphs[-1] == "🕒 *감지 시각*\n2026-10-15 13:46:05 KST"
+    assert all(len(paragraph.split("\n")) > 1 for paragraph in paragraphs)
+    assert detail in message["text"]
+
+
+def test_combined_video_issues_share_one_caution_section_without_losing_limits() -> None:
+    # 복합 이상에도 같은 소제목을 중복 생성하거나 서로 다른 구간을 합산하지 않는다.
+    text = alert._recording_media_issue_mrkdwn(
+        "녹화 파일 영상 이상: 화면 정지 구간 감지 (정지 시간 확인 필요), 단색 화면 구간 감지\n"
+        "영상 길이 60:00\n최장 연속 단색: 00:10.9\n"
+        "전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
+    )
+    assert text.count("⚠️ *확인 필요*\n") == 1
+    assert "정지 시간은 아직 확인되지 않았어." in text
+    assert "전체 단색 구간·합계·비율은 아직 확인되지 않았어." in text
+    assert "*최장 연속 단색: 10.9초*" in text
+    assert "🎞️ *분석 구간*" not in text
+    assert "📏 *감지 기준*" not in text
+    assert "🕒 *감지 시각*" not in text
+    assert "~" not in text and "%" not in text
 
 
 class _App:
@@ -460,7 +506,10 @@ def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
 ])
 def test_all_alert_categories_link_device_to_mda_search_in_blocks_and_text(category: str) -> None:
     # MDA 검색창이 쓰는 두 파라미터를 본문·카드·action target에서 함께 유지한다.
-    item = {**_item(), "hospitalSeq": 43, "device": "MB2-A00071", "alertCategory": category}
+    item = {
+        **_item(), "hospitalSeq": 43, "device": "MB2-A00071", "alertCategory": category,
+        "alertGuidance": "영향: 상태 확인이 필요해.\n다음 확인: 연결 상태를 확인해.",
+    }
     message = _rendered_message(item)
     url = "https://mda.kr.mmtalkbox.com/monitoring?hospitalSeq=43&focusDevice=MB2-A00071"
     link = f"*<{url}|MB2-A00071>*"
@@ -470,6 +519,7 @@ def test_all_alert_categories_link_device_to_mda_search_in_blocks_and_text(categ
     detail = message["blocks"][2]
     assert "fields" not in detail
     assert detail["text"]["text"].count("🔎 *감지 내용*\n") == 1
+    assert "💥 *영향*\n상태 확인이 필요해.\n\n🛠️ *다음 확인*\n연결 상태를 확인해." in detail["text"]["text"]
     assert detail["text"]["text"] in message["text"]
     action = next(block for block in message["blocks"] if block["type"] == "actions")
     target = json.loads(action["elements"][0]["value"])

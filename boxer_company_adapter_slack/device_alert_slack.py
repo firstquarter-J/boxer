@@ -96,6 +96,19 @@ _COMPONENT_TITLES = {
     "pm2": "PM2",
     "storage": "저장 공간",
 }
+# 상세 라벨·순서·간격은 한곳에서 정하고, 없는 항목은 빈 제목 없이 생략한다.
+_ALERT_DETAIL_ICONS = {
+    "감지 내용": "🔎",
+    "측정 정보": "📊",
+    "분석 구간": "🎞️",
+    "감지 기준": "📏",
+    "확인된 내용": "📝",
+    "영향": "💥",
+    "확인 필요": "⚠️",
+    "추가 정보": "ℹ️",
+    "다음 확인": "🛠️",
+    "감지 시각": "🕒",
+}
 
 
 class _DeviceAlertMarkDoneCoordinator:
@@ -386,37 +399,42 @@ def _alert_issue_mrkdwn(item: Mapping[str, Any]) -> str:
     if item.get("alertGuidance"):
         issue += "\n" + str(item["alertGuidance"])
     if item.get("alertCategory") in {"recording_audio", "recording_video"}:
-        detail = _recording_media_issue_mrkdwn(issue)
-    else:
-        # 한 줄 장애도 분석 알림처럼 핵심을 강조하고 발생 시각은 맨 아래에 둔다.
-        lines = issue.splitlines()
-        match = re.search(r" \(발생 ([^)]+)\)$", lines[0])
-        detected_at = match.group(1) if match else ""
-        if match:
-            lines[0] = lines[0][:match.start()]
-        sections = [f"*{lines[0]}*"]
-        for line in lines[1:]:
-            formatted = _alert_detail_line(line)
-            # 연속 측정값은 영상·오디오 비교 목록과 같은 줄 간격으로 묶는다.
-            if formatted.startswith("• ") and sections[-1].startswith("• "):
-                sections[-1] += "\n" + formatted
-            else:
-                sections.append(formatted)
-        if detected_at:
-            sections.append(f"감지 시각: {detected_at}")
-        detail = "\n\n".join(sections)
-    # 공통 라벨 아래에서만 유형별 요약·비교·구간 설명을 달리한다.
-    return f"🔎 *감지 내용*\n{detail}"
+        return _recording_media_issue_mrkdwn(issue)
+    # 일반 장애도 분석 알림과 같은 소제목·순서를 사용하며 원문은 보존한다.
+    sections = {label: [] for label in _ALERT_DETAIL_ICONS}
+    lines = issue.splitlines()
+    match = re.search(r" \(발생 ([^)]+)\)$", lines[0])
+    if match:
+        sections["감지 시각"].append(match.group(1))
+        lines[0] = lines[0][:match.start()]
+    sections["감지 내용"].append(f"*{lines[0]}*")
+    for line in lines[1:]:
+        _append_alert_detail_line(sections, line)
+    return _render_alert_detail_sections(sections)
 
 
-def _alert_detail_line(line: str) -> str:
-    for label in ("확인된 내용", "영향", "다음 확인"):
+def _append_alert_detail_line(sections: dict[str, list[str]], line: str) -> None:
+    # 새 설명도 버리지 않고 알려진 라벨, 측정값, 추가 정보 중 하나에 배치한다.
+    if not line.strip():
+        return
+    for label in _ALERT_DETAIL_ICONS:
         if line.startswith(f"{label}: "):
-            return f"*{label}*\n{line.removeprefix(f'{label}: ')}"
+            sections[label].append(line.removeprefix(f"{label}: "))
+            return
     if ": " in line:
         label, value = line.split(": ", 1)
-        return f"• {label}: *{value}*"
-    return line
+        sections["측정 정보"].append(f"• {label}: *{value}*")
+    else:
+        sections["추가 정보"].append(line)
+
+
+def _render_alert_detail_sections(sections: Mapping[str, list[str]]) -> str:
+    # 모든 소제목은 '이모지 + 굵은 라벨 → 내용'이며 문단 사이만 한 줄 비운다.
+    return "\n\n".join(
+        f"{icon} *{label}*\n" + "\n".join(sections[label])
+        for label, icon in _ALERT_DETAIL_ICONS.items()
+        if sections.get(label)
+    )
 
 
 def _recording_media_issue_mrkdwn(issue: str) -> str:
@@ -436,16 +454,16 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
             parts.append(f"{seconds}초")
         return " ".join(parts)
 
-    headline, comparisons, notes, other, guidance = [], [], [], [], []
-    detected_at = ""
+    sections = {label: [] for label in _ALERT_DETAIL_ICONS}
+    headline, comparisons = sections["감지 내용"], sections["측정 정보"]
     reason = ""
     summarized_reasons = set()
-    for line in issue.splitlines():
+    for index, line in enumerate(issue.splitlines()):
         if line.startswith(("녹화 파일 오디오 이상: ", "녹화 파일 영상 이상: ")):
             reason = line.split(": ", 1)[1]
             match = re.search(r" \(발생 ([^)]+)\)$", reason)
             if match:
-                detected_at = match.group(1)
+                sections["감지 시각"].append(match.group(1))
                 reason = reason[:match.start()]
         elif line.startswith("파일 길이 ") and " · 디코딩 오디오 " in line:
             video, audio = line.removeprefix("파일 길이 ").split(" · 디코딩 오디오 ", 1)
@@ -463,34 +481,34 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
             headline.append(f"*오디오 데이터 누락: {duration(match[1])} (영상의 {match[2]})*")
             summarized_reasons.add("영상 길이 대비 오디오 길이 부족")
         elif line.startswith("오디오 데이터 누락 구간: "):
-            notes.append("*누락 구간 (영상 시작 기준)*\n" + line.removeprefix("오디오 데이터 누락 구간: "))
+            sections["분석 구간"].append("• 오디오 누락: " + line.removeprefix("오디오 데이터 누락 구간: ") + " (영상 시작 기준)")
         elif line == "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)":
-            notes.append("*확인 필요*\n정확한 누락 구간·비율은 아직 확인되지 않았어. 길이 차이가 실제 누락 구간의 합계를 뜻하지는 않아.")
+            sections["확인 필요"].append("정확한 누락 구간·비율은 아직 확인되지 않았어. 길이 차이가 실제 누락 구간의 합계를 뜻하지는 않아.")
         elif (match := re.fullmatch(r"단색 감지 합계 (\S+) \(전체의 ([^)]+)\)", line)):
             headline.append(f"*단색 화면 합계: {duration(match[1])} (영상의 {match[2]})*")
             summarized_reasons.add("단색 화면 구간 감지")
         elif line.startswith("단색 감지 구간: "):
-            notes.append("*단색 화면 구간 (영상 시작 기준)*\n" + line.removeprefix("단색 감지 구간: "))
+            sections["분석 구간"].append("• 단색 화면: " + line.removeprefix("단색 감지 구간: ") + " (영상 시작 기준)")
         elif line.startswith("감지 기준: "):
-            notes.append(line.removesuffix(" · 구간은 영상 시작 기준"))
+            sections["감지 기준"].append("단색: " + line.removeprefix("감지 기준: ").removesuffix(" · 구간은 영상 시작 기준"))
         elif (match := re.fullmatch(r"첫 단색 감지 시작: (\S+) \(영상 시작 기준\)", line)):
             comparisons.append(f"• 첫 단색 시작: *{match[1]}* (영상 시작 기준)")
         elif line.startswith("최장 연속 단색: "):
             headline.append(f"*최장 연속 단색: {duration(line.removeprefix('최장 연속 단색: '))}*")
             summarized_reasons.add("단색 화면 구간 감지")
         elif line == "전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)":
-            notes.append("*확인 필요*\n전체 단색 구간·합계·비율은 아직 확인되지 않았어.")
+            sections["확인 필요"].append("전체 단색 구간·합계·비율은 아직 확인되지 않았어.")
         elif (match := re.fullmatch(r"첫 정지 감지 시작: (\S+) \(영상 시작 기준\)", line)):
             comparisons.append(f"• 첫 정지 시작: *{match[1]}* (영상 시작 기준)")
         elif (match := re.fullmatch(r"정지 감지 기준: 연속 (\S+) 이상", line)):
-            notes.append(f"정지 감지 기준: 연속 {duration(match[1])} 이상")
+            sections["감지 기준"].append(f"정지: 연속 {duration(match[1])} 이상")
         elif line == "전체 정지 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)":
-            notes.append("*확인 필요*\n전체 정지 구간·합계·비율은 아직 확인되지 않았어. 최초 시작과 최장 시간은 서로 다른 구간일 수 있어.")
-        elif line.startswith(("확인된 내용: ", "영향: ", "다음 확인: ")):
-            guidance.append(_alert_detail_line(line))
+            sections["확인 필요"].append("전체 정지 구간·합계·비율은 아직 확인되지 않았어. 최초 시작과 최장 시간은 서로 다른 구간일 수 있어.")
+        elif index == 0 and line.strip():
+            # 아직 분류하지 못한 API 판정도 감지 내용으로 보존한다.
+            headline.append(f"*{line}*")
         else:
-            # 새로운 API 설명도 버리지 않고 그대로 표시한다.
-            other.append(line)
+            _append_alert_detail_line(sections, line)
 
     # 정지는 최장 연속 시간만 보고되므로 단색 합계와 합산하거나 비율을 추정하지 않는다.
     reasons = []
@@ -500,16 +518,11 @@ def _recording_media_issue_mrkdwn(issue: str) -> str:
             reasons.append(f"*최장 연속 정지: {match[1]}*")
         elif item == "화면 정지 구간 감지 (정지 시간 확인 필요)":
             reasons.append("*화면 정지 구간 감지*")
-            notes.append("*확인 필요*\n정지 시간은 아직 확인되지 않았어.")
+            sections["확인 필요"].append("정지 시간은 아직 확인되지 않았어.")
         elif item not in summarized_reasons:
             reasons.append(f"*{item}*")
-    sections = headline + reasons
-    if comparisons:
-        sections.append("\n".join(comparisons))
-    sections.extend(other + notes + guidance)
-    if detected_at:
-        sections.append(f"감지 시각: {detected_at}")
-    return "\n\n".join(sections)
+    headline.extend(reasons)
+    return _render_alert_detail_sections(sections)
 
 
 def _alert_item_blocks(
