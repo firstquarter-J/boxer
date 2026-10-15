@@ -367,58 +367,46 @@ def _alert_title(items: tuple[dict[str, Any], ...]) -> str:
 
 
 def _alert_item_fallback_text(item: Mapping[str, Any]) -> str:
-    components = _problem_components_text(item.get("problemComponents"))
-    lines = [
-        f"*{item['hospital']}*",
-        (
-            f"⚙️ *장비*  {_device_name_text(item)}  ·  "
-            f"🚪 *병실*  `{item['room']}`"
-        ),
-        "",
-    ]
-    if item.get("barcode") or item.get("sessionAt"):
-        lines.extend(
-            (
-                f"🏷️ *바코드*  `{_text(item.get('barcode'), '미확인')}`",
-                (
-                    f"🕐 *{_text(item.get('sessionAtLabel'), '세션 시각')}*  "
-                    f"{_text(item.get('sessionAt'), '미확인')}"
-                ),
-                "",
-            )
-        )
-    if components:
-        lines.append(f":rotating_light: *문제 장치*\n{components}")
-    lines.extend(
-        (
-            _alert_issue_mrkdwn(item),
-            "",
-            f"📞 *전화*\n{_text(item.get('telephone'), '미확인')}",
-            f"💬 *문자*\n{_sms_contact_text(item)}",
-        )
-    )
-    return "\n".join(lines)
+    # 미리보기·접근성 본문도 카드와 같은 순서, 라벨, 문단 간격을 사용한다.
+    sections: list[str] = []
+    for block in _alert_item_blocks(
+        item,
+        card_index=0,
+        include_actions=False,
+        include_device_voice_action=False,
+    ):
+        if "text" in block:
+            sections.append(block["text"]["text"])
+        sections.extend(field["text"] for field in block.get("fields", []))
+    return "\n\n".join(sections)
 
 
 def _alert_issue_mrkdwn(item: Mapping[str, Any]) -> str:
-    if item.get("alertCategory") in {"recording_audio", "recording_video"}:
-        return _recording_media_issue_mrkdwn(str(item["issue"]))
     issue = str(item["issue"])
     if item.get("alertGuidance"):
         issue += "\n" + str(item["alertGuidance"])
-    if "\n" in issue:
-        # 원인·영향·다음 확인은 별도 문단으로 표시하며 발생 시각은 맨 아래로 보낸다.
+    if item.get("alertCategory") in {"recording_audio", "recording_video"}:
+        detail = _recording_media_issue_mrkdwn(issue)
+    else:
+        # 한 줄 장애도 분석 알림처럼 핵심을 강조하고 발생 시각은 맨 아래에 둔다.
         lines = issue.splitlines()
         match = re.search(r" \(발생 ([^)]+)\)$", lines[0])
         detected_at = match.group(1) if match else ""
         if match:
             lines[0] = lines[0][:match.start()]
-        sections = [f"*{lines[0]}*"] + [_alert_detail_line(line) for line in lines[1:]]
+        sections = [f"*{lines[0]}*"]
+        for line in lines[1:]:
+            formatted = _alert_detail_line(line)
+            # 연속 측정값은 영상·오디오 비교 목록과 같은 줄 간격으로 묶는다.
+            if formatted.startswith("• ") and sections[-1].startswith("• "):
+                sections[-1] += "\n" + formatted
+            else:
+                sections.append(formatted)
         if detected_at:
             sections.append(f"감지 시각: {detected_at}")
-        return "\n\n".join(sections)
-    # 분석 구간·합계·기준을 줄별로 보여주고 각 줄의 코드 표시는 닫아 둔다.
-    return "🔎 *감지 내용*\n" + "\n".join(f"`{line}`" for line in item["issue"].splitlines())
+        detail = "\n\n".join(sections)
+    # 공통 라벨 아래에서만 유형별 요약·비교·구간 설명을 달리한다.
+    return f"🔎 *감지 내용*\n{detail}"
 
 
 def _alert_detail_line(line: str) -> str:
@@ -532,20 +520,10 @@ def _alert_item_blocks(
     include_device_voice_action: bool,
 ) -> list[dict[str, Any]]:
     components = _problem_components_text(item.get("problemComponents"))
-    issue_fields: list[dict[str, str]] = []
+    issue_sections: list[str] = []
     if components:
-        issue_fields.append(
-            {
-                "type": "mrkdwn",
-                "text": f":rotating_light: *문제 장치*\n{components}",
-            }
-        )
-    issue_fields.append(
-        {
-            "type": "mrkdwn",
-            "text": _alert_issue_mrkdwn(item),
-        }
-    )
+        issue_sections.append(f":rotating_light: *문제 장치*\n{components}")
+    issue_sections.append(_alert_issue_mrkdwn(item))
     identity_fields = [
         {
             "type": "mrkdwn",
@@ -582,10 +560,12 @@ def _alert_item_blocks(
             "text": {"type": "mrkdwn", "text": f"*{item['hospital']}*"},
             "fields": identity_fields,
         },
-        # 상세 설명은 전체 폭을 쓰되 카드 수·버튼 위치는 유지해 확인 완료 처리를 보존한다.
-        ({"type": "section", "text": {"type": "mrkdwn", "text": "\n\n".join(field["text"] for field in issue_fields)}}
-         if item.get("alertCategory") in {"recording_audio", "recording_video"} or "\n" in item["issue"] or item.get("alertGuidance")
-         else {"type": "section", "fields": issue_fields}),
+        # 모든 감지 내용은 전체 폭과 같은 문단 간격을 쓴다. 식별·연락처는
+        # 짧은 2열로 유지하고 section 수를 보존해 기존 완료 카드도 처리한다.
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n\n".join(issue_sections)},
+        },
         {
             "type": "section",
             "fields": [

@@ -708,7 +708,9 @@ def test_notification_transport_uses_api_render_hint_and_exact_batch_receipt() -
         for block in client.messages[0]["blocks"]
         for field in block.get("fields", [])
     ]
-    assert ":rotating_light: *문제 장치*\n`캡처보드`" in field_texts
+    # notification도 문제 장치와 감지 설명을 같은 전체 폭 영역에 표시한다.
+    issue_text = client.messages[0]["blocks"][2]["text"]["text"]
+    assert ":rotating_light: *문제 장치*\n`캡처보드`\n\n🔎 *감지 내용*\n" in issue_text
     assert "📞 *전화*\n031-123-4567" in field_texts
     assert "💬 *문자*\n010-1234-5678" in field_texts
     assert remember.call_args.kwargs["batch"] is batch

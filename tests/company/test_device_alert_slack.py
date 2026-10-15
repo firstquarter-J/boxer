@@ -50,7 +50,7 @@ def test_audio_alert_prioritizes_length_difference_and_uses_full_width() -> None
         "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)"
     )}
     text = alert._alert_issue_mrkdwn(item)
-    assert text.startswith("*오디오 길이 차이: 38.33초 (파일 길이의 21.3%)*")
+    assert text.startswith("🔎 *감지 내용*\n*오디오 길이 차이: 38.33초 (파일 길이의 21.3%)*")
     assert "• 영상 파일: *2분 59.727초*\n• 확인된 오디오: *2분 21.397초*" in text
     assert "길이 차이가 실제 누락 구간의 합계를 뜻하지는 않아" in text
     assert text.endswith("감지 시각: 2026-10-14 15:17:03 KST")
@@ -122,6 +122,51 @@ def test_complete_uniform_summary_preserves_ranges_and_additional_failures() -> 
                   "단색 화면 구간 (영상 시작 기준)", "감지 기준: 연속 10초 이상", "추가 영상 정보"):
         assert value in text
     assert "확인 필요" not in text
+
+
+@pytest.mark.parametrize("guidance", ["", "다음 확인: 캡처 입력을 확인해."])
+def test_captureboard_alert_keeps_same_emphasis_and_time_with_or_without_guidance(
+    guidance: str,
+) -> None:
+    # 예전 한 줄 payload와 새 안내 payload가 같은 감지 영역으로 렌더링된다.
+    item = {
+        **_item(),
+        "alertCategory": "video_signal",
+        "problemComponents": ["캡처보드"],
+        "issue": "캡처보드 연결 이상으로 녹화가 중단됐어. (발생 2026-10-15 10:11:31 KST)",
+        "alertGuidance": guidance,
+    }
+    message = _rendered_message(item)
+    detail = message["blocks"][2]["text"]["text"]
+    assert detail.startswith(
+        ":rotating_light: *문제 장치*\n`캡처보드`\n\n"
+        "🔎 *감지 내용*\n*캡처보드 연결 이상으로 녹화가 중단됐어.*"
+    )
+    assert detail.endswith("\n\n감지 시각: 2026-10-15 10:11:31 KST")
+    assert "(발생 " not in detail
+    assert ("*다음 확인*\n캡처 입력을 확인해." in detail) == bool(guidance)
+    assert detail in message["text"]
+    # 표시 가공이 완료·문자 action의 원본 장애 식별을 바꾸지 않는다.
+    target = json.loads(message["blocks"][-1]["elements"][0]["value"])
+    assert target["issue"] == item["issue"]
+
+
+def test_recording_alert_groups_measurements_and_preserves_guidance() -> None:
+    # 일반 녹화 알림도 수치는 연속 목록, 안내는 별도 문단으로 구분한다.
+    item = {
+        **_second_item(),
+        "issue": (
+            "녹화 파일 증가가 멈췄어\n현재 파일 크기: 0바이트 (빈 파일)\n"
+            "기대 최소 증가량: 1,024바이트/초\n영향: 데이터가 추가되지 않았어.\n"
+            "추가 분석 정보"
+        ),
+        "alertGuidance": "다음 확인: 현재 녹화 상태를 확인해.",
+    }
+    text = alert._alert_issue_mrkdwn(item)
+    assert "• 현재 파일 크기: *0바이트 (빈 파일)*\n• 기대 최소 증가량: *1,024바이트/초*" in text
+    assert "\n\n*영향*\n데이터가 추가되지 않았어.\n\n추가 분석 정보" in text
+    assert text.endswith("\n\n*다음 확인*\n현재 녹화 상태를 확인해.")
+    assert "감지 시각" not in text
 
 
 class _App:
@@ -364,21 +409,18 @@ def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
         client_msg_id="11111111-1111-1111-1111-111111111111",
     )
 
-    # API 경계 뒤에도 기존 카드의 2열 정보 구조를 exact하게 고정한다.
+    # 식별·연락처는 2열, 감지 내용은 전체 폭으로 표시하고 본문도 같은 간격을 쓴다.
     message = client.chat_postMessage.call_args.kwargs
-    assert message["text"] == "\n".join(
+    assert message["text"] == ":alert: *LED 연결 확인 필요*\n" + "\n\n".join(
         (
-            ":alert: *LED 연결 확인 필요*",
             "*#1 테스트병원*",
             (
-                "⚙️ *장비*  "
+                "⚙️ *장비*\n"
                 "*<https://mda.example.com/monitoring?device=MB2-TEST1|MB2-TEST1>*"
-                "  ·  🚪 *병실*  `1진료실`"
             ),
-            "",
+            "🚪 *병실*\n`1진료실`",
             ":rotating_light: *문제 장치*\n`LED`",
-            "🔎 *감지 내용*\n`LED 이상`",
-            "",
+            "🔎 *감지 내용*\n*LED 이상*",
             "📞 *전화*\n031-123-4567",
             "💬 *문자*\n010-1234-5678",
         )
@@ -400,10 +442,12 @@ def test_renderer_restores_rich_card_layout_for_remote_led_alert() -> None:
         "⚙️ *장비*\n*<https://mda.example.com/monitoring?device=MB2-TEST1|MB2-TEST1>*",
         "🚪 *병실*\n`1진료실`",
     ]
-    assert [field["text"] for field in blocks[2]["fields"]] == [
-        ":rotating_light: *문제 장치*\n`LED`",
-        "🔎 *감지 내용*\n`LED 이상`",
-    ]
+    assert blocks[2] == {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": (
+            ":rotating_light: *문제 장치*\n`LED`\n\n🔎 *감지 내용*\n*LED 이상*"
+        )},
+    }
     assert [field["text"] for field in blocks[3]["fields"]] == [
         "📞 *전화*\n031-123-4567",
         "💬 *문자*\n010-1234-5678",
@@ -422,6 +466,11 @@ def test_all_alert_categories_link_device_to_mda_search_in_blocks_and_text(categ
     link = f"*<{url}|MB2-A00071>*"
     assert link in message["text"]
     assert message["blocks"][1]["fields"][0]["text"] == f"⚙️ *장비*\n{link}"
+    # 유형이 달라도 감지 영역의 폭·라벨·본문 순서는 같고 action target도 보존한다.
+    detail = message["blocks"][2]
+    assert "fields" not in detail
+    assert detail["text"]["text"].count("🔎 *감지 내용*\n") == 1
+    assert detail["text"]["text"] in message["text"]
     action = next(block for block in message["blocks"] if block["type"] == "actions")
     target = json.loads(action["elements"][0]["value"])
     assert target["device"] == "MB2-A00071"
