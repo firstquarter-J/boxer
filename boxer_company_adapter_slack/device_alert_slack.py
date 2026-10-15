@@ -444,13 +444,13 @@ def _append_alert_detail_line(sections: dict[str, list[str]], line: str) -> None
 
 
 def _alert_detail_fields(sections: Mapping[str, list[str]]) -> list[dict[str, str]]:
-    # 짧은 기준과 감지 시각은 실제 Slack fields 두 열로 나란히 배치한다.
+    # 판정 기준은 action 원문에 보존하고, 알림 화면에는 감지 시각만 표시한다.
     return [
         {
             "type": "mrkdwn",
             "text": f"{_ALERT_DETAIL_ICONS[label]} *{label}*\n" + "\n".join(sections[label]),
         }
-        for label in ("감지 기준", "감지 시각") if sections.get(label)
+        for label in ("감지 시각",) if sections.get(label)
     ]
 
 
@@ -485,8 +485,8 @@ def _audio_comparison_fields(sections: Mapping[str, list[str]]) -> list[dict[str
 def _render_alert_detail_body(
     sections: Mapping[str, list[str]], *, compare_lengths: bool = True,
 ) -> str:
-    # 최장/합계는 영상 길이와, 오디오는 확인된 길이와 직접 비교한다.
-    # 최초 시작을 최장 구간의 시작으로 해석하거나 새 비율·끝 시각을 계산하지 않는다.
+    # 최장 연속 구간의 비율과 영상 전체 길이를 두 줄로 표시한다.
+    # 최초 시작을 최장 구간과 연결하거나 누적 이상 비율로 해석하지 않는다.
     headlines = list(sections["감지 내용"])
     measurements = list(sections["측정 정보"])
     video = next((value for value in measurements if value.startswith("영상 전체 ")), "")
@@ -497,6 +497,11 @@ def _render_alert_detail_body(
         measurements.remove(audio)
     if audio and compare_lengths:
         headlines.append(" / ".join(value for value in (audio, video) if value))
+    elif video and compare_lengths and any(
+        headline.startswith(("최장 연속 ", "단색 화면 합계 ")) for headline in headlines
+    ):
+        headlines = [_visual_headline_with_ratio(headline, video) for headline in headlines]
+        headlines.append(video)
     elif video and compare_lengths:
         compared = False
         for index, headline in enumerate(headlines):
@@ -515,6 +520,27 @@ def _render_alert_detail_body(
     lines.extend(sections["추가 정보"])
     lines.extend(f"※ {note}" for note in dict.fromkeys(sections["확인 필요"]))
     return "\n".join(lines)
+
+
+def _visual_headline_with_ratio(headline: str, video: str) -> str:
+    """표시된 실측 최장 시간/총길이로만 비율을 계산하며 action 원문은 바꾸지 않는다."""
+    longest_match = re.fullmatch(r"(최장 연속 (?:정지|단색)) \*([^*]+)\*", headline)
+    video_match = re.fullmatch(r"영상 전체 \*([^*]+)\*", video)
+    if not longest_match or not video_match:
+        return headline
+
+    def seconds(value: str) -> Decimal | None:
+        match = re.fullmatch(r"(?:(\d+)분)?\s*(?:(\d+(?:\.\d+)?)초)?", value)
+        if not match or not any(match.groups()):
+            return None
+        total = Decimal(match[1] or "0") * 60 + Decimal(match[2] or "0")
+        return total if 0 < total <= 7 * 24 * 60 * 60 else None
+
+    longest, total = seconds(longest_match[2]), seconds(video_match[1])
+    if longest is None or total is None or longest > total:
+        return headline
+    ratio = (longest * 100 / total).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return f"{longest_match[1]} *{longest_match[2]}(영상 전체의 {ratio}%)*"
 
 
 def _recording_media_issue_mrkdwn(issue: str) -> str:
@@ -602,14 +628,15 @@ def _recording_media_issue_sections(issue: str) -> dict[str, list[str]]:
         elif (match := re.fullmatch(r"정지 감지 기준: 연속 (\S+) 이상", line)):
             sections["감지 기준"].append(f"정지: 연속 {duration(match[1])} 이상")
         elif line == "전체 정지 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)":
-            sections["확인 필요"].append("첫 정지와 최장 정지는 서로 다른 구간일 수 있어.")
+            # 최장 연속 시간만 비교하므로 전체 구간을 추정하지 않는 상시 안내는 생략한다.
+            continue
         elif index == 0 and line.strip():
             # 아직 분류하지 못한 API 판정도 감지 내용으로 보존한다.
             headline.append(f"*{line}*")
         else:
             _append_alert_detail_line(sections, line)
 
-    # 정지는 최장 연속 시간만 보고되므로 단색 합계와 합산하거나 비율을 추정하지 않는다.
+    # 정지 최장 시간은 단색 합계와 구분하고 비율 표시는 최종 본문 조립에서 처리한다.
     reasons = []
     for item in reason.split(", ") if reason else []:
         match = re.fullmatch(r"화면 정지 구간 감지 \(최장 연속 정지 ([^)]+)\)", item)
@@ -621,6 +648,10 @@ def _recording_media_issue_sections(issue: str) -> dict[str, list[str]]:
         elif item not in summarized_reasons:
             reasons.append(f"*{item}*")
     headline.extend(reasons)
+    if "영상 트랙 없음" in reason.split(", "):
+        # 영상이 없는 파일의 컨테이너 길이는 알림 판단에 도움이 되지 않아 숨긴다.
+        # action 원문은 유지하고 카드·미리보기에 쓰는 표시값만 제외한다.
+        comparisons[:] = [value for value in comparisons if not value.startswith("영상 전체 ")]
     return sections
 
 
@@ -686,7 +717,7 @@ def _alert_item_blocks(
             "text": {"type": "mrkdwn", "text": f"🏥 *{hospital_title}*"},
             "fields": identity_fields,
         },
-        # 비교값은 전체 폭 한 문단, 기준·시각은 두 열로 묶는다.
+        # 비교값은 전체 폭, 감지 시각은 짧은 부가 정보로 표시한다.
         # section 수는 유지해 기존 완료 카드와 같은 위치 계약을 사용한다.
         detail_block,
         {

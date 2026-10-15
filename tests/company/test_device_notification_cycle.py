@@ -694,11 +694,10 @@ def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload()
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    assert "단색 화면 합계 *5분 40초* (영상의 56.7%) / 영상 전체 *10분*" in message["text"]
-    assert "최장 연속 정지 *5분 30.933초* / 영상 전체 *10분*" in message["text"]
-    assert "📏 *감지 기준*\n단색: 연속 10초 이상" in message["text"]
-    assert "단색: 최장 연속 구간이 영상 전체의 50% 이상" in message["text"]
-    assert "정지: 최장 연속 구간이 영상 전체의 50% 이상" in message["text"]
+    assert "단색 화면 합계 *5분 40초* (영상의 56.7%)" in message["text"]
+    assert "최장 연속 정지 *5분 30.933초(영상 전체의 55.2%)*\n영상 전체 *10분*" in message["text"]
+    assert "감지 기준" not in message["text"]
+    assert "알림 기준" not in message["text"]
     rendered = json.dumps(message["blocks"], ensure_ascii=False)
     assert "00:08~00:18, 03:20~08:50" in rendered
     assert "focusDevice=MB2-C00992" in rendered
@@ -762,6 +761,7 @@ def test_audio_intervals_survive_cursor_and_reach_slack_and_sheet_without_sendin
 @pytest.mark.parametrize(("media_type", "issue", "title"), [
     ("video", "video_frozen", "녹화 영상 이상 감지"),
     ("video", "video_uniform_color", "녹화 영상 이상 감지"),
+    ("video", "video_stream_missing", "녹화 영상 이상 감지"),
     ("audio", "audio_duration_mismatch", "녹화 오디오 이상 감지"),
 ])
 def test_media_quality_delivery_reaches_slack_renderer(
@@ -802,9 +802,14 @@ def test_media_quality_delivery_reaches_slack_renderer(
     assert "2026-08-14 09:49:00 KST" in rendered
     actions = [block for block in message["blocks"] if block["type"] == "actions"]
     if media_type == "video":
-        # API에서 추가한 총길이가 카드와 알림 미리보기에 모두 전달된다.
-        assert "영상 전체 *10분*" in rendered
-        assert "영상 전체 *10분*" in message["text"]
+        # 영상 트랙이 없을 때만 총길이를 숨기고 기존 영상 비교는 유지한다.
+        if issue == "video_stream_missing":
+            assert "🔎 *감지 내용*\n*영상 트랙 없음*" in message["text"]
+            assert "영상 전체" not in rendered
+            assert "영상 전체" not in message["text"]
+        else:
+            assert "영상 전체 *10분*" in rendered
+            assert "영상 전체 *10분*" in message["text"]
         from boxer_company.transport_contracts import (
             DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
             DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -825,9 +830,10 @@ def test_media_quality_delivery_reaches_slack_renderer(
             target = json.loads(button["value"])
             assert target["alertCategory"] == "recording_video"
             assert target["device"] == "MB2-C00992"
+            assert "영상 길이 10:00" in target["issue"]
         if issue == "video_frozen":
-            assert "최장 연속 정지 *5분 30.933초*" in rendered
-            assert "최장 연속 정지 *5분 30.933초*" in message["text"]
+            assert "최장 연속 정지 *5분 30.933초(영상 전체의 55.2%)*" in rendered
+            assert "최장 연속 정지 *5분 30.933초(영상 전체의 55.2%)*" in message["text"]
     else:
         assert actions == []
     assert message["client_msg_id"]

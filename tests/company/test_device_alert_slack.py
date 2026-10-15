@@ -99,19 +99,27 @@ def test_audio_alert_keeps_other_failures_and_future_api_descriptions() -> None:
     assert "확인 필요" not in text
 
 
-@pytest.mark.parametrize("reason", [
-    "녹화 파일 없음", "영상 파일 정보 읽기 실패", "영상 트랙 없음",
-    "영상 디코딩 실패", "재생 가능한 영상 프레임 없음",
-    "화면 정지 구간 감지 (정지 시간 확인 필요)", "단색 화면 구간 감지",
+@pytest.mark.parametrize(("reason", "length"), [
+    ("녹화 파일 없음", "확인 필요"),
+    ("영상 파일 정보 읽기 실패", "확인 필요"),
+    ("영상 트랙 없음", "확인 필요"),
+    ("영상 트랙 없음", "00:21.854"),
+    ("영상 디코딩 실패", "확인 필요"),
+    ("재생 가능한 영상 프레임 없음", "확인 필요"),
+    ("화면 정지 구간 감지 (정지 시간 확인 필요)", "확인 필요"),
+    ("단색 화면 구간 감지", "확인 필요"),
 ])
-def test_video_inspection_failures_use_same_full_width_layout(reason: str) -> None:
-    # 지표가 없는 판정도 원인을 보존하고 총길이를 추측하지 않는다.
+def test_video_inspection_failures_use_same_full_width_layout(reason: str, length: str) -> None:
+    # 원인은 보존하되 영상 트랙이 없으면 길이의 확인 여부와 관계없이 표시하지 않는다.
     item = {**_item(), "alertCategory": "recording_video", "problemComponents": [], "issue": (
-        f"녹화 파일 영상 이상: {reason} (발생 2026-10-14 15:17:03 KST)\n영상 길이 확인 필요"
+        f"녹화 파일 영상 이상: {reason} (발생 2026-10-14 15:17:03 KST)\n영상 길이 {length}"
     )}
     text = alert._alert_issue_mrkdwn(item)
     assert reason.split(" (")[0] in text
-    assert "영상 전체 *확인 필요*" in text
+    if reason == "영상 트랙 없음":
+        assert text.split("\n\n")[0] == "🔎 *감지 내용*\n*영상 트랙 없음*"
+    else:
+        assert "영상 전체 *확인 필요*" in text
     assert text.endswith("🕒 *감지 시각*\n2026-10-14 15:17:03 KST")
     assert "`" not in text
     blocks = alert._alert_item_blocks(item, card_index=0, include_actions=False, include_device_voice_action=False)
@@ -121,18 +129,18 @@ def test_video_inspection_failures_use_same_full_width_layout(reason: str) -> No
 
 
 def test_video_freeze_and_legacy_uniform_metrics_remain_separate() -> None:
-    # 최초 시작과 최장 구간이 다를 수 있어 끝 시각·합계·비율을 만들지 않는다.
+    # 최장 구간의 비율만 계산하고 최초 시작으로 끝 시각·전체 합계를 만들지 않는다.
     text = alert._recording_media_issue_mrkdwn(
         "녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 50분 31.8초), 단색 화면 구간 감지\n"
         "영상 길이 60:00\n첫 단색 감지 시작: 00:08.333 (영상 시작 기준)\n"
         "최장 연속 단색: 00:10.9\n전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
     )
-    assert "최장 연속 정지 *50분 31.8초* / 영상 전체 *60분*" in text
-    assert "최장 연속 단색 *10.9초* / 영상 전체 *60분*" in text
+    assert "최장 연속 정지 *50분 31.8초(영상 전체의 84.2%)*" in text
+    assert "최장 연속 단색 *10.9초(영상 전체의 0.3%)*" in text
     assert "첫 단색 시작 *00:08.333* (영상 시작 기준)" in text
     assert "단색 화면 합계" not in text
     assert "~" not in text
-    assert "%" not in text
+    assert "영상 전체 *60분*" in text
 
 
 def test_complete_uniform_summary_preserves_ranges_and_additional_failures() -> None:
@@ -143,11 +151,36 @@ def test_complete_uniform_summary_preserves_ranges_and_additional_failures() -> 
         "단색 감지 구간: 00:00~00:10, 00:12~00:22 외 98구간 (합계에 포함)\n"
         "감지 기준: 연속 10초 이상 · 구간은 영상 시작 기준\n추가 영상 정보"
     )
-    assert text.startswith("🔎 *감지 내용*\n단색 화면 합계 *16분 40초* (영상의 83.3%) / 영상 전체 *20분*")
+    assert text.startswith("🔎 *감지 내용*\n단색 화면 합계 *16분 40초* (영상의 83.3%)")
     for value in ("*영상 디코딩 실패*", "외 98구간 (합계에 포함)",
-                  "단색 구간 00:00~00:10", "📏 *감지 기준*\n단색: 연속 10초 이상", "추가 영상 정보"):
+                  "단색 구간 00:00~00:10", "영상 전체 *20분*", "추가 영상 정보"):
         assert value in text
     assert "확인 필요" not in text
+    assert "감지 기준" not in text
+
+
+@pytest.mark.parametrize(("longest", "video_length", "ratio"), [
+    ("5분", "10:00", "50.0"),
+    ("1초", "00:03", "33.3"),
+    ("1분 0.001초", "01:00.001", "100.0"),
+    ("0초", "00:10", None),
+    ("11초", "00:10", None),
+    ("5초", "00:00", None),
+    ("5초", None, None),
+])
+def test_longest_ratio_uses_valid_measured_lengths_only(
+    longest: str, video_length: str | None, ratio: str | None,
+) -> None:
+    # 길이 미확인·0·모순된 구간에는 추정 백분율을 붙이지 않는다.
+    length = f"영상 길이 {video_length}" if video_length is not None else "영상 길이 확인 필요"
+    text = alert._recording_media_issue_mrkdwn(
+        f"녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 {longest})\n{length}"
+    )
+    assert "\n영상 전체 " in text
+    if ratio is None:
+        assert "%" not in text
+    else:
+        assert f"최장 연속 정지 *{longest}(영상 전체의 {ratio}%)*" in text
 
 
 @pytest.mark.parametrize("guidance", ["", "다음 확인: 캡처 입력을 확인해."])
@@ -198,11 +231,11 @@ def test_recording_alert_groups_measurements_without_repeating_guidance() -> Non
     )
 
 
-def test_reported_freeze_alert_groups_comparison_and_pairs_criterion_with_time() -> None:
-    # 비교값은 한 문단, 짧은 기준·시각은 두 열이며 중복 설명은 표시하지 않는다.
+def test_reported_freeze_alert_shows_ratio_and_hides_criterion_and_note() -> None:
+    # 사용자 예시의 실제 시간으로 최장 비율·총길이 줄 구분과 action 원문 보존을 확인한다.
     issue = (
-        "녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 29분 59.5초) (발생 2026-10-15 13:46:05 KST)\n"
-        "영상 길이 60:01.967\n첫 정지 감지 시작: 11:31.667 (영상 시작 기준)\n"
+        "녹화 파일 영상 이상: 화면 정지 구간 감지 (최장 연속 정지 26분 9.434초) (발생 2026-10-15 16:58:44 KST)\n"
+        "영상 길이 33:47.467\n첫 정지 감지 시작: 07:38.033 (영상 시작 기준)\n"
         "정지 감지 기준: 연속 10:00 이상\n"
         "전체 정지 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)\n"
         "확인된 내용: 화면 변화가 없는 연속 구간을 감지했어.\n"
@@ -212,16 +245,16 @@ def test_reported_freeze_alert_groups_comparison_and_pairs_criterion_with_time()
     message = _rendered_message({**_item(), "alertCategory": "recording_video", "problemComponents": [], "issue": issue})
     detail = message["blocks"][2]["text"]["text"]
     assert detail == (
-        "🔎 *감지 내용*\n최장 연속 정지 *29분 59.5초* / 영상 전체 *60분 1.967초*\n"
-        "첫 정지 시작 *11:31.667* (영상 시작 기준)\n"
-        "※ 첫 정지와 최장 정지는 서로 다른 구간일 수 있어."
+        "🔎 *감지 내용*\n최장 연속 정지 *26분 9.434초(영상 전체의 77.4%)*\n영상 전체 *33분 47.467초*\n"
+        "첫 정지 시작 *07:38.033* (영상 시작 기준)"
     )
     assert message["blocks"][2]["fields"] == [
-        {"type": "mrkdwn", "text": "📏 *감지 기준*\n정지: 연속 10분 이상"},
-        {"type": "mrkdwn", "text": "🕒 *감지 시각*\n2026-10-15 13:46:05 KST"},
+        {"type": "mrkdwn", "text": "🕒 *감지 시각*\n2026-10-15 16:58:44 KST"},
     ]
     assert detail in message["text"]
     assert "측정 정보" not in message["text"]
+    assert "감지 기준" not in message["text"]
+    assert "서로 다른 구간" not in message["text"]
     target = json.loads(message["blocks"][-1]["elements"][0]["value"])
     assert target["issue"] == issue
 
@@ -235,11 +268,11 @@ def test_combined_video_issues_keep_unknown_values_as_short_notes() -> None:
     )
     assert "⚠️ *확인 필요*" not in text
     assert "※ 정지 시간은 아직 확인되지 않았어." in text
-    assert "최장 연속 단색 *10.9초* / 영상 전체 *60분*" in text
+    assert "최장 연속 단색 *10.9초(영상 전체의 0.3%)*" in text
     assert "🎞️ *분석 구간*" not in text
     assert "📏 *감지 기준*" not in text
     assert "🕒 *감지 시각*" not in text
-    assert "~" not in text and "%" not in text
+    assert "~" not in text and "영상 전체 *60분*" in text
 
 
 def test_reported_uniform_alert_matches_approved_compact_preview() -> None:
@@ -254,7 +287,7 @@ def test_reported_uniform_alert_matches_approved_compact_preview() -> None:
     )}
     message = _rendered_message(item)
     expected = (
-        "🔎 *감지 내용*\n최장 연속 단색 *21.633초* / 영상 전체 *39.934초*\n"
+        "🔎 *감지 내용*\n최장 연속 단색 *21.633초(영상 전체의 54.2%)*\n영상 전체 *39.934초*\n"
         "첫 단색 시작 *00:18.3* (영상 시작 기준)"
     )
     assert message["blocks"][2] == {"type": "section", "text": {"type": "mrkdwn", "text": expected}}
@@ -765,7 +798,7 @@ def test_mark_done_highlights_media_alert_without_losing_session_details(
     assert blocks[1]["fields"] == message["blocks"][1]["fields"]
     assert "12345678901" in json.dumps(blocks[1], ensure_ascii=False)
     assert blocks[2:4] == message["blocks"][2:4]
-    assert len(blocks[2]["fields"]) == 2
+    assert len(blocks[2]["fields"]) == (2 if media_type == "audio" else 1)
     expected_actions = {alert.DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL}
     if include_voice:
         expected_actions.add(alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE)
