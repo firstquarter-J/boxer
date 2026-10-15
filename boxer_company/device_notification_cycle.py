@@ -66,6 +66,7 @@ _RECORDING_CRITICALLY_STALLED = "recording_critically_stalled"
 _SEGMENTED_RECORDINGS_MERGE_ERROR = "segmented_recordings_merge_error"
 _VIDEO_DURATION_MISMATCH = "video_duration_mismatch"
 _RECORDING_MEDIA_QUALITY_ISSUE = "recording_media_quality_issue"
+_RECORDING_VISUAL_ALERT_MIN_RATIO = 0.5
 _SUPPORTED_CODES = (
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
@@ -872,6 +873,34 @@ class DeviceNotificationAlertCycleHandler:
     ) -> tuple[AutomationDelivery | None, dict[str, Any] | None]:
         if event["code"] == _RECORDING_MEDIA_QUALITY_ISSUE:
             details = event["details"]
+            for issue_code, metric in (("video_frozen", "freeze"), ("video_uniform_color", "uniformColor")):
+                if issue_code not in details.get("issues", []):
+                    continue
+                # 원본 DB·장비 검사 기록은 유지하고 발송 사유만 거른다. 누적
+                # 정지·단색 합계가 아니라 각각의 최장 연속 구간과 실측 총길이를 비교한다.
+                video = normalize_recording_video_details(details)
+                duration = video["durationSec"]
+                longest = video["video"]["visualAnalysis"][metric]["maxDurationSec"]
+                valid = bool(duration and longest and 0 < longest <= duration)
+                if not valid or longest < duration * _RECORDING_VISUAL_ALERT_MIN_RATIO:
+                    self._logger.info(
+                        "Recording visual alert suppressed notification_id=%s "
+                        "issue=%s reason=%s max_duration_sec=%s "
+                        "video_duration_sec=%s min_ratio=%s",
+                        event["notificationId"],
+                        issue_code,
+                        "below_ratio" if valid else "invalid_duration",
+                        longest,
+                        duration,
+                        _RECORDING_VISUAL_ALERT_MIN_RATIO,
+                    )
+                    # 다른 이상은 각각 판정하고 pending 원본은 수정하지 않는다.
+                    # 남은 발송 사유가 없으면 아래에서 알림 없이 소비한다.
+                    details = {
+                        **details,
+                        "issues": [issue for issue in details["issues"] if issue != issue_code],
+                    }
+                    event = {**event, "details": details}
             if not details.get("mediaType") or not details.get("issues"):
                 # 이상 사유가 없는 정상·미완료 payload는 소비만 하고 알리지 않는다.
                 return None, None

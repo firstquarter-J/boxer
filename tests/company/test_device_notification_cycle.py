@@ -292,8 +292,10 @@ def _media_quality_event(
             "video": {
                 "path": "/private/video.mp4", "diagnostic": "raw-log",
                 "visualAnalysis": {"freeze": {
-                    "detected": True, "maxDurationSec": 270.933,
-                    "thresholdSec": 60, "firstDetectedAtSec": 802.067,
+                    "detected": True, "maxDurationSec": 330.933,
+                    "thresholdSec": 60, "firstDetectedAtSec": 8.067,
+                }, "uniformColor": {
+                    "thresholdSec": 10, "firstDetectedAtSec": 8, "maxDurationSec": 330.933,
                 }},
             },
         },
@@ -379,20 +381,13 @@ def test_media_quality_builds_slack_alert_without_sms_or_upload_wait(
     (59.999, "최장 연속 정지 59.999초"),
     (60.001, "최장 연속 정지 1분 0.001초"),
     (3601.25, "최장 연속 정지 60분 1.25초"),
-    (None, "정지 시간 확인 필요"),
-    (0, "정지 시간 확인 필요"),
-    (-60, "정지 시간 확인 필요"),
-    (True, "정지 시간 확인 필요"),
-    ("unknown", "정지 시간 확인 필요"),
-    (float("nan"), "정지 시간 확인 필요"),
-    (float("inf"), "정지 시간 확인 필요"),
-    (10 ** 400, "정지 시간 확인 필요"),
 ])
 def test_freeze_duration_survives_cursor_reload_without_guessing(
-    duration: object, expected: str,
+    duration: float, expected: str,
 ) -> None:
-    # 실측값이 없으면 영상 길이·감지 기준·세션 경과 시간으로 대체하지 않는다.
+    # 50% 경계의 실제 최장 시간을 cursor 재시작 후에도 그대로 전달한다.
     event = _media_quality_event(issues=["video_frozen"])
+    event["details"]["durationSec"] = duration * 2
     event["details"]["video"]["visualAnalysis"]["freeze"]["maxDurationSec"] = duration
     normalized = cycle._normalize_event(event)
     restored = json.loads(json.dumps(normalized, allow_nan=False))
@@ -416,16 +411,157 @@ def test_freeze_duration_survives_cursor_reload_without_guessing(
 @pytest.mark.parametrize("video", [None, [], {}, {"visualAnalysis": []}, {
     "visualAnalysis": {"freeze": "invalid"},
 }])
-def test_freeze_alert_with_missing_or_malformed_metrics_still_delivers(video: object) -> None:
+def test_freeze_alert_with_missing_or_malformed_metrics_is_suppressed(video: object) -> None:
     event = _media_quality_event(issues=["video_frozen"])
     event["details"]["video"] = video
-    deps, _mocks = _deps(next_result=(90, event))
+    deps, mocks = _deps(next_result=(90, event))
     result = DeviceNotificationAlertCycleHandler(deps).run(
         _request(cursor=_initialized_cursor(89))
     )
-    assert "정지 시간 확인 필요" in result.deliveries[0].payload[
-        "alertSummary"
-    ]["deviceResults"][0]["priorityReason"]
+    assert result.deliveries == ()
+    assert result.cursor["pendingEvents"] == []
+    mocks["media_session"].assert_not_called()
+
+
+@pytest.mark.parametrize(("duration", "longest", "should_send"), [
+    (600, 299.999, False), (600, 300, True), (600, 300.001, True),
+    (600, 600, True), (600, 600.001, False),
+    (3601.967, 1799.5, False), (1512.1, 762.367, True),
+    *[(value, 300, False) for value in (
+        None, 0, -1, True, "600", float("nan"), float("inf"), 10 ** 400,
+    )],
+    *[(600, value, False) for value in (
+        None, 0, -1, True, "300", float("nan"), float("inf"), 10 ** 400,
+    )],
+])
+@pytest.mark.parametrize(("issue_code", "metric"), [
+    ("video_frozen", "freeze"), ("video_uniform_color", "uniformColor"),
+])
+def test_visual_alert_requires_measured_half_video_and_logs_suppression(
+    issue_code: str, metric: str, duration: object, longest: object, should_send: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 반올림 전 50%를 판정한다. 예상 길이와 감지 임계값은 분모·최장값 대체에 쓰지 않는다.
+    event = _media_quality_event(issues=[issue_code])
+    event["details"]["durationSec"] = duration
+    event["details"]["video"]["visualAnalysis"][metric]["maxDurationSec"] = longest
+    restored = json.loads(json.dumps(cycle._normalize_event(event), allow_nan=False))
+    original = json.loads(json.dumps(restored))
+    deps, mocks = _deps()
+    with caplog.at_level(logging.INFO, logger=cycle.__name__):
+        result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor={
+            **_initialized_cursor(90), "pendingEvents": [restored],
+        }))
+
+    assert bool(result.deliveries) is should_send
+    assert restored == original
+    assert event["details"]["issues"] == [issue_code]
+    assert result.cursor["lastSeenId"] == 90
+    if should_send:
+        assert "Recording visual alert suppressed" not in caplog.text
+        mocks["media_session"].assert_called_once_with(90)
+    else:
+        assert result.cursor["pendingEvents"] == []
+        assert result.cursor["pendingDeliveryContexts"] == {}
+        assert "Recording visual alert suppressed notification_id=90" in caplog.text
+        assert "min_ratio=0.5" in caplog.text
+        assert "max_duration_sec=" in caplog.text
+        assert "video_duration_sec=" in caplog.text
+        assert "reason=" in caplog.text
+        mocks["media_session"].assert_not_called()
+    for name in ("append_sheet", "send_sms", "claim_sms", "remember_sms", "verify_video", "next"):
+        mocks[name].assert_not_called()
+    for private_value in ("private-media-file", "81000000000", "/private/", "raw-log"):
+        assert private_value not in caplog.text
+
+
+@pytest.mark.parametrize("other_issue", ["video_uniform_color", "video_decode_failed"])
+@pytest.mark.parametrize("longest", [299.999, None, 601])
+def test_suppressed_freeze_preserves_other_issues_and_original_pending_event(
+    other_issue: str, longest: float | None,
+) -> None:
+    # 같은 파일의 다른 문제는 발송하고, ACK 전까지 원본 정지 지표도 queue에 보존한다.
+    event = _media_quality_event(issues=["video_frozen", other_issue])
+    event["details"]["video"]["visualAnalysis"]["freeze"]["maxDurationSec"] = longest
+    deps, mocks = _deps()
+    handler = DeviceNotificationAlertCycleHandler(deps)
+    result = handler.run(_request(cursor={
+        **_initialized_cursor(90), "pendingEvents": [event],
+    }))
+
+    delivery, = result.deliveries
+    issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    assert cycle._MEDIA_ISSUE_LABELS[other_issue] in issue
+    assert "정지" not in issue
+    pending, = result.cursor["pendingEvents"]
+    assert pending["details"]["issues"] == ["video_frozen", other_issue]
+    assert pending["details"]["video"]["visualAnalysis"]["freeze"]["maxDurationSec"] == longest
+    acknowledged = handler.acknowledge(_request(cursor=dict(result.cursor)), (
+        AutomationDeliveryReceipt(
+            delivery_id=delivery.delivery_id, status="sent",
+            external_message_id="1710000000.090", delivered_at=_NOW,
+        ),
+    ))
+    assert acknowledged["pendingEvents"] == []
+    assert mocks["append_sheet"].call_args.args[0][0]["issue"] == issue
+    mocks["send_sms"].assert_not_called()
+
+
+@pytest.mark.parametrize(("freeze", "uniform", "expected"), [
+    (299.999, 299.999, []),
+    (299.999, 300, ["단색"]),
+    (300, 299.999, ["정지"]),
+    (300, 300, ["정지", "단색"]),
+])
+def test_mixed_visual_issues_use_each_longest_segment(
+    freeze: float, uniform: float, expected: list[str],
+) -> None:
+    # 같은 이벤트여도 각각 판정하며 한 종류가 기준을 넘었다고 다른 종류를 붙이지 않는다.
+    event = _media_quality_event(issues=["video_frozen", "video_uniform_color"])
+    visual = event["details"]["video"]["visualAnalysis"]
+    visual["freeze"]["maxDurationSec"] = freeze
+    visual["uniformColor"]["maxDurationSec"] = uniform
+    deps, _ = _deps(next_result=(90, event))
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor=_initialized_cursor(89)))
+    if not expected:
+        assert result.deliveries == ()
+        return
+    issue = result.deliveries[0].payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+    for label in ("정지", "단색"):
+        assert (label in issue) is (label in expected)
+
+
+def test_uniform_total_over_half_does_not_replace_longest_segment() -> None:
+    # 두 40초 구간의 합계가 80%여도 최장 연속 구간은 40%이므로 알리지 않는다.
+    event = _media_quality_event(issues=["video_uniform_color"])
+    event["details"]["durationSec"] = 100
+    event["details"]["video"]["visualAnalysis"]["uniformColor"] = {
+        "thresholdSec": 10, "maxDurationSec": 40, "firstDetectedAtSec": 0,
+        "timeline": {"status": "complete", "videoDurationSec": 100,
+                     "intervals": [{"startSec": 0, "endSec": 40}, {"startSec": 60, "endSec": 100}],
+                     "intervalCount": 2, "durationSec": 80},
+    }
+    deps, mocks = _deps(next_result=(90, event))
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor=_initialized_cursor(89)))
+    assert result.deliveries == ()
+    mocks["append_sheet"].assert_not_called()
+
+
+def test_suppressed_freeze_does_not_block_next_event_after_cursor_reload() -> None:
+    # 미발송 이벤트도 소비해 다음 알림을 막거나 재시작 때 반복 처리하지 않는다.
+    event = _media_quality_event(90, issues=["video_frozen"])
+    event["details"]["video"]["visualAnalysis"]["freeze"]["maxDurationSec"] = 299.999
+    deps, mocks = _deps()
+    first = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor={
+        **_initialized_cursor(91), "pendingEvents": [event, _captureboard_event(91)],
+    }))
+    assert first.deliveries == ()
+    assert [item["notificationId"] for item in first.cursor["pendingEvents"]] == [91]
+    second = DeviceNotificationAlertCycleHandler(deps).run(_request(
+        cursor=json.loads(json.dumps(first.cursor)),
+    ))
+    assert second.deliveries[0].delivery_id == "device_notification:91"
+    mocks["next"].assert_not_called()
 
 
 @pytest.mark.parametrize(("duration", "expected"), [
@@ -435,7 +571,7 @@ def test_freeze_alert_with_missing_or_malformed_metrics_still_delivers(video: ob
     ("600", "영상 길이 확인 필요"), (float("nan"), "영상 길이 확인 필요"),
     (float("inf"), "영상 길이 확인 필요"), (10 ** 400, "영상 길이 확인 필요"),
 ])
-@pytest.mark.parametrize("issue_code", ["video_frozen", "video_uniform_color", "video_decode_failed"])
+@pytest.mark.parametrize("issue_code", ["video_decode_failed"])
 def test_video_length_survives_cursor_reload_without_using_expected_duration(
     duration: object, expected: str, issue_code: str,
 ) -> None:
@@ -506,7 +642,7 @@ def test_same_recording_video_and_audio_survive_cursor_reload_and_ack() -> None:
         assert item["alertCategory"] == category
         if event_id == 90:
             assert (
-                "화면 정지 구간 감지 (최장 연속 정지 4분 30.933초), 단색 화면 구간 감지"
+                "화면 정지 구간 감지 (최장 연속 정지 5분 30.933초), 단색 화면 구간 감지"
             ) in item["priorityReason"]
         failed = handler.acknowledge(
             _request(cursor=dict(result.cursor)),
@@ -536,10 +672,10 @@ def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload()
     # 단색·정지 혼합 알림을 저장·복원해도 각 지표와 줄 구분을 보존한다.
     event = _media_quality_event(issues=["video_frozen", "video_uniform_color"])
     event["details"]["video"]["visualAnalysis"]["uniformColor"] = {
-        "thresholdSec": 10, "firstDetectedAtSec": 8, "maxDurationSec": 30,
+        "thresholdSec": 10, "firstDetectedAtSec": 8, "maxDurationSec": 330,
         "timeline": {"status": "complete", "videoDurationSec": 600,
-                     "intervals": [{"startSec": 8, "endSec": 18}, {"startSec": 200, "endSec": 230}],
-                     "intervalCount": 2, "durationSec": 40},
+                     "intervals": [{"startSec": 8, "endSec": 18}, {"startSec": 200, "endSec": 530}],
+                     "intervalCount": 2, "durationSec": 340},
     }
     normalized = json.loads(json.dumps(cycle._normalize_event(event), allow_nan=False))
     deps, mocks = _deps()
@@ -547,9 +683,9 @@ def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload()
     result = handler.run(_request(cursor={**_initialized_cursor(90), "pendingEvents": [normalized]}))
     delivery, = result.deliveries
     issue = delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
-    assert "최장 연속 정지 4분 30.933초" in issue
-    assert "단색 감지 합계 00:40 (전체의 6.7%)" in issue
-    assert "00:08~00:18, 03:20~03:50" in issue
+    assert "최장 연속 정지 5분 30.933초" in issue
+    assert "단색 감지 합계 05:40 (전체의 56.7%)" in issue
+    assert "00:08~00:18, 03:20~08:50" in issue
     client = Mock()
     client.chat_postMessage.return_value = {"ts": "1710000000.090"}
     client.chat_getPermalink.return_value = {"permalink": "https://slack.example/p90"}
@@ -558,11 +694,13 @@ def test_uniform_intervals_preserve_freeze_and_reach_slack_after_cursor_reload()
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    assert "단색 화면 합계 *40초* (영상의 6.7%) / 영상 전체 *10분*" in message["text"]
-    assert "최장 연속 정지 *4분 30.933초* / 영상 전체 *10분*" in message["text"]
+    assert "단색 화면 합계 *5분 40초* (영상의 56.7%) / 영상 전체 *10분*" in message["text"]
+    assert "최장 연속 정지 *5분 30.933초* / 영상 전체 *10분*" in message["text"]
     assert "📏 *감지 기준*\n단색: 연속 10초 이상" in message["text"]
+    assert "단색: 최장 연속 구간이 영상 전체의 50% 이상" in message["text"]
+    assert "정지: 최장 연속 구간이 영상 전체의 50% 이상" in message["text"]
     rendered = json.dumps(message["blocks"], ensure_ascii=False)
-    assert "00:08~00:18, 03:20~03:50" in rendered
+    assert "00:08~00:18, 03:20~08:50" in rendered
     assert "focusDevice=MB2-C00992" in rendered
     assert len(issue) < 1000
     assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
@@ -688,8 +826,8 @@ def test_media_quality_delivery_reaches_slack_renderer(
             assert target["alertCategory"] == "recording_video"
             assert target["device"] == "MB2-C00992"
         if issue == "video_frozen":
-            assert "최장 연속 정지 *4분 30.933초*" in rendered
-            assert "최장 연속 정지 *4분 30.933초*" in message["text"]
+            assert "최장 연속 정지 *5분 30.933초*" in rendered
+            assert "최장 연속 정지 *5분 30.933초*" in message["text"]
     else:
         assert actions == []
     assert message["client_msg_id"]

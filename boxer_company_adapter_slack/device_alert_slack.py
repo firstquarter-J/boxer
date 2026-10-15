@@ -583,6 +583,10 @@ def _recording_media_issue_sections(issue: str) -> dict[str, list[str]]:
             summarized_reasons.add("단색 화면 구간 감지")
         elif line.startswith("단색 감지 구간: "):
             sections["분석 구간"].append("단색 구간 " + line.removeprefix("단색 감지 구간: ") + " (영상 시작 기준)")
+        elif line.startswith(("정지 알림 기준: ", "단색 알림 기준: ")):
+            # 새 비율 정책은 고정 초 기준과 구분하며, 이전 카드의 시간 문구도 계속 읽는다.
+            kind, criterion = line.split(" 알림 기준: ", 1)
+            sections["감지 기준"].append(f"{kind}: {criterion}")
         elif line.startswith("감지 기준: "):
             sections["감지 기준"].append("단색: " + line.removeprefix("감지 기준: ").removesuffix(" · 구간은 영상 시작 기준"))
         elif (match := re.fullmatch(r"첫 단색 감지 시작: (\S+) \(영상 시작 기준\)", line)):

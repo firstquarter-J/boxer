@@ -72,8 +72,10 @@ def format_recording_freeze_summary(details: Mapping[str, Any]) -> str:
     # 최초 구간과 최장 구간은 다를 수 있다. 끝 시각·전체 합계·비율을 추정하지 않는다.
     if first is not None and (not duration or first < duration):
         lines.append(f"첫 정지 감지 시작: {format_time(first)} (영상 시작 기준)")
+    # 장비의 시간 기준은 유지되고 Boxer가 비율 조건을 추가 적용한다.
     if threshold:
         lines.append(f"정지 감지 기준: 연속 {format_time(threshold)} 이상")
+    lines.append("정지 알림 기준: 최장 연속 구간이 영상 전체의 50% 이상")
     lines.append("전체 정지 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)")
     return "\n".join(lines)
 
@@ -87,6 +89,7 @@ def format_recording_video_length(details: Mapping[str, Any]) -> str:
 def format_recording_video_summary(details: Mapping[str, Any]) -> str:
     uniform = normalize_recording_video_details(details)["video"]["visualAnalysis"]["uniformColor"]
     timeline = uniform["timeline"]
+    criterion = "단색 알림 기준: 최장 연속 구간이 영상 전체의 50% 이상"
     if timeline is not None:
         duration = timeline["videoDurationSec"]
         total = timeline["durationSec"]
@@ -94,7 +97,9 @@ def format_recording_video_summary(details: Mapping[str, Any]) -> str:
             f"영상 길이 {format_time(duration)}",
             f"단색 감지 합계 {format_time(total)} (전체의 {100 * total / duration:.1f}%)",
             f"단색 감지 구간: {format_ranges(timeline)}",
+            *([f"최장 연속 단색: {format_time(uniform['maxDurationSec'])}"] if uniform["maxDurationSec"] else []),
             f"감지 기준: 연속 {uniform['thresholdSec']:g}초 이상 · 구간은 영상 시작 기준",
+            criterion,
         ])
 
     # 최초 시작 시각과 최장 시간은 서로 다른 구간일 수 있어 더해서 끝을 만들지 않는다.
@@ -105,5 +110,8 @@ def format_recording_video_summary(details: Mapping[str, Any]) -> str:
         lines.append(f"첫 단색 감지 시작: {format_time(first)} (영상 시작 기준)")
     if longest is not None and longest > 0:
         lines.append(f"최장 연속 단색: {format_time(longest)}")
+    if uniform["thresholdSec"]:
+        lines.append(f"감지 기준: 연속 {uniform['thresholdSec']:g}초 이상 · 구간은 영상 시작 기준")
+    lines.append(criterion)
     lines.append("전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)")
     return "\n".join(lines)

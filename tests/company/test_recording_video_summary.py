@@ -19,10 +19,11 @@ def test_freeze_preserves_first_detection_and_threshold_without_inventing_ranges
     assert normalize_recording_video_details(restored) == normalized
     text = format_recording_freeze_summary(restored)
     assert "첫 정지 감지 시작: 00:08.333" in text
+    assert "정지 알림 기준: 최장 연속 구간이 영상 전체의 50% 이상" in text
     assert "정지 감지 기준: 연속 01:00 이상" in text
     assert "전체 정지 구간·합계·비율: 확인 필요" in text
     assert "~" not in text
-    assert "%" not in text
+    assert "(전체의" not in text
     restored["video"]["visualAnalysis"]["freeze"]["firstDetectedAtSec"] = 601
     assert "첫 정지 감지 시작" not in format_recording_freeze_summary(restored)
 
@@ -48,7 +49,8 @@ def test_uniform_intervals_survive_reload_and_use_video_length_for_ratio() -> No
     assert "영상 길이 00:40" in text
     assert "단색 감지 합계 00:25 (전체의 62.5%)" in text
     assert "단색 감지 구간: 00:02~00:12, 00:25~00:40" in text
-    assert "연속 10초 이상 · 구간은 영상 시작 기준" in text
+    assert "단색 알림 기준: 최장 연속 구간이 영상 전체의 50% 이상" in text
+    assert "감지 기준: 연속 10초 이상" in text
     assert "private" not in json.dumps(restored)
     assert "raw-log" not in json.dumps(restored)
 
@@ -63,7 +65,7 @@ def test_legacy_actual_metrics_never_invent_end_or_total_from_first_and_longest(
     assert "최장 연속 단색: 00:10.9" in text
     assert "확인 필요" in text
     assert "~" not in text
-    assert "%" not in text
+    assert "(전체의" not in text
 
 
 @pytest.mark.parametrize(("key", "value"), [
@@ -80,7 +82,7 @@ def test_invalid_or_partial_timeline_does_not_claim_total(key: str, value: objec
     text = format_recording_video_summary(details)
     assert "확인 필요" in text
     assert "~" not in text
-    assert "%" not in text
+    assert "(전체의" not in text
     json.dumps(normalize_recording_video_details(details), allow_nan=False)
 
 
@@ -90,7 +92,7 @@ def test_invalid_measurements_are_not_displayed(value: object) -> None:
         "thresholdSec": value, "firstDetectedAtSec": value, "maxDurationSec": value, "timeline": value,
     }}}}
     text = format_recording_video_summary(details)
-    assert text == "영상 길이 확인 필요\n전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
+    assert text == "영상 길이 확인 필요\n단색 알림 기준: 최장 연속 구간이 영상 전체의 50% 이상\n전체 단색 구간·합계·비율: 확인 필요 (완료된 구간 분석 없음)"
     json.dumps(normalize_recording_video_details(details), allow_nan=False)
 
 
