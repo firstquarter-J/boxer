@@ -41,32 +41,33 @@ def _second_item() -> dict[str, object]:
     }
 
 
-def test_audio_alert_matches_approved_two_column_comparison() -> None:
-    # 승인한 실측 예시의 두 길이를 먼저 나란히 표시하고 차이·주석은 아래에 둔다.
+def test_audio_alert_uses_same_detail_layout_as_video() -> None:
+    # 구간이 없는 실제 수치도 영상처럼 핵심 → 전체 → 비교 길이 순서로 모은다.
     item = {**_item(), "alertCategory": "recording_audio", "problemComponents": [], "issue": (
-        "녹화 파일 오디오 이상: 영상 길이 대비 오디오 길이 부족 (발생 2026-10-15 15:42:25 KST)\n"
-        "파일 길이 03:06.803 · 디코딩 오디오 00:34.219\n"
-        "오디오 길이 차이 02:32.584 (81.7%)\n"
+        "녹화 파일 오디오 이상: 영상 길이 대비 오디오 길이 부족 (발생 2026-10-16 15:06:29 KST)\n"
+        "파일 길이 26:37.843 · 디코딩 오디오 05:03.104\n"
+        "오디오 길이 차이 21:34.739 (81.0%)\n"
         "오디오 데이터 누락 구간 및 비율: 확인 필요 (완료된 구간 분석 없음)"
     )}
     message = _rendered_message(item)
     text = alert._alert_issue_mrkdwn(item)
-    comparison_fields = [
-        {"type": "mrkdwn", "text": "확인된 오디오\n*34.2초*"},
-        {"type": "mrkdwn", "text": "영상 전체\n*3분 6.8초*"},
-    ]
-    footer = (
-        "길이 차이 *2분 32.6초 · 81.7%*\n"
-        "※ 길이 기준 비교이며 실제 누락 구간은 미확인\n\n"
-        "🕒 *감지 시각*\n2026-10-15 15:42:25 KST"
+    body = (
+        "🔎 *감지 내용*\n"
+        "오디오 길이 차이 *21분 34.7초(영상 전체의 81.0%)*\n"
+        "영상 전체 *26분 37.8초*\n"
+        "확인된 오디오 *5분 3.1초*\n"
+        "※ 길이 기준 비교이며 실제 누락 구간은 미확인"
     )
+    metadata = "🕒 *감지 시각*\n2026-10-16 15:06:29 KST"
     assert message["blocks"][2] == {
-        "type": "section", "text": {"type": "mrkdwn", "text": "🔎 *감지 내용*"},
-        "fields": comparison_fields,
+        "type": "section", "text": {"type": "mrkdwn", "text": body},
+        "fields": [{"type": "mrkdwn", "text": metadata}],
     }
-    assert message["blocks"][3]["text"]["text"] == footer
-    assert text == "\n\n".join(["🔎 *감지 내용*", *(field["text"] for field in comparison_fields), footer])
+    assert "text" not in message["blocks"][3]
+    assert text == body + "\n\n" + metadata
     assert text in message["text"]
+    assert "누락 시작" not in text
+    assert "~" not in text
     assert len(message["blocks"]) == 5
     # 화면에서만 반올림하며 API action의 길이·비율과 장애 식별은 바꾸지 않는다.
     target = json.loads(message["blocks"][-1]["elements"][0]["value"])
@@ -82,8 +83,8 @@ def test_audio_display_rounds_once_and_preserves_unknown_lengths(length: str, ex
     text = alert._recording_media_issue_mrkdwn(
         f"녹화 파일 오디오 이상: 오디오 디코딩 실패\n영상 길이 05:00\n디코딩 오디오 {length}"
     )
-    assert f"확인된 오디오\n*{expected}*" in text
-    assert "영상 전체\n*5분*" in text
+    assert f"확인된 오디오 *{expected}*" in text
+    assert "영상 전체 *5분*" in text
 
 
 def test_audio_alert_keeps_other_failures_and_future_api_descriptions() -> None:
@@ -93,7 +94,8 @@ def test_audio_alert_keeps_other_failures_and_future_api_descriptions() -> None:
         "영상 길이 05:00\n오디오 데이터 누락 합계 00:10 (전체의 3.3%)\n"
         "오디오 데이터 누락 구간: 04:50~05:00\n추가 분석 정보"
     )
-    assert text.startswith("🔎 *감지 내용*\n오디오 데이터 누락 *10초* (영상의 3.3%) / 영상 전체 *5분*")
+    assert text.startswith("🔎 *감지 내용*\n오디오 데이터 누락 *10초(영상 전체의 3.3%)*")
+    assert "영상 전체 *5분*\n오디오 누락 구간 04:50~05:00 (영상 시작 기준)" in text
     for value in ("오디오 디코딩 실패", "04:50~05:00", "추가 분석 정보"):
         assert value in text
     assert "확인 필요" not in text
@@ -785,10 +787,10 @@ def test_mark_done_highlights_media_alert_without_losing_session_details(
     blocks = client.root["blocks"]
     media_label = "영상" if media_type == "video" else "오디오"
     assert blocks[0]["text"]["text"] == f"✅ 확인 완료 · 녹화 {media_label} 이상"
-    # 완료 처리 뒤에도 오디오의 두 열과 그 아래 차이·시각 본문이 그대로 남는다.
+    # 완료 처리 뒤에도 두 유형의 감지 본문과 시각을 같은 위치에 보존한다.
     assert "60분" in json.dumps(blocks, ensure_ascii=False)
     if media_type == "audio":
-        assert "길이 차이 *1분 · 1.7%*" in blocks[3]["text"]["text"]
+        assert "오디오 길이 차이 *1분(영상 전체의 1.7%)*" in blocks[2]["text"]["text"]
     assert blocks[1]["text"]["text"] == (
         "담당자 <@U1> · `2026-08-31 09:07:12 KST`\n\n"
         "🏥 *1 테스트병원*"
@@ -798,7 +800,7 @@ def test_mark_done_highlights_media_alert_without_losing_session_details(
     assert blocks[1]["fields"] == message["blocks"][1]["fields"]
     assert "12345678901" in json.dumps(blocks[1], ensure_ascii=False)
     assert blocks[2:4] == message["blocks"][2:4]
-    assert len(blocks[2]["fields"]) == (2 if media_type == "audio" else 1)
+    assert len(blocks[2]["fields"]) == 1
     expected_actions = {alert.DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL}
     if include_voice:
         expected_actions.add(alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE)

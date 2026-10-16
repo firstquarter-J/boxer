@@ -747,7 +747,7 @@ def test_audio_intervals_survive_cursor_and_reach_slack_and_sheet_without_sendin
         channel_id="C123456", cycle_key="transport:notification",
     )
     message = client.chat_postMessage.call_args.kwargs
-    assert "오디오 데이터 누락 *5초* (영상의 0.8%) / 영상 전체 *10분*" in message["text"]
+    assert "오디오 데이터 누락 *5초(영상 전체의 0.8%)*\n영상 전체 *10분*" in message["text"]
     assert "오디오 누락 구간 02:54~02:59 (영상 시작 기준)" in message["text"]
     assert "02:54~02:59" in json.dumps(message["blocks"], ensure_ascii=False)
     assert result.cursor["pendingDeliveryContexts"][delivery.delivery_id]["sheetAlertItem"]["issue"] == issue
@@ -1676,7 +1676,7 @@ def test_media_explanation_survives_cursor_reload_and_reaches_slack(
     for label in ("*확인된 내용*", "*영향*", "*다음 확인*", "*측정 정보*"):
         assert label not in rendered
     if media_type == "audio":
-        assert "확인된 오디오\n*확인 필요*\n\n영상 전체\n*10분*" in rendered
+        assert "영상 전체 *10분*\n확인된 오디오 *확인 필요*" in rendered
     else:
         assert "영상 전체 *10분*" in rendered
     assert "/private/secret" not in json.dumps([result.cursor, delivery.payload])

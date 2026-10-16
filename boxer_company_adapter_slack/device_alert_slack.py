@@ -457,34 +457,14 @@ def _alert_detail_fields(sections: Mapping[str, list[str]]) -> list[dict[str, st
 def _render_alert_detail_sections(
     sections: Mapping[str, list[str]], *, include_metadata: bool = True,
 ) -> str:
-    # 접근성 본문도 카드처럼 두 길이 → 차이·진단 → 시각 순서로 읽힌다.
-    audio_fields = _audio_comparison_fields(sections)
-    if audio_fields:
-        paragraphs = ["🔎 *감지 내용*", *(field["text"] for field in audio_fields)]
-        body = _render_alert_detail_body(sections, compare_lengths=False)
-        if body:
-            paragraphs.append(body)
-    else:
-        paragraphs = ["🔎 *감지 내용*\n" + _render_alert_detail_body(sections)]
+    # 카드와 접근성 본문 모두 이상 수치 → 전체 길이 → 구간 순서로 읽힌다.
+    paragraphs = ["🔎 *감지 내용*\n" + _render_alert_detail_body(sections)]
     if include_metadata:
         paragraphs.extend(field["text"] for field in _alert_detail_fields(sections))
     return "\n\n".join(paragraphs)
 
 
-def _audio_comparison_fields(sections: Mapping[str, list[str]]) -> list[dict[str, str]]:
-    # 한쪽을 확인하지 못했어도 빈칸이나 0으로 대신하지 않고 원래 상태를 표시한다.
-    fields = []
-    for label in ("확인된 오디오", "영상 전체"):
-        measurement = next((value for value in sections["측정 정보"] if value.startswith(f"{label} ")), "")
-        if not measurement:
-            return []
-        fields.append({"type": "mrkdwn", "text": f"{label}\n{measurement.removeprefix(label + ' ')}"})
-    return fields
-
-
-def _render_alert_detail_body(
-    sections: Mapping[str, list[str]], *, compare_lengths: bool = True,
-) -> str:
+def _render_alert_detail_body(sections: Mapping[str, list[str]]) -> str:
     # 최장 연속 구간의 비율과 영상 전체 길이를 두 줄로 표시한다.
     # 최초 시작을 최장 구간과 연결하거나 누적 이상 비율로 해석하지 않는다.
     headlines = list(sections["감지 내용"])
@@ -495,21 +475,12 @@ def _render_alert_detail_body(
         measurements.remove(video)
     if audio:
         measurements.remove(audio)
-    if audio and compare_lengths:
-        headlines.append(" / ".join(value for value in (audio, video) if value))
-    elif video and compare_lengths and any(
-        headline.startswith(("최장 연속 ", "단색 화면 합계 ")) for headline in headlines
-    ):
+    if video:
         headlines = [_visual_headline_with_ratio(headline, video) for headline in headlines]
         headlines.append(video)
-    elif video and compare_lengths:
-        compared = False
-        for index, headline in enumerate(headlines):
-            if headline.startswith(("최장 연속 ", "단색 화면 합계 ", "오디오 데이터 누락 ")):
-                headlines[index] = f"{headline} / {video}"
-                compared = True
-        if not compared:
-            headlines.append(video)
+    # 길이만 있는 구형 오디오도 같은 줄 배치를 쓰되 누락 위치로 추정하지 않는다.
+    if audio:
+        headlines.append(audio)
 
     lines = headlines + measurements + sections["분석 구간"]
     for fact in sections["확인된 내용"]:
@@ -591,10 +562,10 @@ def _recording_media_issue_sections(issue: str) -> dict[str, list[str]]:
         elif line.startswith("디코딩 오디오 "):
             comparisons.append(f"확인된 오디오 *{duration(line.removeprefix('디코딩 오디오 '))}*")
         elif (match := re.fullmatch(r"오디오 길이 차이 (\S+) \(([^)]+)\)", line)):
-            headline.append(f"길이 차이 *{duration(match[1])} · {match[2]}*")
+            headline.append(f"오디오 길이 차이 *{duration(match[1])}(영상 전체의 {match[2]})*")
             summarized_reasons.add("영상 길이 대비 오디오 길이 부족")
         elif (match := re.fullmatch(r"오디오 데이터 누락 합계 (\S+) \(전체의 ([^)]+)\)", line)):
-            headline.append(f"오디오 데이터 누락 *{duration(match[1])}* (영상의 {match[2]})")
+            headline.append(f"오디오 데이터 누락 *{duration(match[1])}(영상 전체의 {match[2]})*")
             summarized_reasons.add("영상 길이 대비 오디오 길이 부족")
         elif line.startswith("오디오 데이터 누락 구간: "):
             sections["분석 구간"].append("오디오 누락 구간 " + line.removeprefix("오디오 데이터 누락 구간: ") + " (영상 시작 기준)")
@@ -667,16 +638,12 @@ def _alert_item_blocks(
     if components:
         issue_sections.append(f":rotating_light: *문제 장치*\n{components}")
     detail_sections = _alert_issue_sections(item)
-    audio_fields = _audio_comparison_fields(detail_sections)
-    issue_sections.append(
-        "🔎 *감지 내용*" if audio_fields
-        else _render_alert_detail_sections(detail_sections, include_metadata=False)
-    )
+    issue_sections.append(_render_alert_detail_sections(detail_sections, include_metadata=False))
     detail_block: dict[str, Any] = {
         "type": "section",
         "text": {"type": "mrkdwn", "text": "\n\n".join(issue_sections)},
     }
-    detail_fields = audio_fields or _alert_detail_fields(detail_sections)
+    detail_fields = _alert_detail_fields(detail_sections)
     if detail_fields:
         detail_block["fields"] = detail_fields
     identity_fields = [
@@ -724,14 +691,6 @@ def _alert_item_blocks(
             ],
         },
     ]
-    if audio_fields:
-        # fields 뒤에는 같은 section의 text를 놓을 수 없으므로 다음 연락처
-        # section 앞부분에 차이·주석·시각을 둔다. 세 section의 완료 위치 계약은 유지한다.
-        footer = [_render_alert_detail_body(detail_sections, compare_lengths=False)]
-        footer.extend(field["text"] for field in _alert_detail_fields(detail_sections))
-        footer_text = "\n\n".join(part for part in footer if part)
-        if footer_text:
-            blocks[2]["text"] = {"type": "mrkdwn", "text": footer_text}
     if not include_actions:
         return blocks
 
