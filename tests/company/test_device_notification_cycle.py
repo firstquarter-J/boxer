@@ -143,6 +143,7 @@ def _deps(
             "sessionAtLabel": "세션 시작",
             "sessionAt": "2026-08-14 09:49:00 KST",
         }),
+        "stall_barcode": Mock(return_value="81000000000"),
     }
     return (
         DeviceNotificationCycleDeps(
@@ -150,6 +151,7 @@ def _deps(
             load_next_event=mocks["next"],
             verify_video_duration_mismatch=mocks["verify_video"],
             load_recording_media_session=mocks["media_session"],
+            load_recording_stall_barcode=mocks["stall_barcode"],
             append_sheet_alerts=mocks["append_sheet"],
             send_sms=mocks["send_sms"],
             claim_sms_delivery=mocks["claim_sms"],
@@ -1710,6 +1712,79 @@ def test_stalled_empty_file_exposes_measurements_and_preserves_incident_identity
     assert recording["incidentKey"] == normalized["incidentDiscriminator"]
 
 
+@pytest.mark.parametrize(("row", "expected"), [
+    ({"barcode": "81000000000", "details": {}}, "81000000000"),
+    ({"barcode": None, "details": '{"barcode":"82000000000"}'}, "82000000000"),
+    ({"barcode": "invalid", "details": {"barcode": "82000000000"}}, "82000000000"),
+    ({"barcode": "invalid", "details": {}}, "미확인"),
+    ({"barcode": "８１０００００００００", "details": {}}, "미확인"),
+    ({"details": {"durationSeconds": 120}}, "미확인"),
+    (None, "미확인"),
+])
+def test_stall_barcode_reads_only_the_original_notification(
+    monkeypatch: pytest.MonkeyPatch, row: dict | None, expected: str,
+) -> None:
+    # 최신 녹화·최근 스캔을 대신 쓰지 않고 정확한 알림 ID의 원본만 조회한다.
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = row
+    monkeypatch.setattr(cycle, "_create_db_connection", Mock(return_value=connection))
+
+    assert cycle._load_recording_stall_barcode(90) == expected
+    sql, params = cursor.execute.call_args.args
+    assert "WHERE id = %s AND code = %s LIMIT 1" in sql
+    assert params == (90, "recording_critically_stalled")
+    assert cursor.execute.call_count == 1
+    connection.close.assert_called_once_with()
+
+
+def test_stall_barcode_survives_pending_reload_and_reaches_slack() -> None:
+    from boxer_company_adapter_slack.device_notification_alert_reporter import (
+        _post_remote_device_notification_delivery,
+    )
+
+    # 대기 cursor에는 식별자를 저장하지 않고 발송 때 원본을 다시 읽어 화면에만 싣는다.
+    event = _recording_stall_event(90, duration_seconds=120, occurred_at=_NOW.isoformat())
+    state = _initialized_cursor(last_seen_id=90)
+    state["pendingEvents"] = [cycle._normalize_event(event)]
+    deps, mocks = _deps()
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=json.loads(json.dumps(state)))
+    )
+    delivery, = result.deliveries
+    mocks["stall_barcode"].assert_called_once_with(90)
+    item = delivery.payload["alertSummary"]["deviceResults"][0]
+    assert item["barcode"] == "81000000000"
+    assert "sessionAt" not in item
+    assert "81000000000" not in json.dumps(result.cursor)
+
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1710000000.090"}
+    client.chat_getPermalink.return_value = {"permalink": "https://slack.example/p90"}
+    _post_remote_device_notification_delivery(
+        client, logging.getLogger("test.stall-barcode"), delivery=delivery,
+        channel_id="C123456", cycle_key="transport:notification",
+    )
+    message = client.chat_postMessage.call_args.kwargs
+    assert "🏷️ *바코드*\n`81000000000`" in message["text"]
+    assert {"type": "mrkdwn", "text": "🏷️ *바코드*\n`81000000000`"} in message["blocks"][1]["fields"]
+    assert "세션 시각" not in message["text"]
+    assert "세션 시작" not in message["text"]
+    assert "120초 (2분)" in message["text"]
+
+
+def test_stall_barcode_lookup_failure_keeps_alert_without_raw_error(caplog: pytest.LogCaptureFixture) -> None:
+    # 표시용 조회 실패가 경고를 막거나 비밀값이 섞인 예외 원문을 로그에 남기지 않는다.
+    event = _recording_stall_event(90, duration_seconds=120, occurred_at=_NOW.isoformat())
+    deps, mocks = _deps(next_result=(90, event))
+    mocks["stall_barcode"].side_effect = RuntimeError("private-database-details")
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor=_initialized_cursor()))
+    delivery, = result.deliveries
+    assert delivery.payload["alertSummary"]["deviceResults"][0]["barcode"] == "미확인"
+    assert "notification_id=90" in caplog.text
+    assert "private-database-details" not in caplog.text
+
+
 def test_merge_error_ack_does_not_open_captureboard_incident() -> None:
     event = {
         **_captureboard_event(15),
@@ -1870,6 +1945,9 @@ def test_recording_stall_followup_becomes_channel_neutral_thread_delivery() -> N
     )
     first_mocks["send_sms"].assert_called_once()
     second_mocks["send_sms"].assert_not_called()
+    # 후속 알림은 바코드가 표시된 기존 root를 이어가며 새 세션 조회를 하지 않는다.
+    first_mocks["stall_barcode"].assert_called_once_with(31)
+    second_mocks["stall_barcode"].assert_not_called()
 
 
 def test_sent_incident_suppresses_repeat_after_cursor_restart_without_sheet(

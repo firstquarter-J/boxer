@@ -484,6 +484,28 @@ def _verify_video_duration_mismatch(
     )
 
 
+def _load_recording_stall_barcode(notification_id: int) -> str:
+    """정체가 발생한 원본 알림의 바코드만 읽고 다른 세션으로 보완하지 않는다."""
+
+    connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT barcode, details FROM device_notification "
+                "WHERE id = %s AND code = %s LIMIT 1",
+                (notification_id, _RECORDING_CRITICALLY_STALLED),
+            )
+            row = cursor.fetchone() or {}
+    finally:
+        connection.close()
+    details = _normalize_json_object(row.get("details"))
+    for candidate in (row.get("barcode"), details.get("barcode")):
+        barcode = str(candidate or "").strip()
+        if re.fullmatch(r"[0-9]{11}", barcode):
+            return barcode
+    return "미확인"
+
+
 def _load_recording_media_session(notification_id: int) -> dict[str, str]:
     """발송 시 원본 알림에서만 바코드·촬영 시각을 읽어 대기 cursor와 분리한다."""
 
@@ -531,6 +553,7 @@ class DeviceNotificationCycleDeps:
     load_recording_media_session: Callable[[int], dict[str, str]] = (
         _load_recording_media_session
     )
+    load_recording_stall_barcode: Callable[[int], str] = _load_recording_stall_barcode
     append_sheet_alerts: Callable[..., int | None] = (
         _append_device_health_sheet_alerts
     )
@@ -943,6 +966,19 @@ class DeviceNotificationAlertCycleHandler:
                 }
             if not _is_recording_stall_alert(event):
                 return None, None
+
+        if event["code"] == _RECORDING_CRITICALLY_STALLED:
+            # 재시작·대기 중 다른 녹화가 시작돼도 exact 알림의 세션만 표시한다.
+            # 표시 보강 실패로 원래의 정체 경고를 누락시키지는 않는다.
+            try:
+                barcode = self._deps.load_recording_stall_barcode(int(event["notificationId"]))
+            except Exception as exc:
+                self._logger.warning(
+                    "Recording stall barcode lookup failed notification_id=%s error_type=%s",
+                    event["notificationId"], type(exc).__name__,
+                )
+                barcode = "미확인"
+            event = {**event, "recordingBarcode": barcode}
 
         alert_summary, alert_item, recording_context = _build_root_alert(event)
         # 영상 품질 알림은 사람이 문자·음성·확인 완료를 선택할 수 있다.
@@ -2314,6 +2350,9 @@ def _build_root_alert(
         device_result.update(video_session_fields)
     elif code == _RECORDING_MEDIA_QUALITY_ISSUE:
         device_result.update(event.get("mediaSessionFields") or {})
+    elif code == _RECORDING_CRITICALLY_STALLED:
+        # 정체 지속 시간은 세션 길이가 아니므로 시작 시각을 역산하지 않는다.
+        device_result["barcode"] = event.get("recordingBarcode") or "미확인"
     if code == _CAPTUREBOARD_CONNECTION_ERROR:
         device_result["statusPayload"] = {
             "overview": {

@@ -689,26 +689,16 @@ def _alert_item_blocks(
             "text": f"🚪 *병실*\n`{item['room']}`",
         },
     ]
-    # 녹화 파일 알림은 바코드와 세션 시각까지 같은 식별 영역에 표시한다.
-    if item.get("barcode") or item.get("sessionAt"):
-        identity_fields.extend(
-            (
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "🏷️ *바코드*\n"
-                        f"`{_text(item.get('barcode'), '미확인')}`"
-                    ),
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"🕐 *{_text(item.get('sessionAtLabel'), '세션 시각')}*\n"
-                        f"{_text(item.get('sessionAt'), '미확인')}"
-                    ),
-                },
-            )
-        )
+    # 진행 중 정체 알림은 바코드만 있을 수 있어 없는 세션 시각을 추가하지 않는다.
+    for value, label in (
+        (
+            f"`{_text(item.get('barcode'), '미확인')}`" if item.get("barcode") or item.get("sessionAt") else "",
+            "🏷️ *바코드*",
+        ),
+        (item.get("sessionAt"), f"🕐 *{_text(item.get('sessionAtLabel'), '세션 시각')}*"),
+    ):
+        if value:
+            identity_fields.append({"type": "mrkdwn", "text": f"{label}\n{value}"})
     # 병원 번호와 action 원본은 유지하고 제목의 #만 병원 아이콘으로 바꾼다.
     hospital_title = item["hospital"].removeprefix("#")
     blocks: list[dict[str, Any]] = [
