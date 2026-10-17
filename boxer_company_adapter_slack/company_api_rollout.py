@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 import logging
 import re
 from typing import Callable, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from boxer_company.assistant.contracts import (
     AssistantMessage,
@@ -90,6 +90,12 @@ _SAFE_REQUEST_ID_PATTERN = re.compile(
 _NOTION_SOURCE_HOSTS = frozenset(
     {"app.notion.com", "notion.so", "www.notion.so"}
 )
+_MEMORY_SOURCE_ID_PATTERN = re.compile(r"src_[a-f0-9]{64}")
+_SLACK_MEMORY_HOST_PATTERN = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+slack\.com"
+)
+_SLACK_MEMORY_PATH_PATTERN = re.compile(r"/archives/([CGD][A-Z0-9]+)/p[0-9]+")
+_SLACK_MEMORY_THREAD_TS_PATTERN = re.compile(r"[0-9]{1,20}\.[0-9]{1,9}")
 
 
 def _match_company_freeform_rollout(
@@ -1189,10 +1195,55 @@ def _validate_remote_barcode_freeform_result(
 def _validate_remote_freeform_result(
     result: CompanyAssistantResult | None,
 ) -> _RemoteResultValidation:
-    return _validate_remote_analysis_result(
+    base_validation = _validate_remote_result_base(
         result,
         _ALLOWED_FREEFORM_ROUTES,
     )
+    if not base_validation.accepted:
+        return base_validation
+    assert result is not None
+    # 기억 원본 검증은 API가 소유한다. 이 최종 전송 경계는 freeform에만
+    # API가 만든 최대 두 개의 Slack 기억 인용을 허용하고 다른 분석 가드는 유지한다.
+    if len(result.sources) > 2 or any(
+        not isinstance(source.source_id, str)
+        or _MEMORY_SOURCE_ID_PATTERN.fullmatch(source.source_id) is None
+        or not _is_slack_memory_source_uri(source.uri)
+        for source in result.sources
+    ):
+        return _RemoteResultValidation(False, "unsafe_memory_sources")
+    return _RemoteResultValidation(True)
+
+
+def _is_slack_memory_source_uri(value: object) -> bool:
+    if (
+        not isinstance(value, str) or not value or len(value) > 2048
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        match = _SLACK_MEMORY_PATH_PATTERN.fullmatch(parsed.path.rstrip("/"))
+        # 기존 원문 permalink 정책과 같은 HTTPS 기본 포트·query 경계를 유지한다.
+        if (
+            parsed.scheme.lower() != "https"
+            or _SLACK_MEMORY_HOST_PATTERN.fullmatch(host) is None
+            or parsed.port not in {None, 443}
+            or parsed.username is not None or parsed.password is not None
+            or "#" in value or match is None
+            or (parsed.port is None and ":" in parsed.netloc)
+        ):
+            return False
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+        params = dict(pairs)
+        if len(params) != len(pairs) or set(params) - {"thread_ts", "cid"}:
+            return False
+        if "cid" in params and params["cid"] != match.group(1):
+            return False
+        # 출처 시각·권한은 이미 원본에서 확인했다. 여기서는 query 형태만 재검사한다.
+        return "thread_ts" not in params or _SLACK_MEMORY_THREAD_TS_PATTERN.fullmatch(params["thread_ts"]) is not None
+    except ValueError:
+        return False
 
 
 def _validate_remote_usage_help_result(

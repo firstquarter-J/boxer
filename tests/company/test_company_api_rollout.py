@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import replace
 from typing import Any, Callable
 import unittest
 
@@ -68,6 +69,14 @@ def _result(
         sources=sources,
         used_llm=used_llm,
     )
+
+
+def _memory_source(
+    uri: str = "https://unit.slack.com/archives/C1/p1792100000000001",
+    *,
+    source_id: str = "src_" + "a" * 64,
+) -> SourceReference:
+    return SourceReference(source_id=source_id, title="이전 대화 근거", uri=uri)
 
 
 class _NextService:
@@ -329,6 +338,109 @@ class CompanyApiRemoteRolloutTests(unittest.TestCase):
         self.assertIs(service.answer(request), precedence)
         self.assertEqual(next_service.requests, [request])
         self.assertEqual(api.calls, [])
+
+    def test_freeform_preserves_verified_slack_memory_citations_on_any_channel(self) -> None:
+        # API가 정상 생성한 저장/실시간 기억 인용을 최종 Slack 전송 가드에서 버리지 않는다.
+        valid_urls = (
+            "https://unit.slack.com/archives/C1/p1792100000000001",
+            "https://unit.slack.com/archives/G1/p1792100000000001/",
+            "https://unit.slack.com/archives/D1/p1792100000000001",
+            "https://unit.slack.com:443/archives/C1/p1792100000000001",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=1792099999.000001",
+            "https://unit.slack.com/archives/C1/p1792100000000001?cid=C1",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=1792099999.000001&cid=C1",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=1.1",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=12345678901234567890.123456789",
+        )
+        for uri in valid_urls:
+            with self.subTest(uri=uri):
+                remote = _result("company_freeform", used_llm=True, sources=(_memory_source(uri),))
+                api = _ApiClient(remote)
+                service = CompanyFreeformApiRolloutService(None, api_client=api, logger=self.logger)  # type: ignore[arg-type]
+                request = replace(_request("디디가 최근 한 말"), metadata={"channel_id": "C_NORMAL"})
+                self.assertIs(service.answer(request), remote)
+                self.assertEqual(api.calls, [(request, "freeform")])
+        sources = (_memory_source(), _memory_source(valid_urls[1], source_id="src_" + "b" * 64))
+        remote = _result("company_freeform", sources=sources)
+        service = CompanyFreeformApiRolloutService(None, api_client=_ApiClient(remote), logger=self.logger)  # type: ignore[arg-type]
+        self.assertIs(service.answer(_request("최근 대화는?")), remote)
+
+    def test_freeform_rejects_unsafe_or_malformed_memory_permalink(self) -> None:
+        invalid_urls = (
+            "http://unit.slack.com/archives/C1/p1792100000000001",
+            "https://slack.com/archives/C1/p1792100000000001",
+            "https://unit.slack.com.evil.invalid/archives/C1/p1792100000000001",
+            "https://not-slack.invalid/archives/C1/p1792100000000001",
+            "https://unit..slack.com/archives/C1/p1792100000000001",
+            "https://unit.slack.com./archives/C1/p1792100000000001",
+            "https://user:pass@unit.slack.com/archives/C1/p1792100000000001",
+            "https://unit.slack.com:8443/archives/C1/p1792100000000001",
+            "https://unit.slack.com:80/archives/C1/p1792100000000001",
+            "https://unit.slack.com:/archives/C1/p1792100000000001",
+            "https://unit.slack.com:invalid/archives/C1/p1792100000000001",
+            "https://unit.slack.com/archives/C1/p1792100000000001#fragment",
+            "https://unit.slack.com/archives/C1/p1792100000000001#",
+            "https://unit.slack.com/archives/B1/p1792100000000001",
+            "https://unit.slack.com/archives/C1/not-a-message",
+            "https://unit.slack.com/archives/C1/p1792100000000001/extra",
+            "https://unit.slack.com/archives/C1/pabc",
+            "https://unit.slack.com/archives/C1/p1792100000000001?cid=C_OTHER",
+            "https://unit.slack.com/archives/C1/p1792100000000001?cid=C1&cid=C1",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=1792099999.000001&thread_ts=1792099999.000001",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=invalid",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=123456789012345678901.1",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=1.1234567890",
+            "https://unit.slack.com/archives/C1/p1792100000000001?thread_ts=1",
+            "https://unit.slack.com/archives/C1/p1792100000000001?unknown=value",
+            "https://unit.slack.com/archives/C1/p1792100000000001?token=synthetic-value",
+            "https://unit.slack.com/archives/C1/p1792100000000001?cid",
+            "https://unit.slack.com/archives/C1/p1792100000000001\n",
+            " https://unit.slack.com/archives/C1/p1792100000000001",
+            "https://unit.slack.com/archives/C1/p1792100000000001\x00",
+        )
+        for uri in invalid_urls:
+            with self.subTest(uri=uri):
+                remote = _result("company_freeform", sources=(_memory_source(uri),))
+                service = CompanyFreeformApiRolloutService(None, api_client=_ApiClient(remote), logger=self.logger)  # type: ignore[arg-type]
+                result = service.answer(_request("디디가 최근 한 말"))
+                self.assertEqual(result.outcome, "failed")
+                self.assertEqual(result.fallback_reason, "company_api_unsafe_memory_sources")
+
+    def test_freeform_requires_canonical_memory_source_ids_and_at_most_two_sources(self) -> None:
+        # live_ 접두사는 내부 기억 ID에만 쓰며 실제 SourceReference는 src_ 해시다.
+        for source_id in ("arbitrary", "live_src_" + "a" * 64, "src_" + "A" * 64, "src_" + "a" * 63):
+            with self.subTest(source_id=source_id):
+                remote = _result("company_freeform", sources=(_memory_source(source_id=source_id),))
+                service = CompanyFreeformApiRolloutService(None, api_client=_ApiClient(remote), logger=self.logger)  # type: ignore[arg-type]
+                result = service.answer(_request("전에 했던 말은?"))
+                self.assertEqual(result.fallback_reason, "company_api_unsafe_memory_sources")
+        remote = _result("company_freeform", sources=tuple(
+            _memory_source(source_id="src_" + f"{index:064x}") for index in range(3)))
+        service = CompanyFreeformApiRolloutService(None, api_client=_ApiClient(remote), logger=self.logger)  # type: ignore[arg-type]
+        self.assertEqual(service.answer(_request("최근 대화는? ")).fallback_reason, "company_api_unsafe_memory_sources")
+
+    def test_freeform_memory_citations_keep_existing_route_and_delivery_scope_guards(self) -> None:
+        for remote, reason in (
+            (_result("company_notion_qa", sources=(_memory_source(),)), "unexpected_route"),
+            (_result("company_freeform", delivery_scope="requester", sources=(_memory_source(),)), "unsafe_message_scope"),
+        ):
+            with self.subTest(reason=reason):
+                service = CompanyFreeformApiRolloutService(None, api_client=_ApiClient(remote), logger=self.logger)  # type: ignore[arg-type]
+                result = service.answer(_request("디디가 최근 한 말"))
+                self.assertEqual(result.outcome, "failed")
+                self.assertEqual(result.fallback_reason, "company_api_" + reason)
+
+    def test_memory_citation_exception_does_not_relax_other_read_route_guards(self) -> None:
+        # 분석·장비·Notion 등 다른 wrapper는 이전 출처 정책을 그대로 적용한다.
+        for service_type, question, route, _, used_llm in self._service_cases():
+            if service_type is CompanyFreeformApiRolloutService:
+                continue
+            with self.subTest(service=service_type.__name__):
+                remote = _result(route, used_llm=used_llm, sources=(_memory_source(),))
+                service = service_type(None, api_client=_ApiClient(remote), logger=self.logger)  # type: ignore[arg-type]
+                result = service.answer(_request(question))
+                self.assertEqual(result.outcome, "failed")
 
     def test_usage_help_is_remote_deterministic_before_final_freeform(
         self,

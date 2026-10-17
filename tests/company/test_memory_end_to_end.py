@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
@@ -20,8 +21,12 @@ from boxer_company.assistant.freeform_route import CompanyFreeformAssistantRoute
 from boxer_company.memory.extraction import MemoryExtractor, ProviderResult
 from boxer_company.memory.store import MemoryStore, initialize_memory_store
 from boxer_company.memory.worker import MemoryWorker
-from boxer_company_adapter_slack.assistant_bridge import build_company_assistant_request
+from boxer_company_adapter_slack.assistant_bridge import (
+    build_company_assistant_request,
+    render_company_assistant_result,
+)
 from boxer_company_adapter_slack.company_api_client import CompanyApiClientSettings, CompanyAssistantApiClient
+from boxer_company_adapter_slack.company_api_rollout import CompanyFreeformApiRolloutService
 from boxer_company_adapter_slack.conversation_memory import SlackConversationMemory
 from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
 from boxer_company_adapter_slack.memory_event_outbox import MemorySourceEventOutbox
@@ -123,12 +128,16 @@ class MemoryEndToEndTests(unittest.TestCase):
         self.memory.bot_user_id = "UBOT"
         self.client.memory_request_preparer = self.memory.prepare
 
-    def turn(self, question, timestamp, *, channel="C1", group="freeform"):
+    def turn(self, question, timestamp, *, channel="C1", group="freeform", through_rollout=False):
         payload = {"workspace_id": "T1", "user_id": "UA", "channel_id": channel,
                    "current_ts": timestamp, "thread_ts": timestamp, "question": question,
                    "raw_text": question, "text": question, "request_log": {}}
         request = build_company_assistant_request(payload)
         request = replace(request, memory_context=self.memory.context_for(payload, manage=group == "operations"))
+        if through_rollout:
+            service = CompanyFreeformApiRolloutService(None, api_client=self.client,
+                logger=logging.getLogger(__name__))
+            return service.answer(request)
         return self.client.answer(request, route_group=group)
 
     def seed(self):
@@ -164,12 +173,25 @@ class MemoryEndToEndTests(unittest.TestCase):
 
     def test_real_capture_delivery_extract_and_retrieval_roundtrip(self):
         self.seed()
-        result = self.turn("나는 어떤 답변을 좋아하지?", SECOND)
+        # 일반 채널의 저장 기억 인용도 실제 Slack wrapper를 지나 사용자 출력까지 살아야 한다.
+        result = self.turn("나는 어떤 답변을 좋아하지?", SECOND, through_rollout=True)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.outcome, "answered")
         self.assertEqual(len(self.runtime.requests[-1].memory_entries), 1)
         self.assertIn("결론부터 짧게", self.runtime.inputs[-1][1])
         self.assertTrue(result.sources)
         self.assertIn("/archives/C1/", result.sources[0].uri)
         self.assertTrue(any(path.endswith("/retrievals") for path, _ in self.session.calls))
+        reply = Mock()
+        sent = render_company_assistant_result(result, reply=reply, actor_id="UA", client=None,
+            logger=logging.getLogger(__name__))
+        self.assertEqual(sent, 1)
+        reply.assert_called_once()
+        rendered = reply.call_args.args[0]
+        self.assertIn("결론부터 짧게", rendered)
+        self.assertIn("<" + result.sources[0].uri + "|이전 대화 근거>", rendered)
+        self.assertNotIn("[memory:", rendered)
+        self.assertNotIn("일반 답변 서비스 상태를 확인할 수 없어", rendered)
 
     def test_other_channel_and_deleted_source_are_not_reused(self):
         self.seed()
@@ -390,10 +412,20 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
         request = build_company_assistant_request(payload)
         request = replace(request, memory_context=memory.context_for(payload))
 
-        # 아직 기억이 전혀 없는 다른 채널의 댓글을 실제 수집기→HTTP lease→모델 참고 근거로 연결한다.
-        result = api.answer(request, route_group="freeform")
+        # 수집기·HTTP·모델뿐 아니라 운영 Slack wrapper의 출처 검증과 최종 렌더링까지 연결한다.
+        service = CompanyFreeformApiRolloutService(None, api_client=api, logger=logging.getLogger(__name__))
+        result = service.answer(request)
+        assert result is not None
+        reply = Mock()
+        sent = render_company_assistant_result(result, reply=reply, actor_id="UA", client=None,
+            logger=logging.getLogger(__name__))
 
     assert result.outcome == "answered"
+    assert sent == 1
+    reply.assert_called_once()
+    rendered = reply.call_args.args[0]
+    assert "일반 답변 서비스 상태를 확인할 수 없어" not in rendered
+    assert "[memory:" not in rendered
     assert bool(result.sources) is expected_live
     assert slack.list_calls == int(expected_live)
     if expected_live:
@@ -402,8 +434,11 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
         assert "https://" not in inputs[0][1]
         assert result.sources[0].uri.endswith("/p" + SECOND.replace(".", ""))
         assert "안내문" in result.messages[0].body
+        assert "안내문" in rendered
+        assert "<" + result.sources[0].uri + "|이전 대화 근거>" in rendered
         assert any(path.endswith("/live") for path, _ in session.calls)
     else:
+        assert "https://" not in rendered
         assert statement not in inputs[0][1]
         assert not any(path.endswith("/live") for path, _ in session.calls)
     with sqlite3.connect(path) as db:
