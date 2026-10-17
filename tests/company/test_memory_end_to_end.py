@@ -9,9 +9,11 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
+from httpx import Response
 
 from boxer_company.assistant.freeform_route import CompanyFreeformAssistantRoute
 from boxer_company.memory.extraction import MemoryExtractor, ProviderResult
@@ -39,10 +41,13 @@ class LocalSession:
     def __init__(self, client):
         self.client = client
         self.calls = []
+        self.responses = []
 
     def post(self, url, **kwargs):
         self.calls.append((urlsplit(url).path, kwargs.get("json")))
-        return self.client.post(urlsplit(url).path, json=kwargs.get("json"), headers=kwargs.get("headers"), follow_redirects=False)
+        response = self.client.post(urlsplit(url).path, json=kwargs.get("json"), headers=kwargs.get("headers"), follow_redirects=False)
+        self.responses.append(response)
+        return response
 
 
 class Slack:
@@ -169,6 +174,107 @@ class MemoryEndToEndTests(unittest.TestCase):
                                  {"team_id": "T1", "event_id": "Ev-delete"}, self.slack)
         self.turn("내 답변 선호가 뭐였지?", THIRD)
         self.assertEqual(self.runtime.requests[-1].memory_entries, ())
+
+    def source_event(self, kind, *, identity="Ev-source", timestamp=FIRST, text="앞으로 자세히 답해줘"):
+        event = {"subtype": "message_" + kind, "channel": "C1"}
+        if kind == "deleted":
+            event["deleted_ts"] = timestamp
+        else:
+            event["message"] = {"ts": timestamp, "text": text}
+        return self.memory.source_event(event, {"team_id": "T1", "event_id": identity}, self.slack)
+
+    def source_event_state(self):
+        # 내부 journal ID와 기억 version을 함께 비교해 ACK 재시도가 재적용으로 바뀌지 않게 한다.
+        with sqlite3.connect(self.store.path) as db:
+            return {
+                "events": db.execute("SELECT id,request_id,event_type,durability_state FROM memory_events WHERE event_type LIKE 'source_%' ORDER BY id").fetchall(),
+                "items": db.execute("SELECT id,status,version FROM memory_items ORDER BY id").fetchall(),
+                "sources": db.execute("SELECT id,state FROM memory_sources ORDER BY id").fetchall(),
+            }
+
+    def assert_source_event_applied_and_replay_acknowledged(self, kind):
+        self.seed()
+        self.assertTrue(self.source_event(kind))
+        self.assertEqual(self.session.responses[-1].json(), {"eventId": "Ev-source", "invalidatedCount": 1})
+        self.assertEqual(self.memory.status(), {"sourceEvents": "ok", "pendingSourceEvents": 0})
+        applied = self.source_event_state()
+        self.assertEqual(len(applied["events"]), 1)
+        internal_id, request_id, event_type, durability = applied["events"][0]
+        self.assertTrue(internal_id.startswith("evt_"))
+        self.assertNotEqual(internal_id, request_id)
+        self.assertEqual((request_id, event_type, durability), ("Ev-source", "source_" + kind, "pending"))
+        self.assertEqual(applied["items"][0][1], "deleted" if kind == "deleted" else "conflicted")
+        # 동일 Slack 이벤트가 다시 전달되어도 transport ID로 ACK하며 내부 삭제 이력은 보존한다.
+        self.assertTrue(self.source_event(kind))
+        self.assertEqual(self.session.responses[-1].json(), {"eventId": "Ev-source", "invalidatedCount": 0})
+        self.assertEqual(self.memory.event_outbox.pending_count(), 0)
+        self.assertEqual(self.source_event_state(), applied)
+
+    def test_known_deleted_source_ack_preserves_internal_journal_and_replay(self):
+        self.assert_source_event_applied_and_replay_acknowledged("deleted")
+
+    def test_known_changed_source_ack_preserves_internal_journal_and_replay(self):
+        self.assert_source_event_applied_and_replay_acknowledged("changed")
+
+    def test_unknown_source_noop_is_acknowledged_without_creating_scope(self):
+        # 학습하지 않은 일반 메시지의 변경/삭제도 대기열을 막지 않으며 새 source를 만들지 않는다.
+        for kind in ("changed", "deleted"):
+            for _ in range(2):
+                self.assertTrue(self.source_event(kind, identity="Ev-noop-" + kind))
+                self.assertEqual(self.session.responses[-1].json(),
+                                 {"eventId": "Ev-noop-" + kind, "invalidatedCount": 0})
+                self.assertEqual(self.memory.status(), {"sourceEvents": "ok", "pendingSourceEvents": 0})
+        for index in range(2):
+            self.memory.event_outbox.enqueue({"tenantId": "T1", "channelId": "C1", "messageTs": FIRST,
+                "eventType": "deleted", "eventId": "Ev-queued-" + str(index)})
+        self.assertEqual(self.memory.drain_source_events(), 2)
+        self.assertEqual(self.memory.event_outbox.pending_count(), 0)
+        with sqlite3.connect(self.store.path) as db:
+            for table in ("memory_threads", "memory_sources", "memory_items", "memory_jobs", "memory_events"):
+                self.assertEqual(db.execute("SELECT count(*) FROM " + table).fetchone()[0], 0)
+
+    def test_unchanged_known_revision_noop_preserves_memory_and_acknowledges(self):
+        self.seed()
+        before = self.source_event_state()
+        self.assertTrue(self.source_event("changed", text=PREFERENCE))
+        self.assertEqual(self.session.responses[-1].json(), {"eventId": "Ev-source", "invalidatedCount": 0})
+        self.assertEqual(self.memory.event_outbox.pending_count(), 0)
+        self.assertEqual(self.source_event_state(), before)
+
+    def test_wrong_ack_keeps_outbox_then_real_api_replay_drains_without_reapplying(self):
+        self.seed()
+        original_post = self.session.post
+
+        def wrong_ack(url, **kwargs):
+            # 실제 저장소 적용 뒤 응답 ID만 망가뜨려 전송 결과 유실·오연결 상황을 재현한다.
+            response = original_post(url, **kwargs)
+            return Response(response.status_code, json={**response.json(), "eventId": "wrong-event"})
+
+        with patch.object(self.session, "post", side_effect=wrong_ack):
+            self.assertTrue(self.source_event("deleted"))
+        self.assertEqual(self.memory.status(), {"sourceEvents": "degraded", "pendingSourceEvents": 1})
+        applied = self.source_event_state()
+        self.assertEqual(len(applied["events"]), 1)
+        self.assertEqual(self.memory.drain_source_events(), 1)
+        self.assertEqual(self.session.responses[-1].json(), {"eventId": "Ev-source", "invalidatedCount": 0})
+        self.assertEqual(self.memory.status(), {"sourceEvents": "ok", "pendingSourceEvents": 0})
+        self.assertEqual(self.source_event_state(), applied)
+
+    def test_failed_store_keeps_outbox_until_successful_retry(self):
+        self.seed()
+        before = self.source_event_state()
+        # HTTP 503은 성공 ACK로 바꾸지 않는다. 보호 원문 같은 예외 내용도 응답에서 제외한다.
+        with patch.object(self.store, "source_event", side_effect=RuntimeError("private error body")):
+            self.assertTrue(self.source_event("deleted"))
+        response = self.session.responses[-1]
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("private error body", response.text)
+        self.assertEqual(self.memory.status(), {"sourceEvents": "degraded", "pendingSourceEvents": 1})
+        self.assertEqual(self.source_event_state(), before)
+        self.assertEqual(self.memory.drain_source_events(), 1)
+        self.assertEqual(self.session.responses[-1].json(), {"eventId": "Ev-source", "invalidatedCount": 1})
+        self.assertEqual(self.memory.status(), {"sourceEvents": "ok", "pendingSourceEvents": 0})
+        self.assertEqual(len(self.source_event_state()["events"]), 1)
 
     def test_manual_preference_uses_original_source_and_same_actor_scope(self):
         text = "내 답변 선호를 짧게로 바꿔줘"

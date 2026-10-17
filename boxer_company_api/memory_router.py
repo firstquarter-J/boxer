@@ -111,6 +111,11 @@ def create_memory_router(*, service: MemoryService, caller_registry: CallerRegis
         result = invoke(request_id, service.store.source_event,
                         tenant_id=body.tenantId, channel_id=body.channelId, message_ts=body.messageTs,
                         event_type=body.eventType, event_id=body.eventId, revision_hash=body.revisionHash)
-        return result
+        if (not isinstance(result, dict) or type(result.get("invalidatedCount")) is not int
+                or result["invalidatedCount"] < 0):
+            raise CompanyApiProblem(status=503, code="service_not_ready", request_id=request_id, retryable=True)
+        # 저장소 eventId는 삭제 journal의 내부 ID이며 noop이면 None이다. 전송 ACK는
+        # 적용된 원요청 ID를 돌려줘야 Slack이 해당 outbox 항목만 지울 수 있다.
+        return {"eventId": body.eventId, "invalidatedCount": result["invalidatedCount"]}
 
     return router

@@ -73,8 +73,10 @@ class Store:
 
     def source_event(self, **kwargs):
         self.events.append(kwargs)
+        invalidated_count = len(self.items)
         self.items = []
-        return {"changed": True}
+        return {"eventId": "evt_test_internal" if invalidated_count else None,
+                "invalidatedCount": invalidated_count}
 
     def create_capture(self, **kwargs):
         if self.broken:
@@ -225,6 +227,23 @@ def client(memory, runtime=None, capabilities=("assistant.turn.read",)):
 
 def headers():
     return {"Authorization": f"Bearer {TOKEN}", "X-Request-ID": REQUEST_ID}
+
+
+@pytest.mark.parametrize("invalid_result", [None, [], {}, {"invalidatedCount": None},
+    {"invalidatedCount": True}, {"invalidatedCount": -1}, {"invalidatedCount": "0"},
+    {"invalidatedCount": 0.0}])
+def test_source_event_invalid_store_result_is_not_acknowledged(monkeypatch, invalid_result):
+    # 적용 결과가 잘못되면 ID만 맞춘 성공 응답을 만들지 않고 outbox 재시도가 가능한 오류로 닫는다.
+    memory = service()
+    monkeypatch.setattr(memory.store, "source_event", lambda **_: invalid_result)
+    with client(memory) as http:
+        response = http.post("/internal/v1/memory/sources/events", headers=headers(), json={
+            "tenantId": "T1", "channelId": "C1", "messageTs": TS,
+            "eventType": "deleted", "eventId": "Ev-contract"})
+    assert response.status_code == 503
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json()["code"] == "service_not_ready" and response.json()["retryable"] is True
+    assert "eventId" not in response.json()
 
 
 def test_api_optional_contract_auth_and_degraded_health():
