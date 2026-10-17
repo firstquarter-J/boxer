@@ -1,0 +1,695 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import pytest
+
+from boxer_company.memory.contracts import MemoryError, canonical_digest, source_revision
+from boxer_company.memory.store import MemoryStore, initialize_memory_store
+from boxer_company.memory.policy import is_allowed_conversation_source
+from boxer_company.memory.presentation import extract_memory_citations, render_memory
+
+
+@pytest.fixture
+def state(tmp_path):
+    # 두 store 인스턴스가 같은 파일을 쓰도록 실제 SQLite 경계를 검증한다.
+    clock = [1_800_000_000.0]
+    path = tmp_path / "private" / "memory.db"
+    initialize_memory_store(path)
+    return MemoryStore(path, clock=lambda: clock[0], debounce_seconds=0), clock
+
+
+def source(text="앞으로 짧게 답해줘", *, author="U1", ts="1800000000.000001", channel="C1", edited=""):
+    return {"messageTs": ts, "revisionHash": source_revision(text, edited), "authorId": author,
+            "authorKind": "human", "text": text, "permalink": f"https://team.slack.com/archives/{channel}/p{ts.replace('.', '')}",
+            "createdAt": ts, "editedAt": edited}
+
+
+def capture(store, *, request="event1", channel="C1", thread="1800000000.000001", message="1800000000.000001", actor="U1"):
+    return store.create_capture(tenant_id="T1", actor_id=actor, channel_id=channel, thread_ts=thread,
+                                current_message_ts=message, channel_kind="channel", request_id=request,
+                                route="company_freeform")
+
+
+def upload(store, cap, sources):
+    return store.put_chunk(tenant_id=cap["tenantId"], capture_id=cap["captureId"], actor_id=cap["actorId"],
+                           claim_token=cap["claimToken"], chunk_no=0, sources=sources, coverage="complete", is_last=True,
+                           total_chunks=1, input_digest=canonical_digest([canonical_digest(sources)]))
+
+
+def candidate(item, **kwargs):
+    return {"kind": "person", "category": "preference", "subjectUserId": item["authorId"],
+            "topicKey": "response_length", "text": "짧은 답변을 선호함", "evidenceType": "self_statement",
+            "sources": [{"sourceId": item["sourceId"], "quote": item["text"], "relation": "supports"}],
+            "subjects": [], "action": "add", **kwargs}
+
+
+def publish(store, cap=None, sources=None, make_candidate=candidate):
+    cap = cap or capture(store)
+    upload(store, cap, sources or [source()])
+    job = store.claim_job("worker")
+    identity = {"tenant_id": "T1", "job_id": job["jobId"], "claim_token": job["claimToken"]}
+    inputs = store.inputs(**identity)
+    for chunk in inputs:
+        values = [make_candidate(item) for item in chunk["sources"]]
+        store.stage_candidates(**identity, chunk_no=chunk["chunkNo"], candidates=values)
+    store.complete(**identity)
+    return job
+
+
+def verified(items):
+    return [{"sourceId": ref["sourceId"], "revisionHash": ref["revisionHash"], "status": "verified"}
+            for item in items for ref in item["sources"]]
+
+
+def test_initialization_is_explicit_private_and_rejects_missing_runtime_file(state):
+    store, _ = state
+    assert store.path.stat().st_mode & 0o777 == 0o600
+    store.path.unlink()
+    assert not store.health()
+    with pytest.raises(MemoryError, match="memory_storage_missing"):
+        capture(store)
+    assert not store.path.exists()
+
+
+def test_unsafe_directory_and_symlink_rejected(tmp_path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o755)
+    with pytest.raises(MemoryError, match="directory_unsafe"):
+        initialize_memory_store(unsafe / "memory.db")
+    safe = tmp_path / "safe"
+    safe.mkdir(mode=0o700)
+    link = safe / "link.db"
+    target = safe / "target.db"
+    target.touch(mode=0o600)
+    link.symlink_to(target)
+    with pytest.raises(MemoryError, match="path_invalid"):
+        initialize_memory_store(link)
+
+
+def test_capture_request_is_idempotent_but_scope_change_is_rejected(state):
+    store, _ = state
+    first = capture(store)
+    assert capture(store)["captureId"] == first["captureId"]
+    with pytest.raises(MemoryError, match="identity_conflict"):
+        capture(store, channel="C2")
+
+
+def test_two_actors_keep_independent_preferences_and_scope(state):
+    store, _ = state
+    cap = capture(store, message="1800000001.000001")
+    publish(store, cap, [source(), source("앞으로 자세히 답해줘", author="U2", ts="1800000001.000001")],
+            lambda item: candidate(item, text="짧은 답변 선호" if item["authorId"] == "U1" else "자세한 답변 선호"))
+    own = store.list_own_memories("T1", "C1", "U1")
+    other = store.list_own_memories("T1", "C1", "U2")
+    assert len(own) == len(other) == 1
+    assert "짧은" in own[0]["text"] and "자세한" in other[0]["text"]
+    assert store.retrieval_candidates("T2", "C1", "U1", "x", "답변") == []
+    shared = store.retrieval_candidates("T1", "C2", "U1", "x", "답변")
+    assert len(shared) == 1 and shared[0]["styleOnly"] is True
+    assert shared[0]["subjectUserId"] == "U1"
+    assert store.retrieval_candidates("T1", "C1", "U3", "x", "그 사람", mentioned_user_ids=["U2"])[0]["subjectUserId"] == "U2"
+
+
+@pytest.mark.parametrize(("topic", "original", "repeated"), [
+    ("response_length", "짧은 답변을 선호함", "앞으로도 핵심만 간단히 짧게 답변해 주기를 선호함"),
+    ("response_length", "짧은 답변을 선호함", "앞으로도 핵심만 간단히 답하는 것을 선호함"),
+    ("response_length", "짧은 답변을 선호함", "앞으로도 핵심만 간단히 답변하는 것을 선호함"),
+    ("response_length", "짧은 답변 선호", "간결한 답변 선호"),
+    ("response_length", "답변은 짧게 받는 것을 선호함", "간단한 응답을 선호함"),
+    ("response_length", "자세한 답변을 선호함", "상세한 답변 선호"),
+    ("response_language", "한국어 답변을 선호함", "한글로 답변해 주기를 선호함"),
+    ("response_language", "영어 답변 선호", "앞으로 영어로 답변해 주기를 선호함"),
+    ("response_order", "결론을 먼저 설명하는 답변을 선호함", "결론부터 답변해 주기를 선호함"),
+])
+def test_standard_preference_paraphrase_adds_evidence_without_conflict(state, topic, original, repeated):
+    # 실모델 same_preference 결과처럼 같은 선호를 다른 문장으로 요약해도 근거만 누적한다.
+    store, _ = state
+    publish(store, sources=[source(original)], make_candidate=lambda item: candidate(item, topicKey=topic, text=original))
+    old_id = store.list_own_memories("T1", "C1", "U1")[0]["memoryId"]
+    newer = "1800000001.000001"
+    publish(store, capture(store, request="repeat", thread=newer, message=newer),
+            [source(repeated, ts=newer)], lambda item: candidate(item, topicKey=topic, text=repeated))
+    memories = store.list_own_memories("T1", "C1", "U1")
+    assert len(memories) == 1
+    assert memories[0]["memoryId"] == old_id
+    assert memories[0]["status"] == "active"
+    assert len(memories[0]["sources"]) == 2
+
+
+@pytest.mark.parametrize(("topic", "original", "opposite"), [
+    ("response_length", "짧은 답변 선호", "자세한 답변 선호"),
+    ("response_language", "한국어 답변 선호", "영어 답변 선호"),
+    ("response_order", "결론 먼저 답변 선호", "설명 먼저 답변 선호"),
+])
+@pytest.mark.parametrize("corrects", [False, True])
+def test_standard_opposite_preference_requires_explicit_correction(state, topic, original, opposite, corrects):
+    store, _ = state
+    publish(store, sources=[source(original)], make_candidate=lambda item: candidate(item, topicKey=topic, text=original))
+    old_id = store.list_own_memories("T1", "C1", "U1")[0]["memoryId"]
+    newer = "1800000001.000001"
+
+    def changed(item):
+        result = candidate(item, topicKey=topic, text=opposite)
+        if corrects:
+            result.update(action="replace", replacesId=old_id)
+            result["sources"][0]["relation"] = "corrects"
+        return result
+
+    message = ("기존 선호를 바꿀게. " if corrects else "") + opposite
+    publish(store, capture(store, request="change", thread=newer, message=newer),
+            [source(message, ts=newer)], changed)
+    memories = store.list_own_memories("T1", "C1", "U1")
+    if corrects:
+        assert [(item["text"], item["status"]) for item in memories] == [(opposite, "active")]
+    else:
+        assert len(memories) == 2
+        assert {item["status"] for item in memories} == {"conflicted"}
+
+
+@pytest.mark.parametrize(("topic", "original", "different"), [
+    ("response_length", "짧은 답변 선호", "짧은 답변을 선호하지 않음"),
+    ("response_length", "짧은 답변 선호", "짧은 답변 대신 자세한 답변을 선호함"),
+    ("response_length", "짧은 답변 선호", "바쁠 때만 짧은 답변을 선호함"),
+    ("response_length", "짧은 답변 선호", "짧은 답변에 예시를 포함하는 것을 선호함"),
+    ("response_length", "짧은 답변 선호", "짧은 답변과 상세한 설명을 선호함"),
+    ("response_length", "짧은 답변 선호", "3줄 이내의 짧은 답변을 선호함"),
+    ("response_language", "한국어 답변 선호", "한국어와 영어 답변을 선호함"),
+    ("response_order", "결론 먼저 답변 선호", "결론을 먼저 말하지 않는 답변 선호"),
+    ("custom_response_style", "짧은 답변 선호", "간결한 답변 선호"),
+])
+def test_preference_paraphrase_does_not_discard_qualifiers_or_negation(state, topic, original, different):
+    # 값이 같아 보여도 추가 의미가 남거나 표준 주제가 아니면 기존 충돌 처리를 유지한다.
+    store, _ = state
+    publish(store, sources=[source(original)], make_candidate=lambda item: candidate(item, topicKey=topic, text=original))
+    newer = "1800000001.000001"
+    publish(store, capture(store, request="different", thread=newer, message=newer),
+            [source(different, ts=newer)], lambda item: candidate(item, topicKey=topic, text=different))
+    memories = store.list_own_memories("T1", "C1", "U1")
+    assert len(memories) == 2
+    assert {item["status"] for item in memories} == {"conflicted"}
+
+
+@pytest.mark.parametrize(("topic", "text", "value"), [
+    ("response_length", "짧은 답변을 선호함", "short"),
+    ("response_language", "영어 답변을 선호함", "en"),
+    ("response_order", "결론부터 답변을 선호함", "conclusion_first"),
+])
+def test_cross_channel_style_exposes_only_own_canonical_value(state, topic, text, value):
+    store, _ = state
+    private_text = "비공개 프로젝트 오로라 검토 중이야. " + text
+    publish(store, sources=[source(private_text)], make_candidate=lambda item: candidate(item, topicKey=topic, text=text))
+    entries = store.retrieval_candidates("T1", "PUBLIC", "U1", "other-thread", "오늘 얘기해줘")
+    assert len(entries) == 1 and entries[0]["styleOnly"] is True
+    assert store.load_verified_items(tenant_id="T1", channel_id="PUBLIC", candidates=entries, verified_sources=verified(entries)) == []
+    assert store.load_verified_items(tenant_id="T1", channel_id="PUBLIC", actor_id="U2", candidates=entries, verified_sources=verified(entries)) == []
+    loaded = store.load_verified_items(tenant_id="T1", channel_id="PUBLIC", actor_id="U1", candidates=entries, verified_sources=verified(entries))
+    assert loaded == [{"kind": "personal_style", "topicKey": topic, "value": value}]
+    for supplied in (loaded, entries):
+        rendered, selected = render_memory(supplied)
+        assert selected == {}
+        assert all(token not in rendered for token in ("C1", "slack.com", "오로라", "sourceId", "memoryId", "U1", "sourceTimes"))
+    assert extract_memory_citations("답변 [memory:" + entries[0]["memoryId"] + "]", {entries[0]["memoryId"]: entries[0]}) == ("답변", ())
+    assert store.retrieval_candidates("T1", "PUBLIC", "U2", "other-thread", "U1 답변 선호", mentioned_user_ids=["U1"]) == []
+    assert store.retrieval_candidates("OTHER_TENANT", "PUBLIC", "U1", "other-thread", "답변") == []
+    assert store.list_own_memories("T1", "PUBLIC", "U1") == []
+
+
+@pytest.mark.parametrize("mutation", ["changed", "deleted", "unavailable", "forget", "suppress"])
+def test_cross_channel_style_rechecks_source_and_forget_revocation(state, mutation):
+    store, _ = state
+    publish(store)
+    entries = store.retrieval_candidates("T1", "PUBLIC", "U1", "other-thread", "오늘 얘기해줘")
+    if mutation == "forget":
+        store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U1", memory_id=entries[0]["memoryId"], request_id="forget")
+    elif mutation == "suppress":
+        store.suppress_topic(tenant_id="T1", channel_id="C1", actor_id="U1", topic_key="response_length", request_id="suppress")
+    else:
+        store.source_event(tenant_id="T1", channel_id="C1", message_ts="1800000000.000001", event_type=mutation, event_id="event")
+    assert store.load_verified_items(tenant_id="T1", channel_id="PUBLIC", actor_id="U1", candidates=entries, verified_sources=verified(entries)) == []
+    assert store.retrieval_candidates("T1", "PUBLIC", "U1", "other-thread", "오늘 얘기해줘") == []
+
+
+@pytest.mark.parametrize("overrides", [
+    {"category": "fact", "text": "기획 담당자임", "topicKey": "job_role"},
+    {"text": "짧은 답변에 오로라 프로젝트 예시를 포함하는 것을 선호함"},
+    {"topicKey": "custom_style", "text": "짧은 답변 선호"},
+])
+def test_cross_channel_does_not_share_facts_or_qualified_preferences(state, overrides):
+    store, _ = state
+    publish(store, make_candidate=lambda item: candidate(item, **overrides))
+    assert store.retrieval_candidates("T1", "PUBLIC", "U1", "other-thread", "오로라 기획 답변") == []
+    assert store.list_own_memories("T1", "C1", "U1")
+
+
+def test_cross_channel_opposite_values_wait_for_explicit_latest_correction(state):
+    store, _ = state
+    publish(store)
+    first = store.retrieval_candidates("T1", "PUBLIC", "U1", "other-thread", "답변")
+    second_ts = "1800000001.000001"
+    publish(store, capture(store, request="opposite", channel="C2", thread=second_ts, message=second_ts),
+            [source("앞으로 자세히 답해줘", ts=second_ts, channel="C2")], lambda item: candidate(item, text="자세한 답변 선호"))
+    assert store.retrieval_candidates("T1", "PUBLIC", "U1", "other-thread", "답변") == []
+    assert store.retrieval_candidates("T1", "C1", "U1", "other-thread", "답변") == []
+    assert store.load_verified_items(tenant_id="T1", channel_id="PUBLIC", actor_id="U1", candidates=first, verified_sources=verified(first)) == []
+    latest_ts = "1800000002.000001"
+    store.set_own_preference(tenant_id="T1", channel_id="PUBLIC", actor_id="U1", thread_ts=latest_ts,
+                            current_message_ts=latest_ts, request_id="explicit-change", topic_key="response_length",
+                            text="자세한 답변 선호", source=source("앞으로 자세히 답해줘", ts=latest_ts, channel="PUBLIC"))
+    latest = store.retrieval_candidates("T1", "C1", "U1", "other-thread", "답변")
+    assert [item["styleValue"] for item in latest] == ["detailed"]
+    assert store.list_own_memories("T1", "C1", "U1") == []
+    assert store.list_own_memories("T1", "C2", "U1") == []
+    # 최신 명시 선호를 지워도 대체된 다른 채널의 예전 선호가 부활하지 않는다.
+    store.forget_item(tenant_id="T1", channel_id="PUBLIC", actor_id="U1", memory_id=latest[0]["memoryId"], request_id="forget-latest")
+    assert store.retrieval_candidates("T1", "C1", "U1", "other-thread", "답변") == []
+
+
+def test_cross_channel_correction_uses_canonical_previous_and_blocks_old_recollection(state):
+    store, _ = state
+    publish(store)
+    old = store.list_own_memories("T1", "C1", "U1")[0]
+    ts = "1800000002.000001"
+    cap = capture(store, request="correct", channel="C2", thread=ts, message=ts)
+    upload(store, cap, [source("기존 선호를 바꿀게. 앞으로 자세히 답해줘", ts=ts, channel="C2")])
+    job = store.claim_job("worker")
+    identity = {"tenant_id": "T1", "job_id": job["jobId"], "claim_token": job["claimToken"]}
+    inputs = store.inputs(**identity)
+    prior = inputs[0]["previousItems"][0]
+    assert prior["memoryId"] == old["memoryId"]
+    assert "C1" not in json.dumps(prior) and "slack.com" not in json.dumps(prior)
+    correction = candidate(inputs[0]["sources"][0], text="자세한 답변 선호", action="replace", replacesId=old["memoryId"])
+    correction["sources"][0]["relation"] = "corrects"
+    store.stage_candidates(**identity, chunk_no=0, candidates=[correction])
+    store.complete(**identity)
+    older = "1800000001.000001"
+    publish(store, capture(store, request="old-recollect", channel="C3", thread=older, message=older),
+            [source("앞으로 짧게 답해줘", ts=older, channel="C3")])
+    assert [item["styleValue"] for item in store.retrieval_candidates("T1", "PUBLIC", "U1", "x", "답변")] == ["detailed"]
+
+
+def test_cross_channel_new_preference_invalidates_running_snapshot(state):
+    store, _ = state
+    upload(store, capture(store), [source()])
+    job = store.claim_job("worker")
+    identity = {"tenant_id": "T1", "job_id": job["jobId"], "claim_token": job["claimToken"]}
+    item = store.inputs(**identity)[0]["sources"][0]
+    store.stage_candidates(**identity, chunk_no=0, candidates=[candidate(item)])
+    ts = "1800000001.000001"
+    store.set_own_preference(tenant_id="T1", channel_id="C2", actor_id="U1", thread_ts=ts, current_message_ts=ts,
+                            request_id="new-preference", topic_key="response_length", text="자세한 답변 선호",
+                            source=source("앞으로 자세히 답해줘", ts=ts, channel="C2"))
+    with pytest.raises(MemoryError, match="items_revision_stale"):
+        store.complete(**identity)
+
+
+def test_import_capture_has_separate_identity_manifest_and_resume_claim(state):
+    store, clock = state
+    sources = [source()]
+    digest = canonical_digest([canonical_digest(sources)])
+    arguments = dict(tenant_id="T1", operator_id="OPERATOR", channel_id="C1", thread_ts="1800000000.000001",
+                     cutoff_ts="1800000000.000001", channel_kind="channel", import_id="approved-history", input_digest=digest)
+    cap = store.create_import_capture(**arguments)
+    assert cap["route"] == "history_import" and cap["answerParts"] == []
+    with pytest.raises(MemoryError, match="capture_scope_invalid"):
+        store.create_capture(tenant_id="T1", actor_id="U1", channel_id="C1", thread_ts="1800000000.000001",
+                             current_message_ts="1800000000.000001", channel_kind="channel", request_id="fake-mention", route="history_import")
+    clock[0] += 121
+    assert store.pull_captures("T1", "slack-worker") == []
+    resumed = store.create_import_capture(**arguments)
+    assert resumed["captureId"] == cap["captureId"] and resumed["claimToken"] != cap["claimToken"]
+    with pytest.raises(MemoryError, match="claim_stale"):
+        upload(store, cap, sources)
+    with pytest.raises(MemoryError, match="manifest_conflict"):
+        store.create_import_capture(**{**arguments, "input_digest": "0" * 64})
+    upload(store, resumed, sources)
+    assert store.create_import_capture(**arguments)["state"] == "ready"
+    with sqlite3.connect(store.path) as connection:
+        metadata = json.loads(connection.execute("SELECT metadata FROM memory_jobs").fetchone()[0])
+    assert (metadata["triggerKind"], metadata["importId"], metadata["inputDigest"]) == ("history_import", "approved-history", digest)
+
+
+def test_import_manifest_mismatch_rolls_back_and_cancelled_import_cannot_revive(state):
+    store, _ = state
+    args = dict(tenant_id="T1", operator_id="OPERATOR", channel_id="C1", thread_ts="1800000000.000001",
+                cutoff_ts="1800000000.000001", channel_kind="channel", import_id="history", input_digest="0" * 64)
+    cap = store.create_import_capture(**args)
+    with pytest.raises(MemoryError, match="manifest_conflict"):
+        upload(store, cap, [source()])
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts="1800000000.000001", event_type="deleted", event_id="deleted")
+    with pytest.raises(MemoryError, match="import_terminal"):
+        store.create_import_capture(**args)
+
+
+def test_reconciled_stage_validates_all_job_sources_and_publishes_atomically(state):
+    store, clock = state
+    cap = capture(store, message="1800000001.000001")
+    parts = [[source()], [source("앞으로 자세히 답해줘", ts="1800000001.000001")]]
+    for index, sources in enumerate(parts):
+        store.put_chunk(tenant_id="T1", capture_id=cap["captureId"], actor_id="U1", claim_token=cap["claimToken"],
+                        chunk_no=index, sources=sources, coverage="complete", is_last=index == 1,
+                        total_chunks=2 if index == 1 else None,
+                        input_digest=canonical_digest([canonical_digest(part) for part in parts]) if index == 1 else None)
+    job = store.claim_job("worker")
+    identity = {"tenant_id": "T1", "job_id": job["jobId"], "claim_token": job["claimToken"]}
+    inputs = store.inputs(**identity)
+    for part in inputs:
+        store.stage_candidates(**identity, chunk_no=part["chunkNo"], candidates=[candidate(part["sources"][0])])
+    clock[0] += 100
+    store.renew_claim(**identity)
+    clock[0] += 100
+    final = candidate(inputs[1]["sources"][0], text="자세한 답변 선호")
+    # chunk 1 근거로 만든 최종 결과를 chunk 0에 원자적으로 보관해도 실제 원본 검증은 유지한다.
+    store.stage_reconciled_candidates(**identity, candidates=[final], usage={"inputTokens": 9})
+    store.stage_reconciled_candidates(**identity, candidates=[final], usage={"inputTokens": 9})
+    staged = store.inputs(**identity)
+    assert all(part["reconciled"] for part in staged)
+    assert staged[1]["candidates"] == [] and len(staged[0]["candidates"]) == 1
+    with pytest.raises(MemoryError, match="result_conflict"):
+        store.stage_reconciled_candidates(**identity, candidates=[])
+    forged = {**final, "sources": [{"sourceId": "outside", "quote": "위조", "relation": "supports"}]}
+    with pytest.raises(MemoryError, match="evidence_invalid"):
+        store.stage_reconciled_candidates(**identity, candidates=[forged])
+    assert store.list_own_memories("T1", "C1", "U1") == []
+    store.complete(**identity)
+    assert [item["text"] for item in store.list_own_memories("T1", "C1", "U1")] == ["자세한 답변 선호"]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT input_tokens FROM memory_jobs").fetchone()[0] == 9
+
+
+@pytest.mark.parametrize(("author", "message", "status"), [
+    ("U1", "내가 맡은 검토 다 해놨어.", "resolved"),
+    ("U2", "U1이 맡은 검토 다 해놨어.", "active"),
+    ("U1", "완료했다고 말한 건 취소할게. 아직 검토하지 못했어.", "active"),
+])
+def test_new_task_completion_requires_direct_assignee_source(state, author, message, status):
+    store, _ = state
+    publish(store, sources=[source(message, author=author)], make_candidate=lambda item: candidate(
+        item, kind="thread", category="task", subjectUserId=None, topicKey="안내문 검토",
+        text="안내문 검토", evidenceType="attributed_statement", subjects=[{"userId": "U1", "role": "assignee"}]))
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute("SELECT topic_key,status FROM memory_items").fetchone()
+    assert row == ("안내문검토", status)
+
+
+def test_resolved_task_recollection_with_same_sources_does_not_duplicate(state):
+    store, _ = state
+    message = source("내가 맡은 안내문 검토 다 해놨어.")
+
+    def task(item, text):
+        return candidate(item, kind="thread", category="task", subjectUserId=None, topicKey="안내문 검토",
+                         text=text, evidenceType="attributed_statement", subjects=[{"userId": "U1", "role": "assignee"}])
+
+    publish(store, sources=[message], make_candidate=lambda item: task(item, "안내문 검토 완료"))
+    upload(store, capture(store, request="recollect", message="1800000001.000001"),
+           [message, source("고마워", ts="1800000001.000001")])
+    job = store.claim_job("worker")
+    identity = {"tenant_id": "T1", "job_id": job["jobId"], "claim_token": job["claimToken"]}
+    repeated = store.inputs(**identity)[0]["sources"][0]
+    store.stage_candidates(**identity, chunk_no=0, candidates=[task(repeated, "안내문 검토를 끝냄")])
+    store.complete(**identity)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_items WHERE status='resolved'").fetchone()[0] == 1
+
+
+def test_atomic_publish_and_staged_payload_cleanup(state):
+    store, _ = state
+    cap = capture(store)
+    upload(store, cap, [source()])
+    job = store.claim_job("worker")
+    identity = dict(tenant_id="T1", job_id=job["jobId"], claim_token=job["claimToken"])
+    item = store.inputs(**identity)[0]["sources"][0]
+    store.stage_candidates(**identity, chunk_no=0, candidates=[candidate(item)])
+    assert store.list_own_memories("T1", "C1", "U1") == []
+    store.complete(**identity)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+        assert "previousItems" not in json.loads(connection.execute("SELECT metadata FROM memory_jobs").fetchone()[0])
+        assert connection.execute("SELECT COUNT(*) FROM memory_summaries").fetchone()[0] == 1
+
+
+def test_retrieval_requires_all_current_source_versions(state):
+    store, _ = state
+    publish(store)
+    items = store.retrieval_candidates("T1", "C1", "U1", "x", "답변")
+    assert store.load_verified_items(tenant_id="T1", channel_id="C1", candidates=items, verified_sources=[]) == []
+    assert len(store.load_verified_items(tenant_id="T1", channel_id="C1", actor_id="U1", candidates=items, verified_sources=verified(items))) == 1
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts="1800000000.000001", event_type="deleted", event_id="delete1")
+    assert store.load_verified_items(tenant_id="T1", channel_id="C1", candidates=items, verified_sources=verified(items)) == []
+
+
+def test_lease_takeover_blocks_old_worker_result(state):
+    store, clock = state
+    upload(store, capture(store), [source()])
+    old = store.claim_job("old")
+    clock[0] += 121
+    second = MemoryStore(store.path, clock=lambda: clock[0], debounce_seconds=0)
+    new = second.claim_job("new")
+    assert new["claimToken"] != old["claimToken"]
+    with pytest.raises(MemoryError, match="claim_stale"):
+        store.stage_candidates(tenant_id="T1", job_id=old["jobId"], claim_token=old["claimToken"], chunk_no=0, candidates=[])
+
+
+def test_delete_cancels_running_job_and_late_capture_chunk(state):
+    store, _ = state
+    cap = capture(store)
+    upload(store, cap, [source()])
+    job = store.claim_job("worker")
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts="1800000000.000001", event_type="deleted", event_id="delete1")
+    with pytest.raises(MemoryError, match="claim_stale"):
+        store.complete(tenant_id="T1", job_id=job["jobId"], claim_token=job["claimToken"])
+    with pytest.raises(MemoryError):
+        upload(store, cap, [source()])
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+
+
+def test_chunk_digest_and_author_are_enforced(state):
+    store, _ = state
+    cap = capture(store)
+    arguments = dict(tenant_id="T1", capture_id=cap["captureId"], actor_id="U1", claim_token=cap["claimToken"], chunk_no=0, sources=[source()])
+    store.put_chunk(**arguments)
+    with pytest.raises(MemoryError, match="chunk_conflict"):
+        store.put_chunk(**{**arguments, "sources": [source("앞으로 상세히 설명해줘")]})
+    with pytest.raises(MemoryError, match="actor_invalid"):
+        store.put_chunk(**{**arguments, "actor_id": "U2"})
+
+
+def test_sensitive_source_never_persisted_and_coverage_stays_partial(state):
+    store, _ = state
+    cap = capture(store)
+    unsafe = [source("password=secret-never-persist")]
+    safe = [source("앞으로 결론부터 알려줘", ts="1800000000.000001")]
+    store.put_chunk(tenant_id="T1", capture_id=cap["captureId"], actor_id="U1", claim_token=cap["claimToken"], chunk_no=0, sources=unsafe)
+    store.put_chunk(tenant_id="T1", capture_id=cap["captureId"], actor_id="U1", claim_token=cap["claimToken"], chunk_no=1, sources=safe, coverage="complete", is_last=True, total_chunks=2, input_digest=canonical_digest([canonical_digest(unsafe), canonical_digest(safe)]))
+    with sqlite3.connect(store.path) as connection:
+        dump = "\n".join(connection.iterdump())
+        assert "secret-never-persist" not in dump
+        assert connection.execute("SELECT coverage FROM memory_threads").fetchone()[0] == "partial"
+
+
+def test_forged_author_and_source_id_candidate_rejected(state):
+    store, _ = state
+    upload(store, capture(store), [source()])
+    job = store.claim_job("worker")
+    identity = dict(tenant_id="T1", job_id=job["jobId"], claim_token=job["claimToken"])
+    item = store.inputs(**identity)[0]["sources"][0]
+    with pytest.raises(MemoryError, match="author_invalid"):
+        store.stage_candidates(**identity, chunk_no=0, candidates=[candidate(item, subjectUserId="U2")])
+    with pytest.raises(MemoryError, match="evidence_invalid"):
+        store.stage_candidates(**identity, chunk_no=0, candidates=[candidate(item, sources=[{"sourceId": "invented", "quote": "fake"}])])
+
+
+def test_forget_removes_payload_and_prevents_recollection(state):
+    store, clock = state
+    publish(store)
+    memory = store.list_own_memories("T1", "C1", "U1")[0]
+    result = store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U1", memory_id=memory["memoryId"], request_id="forget1")
+    assert result["durabilityState"] == "pending"
+    assert store.list_own_memories("T1", "C1", "U1") == []
+    store.mark_deletion_durable(result["id"], 1)
+    assert next(event for event in store.deletion_events() if event["id"] == result["id"])["durabilityState"] == "durable"
+    clock[0] += 1
+    cap = capture(store, request="event2", message="1800000001.000001")
+    publish(store, cap, [source("앞으로 짧게 답해줘", ts="1800000001.000001")])
+    assert store.list_own_memories("T1", "C1", "U1") == []
+
+
+def test_other_actor_cannot_forget_memory(state):
+    store, _ = state
+    publish(store)
+    memory = store.list_own_memories("T1", "C1", "U1")[0]
+    with pytest.raises(MemoryError, match="own_item_required"):
+        store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U2", memory_id=memory["memoryId"], request_id="attack")
+
+
+def test_snapshot_restore_replays_deletion_and_purges_jobs(state, tmp_path):
+    store, _ = state
+    publish(store)
+    old_snapshot = tmp_path / "snapshot.db"
+    store.snapshot(old_snapshot)
+    memory = store.list_own_memories("T1", "C1", "U1")[0]
+    event = store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U1", memory_id=memory["memoryId"], request_id="forget1")
+    restored = MemoryStore(old_snapshot)
+    restored.apply_deletion_event(event)
+    restored.apply_deletion_event(event)
+    restored.cleanup(restored=True)
+    assert restored.list_own_memories("T1", "C1", "U1") == []
+    with pytest.raises(FileExistsError):
+        store.snapshot(old_snapshot)
+
+
+def test_expired_temporary_inputs_are_removed(state):
+    store, clock = state
+    cap = capture(store)
+    store.put_chunk(tenant_id="T1", capture_id=cap["captureId"], actor_id="U1", claim_token=cap["claimToken"], chunk_no=0, sources=[source()])
+    clock[0] += 8 * 86400
+    assert store.cleanup()["payloadsRemoved"] == 1
+    assert store.pull_captures("T1", "worker") == []
+
+
+def test_explicit_preference_is_own_source_idempotent_and_replaces(state):
+    store, _ = state
+    arguments = dict(tenant_id="T1", channel_id="C1", actor_id="U1", thread_ts="1800000000.000001",
+                     current_message_ts="1800000000.000001", request_id="preference1", topic_key="response_length",
+                     text="짧게 답변", source=source())
+    first = store.set_own_preference(**arguments)
+    assert store.set_own_preference(**arguments)["memoryId"] == first["memoryId"]
+    second = store.set_own_preference(**{**arguments, "request_id": "preference2", "current_message_ts": "1800000002.000001",
+                                        "source": source("앞으로 자세히 답해줘", ts="1800000002.000001"), "text": "자세히 답변"})
+    assert second["memoryId"] != first["memoryId"]
+    assert [item["text"] for item in store.list_own_memories("T1", "C1", "U1")] == ["자세히 답변"]
+
+
+def test_cross_thread_item_update_prevents_stale_job_publish(state):
+    store, _ = state
+    publish(store)
+    cap = capture(store, request="event2", thread="1800000010.000001", message="1800000010.000001")
+    upload(store, cap, [source("앞으로 순서대로 답해줘", ts="1800000010.000001")])
+    job = store.claim_job("worker")
+    identity = dict(tenant_id="T1", job_id=job["jobId"], claim_token=job["claimToken"])
+    store.stage_candidates(**identity, chunk_no=0, candidates=[])
+    store.set_own_preference(tenant_id="T1", channel_id="C1", actor_id="U1", thread_ts="1800000020.000001", current_message_ts="1800000020.000001", request_id="newpref", topic_key="response_length", text="자세히 답변", source=source("앞으로 자세히 답해줘", ts="1800000020.000001"))
+    with pytest.raises(MemoryError, match="revision_stale"):
+        store.complete(**identity)
+
+
+def test_interest_requires_three_distinct_threads(state):
+    store, _ = state
+    interest = lambda item: candidate(item, category="interest", evidenceType="inference", topicKey="독서", text="독서에 관심이 있음")
+    for index, ts in enumerate(["1800000000.000001", "1800000010.000001", "1800000020.000001"]):
+        publish(store, capture(store, request=f"reading{index}", thread=ts, message=ts), [source("독서 모임 이야기하자", ts=ts)], interest)
+        items = store.list_own_memories("T1", "C1", "U1")
+        assert len(items) == (1 if index == 2 else 0)
+
+
+def test_bot_text_requires_exact_delivery_receipt(state):
+    store, clock = state
+    cap = store.create_capture(tenant_id="T1", actor_id="U1", channel_id="C1", thread_ts="1800000000.000001", current_message_ts="1800000000.000001", channel_kind="channel", request_id="bot1", route="company_freeform", answer_parts=["답변이야"])
+    receipt = {"messageTs": "1800000001.000001", "partIndex": 0, "deliveryId": cap["answerParts"][0]["deliveryId"], "authorId": "B1", "textHash": canonical_digest("<@U1> 답변이야")}
+    store.checkpoint(tenant_id="T1", capture_id=cap["captureId"], claim_token=cap["claimToken"], delivery_receipts=[receipt])
+    cap = store.pull_captures("T1", "collector")[0]
+    bot = {**source("<@U1> 답변이야", author="B1", ts="1800000001.000001"), "authorKind": "boxer", "deliveryVerified": True, "route": "company_freeform"}
+    upload(store, cap, [source(), bot])
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_sources WHERE author_kind='boxer'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("text", ["마미박스 무료병원 자동 업데이트 켜줘", "이 스레드 학습해줘", "<@B1> 이 스레드 학습해줘"])
+def test_real_operation_router_excludes_old_sensitive_requests(text):
+    assert not is_allowed_conversation_source(text)
+    assert is_allowed_conversation_source("내 답변 선호를 짧게 바꿔줘")
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_new_partial_capture_carries_unprocessed_safe_sources(state, running):
+    store, _ = state
+    first = capture(store)
+    upload(store, first, [source()])
+    old_job = store.claim_job("old") if running else None
+    second = capture(store, request="event2", message="1800000001.000001", actor="U2")
+    new_sources = [source("앞으로 자세히 답해줘", author="U2", ts="1800000001.000001")]
+    store.put_chunk(tenant_id="T1", capture_id=second["captureId"], actor_id="U2", claim_token=second["claimToken"],
+                    chunk_no=0, sources=new_sources, coverage="partial", is_last=True, total_chunks=1,
+                    input_digest=canonical_digest([canonical_digest(new_sources)]))
+    if old_job:
+        with pytest.raises(MemoryError, match="claim_stale"):
+            store.complete(tenant_id="T1", job_id=old_job["jobId"], claim_token=old_job["claimToken"])
+    current = store.claim_job("latest")
+    identity = dict(tenant_id="T1", job_id=current["jobId"], claim_token=current["claimToken"])
+    chunks = store.inputs(**identity)
+    assert {item["authorId"] for chunk in chunks for item in chunk["sources"]} == {"U1", "U2"}
+    for chunk in chunks:
+        store.stage_candidates(**identity, chunk_no=chunk["chunkNo"], candidates=[candidate(item) for item in chunk["sources"]])
+    store.complete(**identity)
+    assert len(store.list_own_memories("T1", "C1", "U1")) == len(store.list_own_memories("T1", "C1", "U2")) == 1
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+
+
+def test_collecting_source_delete_cancels_before_finalize(state):
+    store, _ = state
+    cap = capture(store)
+    store.put_chunk(tenant_id="T1", capture_id=cap["captureId"], actor_id="U1", claim_token=cap["claimToken"], chunk_no=0, sources=[source()])
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts="1800000000.000001", event_type="deleted", event_id="early-delete")
+    with pytest.raises(MemoryError, match="claim_stale"):
+        upload(store, cap, [source()])
+    assert store.deletion_events()[0]["deletionKind"] == "source"
+
+
+def test_source_only_keeps_accepted_short_evidence(state):
+    store, _ = state
+    text = "앞으로 짧게 답해줘. " + "이번 대화의 일회성 설명이야. " * 30
+    cap = capture(store)
+    upload(store, cap, [source(text)])
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT excerpt FROM memory_sources").fetchone()[0] == ""
+    job = store.claim_job("worker")
+    identity = dict(tenant_id="T1", job_id=job["jobId"], claim_token=job["claimToken"])
+    item = store.inputs(**identity)[0]["sources"][0]
+    memory = candidate(item)
+    memory["sources"][0]["quote"] = "앞으로 짧게 답해줘"
+    store.stage_candidates(**identity, chunk_no=0, candidates=[memory])
+    store.complete(**identity)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT excerpt FROM memory_sources").fetchone()[0] == "앞으로 짧게 답해줘"
+        assert "일회성 설명" not in "\n".join(connection.iterdump())
+
+
+def test_out_of_order_edit_event_does_not_invalidate_already_collected_revision(state):
+    store, _ = state
+    publish(store)
+    edited = source("앞으로 자세히 답해줘", edited="1800000002.000001")
+    publish(store, capture(store, request="edit-capture"), [edited], lambda item: candidate(item, text="자세한 답변 선호"))
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts=edited["messageTs"], event_type="changed", event_id="delayed-edit", revision_hash=edited["revisionHash"])
+    current = store.retrieval_candidates("T1", "C1", "U1", "x", "답변")
+    assert len(current) == 1 and current[0]["text"] == "자세한 답변 선호"
+
+
+def test_topic_suppression_is_own_scope_and_idempotent(state):
+    store, _ = state
+    publish(store)
+    arguments = dict(tenant_id="T1", channel_id="C1", actor_id="U1", topic_key="response_length", request_id="suppress1")
+    first = store.suppress_topic(**arguments)
+    assert store.suppress_topic(**arguments)["id"] == first["id"]
+    assert store.list_own_memories("T1", "C1", "U1") == []
+    with pytest.raises(MemoryError, match="request_conflict"):
+        store.suppress_topic(**{**arguments, "actor_id": "U2"})
+
+
+@pytest.mark.parametrize("event_type", ["changed", "deleted"])
+def test_source_event_before_first_upload_invalidates_in_memory_capture(state, event_type):
+    store, _ = state
+    cap = capture(store)
+    # adapter가 읽은 시점과 첫 전송 사이에 온 삭제도 이전 token을 막아야 한다.
+    fetched = [source()]
+    assert store.source_event(tenant_id="T1", channel_id="C1", message_ts=fetched[0]["messageTs"],
+                              event_type=event_type, event_id="before-upload")["eventId"] is None
+    with pytest.raises(MemoryError, match="claim_stale"):
+        upload(store, cap, fetched)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0

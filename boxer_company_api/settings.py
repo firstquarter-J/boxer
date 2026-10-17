@@ -120,6 +120,10 @@ class CompanyApiSettings:
     # companion과 pull/ACK transport는 명시 flag로 함께 열며 Slack caller는
     # domain 실행 권한 없이 transport capability만 가진다.
     automation_scheduler_enabled: bool = False
+    # 기억 저장소 장애는 일반 assistant readiness와 분리한다.
+    memory_enabled: bool = False
+    memory_read_enabled: bool = False
+    memory_state_path: str = "/var/lib/boxer-company-api/conversation_memory.db"
 
     @property
     def authentication_configured(self) -> bool:
@@ -132,6 +136,11 @@ def load_company_api_settings(
     """환경변수의 caller registry를 검증하고 오류 상세 없이 fail closed한다."""
 
     source = env if env is not None else os.environ
+    memory_options = {
+        "memory_enabled": str(source.get("BOXER_COMPANY_API_MEMORY_ENABLED", "false")).strip().lower() in _TRUE_VALUES,
+        "memory_read_enabled": str(source.get("BOXER_COMPANY_API_MEMORY_READ_ENABLED", "false")).strip().lower() in _TRUE_VALUES,
+        "memory_state_path": str(source.get("BOXER_COMPANY_API_MEMORY_STATE_PATH", "/var/lib/boxer-company-api/conversation_memory.db")).strip(),
+    }
     live_device_enabled, live_device_error = _load_live_device_enabled(source)
     operations_enabled, operations_error = _load_operations_enabled(source)
     (
@@ -207,6 +216,7 @@ def load_company_api_settings(
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
+            **memory_options,
         )
 
     try:
@@ -242,6 +252,7 @@ def load_company_api_settings(
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
+            **memory_options,
         )
 
     automation_caller_error = (
@@ -305,6 +316,7 @@ def load_company_api_settings(
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
+            **memory_options,
         )
     return CompanyApiSettings(
         host=host,
@@ -325,6 +337,7 @@ def load_company_api_settings(
         request_log_path=request_log_path,
         automation_enabled_cycles=automation_enabled_cycles,
         automation_scheduler_enabled=automation_scheduler_enabled,
+        **memory_options,
     )
 
 

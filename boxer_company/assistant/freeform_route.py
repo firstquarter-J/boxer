@@ -23,10 +23,15 @@ from boxer_company.prompt_security import (
     is_prompt_exfiltration_attempt,
 )
 from boxer_company.team_chat_context import build_team_freeform_context
+from boxer_company.memory.presentation import MEMORY_GUIDANCE, extract_memory_citations, render_memory
 
 
 FreeformAnswerer = Callable[[str, str, str | None], str]
 ProviderUnavailableSummary = Callable[[], str | None]
+
+
+class AnswerTokenLimitError(RuntimeError):
+    """한 번 늘린 출력 예산에도 답변을 완성하지 못한 경우를 구분한다."""
 
 _META_LINE_PATTERNS = (
     re.compile(r"(?mi)^\s*현재 요청 적용\s*:\s*.+$"),
@@ -173,6 +178,11 @@ class CompanyFreeformAssistantRoute:
         system_prompt = "\n\n".join(
             section for section in (base_prompt, team_context) if section
         ).strip() or None
+        # matcher와 현재 문맥 검사가 끝난 뒤 모델 입력에만 기억을 붙인다.
+        memory_text, selected_memories = render_memory(request.memory_entries)
+        if memory_text:
+            context_text += memory_text
+            system_prompt = (system_prompt or "") + "\n\n" + MEMORY_GUIDANCE
 
         try:
             answer = _sanitize_freeform_answer(
@@ -181,6 +191,13 @@ class CompanyFreeformAssistantRoute:
                     context_text,
                     system_prompt,
                 )
+            )
+        except AnswerTokenLimitError:
+            # 중간에서 끊긴 본문은 정상 답변이나 장기 기억으로 저장하지 않는다.
+            return _provider_failure_result(
+                self.name,
+                "답변을 한 번에 완성하기엔 내용이 길어. 질문 범위를 나눠서 보내줘",
+                "answer_token_limit",
             )
         except TimeoutError:
             return CompanyAssistantResult(
@@ -273,6 +290,7 @@ class CompanyFreeformAssistantRoute:
                 fallback_reason="provider_error",
             )
 
+        answer, memory_sources = extract_memory_citations(answer, selected_memories) if selected_memories else (answer, ())
         if not answer:
             return CompanyAssistantResult(
                 route=self.name,
@@ -286,6 +304,7 @@ class CompanyFreeformAssistantRoute:
             route=self.name,
             outcome="answered",
             messages=(AssistantMessage(body=answer),),
+            sources=memory_sources,
             used_llm=True,
         )
 

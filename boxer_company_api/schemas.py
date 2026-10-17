@@ -16,6 +16,8 @@ from pydantic import (
     model_validator,
 )
 
+from boxer_company_api.memory_schemas import MemoryCaptureOutput, MemoryContextInput
+
 from boxer.context.entries import (
     ContextEntry,
     ContextEntrySource,
@@ -909,6 +911,21 @@ class AssistantTurnInput(_StrictInputModel):
     # 사람 team-fun은 Slack이 이미 최신 5k window로 렌더한 문자열을
     # 그대로 넘긴다. 일반 context entry와 별도의 typed 필드로 유지한다.
     funContext: str | None = Field(default=None, max_length=_MAX_CONTEXT_CHARS)
+    memoryContext: MemoryContextInput | None = None
+
+    @model_validator(mode="after")
+    def _validate_memory_scope(self) -> "AssistantTurnInput":
+        memory = self.memoryContext
+        if memory is not None and (
+            self.channel != "slack"
+            or memory.workspaceId != self.tenantId
+            or memory.actorId != self.actorId
+            or memory.threadTs != self.conversationId
+            or self.scope is None
+            or memory.channelId != self.scope.channelContextId
+        ):
+            raise ValueError("memoryContext scope is inconsistent")
+        return self
 
     @field_validator("question")
     @classmethod
@@ -1026,6 +1043,8 @@ class AssistantTurnInput(_StrictInputModel):
                 for entry in self.contextEntries
             ),
             metadata=metadata,
+            memory_context=(self.memoryContext.model_dump(exclude_none=True)
+                            if self.memoryContext is not None else None),
         )
 
 
@@ -1252,6 +1271,7 @@ class AssistantTurnOutput(BaseModel):
         max_length=_MAX_RESPONSE_SOURCES
     )
     usedLlm: bool
+    memoryCapture: MemoryCaptureOutput | None = None
     fallbackReason: str | None = Field(default=None, max_length=256)
     files: list[AssistantFileOutput] = Field(default_factory=list, max_length=1)
     operationResult: (
@@ -1354,6 +1374,8 @@ def serialize_result(
         messages=_serialize_messages(result.messages),
         sources=sources,
         usedLlm=result.used_llm,
+        memoryCapture=(MemoryCaptureOutput.model_validate(dict(result.memory_capture))
+                       if result.memory_capture is not None else None),
         fallbackReason=result.fallback_reason,
         files=[AssistantFileOutput.model_validate(file)
                for file in serialize_report_files(result.files, route=result.route)],
@@ -1483,6 +1505,8 @@ def _dump_turn_output(payload: AssistantTurnOutput) -> dict[str, Any]:
     # 기존 client와의 additive 호환을 위해 링크가 없는 메시지에는 새 키를
     # 내보내지 않는다. 링크가 있을 때만 requester 전용 확장 계약을 사용한다.
     serialized = payload.model_dump(mode="json")
+    if serialized.get("memoryCapture") is None:
+        serialized.pop("memoryCapture", None)
     for message in serialized.get("messages") or []:
         if not message.get("privateLinks"):
             message.pop("privateLinks", None)

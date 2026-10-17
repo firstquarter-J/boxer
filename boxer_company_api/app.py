@@ -61,6 +61,8 @@ from boxer_company_api.automation_delivery import (
     serialize_automation_delivery_batch,
 )
 from boxer_company_api.auth import CallerRegistry
+from boxer_company_api.memory_service import MemoryService
+from boxer_company_api.memory_router import create_memory_router
 from boxer_company_api.hpa_change_router import create_hpa_change_router
 from boxer_company_api.hpa_change_transport import HpaChangeTransportService
 from boxer_company_api.observability import emit_api_event
@@ -175,6 +177,7 @@ def create_company_api_app(
     hpa_change_coordinator: (
         HpaChangeCoordinator | None | object
     ) = _HPA_CHANGE_UNSET,
+    memory_service: MemoryService | None = None,
 ) -> FastAPI:
     """내부 인증 경계와 채널 중립 assistant runtime을 조립한다."""
 
@@ -188,6 +191,7 @@ def create_company_api_app(
         default_runtime_ready=default_runtime_ready,
     )
     caller_registry = CallerRegistry(api_settings)
+    memory_runtime = memory_service or _create_memory_service(api_settings)
     if hpa_change_coordinator is _HPA_CHANGE_UNSET:
         hpa_change_runtime: HpaChangeCoordinator | None = (
             create_hpa_change_coordinator()
@@ -255,6 +259,7 @@ def create_company_api_app(
         redoc_url=None,
     )
     install_problem_handlers(app)
+    app.include_router(create_memory_router(service=memory_runtime, caller_registry=caller_registry))
 
     def is_ready() -> bool:
         if (
@@ -344,6 +349,7 @@ def create_company_api_app(
                 "authentication": "ok",
                 "runtime": "ok",
                 "configuration": "ok",
+                **({"memory": memory_runtime.status()} if api_settings.memory_enabled else {}),
             },
         }
 
@@ -602,17 +608,31 @@ def create_company_api_app(
             device_ssh_state = None
             try:
                 typed_runtime = cast(_AssistantRuntime, runtime)
+                # route·권한 판정이 끝난 대화 경로에만 검증된 기억을 결합한다.
+                memory_request = (
+                    memory_runtime.bind_verified(domain_request)
+                    if (turn.routeGroup in {"freeform", "fun"}
+                        or (turn.routeGroup == "operations"
+                            and match_company_operation_route(domain_request) == "conversation_memory_manage"))
+                    else domain_request
+                )
+                memory_result = (
+                    memory_runtime.manage(memory_request)
+                    if turn.routeGroup == "operations" else None
+                )
                 # API context는 host 선택을 바꾸지 않고 side-effect marker와
                 # 요청당 mutation/open 횟수 제한만 활성화한다.
                 with company_api_device_ssh_context() as device_ssh_state:
-                    if turn.routeGroup is None:
+                    if memory_result is not None:
+                        result = memory_result
+                    elif turn.routeGroup is None:
                         result = (
                             typed_runtime.answer(
-                                domain_request,
+                                memory_request,
                                 on_partial_result=on_partial_result,
                             )
                             if on_partial_result is not None
-                            else typed_runtime.answer(domain_request)
+                            else typed_runtime.answer(memory_request)
                         )
                     else:
                         # rollout client가 고른 route group만 실행해 thread scope가
@@ -628,17 +648,25 @@ def create_company_api_app(
                         )
                         result = (
                             typed_runtime.answer_stage(
-                                domain_request,
+                                memory_request,
                                 runtime_stage,
                                 on_partial_result=on_partial_result,
                             )
                             if on_partial_result is not None
                             else typed_runtime.answer_stage(
-                                domain_request,
+                                memory_request,
                                 runtime_stage,
                             )
                         )
                 payload = serialize_result(result, request_id)
+                # 분할·잘림을 끝낸 실제 wire part를 capture identity로 삼는다.
+                result = memory_runtime.capture(memory_request, result, answer_parts=tuple(
+                    message["body"] for message in payload["messages"]
+                    if message["deliveryScope"] == "conversation"))
+                if result is not None and result.memory_capture is not None:
+                    with_memory = {**payload, "memoryCapture": dict(result.memory_capture)}
+                    if len(json.dumps(with_memory, ensure_ascii=False).encode("utf-8")) <= _MAX_STREAM_BYTES:
+                        payload = with_memory
             except Exception as exc:
                 side_effect_attempted = bool(
                     device_ssh_state is not None
@@ -1736,6 +1764,28 @@ def _resolve_runtime(
             status=503,
         )
         return None, False
+
+
+def _create_memory_service(settings: CompanyApiSettings) -> MemoryService:
+    # 누락 DB를 자동 생성하지 않는다. 명시 초기화 전에는 기억만 degraded다.
+    store = None
+    if settings.memory_enabled:
+        try:
+            from boxer_company.memory.store import MemoryStore
+            store = MemoryStore(settings.memory_state_path)
+        except Exception:
+            emit_api_event("company_api_memory_initialization_failed", status=503)
+
+    def flush_deletions(memory_store: Any) -> Any:
+        from boxer_company.memory.backup import MemoryBackup, MemoryBackupSettings
+        backup_settings = MemoryBackupSettings.from_env()
+        if backup_settings is None:
+            raise RuntimeError("memory_backup_not_configured")
+        return MemoryBackup(backup_settings).flush_deletions(memory_store)
+
+    return MemoryService(store, enabled=settings.memory_enabled,
+                         read_enabled=settings.memory_read_enabled,
+                         flush_deletions=flush_deletions)
 
 
 def _resolve_readiness_probe(

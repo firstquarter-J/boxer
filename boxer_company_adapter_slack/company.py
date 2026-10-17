@@ -63,6 +63,10 @@ from boxer_company_adapter_slack.company_api_client import (
     CompanyAssistantApiClient,
     load_company_api_client_settings,
 )
+from boxer_company_adapter_slack.conversation_memory import (
+    build_slack_conversation_memory,
+)
+from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
 from boxer_company_adapter_slack.company_api_rollout import (
     wrap_company_barcode_freeform_service,
     wrap_company_barcode_log_service,
@@ -241,6 +245,14 @@ def create_app() -> App:
     company_api_client = CompanyAssistantApiClient(
         company_api_settings
     )
+    # 기본 off이며 membership 뒤의 명시 멘션만 기억 DTO를 갖는다.
+    conversation_memory = build_slack_conversation_memory(
+        CompanyMemoryApiClient(company_api_settings),
+        is_allowed=base_access_runtime.is_allowed,
+        logger=app_logger,
+    )
+    if conversation_memory is not None:
+        company_api_client.memory_request_preparer = conversation_memory.prepare
     automation_api_client = CompanyAutomationApiClient(
         company_api_settings,
         logger=app_logger,
@@ -867,6 +879,8 @@ def create_app() -> App:
                 context_entries=execution_context,
                 metadata=metadata,
             )
+            if conversation_memory is not None and operation_route == "conversation_memory_manage":
+                request = replace(request, memory_context=conversation_memory.context_for(payload, manage=True))
             _set_request_log_route(
                 payload,
                 assistant_slack_route_name(operation_route),
@@ -992,6 +1006,8 @@ def create_app() -> App:
             payload,
             context_entries=get_context_entries(),
         )
+        if conversation_memory is not None:
+            request = replace(request, memory_context=conversation_memory.context_for(payload))
 
         def handle_read_stage(stage: str) -> bool:
             result = remote_read_services[stage].answer(request)
@@ -1009,13 +1025,24 @@ def create_app() -> App:
                 assistantFallbackReason=result.fallback_reason,
                 assistantUsedLlm=result.used_llm,
             )
-            render_company_assistant_result(
-                result,
-                reply=reply,
-                actor_id=user_id,
-                client=client,
-                logger=logger,
+            receipts: list[dict[str, Any]] = []
+            capture = result.memory_capture
+            delivery_reply = (
+                conversation_memory.delivery_reply(reply, capture, receipts)
+                if conversation_memory is not None and capture else reply
             )
+            try:
+                render_company_assistant_result(
+                    result,
+                    reply=delivery_reply,
+                    actor_id=user_id,
+                    client=client,
+                    logger=logger,
+                )
+            finally:
+                # 실패한 발송을 성공으로 꾸미지 않고 확인된 부분만 receipt에 남긴다.
+                if conversation_memory is not None and capture:
+                    conversation_memory.record_delivery(capture, receipts)
             return True
 
         if handle_read_stage("notion"):
@@ -1097,7 +1124,10 @@ def create_app() -> App:
     app = create_slack_app(
         _handle_company_mention,
         _handle_company_message,
+        **({"message_change_handler": conversation_memory.source_event} if conversation_memory is not None else {}),
     )
+    if conversation_memory is not None:
+        conversation_memory.start(app.client, company_api_settings.automation_tenant_id)
     if hpa_change_api_client is not None:
         attach_hpa_change_remote_reporter(
             app,

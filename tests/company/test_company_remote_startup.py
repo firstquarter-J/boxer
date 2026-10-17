@@ -159,6 +159,13 @@ class CompanyRemoteStartupTests(unittest.TestCase):
             state_path="/tmp/company-automation-delivery.json"
         )
 
+    def test_missing_memory_event_state_does_not_stop_existing_bot(self) -> None:
+        # 기억 기능을 켰더라도 영속 삭제 outbox가 없으면 기억만 닫고 봇을 기동한다.
+        with patch.dict(os.environ, {"BOXER_COMPANY_SLACK_MEMORY_ENABLED": "true",
+                                     "BOXER_COMPANY_SLACK_MEMORY_EVENT_STATE_PATH": ""}):
+            result = self._create_app()
+        self.assertIs(result.app, result.fake_app)
+
     def test_all_reporters_share_one_remote_transport_client(self) -> None:
         result = self._create_app()
 

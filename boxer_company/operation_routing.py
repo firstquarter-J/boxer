@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal
 
+from boxer_company.memory.commands import MEMORY_MANAGE_ROUTE, parse_memory_command
+
 from boxer_company._operation_routing_automation import (
     DAILY_AUTO_UPDATE_ROUTE,
     parse_daily_auto_update_command,
@@ -184,6 +186,9 @@ def match_company_operation_route(
     """Slack/API가 공유하는 operation 전체 우선순위를 순수하게 판정한다."""
 
     scoped = as_operations_request(request)
+    # 기억 관리도 API operations 권한을 통과하며 현재 질문만으로 분류한다.
+    if scoped.metadata.get("operation_action") is None and parse_memory_command(scoped.question) is not None:
+        return MEMORY_MANAGE_ROUTE
     # Slack 보안검토 transport가 만든 typed action은 자연어 mutation
     # matcher보다 먼저 확정해 probe 본문을 명령으로 오인하지 않게 한다.
     security_review = match_security_review_route(scoped)

@@ -6,13 +6,14 @@ from typing import Any, Callable
 from boxer.context.builder import _build_model_input
 from boxer.core import settings as core_settings
 from boxer.core.llm import (
-    _ask_claude,
+    _ask_claude_with_meta,
     _ask_ollama_chat,
     _check_ollama_health,
 )
 from boxer_company.assistant.freeform_route import (
     CompanyFreeformAssistantRoute,
     FreeformAnswerer,
+    AnswerTokenLimitError,
 )
 from boxer_company.assistant.team_fun_route import (
     TEAM_FUN_LLM_MAX_TOKENS,
@@ -20,6 +21,23 @@ from boxer_company.assistant.team_fun_route import (
     TEAM_FUN_OLLAMA_MODEL,
     CompanyTeamFunAssistantRoute,
 )
+
+
+def _complete_claude_answer(client: Any, question: str, system_prompt: str | None) -> str:
+    # 사고 토큰도 출력 한도를 쓰므로 회사 대화는 최소 2,048토큰을 확보한다.
+    # 실제 잘림 때만 한 번 더 생성하고, 미완성 답변을 성공으로 반환하지 않는다.
+    budget = max(2048, core_settings.ANTHROPIC_MAX_TOKENS)
+    for attempt in range(2):
+        result = _ask_claude_with_meta(client, question, system_prompt=system_prompt, max_tokens=budget)
+        if result.get("stop_reason") in {"end_turn", "refusal"}:
+            return result["text"]
+        if result.get("stop_reason") != "max_tokens":
+            # 도구 요청·일시 중지·종료 사유 누락은 완성된 최종 답변이 아니다.
+            raise RuntimeError("incomplete_model_turn")
+        if attempt or budget >= 8192:
+            break
+        budget = min(8192, budget * 2)
+    raise AnswerTokenLimitError("answer_token_limit")
 
 
 def build_company_provider_answerer(
@@ -42,7 +60,7 @@ def build_company_provider_answerer(
         if normalized_provider == "claude":
             if claude_client is None:
                 raise RuntimeError("claude provider unavailable")
-            return _ask_claude(
+            return _complete_claude_answer(
                 claude_client,
                 model_input,
                 system_prompt=system_prompt,
@@ -117,11 +135,10 @@ def build_company_team_fun_route(
         if normalized_provider == "claude":
             if claude_client is None:
                 raise RuntimeError("claude provider unavailable")
-            return _ask_claude(
+            return _complete_claude_answer(
                 claude_client,
                 prompt,
                 system_prompt=system_prompt,
-                max_tokens=TEAM_FUN_LLM_MAX_TOKENS,
             )
         if normalized_provider == "ollama":
             return _ask_ollama_chat(

@@ -23,6 +23,8 @@ boxer-company-api = "boxer_company_api.runtime:main"
 boxer-company-api-automation = "boxer_company_api.automation_scheduler:main"
 boxer-company-api-automation-resolve = "boxer_company_api.automation_recovery:main"
 boxer-company-api-hpa-coordinator = "boxer_company_api.hpa_change_coordinator_runner:main"
+boxer-company-api-memory = "boxer_company_api.memory_companion:main"
+boxer-company-api-memory-admin = "boxer_company_api.memory_cli:main"
 
 [tool.setuptools]
 packages = ["boxer_company_api"]

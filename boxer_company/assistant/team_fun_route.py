@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from boxer_company.memory.presentation import MEMORY_GUIDANCE, extract_memory_citations, render_memory
+
 from collections.abc import Callable
 import logging
 import re
@@ -494,11 +496,14 @@ class CompanyTeamFunAssistantRoute:
             context_text,
             team_context,
         )
+        # fun은 스타일 참고만 하고 출처를 한 줄 농담에 붙이지 않는다.
+        memory_text, selected_memories = render_memory(request.memory_entries)
+        prompt += memory_text
         try:
             generated = self._answerer(
                 prompt,
                 "",
-                _TEAM_FUN_SYSTEM_PROMPT,
+                _TEAM_FUN_SYSTEM_PROMPT + ("\n" + MEMORY_GUIDANCE if memory_text else ""),
             )
         except TimeoutError:
             return CompanyAssistantResult(
@@ -525,6 +530,9 @@ class CompanyTeamFunAssistantRoute:
             generated,
             fallback,
         )
+        if selected_memories:
+            answer, _ = extract_memory_citations(answer, selected_memories)
+            answer = answer or fallback
         return CompanyAssistantResult(
             route=self.name,
             outcome="answered",

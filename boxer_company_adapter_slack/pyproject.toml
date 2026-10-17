@@ -17,6 +17,9 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/firstquarter-J/boxer"
 
+[project.scripts]
+boxer-company-slack-memory-history = "boxer_company_adapter_slack.memory_history_cli:main"
+
 [tool.setuptools]
 packages = ["boxer_company_adapter_slack"]
 

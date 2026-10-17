@@ -28,6 +28,9 @@ class CompanyAssistantRequest:
     locale: str
     context_entries: tuple[ContextEntry, ...] = field(default_factory=tuple)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # 출처 확인용 transport와 서버가 검증한 기억을 분리해 라우팅 입력을 보존한다.
+    memory_context: Mapping[str, Any] | None = None
+    memory_entries: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +80,8 @@ class CompanyAssistantResult:
     # transport는 route별 고정 schema로 다시 검증해야 한다.
     operation_result: Mapping[str, Any] | None = None
     files: tuple[AssistantFile, ...] = field(default_factory=tuple)
+    # 대화 본문이 아닌 후속 수집 receipt이며 구 client에는 생략한다.
+    memory_capture: Mapping[str, Any] | None = None
 
 
 __all__ = [

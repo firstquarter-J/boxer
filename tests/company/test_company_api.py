@@ -4035,6 +4035,11 @@ class CompanyApiContractTests(unittest.TestCase):
                 "/internal/v1/hpa-change/threads/lookup",
                 "/internal/v1/hpa-change/deliveries/pull",
                 "/internal/v1/hpa-change/deliveries/ack",
+                "/internal/v1/memory/retrievals",
+                "/internal/v1/memory/captures/pull",
+                "/internal/v1/memory/captures/{capture_id}/chunks",
+                "/internal/v1/memory/captures/{capture_id}/checkpoint",
+                "/internal/v1/memory/sources/events",
             },
         )
         with TestClient(app) as client:

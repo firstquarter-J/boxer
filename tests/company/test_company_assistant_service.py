@@ -115,6 +115,9 @@ class CompanyAssistantServiceTests(unittest.TestCase):
                 "locale",
                 "context_entries",
                 "metadata",
+                # 채널 transport와 검증된 기억을 실행 metadata와 분리한다.
+                "memory_context",
+                "memory_entries",
             ],
         )
         self.assertEqual(
@@ -129,6 +132,7 @@ class CompanyAssistantServiceTests(unittest.TestCase):
                 "operation_result",
                 # 파일은 Slack 채널 정보 없는 requester 전용 DTO다.
                 "files",
+                "memory_capture",
             ],
         )
 

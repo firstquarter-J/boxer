@@ -17,6 +17,8 @@ from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
+from boxer_company.memory.commands import parse_memory_command
+
 from boxer_company.assistant.contracts import (
     AssistantLink,
     AssistantMessage,
@@ -438,6 +440,8 @@ class CompanyAssistantApiClient:
         self._thread_local = (
             threading.local() if session is None else None
         )
+        # 회사 entry가 선택적으로 연결한다. 기본 client 계약은 기억 없이 유지한다.
+        self.memory_request_preparer: Callable[[CompanyAssistantRequest], CompanyAssistantRequest] | None = None
 
     def answer(
         self,
@@ -445,6 +449,16 @@ class CompanyAssistantApiClient:
         *,
         route_group: _RouteGroup | None = None,
     ) -> CompanyAssistantResult:
+        if (
+            (route_group in {"freeform", "fun"} or (route_group == "operations" and parse_memory_command(request.question) is not None))
+            and request.memory_context is not None
+            and self.memory_request_preparer is not None
+        ):
+            try:
+                request = self.memory_request_preparer(request)
+            except Exception as exc:
+                # 부가 기억 조회 장애가 기존 정상 turn 전송을 막지 않는다.
+                self._logger.warning("Memory request preparation failed error_type=%s", type(exc).__name__)
         request_id = _validate_request(
             request,
             route_group=route_group,
@@ -1133,6 +1147,9 @@ def _serialize_request(
     if route_group is not None:
         # routeGroup은 권한이 아니라 실행 범위를 더 좁히는 transport hint다.
         payload["routeGroup"] = route_group
+    if request.memory_context is not None and route_group in {"freeform", "fun", "operations"}:
+        # 기억 metadata는 generic scope나 질문에 섞지 않고 전용 계약으로 보낸다.
+        payload["memoryContext"] = _serialize_memory_context(request)
     raw_audit_context = request.metadata.get("audit_context")
     if raw_audit_context is not None:
         if route_group != "operations":
@@ -2364,7 +2381,7 @@ def _deserialize_result_payload(
     request_id: str,
 ) -> CompanyAssistantResult:
     if (
-        frozenset(payload) - {"files"}
+        frozenset(payload) - {"files", "memoryCapture"}
         not in {_TURN_KEYS, _TURN_WITH_OPERATION_RESULT_KEYS}
         or payload.get("requestId") != request_id
         or not _safe_text(payload.get("route"), maximum=256)
@@ -2421,7 +2438,43 @@ def _deserialize_result_payload(
         fallback_reason=payload["fallbackReason"],
         operation_result=operation_result,
         files=files,
+        memory_capture=_deserialize_memory_capture(payload.get("memoryCapture"), request_id),
     )
+
+
+def _serialize_memory_context(request: CompanyAssistantRequest) -> dict[str, Any]:
+    value = request.memory_context
+    if not isinstance(value, Mapping):
+        raise CompanyApiContractError("company_memory_context_invalid")
+    allowed = {"workspaceId", "channelId", "threadTs", "currentMessageTs", "actorId", "channelKind", "triggerKind", "currentMessagePermalink", "currentMessageText", "currentMessageEditedAt", "retrievalId", "verifications"}
+    if (
+        set(value) - allowed
+        or value.get("workspaceId") != request.tenant_id
+        or value.get("actorId") != request.actor_id
+        or value.get("threadTs") != request.conversation_id
+        or value.get("channelId") != request.metadata.get("channel_id")
+        or value.get("currentMessageTs") != request.metadata.get("message_id")
+    ):
+        raise CompanyApiContractError("company_memory_context_invalid")
+    return json.loads(json.dumps(dict(value), allow_nan=False))
+
+
+def _deserialize_memory_capture(value: Any, request_id: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    # 임의 endpoint나 본문을 전달 receipt에 숨기지 못하게 허용된 키만 받는다.
+    keys = {"captureId", "tenantId", "actorId", "channelId", "threadTs", "currentMessageTs", "channelKind", "requestId", "route", "state", "deletionEpoch", "claimToken", "leaseUntil", "expiresAt", "checkpoint", "receivedChunks", "answerParts", "nextChunkNo"}
+    if (
+        not isinstance(value, dict) or set(value) - keys
+        or value.get("requestId") != request_id
+        or value.get("route") not in {"company_freeform", "company_team_fun"}
+        or any(not isinstance(value.get(key), str) or not _IDENTIFIER_PATTERN.fullmatch(value[key]) for key in ("captureId", "tenantId", "actorId", "channelId"))
+        or any(not _SLACK_MESSAGE_TS_PATTERN.fullmatch(str(value.get(key) or "")) for key in ("threadTs", "currentMessageTs"))
+        or len(json.dumps(value, ensure_ascii=False)) > 64_000
+    ):
+        # 전달 추적 metadata만 닫고 이미 검증된 정상 답변은 보존한다.
+        return None
+    return value
 
 
 def _deserialize_operation_result(

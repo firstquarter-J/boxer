@@ -38,6 +38,7 @@ packages = [
   "boxer_company",
   "boxer_company.assets",
   "boxer_company.assistant",
+  "boxer_company.memory",
   "boxer_company.routers",
 ]
 
@@ -45,6 +46,7 @@ packages = [
 boxer_company = "."
 "boxer_company.assets" = "assets"
 "boxer_company.assistant" = "assistant"
+"boxer_company.memory" = "memory"
 "boxer_company.routers" = "routers"
 
 [tool.setuptools.package-data]

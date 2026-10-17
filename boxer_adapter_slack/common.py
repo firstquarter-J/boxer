@@ -71,7 +71,7 @@ class SlackReplyFn(Protocol):
         mention_user: bool = True,
         blocks: list[dict[str, Any]] | None = None,
         client_msg_id: str | None = None,
-    ) -> None: ...
+    ) -> Any: ...
 
 
 MentionHandler = Callable[[MentionPayload, SlackReplyFn, Any, logging.Logger], None]
@@ -376,6 +376,8 @@ def _should_persist_request_log_event(
 def create_slack_app(
     mention_handler: MentionHandler,
     message_handler: MessageHandler | None = None,
+    *,
+    message_change_handler: Callable[[dict[str, Any], dict[str, Any], Any], None] | None = None,
 ) -> App:
     ss.validate_slack_tokens()
     _validate_tokens(include_llm=False, include_data_sources=False)
@@ -425,7 +427,7 @@ def create_slack_app(
             mention_user: bool = True,
             blocks: list[dict[str, Any]] | None = None,
             client_msg_id: str | None = None,
-        ) -> None:
+        ) -> Any:
             clean_text = (reply_text or "").strip()
             if not clean_text:
                 clean_text = "응답 내용이 비어 있어"
@@ -443,8 +445,10 @@ def create_slack_app(
             if normalized_client_msg_id:
                 # Slack retry에도 같은 logical 댓글을 재사용할 수 있게 adapter가 키를 지정한다.
                 say_kwargs["client_msg_id"] = normalized_client_msg_id
-            say(**say_kwargs)
+            response = say(**say_kwargs)
             _mark_request_log_reply(payload)
+            # 선택형 전달 추적이 실제 서버 발급 message ID를 사용할 수 있다.
+            return response
 
         try:
             mention_handler(payload, reply, client, logger)
@@ -481,6 +485,13 @@ def create_slack_app(
         body: dict[str, Any] | None = None,
     ) -> None:
         subtype = str(event.get("subtype") or "").strip()
+        if subtype in {"message_changed", "message_deleted"} and message_change_handler is not None:
+            # 원문 변경 observer는 응답 생성과 분리하며 실패가 event 처리를 막지 않는다.
+            try:
+                message_change_handler(event, body or {}, client)
+            except Exception as exc:
+                logger.warning("Message change observer failed error_type=%s", type(exc).__name__)
+            return
         if subtype and subtype != "bot_message":
             logger.debug("Ignored message event subtype=%s", subtype)
             return

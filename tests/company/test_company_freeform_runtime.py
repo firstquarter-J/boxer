@@ -1,4 +1,5 @@
 from unittest.mock import Mock, patch
+import pytest
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.freeform_runtime import (
@@ -36,8 +37,8 @@ def _fun_request() -> CompanyAssistantRequest:
 def test_claude_runtime_uses_server_client_once() -> None:
     client = Mock()
     with patch(
-        "boxer_company.assistant.freeform_runtime._ask_claude",
-        return_value="정상",
+        "boxer_company.assistant.freeform_runtime._ask_claude_with_meta",
+        return_value={"text": "정상", "stop_reason": "end_turn"},
     ) as ask:
         route = build_company_freeform_route(
             provider="claude",
@@ -52,6 +53,38 @@ def test_claude_runtime_uses_server_client_once() -> None:
     assert result.messages[0].body == "정상"
     assert ask.call_count == 1
     assert ask.call_args.args[0] is client
+
+
+def test_claude_truncation_retries_once_with_larger_budget() -> None:
+    # 사고 토큰으로 짧은 답이 잘려도 완성된 두 번째 본문만 사용자에게 보낸다.
+    with patch("boxer_company.assistant.freeform_runtime.core_settings.ANTHROPIC_MAX_TOKENS", 700), patch(
+        "boxer_company.assistant.freeform_runtime._ask_claude_with_meta",
+        side_effect=[{"text": "미완성", "stop_reason": "max_tokens"}, {"text": "완성된 답변", "stop_reason": "end_turn"}],
+    ) as ask:
+        route = build_company_freeform_route(provider="claude", claude_client=Mock(), provider_ready=lambda: True, timeout_message="시간 초과")
+        result = route.handle(_request())
+    assert result.messages[0].body == "완성된 답변"
+    assert [call.kwargs["max_tokens"] for call in ask.call_args_list] == [2048, 4096]
+
+
+def test_claude_repeated_truncation_is_failed_and_never_returns_partial_text() -> None:
+    with patch("boxer_company.assistant.freeform_runtime._ask_claude_with_meta", return_value={"text": "미완성 원문", "stop_reason": "max_tokens"}) as ask:
+        route = build_company_freeform_route(provider="claude", claude_client=Mock(), provider_ready=lambda: True, timeout_message="시간 초과")
+        result = route.handle(_request())
+    assert result.outcome == "failed"
+    assert result.fallback_reason == "answer_token_limit"
+    assert "미완성 원문" not in result.messages[0].body
+    assert ask.call_count <= 2
+
+
+@pytest.mark.parametrize("reason", ["pause_turn", "tool_use", ""])
+def test_interrupted_provider_turn_is_not_a_completed_answer(reason) -> None:
+    with patch("boxer_company.assistant.freeform_runtime._ask_claude_with_meta", return_value={"text":"문장이 아직", "stop_reason":reason}) as ask:
+        route = build_company_freeform_route(provider="claude",claude_client=Mock(),provider_ready=lambda:True,timeout_message="시간 초과")
+        result = route.handle(_request())
+    assert result.outcome == "failed"
+    assert "문장이 아직" not in result.messages[0].body
+    assert ask.call_count == 1
 
 
 def test_ollama_runtime_disables_thinking_output() -> None:

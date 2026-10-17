@@ -83,6 +83,7 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
                 "boxer_company",
                 "boxer_company.assets",
                 "boxer_company.assistant",
+                "boxer_company.memory",
                 "boxer_company.routers",
             ],
         )
@@ -137,7 +138,9 @@ class CompanyPackagingBoundaryTests(unittest.TestCase):
         )
         # 자동화 domain state는 API가 소유하므로 Slack 설치 단위에는
         # 과거 forward migration CLI를 다시 노출하지 않는다.
-        self.assertEqual(scripts, {})
+        self.assertEqual(scripts, {
+            "boxer-company-slack-memory-history": "boxer_company_adapter_slack.memory_history_cli:main",
+        })
 
     def test_company_slack_package_import_keeps_entrypoint_lazy(self) -> None:
         script = """
@@ -316,6 +319,8 @@ for prefix in (
                 "boxer-company-api-hpa-coordinator": (
                     "boxer_company_api.hpa_change_coordinator_runner:main"
                 ),
+                "boxer-company-api-memory": "boxer_company_api.memory_companion:main",
+                "boxer-company-api-memory-admin": "boxer_company_api.memory_cli:main",
             },
         )
 
