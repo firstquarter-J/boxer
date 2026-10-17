@@ -415,6 +415,105 @@ def test_resolved_task_recollection_with_same_sources_does_not_duplicate(state):
         assert connection.execute("SELECT COUNT(*) FROM memory_items WHERE status='resolved'").fetchone()[0] == 1
 
 
+def _task_candidate(item, text="안내문 검토 담당", topic="안내문 검토"):
+    return candidate(item, kind="thread", category="task", subjectUserId=None, topicKey=topic,
+                     text=text, evidenceType="attributed_statement", subjects=[{"userId": "U1", "role": "assignee"}])
+
+
+def _history_capture(store, message, *, request="past-import", thread=None):
+    return store.create_import_capture(
+        tenant_id="T1", operator_id="OPERATOR", channel_id="C1", thread_ts=thread or message["messageTs"],
+        cutoff_ts=message["messageTs"], channel_kind="channel", import_id=request,
+        input_digest=canonical_digest([canonical_digest([message])]))
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+@pytest.mark.parametrize("historical", [False, True])
+def test_past_history_task_preserves_newer_active_or_resolved_memory(state, resolved, historical):
+    store, _ = state
+    # 같은 주제의 더 오래된 다른 원문은 현재 상태를 강등하거나 완료 업무를 되살리지 않는다.
+    current = source("내가 맡은 안내문 검토 다 해놨어." if resolved else "내가 안내문 검토를 맡을게.")
+    publish(store, sources=[current], make_candidate=lambda item: _task_candidate(
+        item, "안내문 검토 완료" if resolved else "안내문 검토 담당", "안내문_검토"))
+    with sqlite3.connect(store.path) as connection:
+        before = connection.execute("SELECT * FROM memory_items").fetchall()
+    past = source("내가 안내문 검토를 진행하고 있어.", ts="1799999000.000001")
+    cap = (_history_capture(store, past) if historical else capture(
+        store, request="late-live-message", thread=past["messageTs"], message=past["messageTs"]))
+    publish(store, cap, [past], lambda item: _task_candidate(item, "안내문 검토 진행 중"))
+    with sqlite3.connect(store.path) as connection:
+        after = connection.execute("SELECT * FROM memory_items").fetchall()
+        statuses = dict(connection.execute("SELECT status,count(*) FROM memory_items GROUP BY status"))
+    if historical:
+        assert after == before
+        assert statuses == {"resolved" if resolved else "active": 1}
+    else:
+        # 이번 수정의 범위 밖인 실시간 add의 기존 충돌/새 업무 처리는 바꾸지 않는다.
+        assert statuses == ({"resolved": 1, "active": 1} if resolved else {"conflicted": 2})
+
+
+def test_past_history_different_topic_is_added(state):
+    store, _ = state
+    publish(store, sources=[source("내가 안내문 검토를 맡을게.")], make_candidate=_task_candidate)
+    past = source("내가 회의록 정리를 맡을게.", ts="1799999000.000001")
+    publish(store, _history_capture(store, past), [past],
+            lambda item: _task_candidate(item, "회의록 정리 담당", "회의록 정리"))
+    with sqlite3.connect(store.path) as connection:
+        assert set(connection.execute("SELECT topic_key,status FROM memory_items")) == {
+            ("안내문검토", "active"), ("회의록정리", "active")}
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+@pytest.mark.parametrize("current_subject,past_subject", [(None, "U1"), ("U1", None)])
+def test_past_history_task_subject_variation_does_not_bypass_newer_memory(state, resolved, current_subject, past_subject):
+    store, _ = state
+    # 모델이 스레드 기억의 subject를 작성자나 null로 바꾸어도 같은 업무의 최신 상태를 보호한다.
+    current = source("내가 맡은 안내문 검토 다 해놨어." if resolved else "내가 안내문 검토를 맡을게.")
+    publish(store, sources=[current], make_candidate=lambda item: {
+        **_task_candidate(item, "안내문 검토 완료" if resolved else "안내문 검토 담당"),
+        "subjectUserId": current_subject})
+    with sqlite3.connect(store.path) as connection:
+        before = connection.execute("SELECT * FROM memory_items").fetchall()
+    past = source("내가 안내문 검토를 진행하고 있어.", ts="1799999000.000001")
+    publish(store, _history_capture(store, past), [past], lambda item: {
+        **_task_candidate(item, "안내문 검토 진행 중"), "subjectUserId": past_subject})
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT * FROM memory_items").fetchall() == before
+        assert dict(connection.execute("SELECT status,count(*) FROM memory_items GROUP BY status")) == {
+            "resolved" if resolved else "active": 1}
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_newer_task_can_start_after_resolved_memory(state, historical):
+    store, _ = state
+    publish(store, sources=[source("내가 맡은 안내문 검토 다 해놨어.")],
+            make_candidate=lambda item: _task_candidate(item, "안내문 검토 완료"))
+    newer = source("이번에 새로 받은 안내문 검토를 내가 맡을게.", ts="1800000001.000001")
+    cap = (_history_capture(store, newer) if historical else capture(
+        store, request="new-task", thread=newer["messageTs"], message=newer["messageTs"]))
+    publish(store, cap, [newer], lambda item: _task_candidate(item, "새 안내문 검토 담당"))
+    with sqlite3.connect(store.path) as connection:
+        assert dict(connection.execute("SELECT status,count(*) FROM memory_items GROUP BY status")) == {
+            "resolved": 1, "active": 1}
+
+
+def test_past_history_preserves_sources_and_monotonic_thread_cutoff(state):
+    store, _ = state
+    past = source("내가 안내문 검토를 진행하고 있어.", ts="1799999000.000001")
+    current = source("내가 안내문 검토를 맡을게.")
+    publish(store, capture(store, thread=past["messageTs"]), [current], _task_candidate)
+    with sqlite3.connect(store.path) as connection:
+        original = connection.execute("SELECT * FROM memory_sources WHERE message_ts=?", (current["messageTs"],)).fetchone()
+    publish(store, _history_capture(store, past, thread=past["messageTs"]), [past],
+            lambda item: _task_candidate(item, "안내문 검토 진행 중"))
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT * FROM memory_sources WHERE message_ts=?", (current["messageTs"],)).fetchone() == original
+        assert set(connection.execute("SELECT message_ts,state FROM memory_sources")) == {
+            (past["messageTs"], "current"), (current["messageTs"], "current")}
+        assert connection.execute("SELECT collected_through_ts,input_revision FROM memory_threads").fetchone() == (current["messageTs"], 2)
+        assert connection.execute("SELECT count(*) FROM memory_job_inputs").fetchone()[0] == 0
+
+
 def test_atomic_publish_and_staged_payload_cleanup(state):
     store, _ = state
     cap = capture(store)

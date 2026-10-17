@@ -417,7 +417,9 @@ class MemoryStore:
                     for source in json.loads(chunk["payload"]):
                         changed = self._register_source(connection, tenant_id, thread, source) or changed
                 revision = thread["input_revision"] + int(changed)
-                connection.execute("UPDATE memory_threads SET input_revision=?,coverage=?,last_collected_at=?,collected_through_ts=? WHERE id=?", (revision, coverage, now, metadata["currentMessageTs"], thread["id"]))
+                # 과거 수집을 나중에 추가해도 이미 확인한 최신 수집 경계는 되돌리지 않는다.
+                collected_through = max(thread["collected_through_ts"] or "0", metadata["currentMessageTs"], key=Decimal)
+                connection.execute("UPDATE memory_threads SET input_revision=?,coverage=?,last_collected_at=?,collected_through_ts=? WHERE id=?", (revision, coverage, now, collected_through, thread["id"]))
                 # 부분 snapshot에도 이전 미처리 source가 빠지지 않도록 먼저 내부 chunk로 이월한다.
                 if changed:
                     stale = connection.execute("SELECT id,capture_id FROM memory_jobs WHERE tenant_id=? AND thread_id=? AND id!=? AND state IN ('ready','running','retry') AND base_revision<?", (tenant_id, thread["id"], row["id"], revision)).fetchall()
@@ -603,7 +605,7 @@ class MemoryStore:
             # 오래된 add는 정정 완료 뒤 publish가 최신 근거 시간과 대조해 제외한다.
             ordered = [candidate for _, candidate in sorted(latest.values(), key=lambda value: value[0])] + sorted(additions, key=lambda candidate: self._candidate_latest_time(connection, tenant_id, candidate))
             for candidate in ordered:
-                published += int(self._publish_candidate(connection, tenant_id, thread, candidate, job["trigger_request_id"]))
+                published += int(self._publish_candidate(connection, tenant_id, thread, candidate, job["trigger_request_id"], history_import=metadata.get("triggerKind") == "history_import"))
             connection.execute("UPDATE memory_threads SET memory_generation=memory_generation+1 WHERE id=?", (thread["id"],))
             connection.execute("DELETE FROM memory_summaries WHERE tenant_id=? AND scope_channel_id=?", (tenant_id, thread["channel_id"]))
             self._refresh_summaries(connection, tenant_id, thread["channel_id"])
@@ -612,7 +614,7 @@ class MemoryStore:
             connection.execute("DELETE FROM memory_job_inputs WHERE tenant_id=? AND capture_id=?", (tenant_id, job["capture_id"]))
             return {"state": "succeeded", "publishedCount": published}
 
-    def _publish_candidate(self, connection: sqlite3.Connection, tenant: str, thread: sqlite3.Row, candidate: Mapping[str, Any], request_id: str) -> bool:
+    def _publish_candidate(self, connection: sqlite3.Connection, tenant: str, thread: sqlite3.Row, candidate: Mapping[str, Any], request_id: str, *, history_import: bool = False) -> bool:
         candidate = {**candidate, "topicKey": normalize_topic_key(candidate["topicKey"])}
         source_rows = []
         for ref in candidate["sources"]:
@@ -626,6 +628,20 @@ class MemoryStore:
         if suppression:
             reallow = connection.execute("SELECT * FROM memory_events WHERE tenant_id=? AND scope_channel_id=? AND event_type='reallow' AND subject_id=? AND topic_key_hash=? ORDER BY created_at DESC LIMIT 1", (tenant, thread["channel_id"], subject, topic_hash)).fetchone()
             if not reallow or reallow["created_at"] < suppression["created_at"] or any(Decimal(source["message_ts"]) < Decimal(reallow["source_message_id"] or "0") for source in source_rows):
+                return False
+        if history_import and candidate["action"] == "add":
+            # 뒤늦게 적재한 과거 업무·합의는 더 최신인 현재/완료 상태를 충돌·미완료로 되돌리지 않는다.
+            # 실시간 처리와 개인 표준 선호의 기존 채널 간 시간 비교는 아래 경계를 그대로 따른다.
+            # 사람 기억만 subject를 비교한다. 스레드·팀은 모델의 null/작성자 표기 차이로 보호를 우회하지 않는다.
+            observed = max((Decimal(source["message_ts"]) for source in source_rows), default=Decimal(0))
+            previous = connection.execute("""SELECT i.topic_key,s.message_ts FROM memory_items i
+                JOIN memory_item_sources r ON r.tenant_id=i.tenant_id AND r.memory_id=i.id
+                JOIN memory_sources s ON s.tenant_id=r.tenant_id AND s.id=r.source_id
+                WHERE i.tenant_id=? AND i.scope_channel_id=? AND i.kind=? AND i.category=?
+                AND (i.kind!='person' OR COALESCE(i.subject_user_id,'')=COALESCE(?,''))
+                AND i.status IN ('active','conflicted','resolved') AND s.state='current'""",
+                (tenant, thread["channel_id"], candidate["kind"], candidate["category"], subject)).fetchall()
+            if any(normalize_topic_key(item["topic_key"]) == candidate["topicKey"] and Decimal(item["message_ts"]) > observed for item in previous):
                 return False
         if candidate["kind"] == "thread" and candidate["category"] == "task" and candidate["action"] == "add":
             # 이미 완료된 동일 원문을 다시 요약한 결과만 제거한다. 새 근거의 새 업무는 합치지 않는다.
