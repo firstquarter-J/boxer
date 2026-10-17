@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from .access import can_read_memory_source, is_private_memory_hub
 from .contracts import (
     ELIGIBLE_ROUTES, EXTRACTOR_VERSION, MAX_CANDIDATES, MAX_CHUNK_CHARS,
     MAX_CHUNK_SOURCES, MEMORY_SCHEMA_VERSION, PERSONAL_STYLE_TOPICS, MemoryError, canonical_digest,
@@ -770,8 +771,11 @@ class MemoryStore:
         sources = connection.execute("SELECT s.*,r.relation FROM memory_item_sources r JOIN memory_sources s ON s.tenant_id=r.tenant_id AND s.id=r.source_id WHERE r.tenant_id=? AND r.memory_id=? ORDER BY s.message_ts,s.id", (row["tenant_id"], row["id"])).fetchall()
         references = []
         for source in sources:
-            source_thread = connection.execute("SELECT thread_ts FROM memory_threads WHERE tenant_id=? AND id=?", (row["tenant_id"], source["thread_id"])).fetchone()
-            references.append({"sourceId": source["id"], "channelId": source["channel_id"], "threadTs": source_thread["thread_ts"], "messageTs": source["message_ts"], "revisionHash": source["revision_hash"], "permalink": source["permalink"], "authorId": source["author_id"], "authorKind": source["author_kind"], "state": source["state"], "relation": source["relation"]})
+            # 허브의 교차 채널 조회도 요청 메타데이터가 아닌 저장된 원본 채널 종류로 판정한다.
+            source_thread = connection.execute("SELECT thread_ts,channel_kind FROM memory_threads WHERE tenant_id=? AND channel_id=? AND id=?", (row["tenant_id"], source["channel_id"], source["thread_id"])).fetchone()
+            if source_thread is None:
+                raise MemoryError("memory_source_scope_invalid")
+            references.append({"sourceId": source["id"], "channelId": source["channel_id"], "channelKind": source_thread["channel_kind"], "threadTs": source_thread["thread_ts"], "messageTs": source["message_ts"], "revisionHash": source["revision_hash"], "permalink": source["permalink"], "authorId": source["author_id"], "authorKind": source["author_kind"], "state": source["state"], "relation": source["relation"]})
         return {
             "memoryId": row["id"], "kind": row["kind"], "category": row["category"],
             "subjectUserId": row["subject_user_id"], "topicKey": row["topic_key"], "text": row["text"],
@@ -810,7 +814,8 @@ class MemoryStore:
         # scope를 SQL에서 먼저 제한하고 사용자의 질문으로만 관련성을 평가한다.
         words = set(re.findall(r"[가-힣A-Za-z0-9_]{2,}", question.casefold()))
         with self._connection() as connection:
-            rows = connection.execute("SELECT i.*,t.thread_ts FROM memory_items i JOIN memory_threads t ON t.tenant_id=i.tenant_id AND t.id=i.origin_thread_id WHERE i.tenant_id=? AND i.scope_channel_id=? AND i.status IN ('active','resolved') AND (i.valid_until IS NULL OR i.valid_until>?) ORDER BY i.updated_at DESC LIMIT 256", (tenant_id, channel_id, self._clock())).fetchall()
+            # 고정 허브만 같은 tenant의 비공개 원본 채널을 더 검색한다. DM·공개 채널은 그대로 격리한다.
+            rows = connection.execute("SELECT i.*,t.thread_ts FROM memory_items i JOIN memory_threads t ON t.tenant_id=i.tenant_id AND t.id=i.origin_thread_id WHERE i.tenant_id=? AND (i.scope_channel_id=? OR (? AND t.channel_kind='private_channel' AND t.channel_id=i.scope_channel_id)) AND i.status IN ('active','resolved') AND (i.valid_until IS NULL OR i.valid_until>?) ORDER BY i.updated_at DESC LIMIT 256", (tenant_id, channel_id, is_private_memory_hub(tenant_id, channel_id), self._clock())).fetchall()
             ranked = [(100, 0, item) for item in self._personal_style_candidates(connection, tenant_id, actor_id)]
             for row in rows:
                 own = row["kind"] == "person" and row["subject_user_id"] == actor_id and row["category"] == "preference"
@@ -820,12 +825,17 @@ class MemoryStore:
                 target = row["subject_user_id"] in mentioned_user_ids
                 if not target and mentioned_user_ids:
                     target = any(person[0] in mentioned_user_ids for person in connection.execute("SELECT user_id FROM memory_subjects WHERE tenant_id=? AND memory_id=?", (tenant_id, row["id"])))
-                current = row["thread_ts"] == thread_ts
+                # 교차 채널에서 같은 timestamp가 있어도 현재 스레드로 가산하지 않는다.
+                current = row["scope_channel_id"] == channel_id and row["thread_ts"] == thread_ts
                 matching = sum(word in (row["topic_key"] + " " + row["text"]).casefold() for word in words)
                 if not (own or target or current or matching):
                     continue
                 item = self._item(connection, row)
-                if not item["sources"] or any(source["state"] != "current" for source in item["sources"]):
+                if not item["sources"] or any(
+                    source["state"] != "current" or not can_read_memory_source(
+                        tenant_id, channel_id, source["channelId"], source["channelKind"])
+                    for source in item["sources"]
+                ):
                     continue
                 ranked.append((int(own) * 10 + int(target) * 9 + int(current) * 6 + matching, row["updated_at"], item))
             ranked.sort(key=lambda value: (value[0], value[1]), reverse=True)
@@ -855,13 +865,19 @@ class MemoryStore:
                     if item is None or item["version"] != candidate.get("version") or item["styleValue"] != candidate.get("styleValue"):
                         continue
                 else:
-                    row = connection.execute("SELECT * FROM memory_items WHERE tenant_id=? AND scope_channel_id=? AND id=? AND status IN ('active','resolved') AND (valid_until IS NULL OR valid_until>?)", (tenant_id, channel_id, candidate.get("memoryId"), self._clock())).fetchone()
+                    # 검증 결과를 받아도 현재 DB의 tenant·원채널 종류를 다시 확인한다.
+                    row = connection.execute("SELECT i.* FROM memory_items i JOIN memory_threads t ON t.tenant_id=i.tenant_id AND t.id=i.origin_thread_id WHERE i.tenant_id=? AND (i.scope_channel_id=? OR (? AND t.channel_kind='private_channel' AND t.channel_id=i.scope_channel_id)) AND i.id=? AND i.status IN ('active','resolved') AND (i.valid_until IS NULL OR i.valid_until>?)", (tenant_id, channel_id, is_private_memory_hub(tenant_id, channel_id), candidate.get("memoryId"), self._clock())).fetchone()
                     if not row or row["version"] != candidate.get("version"):
                         continue
                     item = self._item(connection, row)
                 if item["deletionEpoch"] != candidate.get("deletionEpoch") or canonical_digest(item["sources"]) != canonical_digest(candidate.get("sources", [])):
                     continue
                 if not item["sources"] or any(source["state"] != "current" or verified.get(source["sourceId"]) != source["revisionHash"] for source in item["sources"]):
+                    continue
+                if candidate.get("styleOnly") is not True and any(
+                    not can_read_memory_source(tenant_id, channel_id, source["channelId"], source["channelKind"])
+                    for source in item["sources"]
+                ):
                     continue
                 # actor·충돌·원본 revision을 확인한 뒤 모델용 DTO에는 출처 메타데이터조차 넣지 않는다.
                 result.append({"kind": "personal_style", "topicKey": item["topicKey"], "value": item["styleValue"]} if candidate.get("styleOnly") is True else item)

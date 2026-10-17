@@ -23,6 +23,11 @@ MEMORY_GUIDANCE = (
     "답변 선호는 길이·언어·결론 순서에 한해 표현 방식에 참고한다. "
     "personal_style은 현재 질문자 본인의 표준 답변 선호이며 현재 질문에서 지정한 형식이 우선한다. "
     "이 선호를 저장한 대화·채널·시점·원문을 추측하거나 설명하지 말고 표현 방식에만 적용해. "
+    "utterance는 이번 요청에서 Slack으로 읽은 실제 작성자의 발언이며 sourceTimes 순서로 최근 발언을 설명해. "
+    "excerptOnly가 true면 발췌이므로 전체 발언을 인용한 것처럼 말하지 마. "
+    "retrieval_status는 서버가 알려주는 조회 범위다. partial이면 확인한 비공개 채널 범위에서 찾은 결과라고 설명하고 "
+    "전체 기록의 마지막 발언이라고 단정하지 마. unavailable이면 실시간 조회를 완료하지 못했다고 설명해. "
+    "조회 결과가 비어 있어도 Slack 전체 접근 권한이 없거나 발언 자체가 없다고 추측하지 마. "
     "과거 사실·결정 설명에 실제 사용한 기억만 문장 뒤에 [memory:기억ID]로 표시해. "
     "단순 답변 스타일 적용에는 출처 표시가 필요 없다. 원본 URL을 생성하지 마."
     "memoryId·sourceTimes·spokenAtKst·updatedAt 같은 내부 필드명이나 DB 상태명은 사용자에게 노출하지 말고 자연어로 설명해."
@@ -47,7 +52,13 @@ def _spoken_at_kst(value: Any) -> str | None:
 def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, Mapping[str, Any]]]:
     rows: list[dict[str, Any]] = []
     selected: dict[str, Mapping[str, Any]] = {}
-    for item in entries[:8]:
+    # 조회 결과가 없어도 모델이 실제 능력과 조사 범위를 과장하지 않도록 상태를 전달한다.
+    for item in entries:
+        if item.get("kind") == "retrieval_status" and item.get("coverage") in {"complete", "partial", "unavailable"}:
+            rows.append({key: item.get(key) for key in ("kind", "coverage", "channelCount", "sourceCount", "scope")})
+            break
+    ordinary = [item for item in entries if item.get("kind") != "retrieval_status"]
+    for item in ordinary[:8]:
         if item.get("kind") == "personal_style" or item.get("styleOnly") is True:
             topic, value = str(item.get("topicKey") or ""), str(item.get("value") or item.get("styleValue") or "")
             style = personal_style_text(topic, value)
@@ -59,6 +70,8 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
             continue
         row = {key: item.get(key) for key in (
             "memoryId", "kind", "category", "subjectUserId", "text", "evidenceType", "updatedAt", "status")}
+        if item.get("liveSource") is True:
+            row["excerptOnly"] = item.get("excerptOnly") is True
         # URL은 모델에 넣지 않고 각 원본의 작성자와 발언 시각을 함께 제공한다.
         row["authors"] = sorted({str(source.get("authorId")) for source in item.get("sources", [])})
         row["sourceTimes"] = [{"authorId": source.get("authorId"),

@@ -352,8 +352,19 @@ def test_control_rejects_non_scheduler_scope(state_path: Path, changes: dict) ->
 
 def test_http_turn_permissions_dispatch_replay_and_slack_contract(
     state_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 실제 factory·HTTP 경계를 통과하되 장비/Slack/LLM provider는 호출하지 않는다.
+    # 로컬 권한·replay 검증을 개발 환경의 S3 복구 설정에서 분리하고 외부 복구도 금지한다.
+    monkeypatch.setattr(
+        "boxer.observability.request_log.s.REQUEST_LOG_SQLITE_S3_RESTORE_ON_STARTUP",
+        False,
+    )
+    restore = Mock(side_effect=AssertionError("이 계약 테스트는 S3 복구를 호출하면 안 됨"))
+    monkeypatch.setattr(
+        "boxer.observability.request_log._restore_request_log_from_s3",
+        restore,
+    )
     with patch("boxer_company.assistant.factory.core_settings.LLM_PROVIDER", ""):
         runtime = create_company_assistant_runtime(
             daily_auto_update_control=_controller(state_path)
@@ -422,3 +433,4 @@ def test_http_turn_permissions_dispatch_replay_and_slack_contract(
                 )
             else:
                 assert _controller(state_path).read(_request("")).enabled == _DEFAULTS
+    restore.assert_not_called()

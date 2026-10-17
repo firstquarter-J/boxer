@@ -4036,6 +4036,7 @@ class CompanyApiContractTests(unittest.TestCase):
                 "/internal/v1/hpa-change/deliveries/pull",
                 "/internal/v1/hpa-change/deliveries/ack",
                 "/internal/v1/memory/retrievals",
+                "/internal/v1/memory/retrievals/{retrieval_id}/live",
                 "/internal/v1/memory/captures/pull",
                 "/internal/v1/memory/captures/{capture_id}/chunks",
                 "/internal/v1/memory/captures/{capture_id}/checkpoint",

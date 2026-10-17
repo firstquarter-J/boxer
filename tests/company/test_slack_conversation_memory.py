@@ -14,6 +14,8 @@ from boxer_company_adapter_slack.company_api_client import _deserialize_result_p
 ROOT = "1792100000.000001"
 NOW = "1792100001.000001"
 AFTER = "1792100002.000001"
+HUB_TENANT = "T19PA3EPL"
+HUB_CHANNEL = "C068FVD5V7Y"
 SILENT = logging.getLogger(__name__ + ".silent")
 SILENT.disabled = True
 
@@ -74,6 +76,9 @@ class Slack:
     def conversations_replies(self, **kwargs):
         self.calls.append(kwargs)
         return self.pages[kwargs.get("cursor") or ""]
+
+    def conversations_info(self, *, channel, include_num_members=False):
+        return {"ok": True, "channel": {"id": channel, "is_private": False}}
 
     def chat_getPermalink(self, *, channel, message_ts):
         return {"permalink": f"https://unit.slack.com/archives/{channel}/p{message_ts.replace('.', '')}"}
@@ -241,6 +246,135 @@ class SlackConversationMemoryTests(unittest.TestCase):
         self.assertEqual(memory.verify_sources([source], channel_id="C1", tenant_id="T1"), [])
         self.assertEqual(slack.calls, [])
 
+    def test_private_hub_verifies_origin_revisions_without_actor_origin_membership(self):
+        # 승인된 허브는 다른 비공개 채널을 검증하되 편집·삭제 판단은 기존과 같다.
+        slack = Slack({"": {"messages": [human(), human(NOW, "UB", "수정한 말")]}})
+        membership_calls = []
+        slack.conversations_members = lambda **kwargs: membership_calls.append(kwargs) or {"members": []}
+        memory = bridge(slack)
+        memory.is_allowed = lambda tenant, actor: tenant == HUB_TENANT and actor in {"UA", "UB"}
+        sources = [{"sourceId": f"s{i}", "channelId": "C9", "channelKind": "private_channel",
+                    "threadTs": ROOT, "messageTs": ts, "revisionHash": source_revision("앞으로 결론부터 말해줘")}
+                   for i, ts in enumerate((ROOT, NOW, AFTER))]
+        result = memory.verify_sources(sources, channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT, actor_id="UA")
+        self.assertEqual([row["status"] for row in result], ["verified", "changed", "deleted"])
+        self.assertEqual(slack.calls[0]["channel"], "C9")
+        self.assertEqual(membership_calls, [])
+
+    def test_private_hub_does_not_bypass_source_author_membership(self):
+        memory = bridge(Slack({"": {"messages": [human(user="UX")]}}))
+        memory.is_allowed = lambda tenant, actor: tenant == HUB_TENANT and actor == "UA"
+        source = {"sourceId": "s1", "channelId": "C9", "channelKind": "private_channel",
+                  "threadTs": ROOT, "messageTs": ROOT, "revisionHash": source_revision("앞으로 결론부터 말해줘")}
+        result = memory.verify_sources([source], channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT, actor_id="UA")
+        self.assertEqual(result[0]["status"], "unavailable")
+
+    def test_private_hub_cross_scope_is_fixed_and_excludes_dm_and_public_channels(self):
+        # payload의 공유 플래그만으로 일반 채널·다른 회사·DM의 경계를 넓힐 수 없다.
+        for tenant, destination, kind in (
+            (HUB_TENANT, "C1", "private_channel"),
+            ("T2", HUB_CHANNEL, "private_channel"),
+            (HUB_TENANT, HUB_CHANNEL, "dm"),
+            (HUB_TENANT, HUB_CHANNEL, "group_dm"),
+            (HUB_TENANT, HUB_CHANNEL, "channel"),
+            (HUB_TENANT, HUB_CHANNEL, ""),
+        ):
+            with self.subTest(tenant=tenant, destination=destination, kind=kind):
+                slack = Slack({})
+                source = {"sourceId": "s1", "channelId": "C9", "channelKind": kind,
+                          "threadTs": ROOT, "messageTs": ROOT, "revisionHash": "a" * 64,
+                          "privateHub": True, "crossChannelAllowed": True}
+                self.assertEqual(bridge(slack).verify_sources(
+                    [source], channel_id=destination, tenant_id=tenant, actor_id="UA"), [])
+                self.assertEqual(slack.calls, [])
+
+    def test_private_hub_style_only_still_requires_origin_membership_and_self_authorship(self):
+        # 같은 원스레드의 허브 일반 기억은 남기고, 소속이 없는 개인 선호만 제외한다.
+        slack = Slack({"": {"messages": [human(), human(NOW, "UB")]}})
+        slack.conversations_members = lambda **_: {"members": ["UB"]}
+        memory = bridge(slack)
+        memory.is_allowed = lambda tenant, actor: tenant == HUB_TENANT and actor in {"UA", "UB"}
+        sources = [{"sourceId": f"s{i}", "channelId": "C9", "channelKind": "private_channel",
+                    "threadTs": ROOT, "messageTs": ts, "revisionHash": source_revision("앞으로 결론부터 말해줘"),
+                    "styleOnly": i == 0} for i, ts in enumerate((ROOT, NOW))]
+        result = memory.verify_sources(sources, channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT, actor_id="UA")
+        self.assertEqual([(row["sourceId"], row["status"]) for row in result], [("s1", "verified")])
+        slack.conversations_members = lambda **_: {"members": ["UA"]}
+        sources[1]["styleOnly"] = True
+        result = memory.verify_sources(sources, channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT, actor_id="UA")
+        self.assertEqual([row["status"] for row in result], ["verified", "unavailable"])
+        slack.calls.clear()
+        self.assertEqual(memory.verify_sources(sources, channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT), [])
+        self.assertEqual(slack.calls, [])
+
+    def test_private_hub_source_verification_keeps_three_thread_and_deadline_limits(self):
+        # 허브 예외도 기존 응답 지연·스레드 개수 예산을 넓히지 않는다.
+        slack = Slack({"": {"messages": [human()]}})
+        memory = bridge(slack)
+        memory.is_allowed = lambda tenant, actor: tenant == HUB_TENANT and actor == "UA"
+        sources = [{"sourceId": f"s{i}", "channelId": f"C{i}", "channelKind": "private_channel",
+                    "threadTs": ROOT, "messageTs": ROOT, "revisionHash": source_revision("앞으로 결론부터 말해줘")}
+                   for i in range(4)]
+        self.assertEqual(len(memory.verify_sources(sources, channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT)), 3)
+        self.assertEqual(len(slack.calls), 3)
+        ticks = iter((0, 3, 3, 3))
+        memory.clock = lambda: next(ticks)
+        slack.calls.clear()
+        self.assertEqual(memory.verify_sources(sources, channel_id=HUB_CHANNEL, tenant_id=HUB_TENANT), [])
+        self.assertEqual(slack.calls, [])
+
+    def test_context_classifies_private_channel_and_group_dm_from_bounded_info(self):
+        # C/G 접두사를 비공개 종류로 추정하지 않고 Slack의 실제 분류를 보존한다.
+        for info, expected in (
+            ({"is_private": True}, "private_channel"),
+            ({"is_private": False}, "channel"),
+            ({"is_im": True, "is_private": True}, "dm"),
+            ({"is_mpim": True, "is_private": True}, "group_dm"),
+        ):
+            with self.subTest(expected=expected):
+                memory = bridge(Slack({}))
+                timeouts, calls = [], []
+                memory.client.conversations_info = lambda **kwargs: calls.append(kwargs) or {"ok": True, "channel": {"id": "C1", **info}}
+                memory._bounded_client = lambda timeout: timeouts.append(timeout) or memory.client
+                context = memory.context_for({"user_id": "UA", "workspace_id": "T1", "channel_id": "C1", "current_ts": NOW})
+                self.assertEqual(context["channelKind"], expected)
+                self.assertEqual(timeouts, [.5])
+                self.assertEqual(calls, [{"channel": "C1", "include_num_members": False}])
+
+    def test_context_uses_known_classification_and_keeps_dm_without_info_lookup(self):
+        for extra, channel, expected in (
+            ({"channel_kind": "private_channel"}, "C1", "private_channel"),
+            ({"channel_type": "group"}, "G1", "private_channel"),
+            ({"channel_type": "mpim"}, "G1", "group_dm"),
+            ({"is_mpim": True, "is_private": True}, "G1", "group_dm"),
+            ({"is_private": True}, "C1", "private_channel"),
+            ({}, "D1", "dm"),
+        ):
+            with self.subTest(extra=extra, channel=channel):
+                memory = bridge(Slack({}))
+                calls = []
+                memory.client.conversations_info = lambda **kwargs: calls.append(kwargs) or {}
+                context = memory.context_for({"user_id": "UA", "workspace_id": "T1", "channel_id": channel, "current_ts": NOW, **extra})
+                self.assertEqual(context["channelKind"], expected)
+                self.assertEqual(calls, [])
+
+    def test_context_info_failure_skips_memory_without_persisting_wrong_channel_kind(self):
+        # 원문 수집은 분류가 확실한 다음 turn까지 보류하고 일반 답변은 계속한다.
+        for response in ({"ok": False}, {"ok": True, "channel": {}},
+                         {"ok": True, "channel": {"id": "C1"}},
+                         {"ok": True, "channel": {"id": "C_OTHER", "is_private": True}}):
+            with self.subTest(response=response):
+                memory = bridge(Slack({}))
+                memory.client.conversations_info = lambda **_: response
+                context = memory.context_for({"user_id": "UA", "workspace_id": "T1", "channel_id": "C1", "current_ts": NOW})
+                self.assertIsNone(context)
+        memory = bridge(Slack({}))
+        def unavailable(**kwargs):
+            raise RuntimeError("lookup failed")
+        memory.client.conversations_info = unavailable
+        context = memory.context_for({"user_id": "UA", "workspace_id": "T1", "channel_id": "C1", "current_ts": NOW})
+        self.assertIsNone(context)
+
     def test_source_delete_does_not_require_deleted_author_membership(self):
         memory = bridge()
         memory.source_event({"subtype": "message_deleted", "channel": "C1", "deleted_ts": ROOT}, {"team_id": "T1", "event_id": "Ev1"}, None)
@@ -249,13 +383,13 @@ class SlackConversationMemoryTests(unittest.TestCase):
         self.assertEqual(memory.status(), {"sourceEvents": "ok", "pendingSourceEvents": 0})
 
     def test_profile_gate_and_management_context(self):
-        memory = bridge()
+        memory = bridge(Slack({}))
         payload = {"user_id": "UB", "workspace_id": "T1", "channel_id": "C1", "thread_ts": ROOT, "current_ts": NOW}
         self.assertIsNone(memory.context_for(payload))
         self.assertIsNotNone(memory.context_for(payload, manage=True))
 
     def test_wire_context_and_capture_are_optional_and_isolated(self):
-        memory = bridge()
+        memory = bridge(Slack({}))
         payload = {"user_id": "UA", "workspace_id": "T1", "channel_id": "C1", "thread_ts": ROOT, "current_ts": NOW}
         original = request()
         contextual = replace(original, memory_context=memory.context_for(payload))

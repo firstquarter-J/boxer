@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
+from boxer_company.memory.access import can_read_memory_source, is_private_memory_hub
 from boxer_company.memory.contracts import MAX_CHUNK_CHARS, canonical_digest, source_revision
 from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
 from boxer_company.memory.commands import parse_memory_command
@@ -136,10 +137,14 @@ class SlackConversationMemory:
             or (not manage and actor not in self._profile_ids)
         ):
             return None
+        channel_kind = self._channel_kind(payload, channel)
+        if channel_kind is None:
+            # 최초 수집의 잘못된 종류가 thread에 영구 고정되지 않게 기억만 건너뛴다.
+            return None
         context = {
             "workspaceId": tenant, "channelId": channel, "threadTs": thread,
             "currentMessageTs": current, "actorId": actor,
-            "channelKind": "dm" if channel.startswith("D") else "channel",
+            "channelKind": channel_kind,
             "triggerKind": "app_mention",
         }
         if manage and self.client is not None:
@@ -155,6 +160,40 @@ class SlackConversationMemory:
             except Exception as exc:
                 self._failure("management_source", exc)
         return context
+
+    def _channel_kind(self, payload: Mapping[str, Any], channel_id: str) -> str | None:
+        # adapter가 이미 확인한 종류를 우선하고, ID만으로 비공개 채널을 추측하지 않는다.
+        kind = payload.get("channel_kind")
+        if isinstance(kind, str) and kind in {"channel", "private_channel", "dm", "group_dm"}:
+            return str(kind)
+        channel_type = payload.get("channel_type")
+        if isinstance(channel_type, str) and channel_type in {"im", "mpim", "group"}:
+            return {"im": "dm", "mpim": "group_dm", "group": "private_channel"}[channel_type]
+        if payload.get("is_im") is True or channel_id.startswith("D"):
+            return "dm"
+        if payload.get("is_mpim") is True:
+            return "group_dm"
+        if isinstance(payload.get("is_private"), bool):
+            return "private_channel" if payload["is_private"] else "channel"
+        try:
+            # 짧은 별도 client로 분류하며 공유 client의 timeout·retry는 변경하지 않는다.
+            client = self._bounded_client(.5)
+            if client is not None:
+                result = _data(client.conversations_info(channel=channel_id, include_num_members=False))
+                info = _data(result.get("channel"))
+                if result.get("ok") is not False and info and str(info.get("id") or channel_id) == channel_id:
+                    if info.get("is_im") is True:
+                        return "dm"
+                    if info.get("is_mpim") is True:
+                        return "group_dm"
+                    if info.get("is_private") is True:
+                        return "private_channel"
+                    if info.get("is_private") is False:
+                        return "channel"
+        except Exception as exc:
+            self._failure("channel_kind", exc)
+        # 분류 실패를 공개 채널로 저장하지 않고 해당 turn의 기억 기능만 닫는다.
+        return None
 
     def prepare(self, request: CompanyAssistantRequest) -> CompanyAssistantRequest:
         context = dict(request.memory_context or {})
@@ -179,6 +218,32 @@ class SlackConversationMemory:
                 candidates, channel_id=context["channelId"], tenant_id=request.tenant_id,
                 actor_id=request.actor_id,
             )
+            plan = result.get("liveQuery")
+            if isinstance(plan, Mapping) and is_private_memory_hub(request.tenant_id, context["channelId"]):
+                try:
+                    from boxer_company_adapter_slack.private_live_retrieval import collect_private_live_sources
+
+                    # 서버 발행 범위가 이 turn과 정확히 일치할 때만 고정 Slack 읽기 API를 호출한다.
+                    expected = {"tenantId": request.tenant_id, "actorId": request.actor_id,
+                                "channelId": context["channelId"], "requestId": request.request_id,
+                                "question": request.question, "beforeTs": context["currentMessageTs"]}
+                    authors = plan.get("authorIds")
+                    if any(plan.get(key) != value for key, value in expected.items()) or not isinstance(authors, list):
+                        raise ValueError("live_query_scope_invalid")
+                    live = collect_private_live_sources(client_factory=self._bounded_client,
+                        tenant_id=request.tenant_id, destination_channel_id=context["channelId"],
+                        actor_id=str(request.actor_id or ""), question=request.question,
+                        author_ids=authors, before_ts=context["currentMessageTs"],
+                        is_allowed=self.is_allowed, clock=self.clock)
+                    self.api.call(_PREFIX + "/retrievals/" + retrieval_id + "/live", {
+                        "tenantId": request.tenant_id, "actorId": request.actor_id,
+                        "channelId": context["channelId"], "requestId": request.request_id,
+                        "sources": live["sources"], "coverage": live["coverage"],
+                        "channelCount": live["channelCount"],
+                    })
+                except Exception as exc:
+                    # 실시간 읽기 실패도 저장 기억 검증과 일반 답변을 버리지 않는다.
+                    self._failure("live_retrieval", exc)
             return replace(request, memory_context=context)
         except Exception as exc:
             self._failure("prepare", exc)
@@ -194,7 +259,16 @@ class SlackConversationMemory:
             if not isinstance(source, Mapping):
                 continue
             origin = str(source.get("channelId") or "")
-            if not origin or (origin != channel_id and (source.get("styleOnly") is not True or not actor_id)):
+            style_only = source.get("styleOnly") is True
+            # 허브 예외는 API가 반환한 원본 종류와 고정 tenant·목적지 정책으로만 판단한다.
+            # 개인 답변 선호는 허브에서도 기존 본인 원문 검증 경계를 그대로 유지한다.
+            if origin != channel_id and style_only:
+                allowed = bool(origin and actor_id)
+            else:
+                allowed = can_read_memory_source(
+                    tenant_id, channel_id, origin, str(source.get("channelKind") or ""),
+                )
+            if not allowed:
                 continue
             thread = str(source.get("threadTs") or "")
             group = (origin, thread)
@@ -204,12 +278,13 @@ class SlackConversationMemory:
         verified: list[dict[str, str]] = []
         memberships: dict[str, bool] = {}
         for (origin, thread), candidates in groups.items():
-            # 교차채널 개인화는 본인이 여전히 읽을 수 있는 원채널의 자기 발언만 검증한다.
-            if origin != channel_id:
+            # 허브의 일반 비공개 기억은 원채널 소속 대신 명시된 공유 정책을 사용한다.
+            # styleOnly는 목적지에 관계없이 원채널 소속과 자기 발언을 모두 확인한다.
+            if origin != channel_id and any(source.get("styleOnly") is True for source in candidates):
                 if origin not in memberships:
                     memberships[origin] = self._origin_member(origin, actor_id or "", deadline)
                 if not memberships[origin]:
-                    continue
+                    candidates = [source for source in candidates if source.get("styleOnly") is not True]
             expected = {str(s.get("messageTs")): s for s in candidates if _TS.fullmatch(str(s.get("messageTs") or ""))}
             if not expected or self.clock() >= deadline:
                 continue

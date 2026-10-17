@@ -61,6 +61,37 @@ class MemorySourceInput(MemoryInput):
     segmentEnd: int | None = Field(default=None, ge=1)
 
 
+class MemoryLiveSourceInput(MemoryInput):
+    channelId: Identifier
+    channelKind: Literal["private_channel"]
+    threadTs: SlackTs
+    messageTs: SlackTs
+    revisionHash: Digest
+    authorId: Identifier
+    text: str = Field(min_length=1, max_length=8000, repr=False)
+    permalink: str = Field(min_length=1, max_length=2048)
+    editedAt: str = Field(default="", max_length=64)
+
+
+class MemoryLiveResultInput(MemoryInput):
+    tenantId: Identifier
+    actorId: Identifier
+    channelId: Identifier
+    requestId: Identifier
+    sources: list[MemoryLiveSourceInput] = Field(default_factory=list, max_length=8)
+    coverage: Literal["complete", "partial", "unavailable"]
+    channelCount: int = Field(default=0, ge=0, le=200)
+
+    @model_validator(mode="after")
+    def validate_budget(self) -> "MemoryLiveResultInput":
+        # 원문은 한 turn의 짧은 검증 캐시에만 전달하고 과도한 payload는 받지 않는다.
+        if sum(len(source.text) for source in self.sources) > 8000:
+            raise ValueError("live source budget exceeded")
+        if self.coverage == "unavailable" and self.sources:
+            raise ValueError("unavailable result cannot contain sources")
+        return self
+
+
 class MemoryChunkInput(MemoryInput):
     tenantId: Identifier
     actorId: Identifier

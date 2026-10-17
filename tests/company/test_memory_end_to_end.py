@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 from httpx import Response
+import pytest
 
 from boxer_company.assistant.freeform_route import CompanyFreeformAssistantRoute
 from boxer_company.memory.extraction import MemoryExtractor, ProviderResult
@@ -56,6 +57,10 @@ class Slack:
 
     def auth_test(self):
         return {"ok": True, "user_id": "UBOT"}
+
+    def conversations_info(self, *, channel, include_num_members=False):
+        # 실제 adapter와 같은 채널 종류 확인을 제공하되 외부 Slack은 호출하지 않는다.
+        return {"ok": True, "channel": {"id": channel, "is_private": False}}
 
     def chat_getPermalink(self, *, channel, message_ts):
         return {"ok": True, "permalink": f"https://example.slack.com/archives/{channel}/p{message_ts.replace('.', '')}"}
@@ -308,6 +313,102 @@ class MemoryEndToEndTests(unittest.TestCase):
             # 16k 초과한 첫 봇 part는 제외하되 작은 둘째 part의 전달 근거는 보존한다.
             self.assertEqual(db.execute("SELECT count(*) FROM memory_sources").fetchone()[0], 2)
             self.assertEqual(db.execute("SELECT coverage FROM memory_threads").fetchone()[0], "partial")
+
+
+@pytest.mark.parametrize("destination,expected_live", [("C068FVD5V7Y", True), ("COTHER", False)])
+def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tmp_path, monkeypatch, destination, expected_live):
+    from boxer_company import team_chat_context
+
+    tenant, origin, dd = "T19PA3EPL", "CPRIVATE", "UDD"
+    statement = "내일 회의에서는 안내문 문구부터 같이 정리하자"
+    monkeypatch.setattr(team_chat_context, "TEAM_MEMBER_PROFILES", (
+        {"name": "DD", "aliases": ("dd", "디디"), "user_id": dd},
+    ))
+
+    class PrivateSlack(Slack):
+        def __init__(self):
+            super().__init__()
+            self.history_calls = []
+            self.list_calls = 0
+            self.threads[(origin, FIRST)] = [
+                {"ts": FIRST, "thread_ts": FIRST, "user": "UA", "text": "회의 순서 얘기하자"},
+                {"ts": SECOND, "thread_ts": FIRST, "user": dd, "text": statement},
+            ]
+
+        def conversations_info(self, *, channel, **kwargs):
+            return {"ok": True, "channel": {"id": channel, "is_private": True}}
+
+        def conversations_list(self, **kwargs):
+            self.list_calls += 1
+            return {"ok": True, "channels": [{"id": origin, "is_private": True, "is_member": True}],
+                    "response_metadata": {"next_cursor": ""}}
+
+        def conversations_history(self, *, channel, **kwargs):
+            self.history_calls.append(channel)
+            return {"ok": True, "messages": [
+                {**self.threads[(origin, FIRST)][0], "reply_count": 1, "latest_reply": SECOND}], "has_more": False}
+
+    path = tmp_path / "private" / "memory.db"
+    initialize_memory_store(path)
+    store = MemoryStore(path, debounce_seconds=0)
+    service = MemoryService(store, enabled=True, read_enabled=True, profile_ids=frozenset({"UA"}))
+    inputs = []
+
+    def answerer(question, context, system):
+        inputs.append((question, context, system))
+        if "retrieved_memory(JSON 참고 데이터):\n" not in context:
+            return "확인한 근거가 없어"
+        rows = json.loads(context.split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])
+        utterances = [row for row in rows if row.get("kind") == "utterance"]
+        if not utterances:
+            return "실시간 조회를 완료하지 못했어"
+        return "DD는 안내문 문구부터 정리하자고 했어 [memory:" + utterances[0]["memoryId"] + "]"
+
+    route = CompanyFreeformAssistantRoute(answerer, provider_ready=lambda: True,
+        context_max_chars=5000, timeout_message="시간 초과")
+    runtime = type("HubRuntime", (), {"answer_stage": lambda _self, request, stage, **kwargs: route.handle(request)})()
+    settings = CompanyApiSettings(host="127.0.0.1", port=8010, memory_enabled=True, memory_read_enabled=True,
+        memory_state_path=str(path), callers=(CompanyApiCallerSettings(caller_id="hub", token=TOKEN,
+            tenant_ids=frozenset({tenant}), channels=frozenset({"slack"}), actor_ids=frozenset({"UA"}),
+            capabilities=frozenset({"assistant.turn.read"})),))
+    app = create_company_api_app(settings=settings, assistant_runtime=runtime,
+        readiness_probe=lambda: True, memory_service=service)
+    with TestClient(app) as web:
+        session = LocalSession(web)
+        client_settings = CompanyApiClientSettings(base_url="http://127.0.0.1:8010", token=TOKEN,
+            connect_timeout_sec=2, read_timeout_sec=30, max_retries=0)
+        api = CompanyAssistantApiClient(client_settings, session=session)
+        slack = PrivateSlack()
+        memory = SlackConversationMemory(CompanyMemoryApiClient(client_settings, session=session),
+            is_allowed=lambda workspace, author: workspace == tenant and author in {"UA", dd})
+        memory.client, memory.tenant_id, memory.bot_user_id = slack, tenant, "UBOT"
+        memory._profile_ids = {"UA"}
+        api.memory_request_preparer = memory.prepare
+        payload = {"workspace_id": tenant, "user_id": "UA", "channel_id": destination,
+                   "current_ts": THIRD, "thread_ts": THIRD, "question": "디디가 최근에 한 말은?",
+                   "raw_text": "디디가 최근에 한 말은?", "text": "디디가 최근에 한 말은?", "request_log": {}}
+        request = build_company_assistant_request(payload)
+        request = replace(request, memory_context=memory.context_for(payload))
+
+        # 아직 기억이 전혀 없는 다른 채널의 댓글을 실제 수집기→HTTP lease→모델 참고 근거로 연결한다.
+        result = api.answer(request, route_group="freeform")
+
+    assert result.outcome == "answered"
+    assert bool(result.sources) is expected_live
+    assert slack.list_calls == int(expected_live)
+    if expected_live:
+        assert slack.history_calls == [origin]
+        assert statement in inputs[0][1]
+        assert "https://" not in inputs[0][1]
+        assert result.sources[0].uri.endswith("/p" + SECOND.replace(".", ""))
+        assert "안내문" in result.messages[0].body
+        assert any(path.endswith("/live") for path, _ in session.calls)
+    else:
+        assert statement not in inputs[0][1]
+        assert not any(path.endswith("/live") for path, _ in session.calls)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT count(*) FROM memory_sources").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM memory_job_inputs").fetchone()[0] == 0
 
 
 if __name__ == "__main__":

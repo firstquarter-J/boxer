@@ -12,7 +12,7 @@ from boxer_company.memory.commands import parse_memory_command
 from boxer_company_api.auth import CallerRegistry
 from boxer_company_api.memory_schemas import (
     Identifier, MemoryCheckpointInput, MemoryChunkInput, MemoryContextInput,
-    MemoryInput, MemoryPullInput, MemorySourceEventInput,
+    MemoryInput, MemoryLiveResultInput, MemoryPullInput, MemorySourceEventInput,
 )
 from boxer_company_api.memory_service import MemoryService
 from boxer_company_api.policies import validate_request_id, validate_traceparent
@@ -61,22 +61,31 @@ def create_memory_router(*, service: MemoryService, caller_registry: CallerRegis
             raise CompanyApiProblem(status=503, code="service_not_ready", request_id=request_id, retryable=True)
         return request_id
 
-    def invoke(request_id: str, callback, **kwargs: Any):
+    def invoke(transport_request_id: str, callback, **kwargs: Any):
         try:
             return callback(**kwargs)
         except MemoryError as exc:
             status = 404 if "not_found" in exc.code else 409
             raise CompanyApiProblem(status=status, code="not_found" if status == 404 else "request_id_conflict",
-                                    request_id=request_id) from None
+                                    request_id=transport_request_id) from None
         except ValueError:
-            raise CompanyApiProblem(status=422, code="validation_failed", request_id=request_id) from None
+            raise CompanyApiProblem(status=422, code="validation_failed", request_id=transport_request_id) from None
         except Exception:
-            raise CompanyApiProblem(status=503, code="service_not_ready", request_id=request_id, retryable=True) from None
+            raise CompanyApiProblem(status=503, code="service_not_ready", request_id=transport_request_id, retryable=True) from None
 
     @router.post("/retrievals")
     def prepare(request: Request, body: MemoryRetrievalInput):
         request_id = authorize(request, body.tenantId, body.actorId)
         return invoke(request_id, lambda: service.prepare(body.to_request()))
+
+    @router.post("/retrievals/{retrieval_id}/live")
+    def receive_live(request: Request, retrieval_id: str, body: MemoryLiveResultInput):
+        request_id = authorize(request, body.tenantId, body.actorId)
+        # Slack transport가 현재 turn을 위해 조회한 원문만 서버 발행 lease에 연결한다.
+        return invoke(request_id, service.receive_live, retrieval_id=retrieval_id,
+                      tenant_id=body.tenantId, actor_id=body.actorId, channel_id=body.channelId,
+                      request_id=body.requestId, sources=[source.model_dump() for source in body.sources],
+                      coverage=body.coverage, channel_count=body.channelCount)
 
     @router.post("/captures/pull")
     def pull(request: Request, body: MemoryPullInput):
@@ -114,6 +123,9 @@ def create_memory_router(*, service: MemoryService, caller_registry: CallerRegis
         if (not isinstance(result, dict) or type(result.get("invalidatedCount")) is not int
                 or result["invalidatedCount"] < 0):
             raise CompanyApiProblem(status=503, code="service_not_ready", request_id=request_id, retryable=True)
+        invoke(request_id, service.invalidate_live_source, tenant_id=body.tenantId,
+               channel_id=body.channelId, message_ts=body.messageTs,
+               event_type=body.eventType, revision_hash=body.revisionHash)
         # 저장소 eventId는 삭제 journal의 내부 ID이며 noop이면 None이다. 전송 ACK는
         # 적용된 원요청 ID를 돌려줘야 Slack이 해당 outbox 항목만 지울 수 있다.
         return {"eventId": body.eventId, "invalidatedCount": result["invalidatedCount"]}
