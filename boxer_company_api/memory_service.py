@@ -15,6 +15,7 @@ from boxer_company.assistant.contracts import AssistantMessage, CompanyAssistant
 from boxer_company.memory.commands import MEMORY_MANAGE_ROUTE, parse_memory_command
 from boxer_company.memory.contracts import canonical_digest, source_revision
 from boxer_company.memory.policy import is_safe_memory_text
+from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company_api.memory_schemas import MemoryCaptureOutput
 
 
@@ -87,7 +88,8 @@ class MemoryService:
             from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
             for profile in TEAM_MEMBER_PROFILES:
                 aliases = (str(profile.get("name") or ""), *profile.get("aliases", ()))
-                if any(alias and re.search(r"(?<!\w)" + re.escape(str(alias)) + r"(?!\w)", request.question, re.I) for alias in aliases):
+                # 프로필과 같은 경계 규칙으로 DD는/디디는 같은 조사 결합도 대상 사용자로 묶는다.
+                if matches_team_member_alias(request.question, aliases):
                     mentioned.add(str(profile.get("user_id") or ""))
             candidates = self.store.retrieval_candidates(
                 tenant_id=request.tenant_id, channel_id=memory["channelId"],

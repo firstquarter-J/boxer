@@ -9,6 +9,7 @@ from boxer_company._operation_routing_common import (
     CompanyOperationRequestContract as CompanyAssistantRequest,
     window_assistant_context_entries,
 )
+from boxer_company.team_member_aliases import matches_team_member_alias
 
 
 _NOTION_QUESTION_TOKENS = (
@@ -337,7 +338,7 @@ def looks_like_notion_playbook_followup(
     if any(token in collapsed for token in _IDENTITY_TOKENS):
         return False
     if (
-        any(alias in lowered for alias in _TEAM_MEMBER_ALIAS_TOKENS)
+        matches_team_member_alias(lowered, _TEAM_MEMBER_ALIAS_TOKENS)
         and (
             any(token in lowered for token in _PROFILE_HINTS)
             or any(token in collapsed for token in _PROFILE_HINTS)

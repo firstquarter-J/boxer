@@ -2,6 +2,7 @@ from boxer_company import settings as cs
 from boxer_company._operation_routing_knowledge import (
     TEAM_MEMBER_ALIASES_BY_NAME,
 )
+from boxer_company.team_member_aliases import matches_team_member_alias
 
 TEAM_CHAT_GENERAL_GUIDE = (
     "팀 자유대화는 가벼운 드립과 메타 농담이 자주 오가지만, 한 번 치고 회수하는 톤이 맞아. "
@@ -363,6 +364,8 @@ def _normalize_context_text(*texts: str) -> str:
 
 def _iter_profile_aliases(profile: dict[str, object]) -> tuple[str, ...]:
     aliases = [str(alias).strip().lower() for alias in (profile.get("aliases") or ()) if str(alias).strip()]
+    # 원시 ID도 별칭과 함께 검사해 thread 작성자가 프로필 선택 순서를 선점하지 않게 한다.
+    aliases.extend(user_id for user_id, registered_profile in _PROFILE_BY_USER_ID.items() if registered_profile is profile)
     user_id = str(profile.get("user_id") or "").strip()
     if user_id:
         aliases.append(user_id.lower())
@@ -425,7 +428,7 @@ def _collect_profile_names(
         profile_name = str(profile.get("name") or "").strip()
         if not profile_name or profile_name in seen_names:
             continue
-        if any(alias in normalized for alias in _iter_profile_aliases(profile)):
+        if matches_team_member_alias(normalized, _iter_profile_aliases(profile)):
             _append_profile_name(
                 matched_names,
                 seen_names,

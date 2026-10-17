@@ -44,6 +44,38 @@ class TeamChatContextTests(unittest.TestCase):
         self.assertIn("전투력 91, 메인 탱커 / 생존형 카운터", context)
         self.assertIn("MBTI ENFP", context)
 
+    def test_dd_spellings_select_the_same_profile(self) -> None:
+        for name in ("DD 는", "dd 는", "DD는", "dd는", "디디는", "디디", "DD님은", "디디에 대해"):
+            with self.subTest(name=name):
+                context = tcc.build_team_chat_context(f"{name} 어떤 사람이야?")
+                self.assertIn("DD: 감정 직결형 / 반응형 인간", context)
+
+    def test_words_containing_aliases_do_not_add_unrelated_profiles(self) -> None:
+        context = tcc.build_team_chat_context("address message markdown 폴더 DDos")
+
+        for name in ("DD", "Sage", "Mark", "Paul"):
+            with self.subTest(name=name):
+                self.assertNotIn(f"{name}:", context)
+
+    def test_raw_user_id_prefix_does_not_select_another_member(self) -> None:
+        tcc._PROFILE_BY_USER_ID["u_roy"] = tcc._PROFILE_BY_NAME["Roy"]
+
+        context = tcc.build_team_chat_context("U_ROY2: 장비 얘기하자")
+
+        self.assertNotIn("Roy:", context)
+
+    def test_thread_user_ids_preserve_existing_profile_selection_order(self) -> None:
+        for name in ("Roy", "Maru", "Paul"):
+            tcc._PROFILE_BY_USER_ID[f"u_{name.lower()}"] = tcc._PROFILE_BY_NAME[name]
+
+        # 제한된 문맥에서 thread 작성자 ID가 질문의 대상 인물을 밀어내지 않는다.
+        context = tcc.build_team_chat_context("DD는 어때?", "U_ROY: 응 U_MARU: 응 U_PAUL: 응", limit=3)
+
+        self.assertIn("DD:", context)
+        self.assertIn("Roy:", context)
+        self.assertIn("Maru:", context)
+        self.assertNotIn("Paul:", context)
+
     def test_speaker_not_duplicated_in_related_profiles(self) -> None:
         tcc._PROFILE_BY_USER_ID["u_dd"] = tcc._PROFILE_BY_NAME["DD"]
 

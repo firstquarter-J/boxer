@@ -290,6 +290,15 @@ class NotionPlaybookQAAssistantRouteTests(unittest.TestCase):
             build_notion_playbook_query("그럼 왜 그래?", context),
         )
 
+    def test_member_aliases_do_not_confuse_playbook_followups_with_profiles(self) -> None:
+        context = "**문서 기반 답변**\n• 결론: LED 상태 확인\n**함께 참고할 문서**"
+
+        # 조사 결합 이름은 팀 대화로 남기고 message 속 sage는 사람으로 취급하지 않는다.
+        for name in ("DD 는", "dd는", "디디는"):
+            with self.subTest(name=name):
+                self.assertFalse(looks_like_notion_playbook_followup(f"그럼 {name} 성격은?", context))
+        self.assertTrue(looks_like_notion_playbook_followup("그럼 message 성격은?", context))
+
     def test_pure_matcher_classifies_direct_and_normalized_followup_only(
         self,
     ) -> None:

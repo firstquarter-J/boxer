@@ -98,6 +98,44 @@ def service(store=None, **kwargs):
                          profile_ids=frozenset({"U1"}), **kwargs)
 
 
+@pytest.mark.parametrize("question,expected", [
+    ("DD 는 어떤 사람이야?", {"UDD"}),
+    ("dd 는 어떤 사람이야?", {"UDD"}),
+    ("DD는 어떤 사람이야?", {"UDD"}),
+    ("dd는 어떤 사람이야?", {"UDD"}),
+    ("디디는 어떤 사람이야?", {"UDD"}),
+    ("디디 어떤 사람이야?", {"UDD"}),
+    ("DD님은 어떤 사람이야?", {"UDD"}),
+    ("디디에 대해 알려줘", {"UDD"}),
+    ("DD, dd, 디디는 어떤 사람이야?", {"UDD"}),
+    ("디디와 세이지는 어떤 사람이야?", {"UDD", "USAGE"}),
+    ("<@UDD>는 어떤 사람이야?", {"UDD"}),
+    ("<@UDD2>는 어떤 사람이야?", {"UDD2"}),
+    ("address message markdown 폴더 DDos", set()),
+])
+def test_memory_retrieval_resolves_member_spellings_without_word_substrings(monkeypatch, question, expected):
+    from boxer_company import team_chat_context
+
+    monkeypatch.setattr(team_chat_context, "TEAM_MEMBER_PROFILES", (
+        {"name": "DD", "aliases": ("dd", "디디"), "user_id": "UDD"},
+        {"name": "Sage", "aliases": ("sage", "세이지"), "user_id": "USAGE"},
+        {"name": "Mark", "aliases": ("mark", "마크"), "user_id": "UMARK"},
+        {"name": "Paul", "aliases": ("paul", "폴"), "user_id": "UPAUL"},
+    ))
+    calls = []
+    store = Store()
+    monkeypatch.setattr(store, "retrieval_candidates", lambda **kwargs: calls.append(kwargs) or [])
+
+    # 기억 검색까지 같은 Slack 사용자 ID가 전달돼야 표기 차이가 검색 순위에 영향을 주지 않는다.
+    service(store).prepare(domain(question=question))
+
+    assert len(calls) == 1
+    assert set(calls[0]["mentioned_user_ids"]) == expected
+    assert len(calls[0]["mentioned_user_ids"]) == len(expected)
+    assert calls[0]["tenant_id"] == "T1"
+    assert calls[0]["channel_id"] == "C1"
+
+
 def test_memory_retrieval_is_bound_to_turn_and_expires():
     clock = [1.0]
     runtime = service(clock=lambda: clock[0])
