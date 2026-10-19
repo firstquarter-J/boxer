@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from boxer_company.assistant.contracts import AssistantMessage, CompanyAssistantRequest, CompanyAssistantResult
 from boxer_company.memory.commands import MEMORY_MANAGE_ROUTE, parse_memory_command
-from boxer_company.memory.access import is_private_memory_hub
+from boxer_company.memory.access import can_query_private_live_sources, is_private_memory_hub
 from boxer_company.memory.contracts import MemoryError, canonical_digest, source_revision
 from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period, wants_private_live_sources
 from boxer_company.memory.policy import is_safe_memory_text
@@ -31,6 +31,7 @@ class _PreparedRetrieval:
     binding: str
     candidates: list[dict[str, Any]]
     live_query: dict[str, Any] | None = None
+    live_destination_channel_kind: str | None = None
     live_fingerprint: str | None = None
     live_entries: tuple[dict[str, Any], ...] = ()
     live_coverage: str = "unavailable"
@@ -100,6 +101,7 @@ class MemoryService:
         return canonical_digest({
             "requestId": request.request_id, "tenantId": request.tenant_id,
             "actorId": request.actor_id, "channelId": memory.get("channelId"),
+            "channelKind": memory.get("channelKind"),
             "threadTs": request.conversation_id, "currentMessageTs": memory.get("currentMessageTs"),
             "question": request.question, "context": [dict(entry) for entry in request.context_entries],
         })
@@ -108,10 +110,12 @@ class MemoryService:
     def _mentioned_user_ids(question: str) -> set[str]:
         from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
 
-        mentioned = set(re.findall(r"<@([A-Z0-9]+)>", question))
+        # Slack의 표시명 첨부 멘션도 ID를 정본으로 읽고 표시명 자체는 신뢰하지 않는다.
+        mentioned = set(re.findall(r"<@([A-Z0-9]+)(?:\|[^<>]+)?>", question))
+        alias_question = re.sub(r"<@[^<>]*>", " ", question)
         for profile in TEAM_MEMBER_PROFILES:
             aliases = (str(profile.get("name") or ""), *profile.get("aliases", ()))
-            if matches_team_member_alias(question, aliases):
+            if matches_team_member_alias(alias_question, aliases):
                 mentioned.add(str(profile.get("user_id") or ""))
         return mentioned - {""}
 
@@ -156,9 +160,11 @@ class MemoryService:
                 break
         retrieval_id = uuid4().hex
         now = self._clock()
-        # 실시간 읽기 범위는 서버의 고정 허브 정책으로만 발행하며 관리 명령은 제외한다.
+        # 허브 외에는 바인딩된 비공개 원채널만 읽으며 관리 명령은 제외한다.
         live_query = None
-        if (not management and is_private_memory_hub(request.tenant_id, str(memory["channelId"]))
+        destination_kind = memory.get("channelKind")
+        if (not management and can_query_private_live_sources(request.tenant_id,
+                str(memory["channelId"]), destination_kind)
                 and wants_private_live_sources(request.question, tuple(mentioned))):
             live_query = {"tenantId": request.tenant_id, "actorId": request.actor_id,
                           "channelId": memory["channelId"], "requestId": request.request_id,
@@ -170,7 +176,8 @@ class MemoryService:
             while len(self._cache) >= 1024:
                 self._cache.popitem(last=False)
             self._cache[retrieval_id] = _PreparedRetrieval(now + 60, self._binding(request), selected,
-                live_query, live_generation=self._live_generation)
+                live_query, live_destination_channel_kind=destination_kind,
+                live_generation=self._live_generation)
         result = {"retrievalId": retrieval_id, "sources": list(refs.values()), "expiresIn": 60}
         if live_query is not None:
             result["liveQuery"] = live_query
@@ -186,13 +193,17 @@ class MemoryService:
             prepared = self._cache.get(retrieval_id)
             plan = prepared.live_query if prepared else None
             if (prepared is None or prepared.expires_at <= self._clock() or plan is None
-                    or not is_private_memory_hub(tenant_id, channel_id)
+                    or not can_query_private_live_sources(tenant_id, channel_id,
+                        prepared.live_destination_channel_kind)
                     or any(plan.get(key) != value for key, value in
                            (("tenantId", tenant_id), ("actorId", actor_id),
                             ("channelId", channel_id), ("requestId", request_id)))):
                 raise MemoryError("memory_live_retrieval_not_found")
             if coverage not in {"complete", "partial", "unavailable"} or type(channel_count) is not int or not 0 <= channel_count <= 200:
                 raise MemoryError("memory_live_result_invalid")
+            # 원채널 조회가 다른 채널까지 확인한 결과처럼 표시되지 않게 범위 수치도 제한한다.
+            if not is_private_memory_hub(tenant_id, channel_id) and channel_count > 1:
+                raise MemoryError("memory_live_channel_count_invalid")
             if coverage == "unavailable" and sources:
                 raise MemoryError("memory_live_result_invalid")
             fingerprint = canonical_digest([sources, coverage, channel_count])
@@ -200,7 +211,9 @@ class MemoryService:
                 raise MemoryError("memory_live_result_conflict")
             if prepared.live_fingerprint is None:
                 entries = normalize_live_sources(sources, tenant_id=tenant_id,
-                    destination_channel_id=channel_id, before_ts=plan["beforeTs"], author_ids=plan["authorIds"], question=plan["question"])
+                    destination_channel_id=channel_id, before_ts=plan["beforeTs"],
+                    author_ids=plan["authorIds"], question=plan["question"],
+                    destination_channel_kind=prepared.live_destination_channel_kind)
                 if channel_count < len({source["channelId"] for item in entries for source in item["sources"]}):
                     raise MemoryError("memory_live_channel_count_invalid")
                 self._prune_live_sources(self._clock())
@@ -255,11 +268,14 @@ class MemoryService:
                     prepared.live_coverage = "partial"
 
     def _unavailable_live_result(self, request: CompanyAssistantRequest) -> CompanyAssistantRequest:
-        if (is_private_memory_hub(request.tenant_id, str((request.memory_context or {}).get("channelId") or ""))
+        memory = request.memory_context or {}
+        channel_id = str(memory.get("channelId") or "")
+        if (can_query_private_live_sources(request.tenant_id, channel_id, memory.get("channelKind"))
                 and wants_private_live_sources(request.question, tuple(self._mentioned_user_ids(request.question)))):
             # 캐시 유실·검증 장애도 접근 권한 부재로 오해하지 않도록 원문 없는 상태만 남긴다.
             return replace(request, memory_entries=({"kind": "retrieval_status", "coverage": "unavailable",
-                "channelCount": 0, "sourceCount": 0, "scope": "accessible_private_channels"},))
+                "channelCount": 0, "sourceCount": 0, "scope": "accessible_private_channels"
+                    if is_private_memory_hub(request.tenant_id, channel_id) else "current_private_channel"},))
         return request
 
     def bind_verified(self, request: CompanyAssistantRequest) -> CompanyAssistantRequest:
@@ -324,7 +340,8 @@ class MemoryService:
                     evidence = evidence[:8]
                 notice = {"kind": "retrieval_status", "coverage": coverage,
                           "channelCount": prepared.live_channel_count, "sourceCount": len(live),
-                          "scope": "accessible_private_channels"}
+                          "scope": "accessible_private_channels" if is_private_memory_hub(
+                              request.tenant_id, memory["channelId"]) else "current_private_channel"}
                 return replace(request, memory_entries=tuple([*evidence, notice]))
             return replace(request, memory_entries=tuple(verified))
         except Exception as exc:

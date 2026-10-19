@@ -396,17 +396,21 @@ def create_slack_app(
         say,
         client,
         body: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         raw_text = event.get("text") or ""
         text = raw_text.lower()
         user_id = event.get("user")
         thread_ts = event.get("thread_ts") or event.get("ts")
         workspace_id = _extract_slack_workspace_id(event, body)
+        # Bolt 인증 결과의 앱 사용자만 호출 멘션으로 취급한다. 다른 사람 멘션은 조회 대상이다.
+        bot_user_id = (context or {}).get("bot_user_id")
+        bot_user_id = bot_user_id if isinstance(bot_user_id, str) else ""
 
         payload: MentionPayload = {
             "raw_text": raw_text,
             "text": text,
-            "question": _extract_question(raw_text),
+            "question": _extract_question(raw_text, bot_user_id=bot_user_id),
             "user_id": user_id,
             "workspace_id": workspace_id,
             "channel_id": event.get("channel") or "",

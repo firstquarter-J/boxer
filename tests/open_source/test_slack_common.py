@@ -21,6 +21,53 @@ class _FakeApp:
 
 
 class SlackCommonTests(unittest.TestCase):
+    def test_app_mention_uses_authorized_bot_identity_and_preserves_other_mentions(self) -> None:
+        # 전처리된 질문만 봇 멘션을 빼고 raw 본문·스레드는 첨부/명령 수집에 그대로 넘긴다.
+        cases = (
+            ("<@UBOT> 오늘 <@UTARGET> 가 한 말 요약해줘", "오늘 <@UTARGET> 가 한 말 요약해줘"),
+            ("<@UTARGET> <@UBOT> 발언 비교", "<@UTARGET>  발언 비교"),
+            ("<@UBOT|helper> 첨부 문서에서 <@UTARGET|person> 부분 찾아줘", "첨부 문서에서 <@UTARGET|person> 부분 찾아줘"),
+            ("<@UBOT> <@UTARGET> 권한 부여", "<@UTARGET> 권한 부여"),
+            ("<@UBOT> ping", "ping"), ("<@UBOT>", ""),
+        )
+        payloads = []
+        client = object()
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(lambda payload, *_args: payloads.append(payload))
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    event = {"text": text, "user": "UACTOR", "channel": "C1", "team": "T1",
+                             "ts": "1792392600.000001", "thread_ts": "1792392500.000001",
+                             "files": [{"id": "F1"}]}
+                    app.handlers["app_mention"](event, lambda **_kwargs: None, client,
+                        context={"bot_user_id": "UBOT"})
+                    payload = payloads[-1]
+                    self.assertEqual(payload["question"], expected)
+                    self.assertEqual(payload["raw_text"], text)
+                    self.assertEqual(payload["text"], text.lower())
+                    self.assertEqual(payload["thread_ts"], "1792392500.000001")
+                    self.assertEqual(event["files"], [{"id": "F1"}])
+
+    def test_app_mention_without_authorized_bot_identity_keeps_user_mentions(self) -> None:
+        payloads = []
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(lambda payload, *_args: payloads.append(payload))
+            app.handlers["app_mention"]({"text": "<@UTARGET> 발언 요약", "user": "UACTOR",
+                "channel": "C1", "team": "T1", "ts": "1792392600.000001"}, lambda **_kwargs: None, object())
+        self.assertEqual(payloads[0]["question"], "<@UTARGET> 발언 요약")
+
     def test_app_mention_honors_request_log_skip_persist(self) -> None:
         def mention_handler(payload, reply, client, logger) -> None:
             # 원격 실행 계층이 정본 감사 로그를 남기는 요청을 재현한다.

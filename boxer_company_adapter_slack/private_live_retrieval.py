@@ -1,4 +1,4 @@
-"""지정된 비공개 허브에서만 최근 Slack 원문을 제한적으로 읽는다."""
+"""비공개 원채널과 지정 허브에서 최근 Slack 원문을 제한적으로 읽는다."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlsplit
 
 from boxer_company._operation_routing_knowledge import TEAM_MEMBER_ALIASES_BY_NAME
-from boxer_company.memory.access import is_private_memory_hub
+from boxer_company.memory.access import can_query_private_live_sources, is_private_memory_hub
 from boxer_company.memory.contracts import source_revision
 from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period, wants_private_live_sources
 from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
@@ -125,6 +125,30 @@ class _Reader:
             self.partial = True
         return values[:limit], cursor
 
+    def private_channel(self, channel: Any) -> str | None:
+        # 목록·단일 채널 응답 모두 같은 실제 Slack metadata로 workspace와 private 범위를 확인한다.
+        if not isinstance(channel, Mapping):
+            self.partial = True
+            return None
+        if (any(channel.get(key) and channel[key] != self.tenant for key in ("team_id", "context_team_id"))
+                or channel.get("is_ext_shared")
+                or not isinstance(channel.get("shared_team_ids", []), list)
+                or any(team != self.tenant for team in channel.get("shared_team_ids", []))):
+            self.partial = True
+            return None
+        channel_id = channel.get("id")
+        if (channel.get("is_private") is not True or channel.get("is_member") is not True
+                or channel.get("is_im") or channel.get("is_mpim")
+                or not isinstance(channel_id, str) or not _CHANNEL.fullmatch(channel_id)):
+            return None
+        return channel_id
+
+    def current_channel(self, channel_id: str) -> list[str]:
+        # 일반 채널 요청에서는 목록 API를 쓰지 않고 요청한 비공개 채널 한 곳만 확인한다.
+        response = self.call("conversations_info", channel=channel_id, include_num_members=False)
+        accepted = self.private_channel(response.get("channel")) if response else None
+        return [accepted] if accepted == channel_id else []
+
     def channels(self) -> list[str]:
         channels: list[str] = []
         cursor, visited = "", set()
@@ -135,20 +159,8 @@ class _Reader:
                 break
             values, following = self.page(response, "channels", limit=200)
             for channel in values:
-                if not isinstance(channel, Mapping):
-                    self.partial = True
-                    continue
-                # Slack Connect나 다른 workspace의 metadata를 같은 회사 private로 승격하지 않는다.
-                if (any(channel.get(key) and channel[key] != self.tenant for key in ("team_id", "context_team_id"))
-                        or channel.get("is_ext_shared")
-                        or not isinstance(channel.get("shared_team_ids", []), list)
-                        or any(team != self.tenant for team in channel.get("shared_team_ids", []))):
-                    self.partial = True
-                    continue
-                channel_id = channel.get("id")
-                if (channel.get("is_private") is not True or channel.get("is_member") is not True
-                        or channel.get("is_im") or channel.get("is_mpim")
-                        or not isinstance(channel_id, str) or not _CHANNEL.fullmatch(channel_id)):
+                channel_id = self.private_channel(channel)
+                if channel_id is None:
                     continue
                 if channel_id not in channels:
                     if len(channels) >= _MAX_CHANNELS:
@@ -381,11 +393,11 @@ def collect_private_live_sources(
     *, client_factory: Callable[[float], Any], tenant_id: str, destination_channel_id: str,
     actor_id: str, question: str, author_ids: Sequence[str], before_ts: str,
     is_allowed: Callable[[str, str], bool], clock: Callable[[], float] = time.monotonic,
-    budget_seconds: float = 8.0,
+    budget_seconds: float = 8.0, destination_channel_kind: str | None = None,
 ) -> dict[str, Any]:
     """원문을 저장하지 않고 현재 읽을 수 있는 비공개 채널에서 bounded 근거만 반환한다."""
     unavailable = {"sources": [], "coverage": "unavailable", "channelCount": 0}
-    if (not is_private_memory_hub(tenant_id, destination_channel_id) or not actor_id
+    if (not can_query_private_live_sources(tenant_id, destination_channel_id, destination_channel_kind) or not actor_id
             or _timestamp(before_ts) is None or not isinstance(question, str)
             or not is_safe_memory_text(question) or not 0 < budget_seconds <= 30):
         return unavailable
@@ -401,6 +413,9 @@ def collect_private_live_sources(
     reader = _Reader(client_factory, tenant=tenant_id, authors=authors, keywords=keywords, cutoff=before_ts,
                      is_allowed=is_allowed, clock=clock, budget=budget_seconds,
                      period=resolve_live_query_period(question, before_ts))
-    channels = reader.channels()
+    hub = is_private_memory_hub(tenant_id, destination_channel_id)
+    channels = reader.channels() if hub else reader.current_channel(destination_channel_id)
+    if not hub and not channels:
+        return unavailable
     reader.scan(channels)
     return reader.result()

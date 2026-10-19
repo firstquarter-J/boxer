@@ -12,6 +12,21 @@ def is_private_memory_hub(tenant_id: str, channel_id: str) -> bool:
     return (tenant_id, channel_id) in _PRIVATE_MEMORY_HUBS
 
 
+def can_query_private_live_sources(
+    tenant_id: str,
+    channel_id: str,
+    channel_kind: str | None,
+) -> bool:
+    """허브는 기존 교차 조회를, 확인된 비공개 원채널은 그 채널 조회만 시작한다."""
+    # 일반 채널은 adapter가 확인해 요청에 바인딩한 종류가 있어야 한다.
+    # 허브의 기존 호출자는 종류를 전달하지 않아도 고정 서버 정책으로 판정한다.
+    return bool(
+        isinstance(tenant_id, str) and tenant_id
+        and isinstance(channel_id, str) and channel_id
+        and (is_private_memory_hub(tenant_id, channel_id) or channel_kind == "private_channel")
+    )
+
+
 def can_read_memory_source(
     tenant_id: str,
     destination_channel_id: str,

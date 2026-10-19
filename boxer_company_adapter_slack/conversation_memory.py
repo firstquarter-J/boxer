@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
-from boxer_company.memory.access import can_read_memory_source, is_private_memory_hub
+from boxer_company.memory.access import can_query_private_live_sources, can_read_memory_source, is_private_memory_hub
 from boxer_company.memory.contracts import MAX_CHUNK_CHARS, canonical_digest, source_revision
 from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
 from boxer_company.memory.commands import parse_memory_command
@@ -219,7 +219,8 @@ class SlackConversationMemory:
                 actor_id=request.actor_id,
             )
             plan = result.get("liveQuery")
-            if isinstance(plan, Mapping) and is_private_memory_hub(request.tenant_id, context["channelId"]):
+            if isinstance(plan, Mapping) and can_query_private_live_sources(
+                    request.tenant_id, context["channelId"], context.get("channelKind")):
                 try:
                     from boxer_company_adapter_slack.private_live_retrieval import collect_private_live_sources
 
@@ -234,7 +235,8 @@ class SlackConversationMemory:
                         tenant_id=request.tenant_id, destination_channel_id=context["channelId"],
                         actor_id=str(request.actor_id or ""), question=request.question,
                         author_ids=authors, before_ts=context["currentMessageTs"],
-                        is_allowed=self.is_allowed, clock=self.clock)
+                        is_allowed=self.is_allowed, clock=self.clock,
+                        destination_channel_kind=context.get("channelKind"))
                     self.api.call(_PREFIX + "/retrievals/" + retrieval_id + "/live", {
                         "tenantId": request.tenant_id, "actorId": request.actor_id,
                         "channelId": context["channelId"], "requestId": request.request_id,

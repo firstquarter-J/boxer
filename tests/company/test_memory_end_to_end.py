@@ -337,14 +337,21 @@ class MemoryEndToEndTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT coverage FROM memory_threads").fetchone()[0], "partial")
 
 
-@pytest.mark.parametrize("destination,expected_live", [("C068FVD5V7Y", True), ("COTHER", False)])
-def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tmp_path, monkeypatch, destination, expected_live):
+@pytest.mark.parametrize("destination,origin,private_destination,expected_live", [
+    ("C068FVD5V7Y", "CPRIVATE", True, True),
+    ("COTHER", "CPRIVATE", True, False),
+    ("COTHER", "COTHER", True, True),
+    ("CPUBLIC", "CPRIVATE", False, False),
+])
+def test_private_live_scope_reads_unstored_reply_through_real_http_and_sqlite(
+    tmp_path, monkeypatch, destination, origin, private_destination, expected_live,
+):
     from boxer_company import team_chat_context
 
-    tenant, origin, dd = "T19PA3EPL", "CPRIVATE", "UDD"
+    tenant, author = "T19PA3EPL", "UMARU"
     statement = "내일 회의에서는 안내문 문구부터 같이 정리하자"
     monkeypatch.setattr(team_chat_context, "TEAM_MEMBER_PROFILES", (
-        {"name": "DD", "aliases": ("dd", "디디"), "user_id": dd},
+        {"name": "Maru", "aliases": ("maru", "마루"), "user_id": author},
     ))
 
     class PrivateSlack(Slack):
@@ -354,11 +361,12 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
             self.list_calls = 0
             self.threads[(origin, FIRST)] = [
                 {"ts": FIRST, "thread_ts": FIRST, "user": "UA", "text": "회의 순서 얘기하자"},
-                {"ts": SECOND, "thread_ts": FIRST, "user": dd, "text": statement},
+                {"ts": SECOND, "thread_ts": FIRST, "user": author, "text": statement},
             ]
 
         def conversations_info(self, *, channel, **kwargs):
-            return {"ok": True, "channel": {"id": channel, "is_private": True}}
+            return {"ok": True, "channel": {"id": channel, "is_private": private_destination,
+                                           "is_member": True, "context_team_id": tenant}}
 
         def conversations_list(self, **kwargs):
             self.list_calls += 1
@@ -367,6 +375,8 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
 
         def conversations_history(self, *, channel, **kwargs):
             self.history_calls.append(channel)
+            if channel != origin:
+                return {"ok": True, "messages": [], "has_more": False}
             return {"ok": True, "messages": [
                 {**self.threads[(origin, FIRST)][0], "reply_count": 1, "latest_reply": SECOND}], "has_more": False}
 
@@ -384,7 +394,9 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
         utterances = [row for row in rows if row.get("kind") == "utterance"]
         if not utterances:
             return "실시간 조회를 완료하지 못했어"
-        return "DD는 안내문 문구부터 정리하자고 했어 [memory:" + utterances[0]["memoryId"] + "]"
+        assert utterances[0]["sourceTimes"][0]["authorName"] == "Maru"
+        assert '"referenceDateKst":"2026-10-16"' in system
+        return "마루는 안내문 문구부터 정리하자고 했어 [memory:" + utterances[0]["memoryId"] + "]"
 
     route = CompanyFreeformAssistantRoute(answerer, provider_ready=lambda: True,
         context_max_chars=5000, timeout_message="시간 초과")
@@ -402,13 +414,13 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
         api = CompanyAssistantApiClient(client_settings, session=session)
         slack = PrivateSlack()
         memory = SlackConversationMemory(CompanyMemoryApiClient(client_settings, session=session),
-            is_allowed=lambda workspace, author: workspace == tenant and author in {"UA", dd})
+            is_allowed=lambda workspace, actor: workspace == tenant and actor in {"UA", author})
         memory.client, memory.tenant_id, memory.bot_user_id = slack, tenant, "UBOT"
         memory._profile_ids = {"UA"}
         api.memory_request_preparer = memory.prepare
         payload = {"workspace_id": tenant, "user_id": "UA", "channel_id": destination,
-                   "current_ts": THIRD, "thread_ts": THIRD, "question": "디디가 최근에 한 말은?",
-                   "raw_text": "디디가 최근에 한 말은?", "text": "디디가 최근에 한 말은?", "request_log": {}}
+                   "current_ts": THIRD, "thread_ts": THIRD, "question": "오늘 마루가 한 말 요약해줘",
+                   "raw_text": "오늘 마루가 한 말 요약해줘", "text": "오늘 마루가 한 말 요약해줘", "request_log": {}}
         request = build_company_assistant_request(payload)
         request = replace(request, memory_context=memory.context_for(payload))
 
@@ -427,7 +439,9 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
     assert "일반 답변 서비스 상태를 확인할 수 없어" not in rendered
     assert "[memory:" not in rendered
     assert bool(result.sources) is expected_live
-    assert slack.list_calls == int(expected_live)
+    assert slack.list_calls == int(destination == "C068FVD5V7Y")
+    assert slack.history_calls == ([origin] if destination == "C068FVD5V7Y"
+                                   else [destination] if private_destination else [])
     if expected_live:
         assert slack.history_calls == [origin]
         assert statement in inputs[0][1]
@@ -440,7 +454,7 @@ def test_private_hub_reads_unstored_recent_reply_through_real_http_and_sqlite(tm
     else:
         assert "https://" not in rendered
         assert statement not in inputs[0][1]
-        assert not any(path.endswith("/live") for path, _ in session.calls)
+        assert any(path.endswith("/live") for path, _ in session.calls) is private_destination
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT count(*) FROM memory_sources").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM memory_job_inputs").fetchone()[0] == 0

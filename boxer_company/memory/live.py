@@ -7,7 +7,7 @@ from decimal import Decimal
 import re
 from typing import Any, Mapping, Sequence
 
-from .access import is_private_memory_hub
+from .access import can_query_private_live_sources, can_read_memory_source
 from .contracts import MemoryError, canonical_digest
 from .live_query import is_within_live_query_period, resolve_live_query_period
 from .policy import normalize_source
@@ -35,10 +35,10 @@ def _timestamp_iso(value: str) -> str:
 def normalize_live_sources(
     sources: Sequence[Mapping[str, Any]], *, tenant_id: str, destination_channel_id: str,
     before_ts: str, author_ids: Sequence[str], question: str = "",
+    destination_channel_kind: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """고정 허브의 비공개 채널 원문만 현재 질문 시점과 작성자 범위 안에서 받는다."""
-    if (not isinstance(tenant_id, str) or not isinstance(destination_channel_id, str)
-            or not is_private_memory_hub(tenant_id, destination_channel_id)):
+    """비공개 원채널 또는 고정 허브의 원문을 현재 질문·작성자 범위 안에서 받는다."""
+    if not can_query_private_live_sources(tenant_id, destination_channel_id, destination_channel_kind):
         raise MemoryError("memory_live_destination_forbidden")
     _timestamp_iso(before_ts)
     period = resolve_live_query_period(question, before_ts)
@@ -60,7 +60,9 @@ def normalize_live_sources(
             raise MemoryError("memory_live_source_invalid")
         # tenant·출처 종류는 adapter의 실제 조회 결과와 고정 허브 정책 양쪽에서 확인한다.
         if (("tenantId" in source and source["tenantId"] != tenant_id)
-                or source["channelKind"] != "private_channel"):
+                or source["channelKind"] != "private_channel"
+                or not can_read_memory_source(tenant_id, destination_channel_id,
+                    source["channelId"], source["channelKind"])):
             raise MemoryError("memory_live_source_scope_invalid")
         _timestamp_iso(source["threadTs"])
         updated_at = _timestamp_iso(source["messageTs"])

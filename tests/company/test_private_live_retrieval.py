@@ -30,7 +30,7 @@ def page(field, values, cursor="", **extra):
 
 
 class Slack:
-    def __init__(self, *, channels=None, history=None, replies=None, latest_replies=None, links=None, elapsed=None, delay=0):
+    def __init__(self, *, channels=None, history=None, replies=None, latest_replies=None, links=None, elapsed=None, delay=0, infos=None):
         self.channels = channels if channels is not None else {"": page("channels", [private()])}
         self.history = history or {}
         self.replies = replies or {}
@@ -39,6 +39,7 @@ class Slack:
         self.calls = []
         self.timeouts = []
         self.elapsed, self.delay = elapsed, delay
+        self.infos = infos or {}
 
     def factory(self, timeout):
         self.timeouts.append(timeout)
@@ -54,6 +55,10 @@ class Slack:
 
     def conversations_list(self, **kwargs):
         return self.take("list", kwargs, self.channels[kwargs.get("cursor") or ""])
+
+    def conversations_info(self, **kwargs):
+        channel = kwargs["channel"]
+        return self.take("info", kwargs, self.infos.get(channel, {"ok": True, "channel": private(channel)}))
 
     def conversations_history(self, **kwargs):
         key = kwargs["channel"], kwargs.get("cursor") or ""
@@ -82,6 +87,59 @@ def collect(slack, **overrides):
                   before_ts=stamp(1000), is_allowed=lambda tenant, actor: tenant == TENANT and actor in {"UACTOR", "UDD", "UOTHER"})
     values.update(overrides)
     return collect_private_live_sources(**values)
+
+
+def test_ordinary_private_channel_reads_only_itself_even_when_other_channels_are_available():
+    # 기존 대화 채널 질문은 목록을 탐색하지 않고 해당 채널의 마루 발언만 읽는다.
+    slack = Slack(channels={"": page("channels", [private("COTHER"), private("CONE")])}, history={
+        ("CONE", ""): page("messages", [human(10, user="UMARU", text="안내문 문구 검토를 마쳤어")]),
+        ("COTHER", ""): page("messages", [human(11, user="UMARU", text="다른 채널의 이야기")]),
+    })
+    result = collect(slack, destination_channel_id="CONE", destination_channel_kind="private_channel",
+        question="오늘 마루가 한 말 요약해줘", author_ids=["UMARU"],
+        is_allowed=lambda tenant, actor: tenant == TENANT and actor in {"UACTOR", "UMARU"})
+    assert result["coverage"] == "complete" and result["channelCount"] == 1
+    assert len(result["sources"]) == 1 and result["sources"][0]["authorId"] == "UMARU"
+    assert result["sources"][0]["channelId"] == "CONE"
+    assert [method for method, _ in slack.calls] == ["info", "history", "link"]
+    assert all(kwargs.get("channel") == "CONE" for _, kwargs in slack.calls)
+
+
+@pytest.mark.parametrize("kind", [None, "channel", "dm", "group_dm", "private_channel ", True])
+def test_ordinary_live_query_requires_explicit_private_channel_kind(kind):
+    slack = Slack()
+    result = collect(slack, destination_channel_id="CONE", destination_channel_kind=kind)
+    assert result == {"sources": [], "coverage": "unavailable", "channelCount": 0}
+    assert slack.calls == []
+
+
+@pytest.mark.parametrize("info", [
+    {"ok": True, "channel": private("COTHER")},
+    {"ok": True, "channel": private(is_private=False)},
+    {"ok": True, "channel": private(is_member=False)},
+    {"ok": True, "channel": private(is_im=True)},
+    {"ok": True, "channel": private(is_mpim=True)},
+    {"ok": True, "channel": private(is_ext_shared=True)},
+    {"ok": True, "channel": private(context_team_id="TOTHER")},
+    {"ok": True, "channel": private(shared_team_ids=["TOTHER"])},
+    {"ok": True, "channel": private(shared_team_ids="T19PA3EPL")},
+    {"ok": True, "channel": {"id": "CONE", "is_private": True}},
+    {"ok": False, "error": "channel_not_found"},
+    {"ok": True},
+])
+def test_ordinary_channel_info_must_confirm_private_membership_and_workspace(info):
+    # 요청 metadata를 private으로 주장해도 SDK가 원채널을 확인하지 못하면 history를 읽지 않는다.
+    slack = Slack(infos={"CONE": info})
+    result = collect(slack, destination_channel_id="CONE", destination_channel_kind="private_channel")
+    assert result == {"sources": [], "coverage": "unavailable", "channelCount": 0}
+    assert [method for method, _ in slack.calls] == ["info"]
+
+
+def test_ordinary_channel_does_not_fall_back_to_list_after_info_failure():
+    slack = Slack(infos={"CONE": RuntimeError("do not print SDK payload")})
+    result = collect(slack, destination_channel_id="CONE", destination_channel_kind="private_channel")
+    assert result == {"sources": [], "coverage": "unavailable", "channelCount": 0}
+    assert [method for method, _ in slack.calls] == ["info"]
 
 
 def dated_message(ts, **extra):

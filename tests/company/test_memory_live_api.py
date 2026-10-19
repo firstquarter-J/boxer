@@ -68,13 +68,14 @@ def request(**changes):
     tenant = changes.pop("tenant_id", TENANT)
     actor = changes.pop("actor_id", ACTOR)
     channel_id = changes.pop("channel_id", HUB)
+    channel_kind = changes.pop("channel_kind", "private_channel")
     value = CompanyAssistantRequest(
         request_id=REQUEST_ID, tenant_id=tenant, actor_id=actor, channel="slack",
         conversation_id=ROOT, question=QUESTION, locale="ko",
         metadata={"channel_id": channel_id, "route_group": "freeform"},
         memory_context={"workspaceId": tenant, "actorId": actor, "channelId": channel_id,
                         "threadTs": ROOT, "currentMessageTs": CUTOFF,
-                        "channelKind": "private_channel", "triggerKind": "app_mention"},
+                        "channelKind": channel_kind, "triggerKind": "app_mention"},
     )
     return replace(value, **changes)
 
@@ -167,7 +168,8 @@ def client(memory, *, capabilities=frozenset({"assistant.turn.read"})):
         automation_delivery_broker=None, hpa_change_coordinator=None, memory_service=memory))
 
 
-@pytest.mark.parametrize("question", [QUESTION, "DD가 최근에 한 말은?", "dd 는 뭐라고 했어?", "디디는 무슨 말 했어?"])
+@pytest.mark.parametrize("question", [QUESTION, "DD가 최근에 한 말은?", "dd 는 뭐라고 했어?", "디디는 무슨 말 했어?",
+    "<@UDD> 가 오늘 한 말 요약", "<@UDD|person> 가 오늘 한 말 요약"])
 def test_live_plan_resolves_alias_and_binds_author_scope(runtime, question):
     value = request(question=question)
     prepared = runtime.memory.prepare(value)
@@ -179,15 +181,81 @@ def test_live_plan_resolves_alias_and_binds_author_scope(runtime, question):
     assert runtime.store.reads[0][1]["mentioned_user_ids"] == (DD,)
 
 
+def test_mention_display_name_cannot_add_a_different_registered_author(runtime, monkeypatch):
+    from boxer_company import team_chat_context
+
+    # Slack ID와 다르게 붙인 이름은 검색 범위를 넓히지 않고 토큰 밖 명시 별칭만 존중한다.
+    monkeypatch.setattr(team_chat_context, "TEAM_MEMBER_PROFILES", (
+        {"name": "DD", "aliases": ("dd", "디디"), "user_id": DD},
+        {"name": "Maru", "aliases": ("maru", "마루"), "user_id": "UMARU"},
+    ))
+    prepared = runtime.memory.prepare(request(question="<@UMARU|DD> 가 오늘 한 말 요약해줘"))
+    assert prepared["liveQuery"]["authorIds"] == ["UMARU"]
+    assert MemoryService._mentioned_user_ids("<@UMARU|디디> 와 디디가 오늘 한 말") == {"UMARU", DD}
+    assert MemoryService._mentioned_user_ids("<@UNKNOWN|마루> 가 오늘 한 말") == {"UNKNOWN"}
+
+
 @pytest.mark.parametrize("changes", [
-    {"tenant_id": "T2"}, {"channel_id": "C_OTHER"}, {"question": "내 기억 보여줘"},
+    {"channel_id": "C_OTHER", "channel_kind": "channel"},
+    {"channel_id": "C_OTHER", "channel_kind": "dm"},
+    {"channel_id": "C_OTHER", "channel_kind": "group_dm"},
+    {"channel_id": "C_OTHER", "channel_kind": None}, {"question": "내 기억 보여줘"},
 ])
-def test_live_plan_is_absent_outside_fixed_hub_or_for_management(runtime, changes):
+def test_live_plan_is_absent_for_unconfirmed_private_destination_or_management(runtime, changes):
     value = request(**changes)
     prepared = runtime.memory.prepare(value)
     assert prepared["retrievalId"] and "liveQuery" not in prepared
     with pytest.raises(MemoryError, match="memory_live_retrieval_not_found"):
         receive(runtime.memory, prepared["retrievalId"])
+
+
+@pytest.mark.parametrize("tenant", [TENANT, "T2"])
+def test_same_private_channel_plan_upload_and_model_evidence_keep_original_destination(runtime, tenant):
+    # 일반 비공개 채널도 자기 원문은 읽되 다른 tenant의 허브 공유 정책을 상속하지 않는다.
+    value = request(channel_id=ORIGIN, tenant_id=tenant)
+    with client(runtime.memory) as http:
+        prepared = http.post(BASE, headers=headers(), json=retrieval_body(
+            tenantId=tenant, memoryContext=dict(value.memory_context)))
+        assert prepared.status_code == 200
+        payload = prepared.json()
+        assert payload["liveQuery"] == {"tenantId": tenant, "actorId": ACTOR,
+            "channelId": ORIGIN, "requestId": REQUEST_ID, "question": QUESTION,
+            "authorIds": [DD], "beforeTs": CUTOFF}
+        uploaded = http.post(f"{BASE}/{payload['retrievalId']}/live", headers=headers(),
+            json=upload_body(tenantId=tenant, channelId=ORIGIN, channelCount=1))
+        assert uploaded.status_code == 200 and uploaded.json()["acceptedSourceCount"] == 1
+    bound = runtime.memory.bind_verified(bound_request(value, payload["retrievalId"]))
+    utterance, notice = bound.memory_entries
+    assert utterance["sources"][0]["channelId"] == ORIGIN and utterance["text"] == STATEMENT
+    assert notice == {"kind": "retrieval_status", "coverage": "partial", "channelCount": 1,
+                      "sourceCount": 1, "scope": "current_private_channel"}
+    rendered, selected = render_memory(bound.memory_entries)
+    assert STATEMENT in rendered and ORIGIN not in rendered
+    assert set(selected) == {utterance["memoryId"]}
+    assert_no_source_evidence(runtime.memory.bind_verified(bound_request(value, payload["retrievalId"])))
+
+
+@pytest.mark.parametrize("tenant,destination", [(TENANT, "C_OTHER"), ("T2", HUB)])
+def test_ordinary_private_lease_rejects_other_channel_source_and_keeps_valid_upload_available(runtime, tenant, destination):
+    # client의 source kind가 private여도 일반 lease에서는 원채널 ID가 반드시 같아야 한다.
+    value = request(tenant_id=tenant, channel_id=destination)
+    prepared = runtime.memory.prepare(value)
+    path = f"{BASE}/{prepared['retrievalId']}/live"
+    with client(runtime.memory) as http:
+        rejected = http.post(path, headers=headers(),
+            json=upload_body(tenantId=tenant, channelId=destination, channelCount=1))
+        assert rejected.status_code == 409 and STATEMENT not in rejected.text
+        row = source(channelId=destination,
+            permalink=f"https://unit.slack.com/archives/{destination}/p{SPOKEN.replace('.', '')}")
+        accepted = http.post(path, headers=headers(), json=upload_body(
+            tenantId=tenant, channelId=destination, channelCount=1, sources=[row]))
+        assert accepted.status_code == 200 and accepted.json()["acceptedSourceCount"] == 1
+
+
+def test_ordinary_private_live_result_cannot_claim_multiple_channel_coverage(runtime):
+    prepared = runtime.memory.prepare(request(channel_id=ORIGIN))
+    with pytest.raises(MemoryError, match="memory_live_channel_count_invalid"):
+        receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=ORIGIN, channelCount=2))
 
 
 @pytest.mark.parametrize("disabled", ["enabled", "read_enabled", "profile"])
@@ -279,19 +347,18 @@ def test_date_question_keeps_only_stored_items_whose_entire_evidence_is_in_perio
     missing = stored("missing", [])
     monkeypatch.setattr(runtime.store, "load_verified_items", lambda **_: [old, mixed, missing, future, in_day, style])
     prepared = runtime.memory.prepare(value)
-    if channel_id == HUB:
-        receive(runtime.memory, prepared["retrievalId"], upload_body(
-            sources=[dated_source("1792340000.000001")], coverage="complete", channelCount=1))
+    row = dated_source("1792340000.000001")
+    if channel_id != HUB:
+        row.update(channelId=channel_id,
+            permalink=f"https://unit.slack.com/archives/{channel_id}/p1792340000000001")
+    receive(runtime.memory, prepared["retrievalId"], upload_body(
+        channelId=channel_id, sources=[row], coverage="complete", channelCount=1))
     bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
     ids = [item.get("memoryId") for item in bound.memory_entries if item["kind"] != "retrieval_status"]
-    assert set(ids) == ({"style", "in-day", "live_" + bound.memory_entries[1]["sources"][0]["sourceId"]}
-                        if channel_id == HUB else {"style", "in-day"})
-    if channel_id == HUB:
-        assert bound.memory_entries[0] == style
-        assert bound.memory_entries[1]["kind"] == "utterance"
-        assert bound.memory_entries[2] == in_day
-    else:
-        assert "liveQuery" not in prepared
+    assert set(ids) == {"style", "in-day", "live_" + bound.memory_entries[1]["sources"][0]["sourceId"]}
+    assert bound.memory_entries[0] == style
+    assert bound.memory_entries[1]["kind"] == "utterance"
+    assert bound.memory_entries[2] == in_day
 
 
 @pytest.mark.parametrize("changes", [
@@ -323,11 +390,12 @@ def test_live_upload_same_payload_is_idempotent_and_conflicting_payload_is_rejec
     assert value.memory_entries[0]["text"] == STATEMENT
 
 
+@pytest.mark.parametrize("channel_id", [HUB, ORIGIN])
 @pytest.mark.parametrize("delay,coverage,count", [(10.0, "partial", 1), (10.001, "unavailable", 0)])
-def test_live_entries_expire_ten_seconds_after_first_receipt(runtime, delay, coverage, count):
-    value = request()
+def test_live_entries_expire_ten_seconds_after_first_receipt(runtime, delay, coverage, count, channel_id):
+    value = request(channel_id=channel_id)
     prepared = runtime.memory.prepare(value)
-    receive(runtime.memory, prepared["retrievalId"])
+    receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=channel_id, channelCount=1))
     runtime.clock[0] += delay
     bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
     assert len([item for item in bound.memory_entries if item["kind"] == "utterance"]) == count
@@ -336,23 +404,26 @@ def test_live_entries_expire_ten_seconds_after_first_receipt(runtime, delay, cov
     assert_no_source_evidence(runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"])))
 
 
-def test_idempotent_retry_does_not_refresh_raw_source_freshness(runtime):
-    value = request()
+@pytest.mark.parametrize("channel_id", [HUB, ORIGIN])
+def test_idempotent_retry_does_not_refresh_raw_source_freshness(runtime, channel_id):
+    value = request(channel_id=channel_id)
     prepared = runtime.memory.prepare(value)
-    receive(runtime.memory, prepared["retrievalId"])
+    body = upload_body(channelId=channel_id, channelCount=1)
+    receive(runtime.memory, prepared["retrievalId"], body)
     runtime.clock[0] = 109
-    receive(runtime.memory, prepared["retrievalId"])
+    receive(runtime.memory, prepared["retrievalId"], body)
     runtime.clock[0] = 111
     bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
     assert [item["kind"] for item in bound.memory_entries] == ["retrieval_status"]
     assert bound.memory_entries[0]["coverage"] == "unavailable"
 
 
-def test_retrieval_lease_expires_at_sixty_seconds_even_when_live_sources_are_fresh(runtime):
-    value = request()
+@pytest.mark.parametrize("channel_id", [HUB, ORIGIN])
+def test_retrieval_lease_expires_at_sixty_seconds_even_when_live_sources_are_fresh(runtime, channel_id):
+    value = request(channel_id=channel_id)
     prepared = runtime.memory.prepare(value)
     runtime.clock[0] = 159
-    receive(runtime.memory, prepared["retrievalId"])
+    receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=channel_id, channelCount=1))
     runtime.clock[0] = 160
     assert_no_source_evidence(runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"])))
 
@@ -378,11 +449,12 @@ def test_http_expired_consumed_or_unknown_lease_cannot_accept_or_normalize_more_
     assert result.status_code == 404 and calls == []
 
 
-@pytest.mark.parametrize("change", ["actor", "tenant", "destination", "request", "question", "cutoff", "thread", "context"])
-def test_live_binding_rejects_changed_turn_scope_and_cannot_be_replayed(runtime, change):
-    value = request()
+@pytest.mark.parametrize("change", ["actor", "tenant", "destination", "destination_kind", "request", "question", "cutoff", "thread", "context"])
+@pytest.mark.parametrize("channel_id", [HUB, ORIGIN])
+def test_live_binding_rejects_changed_turn_scope_and_cannot_be_replayed(runtime, change, channel_id):
+    value = request(channel_id=channel_id)
     prepared = runtime.memory.prepare(value)
-    receive(runtime.memory, prepared["retrievalId"])
+    receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=channel_id, channelCount=1))
     changed = value
     if change == "actor":
         changed = replace(value, actor_id="UB", memory_context={**value.memory_context, "actorId": "UB"})
@@ -390,6 +462,8 @@ def test_live_binding_rejects_changed_turn_scope_and_cannot_be_replayed(runtime,
         changed = replace(value, tenant_id="T2", memory_context={**value.memory_context, "workspaceId": "T2"})
     elif change == "destination":
         changed = replace(value, metadata={"channel_id": "C_OTHER"}, memory_context={**value.memory_context, "channelId": "C_OTHER"})
+    elif change == "destination_kind":
+        changed = replace(value, memory_context={**value.memory_context, "channelKind": "channel"})
     elif change == "request":
         changed = replace(value, request_id="other-request")
     elif change == "question":
@@ -485,10 +559,11 @@ def test_http_live_endpoint_requires_service_authentication_actor_and_capability
 
 
 @pytest.mark.parametrize("event_type", ["deleted", "unavailable", "changed"])
-def test_live_source_event_after_receipt_removes_cached_raw_evidence(runtime, event_type):
-    value = request()
+@pytest.mark.parametrize("channel_id", [HUB, ORIGIN])
+def test_live_source_event_after_receipt_removes_cached_raw_evidence(runtime, event_type, channel_id):
+    value = request(channel_id=channel_id)
     prepared = runtime.memory.prepare(value)
-    receive(runtime.memory, prepared["retrievalId"], upload_body(coverage="complete", channelCount=1))
+    receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=channel_id, coverage="complete", channelCount=1))
     runtime.memory.invalidate_live_source(tenant_id=TENANT, channel_id=ORIGIN,
         message_ts=SPOKEN, event_type=event_type, revision_hash="0" * 64 if event_type == "changed" else None)
     bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))

@@ -6,6 +6,7 @@ import json
 import pytest
 
 from boxer_company.memory.contracts import MemoryError, source_identity, source_revision
+from boxer_company.memory.access import can_query_private_live_sources
 from boxer_company.memory.live import normalize_live_sources
 from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period
 from boxer_company.memory.presentation import render_memory
@@ -90,6 +91,37 @@ def test_other_source_kinds_are_forbidden_even_if_source_is_destination(kind):
 def test_only_exact_authorized_tenant_and_destination_can_receive_live_sources(tenant, destination):
     with pytest.raises(MemoryError, match="memory_live_destination_forbidden"):
         normalize([source()], tenant_id=tenant, destination_channel_id=destination)
+
+
+@pytest.mark.parametrize(("tenant", "destination", "kind", "allowed"), [
+    (TENANT, HUB, None, True), (TENANT, "CORDINARY", "private_channel", True),
+    ("OTHER_TENANT", "CORDINARY", "private_channel", True),
+    (TENANT, "CORDINARY", None, False), (TENANT, "CORDINARY", "channel", False),
+    (TENANT, "CORDINARY", "dm", False), (TENANT, "CORDINARY", "group_dm", False),
+    ("", "CORDINARY", "private_channel", False), (TENANT, "", "private_channel", False),
+])
+def test_live_query_scope_needs_confirmed_private_kind_outside_fixed_hub(tenant, destination, kind, allowed):
+    # 다른 tenant도 자기 원채널만 읽을 수 있고 고정 허브의 교차 예외는 물려받지 않는다.
+    assert can_query_private_live_sources(tenant, destination, kind) is allowed
+
+
+@pytest.mark.parametrize("tenant", [TENANT, "OTHER_TENANT"])
+def test_confirmed_private_destination_accepts_only_its_own_channel_sources(tenant):
+    kwargs = {"tenant_id": tenant, "destination_channel_id": "CORDINARY",
+              "destination_channel_kind": "private_channel"}
+    original = source(channel="CORDINARY", tenantId=tenant)
+    (item,) = normalize([original], **kwargs)
+    assert item["sources"][0]["channelId"] == "CORDINARY"
+    with pytest.raises(MemoryError, match="memory_live_source_scope_invalid"):
+        normalize([source(tenantId=tenant)], **kwargs)
+
+
+@pytest.mark.parametrize("kind", [None, "channel", "dm", "group_dm", "private"])
+def test_ordinary_destination_cannot_enable_live_read_with_source_flags(kind):
+    # source의 private 표시만으로 목적지의 확인되지 않은 종류를 승격하지 않는다.
+    with pytest.raises(MemoryError, match="memory_live_destination_forbidden"):
+        normalize([source(channel="CORDINARY", allowCrossChannel=True)],
+                  destination_channel_id="CORDINARY", destination_channel_kind=kind)
 
 
 @pytest.mark.parametrize("source_tenant", ["OTHER_TENANT", "", None])
