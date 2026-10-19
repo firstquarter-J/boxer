@@ -61,7 +61,17 @@ class MemoryCompanion:
         stopping = stop or threading.Event()
         while not stopping.is_set():
             try:
-                self.run_once()
+                result = self.run_once()
+                job = result.get("job")
+                now = self.clock()
+                maintenance_due = (self._last_cleanup is None or now - self._last_cleanup >= 3600
+                                   or self.backup is not None and (
+                                       self._last_backup is None or now - self._last_backup >= 86_400))
+                # 완료된 작업만 같은 worker로 바로 이어간다. 중단은 다음 claim 전 loop에서 확인하며,
+                # 내구화·정리·백업 실패는 기존 대기를 유지해 실패한 provider를 연속 재호출하지 않는다.
+                if (isinstance(job, dict) and job.get("state") == "succeeded" and not maintenance_due
+                        and result.get("durability") != "pending" and result.get("retention") != "pending"):
+                    continue
             except Exception as exc:
                 self.logger.warning("memory companion failed error_type=%s", type(exc).__name__)
             stopping.wait(max(1, interval))
