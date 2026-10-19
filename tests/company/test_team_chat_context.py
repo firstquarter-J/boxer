@@ -125,6 +125,29 @@ class TeamChatContextTests(unittest.TestCase):
                     self.assertNotIn("DD = UDUPLICATE", context)
                     self.assertNotIn("Hyun = UDUPLICATE", context)
 
+    def test_factual_identity_context_excludes_speaker_and_target_personality(self) -> None:
+        # 사실 조회에서는 질문자와 대상 모두 이름 연결만 남기고 캐릭터 편향을 제거한다.
+        hyun = {**tcc._PROFILE_BY_NAME["Hyun"], "user_id": "UHYUN"}
+        maru = {**tcc._PROFILE_BY_NAME["Maru"], "user_id": "UMARU"}
+        with patch.object(tcc, "TEAM_MEMBER_PROFILES", (hyun, maru)), \
+                patch.dict(tcc._PROFILE_BY_NAME, {"Hyun": hyun, "Maru": maru}, clear=True), \
+                patch.dict(tcc._PROFILE_BY_USER_ID, {"uhyun": hyun, "umaru": maru}, clear=True):
+            context = tcc.build_team_identity_context("오늘 마루가 한 말 요약해줘", speaker_user_id="UHYUN")
+
+        self.assertIn("Hyun = UHYUN", context)
+        self.assertIn("Maru = UMARU", context)
+        for unsupported in ("MBTI", "완충재", "화자 지침", "반응 지침", "전투력", "fictional framing", "차분한 광기"):
+            with self.subTest(unsupported=unsupported):
+                self.assertNotIn(unsupported, context)
+
+    def test_factual_identity_context_rejects_ambiguous_registration(self) -> None:
+        duplicate = tuple({**tcc._PROFILE_BY_NAME[name], "user_id": "UDUPLICATE"} for name in ("Hyun", "Maru"))
+        with patch.object(tcc, "TEAM_MEMBER_PROFILES", duplicate), \
+                patch.dict(tcc._PROFILE_BY_NAME, {str(profile["name"]): profile for profile in duplicate}, clear=True):
+            context = tcc.build_team_identity_context("현이랑 마루가 한 말 요약")
+
+        self.assertEqual(context, "")
+
     def test_required_sage_profile_includes_mbti(self) -> None:
         context = tcc.build_team_chat_context(
             "세이지 얘기하자",

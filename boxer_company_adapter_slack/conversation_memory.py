@@ -237,12 +237,16 @@ class SlackConversationMemory:
                         author_ids=authors, before_ts=context["currentMessageTs"],
                         is_allowed=self.is_allowed, clock=self.clock,
                         destination_channel_kind=context.get("channelKind"))
-                    self.api.call(_PREFIX + "/retrievals/" + retrieval_id + "/live", {
+                    live_payload = {
                         "tenantId": request.tenant_id, "actorId": request.actor_id,
                         "channelId": context["channelId"], "requestId": request.request_id,
                         "sources": live["sources"], "coverage": live["coverage"],
                         "channelCount": live["channelCount"],
-                    })
+                    }
+                    # 부모·주변 발언도 원 요청의 같은 단기 lease로만 보내고 별도로 저장하지 않는다.
+                    if live.get("contextMessages"):
+                        live_payload["contextMessages"] = live["contextMessages"]
+                    self.api.call(_PREFIX + "/retrievals/" + retrieval_id + "/live", live_payload)
                 except Exception as exc:
                     # 실시간 읽기 실패도 저장 기억 검증과 일반 답변을 버리지 않는다.
                     self._failure("live_retrieval", exc)

@@ -169,11 +169,14 @@ def test_relative_day_filters_roots_and_replies_without_hiding_old_parent(questi
     histories = [kwargs for method, kwargs in slack.calls if method == "history"]
     assert len(histories) == 1 and "oldest" not in histories[0]
     assert histories[0]["latest"] == reply_end
-    full_replies = [kwargs for method, kwargs in slack.calls
-                    if method == "replies" and kwargs["oldest"] != kwargs["latest"]]
+    full_replies = [kwargs for method, kwargs in slack.calls if method == "replies"
+                    and kwargs.get("oldest") == reply_start and kwargs["latest"] == reply_end]
     assert len(full_replies) == 1
     assert full_replies[0]["oldest"] == reply_start and full_replies[0]["latest"] == reply_end
-    assert all(kwargs["message_ts"] in expected for method, kwargs in slack.calls if method == "link")
+    # 날짜 밖 부모·앞뒤 발언은 대상 수에 섞지 않고 별도 맥락으로 링크를 확인한다.
+    transmitted = {source["messageTs"] for source in [*result["sources"], *result.get("contextMessages", [])]}
+    assert all(kwargs["message_ts"] in transmitted for method, kwargs in slack.calls if method == "link")
+    assert "1792350000.000002" not in transmitted
 
 
 def test_today_skips_thread_whose_verified_latest_hint_is_before_midnight():
@@ -193,7 +196,10 @@ def test_date_window_reply_pagination_remains_partial_when_budget_does_not_finis
     })
     result = collect(slack, question="디디가 어제 한 말 요약", before_ts=latest_ts)
     assert result["coverage"] == "partial" and result["sources"][0]["messageTs"] == first_ts
-    assert len([method for method, _ in slack.calls if method == "replies"]) == 2
+    discovery = [kwargs for method, kwargs in slack.calls if method == "replies"
+                 and kwargs.get("oldest") == "1792249200.000000" and kwargs["latest"] == "1792335600.000000"]
+    assert len(discovery) == 2
+    assert len([method for method, _ in slack.calls if method == "replies"]) <= 2 + private_live_retrieval._MAX_CONTEXT_READS
 
 
 @pytest.mark.parametrize("overrides", [
@@ -470,3 +476,185 @@ def test_only_selected_sources_with_matching_safe_permalink_are_returned(link):
 def test_empty_fully_enumerated_private_history_is_complete_without_fake_sources():
     result = collect(Slack())
     assert result == {"sources": [], "coverage": "complete", "channelCount": 1}
+
+
+def test_today_anchor_keeps_yesterdays_parent_and_other_author_reply_as_separate_context():
+    parent_ts, before_ts, anchor_ts = "1792335500.000001", "1792335601.000001", "1792335602.000001"
+    parent = {"ts": parent_ts, "user": "UOTHER", "text": "안내문 제목은 어떤 쪽이 좋아?",
+              "reply_count": 2, "latest_reply": anchor_ts}
+    question = {"ts": before_ts, "thread_ts": parent_ts, "user": "UOTHER", "text": "첫 번째 문구로 확정할까?"}
+    anchor = {"ts": anchor_ts, "thread_ts": parent_ts, "user": "UDD", "text": "응 첫 번째로 하자"}
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", parent_ts, ""): page("messages", [parent, question, anchor]),
+    })
+    result = collect(slack, question="디디가 오늘 한 말 요약", before_ts="1792350000.000001")
+    assert [row["messageTs"] for row in result["sources"]] == [anchor_ts]
+    context = result["contextMessages"]
+    assert [(row["messageTs"], row["relation"]) for row in context] == [
+        (parent_ts, "thread_parent"), (before_ts, "thread_neighbor")]
+    assert all(row["authorId"] == "UOTHER" and row["anchorMessageTs"] == anchor_ts for row in context)
+    assert all(row["permalink"] and row["revisionHash"] == source_revision(row["text"], row["editedAt"]) for row in context)
+
+
+def test_context_phase_recovers_previous_day_neighbors_filtered_from_discovery_without_new_anchors():
+    parent_ts = "1792332000.000001"
+    before = ["1792335000.000001", "1792335480.000001", "1792335540.000001"]
+    anchor_ts, cutoff = "1792335660.000001", "1792350000.000001"
+    parent = {"ts": parent_ts, "user": "UOTHER", "text": "다음 문구를 고르자", "reply_count": 4, "latest_reply": anchor_ts}
+    messages = [parent, *[{"ts": ts, "thread_ts": parent_ts, "user": "UOTHER", "text": "제목 후보를 확인했어"}
+                         for ts in before],
+                {"ts": anchor_ts, "thread_ts": parent_ts, "user": "UDD", "text": "첫 번째 제목으로 하자"}]
+    class WindowSlack(Slack):
+        def conversations_replies(self, **kwargs):
+            oldest, latest = Decimal(kwargs["oldest"]), Decimal(kwargs["latest"])
+            rows = [row for row in messages if oldest <= Decimal(row["ts"]) <= latest]
+            rows = sorted(rows, key=lambda row: Decimal(row["ts"]))[:kwargs["limit"]]
+            return self.take("replies", kwargs, page("messages", rows))
+    slack = WindowSlack(history={("CONE", ""): page("messages", [parent])})
+    result = collect(slack, question="디디가 오늘 한 말 요약", before_ts=cutoff)
+    assert [row["messageTs"] for row in result["sources"]] == [anchor_ts]
+    assert [(row["messageTs"], row["relation"]) for row in result["contextMessages"]] == [
+        (parent_ts, "thread_parent"), (before[2], "thread_neighbor"), (before[1], "thread_neighbor")]
+    discovery = [kwargs for method, kwargs in slack.calls if method == "replies"
+                 and kwargs.get("oldest") == "1792335600.000000"]
+    assert len(discovery) == 1
+    context_reads = [kwargs for method, kwargs in slack.calls if method == "replies"
+                     and kwargs.get("oldest") == parent_ts and kwargs["latest"] == anchor_ts]
+    assert len(context_reads) == 1 and context_reads[0]["limit"] == 100
+    assert all(row["threadTs"] == parent_ts and row["anchorMessageTs"] == anchor_ts
+               for row in result["contextMessages"])
+
+
+def test_thread_context_uses_parent_and_closest_two_before_and_after_only():
+    root = human(1, "UOTHER", reply_count=7, latest_reply=stamp(8))
+    messages = [root, *[human(index, "UDD" if index == 5 else "UOTHER", thread_ts=stamp(1))
+                        for index in range(2, 9)]]
+    slack = Slack(history={("CONE", ""): page("messages", [root, human(9, "UOTHER", thread_ts=stamp(0))])},
+                  replies={("CONE", stamp(1), ""): page("messages", messages)})
+    result = collect(slack)
+    assert [row["messageTs"] for row in result["sources"]] == [stamp(5)]
+    context = result["contextMessages"]
+    assert {row["messageTs"] for row in context} == {stamp(index) for index in (1, 3, 4, 6, 7)}
+    assert len(context) == 5
+    assert sum(row["relation"] == "thread_parent" for row in context) == 1
+    assert all(row["threadTs"] == stamp(1) for row in context)
+
+
+def test_top_level_context_is_only_two_each_side_within_fifteen_minutes():
+    anchor = human(1000)
+    neighbors = [human(offset, "UOTHER") for offset in (99, 100, 101, 998, 999, 1001, 1002, 1899, 1900, 1901)]
+    other_thread = human(1003, "UOTHER", thread_ts=stamp(500))
+    slack = Slack(history={("CONE", ""): page("messages", [anchor, *neighbors, other_thread])})
+    result = collect(slack, before_ts=stamp(2000))
+    assert [row["messageTs"] for row in result["sources"]] == [stamp(1000)]
+    assert {row["messageTs"] for row in result["contextMessages"]} == {stamp(index) for index in (998, 999, 1001, 1002)}
+    assert all(row["relation"] == "channel_neighbor" and row["anchorMessageTs"] == stamp(1000)
+               for row in result["contextMessages"])
+
+
+@pytest.mark.parametrize("offset,expected", [(99, False), (100, True), (1900, True), (1901, False)])
+def test_channel_context_window_includes_only_exact_fifteen_minute_boundaries(offset, expected):
+    slack = Slack(history={("CONE", ""): page("messages", [human(1000), human(offset, "UOTHER")])})
+    result = collect(slack, before_ts=stamp(2000))
+    assert bool(result.get("contextMessages")) is expected
+
+
+@pytest.mark.parametrize("changes", [
+    {"user": "UDENIED"}, {"bot_id": "BBOT"}, {"bot_profile": {"id": "BBOT"}},
+    {"text": "password: never-return-context"}, {"text": "장비 로그 조회해줘"},
+    {"files": [{"id": "F1"}]}, {"attachments": [{"text": "not returned"}]},
+    {"team": "TOTHER"}, {"team_id": "TOTHER"}, {"edited": {"ts": stamp(1001)}},
+    {"is_truncated": True}, {"subtype": "message_changed"}, {"text": None},
+])
+def test_context_does_not_bypass_the_anchor_source_safety_and_membership_checks(changes):
+    parent = human(1, "UOTHER", reply_count=2, latest_reply=stamp(3))
+    neighbor = human(2, "UOTHER", thread_ts=stamp(1))
+    neighbor.update(changes)
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent, neighbor, human(3, thread_ts=stamp(1))])})
+    result = collect(slack)
+    assert [row["messageTs"] for row in result["sources"]] == [stamp(3)]
+    assert [row["messageTs"] for row in result.get("contextMessages", [])] == [stamp(1)]
+    assert "never-return-context" not in str(result)
+
+
+def test_future_context_is_never_linked_or_returned():
+    parent = human(1, "UOTHER", reply_count=2, latest_reply=stamp(1001))
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent, human(3, thread_ts=stamp(1)),
+                                                  human(1001, "UOTHER", thread_ts=stamp(1))])})
+    result = collect(slack)
+    assert [row["messageTs"] for row in result["sources"]] == [stamp(3)]
+    assert all(row["messageTs"] != stamp(1001) for row in result.get("contextMessages", []))
+    assert all(kwargs["message_ts"] != stamp(1001) for method, kwargs in slack.calls if method == "link")
+
+
+def test_missing_parent_is_read_by_bounded_exact_reply_request_without_new_anchor():
+    parent = human(1, "UOTHER")
+    anchor = human(3, thread_ts=stamp(1))
+    slack = Slack(history={("CONE", ""): page("messages", [anchor])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent])})
+    result = collect(slack)
+    assert [row["messageTs"] for row in result["sources"]] == [stamp(3)]
+    assert [(row["messageTs"], row["relation"]) for row in result["contextMessages"]] == [(stamp(1), "thread_parent")]
+    reads = [kwargs for method, kwargs in slack.calls if method == "replies"]
+    assert 1 <= len(reads) <= private_live_retrieval._MAX_CONTEXT_READS
+    assert reads[0]["oldest"] == reads[0]["latest"] == stamp(1)
+    assert reads[0]["limit"] == 1
+    assert all(row["ts"] == stamp(1) and Decimal(row["latest"]) <= Decimal(stamp(1000)) for row in reads)
+
+
+def test_discovery_deadline_leaves_reserved_time_for_missing_parent_and_links():
+    # 두 번째 history가 discovery 55% 경계를 넘겨도 context 예약 구간은 별도로 사용할 수 있다.
+    elapsed = [0.0]
+    class TimedSlack(Slack):
+        def take(self, method, kwargs, value):
+            elapsed[0] += .2 if method in {"list", "history"} else .05
+            return super().take(method, kwargs, value)
+    slack = TimedSlack(history={
+        ("CONE", ""): page("messages", [human(3, thread_ts=stamp(1))], "next"),
+        ("CONE", "next"): page("messages", []),
+    }, replies={("CONE", stamp(1), ""): page("messages", [human(1, "UOTHER")])})
+    result = collect(slack, clock=lambda: elapsed[0], budget_seconds=1)
+    assert result["coverage"] == "partial" and len(result["sources"]) == 1
+    assert result["contextMessages"][0]["messageTs"] == stamp(1)
+    assert elapsed[0] < 1
+    methods = [method for method, _ in slack.calls]
+    assert methods[:3] == ["list", "history", "history"] and methods[-2:] == ["link", "link"]
+    assert 1 <= methods.count("replies") <= private_live_retrieval._MAX_CONTEXT_READS
+
+
+def test_context_caps_preserve_eight_anchors_and_combined_twelve_message_budget():
+    parent = human(1, "UOTHER", reply_count=9, latest_reply=stamp(10))
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent, *[human(i, thread_ts=stamp(1)) for i in range(2, 11)]])})
+    result = collect(slack)
+    assert len(result["sources"]) == 8
+    assert len(result["sources"]) + len(result["contextMessages"]) == 12
+    assert all(sum(row["anchorMessageTs"] == anchor["messageTs"] for row in result["contextMessages"]) <= 5
+               for anchor in result["sources"])
+    assert len([method for method, _ in slack.calls if method == "link"]) <= 12
+
+
+def test_context_total_text_budget_and_bad_permalink_do_not_remove_safe_anchor():
+    parent = human(1, "UOTHER", text="가" * 3000, reply_count=1, latest_reply=stamp(3))
+    anchor = human(3, text="나" * 7000, thread_ts=stamp(1))
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent, anchor])})
+    result = collect(slack)
+    assert len(result["sources"]) == 1 and not result.get("contextMessages")
+    assert sum(len(row["text"]) for row in [*result["sources"], *result.get("contextMessages", [])]) <= 8000
+    parent["text"] = "제목 확인했어?"
+    slack.links[("CONE", stamp(1))] = {"ok": True, "permalink": "https://evil.example/context"}
+    result = collect(slack)
+    assert len(result["sources"]) == 1 and not result.get("contextMessages") and result["coverage"] == "partial"
+
+
+def test_failed_anchor_permalink_never_returns_orphan_context():
+    parent = human(1, "UOTHER", reply_count=1, latest_reply=stamp(3))
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent, human(3, thread_ts=stamp(1))])},
+        links={("CONE", stamp(3)): {"ok": False, "error": "not_found"}})
+    result = collect(slack)
+    assert result["sources"] == [] and not result.get("contextMessages")
+    assert [kwargs["message_ts"] for method, kwargs in slack.calls if method == "link"] == [stamp(3)]

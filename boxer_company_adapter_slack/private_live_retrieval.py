@@ -29,8 +29,13 @@ _MAX_HISTORY_PAGES = 2
 _MAX_REPLY_PAGES = 2
 _PAGE_SIZE = 100
 _MAX_SOURCES = 8
+_MAX_BUNDLE_MESSAGES = 12
+_MAX_CONTEXT_PER_ANCHOR = 5
+_MAX_CONTEXT_READS = 4
 _MAX_TEXT = 8_000
 _MAX_CANDIDATES = 64
+_MAX_OBSERVATIONS = 256
+_MAX_OBSERVATION_TEXT = 128_000
 _ALIASES = tuple(alias for aliases in TEAM_MEMBER_ALIASES_BY_NAME.values() for alias in aliases)
 _QUESTION_WORDS = frozenset({
     "최근", "최근에", "최근의", "요즘", "요새", "지난", "오늘", "어제", "이번", "대화", "기록",
@@ -73,16 +78,22 @@ class _Reader:
         self.period = period
         started = clock()
         self.deadline = started + budget
-        # 링크 확인 시간과 호출 여유를 남겨 원문만 모으고 반환하지 못하는 경우를 줄인다.
-        self.read_deadline = started + budget * .7
+        # 대상 탐색·빠진 부모 보완·링크 확인을 나눠 8초 안에서 근거 반환 여유를 남긴다.
+        self.read_deadline = started + budget * .55
+        self.context_deadline = started + budget * .7
         self.calls = 0
         self.partial = False
         self.read_halted = False
         self.channels_read: set[str] = set()
+        self.complete_channels: set[str] = set()
+        self.thread_windows: dict[tuple[str, str], tuple[str, str]] = {}
         self.candidates: dict[tuple[str, str], dict[str, Any]] = {}
+        self.observations: dict[tuple[str, str], dict[str, Any]] = {}
         self.seen: dict[tuple[str, str], tuple[str, str, str]] = {}
         self.conflicted: set[tuple[str, str]] = set()
+        self.rejected: set[tuple[str, str]] = set()
         self.memberships: dict[str, bool] = {}
+        self.permalinks: dict[tuple[str, str], str | None] = {}
 
     def call(self, method: str, *, read: bool = True, **kwargs: Any) -> Mapping[str, Any] | None:
         deadline = self.read_deadline if read else self.deadline
@@ -178,7 +189,15 @@ class _Reader:
             self.partial = True
         return channels
 
-    def message(self, channel: str, value: Any, *, thread: str | None = None) -> None:
+    def reject(self, key: tuple[str, str]) -> None:
+        # 나중에 관측한 안전하지 않은 형태가 앞서 읽은 동일 메시지를 되살리지 않게 한다.
+        self.partial = True
+        self.rejected.add(key)
+        self.candidates.pop(key, None)
+        self.observations.pop(key, None)
+
+    def message(self, channel: str, value: Any, *, thread: str | None = None,
+                anchor_candidate: bool = True) -> None:
         if not isinstance(value, Mapping):
             self.partial = True
             return
@@ -188,46 +207,63 @@ class _Reader:
             return
         if stamp > self.cutoff_value:
             return
-        if self.period is not None and not is_within_live_query_period(value["ts"], self.period):
-            return
         if self.clock() >= self.read_deadline:
             self.partial = True
             return
         message_ts = value["ts"]
+        key = (channel, message_ts)
         thread_ts = value.get("thread_ts") or thread or message_ts
         thread_value = _timestamp(thread_ts)
         if thread_value is None or thread_value > stamp or (thread and thread_ts != thread):
-            self.partial = True
+            self.reject(key)
             return
-        key = (channel, message_ts)
         text, author = value.get("text"), value.get("user")
         edited = _data(value.get("edited")).get("ts") or ""
         if not isinstance(text, str) or not isinstance(author, str) or not author:
-            self.partial = True
+            self.reject(key)
             return
         revision = source_revision(text, str(edited))
         identity = (author, revision, thread_ts)
         if key in self.seen and self.seen[key] != identity:
             self.conflicted.add(key)
-            self.candidates.pop(key, None)
-            self.partial = True
+            self.reject(key)
         self.seen[key] = identity
-        if key in self.conflicted:
+        if key in self.conflicted or key in self.rejected:
             return
         # 편집 뒤 원문을 과거 시점의 발언으로 제시하지 않고, 첨부/봇/민감 본문도 제외한다.
         if ((value.get("edited") and not edited)
                 or (edited and (_timestamp(edited) is None or Decimal(edited) > self.cutoff_value))):
-            self.partial = True
+            self.reject(key)
             return
         if (value.get("bot_id") or value.get("bot_profile")
                 or value.get("subtype") not in {None, "", "thread_broadcast"}
                 or value.get("files") or value.get("attachments")
                 or value.get("is_truncated") or value.get("truncated")
                 or any(value.get(field) and value[field] != self.tenant for field in ("team", "team_id"))):
-            self.partial = True
-            self.candidates.pop(key, None)
+            self.reject(key)
             return
-        if self.authors and author not in self.authors:
+        if author not in self.memberships:
+            try:
+                self.memberships[author] = bool(self.allowed(self.tenant, author))
+            except Exception:
+                self.memberships[author] = False
+        if (not self.memberships[author] or not 1 <= len(text) <= _MAX_TEXT
+                or not is_safe_memory_text(text) or not is_allowed_conversation_source(text)):
+            self.reject(key)
+            return
+        accepted = {
+            "channelId": channel, "channelKind": "private_channel", "threadTs": thread_ts,
+            "messageTs": message_ts, "revisionHash": revision, "authorId": author,
+            "text": text, "editedAt": edited,
+        }
+        # 대상을 고르기 전 같은 안전 경계로 주변 발언을 보존한다. 타인·전날 부모도 맥락이 될 수 있다.
+        self.observations[key] = accepted
+        while (len(self.observations) > _MAX_OBSERVATIONS
+               or sum(len(item["text"]) for item in self.observations.values()) > _MAX_OBSERVATION_TEXT):
+            oldest = min(self.observations, key=lambda item: Decimal(item[1]))
+            self.observations.pop(oldest)
+        if (not anchor_candidate or self.authors and author not in self.authors
+                or self.period is not None and not is_within_live_query_period(message_ts, self.period)):
             return
         if not self.authors and self.keywords:
             normalized = unicodedata.normalize("NFKC", text).casefold()
@@ -237,21 +273,7 @@ class _Reader:
                 for word in self.keywords
             ):
                 return
-        if author not in self.memberships:
-            try:
-                self.memberships[author] = bool(self.allowed(self.tenant, author))
-            except Exception:
-                self.memberships[author] = False
-        if (not self.memberships[author] or not 1 <= len(text) <= _MAX_TEXT
-                or not is_safe_memory_text(text) or not is_allowed_conversation_source(text)):
-            self.partial = True
-            self.candidates.pop(key, None)
-            return
-        self.candidates[key] = {
-            "channelId": channel, "channelKind": "private_channel", "threadTs": thread_ts,
-            "messageTs": message_ts, "revisionHash": revision, "authorId": author,
-            "text": text, "editedAt": edited,
-        }
+        self.candidates[key] = accepted
         if len(self.candidates) > _MAX_CANDIDATES:
             oldest = min(self.candidates, key=lambda item: Decimal(item[1]))
             self.candidates.pop(oldest)
@@ -321,9 +343,12 @@ class _Reader:
                     self.partial = True
                 else:
                     queues[channel].append((kind, thread, following, pages + 1, visited | {following}))
+            elif kind == "history":
+                self.complete_channels.add(channel)
             elif kind == "replies":
                 root = roots[(channel, thread)]
                 root["done"] = True
+                self.thread_windows[(channel, thread)] = (kwargs.get("oldest", thread), kwargs["latest"])
                 latest = _timestamp(root["latest"])
                 # root의 최신 댓글 또는 댓글 수를 확인하지 못하면 전체 원문이라고 말하지 않는다.
                 if self.period is not None:
@@ -358,8 +383,123 @@ class _Reader:
         if any(not root["done"] for root in roots.values()):
             self.partial = True
 
+    def collect_context(self, anchors: Sequence[Mapping[str, Any]]) -> None:
+        # 날짜 탐색에서 빠진 부모·인접 발언만 보완한다. 새 대상이나 다른 채널로 확대하지 않는다.
+        self.read_deadline = self.context_deadline
+        visited: set[tuple[str, str]] = set()
+        reads = 0
+
+        def read(channel: str, thread: str | None, *, oldest: str, latest: str, limit: int) -> bool:
+            nonlocal reads
+            if (reads >= _MAX_CONTEXT_READS or self.calls >= _MAX_READ_CALLS
+                    or self.calls + len(anchors) + 1 >= _MAX_CALLS
+                    or self.clock() >= self.context_deadline or self.read_halted):
+                return False
+            reads += 1
+            kwargs = {"channel": channel, "oldest": oldest, "latest": latest,
+                      "inclusive": True, "limit": limit}
+            if thread is not None:
+                kwargs["ts"] = thread
+            response = self.call("conversations_replies" if thread is not None else "conversations_history", **kwargs)
+            if response is None:
+                return True
+            messages, following = self.page(response, "messages", limit=limit)
+            if following:
+                self.partial = True
+            for message in messages:
+                # SDK가 요청한 창 밖 메시지를 돌려줘도 보완 조회의 범위를 다시 확인한다.
+                stamp = _timestamp(message.get("ts")) if isinstance(message, Mapping) else None
+                if stamp is not None and Decimal(oldest) <= stamp <= Decimal(latest):
+                    self.message(channel, message, thread=thread, anchor_candidate=False)
+            return True
+
+        # 예산이 적어도 여러 대상의 빠진 부모를 먼저 확인한다.
+        for anchor in anchors:
+            key = anchor["channelId"], anchor["threadTs"]
+            if (anchor["threadTs"] == anchor["messageTs"] or key in visited
+                    or key in self.observations or key in self.rejected):
+                continue
+            visited.add(key)
+            if not read(key[0], key[1], oldest=key[1], latest=key[1], limit=1):
+                break
+
+        for anchor in anchors:
+            channel, thread, message = anchor["channelId"], anchor["threadTs"], anchor["messageTs"]
+            stamp = Decimal(message)
+            if thread == message:
+                # history를 끝까지 읽지 못했거나 날짜 끝 밖 이웃이 있을 때만 15분 창을 보완한다.
+                range_end = min(self.cutoff_value, Decimal(self.period["endTs"])) if self.period else self.cutoff_value
+                if channel in self.complete_channels and not (range_end < self.cutoff_value and stamp + 900 > range_end):
+                    continue
+                if not read(channel, None, oldest=str(max(Decimal(0), stamp - 900)),
+                            latest=str(min(self.cutoff_value, stamp + 900)), limit=_PAGE_SIZE):
+                    break
+                continue
+            rows = [row for row in self.observations.values() if row["channelId"] == channel
+                    and row["threadTs"] == thread and row["messageTs"] not in {thread, message}]
+            window = self.thread_windows.get((channel, thread))
+            # 날짜 밖 앞 댓글은 target 필터에 넣지 않고 같은 thread의 문맥으로만 읽는다.
+            if sum(Decimal(row["messageTs"]) < stamp for row in rows) < 2 and (
+                    window is None or Decimal(window[0]) > Decimal(thread)):
+                if not read(channel, thread, oldest=thread, latest=message, limit=_PAGE_SIZE):
+                    break
+            if sum(Decimal(row["messageTs"]) > stamp for row in rows) < 2 and (
+                    window is None or Decimal(window[1]) < self.cutoff_value):
+                if not read(channel, thread, oldest=message, latest=self.cutoff, limit=3):
+                    break
+
+    def context_candidates(self, anchor: Mapping[str, Any]) -> list[dict[str, Any]]:
+        channel, message, thread = anchor["channelId"], anchor["messageTs"], anchor["threadTs"]
+        stamp = Decimal(message)
+        related: list[dict[str, Any]] = []
+        parent = self.observations.get((channel, thread)) if thread != message else None
+        if parent is not None:
+            related.append({**parent, "anchorMessageTs": message, "relation": "thread_parent"})
+        # 같은 thread 앞뒤를 먼저 붙인다. 다른 thread 발언은 reply 관계로 승격하지 않는다.
+        thread_rows = [row for row in self.observations.values()
+                       if row["channelId"] == channel and row["threadTs"] == thread
+                       and row["messageTs"] not in {message, thread}]
+        before = sorted((row for row in thread_rows if Decimal(row["messageTs"]) < stamp),
+                        key=lambda row: Decimal(row["messageTs"]), reverse=True)[:2]
+        after = sorted((row for row in thread_rows if Decimal(row["messageTs"]) > stamp),
+                       key=lambda row: Decimal(row["messageTs"]))[:2]
+        related.extend({**row, "anchorMessageTs": message, "relation": "thread_neighbor"}
+                       for row in [*before, *after])
+        if thread == message:
+            # top-level 인접 발언은 시간상 가까운 채널 문맥일 뿐 같은 대화라는 근거가 아니다.
+            channel_rows = [row for row in self.observations.values()
+                            if row["channelId"] == channel and row["threadTs"] == row["messageTs"]
+                            and row["messageTs"] != message and abs(Decimal(row["messageTs"]) - stamp) <= 900]
+            before = sorted((row for row in channel_rows if Decimal(row["messageTs"]) < stamp),
+                            key=lambda row: Decimal(row["messageTs"]), reverse=True)[:2]
+            after = sorted((row for row in channel_rows if Decimal(row["messageTs"]) > stamp),
+                           key=lambda row: Decimal(row["messageTs"]))[:2]
+            related.extend({**row, "anchorMessageTs": message, "relation": "channel_neighbor"}
+                           for row in [*before, *after])
+        return related[:_MAX_CONTEXT_PER_ANCHOR]
+
+    def with_permalink(self, item: Mapping[str, Any]) -> dict[str, Any] | None:
+        key = item["channelId"], item["messageTs"]
+        if key not in self.permalinks:
+            response = self.call("chat_getPermalink", read=False, channel=key[0], message_ts=key[1])
+            link = _safe_permalink(response.get("permalink"), key[0], key[1]) if response else None
+            try:
+                parsed = urlsplit(link) if link else None
+                pairs = parse_qsl(parsed.query, keep_blank_values=True) if parsed else []
+                params = dict(pairs)
+                valid = (parsed is not None and parsed.port in {None, 443} and len(params) == len(pairs)
+                         and set(params) <= {"thread_ts", "cid"}
+                         and params.get("thread_ts", item["threadTs"]) == item["threadTs"]
+                         and params.get("cid", key[0]) == key[0])
+            except ValueError:
+                valid = False
+            self.permalinks[key] = link if valid else None
+            if not valid:
+                self.partial = True
+        link = self.permalinks[key]
+        return {**item, "permalink": link} if link else None
+
     def result(self) -> dict[str, Any]:
-        sources: list[dict[str, Any]] = []
         selected: list[dict[str, Any]] = []
         chars = 0
         for item in sorted(self.candidates.values(), key=lambda value: Decimal(value["messageTs"]), reverse=True):
@@ -368,25 +508,36 @@ class _Reader:
                 continue
             selected.append(item)
             chars += len(item["text"])
+        self.collect_context(selected)
+        sources = []
         for item in selected:
-            response = self.call("chat_getPermalink", read=False, channel=item["channelId"], message_ts=item["messageTs"])
-            link = _safe_permalink(response.get("permalink"), item["channelId"], item["messageTs"]) if response else None
-            try:
-                parsed = urlsplit(link) if link else None
-                pairs = parse_qsl(parsed.query, keep_blank_values=True) if parsed else []
-                params = dict(pairs)
-                valid = (parsed is not None and parsed.port in {None, 443} and len(params) == len(pairs)
-                         and set(params) <= {"thread_ts", "cid"}
-                         and params.get("thread_ts", item["threadTs"]) == item["threadTs"]
-                         and params.get("cid", item["channelId"]) == item["channelId"])
-            except ValueError:
-                valid = False
-            if not valid:
-                self.partial = True
+            # 부모 보완 중 충돌·수정·안전 오류가 발견된 대상은 이미 선택됐어도 제외한다.
+            if self.candidates.get((item["channelId"], item["messageTs"])) != item:
                 continue
-            sources.append({**item, "permalink": link})
-        return {"sources": sources, "coverage": "partial" if self.partial else "complete",
-                "channelCount": len(self.channels_read)}
+            linked = self.with_permalink(item)
+            if linked is not None:
+                sources.append(linked)
+        # 링크를 확인한 대상에만 문맥을 연결하고 여러 대상의 부모를 round-robin으로 먼저 배분한다.
+        context_messages: list[dict[str, Any]] = []
+        queues = deque(deque(self.context_candidates(anchor)) for anchor in sources)
+        chars = sum(len(item["text"]) for item in sources)
+        while queues and len(sources) + len(context_messages) < _MAX_BUNDLE_MESSAGES:
+            items = queues.popleft()
+            if not items:
+                continue
+            item = items.popleft()
+            if chars + len(item["text"]) <= _MAX_TEXT:
+                linked = self.with_permalink(item)
+                if linked is not None:
+                    context_messages.append(linked)
+                    chars += len(item["text"])
+            if items:
+                queues.append(items)
+        result = {"sources": sources, "coverage": "partial" if self.partial else "complete",
+                  "channelCount": len(self.channels_read)}
+        if context_messages:
+            result["contextMessages"] = context_messages
+        return result
 
 
 def collect_private_live_sources(

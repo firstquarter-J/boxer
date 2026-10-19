@@ -73,21 +73,35 @@ class MemoryLiveSourceInput(MemoryInput):
     editedAt: str = Field(default="", max_length=64)
 
 
+class MemoryLiveContextInput(MemoryLiveSourceInput):
+    # 문맥은 독립 검색 결과가 아니라 같은 원채널의 특정 대상 발언에만 연결한다.
+    anchorMessageTs: SlackTs
+    relation: Literal["thread_parent", "thread_neighbor", "channel_neighbor"]
+
+
 class MemoryLiveResultInput(MemoryInput):
     tenantId: Identifier
     actorId: Identifier
     channelId: Identifier
     requestId: Identifier
     sources: list[MemoryLiveSourceInput] = Field(default_factory=list, max_length=8)
+    contextMessages: list[MemoryLiveContextInput] = Field(default_factory=list, max_length=12)
     coverage: Literal["complete", "partial", "unavailable"]
     channelCount: int = Field(default=0, ge=0, le=200)
 
     @model_validator(mode="after")
     def validate_budget(self) -> "MemoryLiveResultInput":
         # 원문은 한 turn의 짧은 검증 캐시에만 전달하고 과도한 payload는 받지 않는다.
-        if sum(len(source.text) for source in self.sources) > 8000:
+        rows = [*self.sources, *self.contextMessages]
+        if len(rows) > 12 or sum(len(source.text) for source in rows) > 8000:
             raise ValueError("live source budget exceeded")
-        if self.coverage == "unavailable" and self.sources:
+        counts: dict[tuple[str, str], int] = {}
+        for context in self.contextMessages:
+            key = context.channelId, context.anchorMessageTs
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] > 5:
+                raise ValueError("live context budget exceeded")
+        if self.coverage == "unavailable" and rows:
             raise ValueError("unavailable result cannot contain sources")
         return self
 

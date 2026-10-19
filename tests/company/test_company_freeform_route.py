@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock
+from dataclasses import replace
+from unittest.mock import Mock, patch
 
+from boxer_company import team_chat_context as tcc
 from boxer_company.assistant.contracts import CompanyAssistantRequest
+from boxer_company.assistant.freeform_prompt import (
+    build_company_freeform_system_prompt,
+    classify_company_freeform_response_mode,
+)
 from boxer_company.assistant.freeform_route import (
     CompanyFreeformAssistantRoute,
     match_company_freeform_route,
@@ -36,6 +42,82 @@ def _request(
 
 
 class CompanyFreeformAssistantRouteTests(unittest.TestCase):
+    def test_record_queries_take_priority_over_old_thread_fun(self) -> None:
+        # 현재 기록 조회를 과거의 농담·비교·조언 문장이 장난 모드로 바꾸지 못한다.
+        old_context = "DD vs 마루 누가 더 세? 완충재 드립으로 웃기게 놀려줘. 어떻게 할까?"
+        questions = (
+            "오늘 마루가 한 말 요약해줘", "디디 최근 발언", "이 스레드 대화 정리해줘",
+            "누가 뭐라고 했어?", "마루가 뭐랬어?", "마루가 오늘 한 농담 요약해줘",
+            "마루가 웃기게 말한 내용 요약해줘", "디디를 놀려준 발언 요약해줘",
+            "마루가 농담으로 말한 내용 요약해줘", "놀려줘 말고 오늘 발언을 요약해줘",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertEqual(classify_company_freeform_response_mode(question, old_context), "factual_recap")
+
+    def test_explicit_creative_request_keeps_playful_mode(self) -> None:
+        for question in ("오늘 마루가 한 말 요약해서 놀려줘", "디디 최근 발언을 드립으로 정리해줘",
+                         "오늘 마루 발언 웃기게 요약해줘", "농담으로 요약해줘"):
+            with self.subTest(question=question):
+                self.assertEqual(classify_company_freeform_response_mode(question, "누가 이겨?"), "playful")
+
+    def test_future_speech_advice_is_not_mistaken_for_past_utterance_query(self) -> None:
+        self.assertEqual(classify_company_freeform_response_mode("마루한테 무슨 말 하면 좋을까? 추천해줘"), "advice")
+
+    def test_record_summary_does_not_reuse_configured_character_prompts(self) -> None:
+        with patch("boxer_company.assistant.freeform_prompt.cs.FREEFORM_CORE_IDENTITY_PROMPT", "CORE_PERSONA_SECRET_SENTINEL"), \
+                patch("boxer_company.assistant.freeform_prompt.cs.FREEFORM_RESPONSE_RULES_PROMPT", "FUN_RULE_SECRET_SENTINEL"):
+            prompt = build_company_freeform_system_prompt("오늘 마루 발언 요약해줘", "누가 이겨? 농담으로 놀려줘")
+
+        assert prompt is not None
+        self.assertNotIn("PERSONA_SECRET_SENTINEL", prompt)
+        self.assertNotIn("FUN_RULE_SECRET_SENTINEL", prompt)
+        self.assertIn("주제·스레드별", prompt)
+        self.assertIn("확인한 발언 N건", prompt)
+        self.assertIn("주변 맥락의 작성자를 구별해", prompt)
+
+    def test_factual_route_keeps_real_messages_but_only_identity_in_system(self) -> None:
+        # 모델 출력 mock 대신 실제 route가 구성한 입력을 확인해 프로필 누출과 작성자 손실을 잡는다.
+        captured: dict[str, str | None] = {}
+        question = "오늘 마루가 한 말 요약해줘"
+        hyun = {**tcc._PROFILE_BY_NAME["Hyun"], "user_id": "UHYUN"}
+        maru = {**tcc._PROFILE_BY_NAME["Maru"], "user_id": "UMARU"}
+        contexts = (
+            {"kind": "message", "source": "slack", "author_id": "UHYUN", "text": "점심 메뉴는 마루가 골라주세요"},
+            {"kind": "message", "source": "slack", "author_id": "UMARU", "text": "제가 왜요"},
+        )
+
+        def answerer(question: str, context_text: str, system_prompt: str | None) -> str:
+            captured.update(question=question, context_text=context_text, system_prompt=system_prompt)
+            return "확인한 대화는 점심 메뉴를 고르는 이야기야."
+
+        with patch.object(tcc, "TEAM_MEMBER_PROFILES", (hyun, maru)), \
+                patch.dict(tcc._PROFILE_BY_NAME, {"Hyun": hyun, "Maru": maru}, clear=True), \
+                patch.dict(tcc._PROFILE_BY_USER_ID, {"uhyun": hyun, "umaru": maru}, clear=True):
+            result = CompanyFreeformAssistantRoute(answerer, provider_ready=lambda: True, context_max_chars=5_000,
+                                                  timeout_message="timeout").handle(
+                replace(_request(question), actor_id="UHYUN", context_entries=contexts))
+
+        assert result is not None
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("UHYUN", str(captured["context_text"]))
+        self.assertIn("UMARU", str(captured["context_text"]))
+        self.assertIn("점심 메뉴는 마루가 골라주세요", str(captured["context_text"]))
+        self.assertIn("제가 왜요", str(captured["context_text"]))
+        self.assertIn("Maru = UMARU", str(captured["system_prompt"]))
+        for unsupported in ("완충재", "MBTI", "fictional framing", "기본 사고 프레임", "화자 지침", "반응 지침"):
+            with self.subTest(unsupported=unsupported):
+                self.assertNotIn(unsupported, str(captured["system_prompt"]))
+
+    def test_answer_cleanup_preserves_conditions_on_character_or_log_interpretation(self) -> None:
+        # 조건절을 지워서 장난·일부 기록의 해석을 사람 자체에 대한 단정으로 바꾸지 않는다.
+        for answer in ("캐릭터 로그 기준으로 보면 DD가 우세해", "채팅 밈 기준으로 보면 마루가 이겼어", "오늘 로그 기준으로 보면 대화가 짧아"):
+            with self.subTest(answer=answer):
+                result = CompanyFreeformAssistantRoute(lambda *_args: answer, provider_ready=lambda: True,
+                                                      context_max_chars=5_000, timeout_message="timeout").handle(_request())
+                assert result is not None
+                self.assertEqual(result.messages[0].body, answer)
+
     def test_matches_only_explicit_freeform_group(self) -> None:
         self.assertEqual(match_company_freeform_route(_request()), "company_freeform")
         self.assertIsNone(

@@ -185,7 +185,8 @@ class MemoryService:
 
     def receive_live(self, *, retrieval_id: str, tenant_id: str, actor_id: str,
                      channel_id: str, request_id: str, sources: Sequence[dict[str, Any]],
-                     coverage: str, channel_count: int) -> dict[str, Any]:
+                     coverage: str, channel_count: int,
+                     context_messages: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
         from boxer_company.memory.live import normalize_live_sources
 
         # 원문을 DB나 작업 큐에 쓰지 않고 원 요청의 짧은 1회용 캐시에만 보관한다.
@@ -204,26 +205,30 @@ class MemoryService:
             # 원채널 조회가 다른 채널까지 확인한 결과처럼 표시되지 않게 범위 수치도 제한한다.
             if not is_private_memory_hub(tenant_id, channel_id) and channel_count > 1:
                 raise MemoryError("memory_live_channel_count_invalid")
-            if coverage == "unavailable" and sources:
+            if coverage == "unavailable" and (sources or context_messages):
                 raise MemoryError("memory_live_result_invalid")
-            fingerprint = canonical_digest([sources, coverage, channel_count])
+            fingerprint = canonical_digest([sources, list(context_messages), coverage, channel_count])
             if prepared.live_fingerprint is not None and prepared.live_fingerprint != fingerprint:
                 raise MemoryError("memory_live_result_conflict")
             if prepared.live_fingerprint is None:
                 entries = normalize_live_sources(sources, tenant_id=tenant_id,
                     destination_channel_id=channel_id, before_ts=plan["beforeTs"],
                     author_ids=plan["authorIds"], question=plan["question"],
-                    destination_channel_kind=prepared.live_destination_channel_kind)
+                    destination_channel_kind=prepared.live_destination_channel_kind,
+                    context_messages=context_messages)
                 if channel_count < len({source["channelId"] for item in entries for source in item["sources"]}):
                     raise MemoryError("memory_live_channel_count_invalid")
                 self._prune_live_sources(self._clock())
                 entries = tuple(item for item in entries if all(
                     self._live_source_current(tenant_id, source) for source in item["sources"]))
                 # 안전필터·수정/삭제 표식 때문에 누락된 결과를 완전한 원문 조사라고 표시하지 않는다.
-                supplied_count = len({(source["channelId"], source["messageTs"], source["revisionHash"]) for source in sources})
+                supplied_count = len({(source["channelId"], source["messageTs"], source["revisionHash"])
+                    for source in [*sources, *context_messages]})
+                accepted_count = len({(source["channelId"], source["messageTs"], source["revisionHash"])
+                    for item in entries for source in item["sources"]})
                 prepared.live_entries = entries
                 prepared.live_fingerprint = fingerprint
-                prepared.live_coverage = "partial" if coverage == "complete" and len(entries) < supplied_count else coverage
+                prepared.live_coverage = "partial" if coverage == "complete" and accepted_count < supplied_count else coverage
                 prepared.live_channel_count = channel_count
                 prepared.live_received_at = self._clock()
             return {"retrievalId": retrieval_id, "acceptedSourceCount": len(prepared.live_entries)}

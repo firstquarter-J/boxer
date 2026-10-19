@@ -17,13 +17,14 @@ from boxer_company.assistant.contracts import (
 )
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
+    classify_company_freeform_response_mode,
 )
 from boxer_company.assistant.request_reference import build_request_reference_context
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
 )
-from boxer_company.team_chat_context import build_team_freeform_context
+from boxer_company.team_chat_context import build_team_freeform_context, build_team_identity_context
 from boxer_company.memory.presentation import MEMORY_GUIDANCE, extract_memory_citations, render_memory
 
 
@@ -41,22 +42,7 @@ _META_LINE_PATTERNS = (
     ),
 )
 _META_PREFIX_REWRITES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(
-            r"^\s*(?:캐릭터|대화|채팅)\s*로그\s*기준(?:으로)?\s*"
-            r"(?:해석하면|보면)\s*[,:\-]?\s*",
-            re.IGNORECASE,
-        ),
-        "",
-    ),
-    (
-        re.compile(
-            r"^\s*(?:채팅\s*밈|오늘\s*로그|캐릭터상(?:으로)?)\s*기준(?:으로)?\s*"
-            r"(?:해석하면|보면)\s*[,:\-]?\s*",
-            re.IGNORECASE,
-        ),
-        "",
-    ),
+    # 로그·밈에 한정된 해석이라는 조건을 지우면 사실 단정으로 바뀌므로 보존한다.
     (
         re.compile(r"\bfictional framing\b", re.IGNORECASE),
         "밈 프레임",
@@ -171,7 +157,10 @@ class CompanyFreeformAssistantRoute:
             request.question,
             context_text,
         )
-        team_context = build_team_freeform_context(
+        factual_recap = classify_company_freeform_response_mode(request.question, context_text) == "factual_recap"
+        # 사실 조회에는 화자·대상 캐릭터 지침 대신 검증된 이름 연결만 전달한다.
+        team_context_builder = build_team_identity_context if factual_recap else build_team_freeform_context
+        team_context = team_context_builder(
             request.question,
             context_text,
             speaker_user_id=str(request.actor_id or ""),
@@ -311,7 +300,7 @@ class CompanyFreeformAssistantRoute:
 
 
 def _sanitize_freeform_answer(text: str) -> str:
-    """내부 persona 메타 문구가 사용자 응답에 노출되지 않게 정리한다."""
+    """내부 표제는 정리하되 해석의 범위를 한정하는 조건은 보존한다."""
 
     normalized = str(text or "").strip()
     if not normalized:

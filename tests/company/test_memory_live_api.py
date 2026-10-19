@@ -90,6 +90,15 @@ def source(**changes):
     return value
 
 
+def context_source(**changes):
+    text = "그 문구는 실제 불만이 아니라 예시로 든 농담이야"
+    value = source(messageTs=ROOT, text=text, revisionHash=source_revision(text), authorId="UB",
+        permalink=f"https://unit.slack.com/archives/{ORIGIN}/p{ROOT.replace('.', '')}")
+    value.update(anchorMessageTs=SPOKEN, relation="thread_parent")
+    value.update(changes)
+    return value
+
+
 def upload_body(**changes):
     return {"tenantId": TENANT, "actorId": ACTOR, "channelId": HUB,
             "requestId": REQUEST_ID, "sources": [source()], "coverage": "partial",
@@ -137,6 +146,7 @@ def receive(memory, retrieval_id, body=None):
         retrieval_id=retrieval_id, tenant_id=body["tenantId"], actor_id=body["actorId"],
         channel_id=body["channelId"], request_id=body["requestId"], sources=body["sources"],
         coverage=body["coverage"], channel_count=body["channelCount"],
+        context_messages=body.get("contextMessages", []),
     )
 
 
@@ -286,7 +296,7 @@ def test_http_live_sources_reach_model_with_verified_citations_but_without_origi
                       "sourceCount": 1, "scope": "accessible_private_channels"}
     rendered, selected = render_memory(value.memory_entries)
     rows = json.loads(rendered.split(":\n", 1)[1])
-    assert rows[0] == notice
+    assert rows[0] == {**notice, "renderedSourceCount": 1, "omittedSourceCount": 0}
     assert rows[1]["authors"] == [DD]
     assert rows[1]["sourceTimes"] == [{"authorId": DD, "authorName": "DD",
                                      "spokenAtKst": "2026-10-16T06:33:21.000001+09:00"}]
@@ -785,3 +795,108 @@ def test_http_live_channel_count_cannot_be_less_than_distinct_result_origins(run
         result = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(), json=upload_body(
             sources=sources, coverage="complete", channelCount=reported_count))
     assert result.status_code == 409 and result.json()["code"] == "request_id_conflict"
+
+
+@pytest.mark.parametrize("destination", [HUB, ORIGIN])
+def test_http_context_upload_preserves_anchor_count_and_other_author_attribution(runtime, destination):
+    # 실제 HTTP schema부터 묶음까지 연결하며 부모 발언을 대상 작성자의 발언으로 세지 않는다.
+    value = request(channel_id=destination)
+    with client(runtime.memory) as http:
+        prepared = http.post(BASE, headers=headers(), json=retrieval_body(memoryContext=dict(value.memory_context)))
+        retrieval_id = prepared.json()["retrievalId"]
+        uploaded = http.post(f"{BASE}/{retrieval_id}/live", headers=headers(), json=upload_body(
+            channelId=destination, channelCount=1, contextMessages=[context_source()]))
+        assert uploaded.status_code == 200 and uploaded.json()["acceptedSourceCount"] == 1
+    bound = runtime.memory.bind_verified(bound_request(value, retrieval_id))
+    item, notice = bound.memory_entries
+    assert notice["sourceCount"] == 1 and item["subjectUserId"] == DD
+    assert item["contextCoverage"] == "partial"
+    assert item["contextMessages"][0]["authorId"] == "UB"
+    assert item["sources"][0]["authorId"] == DD and item["sources"][0]["relation"] == "supports"
+    assert item["sources"][1]["authorId"] == "UB" and item["sources"][1]["relation"] == "context"
+    assert [kind for kind, _ in runtime.store.reads] == ["candidates", "verified"]
+
+
+@pytest.mark.parametrize("change", [
+    {"anchorMessageTs": CUTOFF}, {"channelId": "C_OTHER"}, {"threadTs": "1792099999.000001"},
+    {"relation": "thread_parent", "messageTs": SPOKEN},
+    {"revisionHash": "0" * 64}, {"permalink": "https://invalid.example/context"},
+    {"editedAt": AFTER},
+])
+def test_http_context_semantics_reject_orphan_cross_scope_and_invalid_sources(runtime, change):
+    prepared = runtime.memory.prepare(request())
+    with client(runtime.memory) as http:
+        result = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(),
+            json=upload_body(contextMessages=[context_source(**change)]))
+    assert result.status_code == 409
+    assert context_source()["text"] not in result.text
+
+
+@pytest.mark.parametrize("invalid", ["missing_anchor", "bad_relation", "extra_field", "six_for_anchor", "total_count", "total_chars"])
+def test_http_context_schema_enforces_link_shape_and_combined_budget(runtime, invalid):
+    body = upload_body(contextMessages=[context_source()])
+    row = body["contextMessages"][0]
+    if invalid == "missing_anchor":
+        del row["anchorMessageTs"]
+    elif invalid == "bad_relation":
+        row["relation"] = "claims_same_conversation"
+    elif invalid == "extra_field":
+        row["authorName"] = "DD"
+    elif invalid == "six_for_anchor":
+        body["contextMessages"] = [deepcopy(row) for _ in range(6)]
+    elif invalid == "total_count":
+        body["sources"] = [source() for _ in range(8)]
+        body["contextMessages"] = [deepcopy(row) for _ in range(5)]
+    elif invalid == "total_chars":
+        body["sources"] = [source(text="가" * 4000)]
+        row["text"] = "나" * 4001
+    prepared = runtime.memory.prepare(request())
+    with client(runtime.memory) as http:
+        result = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(), json=body)
+    assert result.status_code == 422 and result.headers["content-type"] == "application/problem+json"
+
+
+def test_context_retry_fingerprint_includes_context_body_and_does_not_replace_original(runtime):
+    prepared = runtime.memory.prepare(request())
+    body = upload_body(contextMessages=[context_source()])
+    receive(runtime.memory, prepared["retrievalId"], body)
+    assert receive(runtime.memory, prepared["retrievalId"], body)["acceptedSourceCount"] == 1
+    changed = context_source(text="그건 실제 결정이야", revisionHash=source_revision("그건 실제 결정이야"))
+    with pytest.raises(MemoryError, match="memory_live_result_conflict"):
+        receive(runtime.memory, prepared["retrievalId"], upload_body(contextMessages=[changed]))
+    bound = runtime.memory.bind_verified(bound_request(request(), prepared["retrievalId"]))
+    assert bound.memory_entries[0]["contextMessages"][0]["text"] == context_source()["text"]
+
+
+@pytest.mark.parametrize("destination", [HUB, ORIGIN])
+@pytest.mark.parametrize("event_type", ["deleted", "unavailable", "changed"])
+@pytest.mark.parametrize("stage", ["before_upload", "after_upload"])
+def test_context_invalidation_removes_entire_anchor_bundle_before_model_binding(runtime, destination, event_type, stage):
+    # 부모/주변 댓글이 사라진 뒤 대상 한 줄만 남겨 이전 해석을 계속하게 하지 않는다.
+    value = request(channel_id=destination)
+    prepared = runtime.memory.prepare(value)
+    body = upload_body(channelId=destination, channelCount=1,
+        contextMessages=[context_source()], coverage="complete")
+    def invalidate():
+        runtime.memory.invalidate_live_source(tenant_id=TENANT, channel_id=ORIGIN,
+            message_ts=ROOT, event_type=event_type, revision_hash="0" * 64 if event_type == "changed" else None)
+    if stage == "before_upload":
+        invalidate()
+    receive(runtime.memory, prepared["retrievalId"], body)
+    if stage == "after_upload":
+        invalidate()
+    bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
+    assert_no_source_evidence(bound, coverage="partial")
+    assert context_source()["text"] not in render_memory(bound.memory_entries)[0]
+
+
+def test_filtered_sensitive_context_downgrades_coverage_without_removing_safe_anchor(runtime):
+    secret = "api_key=never-render-context"
+    prepared = runtime.memory.prepare(request())
+    receive(runtime.memory, prepared["retrievalId"], upload_body(channelCount=1, coverage="complete",
+        contextMessages=[context_source(text=secret, revisionHash=source_revision(secret))]))
+    bound = runtime.memory.bind_verified(bound_request(request(), prepared["retrievalId"]))
+    item, notice = bound.memory_entries
+    assert item["contextCoverage"] == "unavailable" and item["contextMessages"] == []
+    assert notice["coverage"] == "partial" and notice["sourceCount"] == 1
+    assert secret not in render_memory(bound.memory_entries)[0]

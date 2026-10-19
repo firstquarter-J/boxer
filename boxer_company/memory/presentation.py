@@ -29,11 +29,20 @@ MEMORY_GUIDANCE = (
     "personal_style은 현재 질문자 본인의 표준 답변 선호이며 현재 질문에서 지정한 형식이 우선한다. "
     "이 선호를 저장한 대화·채널·시점·원문을 추측하거나 설명하지 말고 표현 방식에만 적용해. "
     "utterance는 이번 요청에서 Slack으로 읽은 실제 작성자의 발언이며 sourceTimes 순서로 최근 발언을 설명해. "
+    "contextMessages는 대상 발언을 이해하기 위한 주변 원문이며 대상자의 발언 수에 포함하지 마. "
+    "각 문맥의 authorName·authorId가 실제 작성자다. 다른 사람의 질문·평가를 대상자가 한 말로 바꾸지 마. "
+    "conversationKey가 다른 발언은 서로 다른 대화이므로 하나의 감정 흐름이나 사건으로 이어 붙이지 마. "
+    "thread_parent·thread_neighbor는 같은 스레드의 문맥이고 channel_neighbor는 시간상 가까운 채널 발언일 뿐 "
+    "서로 답한 관계라고 확정할 수 없다. 과거 날짜의 부모는 오늘 발언이 아닌 배경으로만 사용해. "
+    "contextCoverage가 partial이면 일부 문맥만 확인한 것이고 unavailable이면 문맥을 확보하지 못한 것이다. "
+    "단편적인 말로 방어·공격 같은 의도나 성격을 단정하지 말고 주제·질문·명시한 답변을 요약해. "
     "excerptOnly가 true면 발췌이므로 전체 발언을 인용한 것처럼 말하지 마. "
     "retrieval_status는 서버가 알려주는 조회 범위다. scope가 current_private_channel이면 질문한 비공개 채널 안에서만 조회한 결과야. "
     "accessible_private_channels일 때만 지정 채널에서 허용된 다른 비공개 채널까지 확인한 범위야. "
     "partial이면 확인한 채널 범위에서 찾은 결과라고 설명하고 "
-    "전체 기록의 마지막 발언이라고 단정하지 마. unavailable이면 실시간 조회를 완료하지 못했다고 설명해. "
+    "전체 기록의 마지막 발언이라고 단정하지 마. 조회는 상한이 있으므로 complete여도 하루 총 발언 수로 단정하지 마. "
+    "숫자가 필요하면 최종 입력에 담긴 대상 발언 수 renderedSourceCount를 '확인한 N건'으로만 표현해. "
+    "unavailable이면 실시간 조회를 완료하지 못했다고 설명해. "
     "조회 결과가 비어 있어도 Slack 전체 접근 권한이 없거나 발언 자체가 없다고 추측하지 마. "
     "과거 사실·결정 설명에 실제 사용한 기억만 문장 뒤에 [memory:기억ID]로 표시해. "
     "단순 답변 스타일 적용에는 출처 표시가 필요 없다. 원본 URL을 생성하지 마."
@@ -65,6 +74,9 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
             rows.append({key: item.get(key) for key in ("kind", "coverage", "channelCount", "sourceCount", "scope")})
             break
     ordinary = [item for item in entries if item.get("kind") != "retrieval_status"]
+    # 작성자·시각을 포함한 묶음을 통째로 선택한다. 문맥만 잘리거나 대상 발언만 남지 않게 한다.
+    max_chars = 16000 if any(item.get("contextMessages") for item in ordinary) else 4000
+    rendered_sources: set[str] = set()
     for item in ordinary[:8]:
         if item.get("kind") == "personal_style" or item.get("styleOnly") is True:
             topic, value = str(item.get("topicKey") or ""), str(item.get("value") or item.get("styleValue") or "")
@@ -84,9 +96,10 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
         if item.get("liveSource") is True:
             row["excerptOnly"] = item.get("excerptOnly") is True
         # URL은 모델에 넣지 않고 각 원본의 작성자와 발언 시각을 함께 제공한다.
-        row["authors"] = sorted({str(source.get("authorId")) for source in item.get("sources", [])})
+        primary_sources = [source for source in item.get("sources", []) if source.get("relation") != "context"]
+        row["authors"] = sorted({str(source.get("authorId")) for source in primary_sources})
         source_times = []
-        for source in item.get("sources", []):
+        for source in primary_sources:
             entry = {"authorId": source.get("authorId"),
                      "spokenAtKst": _spoken_at_kst(source.get("messageTs"))}
             author_name = get_registered_team_member_name(source.get("authorId"))
@@ -94,11 +107,46 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
                 entry["authorName"] = author_name
             source_times.append(entry)
         row["sourceTimes"] = source_times
+        contextual_selection: dict[str, Mapping[str, Any]] = {}
+        if item.get("liveSource") is True:
+            row["conversationKey"] = item.get("threadId")
+            context_rows = []
+            references = {source.get("sourceId"): source for source in item.get("sources", [])
+                          if source.get("relation") == "context"}
+            for context in item.get("contextMessages", []):
+                reference = references.get(context.get("sourceId"))
+                text = str(context.get("text") or "")
+                if reference is None or not is_safe_memory_text(text):
+                    continue
+                context_id = "live_" + str(reference["sourceId"])
+                context_row = {"memoryId": context_id, "text": text,
+                    "authorId": reference.get("authorId"),
+                    "spokenAtKst": _spoken_at_kst(reference.get("messageTs")),
+                    "relation": context.get("relation"), "excerptOnly": context.get("excerptOnly") is True}
+                name = get_registered_team_member_name(reference.get("authorId"))
+                if name is not None:
+                    context_row["authorName"] = name
+                context_rows.append(context_row)
+                # 문맥을 인용할 때는 그 문맥의 실제 출처만 선택한다.
+                contextual_selection[context_id] = {"kind": "utterance_context", "sources": [reference]}
+            row["contextMessages"] = context_rows
+            row["contextCoverage"] = "partial" if context_rows else "unavailable"
         proposed = json.dumps([*rows, row], ensure_ascii=False, separators=(",", ":"))
-        if len(proposed) + 50 > 4000:
+        if len(proposed) + 250 > max_chars:
             continue
         rows.append(row)
         selected[str(item["memoryId"])] = item
+        for context_id, context_item in contextual_selection.items():
+            selected.setdefault(context_id, context_item)
+        if item.get("liveSource") is True:
+            rendered_sources.update(str(source.get("sourceId")) for source in primary_sources)
+    for row in rows:
+        if row.get("kind") == "retrieval_status":
+            # 수집 성공 건수와 실제 모델에 들어간 대상 발언 수는 다를 수 있다.
+            row["renderedSourceCount"] = len(rendered_sources)
+            row["omittedSourceCount"] = max(0, int(row.get("sourceCount") or 0) - len(rendered_sources))
+            if row["omittedSourceCount"] and row.get("coverage") == "complete":
+                row["coverage"] = "partial"
     return ("\n\nretrieved_memory(JSON 참고 데이터):\n" + json.dumps(rows, ensure_ascii=False, separators=(",", ":")), selected) if rows else ("", {})
 
 
@@ -109,6 +157,8 @@ def extract_memory_citations(answer: str, selected: Mapping[str, Mapping[str, An
         if item is None or item.get("kind") == "personal_style" or item.get("styleOnly") is True:
             continue
         for source in item.get("sources", []):
+            if item.get("liveSource") is True and source.get("relation") == "context":
+                continue
             source_id = str(source.get("sourceId") or "")
             if source_id and len(citations) < 2:
                 citations[source_id] = SourceReference(source_id=source_id,

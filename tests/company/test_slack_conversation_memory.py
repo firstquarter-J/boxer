@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import logging
 import unittest
+from unittest.mock import patch
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.memory.contracts import MAX_CHUNK_CHARS, canonical_digest, source_revision
@@ -90,6 +91,50 @@ def bridge(slack=None):
     memory.client = slack
     memory.bot_user_id = "UBOT"
     return memory
+
+
+class SlackLiveContextTransportTests(unittest.TestCase):
+    def prepare(self, live):
+        memory = bridge(object())
+        context = {"workspaceId": "T1", "actorId": "UA", "channelId": "C1",
+                   "threadTs": ROOT, "currentMessageTs": NOW,
+                   "channelKind": "private_channel", "triggerKind": "app_mention"}
+        value = replace(request(), question="오늘 UB가 한 말 요약", memory_context=context)
+        memory.api.retrieval["liveQuery"] = {"tenantId": "T1", "actorId": "UA", "channelId": "C1",
+            "requestId": value.request_id, "question": value.question, "beforeTs": NOW, "authorIds": ["UB"]}
+        with patch("boxer_company_adapter_slack.private_live_retrieval.collect_private_live_sources", return_value=live) as collect:
+            prepared = memory.prepare(value)
+        return memory, prepared, collect
+
+    def test_context_rows_follow_the_same_bound_live_upload_without_capture(self):
+        # 타인 부모의 원문도 별도 저장 경로 없이 원 요청의 live lease로만 전달한다.
+        anchor = {"channelId": "C1", "channelKind": "private_channel", "threadTs": ROOT,
+                  "messageTs": NOW, "authorId": "UB", "text": "첫 번째로 하자",
+                  "revisionHash": source_revision("첫 번째로 하자"), "editedAt": "",
+                  "permalink": "https://unit.slack.com/archives/C1/p" + NOW.replace(".", "")}
+        context = {**anchor, "messageTs": ROOT, "authorId": "UA", "text": "제목을 고를까?",
+                   "revisionHash": source_revision("제목을 고를까?"), "anchorMessageTs": NOW,
+                   "relation": "thread_parent",
+                   "permalink": "https://unit.slack.com/archives/C1/p" + ROOT.replace(".", "")}
+        memory, prepared, collect = self.prepare({"sources": [anchor], "contextMessages": [context],
+            "coverage": "partial", "channelCount": 1})
+        self.assertEqual(prepared.memory_context["retrievalId"], "retrieval1")
+        self.assertEqual(collect.call_args.kwargs["destination_channel_id"], "C1")
+        self.assertEqual(collect.call_args.kwargs["destination_channel_kind"], "private_channel")
+        uploads = [(path, body) for path, body in memory.api.calls if path.endswith("/live")]
+        self.assertEqual(len(uploads), 1)
+        path, body = uploads[0]
+        self.assertTrue(path.endswith("/retrievals/retrieval1/live"))
+        self.assertEqual(body["sources"], [anchor])
+        self.assertEqual(body["contextMessages"], [context])
+        self.assertEqual((body["tenantId"], body["actorId"], body["channelId"], body["requestId"]),
+                         ("T1", "UA", "C1", "request1"))
+        self.assertFalse(any(path.endswith("/captures") or path.endswith("/chunks") for path, _ in memory.api.calls))
+
+    def test_legacy_collector_without_context_rows_keeps_the_original_http_shape(self):
+        memory, _, _ = self.prepare({"sources": [], "coverage": "complete", "channelCount": 1})
+        body = next(body for path, body in memory.api.calls if path.endswith("/live"))
+        self.assertNotIn("contextMessages", body)
 
 
 class SlackConversationMemoryTests(unittest.TestCase):

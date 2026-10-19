@@ -643,3 +643,28 @@ def build_team_freeform_context(
             )
 
     return "\n".join(lines)
+
+
+def build_team_identity_context(
+    *texts: str,
+    speaker_user_id: str = "",
+) -> str:
+    """사실 요약에는 등록된 이름 연결만 주고 정적 인물 평가는 제외한다."""
+    speaker_name, related_names = _collect_profile_names(
+        *texts,
+        speaker_user_id=speaker_user_id,
+        limit=len(TEAM_MEMBER_PROFILES),
+    )
+    identities = [
+        _format_registered_identity(_PROFILE_BY_NAME.get(name) or {})
+        for name in (speaker_name, *related_names)
+        if name
+    ]
+    identities = [identity for identity in identities if identity]
+    if not identities:
+        return ""
+    return "\n".join((
+        "등록된 이름 연결:",
+        f"- {TEAM_CHAT_IDENTITY_GUIDE}",
+        *(f"- {identity}" for identity in identities),
+    ))

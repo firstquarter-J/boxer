@@ -85,6 +85,7 @@ def create_memory_router(*, service: MemoryService, caller_registry: CallerRegis
         return invoke(request_id, service.receive_live, retrieval_id=retrieval_id,
                       tenant_id=body.tenantId, actor_id=body.actorId, channel_id=body.channelId,
                       request_id=body.requestId, sources=[source.model_dump() for source in body.sources],
+                      context_messages=[source.model_dump() for source in body.contextMessages],
                       coverage=body.coverage, channel_count=body.channelCount)
 
     @router.post("/captures/pull")

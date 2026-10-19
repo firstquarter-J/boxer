@@ -34,6 +34,12 @@ def normalize(sources, **overrides):
     })
 
 
+def context(anchor, text="그 문구는 예시로 든 농담이야", *, message=None, relation="thread_parent", **overrides):
+    # 대상이 아닌 작성자의 발언을 원문의 실제 스레드와 anchor에 연결한다.
+    return source(text, channel=anchor["channelId"], author="UOTHER", thread=anchor["threadTs"],
+        message=message or anchor["threadTs"], anchorMessageTs=anchor["messageTs"], relation=relation, **overrides)
+
+
 def test_live_source_becomes_citable_temporary_item_without_trusting_source_id():
     original = source(sourceId="forged", tenantId=TENANT)
     before = deepcopy(original)
@@ -295,3 +301,103 @@ def test_period_filter_does_not_bypass_existing_future_source_and_revision_check
     with pytest.raises(MemoryError, match="source_revision_mismatch"):
         normalize([source(message="1792249200.000000", thread="1792200000.000001", revisionHash="0" * 64)],
                   question="오늘 한 말은?", before_ts="1792350000.000001")
+
+
+def test_context_preserves_other_author_and_previous_day_parent_without_weakening_anchor_period():
+    # 오늘 발언만 대상이지만 그 발언의 전날 부모는 다른 작성자의 문맥으로 별도 보존한다.
+    anchor = source(message="1792350000.000001", thread="1792249200.000001")
+    parent = context(anchor, sourceId="forged-context-source-id")
+    (item,) = normalize([anchor], context_messages=[parent, parent],
+        question="디디가 오늘 한 말 요약", before_ts="1792350000.000001")
+    assert item["subjectUserId"] == "UDD" and item["sources"][0]["relation"] == "supports"
+    assert item["sources"][0]["authorId"] == "UDD"
+    assert item["contextCoverage"] == "partial" and len(item["contextMessages"]) == 1
+    row = item["contextMessages"][0]
+    assert row["authorId"] == "UOTHER" and row["messageTs"] == "1792249200.000001"
+    assert row["relation"] == "thread_parent" and row["sourceId"] != "forged-context-source-id"
+    assert item["sources"][1]["sourceId"] == row["sourceId"]
+    assert item["sources"][1]["relation"] == "context" and item["sources"][1]["authorId"] == "UOTHER"
+
+
+@pytest.mark.parametrize("relation,message,thread", [
+    ("thread_neighbor", "1800000007.000001", "1800000000.000001"),
+    ("channel_neighbor", "1800000905.000001", "1800000905.000001"),
+    ("channel_neighbor", "1799999105.000001", "1799999105.000001"),
+])
+def test_valid_thread_or_nearby_channel_context_keeps_its_actual_thread(relation, message, thread):
+    anchor = source(message="1800000005.000001")
+    row = context(anchor, message=message, relation=relation, threadTs=thread)
+    (item,) = normalize([anchor], context_messages=[row], before_ts="1800001000.000001")
+    assert item["contextMessages"][0]["threadTs"] == thread
+    assert item["contextMessages"][0]["relation"] == relation
+
+
+@pytest.mark.parametrize("change", [
+    {"anchorMessageTs": "1800000006.000001"}, {"channelId": "COTHER"},
+    {"tenantId": "OTHER"}, {"channelKind": "channel"},
+    {"relation": "thread_parent", "messageTs": "1800000001.000001"},
+    {"relation": "thread_neighbor", "threadTs": "1799999999.000001"},
+    {"relation": "channel_neighbor", "messageTs": "1800000905.000002", "threadTs": "1800000905.000002"},
+    {"relation": "made_up"}, {"relation": []}, {"anchorMessageTs": None},
+])
+def test_orphan_cross_channel_and_invalid_context_relation_fail_closed(change):
+    anchor = source(message="1800000005.000001")
+    row = context(anchor)
+    row.update(change)
+    with pytest.raises(MemoryError):
+        normalize([anchor], context_messages=[row], before_ts="1800001000.000001")
+
+
+@pytest.mark.parametrize("changes,error", [
+    ({"messageTs": "1800000010.000002", "threadTs": "1800000010.000002", "relation": "channel_neighbor"},
+     "source_after_capture_cutoff"),
+    ({"editedAt": "1800000010.000002"}, "source_edited_after_capture_cutoff"),
+    ({"revisionHash": "0" * 64}, "source_revision_mismatch"),
+    ({"permalink": "https://invalid.example/source"}, "source_permalink_invalid"),
+])
+def test_context_date_author_exception_keeps_cutoff_edit_revision_and_permalink_checks(changes, error):
+    anchor = source(message="1800000005.000001")
+    row = context(anchor)
+    row.update(changes)
+    # 새 timestamp의 링크는 맞춰 다른 검증보다 실제 cutoff 검사를 확인한다.
+    if "messageTs" in changes:
+        row["permalink"] = f"https://team.slack.com/archives/CPRIVATE/p{row['messageTs'].replace('.', '')}"
+    with pytest.raises(MemoryError, match=error):
+        normalize([anchor], context_messages=[row])
+
+
+def test_sensitive_context_is_skipped_and_no_context_is_reported_as_unavailable():
+    anchor = source(message="1800000005.000001")
+    unsafe = context(anchor, "가" * 1200 + " password=never-render-context-secret")
+    (item,) = normalize([anchor], context_messages=[unsafe])
+    assert item["contextMessages"] == [] and item["contextCoverage"] == "unavailable"
+    assert len(item["sources"]) == 1 and "never-render" not in json.dumps(item)
+
+
+def test_context_conflicts_cannot_mix_two_revisions_or_authors_of_one_message():
+    anchor = source(message="1800000005.000001")
+    original = context(anchor)
+    for changed in (context(anchor, "그건 실제 결정이야"), {**original, "authorId": "UANOTHER"},
+                    context(anchor, "password=unsafe-newer-revision")):
+        with pytest.raises(MemoryError, match="memory_live_source_(revision_conflict|conflict)"):
+            normalize([anchor], context_messages=[original, changed])
+
+
+def test_context_counts_and_raw_character_budget_include_all_linked_messages():
+    anchor = source(message="1800000005.000001")
+    rows = [context(anchor, message=f"180000000{n}.000001", relation="thread_neighbor") for n in range(5)]
+    assert len(normalize([anchor], context_messages=rows)[0]["contextMessages"]) == 5
+    with pytest.raises(MemoryError, match="memory_live_contexts_too_many"):
+        normalize([anchor], context_messages=[*rows, rows[0]])
+    anchors = [source(message=f"180000000{n}.000001") for n in range(2, 10)]
+    with pytest.raises(MemoryError, match="memory_live_contexts_invalid"):
+        normalize(anchors, context_messages=rows)
+    with pytest.raises(MemoryError, match="memory_live_sources_too_large"):
+        normalize([source("가" * 4000, message="1800000005.000001")],
+                  context_messages=[context(anchor, "나" * 4001)])
+
+
+@pytest.mark.parametrize("contexts", [None, "문맥", [None], [{}]])
+def test_malformed_context_collections_fail_with_memory_error(contexts):
+    with pytest.raises(MemoryError, match="memory_live_context"):
+        normalize([source()], context_messages=contexts)
