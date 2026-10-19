@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from boxer_company.memory.presentation import MEMORY_GUIDANCE, extract_memory_citations, render_memory
+from boxer_company.assistant.request_reference import build_request_reference_context
 
 from collections.abc import Callable
 import logging
@@ -503,7 +504,8 @@ class CompanyTeamFunAssistantRoute:
             generated = self._answerer(
                 prompt,
                 "",
-                _TEAM_FUN_SYSTEM_PROMPT + ("\n" + MEMORY_GUIDANCE if memory_text else ""),
+                _TEAM_FUN_SYSTEM_PROMPT + "\n\n" + build_request_reference_context(request)
+                + ("\n" + MEMORY_GUIDANCE if memory_text else ""),
             )
         except TimeoutError:
             return CompanyAssistantResult(

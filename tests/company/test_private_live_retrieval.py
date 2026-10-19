@@ -62,7 +62,8 @@ class Slack:
     def conversations_replies(self, **kwargs):
         key = kwargs["channel"], kwargs["ts"], kwargs.get("cursor") or ""
         value = self.replies.get(key, page("messages", []))
-        if kwargs.get("oldest") and not isinstance(value, Exception):
+        # 날짜 범위 oldest와 최신 댓글 한 건을 읽는 exact probe를 구분한다.
+        if kwargs.get("oldest") == kwargs.get("latest") and kwargs.get("oldest") and not isinstance(value, Exception):
             messages = [message for (channel, thread, _), response in self.replies.items()
                         if channel == key[0] and thread == key[1] and not isinstance(response, Exception)
                         for message in response.get("messages", []) if message.get("ts") == kwargs["latest"]]
@@ -81,6 +82,60 @@ def collect(slack, **overrides):
                   before_ts=stamp(1000), is_allowed=lambda tenant, actor: tenant == TENANT and actor in {"UACTOR", "UDD", "UOTHER"})
     values.update(overrides)
     return collect_private_live_sources(**values)
+
+
+def dated_message(ts, **extra):
+    return {"ts": ts, "user": "UDD", "text": "안내문 검토를 마쳤어", **extra}
+
+
+@pytest.mark.parametrize("question,expected,reply_start,reply_end", [
+    ("디디가 오늘 한 말 요약", ["1792350000.000001", "1792335600.000000"],
+     "1792335600.000000", "1792350000.000001"),
+    ("디디가 어제 한 말 요약", ["1792335599.999999", "1792249200.000000"],
+     "1792249200.000000", "1792335600.000000"),
+])
+def test_relative_day_filters_roots_and_replies_without_hiding_old_parent(question, expected, reply_start, reply_end):
+    # 오래된 부모와 다음날 최신 댓글이 있어도 요청한 하루의 댓글을 별도로 읽는다.
+    parent_ts, latest_ts = "1792200000.000001", "1792350000.000001"
+    root = dated_message(parent_ts, reply_count=99, latest_reply=latest_ts)
+    reply_stamps = ["1792249199.999999", "1792249200.000000", "1792335599.999999",
+                    "1792335600.000000", latest_ts, "1792350000.000002"]
+    slack = Slack(history={("CONE", ""): page("messages", [root])}, replies={
+        ("CONE", parent_ts, ""): page("messages", [root, *[
+            dated_message(ts, thread_ts=parent_ts) for ts in reply_stamps]]),
+    })
+    result = collect(slack, question=question, before_ts=latest_ts)
+    assert [source["messageTs"] for source in result["sources"]] == expected
+    assert all(source["threadTs"] == parent_ts for source in result["sources"])
+    assert result["coverage"] == "complete"
+    histories = [kwargs for method, kwargs in slack.calls if method == "history"]
+    assert len(histories) == 1 and "oldest" not in histories[0]
+    assert histories[0]["latest"] == reply_end
+    full_replies = [kwargs for method, kwargs in slack.calls
+                    if method == "replies" and kwargs["oldest"] != kwargs["latest"]]
+    assert len(full_replies) == 1
+    assert full_replies[0]["oldest"] == reply_start and full_replies[0]["latest"] == reply_end
+    assert all(kwargs["message_ts"] in expected for method, kwargs in slack.calls if method == "link")
+
+
+def test_today_skips_thread_whose_verified_latest_hint_is_before_midnight():
+    root = dated_message("1792200000.000001", reply_count=99, latest_reply="1792335599.999999")
+    slack = Slack(history={("CONE", ""): page("messages", [root])})
+    result = collect(slack, question="디디가 오늘 한 말 요약", before_ts="1792350000.000001")
+    assert result == {"sources": [], "coverage": "complete", "channelCount": 1}
+    assert not any(method in {"replies", "link"} for method, _ in slack.calls)
+
+
+def test_date_window_reply_pagination_remains_partial_when_budget_does_not_finish():
+    root_ts, first_ts, latest_ts = "1792200000.000001", "1792249200.000001", "1792350000.000001"
+    root = dated_message(root_ts, reply_count=99, latest_reply=latest_ts)
+    slack = Slack(history={("CONE", ""): page("messages", [root])}, replies={
+        ("CONE", root_ts, ""): page("messages", [dated_message(first_ts, thread_ts=root_ts)], "one"),
+        ("CONE", root_ts, "one"): page("messages", [], "two"),
+    })
+    result = collect(slack, question="디디가 어제 한 말 요약", before_ts=latest_ts)
+    assert result["coverage"] == "partial" and result["sources"][0]["messageTs"] == first_ts
+    assert len([method for method, _ in slack.calls if method == "replies"]) == 2
 
 
 @pytest.mark.parametrize("overrides", [

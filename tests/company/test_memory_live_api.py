@@ -112,6 +112,16 @@ def bound_request(value, retrieval_id):
         "retrievalId": retrieval_id, "verifications": []})
 
 
+def dated_request(question="디디가 오늘 한 말 요약", *, channel_id=HUB):
+    value = request(question=question, channel_id=channel_id)
+    return replace(value, memory_context={**value.memory_context, "currentMessageTs": "1792350000.000001"})
+
+
+def dated_source(message_ts):
+    return source(messageTs=message_ts,
+        permalink=f"https://unit.slack.com/archives/{ORIGIN}/p{message_ts.replace('.', '')}")
+
+
 def assert_no_source_evidence(value, *, coverage="unavailable"):
     # 허브의 실패 안내는 남을 수 있지만 사용하지 못한 원문·인용은 없어야 한다.
     assert all(item["kind"] == "retrieval_status" and item["coverage"] == coverage
@@ -210,7 +220,8 @@ def test_http_live_sources_reach_model_with_verified_citations_but_without_origi
     rows = json.loads(rendered.split(":\n", 1)[1])
     assert rows[0] == notice
     assert rows[1]["authors"] == [DD]
-    assert rows[1]["sourceTimes"] == [{"authorId": DD, "spokenAtKst": "2026-10-16T06:33:21.000001+09:00"}]
+    assert rows[1]["sourceTimes"] == [{"authorId": DD, "authorName": "DD",
+                                     "spokenAtKst": "2026-10-16T06:33:21.000001+09:00"}]
     assert set(selected) == {utterance["memoryId"]}
     seen = []
     def answerer(question, context, system):
@@ -227,6 +238,60 @@ def test_http_live_sources_reach_model_with_verified_citations_but_without_origi
     assert "memory:" not in answer.messages[0].body
     assert len(answer.sources) == 1 and answer.sources[0].uri == source()["permalink"]
     assert answer.sources[0].source_id == utterance["sources"][0]["sourceId"]
+
+
+@pytest.mark.parametrize("question,expected", [
+    ("디디가 오늘 한 말 요약", ["1792350000.000001", "1792335600.000000"]),
+    ("디디가 어제 한 말 요약", ["1792335599.999999", "1792249200.000000"]),
+])
+def test_http_live_upload_is_filtered_by_original_question_kst_day(runtime, question, expected):
+    # adapter가 여러 날짜를 보냈더라도 HTTP lease의 원 질문으로 최종 기간을 결정한다.
+    value = dated_request(question)
+    stamps = ["1792249199.999999", "1792249200.000000", "1792335599.999999",
+              "1792335600.000000", "1792350000.000001"]
+    with client(runtime.memory) as http:
+        prepared = http.post(BASE, headers=headers(), json=retrieval_body(
+            question=value.question, memoryContext=dict(value.memory_context)))
+        assert prepared.status_code == 200
+        payload = prepared.json()
+        assert payload["liveQuery"]["beforeTs"] == "1792350000.000001"
+        uploaded = http.post(f"{BASE}/{payload['retrievalId']}/live", headers=headers(),
+            json=upload_body(sources=[dated_source(stamp) for stamp in stamps], coverage="complete", channelCount=1))
+        assert uploaded.status_code == 200 and uploaded.json()["acceptedSourceCount"] == 2
+    bound = runtime.memory.bind_verified(bound_request(value, payload["retrievalId"]))
+    assert [item["sources"][0]["messageTs"] for item in bound.memory_entries if item["kind"] == "utterance"] == expected
+    assert bound.memory_entries[-1]["coverage"] == "partial"
+    assert bound.memory_entries[-1]["sourceCount"] == 2
+
+
+@pytest.mark.parametrize("channel_id", [HUB, "C_OTHER"])
+def test_date_question_keeps_only_stored_items_whose_entire_evidence_is_in_period(runtime, monkeypatch, channel_id):
+    # 한 요약의 출처가 어제와 오늘에 걸치면 오늘 발언으로 재사용하지 않는다.
+    value = dated_request(channel_id=channel_id)
+    def stored(memory_id, stamps, kind="thread_summary"):
+        return {"memoryId": memory_id, "kind": kind,
+                "sources": [{"messageTs": stamp} for stamp in stamps]}
+    style = stored("style", [SPOKEN], kind="personal_style")
+    in_day = stored("in-day", ["1792335600.000000", "1792350000.000001"])
+    old = stored("old", ["1792335599.999999"])
+    mixed = stored("mixed", ["1792335599.999999", "1792335600.000000"])
+    future = stored("future", ["1792350000.000002"])
+    missing = stored("missing", [])
+    monkeypatch.setattr(runtime.store, "load_verified_items", lambda **_: [old, mixed, missing, future, in_day, style])
+    prepared = runtime.memory.prepare(value)
+    if channel_id == HUB:
+        receive(runtime.memory, prepared["retrievalId"], upload_body(
+            sources=[dated_source("1792340000.000001")], coverage="complete", channelCount=1))
+    bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
+    ids = [item.get("memoryId") for item in bound.memory_entries if item["kind"] != "retrieval_status"]
+    assert set(ids) == ({"style", "in-day", "live_" + bound.memory_entries[1]["sources"][0]["sourceId"]}
+                        if channel_id == HUB else {"style", "in-day"})
+    if channel_id == HUB:
+        assert bound.memory_entries[0] == style
+        assert bound.memory_entries[1]["kind"] == "utterance"
+        assert bound.memory_entries[2] == in_day
+    else:
+        assert "liveQuery" not in prepared
 
 
 @pytest.mark.parametrize("changes", [

@@ -7,6 +7,7 @@ import pytest
 
 from boxer_company.memory.contracts import MemoryError, source_identity, source_revision
 from boxer_company.memory.live import normalize_live_sources
+from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period
 from boxer_company.memory.presentation import render_memory
 
 
@@ -195,3 +196,70 @@ def test_source_count_and_total_character_budgets_are_enforced():
 def test_malformed_source_collections_fail_with_memory_error(sources):
     with pytest.raises(MemoryError, match="memory_live_source"):
         normalize(sources)
+
+
+@pytest.mark.parametrize("question,kind,start,end", [
+    ("디디가 오늘 한 말 요약", "today", "1792335600.000000", "1792422000.000000"),
+    ("오늘은 무슨 대화 했어?", "today", "1792335600.000000", "1792422000.000000"),
+    ("어제의 발언은?", "yesterday", "1792249200.000000", "1792335600.000000"),
+    ("디디는 어제 뭐라고 했어?", "yesterday", "1792249200.000000", "1792335600.000000"),
+])
+def test_relative_day_uses_question_kst_date_instead_of_process_clock(question, kind, start, end):
+    # UTC로는 18일인 질문도 KST 19일을 기준으로 해석한다.
+    cutoff = "1792350000.123456789"
+    period = resolve_live_query_period(question, cutoff)
+    assert period == {
+        "kind": kind, "referenceDateKst": "2026-10-19", "startTs": start, "endTs": end,
+        "startAtKst": "2026-10-" + ("19" if kind == "today" else "18") + "T00:00:00+09:00",
+        "endAtKst": "2026-10-" + ("20" if kind == "today" else "19") + "T00:00:00+09:00",
+        "cutoffTs": cutoff,
+    }
+
+
+@pytest.mark.parametrize("question", ["최근 한 말은?", "지난주 발언", "2026-10-18 대화", "오늘날 사회", "어제오늘 근황", "오늘과 어제 비교", "오늘부터의 일정"])
+def test_only_unambiguous_relative_day_tokens_create_a_period(question):
+    assert resolve_live_query_period(question, "1792350000.000001") is None
+
+
+@pytest.mark.parametrize("cutoff", ["", "NaN", "1792350000", "99999999999999999999.000000001", None])
+def test_unusable_question_time_does_not_guess_a_date(cutoff):
+    assert resolve_live_query_period("오늘 한 말은?", cutoff) is None
+
+
+@pytest.mark.parametrize("timestamp,expected", [
+    ("1792335599.999999999", False), ("1792335600.000000000", True),
+    ("1792350000.123456789", True), ("1792350000.123456790", False),
+    ("1792422000.000000000", False), ("NaN", False), (None, False),
+])
+def test_today_includes_midnight_and_question_time_with_exact_fraction(timestamp, expected):
+    period = resolve_live_query_period("오늘 한 말은?", "1792350000.123456789")
+    assert is_within_live_query_period(timestamp, period) is expected
+
+
+def test_yesterday_excludes_the_following_midnight_even_before_question_cutoff():
+    period = resolve_live_query_period("어제 한 말은?", "1792350000.000001")
+    assert is_within_live_query_period("1792249200.000000", period)
+    assert is_within_live_query_period("1792335599.999999999", period)
+    assert not is_within_live_query_period("1792335600.000000", period)
+
+
+@pytest.mark.parametrize("question,accepted", [
+    ("디디가 오늘 한 말 요약", ["1792350000.000001", "1792335600.000000"]),
+    ("디디가 어제 한 말 요약", ["1792335599.999999", "1792249200.000000"]),
+])
+def test_api_normalization_enforces_period_even_for_adapter_sources_from_other_days(question, accepted):
+    # 부모가 더 오래돼도 기간 내 댓글은 허용하고 질문의 날짜 밖 원문은 최종 경계에서 뺀다.
+    stamps = ["1792249199.999999", "1792249200.000000", "1792335599.999999",
+              "1792335600.000000", "1792350000.000001"]
+    items = normalize([source(message=stamp, thread="1792200000.000001") for stamp in stamps],
+                      question=question, before_ts="1792350000.000001")
+    assert [item["sources"][0]["messageTs"] for item in items] == accepted
+
+
+def test_period_filter_does_not_bypass_existing_future_source_and_revision_checks():
+    with pytest.raises(MemoryError, match="source_after_capture_cutoff"):
+        normalize([source(message="1792350000.000002", thread="1792200000.000001")],
+                  question="오늘 한 말은?", before_ts="1792350000.000001")
+    with pytest.raises(MemoryError, match="source_revision_mismatch"):
+        normalize([source(message="1792249200.000000", thread="1792200000.000001", revisionHash="0" * 64)],
+                  question="오늘 한 말은?", before_ts="1792350000.000001")

@@ -18,6 +18,7 @@ from boxer_company.assistant.contracts import (
 from boxer_company.assistant.freeform_prompt import (
     build_company_freeform_system_prompt,
 )
+from boxer_company.assistant.request_reference import build_request_reference_context
 from boxer_company.prompt_security import (
     build_prompt_security_refusal,
     is_prompt_exfiltration_attempt,
@@ -176,7 +177,7 @@ class CompanyFreeformAssistantRoute:
             speaker_user_id=str(request.actor_id or ""),
         )
         system_prompt = "\n\n".join(
-            section for section in (base_prompt, team_context) if section
+            section for section in (base_prompt, team_context, build_request_reference_context(request)) if section
         ).strip() or None
         # matcher와 현재 문맥 검사가 끝난 뒤 모델 입력에만 기억을 붙인다.
         memory_text, selected_memories = render_memory(request.memory_entries)

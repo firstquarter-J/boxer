@@ -8,14 +8,14 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from boxer_company.assistant.contracts import AssistantMessage, CompanyAssistantRequest, CompanyAssistantResult
 from boxer_company.memory.commands import MEMORY_MANAGE_ROUTE, parse_memory_command
 from boxer_company.memory.access import is_private_memory_hub
 from boxer_company.memory.contracts import MemoryError, canonical_digest, source_revision
-from boxer_company.memory.live_query import wants_private_live_sources
+from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period, wants_private_live_sources
 from boxer_company.memory.policy import is_safe_memory_text
 from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company_api.memory_schemas import MemoryCaptureOutput
@@ -200,7 +200,7 @@ class MemoryService:
                 raise MemoryError("memory_live_result_conflict")
             if prepared.live_fingerprint is None:
                 entries = normalize_live_sources(sources, tenant_id=tenant_id,
-                    destination_channel_id=channel_id, before_ts=plan["beforeTs"], author_ids=plan["authorIds"])
+                    destination_channel_id=channel_id, before_ts=plan["beforeTs"], author_ids=plan["authorIds"], question=plan["question"])
                 if channel_count < len({source["channelId"] for item in entries for source in item["sources"]}):
                     raise MemoryError("memory_live_channel_count_invalid")
                 self._prune_live_sources(self._clock())
@@ -290,6 +290,12 @@ class MemoryService:
                 candidates=prepared.candidates, verified_sources=list(memory.get("verifications") or []), limit=8,
                 actor_id=request.actor_id,
             )
+            period = resolve_live_query_period(request.question, str(memory.get("currentMessageTs") or ""))
+            if period is not None:
+                # 날짜 질문에 과거 요약을 그날의 발언처럼 섞지 않는다. 본인 표준 선호는 보존한다.
+                verified = [item for item in verified if item.get("kind") == "personal_style" or (
+                    item.get("sources") and all(isinstance(source, Mapping)
+                        and is_within_live_query_period(source.get("messageTs"), period) for source in item["sources"]))]
             if prepared.live_query is not None:
                 # 최신 발언은 오래된 저장 요약보다 먼저 넣되 본인 표준 답변 선호는 보존한다.
                 with self._lock:
@@ -306,7 +312,7 @@ class MemoryService:
                 styles = [item for item in verified if item.get("kind") == "personal_style"]
                 ordinary = [item for item in verified if item.get("kind") != "personal_style"]
                 # 일반 질문은 저장 요약과 현재 원문을 함께, 최근 발언 질문은 시각순 원문부터 보여준다.
-                recent_utterances = bool(re.search(r"최근|마지막|방금|요즘|직전", request.question)
+                recent_utterances = period is not None or bool(re.search(r"최근|마지막|방금|요즘|직전", request.question)
                     and re.search(r"말|발언|대화|썼|쓴|적은|보낸|메시지|글", request.question))
                 if recent_utterances:
                     evidence = [*styles, *live, *ordinary][:8]

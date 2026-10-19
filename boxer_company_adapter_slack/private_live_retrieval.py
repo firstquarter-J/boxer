@@ -13,7 +13,7 @@ from urllib.parse import parse_qsl, urlsplit
 from boxer_company._operation_routing_knowledge import TEAM_MEMBER_ALIASES_BY_NAME
 from boxer_company.memory.access import is_private_memory_hub
 from boxer_company.memory.contracts import source_revision
-from boxer_company.memory.live_query import wants_private_live_sources
+from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period, wants_private_live_sources
 from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
 from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company_adapter_slack.conversation_memory import _data, _safe_permalink
@@ -67,9 +67,10 @@ def _timestamp(value: Any) -> Decimal | None:
 class _Reader:
     def __init__(self, client_factory: Callable[[float], Any], *, tenant: str, authors: frozenset[str],
                  keywords: tuple[str, ...], cutoff: str, is_allowed: Callable[[str, str], bool],
-                 clock: Callable[[], float], budget: float) -> None:
+                 clock: Callable[[], float], budget: float, period: Mapping[str, str] | None = None) -> None:
         self.factory, self.tenant, self.authors, self.keywords = client_factory, tenant, authors, keywords
         self.cutoff, self.cutoff_value, self.allowed, self.clock = cutoff, Decimal(cutoff), is_allowed, clock
+        self.period = period
         started = clock()
         self.deadline = started + budget
         # 링크 확인 시간과 호출 여유를 남겨 원문만 모으고 반환하지 못하는 경우를 줄인다.
@@ -175,6 +176,8 @@ class _Reader:
             return
         if stamp > self.cutoff_value:
             return
+        if self.period is not None and not is_within_live_query_period(value["ts"], self.period):
+            return
         if self.clock() >= self.read_deadline:
             self.partial = True
             return
@@ -249,6 +252,11 @@ class _Reader:
         def read(channel: str, kind: str, thread: str, cursor: str, pages: int, visited: set[str]) -> None:
             kwargs = {"channel": channel, "limit": _PAGE_SIZE, "latest": self.cutoff,
                       "inclusive": True, "cursor": cursor or None}
+            if self.period is not None:
+                kwargs["latest"] = min((self.cutoff, self.period["endTs"]), key=Decimal)
+                # history의 오래된 부모는 유지하고 댓글만 요청 기간으로 좁힌다.
+                if kind == "replies":
+                    kwargs["oldest"] = self.period["startTs"]
             if kind in {"replies", "latest"}:
                 kwargs["ts"] = thread
             if kind == "latest":
@@ -283,8 +291,11 @@ class _Reader:
                     if latest_value is not None and latest_value <= stamp:
                         self.partial = True
                         latest, latest_value = None, None
+                    if self.period is not None and latest_value is not None and latest_value < Decimal(self.period["startTs"]):
+                        continue
                     roots[key] = {"latest": latest, "count": count, "seen": set(), "done": False}
-                    kind_next = "latest" if latest_value is not None and latest_value <= self.cutoff_value else "replies"
+                    latest_in_period = self.period is None or is_within_live_query_period(latest, self.period)
+                    kind_next = "latest" if latest_value is not None and latest_value <= self.cutoff_value and latest_in_period else "replies"
                     queues[channel].append((kind_next, message["ts"], "", 1, set()))
             if kind == "latest":
                 # 좁은 조회는 전체 thread 확인을 대체하지 않는다. 후속 full 조회가 끝나야 done이다.
@@ -303,7 +314,11 @@ class _Reader:
                 root["done"] = True
                 latest = _timestamp(root["latest"])
                 # root의 최신 댓글 또는 댓글 수를 확인하지 못하면 전체 원문이라고 말하지 않는다.
-                if ((latest is not None and latest <= self.cutoff_value and root["latest"] not in root["seen"])
+                if self.period is not None:
+                    # 기간 밖 최신 댓글·전체 누적 댓글 수로 기간 한정 조회를 미완료로 오인하지 않는다.
+                    if latest is not None and is_within_live_query_period(root["latest"], self.period) and root["latest"] not in root["seen"]:
+                        self.partial = True
+                elif ((latest is not None and latest <= self.cutoff_value and root["latest"] not in root["seen"])
                         or ((latest is None or latest <= self.cutoff_value)
                             and len(root["seen"] - {thread}) < root["count"])):
                     self.partial = True
@@ -384,7 +399,8 @@ def collect_private_live_sources(
         return unavailable
     keywords = () if authors else _keywords(question)
     reader = _Reader(client_factory, tenant=tenant_id, authors=authors, keywords=keywords, cutoff=before_ts,
-                     is_allowed=is_allowed, clock=clock, budget=budget_seconds)
+                     is_allowed=is_allowed, clock=clock, budget=budget_seconds,
+                     period=resolve_live_query_period(question, before_ts))
     channels = reader.channels()
     reader.scan(channels)
     return reader.result()

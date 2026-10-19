@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 
 from .access import is_private_memory_hub
 from .contracts import MemoryError, canonical_digest
+from .live_query import is_within_live_query_period, resolve_live_query_period
 from .policy import normalize_source
 
 
@@ -33,13 +34,14 @@ def _timestamp_iso(value: str) -> str:
 
 def normalize_live_sources(
     sources: Sequence[Mapping[str, Any]], *, tenant_id: str, destination_channel_id: str,
-    before_ts: str, author_ids: Sequence[str],
+    before_ts: str, author_ids: Sequence[str], question: str = "",
 ) -> tuple[dict[str, Any], ...]:
     """고정 허브의 비공개 채널 원문만 현재 질문 시점과 작성자 범위 안에서 받는다."""
     if (not isinstance(tenant_id, str) or not isinstance(destination_channel_id, str)
             or not is_private_memory_hub(tenant_id, destination_channel_id)):
         raise MemoryError("memory_live_destination_forbidden")
     _timestamp_iso(before_ts)
+    period = resolve_live_query_period(question, before_ts)
     if (not isinstance(sources, Sequence) or isinstance(sources, (str, bytes))
             or len(sources) > 8):
         raise MemoryError("memory_live_sources_invalid")
@@ -78,6 +80,9 @@ def normalize_live_sources(
             thread_ts=source["threadTs"], current_message_ts=before_ts,
         )
         if accepted is None:
+            continue
+        # adapter의 기간 필터를 신뢰해 생략하지 않고 API의 최종 원문 경계에서도 강제한다.
+        if period is not None and not is_within_live_query_period(accepted["messageTs"], period):
             continue
         key = (source["channelId"], accepted["messageTs"])
         if key in seen_messages and seen_messages[key] != accepted["revisionHash"]:

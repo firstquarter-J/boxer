@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from boxer_company import team_chat_context as tcc
 
@@ -98,6 +99,31 @@ class TeamChatContextTests(unittest.TestCase):
         self.assertIn("MBTI는 답변 개인화를 위한 보조 힌트", context)
         self.assertIn("- MBTI: ENTJ", context)
         self.assertIn("- MBTI: ISTJ", context)
+
+    def test_selected_profiles_include_registered_name_id_and_alias_identity(self) -> None:
+        # 모델이 실제 발언의 ID를 화자 Hyun·질문 대상 DD와 직접 연결할 수 있어야 한다.
+        hyun = {**tcc._PROFILE_BY_NAME["Hyun"], "user_id": "UHYUN"}
+        dd = {**tcc._PROFILE_BY_NAME["DD"], "user_id": "UDD"}
+        with patch.object(tcc, "TEAM_MEMBER_PROFILES", (hyun, dd)), \
+                patch.dict(tcc._PROFILE_BY_NAME, {"Hyun": hyun, "DD": dd}, clear=True), \
+                patch.dict(tcc._PROFILE_BY_USER_ID, {"uhyun": hyun, "udd": dd}, clear=True):
+            for builder in (tcc.build_team_chat_context, tcc.build_team_freeform_context):
+                with self.subTest(builder=builder.__name__):
+                    context = builder("디디가 오늘 한 말 요약", speaker_user_id="UHYUN")
+                    self.assertIn("Slack 식별 정보: Hyun = UHYUN", context)
+                    self.assertIn("Slack 식별 정보: DD = UDD (등록 별칭: dd, 디디)", context)
+                    self.assertIn("사용자 ID 대신 등록된 이름을 사용해", context)
+
+    def test_duplicate_registered_user_id_is_not_rendered_as_verified_identity(self) -> None:
+        dd = {**tcc._PROFILE_BY_NAME["DD"], "user_id": "UDUPLICATE"}
+        hyun = {**tcc._PROFILE_BY_NAME["Hyun"], "user_id": "UDUPLICATE"}
+        with patch.object(tcc, "TEAM_MEMBER_PROFILES", (dd, hyun)), \
+                patch.dict(tcc._PROFILE_BY_NAME, {"DD": dd, "Hyun": hyun}, clear=True):
+            for builder in (tcc.build_team_chat_context, tcc.build_team_freeform_context):
+                with self.subTest(builder=builder.__name__):
+                    context = builder("디디가 오늘 한 말 요약")
+                    self.assertNotIn("DD = UDUPLICATE", context)
+                    self.assertNotIn("Hyun = UDUPLICATE", context)
 
     def test_required_sage_profile_includes_mbti(self) -> None:
         context = tcc.build_team_chat_context(

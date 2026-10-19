@@ -15,6 +15,10 @@ TEAM_CHAT_MBTI_GUIDE = (
     "MBTI는 답변 개인화를 위한 보조 힌트로만 참고해. "
     "성격을 MBTI 하나로 고정 단정하지 마."
 )
+TEAM_CHAT_IDENTITY_GUIDE = (
+    "Slack 식별 정보는 서버에 등록된 이름과 사용자 ID의 연결이야. "
+    "발언의 작성자·대상을 확인하는 데 쓰고 답변에는 사용자 ID 대신 등록된 이름을 사용해."
+)
 TEAM_CHAT_FREEFORM_GUARDRAIL = (
     "항상 fictional framing을 유지해. 사람 자체를 고정 낙인으로 만들지 말고, "
     "세게 받아쳐도 마지막엔 장점이나 존중 포인트를 남겨."
@@ -357,6 +361,31 @@ _PROFILE_BY_USER_ID = {
 }
 
 
+def _unique_registered_profile(user_id: object) -> dict[str, object] | None:
+    # 출처 작성자의 실명 연결에는 별칭·부분 문자열·대소문자 추정이나 중복 ID를 쓰지 않는다.
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    matches = [profile for profile in TEAM_MEMBER_PROFILES if profile.get("user_id") == user_id]
+    if len(matches) != 1 or not str(matches[0].get("name") or "").strip():
+        return None
+    return matches[0]
+
+
+def get_registered_team_member_name(user_id: object) -> str | None:
+    """정확한 사용자 ID가 등록된 한 사람을 가리킬 때만 표시 이름을 반환한다."""
+    profile = _unique_registered_profile(user_id)
+    return str(profile["name"]).strip() if profile is not None else None
+
+
+def _format_registered_identity(profile: dict[str, object]) -> str:
+    registered = _unique_registered_profile(profile.get("user_id"))
+    if registered is None or registered.get("name") != profile.get("name"):
+        return ""
+    aliases = ", ".join(str(alias).strip() for alias in (registered.get("aliases") or ()) if str(alias).strip())
+    identity = f"Slack 식별 정보: {registered['name']} = {registered['user_id']}"
+    return f"{identity} (등록 별칭: {aliases})" if aliases else identity
+
+
 def _normalize_context_text(*texts: str) -> str:
     joined = " ".join(str(text or "") for text in texts)
     return joined.lower().strip()
@@ -459,7 +488,8 @@ def _format_profile_line(profile: dict[str, object]) -> str:
     if mbti:
         profile_meta = f"{profile_meta} / MBTI {mbti}" if profile_meta else f"MBTI {mbti}"
 
-    segments = [segment for segment in (title, profile_meta, summary) if segment]
+    # 캐릭터 설명과 함께 실제 출처 작성자의 ID를 같은 등록 인물로 연결한다.
+    segments = [segment for segment in (title, profile_meta, summary, _format_registered_identity(profile)) if segment]
     if battle_power:
         power_text = f"전투력 {battle_power}"
         if battle_role:
@@ -499,6 +529,9 @@ def _format_freeform_profile_block(
     title = str(profile.get("title") or "").strip()
     mbti = str(profile.get("mbti") or "").strip().upper()
     lines = [f"- {name}: {title}".strip()]
+    identity = _format_registered_identity(profile)
+    if identity:
+        lines.append(f"- {identity}")
     profile_fact = str(profile.get("profile_fact") or "").strip()
     if profile_fact:
         lines.append(f"- 기본 정보: {profile_fact}")
@@ -552,6 +585,7 @@ def build_team_chat_context(
     lines = [
         "팀 대화 참고:",
         f"- {TEAM_CHAT_GENERAL_GUIDE}",
+        f"- {TEAM_CHAT_IDENTITY_GUIDE}",
         f"- {TEAM_CHAT_MBTI_GUIDE}",
     ]
     if speaker_name:
@@ -580,6 +614,7 @@ def build_team_freeform_context(
     lines = [
         "팀원별 컨텍스트:",
         f"- {TEAM_CHAT_GENERAL_GUIDE}",
+        f"- {TEAM_CHAT_IDENTITY_GUIDE}",
         f"- {TEAM_CHAT_MBTI_GUIDE}",
         f"- {TEAM_CHAT_FREEFORM_GUARDRAIL}",
     ]
