@@ -201,7 +201,12 @@ TEAM_MEMBER_PROFILES: tuple[dict[str, object], ...] = (
         "aliases": TEAM_MEMBER_ALIASES_BY_NAME["Maru"],
         "user_id": cs.MARU_USER_ID,
         "mbti": "INFJ",
-        "profile_fact": "1986 / Core Engineer Team / Server Engineer",
+        # 사용자가 전해 준 일화와 제보 날짜를 일반 대화와 팀원 대화 문맥에 함께 남긴다.
+        "profile_fact": (
+            "1986 / Core Engineer Team / Server Engineer / "
+            "사용자 제보(2026-10-21): 만두를 몇 개 먹냐는 질문에 봉 단위로 먹어서 개수를 세지 않는다고 "
+            "답한 일화가 있어. 대식가로 묘사됐어."
+        ),
         "title": "고신뢰형 / 비공격적 리더",
         "summary": "배려 중심이고 갈등을 낮추는 타입. 공격보다 감정 완충과 안정화에 강하다.",
         "battle_power": 65,
