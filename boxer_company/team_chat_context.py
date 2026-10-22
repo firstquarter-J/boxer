@@ -1,3 +1,6 @@
+from collections.abc import Sequence
+
+from boxer.context.entries import ContextEntry
 from boxer_company import settings as cs
 from boxer_company._operation_routing_knowledge import (
     TEAM_MEMBER_ALIASES_BY_NAME,
@@ -18,6 +21,10 @@ TEAM_CHAT_MBTI_GUIDE = (
 TEAM_CHAT_IDENTITY_GUIDE = (
     "Slack 식별 정보는 서버에 등록된 이름과 사용자 ID의 연결이야. "
     "발언의 작성자·대상을 확인하는 데 쓰고 답변에는 사용자 ID 대신 등록된 이름을 사용해."
+)
+TEAM_CHAT_PROFILE_FACT_GUIDE = (
+    "등록된 기본 정보와 사용자 제보는 인물에 대한 참고 정보야. "
+    "제보의 출처와 한정 표현을 유지하고, 실제 Slack 원문이나 특정 기간의 발언으로 바꾸지 마."
 )
 TEAM_CHAT_FREEFORM_GUARDRAIL = (
     "항상 fictional framing을 유지해. 사람 자체를 고정 낙인으로 만들지 말고, "
@@ -432,12 +439,19 @@ def _collect_profile_names(
     *texts: str,
     speaker_user_id: str = "",
     required_names: tuple[str, ...] = (),
-    limit: int = 4,
+    context_entries: Sequence[ContextEntry] = (),
+    limit: int | None = None,
 ) -> tuple[str, list[str]]:
-    normalized = _normalize_context_text(*texts)
+    # 원문 렌더링 예산과 인물 수집을 분리해 잘린 entry의 작성자와 언급도 보존한다.
+    normalized = _normalize_context_text(
+        *texts,
+        *(str(entry.get(key) or "") for entry in context_entries for key in ("author_id", "text")),
+    )
     matched_names: list[str] = []
     seen_names: set[str] = set()
-    normalized_limit = max(0, limit)
+    normalized_limit = len(TEAM_MEMBER_PROFILES) if limit is None else max(0, limit)
+    if normalized_limit == 0:
+        return "", []
 
     speaker_profile = _PROFILE_BY_USER_ID.get(str(speaker_user_id or "").strip().lower())
     speaker_name = str((speaker_profile or {}).get("name") or "").strip()
@@ -480,21 +494,48 @@ def _collect_profile_names(
     return speaker_name, related_names
 
 
+def _build_team_profile_facts_context(
+    *texts: str,
+    speaker_user_id: str,
+    required_names: tuple[str, ...] = (),
+    context_entries: Sequence[ContextEntry] = (),
+) -> list[str]:
+    # 전체 인물의 기본 정보는 스타일 선택 인원에 제한받지 않는다.
+    speaker_name, related_names = _collect_profile_names(
+        *texts,
+        speaker_user_id=speaker_user_id,
+        required_names=required_names,
+        context_entries=context_entries,
+    )
+    names = [name for name in (speaker_name, *related_names) if name]
+    if not names:
+        return []
+
+    lines = [
+        "등록된 팀원 기본 정보:",
+        f"- {TEAM_CHAT_IDENTITY_GUIDE}",
+        f"- {TEAM_CHAT_PROFILE_FACT_GUIDE}",
+    ]
+    for name in names:
+        profile = _PROFILE_BY_NAME.get(name) or {}
+        identity = _format_registered_identity(profile)
+        profile_fact = str(profile.get("profile_fact") or "").strip()
+        details = [part for part in (identity, profile_fact) if part]
+        lines.append(f"- {name}: {' / '.join(details)}")
+    return lines
+
+
 def _format_profile_line(profile: dict[str, object]) -> str:
     name = str(profile.get("name") or "").strip()
     title = str(profile.get("title") or "").strip()
     mbti = str(profile.get("mbti") or "").strip().upper()
-    profile_fact = str(profile.get("profile_fact") or "").strip()
     summary = str(profile.get("summary") or "").strip()
     battle_power = profile.get("battle_power")
     battle_role = str(profile.get("battle_role") or "").strip()
 
-    profile_meta = profile_fact
-    if mbti:
-        profile_meta = f"{profile_meta} / MBTI {mbti}" if profile_meta else f"MBTI {mbti}"
-
-    # 캐릭터 설명과 함께 실제 출처 작성자의 ID를 같은 등록 인물로 연결한다.
-    segments = [segment for segment in (title, profile_meta, summary, _format_registered_identity(profile)) if segment]
+    # 이름 연결과 기본 정보는 전원 블록에서 제공하고 이 블록은 현재 대상의 스타일만 담는다.
+    profile_meta = f"MBTI {mbti}" if mbti else ""
+    segments = [segment for segment in (title, profile_meta, summary) if segment]
     if battle_power:
         power_text = f"전투력 {battle_power}"
         if battle_role:
@@ -534,12 +575,6 @@ def _format_freeform_profile_block(
     title = str(profile.get("title") or "").strip()
     mbti = str(profile.get("mbti") or "").strip().upper()
     lines = [f"- {name}: {title}".strip()]
-    identity = _format_registered_identity(profile)
-    if identity:
-        lines.append(f"- {identity}")
-    profile_fact = str(profile.get("profile_fact") or "").strip()
-    if profile_fact:
-        lines.append(f"- 기본 정보: {profile_fact}")
     if mbti:
         lines.append(f"- MBTI: {mbti}")
 
@@ -578,21 +613,32 @@ def build_team_chat_context(
     *texts: str,
     speaker_user_id: str = "",
     required_names: tuple[str, ...] = (),
-    limit: int = 4,
+    context_entries: Sequence[ContextEntry] = (),
+    limit: int | None = None,
 ) -> str:
-    speaker_name, related_names = _collect_profile_names(
+    """전체 인물의 기본 정보와 현재 대상의 성향을 제공하며 limit는 성향에만 적용한다."""
+    lines = _build_team_profile_facts_context(
         *texts,
+        speaker_user_id=speaker_user_id,
+        required_names=required_names,
+        context_entries=context_entries,
+    )
+    # 이전 대화에만 등장한 인물은 사실 정보만 주고 현재 질문의 인물에게만 스타일을 적용한다.
+    speaker_name, related_names = _collect_profile_names(
+        texts[0] if texts else "",
         speaker_user_id=speaker_user_id,
         required_names=required_names,
         limit=limit,
     )
 
-    lines = [
-        "팀 대화 참고:",
-        f"- {TEAM_CHAT_GENERAL_GUIDE}",
-        f"- {TEAM_CHAT_IDENTITY_GUIDE}",
-        f"- {TEAM_CHAT_MBTI_GUIDE}",
-    ]
+    lines.extend(
+        [
+            "팀 대화 참고:",
+            f"- {TEAM_CHAT_GENERAL_GUIDE}",
+            f"- {TEAM_CHAT_IDENTITY_GUIDE}",
+            f"- {TEAM_CHAT_MBTI_GUIDE}",
+        ]
+    )
     if speaker_name:
         lines.append("현재 말하는 사람:")
         lines.append(_format_profile_line(_PROFILE_BY_NAME.get(speaker_name) or {}))
@@ -606,23 +652,32 @@ def build_team_chat_context(
 def build_team_freeform_context(
     *texts: str,
     speaker_user_id: str = "",
-    limit: int = 3,
+    context_entries: Sequence[ContextEntry] = (),
+    limit: int | None = None,
 ) -> str:
-    speaker_name, related_names = _collect_profile_names(
+    """전체 인물의 기본 정보와 현재 대상의 대화 지침을 제공하며 limit는 지침에만 적용한다."""
+    lines = _build_team_profile_facts_context(
         *texts,
+        speaker_user_id=speaker_user_id,
+        context_entries=context_entries,
+    )
+    if not lines:
+        return ""
+
+    speaker_name, related_names = _collect_profile_names(
+        texts[0] if texts else "",
         speaker_user_id=speaker_user_id,
         limit=limit,
     )
-    if not speaker_name and not related_names:
-        return ""
-
-    lines = [
-        "팀원별 컨텍스트:",
-        f"- {TEAM_CHAT_GENERAL_GUIDE}",
-        f"- {TEAM_CHAT_IDENTITY_GUIDE}",
-        f"- {TEAM_CHAT_MBTI_GUIDE}",
-        f"- {TEAM_CHAT_FREEFORM_GUARDRAIL}",
-    ]
+    lines.extend(
+        [
+            "팀원별 컨텍스트:",
+            f"- {TEAM_CHAT_GENERAL_GUIDE}",
+            f"- {TEAM_CHAT_IDENTITY_GUIDE}",
+            f"- {TEAM_CHAT_MBTI_GUIDE}",
+            f"- {TEAM_CHAT_FREEFORM_GUARDRAIL}",
+        ]
+    )
 
     if speaker_name:
         lines.append("현재 화자 스타일:")
@@ -653,12 +708,13 @@ def build_team_freeform_context(
 def build_team_identity_context(
     *texts: str,
     speaker_user_id: str = "",
+    context_entries: Sequence[ContextEntry] = (),
 ) -> str:
     """사실 요약에는 등록된 이름 연결만 주고 정적 인물 평가는 제외한다."""
     speaker_name, related_names = _collect_profile_names(
         *texts,
         speaker_user_id=speaker_user_id,
-        limit=len(TEAM_MEMBER_PROFILES),
+        context_entries=context_entries,
     )
     identities = [
         _format_registered_identity(_PROFILE_BY_NAME.get(name) or {})

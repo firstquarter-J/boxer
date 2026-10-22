@@ -99,6 +99,8 @@ def test_team_fun_route_generates_and_sanitizes_one_api_owned_sentence() -> None
     assert "DD가 방금 배포를 시작했어" in prompt
     assert "추출 토픽: 배포도 쉽" in prompt
     assert "기본 템플릿:" in prompt
+    # 현재 질문에 이름이 없어도 fun의 필수 대상 DD 스타일은 계속 제공한다.
+    assert "DD: 감정 직결형 / 반응형 인간" in prompt
     assert context == ""
     assert "모대?" in system_prompt
 

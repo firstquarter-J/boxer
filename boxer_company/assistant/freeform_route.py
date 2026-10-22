@@ -164,6 +164,8 @@ class CompanyFreeformAssistantRoute:
             request.question,
             context_text,
             speaker_user_id=str(request.actor_id or ""),
+            # 인물 정보는 전달받은 entry 전체에서 수집하고 모델 원문 예산은 그대로 유지한다.
+            context_entries=request.context_entries,
         )
         system_prompt = "\n\n".join(
             section for section in (base_prompt, team_context, build_request_reference_context(request)) if section

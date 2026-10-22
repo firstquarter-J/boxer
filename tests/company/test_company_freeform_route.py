@@ -118,6 +118,66 @@ class CompanyFreeformAssistantRouteTests(unittest.TestCase):
                 assert result is not None
                 self.assertEqual(result.messages[0].body, answer)
 
+    def test_dumpling_question_keeps_profile_after_multiple_thread_participants(self) -> None:
+        # 실제 누락처럼 앞순위 인물들이 있어도 현재 대상의 제보와 모든 참여자 정보가 모델에 도달한다.
+        profiles = tuple({**profile, "user_id": f"U{profile['name'].upper()}"} for profile in tcc.TEAM_MEMBER_PROFILES)
+        captured: dict[str, str | None] = {}
+        contexts = tuple(
+            {"kind": "message", "source": "slack", "author_id": f"U{name.upper()}", "text": text}
+            for name, text in (("Mark", "붕어빵 12봉지라는 가정"), ("Juno", "cmux 이야기"),
+                               ("DD", "티타임 이야기"), ("Roy", "폴도 같이 이야기했어"))
+        )
+
+        def answerer(question: str, context_text: str, system_prompt: str | None) -> str:
+            captured.update(context_text=context_text, system_prompt=system_prompt)
+            return "등록된 제보로는 봉 단위로 먹어서 개수는 세지 않는대."
+
+        with patch.object(tcc, "TEAM_MEMBER_PROFILES", profiles), \
+                patch.dict(tcc._PROFILE_BY_NAME, {str(p["name"]): p for p in profiles}, clear=True), \
+                patch.dict(tcc._PROFILE_BY_USER_ID, {str(p["user_id"]).lower(): p for p in profiles}, clear=True):
+            result = CompanyFreeformAssistantRoute(answerer, provider_ready=lambda: True, context_max_chars=5_000,
+                                                  timeout_message="timeout").handle(
+                replace(_request("마루 형님이 만두 몇 개 먹는지 기억해?"), actor_id="UHYUN", context_entries=contexts))
+
+        assert result is not None
+        self.assertEqual(result.outcome, "answered")
+        prompt = str(captured["system_prompt"])
+        for name in ("Hyun", "Mark", "Juno", "DD", "Roy", "Paul", "Maru"):
+            self.assertIn(f"Slack 식별 정보: {name} = U{name.upper()}", prompt)
+        self.assertIn("사용자 제보(2026-10-21)", prompt)
+        self.assertIn("봉 단위로 먹어서 개수를 세지 않는다고", prompt)
+        self.assertIn(f"Maru: {tcc._PROFILE_BY_NAME['Maru']['title']}", prompt)
+        for name in ("Mark", "Juno", "DD", "Roy", "Paul"):
+            self.assertNotIn(f"{name}: {tcc._PROFILE_BY_NAME[name]['title']}", prompt)
+
+    def test_profile_collection_keeps_entries_outside_rendered_context_budget(self) -> None:
+        # 원문 창에서 사라진 작성자와 본문 언급 인물도 이름 정보는 유지하고 원문은 다시 주입하지 않는다.
+        profiles = tuple({**profile, "user_id": f"U{profile['name'].upper()}"} for profile in tcc.TEAM_MEMBER_PROFILES)
+        contexts = (
+            {"kind": "message", "source": "slack", "author_id": "UMARK", "text": "올리비아가 확인했어. " * 8},
+            {"kind": "message", "source": "slack", "author_id": "UROY", "text": "알겠어"},
+        )
+        for question in ("마루 형님이 만두 몇 개 먹는지 기억해?", "오늘 마루가 한 말 요약해줘"):
+            with self.subTest(question=question):
+                answerer = Mock(return_value="확인한 정보로 답할게.")
+                with patch.object(tcc, "TEAM_MEMBER_PROFILES", profiles), \
+                        patch.dict(tcc._PROFILE_BY_NAME, {str(p["name"]): p for p in profiles}, clear=True), \
+                        patch.dict(tcc._PROFILE_BY_USER_ID, {str(p["user_id"]).lower(): p for p in profiles}, clear=True):
+                    result = CompanyFreeformAssistantRoute(answerer, provider_ready=lambda: True, context_max_chars=20,
+                                                          timeout_message="timeout").handle(
+                        replace(_request(question), actor_id="UHYUN", context_entries=contexts))
+
+                assert result is not None
+                _, rendered_context, prompt = answerer.call_args.args
+                self.assertLessEqual(len(rendered_context), 20)
+                self.assertNotIn("올리비아가 확인했어", rendered_context)
+                self.assertIn("UROY: 알겠어", rendered_context)
+                for name in ("Hyun", "Mark", "Olivia", "Roy", "Maru"):
+                    self.assertIn(f"Slack 식별 정보: {name} = U{name.upper()}", prompt)
+                if "요약" in question:
+                    for unsupported in ("만두", "사용자 제보", "MBTI", "화자 지침", "반응 지침"):
+                        self.assertNotIn(unsupported, prompt)
+
     def test_matches_only_explicit_freeform_group(self) -> None:
         self.assertEqual(match_company_freeform_route(_request()), "company_freeform")
         self.assertIsNone(

@@ -491,6 +491,8 @@ class CompanyTeamFunAssistantRoute:
             context_text,
             speaker_user_id=str(request.actor_id or ""),
             required_names=("DD",),
+            # 짧은 fun 문맥에서 빠진 작성자도 기본 정보에는 포함한다.
+            context_entries=request.context_entries,
         )
         prompt = build_team_fun_prompt(
             request.question,
