@@ -20,6 +20,7 @@ from .contracts import (
     ELIGIBLE_ROUTES, EXTRACTOR_VERSION, MAX_CANDIDATES, MAX_CHUNK_CHARS,
     MAX_CHUNK_SOURCES, MEMORY_SCHEMA_VERSION, PERSONAL_STYLE_TOPICS, MemoryError, canonical_digest,
 )
+from .live_query import is_within_live_query_period
 from .policy import (has_explicit_completion, is_safe_memory_text, normalize_source, normalize_topic_key,
                      personal_style_text, standard_preference_value, validate_candidate)
 
@@ -810,12 +811,41 @@ class MemoryStore:
         return result
 
     def retrieval_candidates(self, tenant_id: str, channel_id: str, actor_id: str, thread_ts: str,
-                             question: str, limit: int = 8, mentioned_user_ids: Sequence[str] = ()) -> list[dict[str, Any]]:
+                             question: str, limit: int = 8, mentioned_user_ids: Sequence[str] = (),
+                             period: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
         # scope를 SQL에서 먼저 제한하고 사용자의 질문으로만 관련성을 평가한다.
         words = set(re.findall(r"[가-힣A-Za-z0-9_]{2,}", question.casefold()))
+        dated = period is not None and not mentioned_user_ids
+        period_sql, period_arguments = "", ()
+        if period is not None:
+            values = [period.get(key) for key in ("startTs", "endTs", "cutoffTs")] if isinstance(period, Mapping) else []
+            if (len(values) != 3 or any(not isinstance(value, str) or not re.fullmatch(
+                    r"-?[0-9]{1,20}\.[0-9]{1,9}" if index < 2 else r"[0-9]{1,20}\.[0-9]{1,9}", value)
+                    for index, value in enumerate(values)) or Decimal(values[0]) >= Decimal(values[1])
+                    or any(not Decimal(-(2**63)) <= Decimal(value) < Decimal(2**63) for value in values)):
+                raise MemoryError("memory_query_period_invalid")
+            bounds = []
+            for value in values:
+                boundary = Decimal(value)
+                seconds = int(boundary)
+                fraction = int((boundary - seconds) * 1_000_000_000)
+                if fraction < 0:
+                    seconds, fraction = seconds - 1, fraction + 1_000_000_000
+                bounds.extend((seconds, f"{fraction:09d}"))
+            # SQL의 256개 제한 전에 모든 근거 시각을 비교한다. 정수 초와 9자리 소수를
+            # 나눠 비교해 REAL 반올림 없이 자정·원 질문 cutoff의 경계를 보존한다.
+            stamp = "(CAST(s.message_ts AS INTEGER), substr(substr(s.message_ts,instr(s.message_ts,'.')+1)||'000000000',1,9))"
+            within = f"{stamp}>=(?,?) AND {stamp}<(?,?) AND {stamp}<=(?,?)"
+            edited_stamp = stamp.replace("s.message_ts", "s.edited_at")
+            # 기간 밖의 나중 편집은 허용하되 원 질문 이후 편집된 내용은 당시 근거로 쓰지 않는다.
+            within += f" AND (s.edited_at='' OR {edited_stamp}<=(?,?))"
+            sources = "FROM memory_item_sources r JOIN memory_sources s ON s.tenant_id=r.tenant_id AND s.id=r.source_id WHERE r.tenant_id=i.tenant_id AND r.memory_id=i.id"
+            period_sql = f" AND EXISTS (SELECT 1 {sources} AND ({within})) AND NOT EXISTS (SELECT 1 {sources} AND NOT ({within}))"
+            source_bounds = (*bounds, *bounds[-2:])
+            period_arguments = (*source_bounds, *source_bounds)
         with self._connection() as connection:
             # 고정 허브만 같은 tenant의 비공개 원본 채널을 더 검색한다. DM·공개 채널은 그대로 격리한다.
-            rows = connection.execute("SELECT i.*,t.thread_ts FROM memory_items i JOIN memory_threads t ON t.tenant_id=i.tenant_id AND t.id=i.origin_thread_id WHERE i.tenant_id=? AND (i.scope_channel_id=? OR (? AND t.channel_kind='private_channel' AND t.channel_id=i.scope_channel_id)) AND i.status IN ('active','resolved') AND (i.valid_until IS NULL OR i.valid_until>?) ORDER BY i.updated_at DESC LIMIT 256", (tenant_id, channel_id, is_private_memory_hub(tenant_id, channel_id), self._clock())).fetchall()
+            rows = connection.execute("SELECT i.*,t.thread_ts FROM memory_items i JOIN memory_threads t ON t.tenant_id=i.tenant_id AND t.id=i.origin_thread_id WHERE i.tenant_id=? AND (i.scope_channel_id=? OR (? AND t.channel_kind='private_channel' AND t.channel_id=i.scope_channel_id)) AND i.status IN ('active','resolved') AND (i.valid_until IS NULL OR i.valid_until>?)" + period_sql + " ORDER BY i.updated_at DESC LIMIT 256", (tenant_id, channel_id, is_private_memory_hub(tenant_id, channel_id), self._clock(), *period_arguments)).fetchall()
             ranked = [(100, 0, item) for item in self._personal_style_candidates(connection, tenant_id, actor_id)]
             for row in rows:
                 own = row["kind"] == "person" and row["subject_user_id"] == actor_id and row["category"] == "preference"
@@ -828,9 +858,15 @@ class MemoryStore:
                 # 교차 채널에서 같은 timestamp가 있어도 현재 스레드로 가산하지 않는다.
                 current = row["scope_channel_id"] == channel_id and row["thread_ts"] == thread_ts
                 matching = sum(word in (row["topic_key"] + " " + row["text"]).casefold() for word in words)
-                if not (own or target or current or matching):
+                # 작성자 없는 날짜 요약은 기간 자체로 후보를 고르고 주제 점수는 그대로 쓴다.
+                if not (own or target or current or matching or dated):
                     continue
                 item = self._item(connection, row)
+                # 정밀 helper도 ranking과 8개/3스레드/본문 예산보다 먼저 적용한다.
+                # 본인 표준 선호는 별도 ranked 목록의 표준 선호 예외로 그대로 유지한다.
+                if period is not None and (not item["sources"] or any(
+                        not is_within_live_query_period(source["messageTs"], period) for source in item["sources"])):
+                    continue
                 if not item["sources"] or any(
                     source["state"] != "current" or not can_read_memory_source(
                         tenant_id, channel_id, source["channelId"], source["channelKind"])

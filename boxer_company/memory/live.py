@@ -9,7 +9,8 @@ from typing import Any, Mapping, Sequence
 
 from .access import can_query_private_live_sources, can_read_memory_source
 from .contracts import MemoryError, canonical_digest
-from .live_query import is_within_live_query_period, resolve_live_query_period
+from .live_query import is_within_live_query_period, live_query_period_error, resolve_live_query_period
+from .live_limits import LIVE_BUNDLE_MAX_BYTES, LIVE_SOURCE_MAX_CHARS, LIVE_TOTAL_MAX_CHARS, live_bundle_size
 from .policy import normalize_source
 
 
@@ -42,13 +43,21 @@ def normalize_live_sources(
     if not can_query_private_live_sources(tenant_id, destination_channel_id, destination_channel_kind):
         raise MemoryError("memory_live_destination_forbidden")
     _timestamp_iso(before_ts)
+    # 날짜가 명시됐지만 해석되지 않으면 최근 발언을 대신 받아 다른 기간의 근거로 쓰지 않는다.
+    if live_query_period_error(question, before_ts) is not None:
+        raise MemoryError("memory_live_period_invalid")
     period = resolve_live_query_period(question, before_ts)
-    if (not isinstance(sources, Sequence) or isinstance(sources, (str, bytes))
-            or len(sources) > 8):
+    if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
         raise MemoryError("memory_live_sources_invalid")
-    if (not isinstance(context_messages, Sequence) or isinstance(context_messages, (str, bytes))
-            or len(sources) + len(context_messages) > 12):
+    if not isinstance(context_messages, Sequence) or isinstance(context_messages, (str, bytes)):
         raise MemoryError("memory_live_contexts_invalid")
+    # 발언 수 대신 실제 원문과 metadata를 합친 전송량을 제한한다. 원래 입력 전체가 예산 대상이다.
+    try:
+        bundle_bytes = live_bundle_size(sources, context_messages)
+    except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+        raise MemoryError("memory_live_sources_invalid") from exc
+    if bundle_bytes > LIVE_BUNDLE_MAX_BYTES:
+        raise MemoryError("memory_live_sources_too_large")
     if (not isinstance(author_ids, Sequence) or isinstance(author_ids, (str, bytes))
             or any(not isinstance(author, str) or not author or len(author) > 128 for author in author_ids)):
         raise MemoryError("memory_live_authors_invalid")
@@ -70,8 +79,10 @@ def normalize_live_sources(
         context_counts[key] = context_counts.get(key, 0) + 1
         if context_counts[key] > 5:
             raise MemoryError("memory_live_contexts_too_many")
+        if len(context["text"]) > LIVE_SOURCE_MAX_CHARS:
+            raise MemoryError("memory_live_sources_too_large")
         total_chars += len(context["text"])
-    if total_chars > 8000:
+    if total_chars > LIVE_TOTAL_MAX_CHARS:
         raise MemoryError("memory_live_sources_too_large")
     normalized: dict[str, dict[str, Any]] = {}
     seen_messages: dict[tuple[str, str], str] = {}
@@ -96,8 +107,10 @@ def normalize_live_sources(
                 raise MemoryError("source_edited_after_capture_cutoff")
         if allowed_authors and source["authorId"] not in allowed_authors:
             raise MemoryError("memory_live_source_author_invalid")
+        if len(source["text"]) > LIVE_SOURCE_MAX_CHARS:
+            raise MemoryError("memory_live_sources_too_large")
         total_chars += len(source["text"])
-        if total_chars > 8000:
+        if total_chars > LIVE_TOTAL_MAX_CHARS:
             raise MemoryError("memory_live_sources_too_large")
         # sourceId·작성자 종류는 입력값을 채택하지 않고 기존 원문 검증으로 다시 계산한다.
         accepted = normalize_source(
@@ -123,8 +136,8 @@ def normalize_live_sources(
         item = {
             "memoryId": "live_" + accepted["sourceId"], "kind": "utterance", "category": "statement",
             "topicKey": "live_slack_utterance", "evidenceType": "direct_statement", "status": "active",
-            "version": 1, "subjectUserId": accepted["authorId"], "text": accepted["text"][:1000],
-            "excerptOnly": len(accepted["text"]) > 1000, "liveSource": True, "updatedAt": updated_at,
+            "version": 1, "subjectUserId": accepted["authorId"], "text": accepted["text"],
+            "excerptOnly": False, "liveSource": True, "updatedAt": updated_at,
             "threadTs": source["threadTs"],
             "threadId": "live_thr_" + canonical_digest([tenant_id, source["channelId"], source["threadTs"]]),
             "deletionEpoch": 0, "sources": [reference],
@@ -179,19 +192,21 @@ def normalize_live_sources(
             continue
         if accepted["sourceId"] == anchor_source["sourceId"]:
             continue
-        row = {"text": accepted["text"][:1000], "authorId": accepted["authorId"], "authorKind": "human",
+        row = {"text": accepted["text"], "authorId": accepted["authorId"], "authorKind": "human",
             "sourceId": accepted["sourceId"], "relation": relation, "messageTs": accepted["messageTs"],
             "threadTs": context["threadTs"], "channelId": context["channelId"], "channelKind": "private_channel",
             "revisionHash": accepted["revisionHash"], "permalink": accepted["permalink"],
-            "editedAt": context.get("editedAt", ""), "excerptOnly": len(accepted["text"]) > 1000,
+            "editedAt": context.get("editedAt", ""), "excerptOnly": False,
             "anchorMessageTs": context["anchorMessageTs"]}
         context_key = anchor["memoryId"], accepted["sourceId"]
         if context_key in contexts and contexts[context_key] != row:
             raise MemoryError("memory_live_context_conflict")
         contexts[context_key] = row
+    # 대상 수가 많아져도 문맥 연결 때 전체 발언 목록을 반복 탐색하지 않는다.
+    by_memory_id = {item["memoryId"]: item for item in normalized.values()}
     for (memory_id, _), row in sorted(contexts.items(), key=lambda entry: (
             Decimal(entry[1]["messageTs"]), entry[1]["sourceId"])):
-        anchor = next(item for item in normalized.values() if item["memoryId"] == memory_id)
+        anchor = by_memory_id[memory_id]
         anchor["contextMessages"].append(row)
         # 모든 문맥 출처도 기존 마지막 수정/삭제 검사의 대상이 되어 묶음 전체를 무효화한다.
         anchor["sources"].append({key: row[key] for key in (

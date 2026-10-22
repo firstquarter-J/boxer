@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+import json
 import logging
 import re
 import threading
@@ -15,7 +16,13 @@ from boxer_company.assistant.contracts import AssistantMessage, CompanyAssistant
 from boxer_company.memory.commands import MEMORY_MANAGE_ROUTE, parse_memory_command
 from boxer_company.memory.access import can_query_private_live_sources, is_private_memory_hub
 from boxer_company.memory.contracts import MemoryError, canonical_digest, source_revision
-from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period, wants_private_live_sources
+from boxer_company.memory.live_limits import LIVE_CACHE_MAX_BYTES, LIVE_RETRIEVAL_LEASE_SECONDS
+from boxer_company.memory.live_query import (
+    is_within_live_query_period,
+    live_query_period_error,
+    resolve_live_query_period,
+    wants_private_live_sources,
+)
 from boxer_company.memory.policy import is_safe_memory_text
 from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company_api.memory_schemas import MemoryCaptureOutput
@@ -38,6 +45,7 @@ class _PreparedRetrieval:
     live_channel_count: int = 0
     live_received_at: float | None = None
     live_generation: int = 0
+    live_size: int = 0
 
 
 class MemoryService:
@@ -58,7 +66,13 @@ class MemoryService:
         self._lock = threading.Lock()
 
     def _prune_live_sources(self, now: float) -> None:
-        self._live_source_events = {key: value for key, value in self._live_source_events.items() if now - value[0] < 60}
+        # 60초 수집 중 도착한 수정과 삭제도 원 요청 lease가 끝날 때까지 기억한다.
+        self._live_source_events = {key: value for key, value in self._live_source_events.items()
+                                    if now - value[0] < LIVE_RETRIEVAL_LEASE_SECONDS}
+        for prepared in self._cache.values():
+            if prepared.live_received_at is not None and now - prepared.live_received_at > 10:
+                prepared.live_entries = ()
+                prepared.live_size = 0
 
     def status(self) -> str:
         if not self.enabled:
@@ -69,9 +83,6 @@ class MemoryService:
                 now = self._clock()
                 self._prune_live_sources(now)
                 self._cache = OrderedDict((key, value) for key, value in self._cache.items() if value.expires_at > now)
-                for value in self._cache.values():
-                    if value.live_received_at is not None and now - value.live_received_at > 10:
-                        value.live_entries = ()
             return "ok" if self.store is not None and self.store.health() else "degraded"
         except Exception:
             return "degraded"
@@ -124,11 +135,17 @@ class MemoryService:
         if (not self.read_enabled and not management) or not self._eligible(request, management=management) or not is_safe_memory_text(request.question):
             return {"retrievalId": None, "sources": []}
         memory = request.memory_context or {}
+        stamp = str(memory.get("currentMessageTs") or "")
+        period_error = None if management else live_query_period_error(request.question, stamp)
+        period = None if management else resolve_live_query_period(request.question, stamp)
         mentioned: set[str] = set()
         if parse_memory_command(request.question) is not None:
             candidates = self.store.list_own_memories(
                 tenant_id=request.tenant_id, channel_id=memory["channelId"], actor_id=request.actor_id,
             )
+        elif period_error is not None:
+            # 잘못되거나 상충한 날짜를 무시한 채 최신 기억과 실시간 조회로 대체하지 않는다.
+            candidates = []
         else:
             # 프로필과 같은 조사 경계로 작성자 ID를 정하고 원문 조회 계획에도 재사용한다.
             mentioned = self._mentioned_user_ids(request.question)
@@ -136,11 +153,18 @@ class MemoryService:
                 tenant_id=request.tenant_id, channel_id=memory["channelId"],
                 actor_id=request.actor_id, thread_ts=request.conversation_id,
                 question=request.question, limit=8, mentioned_user_ids=tuple(mentioned - {""}),
+                period=period,
             )
         # 한 번 확인할 수 있는 원본 스레드만 골라 조회를 무한 확장하지 않는다.
         threads: set[tuple[str, str]] = set()
         selected, refs = [], {}
         for candidate in candidates:
+            # 기간 밖 출처가 섞인 요약이 검증 예산을 먼저 차지하지 않게 후보 단계에서도 거른다.
+            if (period is not None and candidate.get("kind") != "personal_style"
+                    and candidate.get("styleOnly") is not True and not (
+                    candidate.get("sources") and all(is_within_live_query_period(
+                        source.get("messageTs"), period) for source in candidate["sources"]))):
+                continue
             candidate_threads = {(source["channelId"], source["threadTs"]) for source in candidate["sources"]}
             candidate_ids = {source["sourceId"] for source in candidate["sources"]}
             if len(threads | candidate_threads) > 3 or len(set(refs) | candidate_ids) > 64:
@@ -163,7 +187,7 @@ class MemoryService:
         # 허브 외에는 바인딩된 비공개 원채널만 읽으며 관리 명령은 제외한다.
         live_query = None
         destination_kind = memory.get("channelKind")
-        if (not management and can_query_private_live_sources(request.tenant_id,
+        if (not management and period_error is None and can_query_private_live_sources(request.tenant_id,
                 str(memory["channelId"]), destination_kind)
                 and wants_private_live_sources(request.question, tuple(mentioned))):
             live_query = {"tenantId": request.tenant_id, "actorId": request.actor_id,
@@ -175,10 +199,10 @@ class MemoryService:
             self._cache = OrderedDict((key, value) for key, value in self._cache.items() if value.expires_at > now)
             while len(self._cache) >= 1024:
                 self._cache.popitem(last=False)
-            self._cache[retrieval_id] = _PreparedRetrieval(now + 60, self._binding(request), selected,
+            self._cache[retrieval_id] = _PreparedRetrieval(now + LIVE_RETRIEVAL_LEASE_SECONDS, self._binding(request), selected,
                 live_query, live_destination_channel_kind=destination_kind,
                 live_generation=self._live_generation)
-        result = {"retrievalId": retrieval_id, "sources": list(refs.values()), "expiresIn": 60}
+        result = {"retrievalId": retrieval_id, "sources": list(refs.values()), "expiresIn": LIVE_RETRIEVAL_LEASE_SECONDS}
         if live_query is not None:
             result["liveQuery"] = live_query
         return result
@@ -200,7 +224,7 @@ class MemoryService:
                            (("tenantId", tenant_id), ("actorId", actor_id),
                             ("channelId", channel_id), ("requestId", request_id)))):
                 raise MemoryError("memory_live_retrieval_not_found")
-            if coverage not in {"complete", "partial", "unavailable"} or type(channel_count) is not int or not 0 <= channel_count <= 200:
+            if coverage not in {"complete", "partial", "unavailable"} or type(channel_count) is not int or channel_count < 0:
                 raise MemoryError("memory_live_result_invalid")
             # 원채널 조회가 다른 채널까지 확인한 결과처럼 표시되지 않게 범위 수치도 제한한다.
             if not is_private_memory_hub(tenant_id, channel_id) and channel_count > 1:
@@ -226,7 +250,17 @@ class MemoryService:
                     for source in [*sources, *context_messages]})
                 accepted_count = len({(source["channelId"], source["messageTs"], source["revisionHash"])
                     for item in entries for source in item["sources"]})
+                live_size = len(json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                if live_size > LIVE_CACHE_MAX_BYTES:
+                    raise MemoryError("memory_live_result_too_large")
+                # 늘어난 원문이 동시 요청 수만큼 쌓이지 않게 오래된 원문 lease부터 제외한다.
+                for cached_id, cached in list(self._cache.items()):
+                    if sum(value.live_size for value in self._cache.values()) + live_size <= LIVE_CACHE_MAX_BYTES:
+                        break
+                    if cached_id != retrieval_id and cached.live_size:
+                        del self._cache[cached_id]
                 prepared.live_entries = entries
+                prepared.live_size = live_size
                 prepared.live_fingerprint = fingerprint
                 prepared.live_coverage = "partial" if coverage == "complete" and accepted_count < supplied_count else coverage
                 prepared.live_channel_count = channel_count
@@ -270,6 +304,9 @@ class MemoryService:
                     self._live_source_current(tenant_id, source) for source in item["sources"]))
                 if len(remaining) != len(prepared.live_entries):
                     prepared.live_entries = remaining
+                    # 삭제된 본문의 예산도 즉시 반환해 다른 정상 요청을 불필요하게 비우지 않는다.
+                    prepared.live_size = len(json.dumps(remaining, ensure_ascii=False,
+                        separators=(",", ":")).encode("utf-8")) if remaining else 0
                     prepared.live_coverage = "partial"
 
     def _unavailable_live_result(self, request: CompanyAssistantRequest) -> CompanyAssistantRequest:
@@ -292,6 +329,9 @@ class MemoryService:
             prepared = self._cache.pop(str(memory.get("retrievalId") or ""), None)
         if prepared is None or prepared.expires_at <= self._clock() or prepared.binding != self._binding(request):
             return self._unavailable_live_result(request) if not management else request
+        if not management and live_query_period_error(request.question, str(memory.get("currentMessageTs") or "")) is not None:
+            # prepare와 같은 원 질문으로 다시 판정해 잘못된 기간에 과거 기억이 끼어들지 않게 한다.
+            return self._unavailable_live_result(replace(request, memory_entries=()))
         try:
             source_refs = {source["sourceId"]: source for item in prepared.candidates for source in item["sources"]}
             for check in memory.get("verifications") or []:
@@ -311,7 +351,7 @@ class MemoryService:
                 candidates=prepared.candidates, verified_sources=list(memory.get("verifications") or []), limit=8,
                 actor_id=request.actor_id,
             )
-            period = resolve_live_query_period(request.question, str(memory.get("currentMessageTs") or ""))
+            period = None if management else resolve_live_query_period(request.question, str(memory.get("currentMessageTs") or ""))
             if period is not None:
                 # 날짜 질문에 과거 요약을 그날의 발언처럼 섞지 않는다. 본인 표준 선호는 보존한다.
                 verified = [item for item in verified if item.get("kind") == "personal_style" or (
@@ -332,17 +372,8 @@ class MemoryService:
                     coverage = "partial"
                 styles = [item for item in verified if item.get("kind") == "personal_style"]
                 ordinary = [item for item in verified if item.get("kind") != "personal_style"]
-                # 일반 질문은 저장 요약과 현재 원문을 함께, 최근 발언 질문은 시각순 원문부터 보여준다.
-                recent_utterances = period is not None or bool(re.search(r"최근|마지막|방금|요즘|직전", request.question)
-                    and re.search(r"말|발언|대화|썼|쓴|적은|보낸|메시지|글", request.question))
-                if recent_utterances:
-                    evidence = [*styles, *live, *ordinary][:8]
-                else:
-                    evidence = [*styles, *ordinary[:3], *live[:4]][:8]
-                    seen = {str(item.get("memoryId") or "") for item in evidence}
-                    evidence.extend(item for item in [*ordinary[3:], *live[4:]]
-                                    if item.get("memoryId") not in seen)
-                    evidence = evidence[:8]
+                # 발언 개수로 자르지 않고 최종 renderer의 원문과 JSON 예산까지 모두 전달한다.
+                evidence = [*styles, *live, *ordinary]
                 notice = {"kind": "retrieval_status", "coverage": coverage,
                           "channelCount": prepared.live_channel_count, "sourceCount": len(live),
                           "scope": "accessible_private_channels" if is_private_memory_hub(

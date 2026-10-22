@@ -1,6 +1,8 @@
 """실시간 원문 수집의 private 경계·작성자·시간·부분 조회 계약을 SDK mock으로 검증한다."""
 
+from datetime import datetime
 from decimal import Decimal
+import json
 
 import pytest
 
@@ -48,7 +50,7 @@ class Slack:
     def take(self, method, kwargs, value):
         self.calls.append((method, kwargs))
         if self.elapsed is not None:
-            self.elapsed[0] += self.delay
+            self.elapsed[0] += min(self.delay, self.timeouts[-1])
         if isinstance(value, Exception):
             raise value
         return value
@@ -146,6 +148,133 @@ def dated_message(ts, **extra):
     return {"ts": ts, "user": "UDD", "text": "안내문 검토를 마쳤어", **extra}
 
 
+def calendar_stamp(value):
+    return f"{int(datetime.fromisoformat(value).timestamp())}.000000"
+
+
+class CalendarSlack(Slack):
+    """시간 창을 실제로 적용해 과거로 이동하지 않는 조회를 빈 결과로 드러낸다."""
+
+    def __init__(self, messages, **kwargs):
+        super().__init__(**kwargs)
+        self.messages = messages
+
+    def conversations_history(self, **kwargs):
+        oldest = Decimal(kwargs.get("oldest", "0"))
+        latest = Decimal(kwargs["latest"])
+        rows = [row for row in self.messages if not row.get("thread_ts")
+                and oldest <= Decimal(row["ts"]) <= latest]
+        rows.sort(key=lambda row: Decimal(row["ts"]), reverse=True)
+        return self.take("history", kwargs, page("messages", rows[:kwargs["limit"]]))
+
+    def conversations_replies(self, **kwargs):
+        oldest = Decimal(kwargs.get("oldest", kwargs["ts"]))
+        latest = Decimal(kwargs["latest"])
+        rows = [row for row in self.messages if (row.get("thread_ts") or row["ts"]) == kwargs["ts"]
+                and oldest <= Decimal(row["ts"]) <= latest]
+        rows.sort(key=lambda row: Decimal(row["ts"]))
+        return self.take("replies", kwargs, page("messages", rows[:kwargs["limit"]]))
+
+
+@pytest.mark.parametrize("date_words,start_at,end_at", [
+    ("작년", "2025-01-01T00:00:00+09:00", "2026-01-01T00:00:00+09:00"),
+    ("2026년 8월", "2026-08-01T00:00:00+09:00", "2026-09-01T00:00:00+09:00"),
+    ("8월", "2026-08-01T00:00:00+09:00", "2026-09-01T00:00:00+09:00"),
+    ("2026년 8월 15일", "2026-08-15T00:00:00+09:00", "2026-08-16T00:00:00+09:00"),
+    ("2026-08-15", "2026-08-15T00:00:00+09:00", "2026-08-16T00:00:00+09:00"),
+    ("8월 15일부터 17일까지", "2026-08-15T00:00:00+09:00", "2026-08-18T00:00:00+09:00"),
+    ("지난달", "2026-09-01T00:00:00+09:00", "2026-10-01T00:00:00+09:00"),
+    ("지난주", "2026-10-12T00:00:00+09:00", "2026-10-19T00:00:00+09:00"),
+    ("최근 3일", "2026-10-20T00:00:00+09:00", "2026-10-23T00:00:00+09:00"),
+    ("올해", "2026-01-01T00:00:00+09:00", "2027-01-01T00:00:00+09:00"),
+])
+def test_calendar_period_jumps_history_and_filters_replies_at_both_boundaries(date_words, start_at, end_at):
+    # 이전 기간의 부모는 남겨 두고 대상 댓글만 [시작, 끝)과 원 질문 시각으로 제한한다.
+    cutoff = calendar_stamp("2026-10-22T15:00:00+09:00")
+    start, end = calendar_stamp(start_at), calendar_stamp(end_at)
+    latest = min((cutoff, end), key=Decimal)
+    parent_ts = str(Decimal(start) - 86400)
+    last_ts = str(min(Decimal(cutoff), Decimal(end) - Decimal("0.000001")))
+    after_cutoff = str(Decimal(cutoff) + Decimal("0.000001"))
+    parent = {**dated_message(parent_ts), "user": "UOTHER", "reply_count": 5, "latest_reply": after_cutoff}
+    reply_stamps = [str(Decimal(start) - Decimal("0.000001")), start, last_ts, end, after_cutoff]
+    messages = [parent, *[dated_message(ts, thread_ts=parent_ts) for ts in reply_stamps]]
+    slack = CalendarSlack(messages)
+
+    result = collect(slack, question=f"디디가 {date_words} 한 말 알려줘", before_ts=cutoff)
+
+    assert [source["messageTs"] for source in result["sources"]] == [last_ts, start]
+    discovery = [kwargs for method, kwargs in slack.calls if method == "history" and "oldest" not in kwargs]
+    assert len(discovery) == 1 and discovery[0]["latest"] == latest
+    replies = [kwargs for method, kwargs in slack.calls if method == "replies"
+               and kwargs.get("oldest") == start and kwargs["latest"] == latest]
+    assert len(replies) == 1
+    assert any(row["messageTs"] == parent_ts and row["relation"] == "thread_parent"
+               for row in result["contextMessages"])
+    assert all(row["threadTs"] == parent_ts for row in result["sources"])
+    assert all(Decimal(row["messageTs"]) <= Decimal(cutoff)
+               for row in [*result["sources"], *result.get("contextMessages", [])])
+
+
+@pytest.mark.parametrize("question", [
+    "디디가 2026년 2월 30일 한 말 알려줘", "디디가 13월에 한 말 알려줘",
+    "디디가 8월 17일부터 15일까지 한 말 알려줘", "디디가 오늘과 어제 한 말 알려줘",
+    "디디가 8월과 9월에 한 말 알려줘", "디디가 2027년 1월에 한 말 알려줘",
+])
+def test_invalid_ambiguous_and_future_dates_never_create_a_slack_client(question):
+    slack = Slack()
+    result = collect(slack, question=question, before_ts=calendar_stamp("2026-10-22T15:00:00+09:00"))
+    assert result == {"sources": [], "coverage": "unavailable", "channelCount": 0}
+    assert slack.calls == slack.timeouts == []
+
+
+@pytest.mark.parametrize("remaining_cursor,coverage", [("", "complete"), ("unread", "partial")])
+def test_past_month_history_pagination_keeps_its_end_and_old_thread_discovery(remaining_cursor, coverage):
+    # 페이지를 넘겨도 현재로 되돌아가지 않고 이전 달 부모의 해당 월 댓글을 찾는다.
+    parent_ts = calendar_stamp("2026-07-31T12:00:00+09:00")
+    reply_ts = calendar_stamp("2026-08-16T12:00:00+09:00")
+    root = {**dated_message(parent_ts), "user": "UOTHER", "reply_count": 1, "latest_reply": reply_ts}
+    other = {**dated_message(calendar_stamp("2026-08-31T12:00:00+09:00")), "user": "UOTHER"}
+    slack = Slack(history={
+        ("CONE", ""): page("messages", [other], "older"),
+        ("CONE", "older"): page("messages", [root], remaining_cursor),
+        ("CONE", "unread"): page("messages", [], "unread"),
+    }, replies={("CONE", parent_ts, ""): page("messages", [root, dated_message(reply_ts, thread_ts=parent_ts)])})
+
+    result = collect(slack, question="디디가 8월에 한 말 알려줘",
+                     before_ts=calendar_stamp("2026-10-22T15:00:00+09:00"))
+
+    assert [source["messageTs"] for source in result["sources"]] == [reply_ts]
+    assert result["coverage"] == coverage
+    history = [kwargs for method, kwargs in slack.calls if method == "history" and "cursor" in kwargs]
+    assert [kwargs["cursor"] for kwargs in history] == [None, "older", *(["unread"] if remaining_cursor else [])]
+    assert all(kwargs["latest"] == calendar_stamp("2026-09-01T00:00:00+09:00")
+               and "oldest" not in kwargs for kwargs in history)
+
+
+@pytest.mark.parametrize("question,month", [
+    ("8월 대화", 8), ("8월 대화 알려줘", 8), ("9월 대화 요약해줘", 9),
+    ("9월 대화 정리해줘", 9), ("9월 대화 요약", 9), ("9월 대화 정리", 9),
+])
+def test_unnamed_calendar_summary_does_not_filter_on_the_date_or_query_action(question, month):
+    ts = calendar_stamp(f"2026-{month:02d}-15T12:00:00+09:00")
+    slack = CalendarSlack([dated_message(ts)])
+    result = collect(slack, question=question, author_ids=[],
+                     before_ts=calendar_stamp("2026-10-22T15:00:00+09:00"))
+    assert [source["messageTs"] for source in result["sources"]] == [ts]
+    assert result["coverage"] == "complete"
+
+
+def test_unnamed_calendar_topic_keeps_the_topic_after_removing_the_period():
+    # 날짜를 지워도 실제 검색 주제까지 없어져 다른 발언을 반환하지 않게 한다.
+    matching = dated_message(calendar_stamp("2026-08-16T12:00:00+09:00"), text="회의 장소는 아직 미정이야")
+    other = dated_message(calendar_stamp("2026-08-15T12:00:00+09:00"), text="새로운 안내문을 확인했어")
+    slack = CalendarSlack([matching, other])
+    result = collect(slack, question="8월 대화 중 회의 정리해줘", author_ids=[],
+                     before_ts=calendar_stamp("2026-10-22T15:00:00+09:00"))
+    assert [source["messageTs"] for source in result["sources"]] == [matching["ts"]]
+
+
 @pytest.mark.parametrize("question,expected,reply_start,reply_end", [
     ("디디가 오늘 한 말 요약", ["1792350000.000001", "1792335600.000000"],
      "1792335600.000000", "1792350000.000001"),
@@ -190,22 +319,24 @@ def test_today_skips_thread_whose_verified_latest_hint_is_before_midnight():
 def test_date_window_reply_pagination_remains_partial_when_budget_does_not_finish():
     root_ts, first_ts, latest_ts = "1792200000.000001", "1792249200.000001", "1792350000.000001"
     root = dated_message(root_ts, reply_count=99, latest_reply=latest_ts)
+    elapsed = [0.0]
     slack = Slack(history={("CONE", ""): page("messages", [root])}, replies={
         ("CONE", root_ts, ""): page("messages", [dated_message(first_ts, thread_ts=root_ts)], "one"),
         ("CONE", root_ts, "one"): page("messages", [], "two"),
-    })
-    result = collect(slack, question="디디가 어제 한 말 요약", before_ts=latest_ts)
+    }, elapsed=elapsed, delay=.15)
+    result = collect(slack, question="디디가 어제 한 말 요약", before_ts=latest_ts,
+                     clock=lambda: elapsed[0], budget_seconds=1)
     assert result["coverage"] == "partial" and result["sources"][0]["messageTs"] == first_ts
     discovery = [kwargs for method, kwargs in slack.calls if method == "replies"
                  and kwargs.get("oldest") == "1792249200.000000" and kwargs["latest"] == "1792335600.000000"]
     assert len(discovery) == 2
-    assert len([method for method, _ in slack.calls if method == "replies"]) <= 2 + private_live_retrieval._MAX_CONTEXT_READS
+    assert elapsed[0] <= 1
 
 
 @pytest.mark.parametrize("overrides", [
     {"tenant_id": "TOTHER"}, {"destination_channel_id": "COTHER"}, {"actor_id": ""},
     {"is_allowed": lambda *_: False}, {"before_ts": "not-a-timestamp"},
-    {"budget_seconds": 0}, {"budget_seconds": float("inf")},
+    {"budget_seconds": 0}, {"budget_seconds": 60.001}, {"budget_seconds": float("inf")},
 ])
 def test_destination_tenant_actor_and_cutoff_fail_closed_before_sdk(overrides):
     slack = Slack()
@@ -331,9 +462,8 @@ def test_thread_pages_are_fairly_distributed_after_each_channels_latest_history(
     assert result["coverage"] == "complete"
 
 
-def test_latest_reply_on_old_parent_is_prioritized_under_small_read_budget(monkeypatch):
+def test_latest_reply_on_old_parent_is_prioritized_under_small_read_budget():
     # 부모 글이 오래됐어도 방금 달린 대상 작성자 댓글을 새 부모의 오래된 댓글보다 먼저 읽는다.
-    monkeypatch.setattr(private_live_retrieval, "_MAX_READ_CALLS", 3)
     old_parent = human(1, "UOTHER", reply_count=1, latest_reply=stamp(999))
     new_parent = human(100, "UOTHER", reply_count=1, latest_reply=stamp(101))
     elapsed = [0.0]
@@ -342,13 +472,12 @@ def test_latest_reply_on_old_parent_is_prioritized_under_small_read_budget(monke
         ("CONE", stamp(100), ""): page("messages", [new_parent, human(101, thread_ts=stamp(100))]),
     }, elapsed=elapsed, delay=.15)
     result = collect(slack, clock=lambda: elapsed[0], budget_seconds=1)
-    assert [kwargs["ts"] for method, kwargs in slack.calls if method == "replies"] == [stamp(1)]
+    assert next(kwargs["ts"] for method, kwargs in slack.calls if method == "replies") == stamp(1)
     assert [row["messageTs"] for row in result["sources"]] == [stamp(999)]
-    assert result["coverage"] == "partial" and elapsed[0] < 1
+    assert result["coverage"] == "partial" and elapsed[0] <= 1
 
 
-def test_latest_reply_beyond_first_two_thread_pages_is_read_by_exact_probe(monkeypatch):
-    monkeypatch.setattr(private_live_retrieval, "_MAX_READ_CALLS", 3)
+def test_latest_reply_beyond_first_two_thread_pages_is_read_by_exact_probe():
     root = human(1, "UOTHER", reply_count=300, latest_reply=stamp(999))
     slack = Slack(history={("CONE", ""): page("messages", [root])}, replies={
         ("CONE", stamp(1), ""): page("messages", [root, *[human(n, "UOTHER", thread_ts=stamp(1)) for n in range(2, 100)]], "second"),
@@ -423,25 +552,130 @@ def test_deadline_prevents_additional_sdk_calls_and_passes_bounded_timeouts():
     assert all(0 < value <= .2 for value in slack.timeouts)
 
 
-def test_total_call_channel_and_source_limits_are_explicitly_partial():
-    channels = [private(f"C{index:03}") for index in range(200)]
-    slack = Slack(channels={"": page("channels", channels)}, history={
+def test_time_and_text_budget_allow_more_than_the_old_call_channel_and_source_caps():
+    channels = [private(f"C{index:03}") for index in range(240)]
+    slack = Slack(channels={str(offset) if offset else "": page(
+        "channels", channels[offset:offset + 60], str(offset + 60) if offset + 60 < len(channels) else "")
+        for offset in range(0, len(channels), 60)}, history={
         (channel["id"], ""): page("messages", [human(index + 1)]) for index, channel in enumerate(channels)
     })
     result = collect(slack)
-    assert len(slack.calls) <= 32 and len(result["sources"]) == 8
-    assert result["channelCount"] > 8 and result["coverage"] == "partial"
-    assert len([call for call in slack.calls if call[0] == "link"]) == 8
+    assert len(slack.calls) > 32 and len(result["sources"]) == 240
+    assert result["channelCount"] == 240 and result["coverage"] == "complete"
+    assert len([call for call in slack.calls if call[0] == "list"]) == 4
+    assert len([call for call in slack.calls if call[0] == "link"]) == 240
     assert [Decimal(row["messageTs"]) for row in result["sources"]] == sorted(
         [Decimal(row["messageTs"]) for row in result["sources"]], reverse=True)
 
 
+def test_default_sixty_seconds_reads_many_pages_and_more_than_eight_thousand_characters():
+    # SDK 지연을 시계로만 흉내 내 기존 8초, 2페이지, 대상 8개를 모두 넘겨 확인한다.
+    elapsed = [0.0]
+    slack = Slack(history={("CONE", str(index) if index else ""): page(
+        "messages", [human(index + 1, text="가" * 500)], str(index + 1) if index < 19 else "")
+        for index in range(20)}, elapsed=elapsed, delay=1)
+    result = collect(slack, clock=lambda: elapsed[0])
+    assert result["coverage"] == "complete" and len(result["sources"]) == 20
+    assert sum(len(row["text"]) for row in result["sources"]) == 10_000
+    assert 30 < elapsed[0] <= 60
+    assert len([method for method, _ in slack.calls if method == "history"]) == 20
+    assert all(0 < timeout <= 2 for timeout in slack.timeouts)
+
+
+def test_sixty_second_deadline_returns_partial_without_reading_every_page():
+    elapsed = [0.0]
+    slack = Slack(history={("CONE", str(index) if index else ""): page(
+        "messages", [human(index + 1)], str(index + 1) if index < 74 else "")
+        for index in range(75)}, elapsed=elapsed, delay=1)
+    result = collect(slack, clock=lambda: elapsed[0])
+    assert result["coverage"] == "partial" and result["sources"]
+    assert elapsed[0] <= 60
+    discovery = [kwargs for method, kwargs in slack.calls if method == "history" and "cursor" in kwargs]
+    assert 2 < len(discovery) < 75
+
+
+def test_small_messages_are_not_limited_by_old_candidate_and_observation_counts():
+    slack = Slack(history={("CONE", str(index) if index else ""): page(
+        "messages", [human(index * 100 + offset + 1) for offset in range(100)],
+        str(index + 1) if index < 3 else "") for index in range(4)})
+    result = collect(slack)
+    assert len(result["sources"]) == 400 and result["coverage"] == "complete"
+    assert len({row["messageTs"] for row in result["sources"]}) == 400
+
+
+def test_body_budget_and_single_message_limit_exclude_whole_messages_without_truncation():
+    slack = Slack(history={("CONE", ""): page("messages", [
+        *[human(index, text="가나다라마바사"[index] * 16_000) for index in range(1, 7)],
+        human(7, text="가" * 16_001)])})
+    result = collect(slack)
+    assert [row["messageTs"] for row in result["sources"]] == [stamp(index) for index in range(6, 1, -1)]
+    assert all(len(row["text"]) == 16_000 for row in result["sources"])
+    assert sum(len(row["text"]) for row in result["sources"]) == 80_000
+    assert result["coverage"] == "partial"
+
+
+def test_metadata_and_utf8_bundle_bytes_are_bounded_without_a_source_count_cap(monkeypatch):
+    # 원문이 작아도 permalink 등 메타데이터를 포함한 실제 JSON 바이트로 제한한다.
+    monkeypatch.setattr(private_live_retrieval, "LIVE_BUNDLE_MAX_BYTES", 2000)
+    slack = Slack(history={("CONE", ""): page("messages", [human(index, text='가"\n') for index in range(1, 8)])})
+    result = collect(slack)
+    bundle = {"sources": result["sources"], "contextMessages": result.get("contextMessages", [])}
+    assert len(json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 2000
+    assert 0 < len(result["sources"]) < 7 and result["coverage"] == "partial"
+    assert all(row["text"] == '가"\n' for row in result["sources"])
+
+
+def test_thread_reply_pagination_reads_beyond_two_pages_when_time_and_text_fit():
+    parent = human(1, "UOTHER", reply_count=250)
+    slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
+        ("CONE", stamp(1), ""): page("messages", [parent, *[
+            human(index, thread_ts=stamp(1)) for index in range(2, 101)]], "second"),
+        ("CONE", stamp(1), "second"): page("messages", [
+            human(index, thread_ts=stamp(1)) for index in range(101, 201)], "third"),
+        ("CONE", stamp(1), "third"): page("messages", [
+            human(index, thread_ts=stamp(1)) for index in range(201, 252)]),
+    })
+    result = collect(slack)
+    assert len(result["sources"]) == 250 and result["coverage"] == "complete"
+    pages = [kwargs["cursor"] for method, kwargs in slack.calls if method == "replies" and "cursor" in kwargs]
+    assert pages == [None, "second", "third"]
+
+
+def test_context_phase_can_recover_more_than_four_missing_parents_within_its_time_budget():
+    parents = [human(index, "UOTHER") for index in range(1, 7)]
+    anchors = [human(index + 10, thread_ts=stamp(index)) for index in range(1, 7)]
+    slack = Slack(history={("CONE", ""): page("messages", anchors)}, replies={
+        ("CONE", parent["ts"], ""): page("messages", [parent]) for parent in parents})
+    result = collect(slack)
+    exact = [kwargs for method, kwargs in slack.calls if method == "replies"
+             and kwargs.get("oldest") == kwargs["latest"]]
+    assert len(exact) == 6 and len(result["sources"]) == 6
+    assert {row["messageTs"] for row in result["contextMessages"]} == {parent["ts"] for parent in parents}
+    assert all(row["relation"] == "thread_parent" for row in result["contextMessages"])
+
+
+def test_verification_metadata_budget_stops_reads_without_evicting_revision_history(monkeypatch):
+    # 발언 개수 제한을 되살리지 않고 이미 관측한 충돌 검증 metadata를 남긴 채 종료한다.
+    slack = Slack()
+    reader = private_live_retrieval._Reader(slack.factory, tenant=TENANT, authors=frozenset({"UDD"}),
+        keywords=(), cutoff=stamp(1000), is_allowed=lambda *_: True, clock=lambda: 0, budget=60)
+    for index in range(1, 11):
+        reader.message("CONE", human(index))
+    before = dict(reader.seen)
+    monkeypatch.setattr(private_live_retrieval, "LIVE_BUNDLE_MAX_BYTES", 1000)
+    assert reader.call("conversations_history", channel="CONE") is None
+    assert reader.seen == before and len(reader.seen) == 10
+    assert reader.partial and reader.read_halted and reader.metadata_halted
+    assert reader.call("chat_getPermalink", read=False, channel="CONE", message_ts=stamp(1)) is None
+    assert slack.calls == slack.timeouts == []
+
+
 @pytest.mark.parametrize("stream", ["channels", "history", "replies"])
-def test_page_limits_and_repeated_cursors_cannot_claim_complete(stream):
+def test_repeated_cursors_cannot_claim_complete(stream):
     root = human(1, reply_count=1, latest_reply=stamp(2))
     channels = {"": page("channels", [private()], "same"), "same": page("channels", [], "same")}
     history = {("CONE", ""): page("messages", [root], "next"),
-               ("CONE", "next"): page("messages", [], "more")}
+               ("CONE", "next"): page("messages", [], "next")}
     replies = {("CONE", stamp(1), ""): page("messages", [root], "same"),
                ("CONE", stamp(1), "same"): page("messages", [human(2, thread_ts=stamp(1))], "same")}
     slack = Slack(channels=channels if stream == "channels" else None,
@@ -455,9 +689,9 @@ def test_body_budget_never_truncates_original_text():
     slack = Slack(history={("CONE", ""): page("messages", [
         human(3, text="가" * 7000), human(2, text="나" * 2000), human(1, text="다" * 500)])})
     result = collect(slack)
-    assert [len(row["text"]) for row in result["sources"]] == [7000, 500]
-    assert sum(len(row["text"]) for row in result["sources"]) <= 8000
-    assert result["coverage"] == "partial"
+    assert [len(row["text"]) for row in result["sources"]] == [7000, 2000, 500]
+    assert sum(len(row["text"]) for row in result["sources"]) == 9500
+    assert result["coverage"] == "complete"
 
 
 @pytest.mark.parametrize("link", [
@@ -598,7 +832,7 @@ def test_missing_parent_is_read_by_bounded_exact_reply_request_without_new_ancho
     assert [row["messageTs"] for row in result["sources"]] == [stamp(3)]
     assert [(row["messageTs"], row["relation"]) for row in result["contextMessages"]] == [(stamp(1), "thread_parent")]
     reads = [kwargs for method, kwargs in slack.calls if method == "replies"]
-    assert 1 <= len(reads) <= private_live_retrieval._MAX_CONTEXT_READS
+    assert len(reads) >= 1
     assert reads[0]["oldest"] == reads[0]["latest"] == stamp(1)
     assert reads[0]["limit"] == 1
     assert all(row["ts"] == stamp(1) and Decimal(row["latest"]) <= Decimal(stamp(1000)) for row in reads)
@@ -621,29 +855,29 @@ def test_discovery_deadline_leaves_reserved_time_for_missing_parent_and_links():
     assert elapsed[0] < 1
     methods = [method for method, _ in slack.calls]
     assert methods[:3] == ["list", "history", "history"] and methods[-2:] == ["link", "link"]
-    assert 1 <= methods.count("replies") <= private_live_retrieval._MAX_CONTEXT_READS
+    assert methods.count("replies") >= 1
 
 
-def test_context_caps_preserve_eight_anchors_and_combined_twelve_message_budget():
+def test_context_selection_keeps_more_than_eight_anchors_without_a_total_message_cap():
     parent = human(1, "UOTHER", reply_count=9, latest_reply=stamp(10))
     slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
         ("CONE", stamp(1), ""): page("messages", [parent, *[human(i, thread_ts=stamp(1)) for i in range(2, 11)]])})
     result = collect(slack)
-    assert len(result["sources"]) == 8
-    assert len(result["sources"]) + len(result["contextMessages"]) == 12
+    assert len(result["sources"]) == 9
+    assert len(result["sources"]) + len(result["contextMessages"]) > 12
     assert all(sum(row["anchorMessageTs"] == anchor["messageTs"] for row in result["contextMessages"]) <= 5
                for anchor in result["sources"])
-    assert len([method for method, _ in slack.calls if method == "link"]) <= 12
+    assert len([method for method, _ in slack.calls if method == "link"]) == 10
 
 
-def test_context_total_text_budget_and_bad_permalink_do_not_remove_safe_anchor():
+def test_expanded_context_text_budget_and_bad_permalink_do_not_remove_safe_anchor():
     parent = human(1, "UOTHER", text="가" * 3000, reply_count=1, latest_reply=stamp(3))
     anchor = human(3, text="나" * 7000, thread_ts=stamp(1))
     slack = Slack(history={("CONE", ""): page("messages", [parent])}, replies={
         ("CONE", stamp(1), ""): page("messages", [parent, anchor])})
     result = collect(slack)
-    assert len(result["sources"]) == 1 and not result.get("contextMessages")
-    assert sum(len(row["text"]) for row in [*result["sources"], *result.get("contextMessages", [])]) <= 8000
+    assert len(result["sources"]) == 1 and len(result["contextMessages"]) == 1
+    assert sum(len(row["text"]) for row in [*result["sources"], *result["contextMessages"]]) == 10000
     parent["text"] = "제목 확인했어?"
     slack.links[("CONE", stamp(1))] = {"ok": True, "permalink": "https://evil.example/context"}
     result = collect(slack)

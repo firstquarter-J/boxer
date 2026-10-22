@@ -6,6 +6,10 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from boxer_company.memory.live_limits import (
+    LIVE_BUNDLE_MAX_BYTES, LIVE_SOURCE_MAX_CHARS, LIVE_TOTAL_MAX_CHARS, live_bundle_size,
+)
+
 
 Identifier = Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$")]
 SlackTs = Annotated[str, Field(pattern=r"^\d{10,16}\.\d{6}$")]
@@ -68,7 +72,7 @@ class MemoryLiveSourceInput(MemoryInput):
     messageTs: SlackTs
     revisionHash: Digest
     authorId: Identifier
-    text: str = Field(min_length=1, max_length=8000, repr=False)
+    text: str = Field(min_length=1, max_length=LIVE_SOURCE_MAX_CHARS, repr=False)
     permalink: str = Field(min_length=1, max_length=2048)
     editedAt: str = Field(default="", max_length=64)
 
@@ -84,16 +88,18 @@ class MemoryLiveResultInput(MemoryInput):
     actorId: Identifier
     channelId: Identifier
     requestId: Identifier
-    sources: list[MemoryLiveSourceInput] = Field(default_factory=list, max_length=8)
-    contextMessages: list[MemoryLiveContextInput] = Field(default_factory=list, max_length=12)
+    sources: list[MemoryLiveSourceInput] = Field(default_factory=list)
+    contextMessages: list[MemoryLiveContextInput] = Field(default_factory=list)
     coverage: Literal["complete", "partial", "unavailable"]
-    channelCount: int = Field(default=0, ge=0, le=200)
+    channelCount: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_budget(self) -> "MemoryLiveResultInput":
         # 원문은 한 turn의 짧은 검증 캐시에만 전달하고 과도한 payload는 받지 않는다.
         rows = [*self.sources, *self.contextMessages]
-        if len(rows) > 12 or sum(len(source.text) for source in rows) > 8000:
+        if (sum(len(source.text) for source in rows) > LIVE_TOTAL_MAX_CHARS
+                or live_bundle_size([source.model_dump() for source in self.sources],
+                                    [source.model_dump() for source in self.contextMessages]) > LIVE_BUNDLE_MAX_BYTES):
             raise ValueError("live source budget exceeded")
         counts: dict[tuple[str, str], int] = {}
         for context in self.contextMessages:

@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 import requests
 
+from boxer_company.memory.live_limits import LIVE_BUNDLE_MAX_BYTES, live_bundle_size
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiClientSettings,
     CompanyApiContractError,
@@ -27,6 +28,10 @@ class CompanyMemoryApiClient:
         # 경로는 호출 코드의 고정 endpoint와 API가 발행한 ID로만 조립한다.
         if not path.startswith("/internal/v1/memory/") or ".." in path:
             raise CompanyApiContractError("company_memory_path_invalid")
+        # 대량 발언도 고정 개수 대신 같은 원문 bundle의 실제 JSON 크기로 전송을 제한한다.
+        if path.endswith("/live") and live_bundle_size(
+                payload.get("sources") or [], payload.get("contextMessages") or []) > LIVE_BUNDLE_MAX_BYTES:
+            raise CompanyApiContractError("company_memory_payload_too_large")
         session = self._session or getattr(self._local, "session", None)
         if session is None:
             session = self._local.session = requests.Session()

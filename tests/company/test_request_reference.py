@@ -1,7 +1,7 @@
 """모델에 실제 질문의 KST 기준일과 등록된 화자 이름을 함께 전달한다."""
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 import json
 from unittest.mock import Mock
 
@@ -50,6 +50,33 @@ def test_yesterday_uses_question_day_and_keeps_statement_day_separate():
     assert context["requestedPeriod"]["kind"] == "yesterday"
     assert context["requestedPeriod"]["startAtKst"] == "2026-10-18T00:00:00+09:00"
     assert context["requestedPeriod"]["endAtKst"] == "2026-10-19T00:00:00+09:00"
+
+
+@pytest.mark.parametrize("question,start,end", [
+    ("디디가 올해 욕 몇번이나 했어?", "2026-01-01", "2027-01-01"),
+    ("디디가 지난달 한 말 요약", "2026-09-01", "2026-10-01"),
+    ("디디가 지난주 한 말 요약", "2026-10-12", "2026-10-19"),
+    ("디디가 2026-10-18에 한 말", "2026-10-18", "2026-10-19"),
+    ("디디가 9월 1일부터 15일까지 한 말", "2026-09-01", "2026-09-16"),
+])
+def test_model_receives_resolved_calendar_period_from_original_question(question, start, end):
+    # 처리가 다음 날 이뤄져도 API와 같은 원 질문 시각으로 기간을 전달한다.
+    context = facts(build_request_reference_context(request(question), now=datetime(2027, 1, 1, tzinfo=UTC)))
+    assert context["requestedPeriod"]["startAtKst"] == start + "T00:00:00+09:00"
+    assert context["requestedPeriod"]["endAtKst"] == end + "T00:00:00+09:00"
+    assert context["requestedPeriod"]["endExclusive"] is True
+    assert context["requestedPeriod"]["cutoffAtKst"] == "2026-10-19T00:02:03.456789+09:00"
+
+
+@pytest.mark.parametrize("question,error", [
+    ("디디가 2026-02-30에 한 말", "invalid"),
+    ("디디가 오늘과 어제 한 말", "ambiguous"),
+    ("디디가 2027년에 한 말", "future"),
+])
+def test_unusable_period_is_not_presented_as_recent_or_today(question, error):
+    context = facts(build_request_reference_context(request(question)))
+    assert context["requestedPeriodError"] == error
+    assert "requestedPeriod" not in context
 
 
 @pytest.mark.parametrize("fraction,expected", [("1", "100000"), ("123456", "123456"), ("123456789", "123456")])

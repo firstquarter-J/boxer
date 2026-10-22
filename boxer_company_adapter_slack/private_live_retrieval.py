@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from decimal import Decimal
+import json
 import re
 import time
 import unicodedata
@@ -13,7 +14,20 @@ from urllib.parse import parse_qsl, urlsplit
 from boxer_company._operation_routing_knowledge import TEAM_MEMBER_ALIASES_BY_NAME
 from boxer_company.memory.access import can_query_private_live_sources, is_private_memory_hub
 from boxer_company.memory.contracts import source_revision
-from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period, wants_private_live_sources
+from boxer_company.memory.live_limits import (
+    LIVE_BUNDLE_MAX_BYTES,
+    LIVE_QUERY_SECONDS,
+    LIVE_SOURCE_MAX_CHARS,
+    LIVE_TOTAL_MAX_CHARS,
+    live_bundle_size,
+)
+from boxer_company.memory.live_query import (
+    is_within_live_query_period,
+    live_query_period_error,
+    resolve_live_query_period,
+    strip_live_query_period,
+    wants_private_live_sources,
+)
 from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
 from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company_adapter_slack.conversation_memory import _data, _safe_permalink
@@ -21,21 +35,9 @@ from boxer_company_adapter_slack.conversation_memory import _data, _safe_permali
 
 _TS = re.compile(r"^[0-9]{1,20}\.[0-9]{1,9}$")
 _CHANNEL = re.compile(r"^[CG][A-Z0-9]+$")
-_MAX_CALLS = 32
-_MAX_READ_CALLS = 24
-_MAX_CHANNELS = 200
-_MAX_LIST_PAGES = 3
-_MAX_HISTORY_PAGES = 2
-_MAX_REPLY_PAGES = 2
 _PAGE_SIZE = 100
-_MAX_SOURCES = 8
-_MAX_BUNDLE_MESSAGES = 12
 _MAX_CONTEXT_PER_ANCHOR = 5
-_MAX_CONTEXT_READS = 4
-_MAX_TEXT = 8_000
-_MAX_CANDIDATES = 64
-_MAX_OBSERVATIONS = 256
-_MAX_OBSERVATION_TEXT = 128_000
+_EMPTY_BUNDLE_BYTES = live_bundle_size([])
 _ALIASES = tuple(alias for aliases in TEAM_MEMBER_ALIASES_BY_NAME.values() for alias in aliases)
 _QUESTION_WORDS = frozenset({
     "최근", "최근에", "최근의", "요즘", "요새", "지난", "오늘", "어제", "이번", "대화", "기록",
@@ -45,6 +47,7 @@ _QUESTION_WORDS = frozenset({
     "나온", "했는지", "했나요", "해줘", "내역", "무슨", "어디", "알려", "찾아",
     "비공개", "채널", "비공개채널", "사람들", "전부", "모두", "모든", "소식", "뭐있어",
     "최근대화", "최근발언", "최근소식", "최근말", "어떤말", "무슨말",
+    "요약", "요약해줘", "정리", "정리해줘",
 })
 _WORD_ENDINGS = ("에서는", "에게는", "한테는", "에서", "에는", "에도", "에게", "한테", "으로", "은", "는", "이", "가", "을", "를", "의", "에", "도", "만")
 
@@ -69,6 +72,10 @@ def _timestamp(value: Any) -> Decimal | None:
     return Decimal(value) if isinstance(value, str) and _TS.fullmatch(value) else None
 
 
+def _entry_bytes(value: Mapping[str, Any]) -> int:
+    return live_bundle_size([value]) - _EMPTY_BUNDLE_BYTES
+
+
 class _Reader:
     def __init__(self, client_factory: Callable[[float], Any], *, tenant: str, authors: frozenset[str],
                  keywords: tuple[str, ...], cutoff: str, is_allowed: Callable[[str, str], bool],
@@ -78,7 +85,7 @@ class _Reader:
         self.period = period
         started = clock()
         self.deadline = started + budget
-        # 대상 탐색·빠진 부모 보완·링크 확인을 나눠 8초 안에서 근거 반환 여유를 남긴다.
+        # 대상 탐색, 빠진 부모 보완, 링크 확인에 시간을 나눠 전체 마감 안에서 근거를 반환한다.
         self.read_deadline = started + budget * .55
         self.context_deadline = started + budget * .7
         self.calls = 0
@@ -89,16 +96,53 @@ class _Reader:
         self.thread_windows: dict[tuple[str, str], tuple[str, str]] = {}
         self.candidates: dict[tuple[str, str], dict[str, Any]] = {}
         self.observations: dict[tuple[str, str], dict[str, Any]] = {}
+        self.candidate_sizes: dict[tuple[str, str], tuple[int, int]] = {}
+        self.observation_sizes: dict[tuple[str, str], tuple[int, int]] = {}
+        self.candidate_budget = [0, _EMPTY_BUNDLE_BYTES]
+        self.observation_budget = [0, _EMPTY_BUNDLE_BYTES]
         self.seen: dict[tuple[str, str], tuple[str, str, str]] = {}
         self.conflicted: set[tuple[str, str]] = set()
         self.rejected: set[tuple[str, str]] = set()
         self.memberships: dict[str, bool] = {}
         self.permalinks: dict[tuple[str, str], str | None] = {}
+        self.channel_ids: list[str] = []
+        self.channel_cursors: set[str] = set()
+        self.scan_roots: dict[tuple[str, str], dict[str, Any]] = {}
+        self.scan_queues: dict[str, deque] = {}
+        self.metadata_halted = False
+
+    def metadata_available(self) -> bool:
+        # 충돌 검증 이력을 버리면 같은 원문이 되살아날 수 있어, metadata 초과는 읽기만 멈춘다.
+        if self.metadata_halted:
+            return False
+
+        def serializable(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return [[serializable(key), serializable(item)] for key, item in value.items()]
+            if isinstance(value, (tuple, list, set, deque)):
+                return [serializable(item) for item in value]
+            return value
+
+        values = (self.seen, self.conflicted, self.rejected, self.memberships, self.permalinks,
+                  self.channels_read, self.complete_channels, self.channel_ids, self.channel_cursors,
+                  self.scan_roots, self.scan_queues, self.thread_windows,
+                  self.candidate_sizes, self.observation_sizes)
+        try:
+            size = len(json.dumps(serializable(values), ensure_ascii=False, separators=(",", ":"),
+                                  allow_nan=False).encode("utf-8"))
+        except (TypeError, ValueError, OverflowError, UnicodeError):
+            size = LIVE_BUNDLE_MAX_BYTES + 1
+        if size > LIVE_BUNDLE_MAX_BYTES:
+            self.partial = self.read_halted = self.metadata_halted = True
+            return False
+        return True
 
     def call(self, method: str, *, read: bool = True, **kwargs: Any) -> Mapping[str, Any] | None:
+        if not self.metadata_available():
+            return None
         deadline = self.read_deadline if read else self.deadline
         remaining = deadline - self.clock()
-        if remaining <= 0 or self.calls >= (_MAX_READ_CALLS if read else _MAX_CALLS) or (read and self.read_halted):
+        if remaining <= 0 or (read and self.read_halted):
             self.partial = True
             return None
         self.calls += 1
@@ -161,9 +205,10 @@ class _Reader:
         return [accepted] if accepted == channel_id else []
 
     def channels(self) -> list[str]:
-        channels: list[str] = []
-        cursor, visited = "", set()
-        for _ in range(_MAX_LIST_PAGES):
+        channels = self.channel_ids
+        cursor, visited = "", self.channel_cursors
+        # 페이지 수 대신 남은 시간과 커서 순환 여부로 종료한다.
+        while self.clock() < self.read_deadline and not self.read_halted:
             response = self.call("conversations_list", types="private_channel", exclude_archived=False,
                                  limit=200, cursor=cursor or None, team_id=self.tenant)
             if response is None:
@@ -174,10 +219,7 @@ class _Reader:
                 if channel_id is None:
                     continue
                 if channel_id not in channels:
-                    if len(channels) >= _MAX_CHANNELS:
-                        self.partial = True
-                    else:
-                        channels.append(channel_id)
+                    channels.append(channel_id)
             if not following:
                 return channels
             if following in visited:
@@ -193,8 +235,29 @@ class _Reader:
         # 나중에 관측한 안전하지 않은 형태가 앞서 읽은 동일 메시지를 되살리지 않게 한다.
         self.partial = True
         self.rejected.add(key)
-        self.candidates.pop(key, None)
-        self.observations.pop(key, None)
+        self.forget(self.candidates, self.candidate_sizes, self.candidate_budget, key)
+        self.forget(self.observations, self.observation_sizes, self.observation_budget, key)
+
+    @staticmethod
+    def forget(items: dict, sizes: dict, budget: list[int], key: tuple[str, str]) -> None:
+        items.pop(key, None)
+        chars, byte_size = sizes.pop(key, (0, 0))
+        budget[0] -= chars
+        budget[1] -= byte_size
+
+    def remember(self, items: dict, sizes: dict, budget: list[int], key: tuple[str, str],
+                 value: dict[str, Any], *, target: bool = False) -> None:
+        # 발언 수를 자르지 않고 후보와 문맥을 각각 문자와 UTF-8 메타데이터 예산 안에 보관한다.
+        self.forget(items, sizes, budget, key)
+        cost = len(value["text"]), _entry_bytes(value) + 1
+        items[key], sizes[key] = value, cost
+        budget[0] += cost[0]
+        budget[1] += cost[1]
+        while budget[0] > LIVE_TOTAL_MAX_CHARS or budget[1] > LIVE_BUNDLE_MAX_BYTES:
+            oldest = min(items, key=lambda item: Decimal(item[1]))
+            self.forget(items, sizes, budget, oldest)
+            if target:
+                self.partial = True
 
     def message(self, channel: str, value: Any, *, thread: str | None = None,
                 anchor_candidate: bool = True) -> None:
@@ -247,7 +310,7 @@ class _Reader:
                 self.memberships[author] = bool(self.allowed(self.tenant, author))
             except Exception:
                 self.memberships[author] = False
-        if (not self.memberships[author] or not 1 <= len(text) <= _MAX_TEXT
+        if (not self.memberships[author] or not 1 <= len(text) <= LIVE_SOURCE_MAX_CHARS
                 or not is_safe_memory_text(text) or not is_allowed_conversation_source(text)):
             self.reject(key)
             return
@@ -257,11 +320,7 @@ class _Reader:
             "text": text, "editedAt": edited,
         }
         # 대상을 고르기 전 같은 안전 경계로 주변 발언을 보존한다. 타인·전날 부모도 맥락이 될 수 있다.
-        self.observations[key] = accepted
-        while (len(self.observations) > _MAX_OBSERVATIONS
-               or sum(len(item["text"]) for item in self.observations.values()) > _MAX_OBSERVATION_TEXT):
-            oldest = min(self.observations, key=lambda item: Decimal(item[1]))
-            self.observations.pop(oldest)
+        self.remember(self.observations, self.observation_sizes, self.observation_budget, key, accepted)
         if (not anchor_candidate or self.authors and author not in self.authors
                 or self.period is not None and not is_within_live_query_period(message_ts, self.period)):
             return
@@ -273,20 +332,18 @@ class _Reader:
                 for word in self.keywords
             ):
                 return
-        self.candidates[key] = accepted
-        if len(self.candidates) > _MAX_CANDIDATES:
-            oldest = min(self.candidates, key=lambda item: Decimal(item[1]))
-            self.candidates.pop(oldest)
-            self.partial = True
+        self.remember(self.candidates, self.candidate_sizes, self.candidate_budget, key, accepted, target=True)
 
     def scan(self, channels: list[str]) -> None:
         queues: dict[str, deque] = {channel: deque() for channel in channels}
         roots: dict[tuple[str, str], dict[str, Any]] = {}
+        self.scan_roots, self.scan_queues = roots, queues
 
         def read(channel: str, kind: str, thread: str, cursor: str, pages: int, visited: set[str]) -> None:
             kwargs = {"channel": channel, "limit": _PAGE_SIZE, "latest": self.cutoff,
                       "inclusive": True, "cursor": cursor or None}
             if self.period is not None:
+                # 과거 월이나 날짜는 그 기간 끝으로 바로 이동한다. 이후 페이지도 같은 끝을 유지한다.
                 kwargs["latest"] = min((self.cutoff, self.period["endTs"]), key=Decimal)
                 # history의 오래된 부모는 유지하고 댓글만 요청 기간으로 좁힌다.
                 if kind == "replies":
@@ -337,9 +394,8 @@ class _Reader:
                     self.partial = True
                 queues[channel].append(("replies", thread, "", 1, set()))
                 return
-            limit = _MAX_HISTORY_PAGES if kind == "history" else _MAX_REPLY_PAGES
             if following:
-                if following in visited or pages >= limit:
+                if following in visited:
                     self.partial = True
                 else:
                     queues[channel].append((kind, thread, following, pages + 1, visited | {following}))
@@ -362,9 +418,12 @@ class _Reader:
 
         # 채널별 최신 history를 모두 우선한 뒤, 추가 history·댓글 페이지를 채널마다 한 번씩 배분한다.
         for channel in channels:
+            if self.read_halted or self.clock() >= self.read_deadline:
+                self.partial = True
+                break
             read(channel, "history", "", "", 1, set())
         while any(queues.values()):
-            if self.read_halted or self.calls >= _MAX_READ_CALLS or self.clock() >= self.read_deadline:
+            if self.read_halted or self.clock() >= self.read_deadline:
                 self.partial = True
                 break
             for channel in channels:
@@ -387,15 +446,9 @@ class _Reader:
         # 날짜 탐색에서 빠진 부모·인접 발언만 보완한다. 새 대상이나 다른 채널로 확대하지 않는다.
         self.read_deadline = self.context_deadline
         visited: set[tuple[str, str]] = set()
-        reads = 0
-
         def read(channel: str, thread: str | None, *, oldest: str, latest: str, limit: int) -> bool:
-            nonlocal reads
-            if (reads >= _MAX_CONTEXT_READS or self.calls >= _MAX_READ_CALLS
-                    or self.calls + len(anchors) + 1 >= _MAX_CALLS
-                    or self.clock() >= self.context_deadline or self.read_halted):
+            if self.clock() >= self.context_deadline or self.read_halted:
                 return False
-            reads += 1
             kwargs = {"channel": channel, "oldest": oldest, "latest": latest,
                       "inclusive": True, "limit": limit}
             if thread is not None:
@@ -503,38 +556,51 @@ class _Reader:
         selected: list[dict[str, Any]] = []
         chars = 0
         for item in sorted(self.candidates.values(), key=lambda value: Decimal(value["messageTs"]), reverse=True):
-            if len(selected) >= _MAX_SOURCES or chars + len(item["text"]) > _MAX_TEXT:
+            if chars + len(item["text"]) > LIVE_TOTAL_MAX_CHARS:
                 self.partial = True
                 continue
             selected.append(item)
             chars += len(item["text"])
         self.collect_context(selected)
         sources = []
+        bundle_bytes = _EMPTY_BUNDLE_BYTES
+        chars = 0
         for item in selected:
             # 부모 보완 중 충돌·수정·안전 오류가 발견된 대상은 이미 선택됐어도 제외한다.
             if self.candidates.get((item["channelId"], item["messageTs"])) != item:
                 continue
             linked = self.with_permalink(item)
             if linked is not None:
+                byte_size = _entry_bytes(linked) + bool(sources)
+                if bundle_bytes + byte_size > LIVE_BUNDLE_MAX_BYTES:
+                    self.partial = True
+                    continue
                 sources.append(linked)
+                chars += len(linked["text"])
+                bundle_bytes += byte_size
         # 링크를 확인한 대상에만 문맥을 연결하고 여러 대상의 부모를 round-robin으로 먼저 배분한다.
         context_messages: list[dict[str, Any]] = []
         queues = deque(deque(self.context_candidates(anchor)) for anchor in sources)
-        chars = sum(len(item["text"]) for item in sources)
-        while queues and len(sources) + len(context_messages) < _MAX_BUNDLE_MESSAGES:
+        while queues:
             items = queues.popleft()
             if not items:
                 continue
             item = items.popleft()
-            if chars + len(item["text"]) <= _MAX_TEXT:
+            if chars + len(item["text"]) <= LIVE_TOTAL_MAX_CHARS:
                 linked = self.with_permalink(item)
                 if linked is not None:
-                    context_messages.append(linked)
-                    chars += len(item["text"])
+                    byte_size = _entry_bytes(linked) + bool(context_messages)
+                    if bundle_bytes + byte_size <= LIVE_BUNDLE_MAX_BYTES:
+                        context_messages.append(linked)
+                        chars += len(item["text"])
+                        bundle_bytes += byte_size
             if items:
                 queues.append(items)
         result = {"sources": sources, "coverage": "partial" if self.partial else "complete",
                   "channelCount": len(self.channels_read)}
+        # API와 같은 직렬화 정의로 최종 전체 묶음도 확인하며 예산 불일치 시 원문을 보내지 않는다.
+        if live_bundle_size(sources, context_messages) > LIVE_BUNDLE_MAX_BYTES:
+            return {"sources": [], "coverage": "partial", "channelCount": len(self.channels_read)}
         if context_messages:
             result["contextMessages"] = context_messages
         return result
@@ -544,13 +610,16 @@ def collect_private_live_sources(
     *, client_factory: Callable[[float], Any], tenant_id: str, destination_channel_id: str,
     actor_id: str, question: str, author_ids: Sequence[str], before_ts: str,
     is_allowed: Callable[[str, str], bool], clock: Callable[[], float] = time.monotonic,
-    budget_seconds: float = 8.0, destination_channel_kind: str | None = None,
+    budget_seconds: float = LIVE_QUERY_SECONDS, destination_channel_kind: str | None = None,
 ) -> dict[str, Any]:
     """원문을 저장하지 않고 현재 읽을 수 있는 비공개 채널에서 bounded 근거만 반환한다."""
     unavailable = {"sources": [], "coverage": "unavailable", "channelCount": 0}
     if (not can_query_private_live_sources(tenant_id, destination_channel_id, destination_channel_kind) or not actor_id
             or _timestamp(before_ts) is None or not isinstance(question, str)
-            or not is_safe_memory_text(question) or not 0 < budget_seconds <= 30):
+            or not is_safe_memory_text(question) or not 0 < budget_seconds <= LIVE_QUERY_SECONDS):
+        return unavailable
+    # 잘못되거나 모호한 날짜를 기간 없는 최근 조회로 바꾸지 않고 SDK 생성 전에 닫는다.
+    if live_query_period_error(question, before_ts) is not None:
         return unavailable
     try:
         if not is_allowed(tenant_id, actor_id):
@@ -560,7 +629,8 @@ def collect_private_live_sources(
     authors = frozenset(value for value in author_ids if isinstance(value, str) and value)
     if not wants_private_live_sources(question, tuple(authors)):
         return unavailable
-    keywords = () if authors else _keywords(question)
+    # 날짜와 조회 동작은 주제가 아니므로 작성자 없는 기간 조회에서 본문 일치를 강제하지 않는다.
+    keywords = () if authors else _keywords(strip_live_query_period(question, before_ts))
     reader = _Reader(client_factory, tenant=tenant_id, authors=authors, keywords=keywords, cutoff=before_ts,
                      is_allowed=is_allowed, clock=clock, budget=budget_seconds,
                      period=resolve_live_query_period(question, before_ts))

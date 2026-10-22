@@ -151,7 +151,7 @@ def test_memory_retrieval_is_bound_to_turn_and_expires():
     assert not runtime.bind_verified(replace(request, question="다른 질문", memory_context=verified)).memory_entries
     prepared = runtime.prepare(request)
     verified["retrievalId"] = prepared["retrievalId"]
-    clock[0] = 62
+    clock[0] = 122
     assert not runtime.bind_verified(replace(request, memory_context=verified)).memory_entries
 
 

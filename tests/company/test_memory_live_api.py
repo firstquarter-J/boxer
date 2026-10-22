@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime
 import json
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from boxer_company.memory import live as live_normalization
 from boxer_company.memory.presentation import render_memory
 from boxer_company_api.app import create_company_api_app
 from boxer_company_api.memory_service import MemoryService
+from boxer_company_api import memory_service as service_module
 from boxer_company_api.settings import CompanyApiCallerSettings, CompanyApiSettings
 
 
@@ -187,7 +189,7 @@ def test_live_plan_resolves_alias_and_binds_author_scope(runtime, question):
         "tenantId": TENANT, "actorId": ACTOR, "channelId": HUB, "requestId": REQUEST_ID,
         "question": question, "authorIds": [DD], "beforeTs": CUTOFF,
     }
-    assert prepared["sources"] == [] and prepared["expiresIn"] == 60
+    assert prepared["sources"] == [] and prepared["expiresIn"] == 120
     assert runtime.store.reads[0][1]["mentioned_user_ids"] == (DD,)
 
 
@@ -342,6 +344,59 @@ def test_http_live_upload_is_filtered_by_original_question_kst_day(runtime, ques
     assert bound.memory_entries[-1]["sourceCount"] == 2
 
 
+@pytest.mark.parametrize("question,days,expected_days", [
+    ("디디가 올해 욕 몇번이나 했어?", ["2025-12-31", "2026-01-01", "2026-09-30"], ["2026-09-30", "2026-01-01"]),
+    ("디디가 9월에 한 말 요약", ["2026-08-31", "2026-09-01", "2026-09-30", "2026-10-01"], ["2026-09-30", "2026-09-01"]),
+    ("디디가 9월 1일부터 3일까지 한 말", ["2026-08-31", "2026-09-01", "2026-09-03", "2026-09-04"], ["2026-09-03", "2026-09-01"]),
+    ("디디가 2026-10-18에 한 말", ["2026-10-17", "2026-10-18", "2026-10-19"], ["2026-10-18"]),
+])
+def test_http_period_filter_uses_bound_year_month_date_and_range(runtime, question, days, expected_days):
+    # HTTP로 기간 밖 원문을 섞어 보내도 원 요청에서 해석한 기간만 모델에 전달한다.
+    def stamp(day):
+        return str(int(datetime.fromisoformat(day + "T00:00:00+09:00").timestamp())) + ".000000"
+
+    value = dated_request(question)
+    rows = [dict(dated_source(stamp(day)), threadTs="1760000000.000001") for day in days]
+    with client(runtime.memory) as http:
+        prepared = http.post(BASE, headers=headers(), json=retrieval_body(
+            question=question, memoryContext=dict(value.memory_context))).json()
+        period = runtime.store.reads[0][1]["period"]
+        assert period is not None
+        uploaded = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(),
+            json=upload_body(sources=rows, coverage="complete", channelCount=1))
+        assert uploaded.status_code == 200 and uploaded.json()["acceptedSourceCount"] == len(expected_days)
+    bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
+    assert [item["sources"][0]["messageTs"] for item in bound.memory_entries
+            if item["kind"] == "utterance"] == [stamp(day) for day in expected_days]
+
+
+@pytest.mark.parametrize("question", [
+    "디디가 2026-02-30에 한 말", "디디가 오늘과 어제 한 말", "디디가 2027년에 한 말",
+])
+def test_unusable_calendar_query_does_not_plan_live_read_or_load_recent_memory(runtime, question):
+    value = dated_request(question)
+    prepared = runtime.memory.prepare(value)
+    assert "liveQuery" not in prepared and prepared["sources"] == []
+    assert runtime.store.reads == []
+    with pytest.raises(MemoryError, match="memory_live_retrieval_not_found"):
+        receive(runtime.memory, prepared["retrievalId"])
+    bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
+    assert_no_source_evidence(bound)
+    assert runtime.store.reads == []
+
+
+def test_calendar_prepare_keeps_actor_style_but_skips_other_out_of_period_candidates(runtime, monkeypatch):
+    # 표준 답변 선호는 출처 날짜가 오래됐어도 표현 방식에만 적용하는 예외를 유지한다.
+    reference = {"sourceId": "src_style", "channelId": ORIGIN, "threadTs": ROOT,
+                 "messageTs": SPOKEN, "revisionHash": "a" * 64, "channelKind": "private_channel"}
+    style = {"memoryId": "style", "kind": "person", "styleOnly": True, "sources": [reference]}
+    ordinary = {"memoryId": "ordinary", "kind": "thread", "sources": [dict(reference, sourceId="src_ordinary")]}
+    monkeypatch.setattr(runtime.store, "retrieval_candidates", lambda **_: [ordinary, style])
+    prepared = runtime.memory.prepare(dated_request("디디가 9월에 한 말 요약"))
+    assert prepared["sources"] == [{key: reference[key] for key in (
+        "sourceId", "channelId", "threadTs", "messageTs", "revisionHash", "channelKind")} | {"styleOnly": True}]
+
+
 @pytest.mark.parametrize("channel_id", [HUB, "C_OTHER"])
 def test_date_question_keeps_only_stored_items_whose_entire_evidence_is_in_period(runtime, monkeypatch, channel_id):
     # 한 요약의 출처가 어제와 오늘에 걸치면 오늘 발언으로 재사용하지 않는다.
@@ -429,12 +484,12 @@ def test_idempotent_retry_does_not_refresh_raw_source_freshness(runtime, channel
 
 
 @pytest.mark.parametrize("channel_id", [HUB, ORIGIN])
-def test_retrieval_lease_expires_at_sixty_seconds_even_when_live_sources_are_fresh(runtime, channel_id):
+def test_retrieval_lease_expires_after_collection_and_transport_grace_even_when_sources_are_fresh(runtime, channel_id):
     value = request(channel_id=channel_id)
     prepared = runtime.memory.prepare(value)
-    runtime.clock[0] = 159
+    runtime.clock[0] = 219
     receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=channel_id, channelCount=1))
-    runtime.clock[0] = 160
+    runtime.clock[0] = 220
     assert_no_source_evidence(runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"])))
 
 
@@ -444,7 +499,7 @@ def test_http_expired_consumed_or_unknown_lease_cannot_accept_or_normalize_more_
     prepared = runtime.memory.prepare(value)
     retrieval_id = prepared["retrievalId"]
     if reason == "expired":
-        runtime.clock[0] = 160
+        runtime.clock[0] = 220
     elif reason == "consumed":
         runtime.memory.bind_verified(bound_request(value, retrieval_id))
     else:
@@ -524,7 +579,7 @@ def test_http_live_source_semantic_validation_rejects_invalid_evidence(runtime, 
 
 @pytest.mark.parametrize("invalid", [
     "source_kind", "source_timestamp", "source_digest", "missing_thread", "extra_source_field",
-    "too_many_sources", "large_source", "total_size", "boolean_count", "unavailable_with_sources",
+    "metadata_size", "large_source", "total_size", "boolean_count", "unavailable_with_sources",
 ])
 def test_http_live_source_schema_is_strict_and_budgeted(runtime, invalid):
     body = upload_body()
@@ -539,12 +594,12 @@ def test_http_live_source_schema_is_strict_and_budgeted(runtime, invalid):
         del row["threadTs"]
     elif invalid == "extra_source_field":
         row["authorKind"] = "human"
-    elif invalid == "too_many_sources":
-        body["sources"] = [deepcopy(row) for _ in range(9)]
+    elif invalid == "metadata_size":
+        body["sources"] = [dict(row, text="가", permalink="https://unit.slack.com/" + "x" * 1800) for _ in range(600)]
     elif invalid == "large_source":
-        row["text"] = "가" * 8001
+        row["text"] = "가" * 16001
     elif invalid == "total_size":
-        body["sources"] = [source(text="가" * 4500), source(text="나" * 4500)]
+        body["sources"] = [source(text="가" * 14000) for _ in range(6)]
     elif invalid == "boolean_count":
         body["channelCount"] = True
     elif invalid == "unavailable_with_sources":
@@ -554,6 +609,58 @@ def test_http_live_source_schema_is_strict_and_budgeted(runtime, invalid):
         result = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(), json=body)
     assert result.status_code == 422
     assert result.headers["content-type"] == "application/problem+json"
+
+
+def test_full_sixty_second_collection_and_eighty_thousand_chars_reach_model_without_count_slicing(runtime):
+    # 수집이 60초 걸리고 100개 발언이 와도 HTTP, bind와 실제 모델 입력에서 8개로 잘리지 않는다.
+    value = request()
+    rows = []
+    for index in range(100):
+        text = f"근거{index:03d} " + "가" * 794
+        stamp = f"1792100001.{index:06d}"
+        rows.append(source(text=text, revisionHash=source_revision(text), messageTs=stamp,
+            permalink=f"https://unit.slack.com/archives/{ORIGIN}/p{stamp.replace('.', '')}"))
+    assert sum(len(row["text"]) for row in rows) == 80000
+    with client(runtime.memory) as http:
+        prepared = http.post(BASE, headers=headers(), json=retrieval_body()).json()
+        runtime.clock[0] += 60
+        uploaded = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(),
+            json=upload_body(sources=rows, coverage="complete", channelCount=1))
+        assert uploaded.status_code == 200 and uploaded.json()["acceptedSourceCount"] == 100
+    bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
+    assert len([item for item in bound.memory_entries if item["kind"] == "utterance"]) == 100
+    received = []
+    result = CompanyFreeformAssistantRoute(lambda question, context, system: received.append(context) or "확인했어",
+        provider_ready=lambda: True, context_max_chars=5000, timeout_message="시간 초과").handle(bound)
+    assert result.outcome == "answered" and len(received) == 1
+    rendered = json.loads(received[0].split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])
+    assert next(row for row in rendered if row["kind"] == "retrieval_status")["renderedSourceCount"] == 100
+    assert {row["text"] for row in rendered if row["kind"] == "utterance"} == {row["text"] for row in rows}
+
+
+def test_global_live_cache_evicts_old_raw_lease_by_bytes_instead_of_source_count(runtime, monkeypatch):
+    first = request()
+    prepared = runtime.memory.prepare(first)
+    receive(runtime.memory, prepared["retrievalId"])
+    first_size = runtime.memory._cache[prepared["retrievalId"]].live_size
+    monkeypatch.setattr(service_module, "LIVE_CACHE_MAX_BYTES", first_size + 100)
+    second = request(request_id="live-request-2")
+    newer = runtime.memory.prepare(second)
+    receive(runtime.memory, newer["retrievalId"], upload_body(requestId=second.request_id))
+    assert sum(item.live_size for item in runtime.memory._cache.values()) <= first_size + 100
+    assert_no_source_evidence(runtime.memory.bind_verified(bound_request(first, prepared["retrievalId"])))
+    bound = runtime.memory.bind_verified(bound_request(second, newer["retrievalId"]))
+    assert bound.memory_entries[0]["text"] == STATEMENT
+
+
+def test_expired_raw_freshness_releases_its_cache_byte_budget(runtime):
+    prepared = runtime.memory.prepare(request())
+    receive(runtime.memory, prepared["retrievalId"])
+    cached = runtime.memory._cache[prepared["retrievalId"]]
+    assert cached.live_size > 0
+    runtime.clock[0] += 11
+    assert runtime.memory.status() == "ok"
+    assert cached.live_entries == () and cached.live_size == 0
 
 
 def test_http_live_endpoint_requires_service_authentication_actor_and_capability(runtime):
@@ -576,6 +683,7 @@ def test_live_source_event_after_receipt_removes_cached_raw_evidence(runtime, ev
     receive(runtime.memory, prepared["retrievalId"], upload_body(channelId=channel_id, coverage="complete", channelCount=1))
     runtime.memory.invalidate_live_source(tenant_id=TENANT, channel_id=ORIGIN,
         message_ts=SPOKEN, event_type=event_type, revision_hash="0" * 64 if event_type == "changed" else None)
+    assert runtime.memory._cache[prepared["retrievalId"]].live_size == 0
     bound = runtime.memory.bind_verified(bound_request(value, prepared["retrievalId"]))
     assert_no_source_evidence(bound, coverage="partial")
 
@@ -671,8 +779,8 @@ def test_live_source_event_does_not_cross_tenant_channel_or_message_identity(run
     assert bound.memory_entries[-1]["sourceCount"] == 1
 
 
-@pytest.mark.parametrize("age,count", [(59.999, 0), (60.0, 1)])
-def test_live_source_event_watermark_has_a_sixty_second_lifetime(runtime, age, count):
+@pytest.mark.parametrize("age,count", [(59.999, 0), (60.0, 0), (119.999, 0), (120.0, 1)])
+def test_live_source_event_watermark_covers_the_full_collection_lease(runtime, age, count):
     runtime.memory.invalidate_live_source(tenant_id=TENANT, channel_id=ORIGIN,
         message_ts=SPOKEN, event_type="deleted")
     runtime.clock[0] += age
@@ -726,12 +834,12 @@ def test_live_event_during_database_verification_is_checked_again_before_model_i
     assert_no_source_evidence(runtime.memory.bind_verified(bound_request(request(), prepared["retrievalId"])), coverage="partial")
 
 
-def test_live_lease_expiry_during_database_verification_cannot_extend_the_sixty_second_lease(runtime, monkeypatch):
+def test_live_lease_expiry_during_database_verification_cannot_extend_the_collection_lease(runtime, monkeypatch):
     prepared = runtime.memory.prepare(request())
-    runtime.clock[0] = 159
+    runtime.clock[0] = 219
     receive(runtime.memory, prepared["retrievalId"], upload_body(coverage="complete", channelCount=1))
     def load_after_lease_expiry(**kwargs):
-        runtime.clock[0] = 160
+        runtime.clock[0] = 220
         return []
     monkeypatch.setattr(runtime.store, "load_verified_items", load_after_lease_expiry)
     assert_no_source_evidence(runtime.memory.bind_verified(bound_request(request(), prepared["retrievalId"])))
@@ -832,7 +940,7 @@ def test_http_context_semantics_reject_orphan_cross_scope_and_invalid_sources(ru
     assert context_source()["text"] not in result.text
 
 
-@pytest.mark.parametrize("invalid", ["missing_anchor", "bad_relation", "extra_field", "six_for_anchor", "total_count", "total_chars"])
+@pytest.mark.parametrize("invalid", ["missing_anchor", "bad_relation", "extra_field", "six_for_anchor", "total_chars"])
 def test_http_context_schema_enforces_link_shape_and_combined_budget(runtime, invalid):
     body = upload_body(contextMessages=[context_source()])
     row = body["contextMessages"][0]
@@ -844,12 +952,10 @@ def test_http_context_schema_enforces_link_shape_and_combined_budget(runtime, in
         row["authorName"] = "DD"
     elif invalid == "six_for_anchor":
         body["contextMessages"] = [deepcopy(row) for _ in range(6)]
-    elif invalid == "total_count":
-        body["sources"] = [source() for _ in range(8)]
-        body["contextMessages"] = [deepcopy(row) for _ in range(5)]
     elif invalid == "total_chars":
-        body["sources"] = [source(text="가" * 4000)]
-        row["text"] = "나" * 4001
+        # 개수 제한은 제거했지만 대상 발언과 주변 문맥의 원문 합계는 80,000자를 지킨다.
+        body["sources"] = [source(text="가" * 14000) for _ in range(5)]
+        row["text"] = "나" * 10001
     prepared = runtime.memory.prepare(request())
     with client(runtime.memory) as http:
         result = http.post(f"{BASE}/{prepared['retrievalId']}/live", headers=headers(), json=body)

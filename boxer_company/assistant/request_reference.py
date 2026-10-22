@@ -8,7 +8,7 @@ import re
 from zoneinfo import ZoneInfo
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
-from boxer_company.memory.live_query import resolve_live_query_period
+from boxer_company.memory.live_query import live_query_period_error, resolve_live_query_period
 
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -63,11 +63,18 @@ def build_request_reference_context(
             "endExclusive": True,
             "cutoffAtKst": reference.isoformat(timespec="microseconds"),
         }
+    period_error = live_query_period_error(request.question, stamp)
+    if period_error is not None:
+        # 조회하지 않은 기간을 모델이 임의 보정하거나 최근 발언으로 채우지 않게 사유만 전달한다.
+        facts["requestedPeriodError"] = period_error
     # 발언의 상대 날짜와 질문의 상대 날짜를 같은 기준일로 섞지 않도록 따로 설명한다.
     return (
         "요청 기준 정보(서버 확인):\n"
         + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
-        + "\n질문의 오늘·어제는 위 질문 기준 KST 날짜로 해석해. "
+        + "\n질문의 상대 날짜와 연도 없는 날짜는 위 질문 기준 KST 날짜로 해석해. "
+        "요청 기간이 있으면 그 기간과 질문 시각까지의 확인된 근거만 사용해. "
+        "대화 기록 조회에서 기간 오류가 있으면 날짜가 잘못됐는지, 여러 기간인지, 미래인지 설명하고 기간을 다시 확인해. "
+        "기간 오류를 최근 발언 조회로 바꾸지 마. 일부 근거만 확인했다면 그 기간 전체를 집계했다고 말하지 마. "
         "발언 본문 안의 오늘·어제는 그 발언의 sourceTimes.spokenAtKst를 기준으로 해석해. "
         "기준일이 제공됐으므로 현재 날짜를 모른다고 하거나 날짜 확인을 다시 요청하지 마. "
         "기준 정보의 내부 필드명은 답변에 노출하지 마."

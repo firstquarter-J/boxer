@@ -9,6 +9,9 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from boxer_company.assistant.contracts import SourceReference
+from boxer_company.memory.live_limits import (
+    LIVE_RENDER_MAX_BYTES, LIVE_RENDER_MAX_CHARS, LIVE_SOURCE_MAX_CHARS, LIVE_TOTAL_MAX_CHARS,
+)
 from boxer_company.memory.policy import is_safe_memory_text, personal_style_text
 from boxer_company.team_chat_context import get_registered_team_member_name
 
@@ -68,22 +71,45 @@ def _spoken_at_kst(value: Any) -> str | None:
 def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, Mapping[str, Any]]]:
     rows: list[dict[str, Any]] = []
     selected: dict[str, Mapping[str, Any]] = {}
+    json_chars = json_bytes = 2
+
+    def append_row(row: dict[str, Any]) -> bool:
+        nonlocal json_chars, json_bytes
+        # JSON을 매번 전체 재직렬화하지 않고 각 묶음의 실제 UTF-8 크기를 한 번만 차감한다.
+        try:
+            encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            chars, byte_count = len(encoded), len(encoded.encode("utf-8"))
+        except (TypeError, ValueError, OverflowError, UnicodeError):
+            return False
+        separator = int(bool(rows))
+        # 마지막 조회 상태의 실제 노출 건수 두 필드를 추가할 여유도 함께 예약한다.
+        if (json_chars + chars + separator + 250 > LIVE_RENDER_MAX_CHARS
+                or json_bytes + byte_count + separator + 250 > LIVE_RENDER_MAX_BYTES):
+            return False
+        rows.append(row)
+        json_chars += chars + separator
+        json_bytes += byte_count + separator
+        return True
+
     # 조회 결과가 없어도 모델이 실제 능력과 조사 범위를 과장하지 않도록 상태를 전달한다.
     for item in entries:
         if item.get("kind") == "retrieval_status" and item.get("coverage") in {"complete", "partial", "unavailable"}:
-            rows.append({key: item.get(key) for key in ("kind", "coverage", "channelCount", "sourceCount", "scope")})
+            append_row({key: item.get(key) for key in ("kind", "coverage", "channelCount", "sourceCount", "scope")})
             break
-    ordinary = [item for item in entries if item.get("kind") != "retrieval_status"]
-    # 작성자·시각을 포함한 묶음을 통째로 선택한다. 문맥만 잘리거나 대상 발언만 남지 않게 한다.
-    max_chars = 16000 if any(item.get("contextMessages") for item in ordinary) else 4000
+    live = [item for item in entries if item.get("liveSource") is True]
+    stored = [item for item in entries if item.get("kind") != "retrieval_status" and item.get("liveSource") is not True][:8]
+    styles = [item for item in stored if item.get("kind") == "personal_style" or item.get("styleOnly") is True]
+    ordinary = [item for item in stored if item.get("kind") != "personal_style" and item.get("styleOnly") is not True]
+    # 표준 선호는 원문 없이 먼저, live는 개수 제한 없이, 저장 요약은 남은 예산에 최대 8개 넣는다.
+    live_chars = 0
     rendered_sources: set[str] = set()
-    for item in ordinary[:8]:
+    for item in [*styles, *live, *ordinary]:
         if item.get("kind") == "personal_style" or item.get("styleOnly") is True:
             topic, value = str(item.get("topicKey") or ""), str(item.get("value") or item.get("styleValue") or "")
             style = personal_style_text(topic, value)
             if style is not None:
                 # 검증용 후보가 실수로 전달돼도 원문·식별자·출처를 모델이나 인용 목록에 넣지 않는다.
-                rows.append({"kind": "personal_style", "topicKey": topic, "value": value, "text": style})
+                append_row({"kind": "personal_style", "topicKey": topic, "value": value, "text": style})
             continue
         if item.get("status") not in {"active", "resolved"} or not is_safe_memory_text(str(item.get("text") or "")):
             continue
@@ -108,9 +134,14 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
             source_times.append(entry)
         row["sourceTimes"] = source_times
         contextual_selection: dict[str, Mapping[str, Any]] = {}
+        raw_chars = 0
         if item.get("liveSource") is True:
+            raw_chars = len(str(item.get("text") or ""))
+            if raw_chars > LIVE_SOURCE_MAX_CHARS:
+                continue
             row["conversationKey"] = item.get("threadId")
             context_rows = []
+            oversized_context = False
             references = {source.get("sourceId"): source for source in item.get("sources", [])
                           if source.get("relation") == "context"}
             for context in item.get("contextMessages", []):
@@ -118,6 +149,9 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
                 text = str(context.get("text") or "")
                 if reference is None or not is_safe_memory_text(text):
                     continue
+                if len(text) > LIVE_SOURCE_MAX_CHARS:
+                    oversized_context = True
+                    break
                 context_id = "live_" + str(reference["sourceId"])
                 context_row = {"memoryId": context_id, "text": text,
                     "authorId": reference.get("authorId"),
@@ -127,18 +161,21 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
                 if name is not None:
                     context_row["authorName"] = name
                 context_rows.append(context_row)
+                raw_chars += len(text)
                 # 문맥을 인용할 때는 그 문맥의 실제 출처만 선택한다.
                 contextual_selection[context_id] = {"kind": "utterance_context", "sources": [reference]}
+            if oversized_context or live_chars + raw_chars > LIVE_TOTAL_MAX_CHARS:
+                # 원문만 남기거나 문맥 중간을 자르지 않고 대화 묶음 전체를 제외한다.
+                continue
             row["contextMessages"] = context_rows
             row["contextCoverage"] = "partial" if context_rows else "unavailable"
-        proposed = json.dumps([*rows, row], ensure_ascii=False, separators=(",", ":"))
-        if len(proposed) + 250 > max_chars:
+        if not append_row(row):
             continue
-        rows.append(row)
         selected[str(item["memoryId"])] = item
         for context_id, context_item in contextual_selection.items():
             selected.setdefault(context_id, context_item)
         if item.get("liveSource") is True:
+            live_chars += raw_chars
             rendered_sources.update(str(source.get("sourceId")) for source in primary_sources)
     for row in rows:
         if row.get("kind") == "retrieval_status":

@@ -63,6 +63,7 @@ from boxer_company_api.automation_delivery import (
 from boxer_company_api.auth import CallerRegistry
 from boxer_company_api.memory_service import MemoryService
 from boxer_company_api.memory_router import create_memory_router
+from boxer_company_api.memory_request_limits import MemoryLiveRequestBodyLimitMiddleware
 from boxer_company_api.hpa_change_router import create_hpa_change_router
 from boxer_company_api.hpa_change_transport import HpaChangeTransportService
 from boxer_company_api.observability import emit_api_event
@@ -259,6 +260,7 @@ def create_company_api_app(
         redoc_url=None,
     )
     install_problem_handlers(app)
+    app.add_middleware(MemoryLiveRequestBodyLimitMiddleware)
     app.include_router(create_memory_router(service=memory_runtime, caller_registry=caller_registry))
 
     def is_ready() -> bool:

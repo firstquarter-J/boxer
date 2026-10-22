@@ -11,7 +11,7 @@ import pytest
 from boxer_company import team_chat_context as team
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.freeform_route import CompanyFreeformAssistantRoute
-from boxer_company_adapter_slack.company_api_client import CompanyApiClientSettings
+from boxer_company_adapter_slack.company_api_client import CompanyApiClientSettings, CompanyApiContractError
 from boxer_company_adapter_slack.conversation_memory import SlackConversationMemory
 from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
 from boxer_company_api.app import create_company_api_app
@@ -82,6 +82,19 @@ class HttpSession:
     def post(self, url, *, json, headers, **_kwargs):
         self.payloads.append((urlsplit(url).path, json))
         return self.web.post(urlsplit(url).path, json=json, headers=headers)
+
+
+def test_live_transport_rejects_oversized_metadata_before_http_send():
+    # 본문이 짧아도 메타데이터가 큰 결과는 동일한 byte 예산으로 송신 전에 차단한다.
+    class NoSendSession:
+        def post(self, *args, **kwargs):
+            raise AssertionError("과대 원문 bundle은 HTTP로 보내면 안 된다")
+
+    api = CompanyMemoryApiClient(CompanyApiClientSettings(base_url="http://127.0.0.1:8010", token=TOKEN),
+        session=NoSendSession())
+    with pytest.raises(CompanyApiContractError, match="company_memory_payload_too_large"):
+        api.call("/internal/v1/memory/retrievals/example/live", {
+            "sources": [{"text": "가", "metadata": "x" * 2000} for _ in range(600)]})
 
 
 @pytest.mark.parametrize("destination", [ORIGIN, HUB])

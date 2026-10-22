@@ -8,6 +8,7 @@ import pytest
 from boxer_company.memory.contracts import MemoryError, source_identity, source_revision
 from boxer_company.memory.access import can_query_private_live_sources
 from boxer_company.memory.live import normalize_live_sources
+from boxer_company.memory.live_limits import LIVE_BUNDLE_MAX_BYTES, LIVE_SOURCE_MAX_CHARS, LIVE_TOTAL_MAX_CHARS, live_bundle_size
 from boxer_company.memory.live_query import is_within_live_query_period, resolve_live_query_period
 from boxer_company.memory.presentation import render_memory
 
@@ -212,22 +213,50 @@ def test_sensitive_and_operation_sources_are_skipped_without_returning_the_paylo
     assert "never-return" not in json.dumps(items)
 
 
-def test_text_is_excerpted_only_after_full_revision_and_safety_validation():
+def test_full_text_survives_after_complete_revision_and_safety_validation():
     text = "안내문 검토 의견을 정리했어. " * 90
     (item,) = normalize([source(text)])
-    assert len(item["text"]) == 1000 and item["excerptOnly"] is True
+    assert item["text"] == text.strip() and item["excerptOnly"] is False
     assert item["sources"][0]["revisionHash"] == source_revision(text)
     # 비밀값이 표시 발췌 뒤에 있어도 전체 원문 안전 검사에서 제외한다.
     assert normalize([source(text + "password=secret-at-the-end")]) == ()
 
 
-def test_source_count_and_total_character_budgets_are_enforced():
-    eight = [source("가" * 1000, message=f"180000000{index}.000001") for index in range(8)]
-    assert len(normalize(eight)) == 8
-    with pytest.raises(MemoryError, match="memory_live_sources_invalid"):
-        normalize([*eight, source(message="1800000008.000001")])
+def test_source_count_is_not_capped_at_eight_and_whole_raw_budget_is_enforced():
+    many = [source("가" * 3000, message=f"1800000000.{index:06d}") for index in range(1, 21)]
+    items = normalize(many)
+    assert len(items) == 20 and all(len(item["text"]) == 3000 for item in items)
+    maximum = [source("가" * LIVE_SOURCE_MAX_CHARS, message=f"1800000000.{index:06d}") for index in range(1, 6)]
+    assert sum(len(item["text"]) for item in normalize(maximum)) == LIVE_TOTAL_MAX_CHARS
     with pytest.raises(MemoryError, match="memory_live_sources_too_large"):
-        normalize([source("가" * 8001)])
+        normalize([*maximum, source("나", message="1800000000.000006")])
+
+
+@pytest.mark.parametrize("is_context", [False, True])
+def test_each_target_and_context_must_fit_the_original_single_source_contract(is_context):
+    anchor = source(message="1800000005.000001")
+    overlong = "가" * (LIVE_SOURCE_MAX_CHARS + 1)
+    with pytest.raises(MemoryError, match="memory_live_sources_too_large"):
+        normalize([anchor] if is_context else [source(overlong)],
+                  context_messages=[context(anchor, overlong)] if is_context else [])
+
+
+def test_metadata_and_utf8_count_toward_the_original_bundle_byte_budget():
+    # metadata가 원문 글자 수 제한을 우회하지 못하며 한글의 UTF-8 크기도 실제로 센다.
+    row = source(extraMetadata="")
+    spare = LIVE_BUNDLE_MAX_BYTES - live_bundle_size([row])
+    row["extraMetadata"] = "가" * (spare // 3) + "a" * (spare % 3)
+    assert live_bundle_size([row]) == LIVE_BUNDLE_MAX_BYTES
+    assert len(normalize([row])) == 1
+    row["extraMetadata"] += "a"
+    with pytest.raises(MemoryError, match="memory_live_sources_too_large"):
+        normalize([row])
+
+
+@pytest.mark.parametrize("metadata", [object(), float("nan"), "\ud800"])
+def test_nonserializable_raw_bundle_closes_with_memory_error(metadata):
+    with pytest.raises(MemoryError, match="memory_live_sources_invalid"):
+        normalize([source(extraMetadata=metadata)])
 
 
 @pytest.mark.parametrize("sources", [None, "원문", [None], [{"text": "원문"}]])
@@ -254,8 +283,8 @@ def test_relative_day_uses_question_kst_date_instead_of_process_clock(question, 
     }
 
 
-@pytest.mark.parametrize("question", ["최근 한 말은?", "지난주 발언", "2026-10-18 대화", "오늘날 사회", "어제오늘 근황", "오늘과 어제 비교", "오늘부터의 일정"])
-def test_only_unambiguous_relative_day_tokens_create_a_period(question):
+@pytest.mark.parametrize("question", ["최근 한 말은?", "오늘날 사회", "어제오늘 근황", "오늘과 어제 비교", "오늘부터의 일정"])
+def test_unresolved_or_ambiguous_date_does_not_guess_a_period(question):
     assert resolve_live_query_period(question, "1792350000.000001") is None
 
 
@@ -301,6 +330,16 @@ def test_period_filter_does_not_bypass_existing_future_source_and_revision_check
     with pytest.raises(MemoryError, match="source_revision_mismatch"):
         normalize([source(message="1792249200.000000", thread="1792200000.000001", revisionHash="0" * 64)],
                   question="오늘 한 말은?", before_ts="1792350000.000001")
+
+
+@pytest.mark.parametrize("question", [
+    "디디가 2026-02-30에 한 말", "디디가 오늘과 어제 한 말", "디디가 2027년에 한 말",
+])
+def test_invalid_calendar_query_cannot_accept_undated_live_sources(question):
+    # adapter 검사를 우회해 원문을 직접 넘겨도 잘못된 날짜를 최근 발언으로 바꾸지 않는다.
+    with pytest.raises(MemoryError, match="memory_live_period_invalid"):
+        normalize([source(message="1792350000.000001", thread="1792200000.000001")],
+                  question=question, before_ts="1792350000.000001")
 
 
 def test_context_preserves_other_author_and_previous_day_parent_without_weakening_anchor_period():
@@ -385,16 +424,27 @@ def test_context_conflicts_cannot_mix_two_revisions_or_authors_of_one_message():
 
 def test_context_counts_and_raw_character_budget_include_all_linked_messages():
     anchor = source(message="1800000005.000001")
-    rows = [context(anchor, message=f"180000000{n}.000001", relation="thread_neighbor") for n in range(5)]
+    rows = [context(anchor, message=f"1800000000.{n + 2:06d}", relation="thread_neighbor") for n in range(5)]
     assert len(normalize([anchor], context_messages=rows)[0]["contextMessages"]) == 5
     with pytest.raises(MemoryError, match="memory_live_contexts_too_many"):
         normalize([anchor], context_messages=[*rows, rows[0]])
     anchors = [source(message=f"180000000{n}.000001") for n in range(2, 10)]
-    with pytest.raises(MemoryError, match="memory_live_contexts_invalid"):
-        normalize(anchors, context_messages=rows)
+    items = normalize(anchors, context_messages=rows)
+    assert len(items) == 8 and sum(len(item["contextMessages"]) for item in items) == 5
     with pytest.raises(MemoryError, match="memory_live_sources_too_large"):
-        normalize([source("가" * 4000, message="1800000005.000001")],
-                  context_messages=[context(anchor, "나" * 4001)])
+        normalize([source("가", message="1800000005.000001")], context_messages=[
+            context(anchor, "나" * LIVE_SOURCE_MAX_CHARS, message=f"1800000000.{n + 2:06d}", relation="thread_neighbor")
+            for n in range(5)])
+
+
+def test_context_full_text_is_not_excerpted_and_counts_against_the_same_raw_limit():
+    anchor = source("가" * LIVE_SOURCE_MAX_CHARS, message="1800000005.000001")
+    contexts = [context(anchor, "나" * LIVE_SOURCE_MAX_CHARS, message=f"1800000000.{n + 2:06d}", relation="thread_neighbor")
+                for n in range(4)]
+    (item,) = normalize([anchor], context_messages=contexts)
+    assert len(item["text"]) + sum(len(row["text"]) for row in item["contextMessages"]) == LIVE_TOTAL_MAX_CHARS
+    assert all(row["text"] == "나" * LIVE_SOURCE_MAX_CHARS and row["excerptOnly"] is False
+               for row in item["contextMessages"])
 
 
 @pytest.mark.parametrize("contexts", [None, "문맥", [None], [{}]])
