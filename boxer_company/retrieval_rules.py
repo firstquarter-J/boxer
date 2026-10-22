@@ -149,7 +149,7 @@ def _transform_company_retrieval_payload(payload: Any) -> Any:
             "companyNotionReferences": compact_references,
         }
 
-    if route == "device_diagnostic_snapshot":
+    if route in {"device_diagnostic_snapshot", "device_diagnostic_freeform"}:
         summary = masked_payload.get("summary") if isinstance(masked_payload.get("summary"), dict) else {}
         checks = masked_payload.get("checks") if isinstance(masked_payload.get("checks"), dict) else {}
         compact_checks: dict[str, Any] = {}
@@ -173,15 +173,51 @@ def _transform_company_retrieval_payload(payload: Any) -> Any:
                 "reason": item.get("reason"),
             }
 
+        # 자동 원인 분석과 후속 조회도 같은 제한된 근거를 사용한다.
+        # 네트워크 원문 대신 필드별로 추출한 summary.network를 전달한다.
+        followup = masked_payload.get("followupLiveCheck")
+        compact_followup = None
+        if isinstance(followup, dict):
+            compact_followup = {
+                key: followup.get(key)
+                for key in (
+                    "performed", "readOnly", "capturedAt", "commandKeys",
+                    "mutatingCommandsSent", "reason", "summary",
+                )
+            }
+            live_ssh = followup.get("ssh")
+            if isinstance(live_ssh, dict):
+                compact_followup["ssh"] = {
+                    "ready": live_ssh.get("ready"),
+                    "reason": live_ssh.get("reason"),
+                }
+            live_checks = followup.get("checks")
+            if isinstance(live_checks, dict):
+                compact_followup["checks"] = {
+                    key: {
+                        field: item.get(field)
+                        for field in ("summary", "ok", "exitStatus", "reason")
+                    } | {"output": str(item.get("output") or "")[:1600]}
+                    for key, item in live_checks.items()
+                    if key in {
+                        "uptime", "memory", "disk", "pm2_describe_box",
+                        "pm2_describe_agent", "reboot_history", "kernel_oom",
+                    } and isinstance(item, dict)
+                }
+
         return {
             "route": masked_payload.get("route"),
             "source": masked_payload.get("source"),
             "request": masked_payload.get("request"),
             "device": masked_payload.get("device"),
             "ping": masked_payload.get("ping"),
-            "ssh": masked_payload.get("ssh"),
+            "ssh": {
+                key: (masked_payload.get("ssh") or {}).get(key)
+                for key in ("ready", "reason")
+            } if isinstance(masked_payload.get("ssh"), dict) else {},
             "summary": summary,
             "checks": compact_checks,
+            **({"followupLiveCheck": compact_followup} if compact_followup is not None else {}),
         }
 
     if route != "barcode_log_error_summary":
@@ -476,25 +512,32 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "14) 현장 표현만으로 하드웨어 고장까지 단정하지 말고, 재부팅 후 미기동 같은 별도 증상은 전원/하드웨어 점검을 분리해서 안내해.\n"
             "15) 6줄 안팎으로 끝내."
         )
-    if route == "device_diagnostic_snapshot":
+    if route in {"device_diagnostic_snapshot", "device_diagnostic_freeform"}:
         return (
             "\n"
             "7) 이 작업은 장비 진단 스냅샷 기반 follow-up 답변이다.\n"
             "8) 아래 형식 그대로만 답해:\n"
             "   *장비 진단 답변*\n"
-            "   • 결론:\n"
-            "   • 근거:\n"
-            "   • 조치:\n"
-            "   • 한계:\n"
+            "   - 결론:\n"
+            "   - 근거:\n"
+            "   - 조치:\n"
+            "   - 한계:\n"
             "9) 반드시 한국어만 사용해. 영어 설명, 자기 사고 과정, 중간 추론, 검토 문장은 절대 쓰지 마.\n"
-            "10) evidence의 device/ping/ssh/summary/checks만 사용해. 스냅샷에 없는 원인은 단정하지 마.\n"
+            "10) evidence의 device/ping/ssh/summary/checks/followupLiveCheck만 사용해. 스냅샷에 없는 원인은 단정하지 마.\n"
             "11) capturedAt 기준 스냅샷이라는 점을 한계에 짧게 적어.\n"
             "12) ssh.ready=false면 앱 내부 원인을 단정하지 말고 원격 접속/온라인 상태부터 확인하라고 적어.\n"
             "13) PM2 restartCount가 높거나 로그에 restart/exit/error/OOM 단서가 있으면 그 관찰값을 근거로 써.\n"
             "14) OOM/out of memory/killed process/heap 계열 단서가 있으면 메모리 문제를 우선 의심하되 추정이라고 적어.\n"
             "15) PM2 상태가 online이어도 restartCount나 최근 로그 단서가 있으면 현재 online과 반복 재시작 가능성을 분리해서 설명해.\n"
             "16) 조치는 최대 3개만 `/`로 이어서 적어. 위험하거나 상태 변경하는 명령은 제안하지 마.\n"
-            "17) 5줄 안팎으로 짧게 끝내."
+            "17) followupLiveCheck.performed=true면 그 시각과 summary.network를 우선하고, 없으면 summary.network를 사용해.\n"
+            "18) 네트워크 classification=network_link_failure면 실제 사용 인터페이스의 링크 단절 기록을 근거로 네트워크 연결 문제로 판단해. correlation.available=true일 때 linkTimestamp/appTimestamp를 함께 적고, linkBeforeAppError=true인 경우에만 앱 오류보다 먼저 링크가 끊겼다고 설명해.\n"
+            "19) classification=network_error_only면 DNS/FTP/소켓 오류는 확인됐지만 물리 링크 단절은 미확정이라고 적어. 네트워크 오류만으로 앱 결함이나 케이블 고장을 단정하지 마.\n"
+            "   classification=network_route_failure면 기본 경로가 없다는 관찰을 근거로 IP와 게이트웨이 설정, 연결된 네트워크 확인을 안내해.\n"
+            "20) no_network_evidence는 수집 범위에서 단서가 없다는 뜻이야. 현재 연결 정상이나 로그 부재만으로 과거 네트워크 장애를 배제하거나 앱 문제로 확정하지 마. check_unavailable이면 조회 실패와 확인 범위를 밝혀.\n"
+            "21) 사용하지 않는 무선 인터페이스의 DOWN, 부팅 초기의 정상 링크 협상, 종료 후 오류만으로 장애를 만들지 마. 과거 단절과 현재 복구 상태를 구분해.\n"
+            "22) 네트워크 단절의 현장 점검은 랜 케이블, 연결 단자, 스위치 포트와 장비 랜 포트야. 특정 부품 고장이나 병원 책임, 캡처 생성 실패 전체 원인은 근거 없이 확정하지 마.\n"
+            "23) 네트워크 이력의 completeness나 available이 불충분하면 정상으로 확정하지 마. 5줄 안팎으로 짧게 끝내."
         )
 
     if route != "barcode_log_analysis":

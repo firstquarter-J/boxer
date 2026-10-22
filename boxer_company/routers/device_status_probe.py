@@ -1,6 +1,3 @@
-from boxer_company._operation_routing_device import (
-    _normalize_device_status_question,
-)
 import base64
 import hashlib
 import json
@@ -11,7 +8,9 @@ from typing import Any
 
 from boxer.core.utils import _truncate_text
 from boxer_company import settings as cs
-from boxer_company.utils import _display_value, _format_size
+from boxer_company._operation_routing_device import (
+    _normalize_device_status_question,
+)
 from boxer_company.device_led_health import LED_USB_SIGNATURES
 from boxer_company.notion_playbooks import _select_notion_references
 from boxer_company.routers.device_audio_probe import (
@@ -25,6 +24,11 @@ from boxer_company.routers.device_file_probe import (
     _connect_device_ssh_client,
     _get_active_device_ssh_client_count,
 )
+from boxer_company.routers.device_network_probe import (
+    NETWORK_COMMAND_KEYS,
+    NETWORK_COMMAND_SPECS,
+    build_network_summary,
+)
 from boxer_company.routers.device_ssh_security import (
     _mark_company_api_mutation_attempted,
 )
@@ -33,7 +37,11 @@ from boxer_company.routers.mda_graphql import (
     _send_mda_device_ping,
     _wait_for_mda_device_agent_ssh,
 )
-from boxer_company.routers.ssh_command import _close_ssh_streams, _wait_for_ssh_exit_status
+from boxer_company.routers.ssh_command import (
+    _close_ssh_streams,
+    _wait_for_ssh_exit_status,
+)
+from boxer_company.utils import _display_value, _format_size
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +351,8 @@ def _build_voice_config_command() -> str:
     )
 
 _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
+    # 일반 상태 조회에서도 장애 시점의 물리 링크와 앱 통신 이력을 함께 본다.
+    **NETWORK_COMMAND_SPECS,
     "tools": {
         "summary": "점검 도구 확인",
         "timeout_sec": 10,
@@ -465,6 +475,7 @@ _PROBE_COMMAND_SPECS: dict[str, dict[str, Any]] = {
 }
 _PROBE_COMPONENT_COMMAND_KEYS = {
     "all": (
+        *NETWORK_COMMAND_KEYS,
         "tools",
         "playback_devices",
         "master_mixer",
@@ -2744,6 +2755,24 @@ def _build_memory_patch_check_payload(command_result: dict[str, Any]) -> dict[st
     return parsed
 
 
+def _network_display_evidence(network: dict[str, Any]) -> list[dict[str, Any]]:
+    """반복된 앱 오류가 최신 링크 단절 근거를 화면에서 밀어내지 않게 한다."""
+    evidence = network.get("evidence") if isinstance(network.get("evidence"), list) else []
+    rows = sorted(
+        (row for row in evidence if isinstance(row, dict) and row.get("line")),
+        key=lambda row: str(row.get("timestamp") or ""),
+    )
+    links = [row for row in rows if row.get("kind") == "link_down" or re.search(
+        r"링크 단절|Lost carrier|Link is Down", str(row.get("line") or ""), re.IGNORECASE,
+    )]
+    app = [row for row in rows if row.get("source") == "app_daily_log"]
+    correlation = network.get("correlation") or {}
+    matching = [row for row in app if row.get("timestamp") == correlation.get("appTimestamp")]
+    if not links:
+        return rows[-3:]
+    return links[-2:] + (matching[-1:] or app[-1:])
+
+
 def _render_device_status_overview_result(
     *,
     device_name: str,
@@ -2757,6 +2786,7 @@ def _render_device_status_overview_result(
     captureboard_summary: dict[str, Any] | None,
     led_summary: dict[str, Any] | None,
     voice_summary: dict[str, Any] | None = None,
+    network_summary: dict[str, Any] | None = None,
 ) -> str:
     lines = _build_device_header_lines(
         title="*장비 상태 점검*",
@@ -2780,6 +2810,7 @@ def _render_device_status_overview_result(
         lines.append("• TrashCan 용량: *점검 불가*")
         lines.append("• 캡처보드: *점검 불가*")
         lines.append("• LED: *점검 불가*")
+        lines.append("- 네트워크: *점검 불가*, 원격 접속 실패만으로 장애 원인을 확정할 수 없어")
         lines.append("")
         lines.extend(_build_device_config_lines(device_info))
         lines.append(f"• 판단: {guidance['summary']}")
@@ -2793,6 +2824,8 @@ def _render_device_status_overview_result(
         "캡처보드": captureboard_summary or {},
         "LED": led_summary or {},
     }
+    if network_summary is not None:
+        component_summaries["네트워크"] = network_summary
     worst_rank = 0
     for label, summary in component_summaries.items():
         state = _display_value(summary.get("status"), default="check_needed")
@@ -2891,6 +2924,24 @@ def _render_device_status_overview_result(
     if trashcan_detail:
         trashcan_line = f"{trashcan_line} | {trashcan_detail}"
     lines.append(trashcan_line)
+
+    if network_summary is not None:
+        # 현재 연결이 복구됐어도 과거 단절과 앱 오류가 있었으면 함께 안내한다.
+        lines.append("")
+        lines.append("*네트워크*")
+        lines.append(f"- 판단: {_display_value(network_summary.get('summary'), default='확인 필요')}")
+        connection = {"wired": "유선", "wireless": "무선"}.get(network_summary.get("connectionType"))
+        if connection:
+            lines.append(f"- 연결 방식: {connection}, 인터페이스 `{network_summary.get('interface', '')}`")
+        for item in _network_display_evidence(network_summary):
+            if isinstance(item, dict) and item.get("line"):
+                line = str(item["line"])
+                timestamp = _display_value(item.get("timestamp"), default="")
+                if timestamp and not line.startswith(timestamp):
+                    line = f"{timestamp} {line}"
+                lines.append(f"- 근거: {_truncate_text(line, 300)}")
+        if network_summary.get("action"):
+            lines.append(f"- 점검: {network_summary['action']}")
 
     lines.append("")
     lines.extend(_build_device_config_lines(device_info))
@@ -3290,7 +3341,9 @@ def _probe_device_status_overview(
     storage_summary = None
     captureboard_summary = None
     led_summary = None
+    network_summary = None
     if ssh_ready:
+        network_summary = build_network_summary(checks)
         audio_summary = _summarize_audio_path_probe(checks)
         voice_summary = _summarize_voice_set_probe(
             _parse_voice_config(_display_value((checks.get("voice_config") or {}).get("output"), default=""))
@@ -3327,6 +3380,7 @@ def _probe_device_status_overview(
         "storage": storage_summary,
         "captureboard": captureboard_summary,
         "led": led_summary,
+        "network": network_summary,
     }
     if notion_references:
         evidence_payload["notionPlaybooks"] = notion_references
@@ -3343,6 +3397,7 @@ def _probe_device_status_overview(
         captureboard_summary=captureboard_summary,
         led_summary=led_summary,
         voice_summary=voice_summary,
+        network_summary=network_summary,
     )
     if notion_references:
         result_text = _append_remote_access_notion_section(result_text, notion_references)

@@ -1,6 +1,3 @@
-from boxer_company._operation_routing_device import (
-    _select_device_diagnostic_followup_command_keys,
-)
 import re
 import threading
 import time
@@ -9,15 +6,23 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from boxer.core.utils import _truncate_text
-from boxer_company.utils import _display_value
 from boxer_company import settings as cs
+from boxer_company._operation_routing_device import (
+    _select_device_diagnostic_followup_command_keys,
+)
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
+from boxer_company.routers.device_network_probe import (
+    NETWORK_COMMAND_SPECS,
+    build_network_summary,
+)
 from boxer_company.routers.device_status_probe import (
     _display_device_status_probe_reason,
+    _network_display_evidence,
     _parse_pm2_processes,
     _run_remote_ssh_command,
 )
 from boxer_company.routers.mda_graphql import _wait_for_mda_device_agent_ssh
+from boxer_company.utils import _display_value
 
 _DEVICE_DIAGNOSTIC_LOG_PATTERN = re.compile(
     r"(error|exception|fatal|fail|failed|restart|restarted|exit|exited|oom|out of memory|"
@@ -33,6 +38,8 @@ _PM2_JLIST_COMMAND = (
     "else echo pm2_missing; fi'"
 )
 _DEVICE_DIAGNOSTIC_COMMANDS: dict[str, dict[str, Any]] = {
+    # 앱 오류가 정상 접속 뒤 로그에서 밀려도 과거 링크 이력을 별도로 보존한다.
+    **NETWORK_COMMAND_SPECS,
     "uptime": {
         "summary": "uptime/load 확인",
         "timeout_sec": 8,
@@ -325,7 +332,31 @@ def _build_device_diagnostic_summary(snapshot: dict[str, Any]) -> dict[str, Any]
         "pm2": pm2,
         "interestingLogLines": interesting_lines,
         "interestingLogLineCount": len(interesting_lines),
+        "network": build_network_summary(checks),
     }
+
+
+def _diagnostic_network_lines(summary: dict[str, Any]) -> list[str]:
+    """LLM을 사용하지 못해도 링크 단절과 그 근거를 사용자에게 전달한다."""
+    network = summary.get("network")
+    if not isinstance(network, dict):
+        return []
+    lines = [f"- 네트워크: {_display_value(network.get('summary'), default='확인 필요')}"]
+    connection = {"wired": "유선", "wireless": "무선"}.get(network.get("connectionType"))
+    if connection:
+        lines.append(f"- 연결 방식: {connection}, 인터페이스 `{network.get('interface', '')}`")
+    for item in _network_display_evidence(network):
+        if isinstance(item, dict):
+            line = _display_value(item.get("line"), default="")
+            if line:
+                timestamp = _display_value(item.get("timestamp"), default="")
+                if timestamp and not line.startswith(timestamp):
+                    line = f"{timestamp} {line}"
+                lines.append(f"- 네트워크 근거: {_truncate_text(line, 300)}")
+    action = _display_value(network.get("action"), default="")
+    if action:
+        lines.append(f"- 네트워크 점검: {action}")
+    return lines
 
 
 def _device_diagnostic_snapshot_device_name(snapshot: dict[str, Any]) -> str:
@@ -383,6 +414,7 @@ def _build_device_diagnostic_start_reply(snapshot: dict[str, Any]) -> str:
     )
     if bool(ssh.get("ready")):
         lines.append(f"• PM2: {_format_diagnostic_pm2_line(pm2)}")
+        lines.extend(_diagnostic_network_lines(summary))
         lines.append(f"• 로그 단서: `{int(summary.get('interestingLogLineCount') or 0)}건`")
     lines.append("• 다음: 이 thread에서 `왜 반복 재시작해?`처럼 물어보면 이 스냅샷 기준으로 답할게")
     return "\n".join(lines)
@@ -724,6 +756,7 @@ def _build_device_diagnostic_followup_fallback(
         return "\n".join(lines)
 
     lines.append(f"• PM2: {_format_diagnostic_pm2_line(pm2)}")
+    lines.extend(_diagnostic_network_lines(summary))
     if interesting_lines:
         first_line = interesting_lines[0] if isinstance(interesting_lines[0], dict) else {}
         lines.append(f"• 로그 단서: `{len(interesting_lines)}건` | `{_display_value(first_line.get('line'), default='')}`")

@@ -8,6 +8,8 @@ from typing import Any
 
 from boxer_company._operation_routing_common import (
     CompanyOperationRequestContract as CompanyAssistantRequest,
+)
+from boxer_company._operation_routing_common import (
     _extract_device_name_scope,
     _extract_log_date_with_presence,
     _normalize_spaces,
@@ -18,7 +20,6 @@ from boxer_company.transport_contracts import (
     DEVICE_SCANNER_ABI_PATCH_ROUTE,
     _is_device_scanner_abi_patch_intent,
 )
-
 
 _DEVICE_AUDIO_HINTS = (
     "소리",
@@ -170,6 +171,49 @@ _DEVICE_DIAGNOSTIC_MEMORY_HINTS = ("메모리", "memory", "oom", "out of memory"
 _DEVICE_DIAGNOSTIC_DISK_HINTS = ("디스크", "disk", "용량", "저장공간")
 
 
+# 네트워크 이름만 있는 점검 질문도 기존 장비명 parser 안에서 진단으로 보낸다.
+_DEVICE_DIAGNOSTIC_NETWORK_HINTS = (
+    "네트워크",
+    "network",
+    "인터넷",
+    "유선",
+    "무선",
+    "랜선",
+    "랜케이블",
+    "와이파이",
+    "와이 파이",
+    "wifi",
+    "wi-fi",
+    "wi fi",
+    "이더넷",
+    "ethernet",
+    "통신",
+)
+_DEVICE_DIAGNOSTIC_LAN_PATTERN = re.compile(r"(?<![a-z가-힣])(?:랜|lan|wlan)(?![a-z가-힣])", re.IGNORECASE)
+
+
+# 일반 원인 분석에서도 앱 오류만 보고 회선 장애를 놓치지 않도록 함께 확인한다.
+_DEVICE_DIAGNOSTIC_CAUSE_HINTS = (
+    "왜",
+    "원인",
+    "꺼졌",
+    "꺼짐",
+    "종료",
+    "전원",
+    "재시작",
+    "재부팅",
+    "크래시",
+    "에러",
+    "오류",
+    "실패",
+)
+_DEVICE_DIAGNOSTIC_NETWORK_COMMAND_KEYS = (
+    "network_state",
+    "network_link_history",
+    "network_app_history",
+)
+
+
 def _normalize_device_diagnostic_question(question: str) -> str:
     text = re.sub(r"<@[^>]+>", " ", str(question or "")).strip()
     return re.sub(r"[`'\"“”‘’]+", "", text)
@@ -222,12 +266,21 @@ def _has_any_device_diagnostic_hint(question: str, hints: tuple[str, ...]) -> bo
     return any(hint in text or hint in lowered for hint in hints)
 
 
+def _has_device_diagnostic_network_hint(question: str) -> bool:
+    text = _normalize_device_diagnostic_question(question)
+    return _has_any_device_diagnostic_hint(text, _DEVICE_DIAGNOSTIC_NETWORK_HINTS) or bool(
+        _DEVICE_DIAGNOSTIC_LAN_PATTERN.search(text)
+    )
+
+
 def _select_device_diagnostic_followup_command_keys(question: str) -> list[str]:
-    if not _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_LIVE_FOLLOWUP_HINTS):
+    has_network_hint = _has_device_diagnostic_network_hint(question)
+    if not has_network_hint and not _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_LIVE_FOLLOWUP_HINTS):
         return []
 
     selected: list[str] = ["pm2_jlist"]
-    if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_APP_LOG_HINTS):
+    # 네트워크만 물어도 앱의 실패/복구 시각과 시스템 링크 이력을 함께 대조한다.
+    if has_network_hint or _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_APP_LOG_HINTS):
         selected.extend(["pm2_describe_box", "pm2_describe_agent", "pm2_logs_box", "pm2_logs_agent", "app_recent_logs"])
     if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_SYSTEM_LOG_HINTS):
         selected.extend(["reboot_history", "system_journal_recent", "kernel_oom"])
@@ -235,6 +288,8 @@ def _select_device_diagnostic_followup_command_keys(question: str) -> list[str]:
         selected.extend(["memory", "kernel_oom"])
     if _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_DISK_HINTS):
         selected.append("disk")
+    if has_network_hint or _has_any_device_diagnostic_hint(question, _DEVICE_DIAGNOSTIC_CAUSE_HINTS):
+        selected.extend(_DEVICE_DIAGNOSTIC_NETWORK_COMMAND_KEYS)
 
     deduped: list[str] = []
     for key in selected:
@@ -902,7 +957,9 @@ def match_device_operation_candidate_route(
         device_name=status_device_name,
     ):
         return "device_led_probe"
-    if _is_device_status_probe_request(
+    # 명시 네트워크의 연결 상태는 generic 상태 요약 대신 이력 분석으로 보낸다.
+    # 위의 PM2/캡처보드/LED 전용 probe와 아래의 기존 진단 thread 우선순위는 유지한다.
+    if not _has_device_diagnostic_network_hint(question) and _is_device_status_probe_request(
         question,
         device_name=status_device_name,
     ):
