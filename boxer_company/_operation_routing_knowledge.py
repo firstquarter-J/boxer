@@ -7,10 +7,15 @@ from typing import Callable
 
 from boxer_company._operation_routing_common import (
     CompanyOperationRequestContract as CompanyAssistantRequest,
+)
+from boxer_company._operation_routing_common import (
     window_assistant_context_entries,
 )
+from boxer_company._operation_routing_device import (
+    _extract_device_name_for_diagnostic_freeform,
+    _has_device_diagnostic_network_hint,
+)
 from boxer_company.team_member_aliases import matches_team_member_alias
-
 
 _NOTION_QUESTION_TOKENS = (
     "마미박스",
@@ -292,6 +297,22 @@ _TEAM_MEMBER_ALIAS_TOKENS = tuple(
 _NOTION_PLAYBOOK_ROUTE = "notion_playbook_qa"
 
 
+_EXPLICIT_PLAYBOOK_REQUEST_HINTS = (
+    "문서",
+    "노션",
+    "notion",
+    "가이드",
+    "guide",
+    "매뉴얼",
+    "manual",
+    "플레이북",
+    "playbook",
+    "사용법",
+    "방법",
+    "절차",
+)
+
+
 def _request_context_text(request: CompanyAssistantRequest) -> str:
     # matcher와 합성은 adapter 원본이 아니라 공통 창 제한을 거친 text만 사용한다.
     return "\n".join(
@@ -365,6 +386,18 @@ def _match_notion_playbook_route(
     context_text: str | None = None,
 ) -> str | None:
     """조회 없이 직접·후속 플레이북 질문의 공통 route만 확정한다."""
+
+    # 명시 문서 요청은 보존하되, 본문 장비명과 네트워크 live 진단 의도가 있으면
+    # 마미박스 같은 주제 토큰으로 문서가 선점하지 않게 한다. Slack 사전 분류,
+    # operation 우선순위와 API 실제 route가 모두 이 한 경계를 공유한다.
+    question = str(request.question or "").strip()
+    has_document_request = any(hint in question.lower() for hint in _EXPLICIT_PLAYBOOK_REQUEST_HINTS)
+    if (
+        not has_document_request
+        and _has_device_diagnostic_network_hint(question)
+        and _extract_device_name_for_diagnostic_freeform(question)
+    ):
+        return None
 
     # HTTP rollout matcher와 실제 route가 같은 정규화 문맥·판정 순서를
     # 공유해 adapter별 분류 차이로 다른 route를 호출하지 않게 한다.
