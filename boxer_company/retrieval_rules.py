@@ -182,7 +182,7 @@ def _transform_company_retrieval_payload(payload: Any) -> Any:
                 key: followup.get(key)
                 for key in (
                     "performed", "readOnly", "capturedAt", "commandKeys",
-                    "mutatingCommandsSent", "reason", "summary",
+                    "mutatingCommandsSent", "reason", "summary", "networkWindow",
                 )
             }
             live_ssh = followup.get("ssh")
@@ -216,6 +216,7 @@ def _transform_company_retrieval_payload(payload: Any) -> Any:
                 for key in ("ready", "reason")
             } if isinstance(masked_payload.get("ssh"), dict) else {},
             "summary": summary,
+            **({"networkWindow": masked_payload["networkWindow"]} if isinstance(masked_payload.get("networkWindow"), dict) else {}),
             "checks": compact_checks,
             **({"followupLiveCheck": compact_followup} if compact_followup is not None else {}),
         }
@@ -537,7 +538,9 @@ def _build_company_retrieval_rules(evidence_payload: Any) -> str:
             "20) no_network_evidence는 수집 범위에서 단서가 없다는 뜻이야. 현재 연결 정상이나 로그 부재만으로 과거 네트워크 장애를 배제하거나 앱 문제로 확정하지 마. check_unavailable이면 조회 실패와 확인 범위를 밝혀.\n"
             "21) 사용하지 않는 무선 인터페이스의 DOWN, 부팅 초기의 정상 링크 협상, 종료 후 오류만으로 장애를 만들지 마. 과거 단절과 현재 복구 상태를 구분해.\n"
             "22) 네트워크 단절의 현장 점검은 랜 케이블, 연결 단자, 스위치 포트와 장비 랜 포트야. 특정 부품 고장이나 병원 책임, 캡처 생성 실패 전체 원인은 근거 없이 확정하지 마.\n"
-            "23) 네트워크 이력의 completeness나 available이 불충분하면 정상으로 확정하지 마. 5줄 안팎으로 짧게 끝내."
+            "23) 네트워크 이력의 completeness나 available이 불충분하면 정상으로 확정하지 마.\n"
+            "24) networkWindow.label의 로그 조회 날짜와 시간 범위를 답변에 명시해. 날짜가 없으면 오늘 00시부터 조회 시점까지이며 지정일 밖의 사건을 원인 근거로 섞지 마.\n"
+            "25) PM2, 연결 방식, carrier, 경로와 DNS는 조회 시점의 현재 관찰이야. 과거 날짜의 장애 원인을 현재 상태만으로 판정하지 마. 조회 실패나 로그 미보존이면 해당 날짜의 자료를 확인하지 못했다고 밝혀. 5줄 안팎으로 짧게 끝내."
         )
 
     if route != "barcode_log_analysis":

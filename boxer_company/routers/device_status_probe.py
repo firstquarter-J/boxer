@@ -27,7 +27,9 @@ from boxer_company.routers.device_file_probe import (
 from boxer_company.routers.device_network_probe import (
     NETWORK_COMMAND_KEYS,
     NETWORK_COMMAND_SPECS,
+    build_network_command_specs,
     build_network_summary,
+    resolve_network_window,
 )
 from boxer_company.routers.device_ssh_security import (
     _mark_company_api_mutation_attempted,
@@ -730,8 +732,18 @@ def _run_remote_ssh_command(
         _close_ssh_streams(stdin, stdout, stderr)
 
 
-def _run_status_probe_command(client: Any, key: str) -> dict[str, Any]:
-    spec = _PROBE_COMMAND_SPECS[key]
+def _run_status_probe_command(
+    client: Any,
+    key: str,
+    *,
+    network_window: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # 날짜 지정은 네트워크 조회 명령에만 적용하고 다른 장비 점검 명령은 유지한다.
+    spec = (
+        build_network_command_specs(network_window)[key]
+        if network_window is not None and key in NETWORK_COMMAND_KEYS
+        else _PROBE_COMMAND_SPECS[key]
+    )
     result = _run_remote_ssh_command(
         client,
         command=str(spec.get("command") or "").strip(),
@@ -2787,12 +2799,16 @@ def _render_device_status_overview_result(
     led_summary: dict[str, Any] | None,
     voice_summary: dict[str, Any] | None = None,
     network_summary: dict[str, Any] | None = None,
+    network_window: dict[str, Any] | None = None,
 ) -> str:
     lines = _build_device_header_lines(
         title="*장비 상태 점검*",
         device_name=device_name,
         device_info=device_info,
     )
+    # SSH가 열리지 않은 경우에도 요청한 날짜 범위는 답변에 명시한다.
+    if network_window is not None:
+        lines.append(f"- 네트워크 조회 범위: {_display_value(network_window.get('label'), default='확인 필요')}")
     if not ssh_ready:
         remote_state = _extract_remote_access_state(device_info)
         guidance = _build_status_overview_ssh_unavailable_guidance(
@@ -3062,12 +3078,15 @@ def _collect_runtime_checks(
     *,
     resend_ssh_open: bool = True,
     allow_force_reopen: bool = True,
+    network_window: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
     evidence_payload, device_info = _build_runtime_probe_payload(
         device_name=device_name,
         component=component,
         resend_ssh_open=resend_ssh_open,
     )
+    if network_window is not None:
+        evidence_payload["networkWindow"] = dict(network_window)
     if not evidence_payload["ssh"]["ready"]:
         return evidence_payload, device_info, {}
 
@@ -3190,6 +3209,9 @@ def _collect_runtime_checks(
                             evidence_payload
                         )
 
+    # 터널 재조회가 payload를 교체해도 최초 요청의 네트워크 범위는 보존한다.
+    if network_window is not None:
+        evidence_payload["networkWindow"] = dict(network_window)
     if not connection.get("ok"):
         final_reason = _display_value(
             connection.get("reason"),
@@ -3243,7 +3265,11 @@ def _collect_runtime_checks(
     keys = _PROBE_COMPONENT_COMMAND_KEYS[component]
     try:
         results = {
-            key: _run_status_probe_command(client, key)
+            key: (
+                _run_status_probe_command(client, key, network_window=network_window)
+                if network_window is not None and key in NETWORK_COMMAND_KEYS
+                else _run_status_probe_command(client, key)
+            )
             for key in keys
         }
     finally:
@@ -3315,6 +3341,7 @@ def _probe_device_runtime_component(
 def _probe_device_status_overview(
     device_name: str,
     *,
+    question: str = "",
     resend_ssh_open: bool = True,
     allow_force_reopen: bool = True,
 ) -> tuple[str, dict[str, Any]]:
@@ -3322,13 +3349,17 @@ def _probe_device_status_overview(
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 장비 상태`")
 
+    # 잘못된 날짜는 ping이나 SSH 개방 전에 거절하고 기본 조회는 한국 시간 오늘로 한다.
+    network_window = resolve_network_window(question)
     ping_result = _send_mda_device_ping(normalized_device_name)
     evidence_payload, device_info, checks = _collect_runtime_checks(
         normalized_device_name,
         "all",
         resend_ssh_open=resend_ssh_open,
         allow_force_reopen=allow_force_reopen,
+        network_window=network_window,
     )
+    evidence_payload["networkWindow"] = dict(network_window)
     evidence_payload["ping"] = ping_result
     ssh = evidence_payload.get("ssh") if isinstance(evidence_payload.get("ssh"), dict) else {}
     ssh_ready = bool(ssh.get("ready"))
@@ -3343,7 +3374,7 @@ def _probe_device_status_overview(
     led_summary = None
     network_summary = None
     if ssh_ready:
-        network_summary = build_network_summary(checks)
+        network_summary = build_network_summary(checks, window=network_window)
         audio_summary = _summarize_audio_path_probe(checks)
         voice_summary = _summarize_voice_set_probe(
             _parse_voice_config(_display_value((checks.get("voice_config") or {}).get("output"), default=""))
@@ -3398,6 +3429,7 @@ def _probe_device_status_overview(
         led_summary=led_summary,
         voice_summary=voice_summary,
         network_summary=network_summary,
+        network_window=network_window,
     )
     if notion_references:
         result_text = _append_remote_access_notion_section(result_text, notion_references)

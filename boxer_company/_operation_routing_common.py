@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -237,7 +237,11 @@ def _sub_non_embedded_date_matches(text: str, pattern: re.Pattern[str], kind: st
     )
 
 
-def _parse_explicit_date_expression(text: str) -> tuple[bool, str | None]:
+def _parse_explicit_date_expression(
+    text: str,
+    *,
+    reference_date: date | None = None,
+) -> tuple[bool, str | None]:
     candidates: list[tuple[int, str, re.Match[str]]] = []
     for kind, pattern in (
         ("korean_ymd", _KOREAN_YMD_PATTERN),
@@ -275,7 +279,8 @@ def _parse_explicit_date_expression(text: str) -> tuple[bool, str | None]:
             day = int(matched.group(3))
             parsed = _try_format_date(year, month, day)
         else:
-            local_year = _current_local_date().year
+            # 호출자가 고정한 한국 날짜를 쓰면 연도 없는 월일도 같은 기준으로 해석한다.
+            local_year = (reference_date if reference_date is not None else _current_local_date()).year
             month = int(matched.group(1))
             day = int(matched.group(2))
             parsed = _try_format_date(local_year, month, day)
@@ -315,17 +320,26 @@ def _extract_relative_day_offset(text: str, lowered: str) -> int | None:
     return None
 
 
-def _extract_log_date_with_presence(question: str) -> tuple[str, bool]:
+def _extract_log_date_with_presence(
+    question: str,
+    *,
+    reference_date: date | None = None,
+) -> tuple[str, bool]:
     text = (question or "").strip()
     lowered = text.lower()
 
-    has_explicit_date, parsed_explicit_date = _parse_explicit_date_expression(text)
+    # 기존 호출 형태는 보존하고 네트워크 조회만 동일한 기준 날짜를 명시할 수 있다.
+    has_explicit_date, parsed_explicit_date = (
+        _parse_explicit_date_expression(text)
+        if reference_date is None
+        else _parse_explicit_date_expression(text, reference_date=reference_date)
+    )
     if has_explicit_date:
         if parsed_explicit_date is None:
             raise ValueError("날짜 형식을 확인해줘. 예: 2026-03-03, 26.03.03, 3/3, 3월 3일, 02-20, 260220")
         return parsed_explicit_date, True
 
-    base_date = _current_local_date()
+    base_date = reference_date if reference_date is not None else _current_local_date()
     relative_offset = _extract_relative_day_offset(text, lowered)
     if relative_offset is not None:
         base_date = base_date + timedelta(days=relative_offset)

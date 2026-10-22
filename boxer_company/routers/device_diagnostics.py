@@ -8,12 +8,16 @@ from zoneinfo import ZoneInfo
 from boxer.core.utils import _truncate_text
 from boxer_company import settings as cs
 from boxer_company._operation_routing_device import (
+    _has_device_diagnostic_network_hint,
     _select_device_diagnostic_followup_command_keys,
 )
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.device_network_probe import (
+    NETWORK_COMMAND_KEYS,
     NETWORK_COMMAND_SPECS,
+    build_network_command_specs,
     build_network_summary,
+    resolve_network_window,
 )
 from boxer_company.routers.device_status_probe import (
     _display_device_status_probe_reason,
@@ -260,11 +264,22 @@ def _build_device_diagnostic_ssh_state(wait_result: dict[str, Any]) -> tuple[dic
 def _run_device_diagnostic_commands(
     client: Any,
     command_keys: list[str] | None = None,
+    *,
+    network_window: dict[str, Any] | None = None,
+    network_only_logs: bool = False,
 ) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     selected_keys = command_keys or list(_DEVICE_DIAGNOSTIC_COMMANDS.keys())
+    network_specs = build_network_command_specs(network_window) if network_window is not None else {}
     for key in selected_keys:
-        spec = _DEVICE_DIAGNOSTIC_COMMANDS.get(key)
+        # 기간을 지정한 분석에 다른 날짜의 최근 원문을 섞지 않는다.
+        # 앱 통신 이력과 링크 이력은 같은 기간을 적용한 구조화 수집기로 대조한다.
+        if network_only_logs and network_window is not None and key in {
+            "pm2_logs_box", "pm2_logs_agent", "app_recent_logs",
+            "system_journal_recent", "kernel_oom", "reboot_history",
+        }:
+            continue
+        spec = network_specs.get(key) or _DEVICE_DIAGNOSTIC_COMMANDS.get(key)
         if not spec:
             continue
         # 진단 시작은 상태 확인 전용이라 command registry도 read-only 명령만 둔다.
@@ -332,7 +347,7 @@ def _build_device_diagnostic_summary(snapshot: dict[str, Any]) -> dict[str, Any]
         "pm2": pm2,
         "interestingLogLines": interesting_lines,
         "interestingLogLineCount": len(interesting_lines),
-        "network": build_network_summary(checks),
+        "network": build_network_summary(checks, window=snapshot.get("networkWindow")),
     }
 
 
@@ -342,6 +357,10 @@ def _diagnostic_network_lines(summary: dict[str, Any]) -> list[str]:
     if not isinstance(network, dict):
         return []
     lines = [f"- 네트워크: {_display_value(network.get('summary'), default='확인 필요')}"]
+    window = network.get("networkWindow")
+    if isinstance(window, dict) and window.get("label"):
+        lines.append(f"- 네트워크 로그 조회 범위: {window['label']}")
+        lines.append("- 연결 방식과 PM2 상태는 조회 시점의 현재 관찰이야. 과거 장애의 원인으로 단정하지 않아.")
     connection = {"wired": "유선", "wireless": "무선"}.get(network.get("connectionType"))
     if connection:
         lines.append(f"- 연결 방식: {connection}, 인터페이스 `{network.get('interface', '')}`")
@@ -434,6 +453,11 @@ def _collect_device_diagnostic_snapshot(
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 진단 시작`")
 
+    # 잘못된 날짜는 장비 접근 전에 거절하고 한 요청의 두 로그 수집기에 같은 범위를 쓴다.
+    network_window = resolve_network_window(
+        question if _has_device_diagnostic_network_hint(question) else "",
+    )
+
     # 진단 시작은 원인 조사 접근을 위해 SSH open만 허용한다. 이후 원격 실행은 상태 조회와 로그 확인
     # 같은 read-only 명령으로 제한하고, 업데이트/재시작/종료 계열 조작 명령은 넣지 않는다.
     device_info, ssh_state = _build_device_diagnostic_ssh_state(
@@ -444,6 +468,7 @@ def _collect_device_diagnostic_snapshot(
     )
 
     snapshot: dict[str, Any] = {
+        "networkWindow": network_window,
         "route": "device_diagnostic_snapshot",
         "source": "mda_graphql_ssh_open+ssh_read",
         "request": {
@@ -495,7 +520,10 @@ def _collect_device_diagnostic_snapshot(
 
     client = connection["client"]
     try:
-        snapshot["checks"] = _run_device_diagnostic_commands(client)
+        snapshot["checks"] = _run_device_diagnostic_commands(
+            client, network_window=network_window,
+            network_only_logs=_has_device_diagnostic_network_hint(question),
+        )
     finally:
         client.close()
     snapshot["summary"] = _build_device_diagnostic_summary(snapshot)
@@ -538,6 +566,22 @@ def _build_device_diagnostic_followup_evidence(
 ) -> dict[str, Any]:
     evidence = dict(snapshot)
     command_keys = _select_device_diagnostic_followup_command_keys(question)
+    network_window = (
+        resolve_network_window(question if _has_device_diagnostic_network_hint(question) else "")
+        if any(key in NETWORK_COMMAND_KEYS for key in command_keys) else None
+    )
+    if network_window is not None:
+        # 지난 스냅샷의 다른 날짜 로그는 새 조회의 합성 근거로 재사용하지 않는다.
+        evidence["networkWindow"] = network_window
+        if _has_device_diagnostic_network_hint(question):
+            evidence["checks"] = {}
+            evidence["summary"] = {}
+        else:
+            # 일반 종료/OOM 조사는 기존 앱 근거를 보존하되 기간이 다른 네트워크 근거만 뺀다.
+            previous_checks = snapshot.get("checks") if isinstance(snapshot.get("checks"), dict) else {}
+            evidence["checks"] = {key: value for key, value in previous_checks.items() if key not in NETWORK_COMMAND_KEYS}
+            previous_summary = snapshot.get("summary") if isinstance(snapshot.get("summary"), dict) else {}
+            evidence["summary"] = {key: value for key, value in previous_summary.items() if key != "network"}
     device_name = _device_diagnostic_snapshot_device_name(snapshot)
     live_check: dict[str, Any] = {
         "performed": False,
@@ -547,6 +591,8 @@ def _build_device_diagnostic_followup_evidence(
         "commandKeys": command_keys,
         "mutatingCommandsSent": False,
     }
+    if network_window is not None:
+        live_check["networkWindow"] = network_window
     evidence["followupLiveCheck"] = live_check
 
     if not command_keys:
@@ -589,6 +635,7 @@ def _build_device_diagnostic_followup_evidence(
                 {
                     "ssh": ssh_state,
                     "checks": {},
+                    "networkWindow": network_window,
                 }
             )
             return evidence
@@ -610,13 +657,17 @@ def _build_device_diagnostic_followup_evidence(
                 {
                     "ssh": ssh_state,
                     "checks": {},
+                    "networkWindow": network_window,
                 }
             )
             return evidence
 
         client = connection["client"]
         try:
-            checks = _run_device_diagnostic_commands(client, command_keys=command_keys)
+            checks = _run_device_diagnostic_commands(
+                client, command_keys=command_keys, network_window=network_window,
+                network_only_logs=_has_device_diagnostic_network_hint(question),
+            )
         finally:
             client.close()
         live_check["checks"] = checks
@@ -624,6 +675,7 @@ def _build_device_diagnostic_followup_evidence(
             {
                 "ssh": ssh_state,
                 "checks": checks,
+                "networkWindow": network_window,
             }
         )
         live_check["reason"] = "ok"
@@ -636,6 +688,7 @@ def _build_device_diagnostic_followup_evidence(
             {
                 "ssh": {"ready": False, "reason": type(exc).__name__},
                 "checks": {},
+                "networkWindow": network_window,
             }
         )
         return evidence

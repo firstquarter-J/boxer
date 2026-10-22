@@ -46,8 +46,12 @@ class DeviceNetworkIntegrationTests(unittest.TestCase):
 
         collect.assert_called_once_with(
             "MB2-C00330", "all", resend_ssh_open=False, allow_force_reopen=False,
+            network_window=collect.call_args.kwargs["network_window"],
         )
-        network.assert_called_once_with({"network_state": {"ok": True}})
+        window = collect.call_args.kwargs["network_window"]
+        self.assertEqual(window["timezone"], "Asia/Seoul")
+        self.assertTrue(window["isCurrentDay"])
+        network.assert_called_once_with({"network_state": {"ok": True}}, window=window)
         self.assertIn("Lost carrier", text)
         self.assertIn("랜 케이블", text)
         self.assertIn("확인 필요", text)
@@ -73,7 +77,7 @@ class DeviceNetworkIntegrationTests(unittest.TestCase):
         checks = {"network_state": {"ok": True}}
         with patch.object(diagnostics, "build_network_summary", return_value=_network_summary()) as build:
             summary = diagnostics._build_device_diagnostic_summary({"checks": checks})
-        build.assert_called_once_with(checks)
+        build.assert_called_once_with(checks, window=None)
         self.assertEqual(summary["network"]["classification"], "network_link_failure")
 
     def test_repeated_app_errors_do_not_hide_latest_link_failure(self):

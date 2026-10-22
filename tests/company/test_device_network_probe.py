@@ -14,6 +14,8 @@ from boxer_company.routers import device_network_probe as network
 
 _BOOT = "a" * 32
 _STAMP = "2026-10-22T09:15:42+09:00"
+_NOW = datetime.datetime.fromisoformat("2026-10-22T12:30:00.500000+09:00")
+_WINDOW = network.resolve_network_window("", _NOW)
 
 
 def _check(value):
@@ -32,6 +34,7 @@ def _checks(events=None, app_events=None, **state):
         "network_state": _check({
             "status": "ok", "interface": "enp1s0", "connectionType": "wired", "carrier": True,
             "operstate": "up", "hasDefaultRoute": True, "dnsServers": ["192.0.2.53"], **state,
+            "networkWindow": _WINDOW,
         }),
         "network_link_history": _check({"status": "ok", "events": events or []}),
         "network_app_history": _check({"status": "ok", "events": app_events or []}),
@@ -39,7 +42,7 @@ def _checks(events=None, app_events=None, **state):
 
 
 def _remote_namespace(script):
-    namespace = {}
+    namespace = {"_FIXED_START": _WINDOW["startEpoch"], "_FIXED_END": _WINDOW["endEpoch"]}
     # 사용자 입력 없이 제품의 고정 원격 스크립트만 격리된 namespace에서 검증한다.
     exec(network._REMOTE_COMMON + script, namespace)  # noqa: S102
     results = []
@@ -250,7 +253,8 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
         self.assertEqual(output[0]["events"][2]["transition"], "shutdown")
         self.assertNotIn("hidden", json.dumps(output))
         self.assertNotIn("-k", calls[0])
-        self.assertIn("72 hours ago", calls[0])
+        self.assertIn("--until", calls[0])
+        self.assertIn(f"@{_WINDOW['startEpoch']:.6f}", calls[0])
 
     def test_journal_permission_failure_is_explicit(self):
         namespace, output = _remote_namespace(network._REMOTE_LINK_HISTORY)
@@ -277,9 +281,9 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
         self.assertEqual(payload["events"][1]["transition"], "lost_carrier")
         self.assertLess(len(json.dumps(payload, separators=(",", ":"))), 8000)
 
-    def test_app_history_reads_four_dates_cuts_at_72_hours_and_discards_pii(self):
-        # 시각은 실제 현재를 기준으로 만들고 원문은 임시 파일에만 둔다.
-        now = datetime.datetime.now().astimezone()
+    def test_app_history_reads_only_selected_day_and_discards_pii(self):
+        # 고정된 오늘 범위로 전날 오류를 제외하고 원문은 임시 파일에만 둔다.
+        now = _NOW
         with tempfile.TemporaryDirectory() as directory:
             logs = Path(directory) / "AppData" / "logs"
             logs.mkdir(parents=True)
@@ -298,7 +302,7 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
             with patch.dict(os.environ, {"HOME": directory}):
                 namespace["main"]()
         payload = output[0]
-        self.assertEqual(payload["counts"]["route_unreachable"], 1)
+        self.assertNotIn("route_unreachable", payload["counts"])
         self.assertEqual(payload["counts"]["socket_error"], 1)
         self.assertEqual(payload["counts"]["app_offline"], 1)
         self.assertEqual(payload["counts"]["app_lifecycle"], 1)
@@ -313,7 +317,7 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
         self.assertEqual(output[0]["status"], "permission_denied")
 
     def test_repeated_app_errors_preserve_episode_start_and_total_count(self):
-        now = datetime.datetime.now().astimezone()
+        now = _NOW
         with tempfile.TemporaryDirectory() as directory:
             logs = Path(directory) / "AppData" / "logs"
             logs.mkdir(parents=True)
@@ -330,7 +334,7 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
 
     def test_normal_reconnections_do_not_displace_first_failure(self):
         # 복구 이후 정상 연결 로그가 많아도 같은 날 최초 통신 오류를 남긴다.
-        now = datetime.datetime.now().astimezone()
+        now = _NOW
         entries = [(now - datetime.timedelta(hours=4), "FTP ENETUNREACH")]
         entries += [
             (now - datetime.timedelta(minutes=6 * index), "Socket Connected")
@@ -351,7 +355,7 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
         self.assertTrue(output[0]["eventsTruncated"])
 
     def test_app_retry_episodes_keep_first_and_last_before_output_limit(self):
-        now = datetime.datetime.now().astimezone()
+        now = _NOW
         starts = [now - datetime.timedelta(hours=2), now - datetime.timedelta(hours=1)]
         with tempfile.TemporaryDirectory() as directory:
             logs = Path(directory) / "AppData" / "logs"
@@ -371,7 +375,7 @@ class NetworkRemoteCollectorTests(unittest.TestCase):
         self.assertEqual(output[0]["events"][2]["timestamp"], starts[1].replace(microsecond=0).isoformat())
 
     def test_many_separate_app_incidents_report_output_truncation(self):
-        now = datetime.datetime.now().astimezone()
+        now = _NOW
         with tempfile.TemporaryDirectory() as directory:
             logs = Path(directory) / "AppData" / "logs"
             logs.mkdir(parents=True)

@@ -3,8 +3,16 @@
 import json
 import re
 import shlex
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from boxer_company.routers.device_network_window import (
+    NetworkDateWindowError as NetworkDateWindowError,  # noqa: PLC0414 - 기존 import 경계에 예외를 공개한다.
+)
+from boxer_company.routers.device_network_window import (
+    resolve_network_window,
+    validate_network_window,
+)
 
 # 원격 Python은 Ubuntu 장비의 Python 3.6에서도 실행되는 표준 라이브러리만 쓴다.
 # stderr와 앱 원문은 반환하지 않고 허용한 상태, 시각, 이벤트 코드만 내보낸다.
@@ -19,7 +27,30 @@ import shutil
 import subprocess
 import time
 
+KST = datetime.timezone(datetime.timedelta(hours=9))
+_FIXED_START = globals().get("_FIXED_START")
+_FIXED_END = globals().get("_FIXED_END")
+_BOUNDS = None
+
+def window_bounds():
+    global _BOUNDS
+    if _BOUNDS is None:
+        now = time.time()
+        today = datetime.datetime.fromtimestamp(now, KST).replace(hour=0, minute=0, second=0, microsecond=0)
+        _BOUNDS = (today.timestamp(), now) if _FIXED_START is None else (float(_FIXED_START), float(_FIXED_END))
+    return _BOUNDS
+
+def window_metadata():
+    start, end = window_bounds()
+    first = datetime.datetime.fromtimestamp(start, KST)
+    last = datetime.datetime.fromtimestamp(end, KST)
+    current = first.date() == datetime.datetime.now(KST).date()
+    return {"startEpoch": start, "endEpoch": end, "date": first.date().isoformat(),
+            "timezone": "Asia/Seoul", "mode": "today" if current else "date", "isCurrentDay": current,
+            "label": first.strftime("%Y-%m-%d %H:%M:%S") + " ~ " + last.strftime("%Y-%m-%d %H:%M:%S") + " KST"}
+
 def emit(value):
+    value["networkWindow"] = window_metadata()
     print(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
 
 def run(args, seconds=4):
@@ -50,7 +81,7 @@ def safe_iface(value):
     return name
 
 def clock_stamp():
-    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    return datetime.datetime.now(KST).isoformat(timespec="seconds")
 '''
 
 _REMOTE_STATE = r'''
@@ -137,13 +168,14 @@ def main():
 _REMOTE_LINK_HISTORY = r'''
 def main():
     # -k는 현재 부팅만 선택하므로 사용하지 않는다. 커널 transport와 네트워크 unit을 OR로 조회한다.
-    args = ["journalctl", "--since", "72 hours ago", "--no-pager", "-o", "json", "-n", "401",
+    start, end = window_bounds()
+    args = ["journalctl", "--since", "@%.6f" % start, "--until", "@%.6f" % end, "--no-pager", "-o", "json", "-n", "401",
             "--grep", "(?i)(Link is (Up|Down)|Gained carrier|Lost carrier|carrier: link|state change:|Stopping Network Configuration|Reached target Shutdown|Powering off|Shutting down)",
             "_TRANSPORT=kernel", "+", "_SYSTEMD_UNIT=systemd-networkd.service", "+",
             "_SYSTEMD_UNIT=NetworkManager.service", "+", "_PID=1"]
     status, text = run(args, 12)
     if status != "ok":
-        emit({"status": status, "historyWindowHours": 72, "events": []})
+        emit({"status": status, "events": []})
         return
     records = [line for line in text.splitlines() if line.strip().startswith("{")]
     events = []
@@ -151,13 +183,17 @@ def main():
     for line in records:
         try:
             row = json.loads(line)
+            # journalctl의 끝 경계 포함 여부와 무관하게 [start, end)로 한 번 더 제한한다.
+            micros = int(row.get("__REALTIME_TIMESTAMP", 0))
+            if not start * 1000000 <= micros < end * 1000000:
+                continue
             message = str(row.get("MESSAGE", ""))
             source = "kernel" if row.get("_TRANSPORT") == "kernel" else str(row.get("_SYSTEMD_UNIT", ""))
             if str(row.get("_PID", "")) == "1" and re.search(r"Stopping Network Configuration|Reached target Shutdown|Powering off|Shutting down", message, re.I):
                 boot = str(row.get("_BOOT_ID", ""))
                 micros = int(row.get("__REALTIME_TIMESTAMP", 0))
                 if micros and re.match(r"^[0-9a-f]{32}$", boot):
-                    stamp = datetime.datetime.fromtimestamp(micros / 1000000.0).astimezone().isoformat(timespec="seconds")
+                    stamp = datetime.datetime.fromtimestamp(micros / 1000000.0, KST).isoformat(timespec="seconds")
                     events.append({"timestamp": stamp, "source": "system_lifecycle", "interface": "", "state": "shutdown", "boot": boot, "transition": "shutdown"})
                 continue
             if source not in ("kernel", "systemd-networkd.service", "NetworkManager.service"):
@@ -178,7 +214,7 @@ def main():
             if not micros:
                 invalid = True
                 continue
-            stamp = datetime.datetime.fromtimestamp(micros / 1000000.0).astimezone().isoformat(timespec="seconds")
+            stamp = datetime.datetime.fromtimestamp(micros / 1000000.0, KST).isoformat(timespec="seconds")
             boot = str(row.get("_BOOT_ID", ""))
             if not re.match(r"^[0-9a-f]{32}$", boot):
                 invalid = True
@@ -203,7 +239,7 @@ def main():
     events = compact
     limited = len(events) > 32 or len(records) >= 401
     emit({"status": "partial" if limited or invalid else ("ok" if records else "empty"),
-          "historyWindowHours": 72, "eventsTruncated": limited, "eventCount": len(events), "events": events[-32:]})
+          "eventsTruncated": limited, "eventCount": len(events), "events": events[-32:]})
 '''
 
 _REMOTE_APP_HISTORY = r'''
@@ -222,11 +258,9 @@ def main():
     paths = []
     seen_files = set()
     permission_error = False
-    today = datetime.date.today()
-    cutoff = time.time() - 72 * 3600
-    # 72시간의 시작 날짜가 오늘로부터 3일 전일 수 있어 네 날짜를 확인한다.
-    for days in range(4):
-        date = (today - datetime.timedelta(days=days)).isoformat()
+    start_epoch, end_epoch = window_bounds()
+    # 앱 일별 파일도 KST 하루만 연다. 장비 OS의 시간대와 무관하게 선택한다.
+    for date in (datetime.datetime.fromtimestamp(start_epoch, KST).date().isoformat(),):
         for directory in ("logs", "Logs"):
             path = os.path.expanduser("~/AppData/" + directory + "/log-" + date + ".log")
             try:
@@ -240,7 +274,7 @@ def main():
             except OSError:
                 pass
     if not paths:
-        emit({"status": "permission_denied" if permission_error else "empty", "historyWindowHours": 72, "events": [], "filesRead": 0})
+        emit({"status": "permission_denied" if permission_error else "empty", "events": [], "filesRead": 0})
         return
     events = []
     counts = {}
@@ -269,10 +303,10 @@ def main():
             if not match:
                 continue
             try:
-                stamp_value = datetime.datetime.strptime(match.group(1) + "T" + match.group(2), "%Y-%m-%dT%H:%M:%S").astimezone()
+                stamp_value = datetime.datetime.strptime(match.group(1) + "T" + match.group(2), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=KST)
             except ValueError:
                 continue
-            if stamp_value.timestamp() < cutoff or stamp_value.timestamp() > time.time() + 60:
+            if not start_epoch <= stamp_value.timestamp() < end_epoch:
                 continue
             for kind, pattern in APP_PATTERNS:
                 if pattern.search(line):
@@ -311,13 +345,15 @@ def main():
     grouped.sort(key=lambda item: item["timestamp"])
     limited = limited or len(groups) > len(selected) or len(paths) > 8
     status = "permission_denied" if permission_error and not files_read else ("partial" if limited or permission_error else "ok")
-    emit({"status": status, "historyWindowHours": 72, "filesRead": files_read,
+    emit({"status": status, "filesRead": files_read,
           "eventsTruncated": limited, "counts": counts, "events": grouped})
 '''
 
 
-def _remote_command(script: str) -> str:
-    body = _REMOTE_COMMON + script + "\ntry:\n    main()\nexcept Exception:\n    emit({\"status\": \"query_failed\"})\n"
+def _remote_command(script: str, window: dict[str, Any] | None = None) -> str:
+    fixed = validate_network_window(window) if window is not None else None
+    prefix = "" if fixed is None else "_FIXED_START = " + repr(fixed["startEpoch"]) + "\n_FIXED_END = " + repr(fixed["endEpoch"]) + "\n"
+    body = prefix + _REMOTE_COMMON + script + "\ntry:\n    main()\nexcept Exception:\n    emit({\"status\": \"query_failed\"})\n"
     invocation = "python3 -c " + shlex.quote(body)
     missing = shlex.quote('{"status":"tool_missing","reason":"python3_missing"}')
     return "sh -lc " + shlex.quote(
@@ -326,11 +362,18 @@ def _remote_command(script: str) -> str:
 
 
 NETWORK_COMMAND_KEYS = ("network_state", "network_link_history", "network_app_history")
-NETWORK_COMMAND_SPECS: dict[str, dict[str, Any]] = {
-    "network_state": {"summary": "현재 연결 인터페이스와 경로, DNS 확인", "timeout_sec": 22, "command": _remote_command(_REMOTE_STATE)},
-    "network_link_history": {"summary": "최근 72시간 유선과 무선 링크 이력 확인", "timeout_sec": 18, "command": _remote_command(_REMOTE_LINK_HISTORY)},
-    "network_app_history": {"summary": "최근 72시간 앱 통신 오류 이력 확인", "timeout_sec": 18, "command": _remote_command(_REMOTE_APP_HISTORY)},
-}
+def build_network_command_specs(window: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    # 기본 registry는 import 시각을 고정하지 않고 원격 실행 때의 KST 오늘을 사용한다.
+    fixed = validate_network_window(window) if window is not None else None
+    label = fixed["label"] if fixed else "오늘 KST 00:00부터 현재까지"
+    return {
+        "network_state": {"summary": "현재 연결 인터페이스와 경로, DNS 확인", "timeout_sec": 22, "command": _remote_command(_REMOTE_STATE, fixed)},
+        "network_link_history": {"summary": label + " 링크 이력 확인", "timeout_sec": 18, "command": _remote_command(_REMOTE_LINK_HISTORY, fixed)},
+        "network_app_history": {"summary": label + " 앱 통신 오류 이력 확인", "timeout_sec": 18, "command": _remote_command(_REMOTE_APP_HISTORY, fixed)},
+    }
+
+
+NETWORK_COMMAND_SPECS = build_network_command_specs()
 
 _APP_LABELS = {
     "dns_retry": "DNS EAI_AGAIN", "route_unreachable": "네트워크 ENETUNREACH",
@@ -421,9 +464,35 @@ def _time_distance(left: str, right: str) -> float | None:
         return None
 
 
-def build_network_summary(checks: dict[str, Any]) -> dict[str, Any]:
+def _event_in_window(event: Any, window: dict[str, Any]) -> bool:
+    if not isinstance(event, dict):
+        return False
+    stamp = _timestamp(event.get("timestamp"))
+    if not stamp:
+        return False
+    try:
+        parsed = datetime.fromisoformat(stamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=9)))
+        return window["startEpoch"] <= parsed.timestamp() < window["endEpoch"]
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
+def build_network_summary(checks: dict[str, Any], window: dict[str, Any] | None = None) -> dict[str, Any]:
     """현재 연결과 과거 오류를 나누고, 미수집을 정상으로 바꾸지 않는다."""
     state, history, app = (_payload(checks, key) for key in NETWORK_COMMAND_KEYS)
+    if window is None:
+        for payload in (history, app, state):
+            if isinstance(payload.get("networkWindow"), dict):
+                window = payload["networkWindow"]
+                break
+    selected_window = validate_network_window(window) if window is not None else resolve_network_window("")
+    # 원격 필터가 없는 구버전/불완전 응답도 요청한 날짜 밖의 사건을 원인으로 쓰지 않는다.
+    history_events = history.get("events") if isinstance(history.get("events"), list) else []
+    app_events = app.get("events") if isinstance(app.get("events"), list) else []
+    history = dict(history, events=[event for event in history_events if _event_in_window(event, selected_window)])
+    app = dict(app, events=[event for event in app_events if _event_in_window(event, selected_window)])
     interface = _interface(state.get("interface"))
     connection = state.get("connectionType") if state.get("connectionType") in {"wired", "wireless"} and interface else "unknown"
     statuses = {key: str(value.get("status") or "parse_failed") for key, value in zip(NETWORK_COMMAND_KEYS, (state, history, app))}
@@ -444,8 +513,10 @@ def build_network_summary(checks: dict[str, Any]) -> dict[str, Any]:
         stamp = _timestamp(event.get("timestamp"))
         if stamp and interface and _interface(event.get("interface")) == interface:
             errors.append({"timestamp": stamp, "source": "NetworkManager.service", "line": stamp + " " + interface + ": 연결 종료 상태 전이"})
-    current_down = state.get("status") in {"ok", "partial"} and bool(interface) and (state.get("carrier") is False or state.get("operstate") in {"down", "lowerlayerdown"})
-    route_missing = state.get("status") in {"ok", "partial"} and state.get("hasDefaultRoute") is False
+    # 현재 carrier/route는 과거 날짜 장애의 증거가 될 수 없다.
+    use_current = selected_window["isCurrentDay"]
+    current_down = use_current and state.get("status") in {"ok", "partial"} and bool(interface) and (state.get("carrier") is False or state.get("operstate") in {"down", "lowerlayerdown"})
+    route_missing = use_current and state.get("status") in {"ok", "partial"} and state.get("hasDefaultRoute") is False
     current_up = bool(interface) and state.get("carrier") is True and state.get("hasDefaultRoute") is True
     incomplete = [_CHECK_LABELS[name] + ": " + _FAILURE_LABELS.get(status, "조회 상태 미확인") for name, status in statuses.items() if status != "ok"]
     result: dict[str, Any] = {
@@ -453,15 +524,19 @@ def build_network_summary(checks: dict[str, Any]) -> dict[str, Any]:
         "connectionType": connection, "interface": interface, "classification": "check_unavailable",
         "summary": "네트워크 상태를 판단할 조회 근거가 부족해.",
         "action": "조회 권한과 도구, 로그 보관 상태를 확인한 뒤 다시 점검해.",
-        "evidence": [], "historyWindowHours": 72, "collectionStatus": statuses,
+        "evidence": [], "networkWindow": selected_window, "collectionStatus": statuses,
+        "currentConnection": {"capturedAt": _timestamp(state.get("capturedAt")), "carrier": state.get("carrier") if isinstance(state.get("carrier"), bool) else None, "hasDefaultRoute": state.get("hasDefaultRoute") if isinstance(state.get("hasDefaultRoute"), bool) else None, "usedForHistoricalCause": False},
         "correlation": {"available": False},
     }
     network_name = {"wired": "유선", "wireless": "무선", "unknown": "네트워크"}[connection]
     pair = None
     if evidence or current_down:
         result.update(classification="network_link_failure", status="fail" if current_down else "check_needed", label="링크 단절 확인")
-        result["summary"] = ("최근 72시간 " + network_name + " 링크 단절 " + str(len(evidence)) + "건이 확인됐어. ") if evidence else ""
-        result["summary"] += "현재 링크도 끊겨 있어." if current_down else ("현재 링크는 연결돼 있어." if current_up else "현재 연결 상태는 추가 확인이 필요해.")
+        result["summary"] = ("조회 범위에서 " + network_name + " 링크 단절 " + str(len(evidence)) + "건이 확인됐어. ") if evidence else ""
+        if use_current:
+            result["summary"] += "현재 링크도 끊겨 있어." if current_down else ("현재 링크는 연결돼 있어." if current_up else "현재 연결 상태는 추가 확인이 필요해.")
+        else:
+            result["summary"] += "현재 연결 상태는 별도 참고값이야."
         result["action"] = "케이블과 접속 단자, 스위치 포트를 확인하고 지속되면 장비 랜포트를 점검해." if connection == "wired" else "무선 연결과 AP, 신호 상태를 확인해."
         # 수집한 사건의 시각 차이만 설명하며 캡처 실패나 책임 소재로 확장하지 않는다.
         pairs = [(link, error, _time_distance(error["timestamp"], link["timestamp"])) for link in evidence for error in errors if error["source"] == "app_daily_log"]
@@ -475,10 +550,11 @@ def build_network_summary(checks: dict[str, Any]) -> dict[str, Any]:
         result.update(classification="network_error_only", label="통신 이상 기록 확인", summary="앱 통신 오류 또는 네트워크 연결 종료 기록이 확인됐어. 이 기록만으로 물리적 링크 단절은 확정할 수 없어.", action="같은 시각의 링크 이력과 DNS, 게이트웨이를 함께 확인해.")
     elif available:
         result.update(classification="no_network_evidence", label="수집 범위 내 이상 근거 없음", summary="수집된 범위에서 네트워크 오류 근거는 확인되지 않았어. 외부 연결 성공 여부는 검사하지 않았어.", action="증상이 반복되면 발생 시각을 기준으로 다시 점검해.")
-        if current_up and not incomplete:
+        if use_current and current_up and not incomplete:
             result["status"] = "pass"
     if incomplete:
         result["summary"] += " 일부 조회가 불완전해(" + ", ".join(incomplete) + ")."
+    result["summary"] = selected_window["label"] + ": " + result["summary"]
     selected_links, selected_errors = evidence[-6:], errors[-6:]
     if pair:
         # 시각 대조에 사용한 사건이 화면과 LLM 근거에서도 누락되지 않게 한다.

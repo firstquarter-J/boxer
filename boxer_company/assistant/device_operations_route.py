@@ -1,32 +1,26 @@
 from __future__ import annotations
 
-# 장비 실행은 provider-free 정본이 확정한 route와 target parser만 소비한다.
-from boxer_company._operation_routing_device import (
-    _OPERATIONS_ROUTE_GROUP,
-)
-from boxer_company.operation_routing import (
-    _extract_device_name_for_audio_probe,
-    _extract_device_name_for_diagnostic_freeform,
-    _extract_device_name_for_diagnostic_start,
-    _extract_device_name_for_remote_access_probe,
-    _extract_device_name_for_status_probe,
-    _extract_device_name_for_update,
-    match_device_operation_route,
-)
-from boxer_company.read_routing import _extract_device_name_scope
-
-from collections import OrderedDict
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
 import re
 import threading
+from collections import OrderedDict
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from datetime import date
 from typing import Any, Callable
 
 from boxer.core import settings as core_settings
 from boxer_company import settings as cs
+from boxer_company._operation_routing_common import (
+    _extract_log_date_with_presence,
+)
+
+# 장비 실행은 provider-free 정본이 확정한 route와 target parser만 소비한다.
+from boxer_company._operation_routing_device import (
+    _OPERATIONS_ROUTE_GROUP,
+)
 from boxer_company.assistant.answer_composer import (
     CompanyEvidenceAnswerComposer,
     CompanyEvidenceAnswerPolicy,
@@ -38,28 +32,37 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
+from boxer_company.operation_routing import (
+    _extract_device_name_for_audio_probe,
+    _extract_device_name_for_diagnostic_freeform,
+    _extract_device_name_for_diagnostic_start,
+    _extract_device_name_for_remote_access_probe,
+    _extract_device_name_for_status_probe,
+    _extract_device_name_for_update,
+    match_device_operation_route,
+)
+from boxer_company.read_routing import _extract_device_name_scope
+from boxer_company.retrieval_rules import (
+    _build_company_retrieval_rules,
+    _transform_company_retrieval_payload,
+)
 from boxer_company.routers.device_audio_probe import (
     _build_device_audio_probe_config_message,
     _probe_device_audio_output,
 )
 from boxer_company.routers.device_diagnostics import (
     _build_device_diagnostic_config_message,
+    _build_device_diagnostic_device_required_message,
     _build_device_diagnostic_followup_evidence,
     _build_device_diagnostic_followup_fallback,
-    _build_device_diagnostic_device_required_message,
     _is_device_diagnostic_runtime_configured,
     _load_device_diagnostic_snapshot,
     _start_device_diagnostic_freeform_analysis,
     _start_device_diagnostic_snapshot,
 )
-from boxer_company.routers.device_status_probe import (
-    _build_device_memory_patch_config_message,
-    _build_device_remote_access_probe_config_message,
-    _build_device_status_probe_config_message,
-    _patch_device_pm2_memory,
-    _probe_device_remote_access,
-    _probe_device_runtime_component,
-    _probe_device_status_overview,
+from boxer_company.routers.device_network_probe import (
+    NetworkDateWindowError,
+    resolve_network_window,
 )
 from boxer_company.routers.device_scanner_abi_patch import (
     DeviceScannerAbiPatchError,
@@ -70,15 +73,19 @@ from boxer_company.routers.device_scanner_abi_patch import (
     _is_device_scanner_abi_patch_request,
     _is_device_scanner_abi_patch_runtime_configured,
 )
-from boxer_company.transport_contracts import (
-    DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
-    DEVICE_OPERATION_DELIVERY_ACTION,
-    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+from boxer_company.routers.device_status_probe import (
+    _build_device_memory_patch_config_message,
+    _build_device_remote_access_probe_config_message,
+    _build_device_status_probe_config_message,
+    _patch_device_pm2_memory,
+    _probe_device_remote_access,
+    _probe_device_runtime_component,
+    _probe_device_status_overview,
 )
 from boxer_company.routers.device_update import (
     _build_device_power_control_config_message,
-    _build_device_update_config_message,
     _build_device_update_activity_input,
+    _build_device_update_config_message,
     _query_device_update_status,
     _request_device_agent_update,
     _request_device_box_update,
@@ -92,15 +99,15 @@ from boxer_company.routers.device_voice_control import (
     _change_device_voice,
     _extract_device_voice_label,
 )
-from boxer_company.retrieval_rules import (
-    _build_company_retrieval_rules,
-    _transform_company_retrieval_payload,
-)
 from boxer_company.routers.mda_graphql import (
     _create_mda_activity_log,
     _send_mda_device_command,
 )
-
+from boxer_company.transport_contracts import (
+    DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
+    DEVICE_OPERATION_DELIVERY_ACTION,
+    DEVICE_SCANNER_ABI_PATCH_ROUTE,
+)
 
 OperationResult = tuple[str, dict[str, Any]]
 OperationFn = Callable[..., OperationResult]
@@ -316,6 +323,15 @@ class DeviceOperationsAssistantRoute:
                 outcome="failed",
                 body=slack_mrkdwn_to_commonmark(exc.user_message),
                 fallback_reason=exc.fallback_reason,
+                prefix_bodies=tuple(progress_notices),
+            )
+        except NetworkDateWindowError as exc:
+            # 이 전용 예외의 문구만 날짜 parser가 정한 안전한 사용자 안내로 반환한다.
+            return _result(
+                route=route,
+                outcome="needs_input",
+                body=str(exc),
+                fallback_reason="invalid_date",
                 prefix_bodies=tuple(progress_notices),
             )
         except ValueError as exc:
@@ -618,10 +634,18 @@ class DeviceOperationsAssistantRoute:
             )
             return _DeviceOperationExecution(result_text)
         if route == "device_status_probe":
+            # 지원하지 않는 기간도 실행 전에 검증하되 날짜 없는 기존 호출 계약은 유지한다.
+            network_window = resolve_network_window(request.question)
+            _, has_date = _extract_log_date_with_presence(
+                request.question,
+                reference_date=date.fromisoformat(network_window["date"]),
+            )
+            question_options = {"question": request.question} if has_date else {}
             result_text, _ = self._deps.probe_status(
                 device_name,
                 resend_ssh_open=False,
                 allow_force_reopen=False,
+                **question_options,
             )
             return _DeviceOperationExecution(result_text)
         raise ValueError("unsupported device operation")
