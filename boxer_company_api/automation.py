@@ -662,7 +662,7 @@ class DurableAutomationCycleCoordinator:
 
         if not current and previous:
             # 운영에 남아 있는 가장 최근 날짜의 확정 cursor를 그대로 이어받는다.
-            # 전체를 완료한 경우에만 다음 야간 창에서 새 순회를 시작한다.
+            # 완료된 회차는 새 야간 창의 첫 회차로 처음부터 시작한다.
             _, latest = max(previous, key=lambda item: item[0])
             cursor = latest.get("cursor")
             if not isinstance(cursor, dict):
@@ -788,7 +788,7 @@ class DurableAutomationCycleCoordinator:
                 kind="return",
                 result=pending_result,
             )
-        if state.get("cycleCompleted"):
+        if state.get("cycleCompleted") and trigger.cycle != "daily_device_round":
             return state, _CoordinatorTransition(
                 kind="return",
                 result=AutomationCycleResult(
@@ -803,6 +803,26 @@ class DurableAutomationCycleCoordinator:
         # in-flight보다 먼저 끝내 입력 오류가 cycle을 잠그지 않게 한다.
         domain_cursor = dict(state.get("cursor") or {})
         if trigger.cycle == "daily_device_round":
+            # 누락된 구버전 회차는 1로만 해석한다. 훼손된 번호는 새 예약 전에
+            # 차단해 delivery identity를 재사용하거나 잘못 초기화하지 않는다.
+            round_number = domain_cursor.get("roundNumber", 1)
+            if type(round_number) is not int or round_number <= 0:
+                raise AutomationCycleContractError(
+                    "daily device round number is invalid"
+                )
+            if state.get("cycleCompleted"):
+                # 모든 pending과 exact ACK가 닫힌 뒤에만 다음 회차를 예약한다.
+                # 처리 목록과 active 위치를 함께 비우고 새 inFlight와 원자 저장한다.
+                domain_cursor = {
+                    "roundNumber": round_number + 1,
+                    "processedHospitalSeqs": [],
+                }
+                state["cycleCompleted"] = False
+                state["domainCycleComplete"] = False
+                state.pop("lastRequestId", None)
+                state.pop("lastResult", None)
+            else:
+                domain_cursor["roundNumber"] = round_number
             # 자정을 넘기는 야간 창도 server-derived cycle key 날짜를
             # delivery id와 domain cursor가 그대로 공유하게 한다.
             domain_cursor.setdefault(
@@ -844,6 +864,9 @@ class DurableAutomationCycleCoordinator:
             **state,
             "inFlight": marker,
         }
+        if trigger.cycle == "daily_device_round":
+            # 첫 progress event 전에 실패해도 운영자 복구가 새 회차를 이어간다.
+            reserved_state["cursor"] = domain_cursor
         if scheduler_metadata is not None:
             reserved_state.update(scheduler_metadata)
         return reserved_state, _CoordinatorTransition(

@@ -138,7 +138,7 @@ def rounds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Rounds:
     return _Rounds(tmp_path / "automation.json", monkeypatch)
 
 
-def test_scheduler_continues_next_night_and_resets_only_after_full_sweep(
+def test_scheduler_repeats_completed_sweep_and_carries_unfinished_round_next_night(
     rounds: _Rounds,
 ) -> None:
     results: list[AutomationCycleResult] = []
@@ -187,10 +187,166 @@ def test_scheduler_continues_next_night_and_resets_only_after_full_sweep(
     tick("2026-09-18")
     rounds.ack("2026-09-18", results[-1])
     assert results[-1].cursor["cycleCompleted"] is True
-    assert tick("2026-09-18") == ()
-    tick("2026-09-19")
-    assert rounds.visited == [1, 2, 84, 1]
+    # 마지막 보고서 ACK 뒤 같은 야간 창에서 다음 회차를 시작한다.
+    assert tick("2026-09-18") == ("daily_device_round",)
+    assert results[-1].cursor["roundNumber"] == 2
     assert results[-1].cursor["processedHospitalSeqs"] == [1]
+    rounds.ack("2026-09-18", results[-1])
+    assert tick("2026-09-19", hour=6) == ()
+    tick("2026-09-19")
+    assert rounds.visited == [1, 2, 84, 1, 2]
+    assert results[-1].cursor["processedHospitalSeqs"] == [1, 2]
+    assert results[-1].cursor["roundNumber"] == 1
+    assert results[-1].deliveries[0].delivery_id == "daily_device_round:2026-09-19:2"
+
+
+def test_repeated_sweeps_require_each_exact_ack_and_keep_distinct_deliveries(
+    rounds: _Rounds,
+) -> None:
+    rounds.candidates = [1]
+    day = "2026-09-18"
+    deliveries = []
+    for number in range(1, 5):
+        result = rounds.run(day)
+        deliveries.append(result.deliveries[0].delivery_id)
+        assert result.cursor["roundNumber"] == number
+        assert result.cursor["cycleCompleted"] is True
+        # 완료한 병원 보고서가 대기 중이면 재시작해도 장비를 다시 실행하지 않는다.
+        assert rounds.run(day).deliveries == result.deliveries
+        if number > 1:
+            rounds.coordinator().run(replace(
+                _trigger(day), ack_only=True,
+                delivery_receipts=(AutomationDeliveryReceipt(
+                    delivery_id=deliveries[-2], status="sent",
+                ),),
+            ))
+            assert rounds.run(day).deliveries == result.deliveries
+        assert rounds.visited == [1] * number
+        rounds.ack(day, result)
+    assert deliveries == [
+        "daily_device_round:2026-09-18:1",
+        "daily_device_round:2026-09-18:1:round:2",
+        "daily_device_round:2026-09-18:1:round:3",
+        "daily_device_round:2026-09-18:1:round:4",
+    ]
+    assert rounds.store.load(_key(day))["acknowledgedDeliveryIds"] == deliveries
+
+
+def test_legacy_completed_state_resumes_same_night_with_new_delivery_identity(
+    rounds: _Rounds,
+) -> None:
+    day = "2026-09-18"
+    old_id = "daily_device_round:2026-09-18:1"
+    rounds.seed(day, [1, 2, 84], cycleCompleted=True,
+                domainCycleComplete=True, acknowledgedDeliveryIds=[old_id])
+    result = rounds.run(day)
+    assert rounds.visited == [1]
+    assert result.cursor["roundNumber"] == 2
+    assert result.cursor["processedHospitalSeqs"] == [1]
+    assert result.deliveries[0].delivery_id == old_id + ":round:2"
+    assert rounds.store.load(_key(day))["acknowledgedDeliveryIds"] == [old_id]
+
+
+@pytest.mark.parametrize("number", [None, True, 0, -1, "2", 10**100])
+@pytest.mark.parametrize("completed", [False, True])
+def test_invalid_round_number_cannot_start_device_work(
+    rounds: _Rounds, number: Any, completed: bool,
+) -> None:
+    day = "2026-09-18"
+    rounds.seed(day, [], cycleCompleted=completed,
+                cursor={"windowKey": day, "roundNumber": number})
+    before = rounds.path.read_bytes()
+    with pytest.raises(AutomationCycleContractError):
+        rounds.run(day)
+    assert rounds.visited == []
+    assert rounds.path.read_bytes() == before
+
+
+def test_round_identity_fits_transport_limit_before_device_work(rounds: _Rounds) -> None:
+    day = "2026-09-18"
+    rounds.candidates = [18446744073709551615]
+    maximum = DailyDeviceRoundCycleHandler._MAX_ROUND_NUMBER
+    rounds.seed(day, [], cursor={"windowKey": day, "roundNumber": maximum})
+    result = rounds.run(day)
+    assert len(result.deliveries[0].delivery_id) == 128
+    rounds.ack(day, result)
+    before = rounds.path.read_bytes()
+    # ID에 더 이상 담을 수 없는 훼손 상태는 새 장비 작업 전에 차단한다.
+    with pytest.raises(AutomationCycleContractError):
+        rounds.run(day)
+    assert rounds.visited == [18446744073709551615]
+    assert rounds.path.read_bytes() == before
+
+
+def test_new_round_reservation_survives_failure_before_first_progress(
+    rounds: _Rounds, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    day = "2026-09-18"
+    rounds.seed(day, [1, 2, 84], cycleCompleted=True, domainCycleComplete=True)
+
+    def fail_candidates(**_: Any) -> list[Any]:
+        raise RuntimeError("candidate lookup unavailable")
+
+    # 외부 조회 전에 실패해도 새 회차와 불명 실행 표식을 함께 보존한다.
+    monkeypatch.setattr(rounder, "_load_daily_device_round_hospital_candidates", fail_candidates)
+    with pytest.raises(RuntimeError, match="candidate lookup unavailable"):
+        rounds.run(day)
+    state = rounds.store.load(_key(day))
+    assert state["cursor"] == {
+        "roundNumber": 2, "processedHospitalSeqs": [], "windowKey": day,
+    }
+    assert state["cycleCompleted"] is False
+    assert state["domainCycleComplete"] is False
+    assert state["inFlight"]["requestId"] == _trigger(day).request_id
+    before = rounds.path.read_bytes()
+    with pytest.raises(AutomationCycleUncertainError):
+        rounds.run(day)
+    assert rounds.path.read_bytes() == before
+
+
+def test_empty_scope_can_discover_hospitals_on_later_poll(rounds: _Rounds) -> None:
+    day = "2026-09-18"
+    rounds.candidates = []
+    empty = rounds.run(day)
+    assert not empty.deliveries
+    assert empty.cursor["cycleCompleted"] is True
+    rounds.candidates = [1]
+    # 빈 후보를 본 요청의 재전송은 유지하고 다음 예약에서 대상을 다시 찾는다.
+    assert rounds.run(day) == empty
+    later = rounds.coordinator().run(replace(_trigger(day), request_id="next-poll"))
+    assert rounds.visited == [1]
+    assert later.cursor["roundNumber"] == 2
+
+
+def test_concurrent_restart_reserves_next_round_only_once(
+    rounds: _Rounds, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    day = "2026-09-18"
+    rounds.seed(day, [1, 2, 84], cycleCompleted=True, domainCycleComplete=True)
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_devices(seq: int) -> list[Any]:
+        rounds.visited.append(seq)
+        entered.set()
+        assert release.wait(5)
+        return []
+
+    # 재시작한 두 coordinator가 동시에 다음 회차를 열어도 한 번만 예약한다.
+    monkeypatch.setattr(rounder, "_load_daily_device_round_devices", blocked_devices)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(rounds.run, day)
+        try:
+            assert entered.wait(5)
+            before = rounds.path.read_bytes()
+            with pytest.raises(AutomationCycleUncertainError):
+                rounds.run(day)
+            assert rounds.path.read_bytes() == before
+            assert rounds.store.load(_key(day))["cursor"]["roundNumber"] == 2
+        finally:
+            release.set()
+        result = first.result(timeout=5)
+    assert rounds.visited == [1]
+    assert result.cursor["roundNumber"] == 2
 
 
 def test_legacy_latest_cursor_is_carried_across_missed_days_and_month_order_change(

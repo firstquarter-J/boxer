@@ -115,7 +115,7 @@ def plan_automation_cycle(
 ) -> AutomationScheduleDecision:
     """현재 시각에서 cycle 하나의 실행 가능 여부를 순수 계산한다.
 
-    weekly/daily의 이미 끝난 identity는 ``completed_cycle_key``로, continuous
+    weekly의 이미 끝난 identity는 ``completed_cycle_key``로, continuous
     cycle의 마지막 논리 완료 시각은 ``last_completed_at``으로 주입한다.
     pending delivery와 in-flight marker는 durable coordinator가 별도로 막는다.
     """
@@ -133,11 +133,7 @@ def plan_automation_cycle(
             completed_cycle_key=completed_cycle_key,
         )
     if normalized_cycle == "daily_device_round":
-        return _plan_daily(
-            local_now,
-            config,
-            completed_cycle_key=completed_cycle_key,
-        )
+        return _plan_daily(local_now, config)
     return _plan_continuous(
         normalized_cycle,
         local_now,
@@ -201,8 +197,6 @@ def _plan_weekly(
 def _plan_daily(
     local_now: datetime,
     config: AutomationScheduleConfig,
-    *,
-    completed_cycle_key: str | None,
 ) -> AutomationScheduleDecision:
     window = _current_daily_window(local_now, config)
     if window is None:
@@ -216,12 +210,12 @@ def _plan_daily(
 
     window_date, _window_start, _window_end = window
     cycle_key = f"daily:{window_date.isoformat()}"
-    completed = completed_cycle_key == cycle_key
-    due = not completed
+    # 한 바퀴 완료는 야간 창 종료가 아니다. 다음 바퀴의 예약과 발송 ACK
+    # 확인은 coordinator가 담당하고 시간 창 안에서는 계속 실행 후보가 된다.
     return AutomationScheduleDecision(
-        due=due,
+        due=True,
         cycle_key=cycle_key,
-        scheduled_at=local_now if due else None,
+        scheduled_at=local_now,
     )
 
 

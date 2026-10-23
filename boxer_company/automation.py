@@ -261,6 +261,11 @@ class WeeklyRecordingsCycleHandler:
 
 class DailyDeviceRoundCycleHandler:
     name: AutomationCycleName = "daily_device_round"
+    # 전송 ID의 128자 안에 날짜, 최대 20자리 병원 PK와 회차를 담는다.
+    # 훼손된 초대형 회차 때문에 장비 실행 후 결과 저장이 실패하지 않게 한다.
+    _MAX_ROUND_NUMBER = 10 ** (
+        128 - len("daily_device_round:0000-00-00:18446744073709551615:round:")
+    ) - 1
     _OPTION_KEYS = frozenset(
         {
             "autoUpdateAgent",
@@ -279,6 +284,15 @@ class DailyDeviceRoundCycleHandler:
             )
         for key in self._OPTION_KEYS:
             _require_bool_option(request.options, key)
+        # 회차 식별자가 훼손되면 이전 delivery ID로 장비 작업을 반복하지 않는다.
+        round_number = request.cursor.get("roundNumber", 1)
+        if (
+            type(round_number) is not int
+            or not 1 <= round_number <= self._MAX_ROUND_NUMBER
+        ):
+            raise AutomationCycleContractError(
+                "daily device round number is invalid"
+            )
 
     def run(self, request: AutomationCycleRequest) -> AutomationCycleResult:
         self.validate(request)
@@ -289,6 +303,9 @@ class DailyDeviceRoundCycleHandler:
         # 기존 동기 구현을 그대로 한 번 실행한다. SSH open, update, cleanup,
         # power-off의 HTTP transport 재시도는 이 경계에서 추가하지 않는다.
         progress_cursor = dict(request.cursor)
+        # 구버전 cursor도 첫 회차로 취급하며 진행 checkpoint에 회차를 보존한다.
+        round_number = request.cursor.get("roundNumber", 1)
+        progress_cursor["roundNumber"] = round_number
 
         def _checkpoint_progress(
             event: str,
@@ -353,6 +370,7 @@ class DailyDeviceRoundCycleHandler:
         )
         cursor = {
             "windowKey": window_key,
+            "roundNumber": round_number,
             "hospitalScope": str(summary.get("hospitalScope") or ""),
             "hospitalOrder": str(summary.get("hospitalOrder") or ""),
             "processedHospitalSeqs": processed_hospital_seqs,
@@ -373,12 +391,14 @@ class DailyDeviceRoundCycleHandler:
         deliveries: tuple[AutomationDelivery, ...] = ()
         outcome: AutomationCycleOutcome = "no_change"
         if hospital_seq is not None:
+            # 첫 회차 ID는 기존 ACK와 호환하고 같은 날짜의 재순회만 구별한다.
+            round_suffix = f":round:{round_number}" if round_number > 1 else ""
             deliveries = (
                 AutomationDelivery(
                     delivery_id=(
                         f"daily_device_round:"
                         f"{window_key}:"
-                        f"{hospital_seq}"
+                        f"{hospital_seq}{round_suffix}"
                     ),
                     kind="daily_device_round_report",
                     payload=presentation,

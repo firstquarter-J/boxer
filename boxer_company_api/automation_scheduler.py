@@ -230,7 +230,8 @@ class AutomationScheduler:
             completed_cycle_key=(
                 candidate.cycle_key
                 if (
-                    cycle in {"weekly_recordings", "daily_device_round"}
+                    # 일일 순회는 완주한 뒤에도 같은 야간 창에서 반복한다.
+                    cycle == "weekly_recordings"
                     and state.get("cycleCompleted") is True
                 )
                 else None

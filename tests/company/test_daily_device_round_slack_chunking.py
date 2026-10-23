@@ -4,8 +4,10 @@ import hashlib
 import json
 import logging
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 from zoneinfo import ZoneInfo
 
@@ -42,7 +44,7 @@ def _flatten(chunks: list[list[dict[str, object]]]) -> list[dict[str, object]]:
 
 
 def _daily_batch(
-    *, device_count: int = 31, extra_detail: str = ""
+    *, device_count: int = 31, extra_detail: str = "", round_number: int = 1
 ) -> AutomationRemoteDeliveryBatch:
     device_lines = [
         f"• *4층 {index:02d}진료실* | *MB2-TEST{index:03d}* | 🟢 *정상*\n"
@@ -82,8 +84,11 @@ def _daily_batch(
         {"type": "divider"},
         *[_section(line) for line in device_lines],
     ]
+    delivery_id = "daily_device_round:2026-10-02:345"
+    if round_number > 1:
+        delivery_id += f":round:{round_number}"
     delivery = AutomationDelivery(
-        delivery_id="daily_device_round:2026-10-02:345",
+        delivery_id=delivery_id,
         kind="daily_device_round_report",
         payload={
             "runDate": "2026-10-02",
@@ -156,6 +161,75 @@ def _use_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # pacing 자체는 유지하되 mock 발송 검증에서 실제 1초 대기를 하지 않는다.
     monkeypatch.setattr(daily.threading, "Event", Mock())
     return state_path
+
+
+@pytest.mark.parametrize("round_number", [1, 2, 10])
+def test_transport_accepts_legacy_and_canonical_repeat_delivery_ids(
+    round_number: int,
+) -> None:
+    batch = _daily_batch(round_number=round_number)
+    payload, render_now, window_key = (
+        daily._validate_daily_device_round_transport_batch(batch)
+    )
+    assert payload == batch.deliveries[0].payload
+    assert render_now == _NOW
+    assert window_key == "2026-10-02"
+
+
+@pytest.mark.parametrize(
+    "delivery_id",
+    [
+        "daily_device_round:2026-10-02:345:round:1",
+        "daily_device_round:2026-10-02:345:round:0",
+        "daily_device_round:2026-10-02:345:round:-2",
+        "daily_device_round:2026-10-02:345:round:+2",
+        "daily_device_round:2026-10-02:345:round:02",
+        "daily_device_round:2026-10-02:345:round:2.0",
+        "daily_device_round:2026-10-02:345:round:２",
+        "daily_device_round:2026-10-02:345:round:two",
+        "daily_device_round:2026-10-02:345:round:",
+        "daily_device_round:2026-10-02:345:round:2:extra",
+        "daily_device_round:2026-10-02:345:round:2\n",
+        "daily_device_round:2026-10-02:345:round:2 ",
+        "daily_device_round:2026-10-03:345:round:2",
+        "daily_device_round:2026-10-02:346:round:2",
+        "daily_device_round:2026-10-02:3450:round:2",
+    ],
+)
+def test_transport_rejects_noncanonical_or_unbound_repeat_delivery_id(
+    delivery_id: str,
+) -> None:
+    batch = _daily_batch()
+    # wire DTO를 직접 넣어 상위 공통 validator가 막는 잘못된 문자도
+    # 날짜와 병원을 검사하는 최종 renderer에서 그대로 거절하는지 본다.
+    delivery = SimpleNamespace(
+        delivery_id=delivery_id,
+        kind=batch.deliveries[0].kind,
+        payload=batch.deliveries[0].payload,
+    )
+    with pytest.raises(RuntimeError, match="transport batch"):
+        daily._validate_daily_device_round_transport_batch(
+            replace(batch, deliveries=(delivery,))
+        )
+
+
+@pytest.mark.parametrize("delivery_id_length", [128, 129])
+def test_repeat_delivery_id_keeps_the_common_identifier_length_limit(
+    delivery_id_length: int,
+) -> None:
+    batch = _daily_batch()
+    prefix = "daily_device_round:2026-10-02:345:round:"
+    delivery = SimpleNamespace(
+        delivery_id=prefix + "2" * (delivery_id_length - len(prefix)),
+        kind=batch.deliveries[0].kind,
+        payload=batch.deliveries[0].payload,
+    )
+    batch = replace(batch, deliveries=(delivery,))
+    if delivery_id_length == 128:
+        daily._validate_daily_device_round_transport_batch(batch)
+    else:
+        with pytest.raises(RuntimeError, match="transport batch"):
+            daily._validate_daily_device_round_transport_batch(batch)
 
 
 def test_korean_emoji_report_preserves_all_31_devices_and_block_order() -> None:
@@ -297,6 +371,61 @@ def test_single_chunk_keeps_existing_fallback_and_part_identity(
         delivery_id=batch.deliveries[0].delivery_id,
         part="chunk:0",
     )
+
+
+def test_same_hospital_repeats_share_thread_but_keep_messages_and_acks_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = _use_journal(tmp_path, monkeypatch)
+    batches = tuple(
+        _daily_batch(device_count=1, round_number=round_number)
+        for round_number in (1, 2, 3)
+    )
+    api = Mock(
+        pull_pending=Mock(side_effect=[*batches, None]),
+        acknowledge_batch=Mock(
+            return_value=AutomationRemoteAckResult(acknowledged=True)
+        ),
+    )
+    client = _SlackClient()
+    logger = logging.getLogger("test.daily.repeat")
+
+    # 실제 receipt journal을 다음 poll에서 ACK하도록 이어 실행한다.
+    # 같은 날짜 같은 병원을 다시 처리해도 이전 회차의 완료로 합치면 안 된다.
+    for _batch in batches:
+        assert daily._run_daily_device_round_if_due(
+            client, logger, now=_NOW, automation_client=api
+        )
+    assert daily._run_daily_device_round_if_due(
+        client, logger, now=_NOW, automation_client=api
+    ) is False
+
+    title, *messages = client.messages
+    assert len(messages) == 3
+    root_ts = client.accepted_ids[title["client_msg_id"]]
+    assert all(message["thread_ts"] == root_ts for message in messages)
+    assert len({message["client_msg_id"] for message in messages}) == 3
+    assert len({batch.batch_id for batch in batches}) == 3
+    acknowledgements = api.acknowledge_batch.call_args_list
+    assert len(acknowledgements) == 3
+    assert len({ack.kwargs["request_id"] for ack in acknowledgements}) == 3
+    for batch, message, acknowledgement in zip(batches, messages, acknowledgements):
+        assert message["client_msg_id"] == (
+            automation_reporter.build_automation_delivery_client_msg_id(
+                cycle=batch.cycle,
+                cycle_key=batch.cycle_key,
+                delivery_id=batch.deliveries[0].delivery_id,
+                part="chunk:0",
+            )
+        )
+        assert acknowledgement.kwargs["batch"].batch_id == batch.batch_id
+        assert [
+            receipt.delivery_id for receipt in acknowledgement.kwargs["receipts"]
+        ] == [batch.deliveries[0].delivery_id]
+    assert json.loads(state_path.read_text())["cycles"]["daily_device_round"][
+        "receipts"
+    ] == []
 
 
 def test_chunk_fallback_preserves_nested_elements_and_fields() -> None:

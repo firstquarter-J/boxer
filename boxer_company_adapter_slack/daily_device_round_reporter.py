@@ -441,14 +441,26 @@ def _validate_daily_device_round_transport_batch(
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     scheduled_date = render_now.date()
     window_key = window_date.isoformat()
+    delivery_id = deliveries[0].delivery_id
+    # 첫 순회의 기존 ID는 유지하고, 같은 날짜 재순회만 canonical 회차를
+    # 붙인다. 날짜와 병원이 다른 ID나 앞자리 0이 있는 회차는 받지 않는다.
+    delivery_id_match = (
+        re.fullmatch(
+            re.escape(f"daily_device_round:{window_key}:{hospital_seq}")
+            + r"(?::round:([1-9][0-9]*))?",
+            delivery_id,
+        )
+        if isinstance(delivery_id, str) and len(delivery_id) <= 128
+        else None
+    )
     if (
         hospital_seq is None
         or hospital_seq <= 0
         or scheduled_date
         not in {window_date, window_date + timedelta(days=1)}
         or report_summary.get("runDate") != scheduled_date.isoformat()
-        or deliveries[0].delivery_id
-        != f"daily_device_round:{window_key}:{hospital_seq}"
+        or delivery_id_match is None
+        or delivery_id_match.group(1) == "1"
     ):
         raise RuntimeError("일일 장비 순회 transport batch 계약이 올바르지 않아")
     return report_summary, render_now, window_key

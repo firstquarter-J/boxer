@@ -131,7 +131,7 @@ def test_daily_outside_window_pending_ack_is_not_a_planner_run() -> None:
     assert decision.cycle_key is None
 
 
-def test_daily_completed_window_identity_waits_for_next_window() -> None:
+def test_daily_completed_sweep_remains_due_inside_same_window() -> None:
     decision = plan_automation_cycle(
         "daily_device_round",
         now=_kst(2026, 8, 25, 0, 0),
@@ -142,8 +142,10 @@ def test_daily_completed_window_identity_waits_for_next_window() -> None:
         completed_cycle_key="daily:2026-08-24",
     )
 
-    assert decision.due is False
+    # 한 바퀴 완료만으로 남은 야간 시간을 쉬지 않는다.
+    assert decision.due is True
     assert decision.cycle_key == "daily:2026-08-24"
+    assert decision.scheduled_at == _kst(2026, 8, 25, 0, 0)
 
 
 def test_daily_equal_start_and_end_is_a_24_hour_calendar_window() -> None:
