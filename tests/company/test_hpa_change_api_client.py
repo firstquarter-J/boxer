@@ -49,6 +49,14 @@ class _Session:
         return response
 
 
+class _CorrelatedSession(_Session):
+    def post(self, url: str, **kwargs: Any) -> _Response:
+        # 실제 API처럼 응답 request ID를 각 pull/ACK 요청에 맞춰 돌려준다.
+        response = super().post(url, **kwargs)
+        response._payload["requestId"] = kwargs["headers"]["X-Request-ID"]
+        return response
+
+
 class _Slack:
     def __init__(self, *, fail_at: int = 0) -> None:
         self.fail_at = fail_at
@@ -114,6 +122,124 @@ def _delivery() -> HpaChangeRemoteDelivery:
         result={"status": "needs_clarification"},
         request_text="Bonus 프롬프트 변경",
     )
+
+
+def _pending_session(request_text: str) -> _CorrelatedSession:
+    delivery = _delivery()
+    return _CorrelatedSession(
+        [
+            _Response(
+                {
+                    "requestId": "",
+                    "deliveries": [
+                        {
+                            "deliveryId": delivery.delivery_id,
+                            "hpaRequestId": delivery.task_id,
+                            "workspaceId": delivery.workspace_id,
+                            "channelId": delivery.channel_id,
+                            "threadTs": delivery.thread_ts,
+                            "state": "running",
+                            "workflowPhase": "review",
+                            "result": {},
+                            "prUrls": [],
+                            "requestSource": {
+                                "text": request_text,
+                                "attachmentNames": ["handoff.txt"],
+                            },
+                        }
+                    ],
+                    "autoRetryAllowed": False,
+                }
+            ),
+            _Response(
+                {
+                    "requestId": "",
+                    "deliveryId": delivery.delivery_id,
+                    "acknowledged": True,
+                    "hpaRequestId": delivery.task_id,
+                    "jobStatus": "running",
+                    "implementationDispatchStarted": False,
+                    "autoRetryAllowed": False,
+                }
+            ),
+        ]
+    )
+
+
+def test_multiline_request_source_reaches_renderer_and_exact_delivery_ack() -> None:
+    request_text = "Bonus 프롬프트를 변경해줘\n\n변경 사항\n1. 제목 수정\n2. 안내문 수정"
+    session = _pending_session(request_text)
+    client = HpaChangeApiClient(_settings(), workspace_id="TWORK", session=session)
+    slack = _Slack()
+    rendered_requests: list[str] = []
+
+    def render(delivery: HpaChangeRemoteDelivery) -> tuple[str, ...]:
+        rendered_requests.append(delivery.to_poll_result().job.request_text)
+        return ("검토 작업을 진행 중이야",)
+
+    # LF가 있는 정상 원문 때문에 running 알림과 뒤따르는 ACK가 함께
+    # 막혔던 경로를 HTTP response부터 mock Slack 전송까지 이어 검증한다.
+    assert run_hpa_change_remote_reporter_once(
+        client, slack, renderer=render
+    ) == 1
+
+    assert rendered_requests == [request_text]
+    assert len(slack.calls) == 1
+    assert len(session.calls) == 2
+    assert session.calls[1]["json"] == {
+        "workspaceId": "TWORK",
+        "taskId": _delivery().task_id,
+        "deliveryId": _delivery().delivery_id,
+        "state": "running",
+    }
+
+
+@pytest.mark.parametrize(
+    "control",
+    ["\x00", "\x07", "\x1b", "\r", "\t", "\v", "\f", "\u0085", "\u2028", "\u202e"],
+)
+def test_multiline_request_source_still_rejects_other_controls(control: str) -> None:
+    session = _pending_session(f"변경 요청\n검토{control}본문")
+    client = HpaChangeApiClient(_settings(), workspace_id="TWORK", session=session)
+    slack = _Slack()
+
+    with pytest.raises(CompanyApiContractError) as exc:
+        run_hpa_change_remote_reporter_once(client, slack)
+
+    assert str(exc.value) == "company_api_hpa_text_invalid"
+    assert slack.calls == []
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("field", ["workflowPhase", "prUrls", "attachmentNames"])
+def test_delivery_metadata_keeps_its_single_line_contract(field: str) -> None:
+    session = _pending_session("정상 요청\n변경 내용을 검토해줘")
+    delivery = session.responses[0]._payload["deliveries"][0]
+    if field == "workflowPhase":
+        delivery[field] = "review\nimplementation"
+    elif field == "prUrls":
+        delivery[field] = ["https://github.com/example/repo/pull/1\n추가 문장"]
+    else:
+        delivery["requestSource"][field] = ["handoff\nfile.txt"]
+    client = HpaChangeApiClient(_settings(), workspace_id="TWORK", session=session)
+
+    with pytest.raises(CompanyApiContractError, match="company_api_hpa_text_invalid"):
+        client.pull_pending()
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("text_length", [60_000, 60_001])
+def test_multiline_request_source_keeps_60000_character_budget(text_length: int) -> None:
+    request_text = "가" * (text_length - 2) + "\n끝"
+    session = _pending_session(request_text)
+    client = HpaChangeApiClient(_settings(), workspace_id="TWORK", session=session)
+
+    if text_length == 60_000:
+        assert client.pull_pending()[0].request_text == request_text
+    else:
+        with pytest.raises(CompanyApiContractError, match="company_api_hpa_text_invalid"):
+            client.pull_pending()
+    assert len(session.calls) == 1
 
 
 def test_submit_sends_collected_context_only_and_never_repo_selector() -> None:

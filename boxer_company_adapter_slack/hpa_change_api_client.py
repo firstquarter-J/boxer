@@ -455,9 +455,12 @@ def _event_request_id(kind: str, workspace_id: str, event_ts: str) -> str:
     return f"hpa:{kind}:{digest}"
 
 
-def _safe_text(value: Any, maximum: int) -> str:
+def _safe_text(value: Any, maximum: int, *, allow_newlines: bool = False) -> str:
     text = str(value or "").strip()
-    if len(text) > maximum or not text.isprintable():
+    # 원 요청 본문만 LF 개행을 허용한다. 검사에서만 LF를 빼고 원문은
+    # 유지해 메타데이터의 단일 줄 계약과 나머지 제어문자 차단을 보존한다.
+    printable_text = text.replace("\n", "") if allow_newlines else text
+    if len(text) > maximum or not printable_text.isprintable():
         raise CompanyApiContractError("company_api_hpa_text_invalid")
     return text
 
@@ -505,7 +508,7 @@ def _deserialize_delivery(value: Any, request_id: str) -> HpaChangeRemoteDeliver
         workflow_phase=_safe_text(value.get("workflowPhase"), 32),
         result=result,
         pr_urls=tuple(_safe_text(item, 2_048) for item in pr_urls),
-        request_text=_safe_text(source.get("text"), 60_000),
+        request_text=_safe_text(source.get("text"), 60_000, allow_newlines=True),
         attachment_names=tuple(
             _safe_text(item, 255) for item in source["attachmentNames"]
         ),
