@@ -697,11 +697,12 @@ def _alert_item_blocks(
     # 버튼에는 현재 API action이 요구하는 exact target만 넣어 Slack value
     # 제한과 자동문자 본문 노출을 피한다.
     value = _alert_action_value(item)
+    # 미완료 알림의 실행 버튼은 초록색으로 강조하고 동작별 아이콘으로 구분한다.
     action_elements = [
         {
             "type": "button",
             "action_id": DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
-            "text": {"type": "plain_text", "text": "병원 문자 보내기"},
+            "text": {"type": "plain_text", "text": "✉️ 병원 문자 보내기"},
             "value": value,
             "style": "primary",
         }
@@ -711,16 +712,18 @@ def _alert_item_blocks(
             {
                 "type": "button",
                 "action_id": DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE,
-                "text": {"type": "plain_text", "text": "장비 음성 안내"},
+                "text": {"type": "plain_text", "text": "📣 장비 음성 안내"},
                 "value": value,
+                "style": "primary",
             }
         )
     action_elements.append(
         {
             "type": "button",
             "action_id": DEVICE_HEALTH_ALERT_ACTION_MARK_DONE,
-            "text": {"type": "plain_text", "text": "확인 완료"},
+            "text": {"type": "plain_text", "text": "✅ 확인 완료"},
             "value": value,
+            "style": "primary",
         }
     )
     blocks.append(

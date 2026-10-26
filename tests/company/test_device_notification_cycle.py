@@ -825,7 +825,7 @@ def test_media_quality_delivery_reaches_slack_renderer(
             DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
         ]
         assert [button["text"]["text"] for button in action_block["elements"]] == [
-            "병원 문자 보내기", "장비 음성 안내", "확인 완료",
+            "✉️ 병원 문자 보내기", "📣 장비 음성 안내", "✅ 확인 완료",
         ]
         assert action_block["block_id"]
         for button in action_block["elements"]:
