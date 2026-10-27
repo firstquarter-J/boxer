@@ -174,8 +174,34 @@ def test_only_explicit_profanity_message_count_intent_is_parsed(question):
 
 
 @pytest.mark.parametrize("question", [
+    "디디가 올해 한 욕 보여줘", "올해 디디가 했던 욕을 알려줘", "디디가 올해 욕한 메시지 찾아줘",
+    "디디가 올해 쓴 욕 표현 목록", "올해 디디가 한 욕 정리해줘", "디디가 올해 한 욕은 뭐야?",
+    "디디가 올해 무슨 욕 했어?", "디디가 올해 어떤 욕을 했는지 알려줘",
+    "모대야 디디가 올해 한 욕 보여줘", "<@UDD123>가 올해 한 욕 보여줘",
+])
+def test_spoken_profanity_lookup_uses_the_same_stored_message_contract(question):
+    # 숫자를 묻지 않아도 발언 조회는 검색 상위 몇 건과 모델 추정으로 빠지면 안 된다.
+    query = parse_conversation_count_query(question, NOW, ["UDD123"])
+    assert query is not None and query["kind"] == CONVERSATION_COUNT_KIND
+    assert query["authorIds"] == ["UDD123"] and query["unit"] == "messages"
+    assert query["period"]["startAtKst"] == "2026-01-01T00:00:00+09:00"
+    assert query["periodError"] is None
+
+
+@pytest.mark.parametrize("question", [
     "디디 올해 한 말 요약해줘", "올해 욕설이란 무엇이야", "욕심을 몇 번 부렸어",
     "목욕 몇 번 했어", "욕구가 몇 개야", "욕설을 몇 번 하면 차단해야 해?", "욕설 예시를 알려줘",
+    "욕설 뜻 보여줘", "올해 쓸 욕 예시 보여줘", "디디에게 할 욕을 써줘",
+    "디디가 올해 한 욕 보여줘라는 문구를 다듬어줘", "디디가 올해 무슨 욕 했어라는 문장을 번역해줘",
+    "디디가 올해 한 욕 보여줘라는 문구를 다듬어서 보여줘",
+    "디디가 올해 한 욕이라는 제목으로 농담을 만들어서 보여줘",
+    '"디디가 올해 한 욕 보여줘"라는 문장을 보여줘',
+    '"디디가 올해 한 욕 보여줘"라는 문장의 뜻을 알려줘',
+    "`디디가 올해 한 욕 보여줘` 문자열을 정리해줘", "디디가 올해 한 욕 보여줘라는 문구의 뜻을 알려줘",
+    "디디가 올해 한 욕을 소재로 운세를 정리해줘", "욕설을 한 번 보여줘",
+    "디디에게 할 욕설을 한 번 보여줘", "올해 욕을 한다면 어떤 표현인지 알려줘",
+    "욕설을 한 달 배운 뒤 예시를 보여줘",
+    "`디디가 올해 한 욕 보여줘`", "올해 디디가 욕한 장비를 업데이트해줘",
 ])
 def test_summary_general_words_and_policy_threshold_questions_are_not_count_requests(question):
     assert parse_conversation_count_query(question, NOW, ["UDD123"]) is None

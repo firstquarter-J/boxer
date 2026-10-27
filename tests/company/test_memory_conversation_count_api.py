@@ -69,13 +69,22 @@ def state(tmp_path, monkeypatch):
         yield memory, store, client
 
 
-def test_existing_db_excerpts_are_counted_synchronously_without_new_state(state):
+@pytest.mark.parametrize("question", [
+    "올해 디디가 한 욕 몇개야?", "디디가 올해 한 욕 보여줘", "디디가 올해 어떤 욕을 했는지 알려줘",
+])
+@pytest.mark.parametrize("route_group", ["freeform", "fun", None])
+def test_existing_db_excerpts_are_counted_synchronously_without_new_state(state, question, route_group):
     memory, store, client = state
     for index, excerpt in enumerate(("병신들", "ㅈㄴ 피곤해", '"씨발"이라는 단어', "일반 발언", "")):
         add_source(store, excerpt=excerpt, stamp=f"179210000{index}.000001")
-    value = request("올해 디디가 한 욕 몇개야?")
+    value = request(question)
     assert memory.prepare(value) == {"retrievalId": None, "sources": [], "storedOnly": True}
-    response = client.post("/internal/v1/assistant/turns", headers=headers(), json=turn(value))
+    payload = turn(value)
+    if route_group is None:
+        payload.pop("routeGroup")
+    else:
+        payload["routeGroup"] = route_group
+    response = client.post("/internal/v1/assistant/turns", headers=headers(), json=payload)
     assert response.status_code == 200, response.text
     answer = response.json()
     assert answer["route"] == "company_conversation_count" and answer["usedLlm"] is False
@@ -91,7 +100,8 @@ def test_existing_db_excerpts_are_counted_synchronously_without_new_state(state)
         assert not connection.execute("SELECT name FROM sqlite_master WHERE name LIKE 'memory_count_%'").fetchall()
 
 
-def test_slack_client_and_rollout_return_db_answer_without_any_slack_sdk_call(state):
+@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘"])
+def test_slack_client_and_rollout_return_db_answer_without_any_slack_sdk_call(state, question):
     from boxer_company_adapter_slack.company_api_client import (
         CompanyApiClientSettings,
         CompanyAssistantApiClient,
@@ -117,7 +127,7 @@ def test_slack_client_and_rollout_return_db_answer_without_any_slack_sdk_call(st
     api = CompanyAssistantApiClient(settings, session=session)
     api.memory_request_preparer = transport.prepare
     rollout = CompanyFreeformApiRolloutService(None, api_client=api, logger=logging.getLogger(__name__))
-    result = rollout.answer(request())
+    result = rollout.answer(request(question))
     assert result.route == "company_conversation_count" and result.outcome == "answered"
     assert "메시지는 1건" in result.messages[0].body and result.used_llm is False
     assert "확인된 욕 표현: `씨발`" in result.messages[0].body
@@ -127,6 +137,7 @@ def test_slack_client_and_rollout_return_db_answer_without_any_slack_sdk_call(st
                                      "디디가 2025년에 한 말은 뭐야?", "2026년 이전 대화 요약해줘",
                                      "2026년 1월 1일 이전 대화 요약해줘", "2025년 이전 대화 요약해줘",
                                      "2026년이전대화요약해줘", "2026년1월1일이전대화기록",
+                                     "디디가 2025년에 한 욕 보여줘", "디디가 2026년 이전 어떤 욕 했어?",
                                      "디디가 2026년 이전 욕 몇 번 했어?", "디디가 2026년 10월 이전 욕 몇 번 했어?"])
 def test_before_supported_period_is_rejected_before_counting_or_model_call(state, monkeypatch, question):
     import boxer_company.memory.conversation_count_store as counting
@@ -159,10 +170,11 @@ def test_omitting_route_group_cannot_bypass_supported_history_period(state, monk
     assert "2026년 1월 1일" in answer["messages"][0]["body"]
 
 
-def test_omitting_route_group_still_counts_supported_existing_db_excerpts(state):
+@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘"])
+def test_omitting_route_group_still_counts_supported_existing_db_excerpts(state, question):
     _, store, client = state
     add_source(store)
-    body = turn(request())
+    body = turn(request(question))
     body.pop("routeGroup")
     # routeGroup은 선택 필드이므로 생략 여부가 DB 전용 집계의 실행 경계를 바꾸면 안 된다.
     response = client.post("/internal/v1/assistant/turns", headers=headers(), json=body)
@@ -174,7 +186,8 @@ def test_omitting_route_group_still_counts_supported_existing_db_excerpts(state)
     assert "memoryCapture" not in answer
 
 
-@pytest.mark.parametrize("question", ["누가 올해 욕 몇 번 했어?", "디디가 욕 몇 번 했어?", "디디가 2월 30일 욕 몇 번 했어?"])
+@pytest.mark.parametrize("question", ["누가 올해 욕 몇 번 했어?", "디디가 욕 몇 번 했어?", "디디가 2월 30일 욕 몇 번 했어?",
+                                     "올해 한 욕 보여줘", "디디가 한 욕 보여줘", "디디가 2월 30일에 한 욕 보여줘"])
 def test_missing_target_or_invalid_period_never_guesses_a_count(state, question):
     _, _, client = state
     response = client.post("/internal/v1/assistant/turns", headers=headers(), json=turn(request(question)))
@@ -182,21 +195,22 @@ def test_missing_target_or_invalid_period_never_guesses_a_count(state, question)
     assert response.json()["outcome"] == "needs_input" and response.json()["usedLlm"] is False
 
 
-def test_missing_excerpt_is_unavailable_and_next_query_observes_db_deletion(state):
+@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘"])
+def test_missing_excerpt_is_unavailable_and_next_query_observes_db_deletion(state, question):
     _, store, client = state
     add_source(store, excerpt="", stamp="1792100001.000001")
-    first = client.post("/internal/v1/assistant/turns", headers=headers(), json=turn(request())).json()
+    first = client.post("/internal/v1/assistant/turns", headers=headers(), json=turn(request(question))).json()
     assert "확인할 수 없어" in first["messages"][0]["body"] and "0회라는 뜻은 아니야" in first["messages"][0]["body"]
     assert "확인된 욕 표현:" not in first["messages"][0]["body"]
     add_source(store, stamp="1792100002.000001")
     current = client.post("/internal/v1/assistant/turns", headers=headers("after-insert"),
-        json=turn(request(request_id="after-insert"))).json()
+        json=turn(request(question, request_id="after-insert"))).json()
     assert "메시지는 1건" in current["messages"][0]["body"]
     assert "`씨발`" in current["messages"][0]["body"]
     store.source_event(tenant_id=TENANT, channel_id=CHANNEL, message_ts="1792100002.000001",
         event_type="deleted", event_id="delete-stored-message")
     following = client.post("/internal/v1/assistant/turns", headers=headers("after-delete"),
-        json=turn(request(request_id="after-delete"))).json()
+        json=turn(request(question, request_id="after-delete"))).json()
     assert "확인할 수 없어" in following["messages"][0]["body"] and "메시지는 1건" not in following["messages"][0]["body"]
     assert "확인된 욕 표현:" not in following["messages"][0]["body"]
 

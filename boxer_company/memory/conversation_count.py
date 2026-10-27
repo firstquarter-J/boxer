@@ -29,6 +29,24 @@ _QUERY_SUBJECT = re.compile(
 _QUERY_COUNT = re.compile(r"몇\s*(?:번|건|개|회)|횟수|개수|(?:메시지|발언)\s*수|얼마나\s*(?:했|많)")
 _QUERY_NUMBER = re.compile(r"욕(?:설|\s*표현)?\s*(?:메시지\s*)?수(?=$|[\s?!.,]|가|는|를)")
 _QUERY_POLICY = re.compile(r"몇\s*(?:번|건|개|회).{0,20}(?:하면|해야|까지).{0,20}(?:차단|금지|제재|허용)")
+# 실제로 한 욕의 표현 조회도 같은 DB 판정으로 보낸다. 단순한 뜻, 예시와 창작 요청은 고르지 않는다.
+_QUERY_SPOKEN_SUBJECT = re.compile(
+    r"(?<![가-힣a-z0-9_])(?:한|했던|하던|했었던|쓴|썼던|내뱉은|사용한)\s*욕(?:설|\s*표현)?|"
+    r"(?<![가-힣a-z0-9_])욕(?:설|\s*표현)?\s*(?:을|를)?\s*(?:한|했던|하던|쓴|썼던)"
+    r"\s*(?:메시지|발언|기록|목록|내역|모음|말|것|거)(?=$|[\s?!.,]|을|를|은|는)"
+)
+_QUERY_LOOKUP_END = re.compile(
+    r"(?:(?:보여|알려|찾아|정리해)\s*(?:줘|주라|줄래|주세요|줄\s*수\s*있(?:어|을까))|"
+    r"목록|모음|내역|뭐야|뭐였어|무엇이야)[?!.。！？]*\s*$"
+)
+_QUERY_SPOKEN_QUESTION = re.compile(
+    r"(?:무슨|어떤)\s*욕(?:설|\s*표현)?\s*(?:을|를)?\s*(?:했|썼|내뱉었|사용했)"
+    r"(?:어|지|니|는지)(?:\s*(?:알려|보여)\s*(?:줘|줄래|주세요))?[?!.。！？]*\s*$"
+)
+_QUERY_LOOKUP_TRANSFORM = re.compile(
+    r"다듬(?:어|어서)|고쳐|수정해|편집해|번역해|바꿔|줄여|늘려|작성해|만들어|생성해|써서|소재로|"
+    r"(?:문구|문장|문자열).{0,40}(?:뜻|의미|설명)"
+)
 
 # 사전은 표현의 출현만 판정한다. '개'나 '죽' 같은 일반 어근을 욕설로 확장하지 않는다.
 # 호환 자모를 NFKC로 정규화하므로 초성 표현도 같은 표기로 비교한다.
@@ -68,12 +86,20 @@ _NON_PROFANE_CONTEXTS = (
 def parse_conversation_count_query(
     question: str, before_ts: str, author_ids: Sequence[str] = (),
 ) -> dict[str, Any] | None:
-    """욕 표현의 메시지 수 질문만 선택하며 이름 해석과 접근 권한은 호출자가 담당한다."""
+    """욕 표현의 메시지 수와 실제 표현 조회를 고르고 이름 해석과 접근 권한은 호출자에게 맡긴다."""
     if not isinstance(question, str):
         return None
     text = unicodedata.normalize("NFKC", question).casefold()
-    if (not _QUERY_SUBJECT.search(text) or not (_QUERY_COUNT.search(text) or _QUERY_NUMBER.search(text))
-            or _QUERY_POLICY.search(text)):
+    count = _QUERY_COUNT.search(text) or _QUERY_NUMBER.search(text)
+    # 인용한 질문과 '문구를 다듬어서 보여줘' 같은 창작은 실제 발언 조회로 선점하지 않는다.
+    lookup_text = text
+    for pattern in (_CODE, _QUOTED, _BLOCK_QUOTED):
+        lookup_text = pattern.sub(" ", lookup_text)
+    lookup = not _QUERY_LOOKUP_TRANSFORM.search(lookup_text) and (
+        (_QUERY_SPOKEN_SUBJECT.search(lookup_text) and _QUERY_LOOKUP_END.search(lookup_text))
+        or _QUERY_SPOKEN_QUESTION.search(lookup_text)
+    )
+    if not _QUERY_SUBJECT.search(text) or not (count or lookup) or _QUERY_POLICY.search(text):
         return None
     # 잘못된 날짜도 집계 의도로 남겨 일반 최근 조회로 빠지지 않게 한다. 기간 누락은 별도 확인한다.
     period = resolve_live_query_period(question, before_ts)
