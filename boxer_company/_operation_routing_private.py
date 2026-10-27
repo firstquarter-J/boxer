@@ -19,6 +19,9 @@ from boxer_company._operation_routing_common import (
 from boxer_company._operation_routing_file import (
     _is_recording_streaming_restore_request,
 )
+from boxer_company._operation_routing_knowledge import (
+    looks_like_barcode_policy_question,
+)
 
 
 def _extract_db_query(question: str) -> str | None:
@@ -175,6 +178,9 @@ def _contains_any_hint(question: str, hints: tuple[str, ...]) -> bool:
 
 
 def _is_barcode_validation_status_request(question: str, barcode: str | None) -> bool:
+    # 정책 사례의 차단/환불 표현을 특정 바코드의 현재 상태 조회로 해석하지 않는다.
+    if looks_like_barcode_policy_question(question):
+        return False
     if not str(barcode or "").strip():
         return False
     normalized = str(question or "").strip()
@@ -197,6 +203,9 @@ def _is_barcode_validation_status_request(question: str, barcode: str | None) ->
 
 
 def _is_barcode_pink_classification_reason_request(question: str, barcode: str | None) -> bool:
+    # 첫 영상 삭제/이전의 가정형 질문은 등록 병원 대조가 아니라 정책 근거로 답한다.
+    if looks_like_barcode_policy_question(question):
+        return False
     if not str(barcode or "").strip():
         return False
     normalized = str(question or "").strip()

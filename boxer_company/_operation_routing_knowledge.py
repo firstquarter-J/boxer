@@ -9,6 +9,7 @@ from boxer_company._operation_routing_common import (
     CompanyOperationRequestContract as CompanyAssistantRequest,
 )
 from boxer_company._operation_routing_common import (
+    _extract_barcode,
     window_assistant_context_entries,
 )
 from boxer_company._operation_routing_device import (
@@ -331,11 +332,65 @@ def _looks_like_thread_answer_instruction(question: str) -> bool:
     )
 
 
+def looks_like_barcode_policy_question(question: str) -> bool:
+    """바코드 조회나 변경 지시와 구분해 사용 정책과 가정형 사례를 판정한다."""
+    text = re.sub(r"\s+", "", (question or "").lower())
+    if "바코드" not in text:
+        return False
+    # 실제 변경 요청은 정책 키워드가 함께 있어도 기존 operation 경계에 남긴다.
+    if re.search(
+        r"(?:삭제|이전|변경|초기화|등록|해제|복구)(?:해줘|해주세요|해라)|옮겨줘|옮겨주세요",
+        text,
+    ):
+        return False
+    has_explicit_policy = any(
+        token in text
+        for token in ("정책", "규칙", "사용기준", "재사용조건")
+    )
+    has_hypothesis = any(
+        token in text
+        for token in ("하면", "해도", "했을때", "한경우", "한다면", "하더라도")
+    )
+    barcode = _extract_barcode(question)
+    # 실제 번호와 현재 상태 확인이 함께 있으면 유효기간 언급도 조회의 일부다.
+    # '삭제했는데'처럼 이미 일어난 일은 조건문으로 보지 않는다.
+    if (
+        barcode is not None
+        and not has_explicit_policy
+        and not has_hypothesis
+        and any(token in text for token in ("현재", "지금", "상태", "여부", "대상인지", "확인", "조회"))
+    ):
+        return False
+    if has_explicit_policy or any(token in text for token in ("유효기간", "사용기간")):
+        return True
+
+    has_lifecycle = any(
+        token in text
+        for token in (
+            "삭제", "이전", "재사용", "재지급", "다른산모", "1년", "일년", "12개월", "만료",
+        )
+    )
+    has_usage_question = any(
+        token in text
+        for token in (
+            "사용가능", "사용이가능", "사용할수", "쓸수", "재사용가능", "가능해질",
+            "가능할", "될까", "될가", "되나요", "안될", "초기화되", "초기화돼",
+        )
+    )
+    # 번호가 명시된 단순 사용 가능 여부는 실데이터 검증에 맡기고,
+    # 삭제/이전하면 어떻게 되는지 묻는 조건문만 정책 사례로 처리한다.
+    return has_lifecycle and has_usage_question and (
+        barcode is None or has_hypothesis
+    )
+
+
 def looks_like_notion_playbook_question(question: str) -> bool:
     text = (question or "").strip()
     if not text or _looks_like_thread_answer_instruction(text):
         return False
-    return any(token in text for token in _NOTION_QUESTION_TOKENS)
+    return looks_like_barcode_policy_question(text) or any(
+        token in text for token in _NOTION_QUESTION_TOKENS
+    )
 
 
 def _has_notion_playbook_context(context_text: str) -> bool:

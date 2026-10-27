@@ -56,6 +56,7 @@ from boxer_company._operation_routing_file import (
 )
 from boxer_company._operation_routing_knowledge import (
     _request_context_text,
+    looks_like_barcode_policy_question,
     looks_like_notion_playbook_followup,
     looks_like_notion_playbook_question,
     match_notion_playbook_route,
@@ -1208,6 +1209,10 @@ def _build_structured_query_match(
     """기존 route 우선순위를 보존하며 입력만 파싱한다."""
 
     question = request.question
+    # 사례 속 병원과 날짜는 조회 조건이 아니다. 사용 정책은 날짜 parser보다
+    # 먼저 문서 경로에 양보해 연월이나 항목 번호가 형식 오류를 만들지 않게 한다.
+    if looks_like_barcode_policy_question(question):
+        return None
     barcode = resolve_assistant_request_scope(request).barcode
     if _is_recording_streaming_restore_request(question, barcode):
         return None
