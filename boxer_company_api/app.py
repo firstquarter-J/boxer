@@ -610,18 +610,27 @@ def create_company_api_app(
             device_ssh_state = None
             try:
                 typed_runtime = cast(_AssistantRuntime, runtime)
+                conversation_stage = (turn.routeGroup in {"freeform", "fun"}
+                    or (turn.routeGroup is None and memory_runtime.is_stored_history_request(domain_request)))
                 # route·권한 판정이 끝난 대화 경로에만 검증된 기억을 결합한다.
                 memory_request = (
                     memory_runtime.bind_verified(domain_request)
-                    if (turn.routeGroup in {"freeform", "fun"}
+                    if (conversation_stage
                         or (turn.routeGroup == "operations"
                             and match_company_operation_route(domain_request) == "conversation_memory_manage"))
                     else domain_request
                 )
-                memory_result = (
-                    memory_runtime.manage(memory_request)
-                    if turn.routeGroup == "operations" else None
-                )
+                # 기간 합계는 LLM 준비 상태나 모델 입력에 의존하지 않고 API가 확정한 숫자만 쓴다.
+                memory_result = None
+                if turn.routeGroup == "operations":
+                    memory_result = memory_runtime.manage(memory_request)
+                elif conversation_stage:
+                    memory_request = memory_runtime.stored_history_request(memory_request)
+                    memory_result = memory_runtime.conversation_count(memory_request)
+                    if memory_result is None:
+                        # 지원 시작일 전의 대화 질문은 모델 추정이나 원문 재수집 없이 안내한다.
+                        memory_result = memory_runtime.stored_history_response(memory_request,
+                            route="company_team_fun" if turn.routeGroup == "fun" else "company_freeform")
                 # API context는 host 선택을 바꾸지 않고 side-effect marker와
                 # 요청당 mutation/open 횟수 제한만 활성화한다.
                 with company_api_device_ssh_context() as device_ssh_state:

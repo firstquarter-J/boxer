@@ -11,6 +11,7 @@ from boxer_company.assistant.contracts import (
     CompanyAssistantRequest,
     CompanyAssistantResult,
 )
+from boxer_company.memory.conversation_count import parse_conversation_count_query
 from boxer_company.read_routing import (
     BARCODE_TIMELINE_ROUTES,
     _looks_like_company_notion_search,
@@ -83,7 +84,7 @@ _ALLOWED_BARCODE_FREEFORM_ROUTES = frozenset(
     {"barcode_evidence_freeform"}
 )
 _ALLOWED_USAGE_HELP_ROUTES = frozenset({"usage_help"})
-_ALLOWED_FREEFORM_ROUTES = frozenset({"company_freeform"})
+_ALLOWED_FREEFORM_ROUTES = frozenset({"company_freeform", "company_conversation_count"})
 _SAFE_REQUEST_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
 )
@@ -108,6 +109,12 @@ def _match_company_freeform_rollout(
     return match_company_freeform_route(
         replace(request, metadata=metadata)
     )
+
+
+def _expected_company_freeform_result(request: CompanyAssistantRequest) -> str | None:
+    # 기간 집계는 같은 API stage 안의 결정적 응답이므로 결과 route도 원 질문으로 제한한다.
+    stamp = str((request.memory_context or {}).get("currentMessageTs") or "")
+    return "company_conversation_count" if parse_conversation_count_query(request.question, stamp) else _match_company_freeform_rollout(request)
 
 
 class _AssistantService(Protocol):
@@ -675,7 +682,7 @@ class CompanyFreeformApiRolloutService(
                     "잠시 후 다시 시도해줘"
                 ),
                 route_group="freeform",
-                expected_route=_match_company_freeform_rollout,
+                expected_route=_expected_company_freeform_result,
             ),
             api_client=api_client,
             logger=logger,
@@ -1202,6 +1209,9 @@ def _validate_remote_freeform_result(
     if not base_validation.accepted:
         return base_validation
     assert result is not None
+    if result.route == "company_conversation_count" and (
+            result.used_llm or result.sources or result.memory_capture is not None):
+        return _RemoteResultValidation(False, "unexpected_count_result")
     # 기억 원본 검증은 API가 소유한다. 이 최종 전송 경계는 freeform에만
     # API가 만든 최대 두 개의 Slack 기억 인용을 허용하고 다른 분석 가드는 유지한다.
     if len(result.sources) > 2 or any(

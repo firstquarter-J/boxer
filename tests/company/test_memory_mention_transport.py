@@ -49,7 +49,7 @@ class CandidateStore:
 def test_slack_event_question_reaches_http_memory_author_scope(monkeypatch, raw, expected):
     from boxer_company import team_chat_context
 
-    # Slack·LLM·DB를 호출하지 않고 실제 이벤트 전처리, 회사 DTO, HTTP schema, 기억 계획을 잇는다.
+    # 실제 이벤트 전처리, 회사 DTO, HTTP schema에서 멘션을 저장 DB의 작성자 필터까지 잇는다.
     monkeypatch.setattr(common, "App", FakeApp)
     monkeypatch.setattr(common.ss, "validate_slack_tokens", lambda: None)
     monkeypatch.setattr(common, "_validate_tokens", lambda **_: None)
@@ -84,8 +84,8 @@ def test_slack_event_question_reaches_http_memory_author_scope(monkeypatch, raw,
                       "threadTs": request.conversation_id, "currentMessageTs": request.metadata["message_id"],
                       "channelKind": "private_channel", "triggerKind": "app_mention"}})
     assert response.status_code == 200
-    plan = response.json()["liveQuery"]
-    assert plan["question"] == expected
-    assert plan["authorIds"] == ["UTARGET"]
-    assert plan["beforeTs"] == "1792392600.000001"
+    prepared = response.json()
+    assert prepared["storedOnly"] is True and prepared["retrievalId"]
+    assert "liveQuery" not in prepared
+    assert store.queries[0]["question"] == expected
     assert store.queries[0]["mentioned_user_ids"] == ("UTARGET",)

@@ -71,6 +71,9 @@ class Store:
     def load_verified_items(self, **kwargs):
         return self.items if kwargs["verified_sources"] == [{"sourceId": "src_example", "revisionHash": "a" * 64, "status": "verified"}] else []
 
+    def load_stored_items(self, **kwargs):
+        return self.items
+
     def source_event(self, **kwargs):
         self.events.append(kwargs)
         invalidated_count = len(self.items)
@@ -144,25 +147,37 @@ def test_memory_retrieval_is_bound_to_turn_and_expires():
     assert "text" not in str(prepared)
     verified = {**request.memory_context, "retrievalId": prepared["retrievalId"],
                 "verifications": [{"sourceId": "src_example", "revisionHash": "a" * 64, "status": "verified"}]}
-    assert runtime.bind_verified(replace(request, memory_context=verified)).memory_entries
-    assert not runtime.bind_verified(replace(request, memory_context=verified)).memory_entries
+    assert any(entry.get("memoryId") == "mem_example" for entry in runtime.bind_verified(replace(request, memory_context=verified)).memory_entries)
+    assert all("memoryId" not in entry for entry in runtime.bind_verified(replace(request, memory_context=verified)).memory_entries)
     prepared = runtime.prepare(request)
     verified["retrievalId"] = prepared["retrievalId"]
     assert not runtime.bind_verified(replace(request, question="다른 질문", memory_context=verified)).memory_entries
     prepared = runtime.prepare(request)
     verified["retrievalId"] = prepared["retrievalId"]
     clock[0] = 122
-    assert not runtime.bind_verified(replace(request, memory_context=verified)).memory_entries
+    assert all("memoryId" not in entry for entry in runtime.bind_verified(replace(request, memory_context=verified)).memory_entries)
 
 
 def test_changed_source_is_invalidated_without_using_old_text():
     runtime = service()
     request = domain()
     prepared = runtime.prepare(request)
-    request = replace(request, memory_context={**request.memory_context, "retrievalId": prepared["retrievalId"],
-                      "verifications": [{"sourceId": "src_example", "revisionHash": "a" * 64, "status": "changed"}]})
-    assert not runtime.bind_verified(request).memory_entries
+    # 원문 변경은 기존 이벤트 처리로 DB에 반영하며 일반 조회에서 client 검증값으로 쓰지 않는다.
+    runtime.store.source_event(tenant_id="T1", channel_id="C1", message_ts=TS,
+        event_type="changed", event_id="stored-source-changed")
+    request = replace(request, memory_context={**request.memory_context, "retrievalId": prepared["retrievalId"]})
+    assert all("memoryId" not in entry for entry in runtime.bind_verified(request).memory_entries)
     assert runtime.store.events[0]["event_type"] == "changed"
+
+
+def test_stored_query_does_not_treat_client_verification_as_a_source_event():
+    runtime = service()
+    request = domain()
+    prepared = runtime.prepare(request)
+    request = replace(request, memory_context={**request.memory_context, "retrievalId": prepared["retrievalId"],
+        "verifications": [{"sourceId": "src_example", "revisionHash": "a" * 64, "status": "deleted"}]})
+    assert any(entry.get("memoryId") == "mem_example" for entry in runtime.bind_verified(request).memory_entries)
+    assert runtime.store.events == []
 
 
 def test_removed_profile_can_still_manage_verified_own_facts_with_reads_off():
@@ -265,6 +280,97 @@ def client(memory, runtime=None, capabilities=("assistant.turn.read",)):
 
 def headers():
     return {"Authorization": f"Bearer {TOKEN}", "X-Request-ID": REQUEST_ID}
+
+
+@pytest.mark.parametrize("route_group", ["freeform", "fun"])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_history_answer_uses_db_memory_without_caller_thread_or_fun_context(route_group, prepared):
+    memory = service()
+    body = payload(question="디디가 올해 한 말은 뭐야?", routeGroup=route_group,
+        contextEntries=[{"kind": "message", "source": "slack", "authorId": "U1", "text": "저장하지 않은 스레드 원문"}])
+    if route_group == "fun":
+        body["funContext"] = "저장하지 않은 fun 스레드 원문"
+    if prepared:
+        value = AssistantTurnInput.model_validate(body).to_company_request(REQUEST_ID)
+        body["memoryContext"]["retrievalId"] = memory.prepare(value)["retrievalId"]
+    seen = []
+
+    def answer_stage(request, _stage, **_kwargs):
+        seen.append(request)
+        return CompanyAssistantResult(route="company_team_fun" if route_group == "fun" else "company_freeform",
+            outcome="answered", messages=(AssistantMessage("저장된 근거에서만 답변"),))
+
+    # 직접 API caller가 과거 원문을 보내도 prepare 바인딩 확인 후 모델 입력에서는 제거한다.
+    with client(memory, SimpleNamespace(answer_stage=answer_stage)) as http:
+        response = http.post("/internal/v1/assistant/turns", headers=headers(), json=body)
+    assert response.status_code == 200, response.text
+    assert len(seen) == 1 and seen[0].context_entries == ()
+    assert "team_fun_context" not in seen[0].metadata
+    assert any(row.get("memoryId") == "mem_example" for row in seen[0].memory_entries) is prepared
+
+
+def test_history_context_removal_does_not_bypass_original_retrieval_binding():
+    memory = service()
+    body = payload(question="디디가 올해 한 말은 뭐야?", contextEntries=[
+        {"kind": "message", "source": "slack", "text": "준비 때의 원문"}])
+    value = AssistantTurnInput.model_validate(body).to_company_request(REQUEST_ID)
+    body["memoryContext"]["retrievalId"] = memory.prepare(value)["retrievalId"]
+    body["contextEntries"][0]["text"] = "다른 원문"
+    seen = []
+
+    def answer_stage(request, _stage, **_kwargs):
+        seen.append(request)
+        return CompanyAssistantResult(route="company_freeform", outcome="answered", messages=(AssistantMessage("저장 근거 없음"),))
+
+    # 원문을 지우기 전에 원 요청과 비교하므로 다른 문맥으로 준비한 기억을 재사용할 수 없다.
+    with client(memory, SimpleNamespace(answer_stage=answer_stage)) as http:
+        response = http.post("/internal/v1/assistant/turns", headers=headers(), json=body)
+    assert response.status_code == 200, response.text
+    assert len(seen) == 1 and not seen[0].context_entries
+    assert all("memoryId" not in row for row in seen[0].memory_entries)
+
+
+@pytest.mark.parametrize("route_group", [None, "freeform", "fun"])
+def test_named_member_draft_edit_preserves_current_draft_context(route_group):
+    seen = []
+
+    def answer_stage(request, _stage, **_kwargs):
+        seen.append(request)
+        return CompanyAssistantResult(route="company_team_fun" if route_group == "fun" else "company_freeform",
+            outcome="answered", messages=(AssistantMessage("다듬은 문구"),))
+
+    # 팀원 이름만 언급한 문구 편집은 기록 검색으로 오인해 현재 초안을 버리지 않는다.
+    runtime = SimpleNamespace(answer_stage=answer_stage, answer=lambda request, **kwargs: answer_stage(request, None, **kwargs))
+    body = payload(question="디디 생일 축하 문구를 더 짧게 다듬어줘", routeGroup=route_group,
+        contextEntries=[{"kind": "message", "source": "slack", "text": "현재 편집할 축하 문구 초안"}])
+    if route_group == "fun":
+        body["funContext"] = "현재 작성 중인 문구"
+    with client(service(), runtime) as http:
+        response = http.post("/internal/v1/assistant/turns", headers=headers(), json=body)
+    assert response.status_code == 200, response.text
+    assert len(seen) == 1 and seen[0].context_entries[0]["text"] == "현재 편집할 축하 문구 초안"
+    if route_group == "fun":
+        assert seen[0].metadata["team_fun_context"] == "현재 작성 중인 문구"
+
+
+def test_daily_fortune_preserves_its_root_context_with_memory_disabled():
+    from boxer_company.assistant.team_fun_route import match_company_daily_fortune_route
+
+    seen = []
+    memory = MemoryService(None, enabled=False, read_enabled=False)
+
+    def answer_stage(request, _stage, **_kwargs):
+        seen.append(request)
+        assert match_company_daily_fortune_route(request) == "company_daily_fortune"
+        return CompanyAssistantResult(route="company_daily_fortune", outcome="answered", messages=(AssistantMessage("운세 답변"),))
+
+    # 운세 본문의 '오늘'과 '대화'가 과거 기록 조회로 오인되어 필수 root가 사라지지 않는다.
+    with client(memory, SimpleNamespace(answer_stage=answer_stage)) as http:
+        response = http.post("/internal/v1/assistant/turns", headers=headers(), json=payload(
+            question="1992년생 오늘은 대화하며 행운을 찾아보세요.", routeGroup="fun", memoryContext=None,
+            contextEntries=[{"kind": "message", "source": "slack", "text": "오늘의 운세"}]))
+    assert response.status_code == 200, response.text
+    assert len(seen) == 1 and seen[0].context_entries[0]["text"] == "오늘의 운세"
 
 
 @pytest.mark.parametrize("invalid_result", [None, [], {}, {"invalidatedCount": None},

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
+from boxer_company import team_chat_context
 from boxer_company.assistant import (
     AssistantMessage,
     CompanyAssistantResult,
@@ -104,6 +105,7 @@ class _Invocation:
     api_client: Mock
     render: Mock
     render_download: Mock
+    context_loader: Mock
 
 
 class CompanyRouteContractTests(unittest.TestCase):
@@ -125,6 +127,9 @@ class CompanyRouteContractTests(unittest.TestCase):
         current_ts: str = "1785312000.000001",
         base_access_runtime: SlackBaseAccessRuntime | None = None,
         slack_client: Any = None,
+        channel_id: str = "C123456",
+        message_event: bool = False,
+        use_real_context_loader: bool = False,
     ) -> _Invocation:
         settings = CompanyApiClientSettings(
             base_url="http://127.0.0.1:8010",
@@ -164,7 +169,7 @@ class CompanyRouteContractTests(unittest.TestCase):
             "question": question,
             "user_id": actor_user_id,
             "workspace_id": "T1",
-            "channel_id": "C123456",
+            "channel_id": channel_id,
             "current_ts": current_ts,
             "thread_ts": "1785312000.000001",
             "request_log": {
@@ -183,7 +188,7 @@ class CompanyRouteContractTests(unittest.TestCase):
         ) -> int:
             if render_error is not None:
                 raise render_error
-            reply(result.messages[0].body)
+            _kwargs["reply"](result.messages[0].body)
             return 1
 
         captured_handlers: dict[str, Any] = {}
@@ -314,11 +319,12 @@ class CompanyRouteContractTests(unittest.TestCase):
                     return_value=operation_stage,
                 )
             )
-            stack.enter_context(
+            context_loader = stack.enter_context(
                 patch.object(
                     company,
                     "load_slack_thread_context_entries",
-                    return_value=(),
+                    **({"wraps": company.load_slack_thread_context_entries}
+                       if use_real_context_loader else {"return_value": ()}),
                 )
             )
             stack.enter_context(
@@ -354,7 +360,7 @@ class CompanyRouteContractTests(unittest.TestCase):
             )
 
             company.create_app()
-            captured_handlers["mention"](
+            captured_handlers["message" if message_event else "mention"](
                 payload,
                 reply,
                 slack_client if slack_client is not None else Mock(),
@@ -369,6 +375,7 @@ class CompanyRouteContractTests(unittest.TestCase):
             api_client=api_client,
             render=render,
             render_download=render_download,
+            context_loader=context_loader,
         )
 
     def test_membership_denial_is_terminal_before_remote_services(self) -> None:
@@ -549,7 +556,88 @@ class CompanyRouteContractTests(unittest.TestCase):
         )
 
         self.assertEqual(len(invocation.operation_service.answer_calls), 1)
+        invocation.context_loader.assert_called_once()
         self.assertEqual(invocation.replies[-1][0], "API 답변")
+
+    def test_conversation_questions_skip_entry_slack_context_and_diagnostic_probe(self) -> None:
+        # 실제 mention entry가 일반 문맥을 준비하기 전부터 저장 조회의 Slack 읽기를 차단한다.
+        for question in ("디디가 올해 욕 몇 번 했어?", "오늘 디디가 한 말 요약해줘",
+                         "디디가 최근 뭐랬어?", "<@UDD|디디>가 최근 뭐랬어?"):
+            with self.subTest(question=question), patch.object(team_chat_context, "TEAM_MEMBER_PROFILES",
+                    ({"name": "디디", "aliases": ("DD",), "user_id": "UDD"},)):
+                slack = Mock()
+                slack.conversations_replies.return_value = {"messages": [{"ts": "1785311999.000001",
+                    "user": "U1", "text": "DB에 저장하지 않은 스레드 원문"}]}
+                invocation = self._invoke_mention(question=question, read_stage="knowledge",
+                    read_result=_result("company_freeform"), slack_client=slack, use_real_context_loader=True)
+                invocation.context_loader.assert_not_called()
+                slack.conversations_replies.assert_not_called()
+                slack.conversations_history.assert_not_called()
+                slack.conversations_list.assert_not_called()
+                self.assertFalse(invocation.operation_service.answer_calls)
+                self.assertTrue(invocation.read_services["knowledge"].calls)
+                self.assertTrue(all(request.context_entries == ()
+                    for service in invocation.read_services.values() for request in service.calls))
+
+    def test_fun_conversation_questions_reach_stored_read_before_fun_collects_context(self) -> None:
+        # 모대 호출어가 붙어도 fun의 스레드 수집과 운영 probe를 건너뛰고 저장 조회로 전달한다.
+        for question in ("모대야 디디가 올해 욕 몇 번 했어?", "모대야 오늘 디디가 한 말 요약해줘", "모대야 디디가 최근 뭐랬어?"):
+            with (
+                self.subTest(question=question),
+                patch.object(company, "handle_fun_message") as fun,
+                patch.object(team_chat_context, "TEAM_MEMBER_PROFILES",
+                    ({"name": "디디", "aliases": ("DD",), "user_id": "UDD"},)),
+            ):
+                slack = Mock()
+                invocation = self._invoke_mention(question=question, raw_text=question, channel_id="C0621TL2HSB",
+                    message_event=True, read_stage="knowledge", read_result=_result("company_freeform"),
+                    slack_client=slack, use_real_context_loader=True)
+                fun.assert_not_called()
+                invocation.context_loader.assert_not_called()
+                slack.conversations_replies.assert_not_called()
+                slack.conversations_history.assert_not_called()
+                slack.conversations_list.assert_not_called()
+                self.assertFalse(invocation.operation_service.answer_calls)
+                (request,) = invocation.read_services["knowledge"].calls
+                self.assertEqual(request.question, question)
+                self.assertEqual(request.context_entries, ())
+                self.assertEqual(invocation.replies[-1][1], {"thread": True})
+
+    def test_named_copywriting_keeps_its_existing_thread_context(self) -> None:
+        # 이름이 등장해도 문구 편집 요청은 과거 기록 질문으로 바꾸지 않는다.
+        slack = Mock()
+        slack.conversations_replies.return_value = {"messages": [{"ts": "1785311999.000001",
+            "user": "U1", "text": "생일 축하해 디디"}]}
+        with patch.object(team_chat_context, "TEAM_MEMBER_PROFILES",
+                ({"name": "디디", "aliases": ("DD",), "user_id": "UDD"},)):
+            invocation = self._invoke_mention(question="디디 생일축하 문구 다듬어줘", read_stage="knowledge",
+                read_result=_result("company_freeform"), slack_client=slack, use_real_context_loader=True)
+        invocation.context_loader.assert_called_once()
+        slack.conversations_replies.assert_called_once()
+        (request,) = invocation.read_services["knowledge"].calls
+        self.assertEqual(request.context_entries[0]["text"], "생일 축하해 디디")
+
+    def test_named_fun_copywriting_keeps_the_fun_handler(self) -> None:
+        # fun의 문구 작성은 사람 이름 때문에 DB 기록 조회로 선점하지 않는다.
+        with patch.object(company, "handle_fun_message") as fun, patch.object(team_chat_context,
+                "TEAM_MEMBER_PROFILES", ({"name": "디디", "aliases": ("DD",), "user_id": "UDD"},)):
+            invocation = self._invoke_mention(question="모대 디디 생일축하 문구 다듬어줘",
+                raw_text="모대 디디 생일축하 문구 다듬어줘", channel_id="C0621TL2HSB", message_event=True)
+        fun.assert_called_once()
+        self.assertFalse(any(service.calls for service in invocation.read_services.values()))
+
+    def test_explicit_operation_preserves_its_required_thread_context(self) -> None:
+        # 기록 언급이 섞여도 명시 장비 operation은 기존의 필요한 스레드 문맥을 유지한다.
+        slack = Mock()
+        slack.conversations_replies.return_value = {"messages": [{"ts": "1785311999.000001",
+            "user": "U1", "text": "이 장비를 업데이트하기로 했어"}]}
+        invocation = self._invoke_mention(question="어제 대화에서 정한 장비 업데이트를 실행해줘",
+            operation_route="device_box_update", operation_stage="device",
+            operation_result=_result("device_box_update"), slack_client=slack, use_real_context_loader=True)
+        invocation.context_loader.assert_called_once()
+        slack.conversations_replies.assert_called_once()
+        (request,) = invocation.operation_service.progress_calls
+        self.assertEqual(request.context_entries[0]["text"], "이 장비를 업데이트하기로 했어")
 
     def test_operation_receipt_failure_keeps_slack_delivery_success(self) -> None:
         invocation = self._invoke_mention(

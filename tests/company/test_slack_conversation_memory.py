@@ -43,7 +43,7 @@ def request():
 class Api:
     def __init__(self):
         self.calls = []
-        self.retrieval = {"retrievalId": "retrieval1", "sources": []}
+        self.retrieval = {"retrievalId": "retrieval1", "sources": [], "storedOnly": True}
 
     def call(self, path, payload):
         self.calls.append((path, payload))
@@ -93,48 +93,36 @@ def bridge(slack=None):
     return memory
 
 
-class SlackLiveContextTransportTests(unittest.TestCase):
-    def prepare(self, live):
+class SlackStoredContextTransportTests(unittest.TestCase):
+    def prepare(self, candidates):
         memory = bridge(object())
         context = {"workspaceId": "T1", "actorId": "UA", "channelId": "C1",
                    "threadTs": ROOT, "currentMessageTs": NOW,
                    "channelKind": "private_channel", "triggerKind": "app_mention"}
         value = replace(request(), question="오늘 UB가 한 말 요약", memory_context=context)
+        memory.api.retrieval["sources"] = candidates
         memory.api.retrieval["liveQuery"] = {"tenantId": "T1", "actorId": "UA", "channelId": "C1",
             "requestId": value.request_id, "question": value.question, "beforeTs": NOW, "authorIds": ["UB"]}
-        with patch("boxer_company_adapter_slack.private_live_retrieval.collect_private_live_sources", return_value=live) as collect:
+        with patch.object(memory, "verify_sources", side_effect=AssertionError("일반 질문은 Slack 원문을 다시 읽지 않는다")) as verify:
             prepared = memory.prepare(value)
-        return memory, prepared, collect
+        return memory, prepared, verify
 
-    def test_context_rows_follow_the_same_bound_live_upload_without_capture(self):
-        # 타인 부모의 원문도 별도 저장 경로 없이 원 요청의 live lease로만 전달한다.
-        anchor = {"channelId": "C1", "channelKind": "private_channel", "threadTs": ROOT,
-                  "messageTs": NOW, "authorId": "UB", "text": "첫 번째로 하자",
-                  "revisionHash": source_revision("첫 번째로 하자"), "editedAt": "",
-                  "permalink": "https://unit.slack.com/archives/C1/p" + NOW.replace(".", "")}
-        context = {**anchor, "messageTs": ROOT, "authorId": "UA", "text": "제목을 고를까?",
-                   "revisionHash": source_revision("제목을 고를까?"), "anchorMessageTs": NOW,
-                   "relation": "thread_parent",
-                   "permalink": "https://unit.slack.com/archives/C1/p" + ROOT.replace(".", "")}
-        memory, prepared, collect = self.prepare({"sources": [anchor], "contextMessages": [context],
-            "coverage": "partial", "channelCount": 1})
+    def test_stored_source_candidates_bind_without_reading_or_uploading_slack_context(self):
+        # 저장된 출처가 있어도 일반 조회는 새 부모·댓글 원문을 수집하거나 전송하지 않는다.
+        source = {"sourceId": "src_stored", "channelId": "C1", "channelKind": "private_channel",
+                  "threadTs": ROOT, "messageTs": NOW, "revisionHash": source_revision("첫 번째로 하자")}
+        memory, prepared, verify = self.prepare([source])
         self.assertEqual(prepared.memory_context["retrievalId"], "retrieval1")
-        self.assertEqual(collect.call_args.kwargs["destination_channel_id"], "C1")
-        self.assertEqual(collect.call_args.kwargs["destination_channel_kind"], "private_channel")
-        uploads = [(path, body) for path, body in memory.api.calls if path.endswith("/live")]
-        self.assertEqual(len(uploads), 1)
-        path, body = uploads[0]
-        self.assertTrue(path.endswith("/retrievals/retrieval1/live"))
-        self.assertEqual(body["sources"], [anchor])
-        self.assertEqual(body["contextMessages"], [context])
-        self.assertEqual((body["tenantId"], body["actorId"], body["channelId"], body["requestId"]),
-                         ("T1", "UA", "C1", "request1"))
-        self.assertFalse(any(path.endswith("/captures") or path.endswith("/chunks") for path, _ in memory.api.calls))
+        self.assertNotIn("verifications", prepared.memory_context)
+        verify.assert_not_called()
+        self.assertEqual([path for path, _ in memory.api.calls], ["/internal/v1/memory/retrievals"])
 
-    def test_legacy_collector_without_context_rows_keeps_the_original_http_shape(self):
-        memory, _, _ = self.prepare({"sources": [], "coverage": "complete", "channelCount": 1})
-        body = next(body for path, body in memory.api.calls if path.endswith("/live"))
-        self.assertNotIn("contextMessages", body)
+    def test_empty_stored_result_does_not_fall_back_to_slack_collection(self):
+        # 저장된 결과가 없으면 예전 liveQuery가 남아 있어도 Slack에서 보충하지 않는다.
+        memory, prepared, verify = self.prepare([])
+        self.assertEqual(prepared.memory_context["retrievalId"], "retrieval1")
+        verify.assert_not_called()
+        self.assertEqual([path for path, _ in memory.api.calls], ["/internal/v1/memory/retrievals"])
 
 
 class SlackConversationMemoryTests(unittest.TestCase):

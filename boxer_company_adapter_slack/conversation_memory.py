@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
-from boxer_company.memory.access import can_query_private_live_sources, can_read_memory_source, is_private_memory_hub
+from boxer_company.memory.access import can_read_memory_source
 from boxer_company.memory.contracts import MAX_CHUNK_CHARS, canonical_digest, source_revision
 from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
 from boxer_company.memory.commands import parse_memory_command
@@ -214,42 +214,16 @@ class SlackConversationMemory:
             if not isinstance(retrieval_id, str) or not isinstance(candidates, list):
                 return request
             context["retrievalId"] = retrieval_id
+            if not manage:
+                # 일반 질문은 서버가 저장 DB에서 확정한 후보만 사용하며 Slack 원문을 다시 읽지 않는다.
+                if result.get("storedOnly") is True:
+                    return replace(request, memory_context=context)
+                return request
+            # 기억 관리 명령의 정정·삭제 대상은 기존 원문 revision 확인 경계를 유지한다.
             context["verifications"] = self.verify_sources(
                 candidates, channel_id=context["channelId"], tenant_id=request.tenant_id,
                 actor_id=request.actor_id,
             )
-            plan = result.get("liveQuery")
-            if isinstance(plan, Mapping) and can_query_private_live_sources(
-                    request.tenant_id, context["channelId"], context.get("channelKind")):
-                try:
-                    from boxer_company_adapter_slack.private_live_retrieval import collect_private_live_sources
-
-                    # 서버 발행 범위가 이 turn과 정확히 일치할 때만 고정 Slack 읽기 API를 호출한다.
-                    expected = {"tenantId": request.tenant_id, "actorId": request.actor_id,
-                                "channelId": context["channelId"], "requestId": request.request_id,
-                                "question": request.question, "beforeTs": context["currentMessageTs"]}
-                    authors = plan.get("authorIds")
-                    if any(plan.get(key) != value for key, value in expected.items()) or not isinstance(authors, list):
-                        raise ValueError("live_query_scope_invalid")
-                    live = collect_private_live_sources(client_factory=self._bounded_client,
-                        tenant_id=request.tenant_id, destination_channel_id=context["channelId"],
-                        actor_id=str(request.actor_id or ""), question=request.question,
-                        author_ids=authors, before_ts=context["currentMessageTs"],
-                        is_allowed=self.is_allowed, clock=self.clock,
-                        destination_channel_kind=context.get("channelKind"))
-                    live_payload = {
-                        "tenantId": request.tenant_id, "actorId": request.actor_id,
-                        "channelId": context["channelId"], "requestId": request.request_id,
-                        "sources": live["sources"], "coverage": live["coverage"],
-                        "channelCount": live["channelCount"],
-                    }
-                    # 부모·주변 발언도 원 요청의 같은 단기 lease로만 보내고 별도로 저장하지 않는다.
-                    if live.get("contextMessages"):
-                        live_payload["contextMessages"] = live["contextMessages"]
-                    self.api.call(_PREFIX + "/retrievals/" + retrieval_id + "/live", live_payload)
-                except Exception as exc:
-                    # 실시간 읽기 실패도 저장 기억 검증과 일반 답변을 버리지 않는다.
-                    self._failure("live_retrieval", exc)
             return replace(request, memory_context=context)
         except Exception as exc:
             self._failure("prepare", exc)

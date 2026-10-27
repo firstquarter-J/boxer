@@ -1,4 +1,4 @@
-"""API와 Slack이 같은 질문에만 비공개 원문 조회를 실행한다."""
+"""대화 질문의 날짜 범위를 해석하고 저장 기록의 지원 시작일을 검사한다."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 _TIMESTAMP = re.compile(r"[0-9]{1,20}\.[0-9]{1,9}")
 # 날짜 양옆의 단어 경계를 지켜 버전, 기기 번호, 오늘날 같은 일반 문구를 날짜로 읽지 않는다.
 _TOKEN_START = r"(?:(?<![가-힣a-z0-9_./-])|(?<=부터))"
-_TOKEN_END = r"(?=(?:부터|까지)|(?:은|는|이|가|을|를|의|도|만|에|엔|과|와|랑)?(?![가-힣a-z0-9_./-]))"
+_TOKEN_END = r"(?=(?:부터|까지|이전|이후)|(?:은|는|이|가|을|를|의|도|만|에|엔|과|와|랑)?(?![가-힣a-z0-9_./-]))"
 _EXPRESSION = re.compile(
     _TOKEN_START + r"(?:"
     r"(?P<numeric>[0-9]{4}[-./][0-9]{1,3}[-./][0-9]{1,3})|"
@@ -28,6 +28,10 @@ _EXPRESSION = re.compile(
 _SHORT_RANGE_END = re.compile(r"\s*(?:~|부터)\s*(?P<day>[0-9]{1,3})\s*일" + _TOKEN_END)
 _RANGE_JOIN = re.compile(r"\s*(?:~|부터)\s*")
 _OPEN_RANGE = re.compile(r"\s*(?:~|부터|까지)")
+# '2026년이전대화'처럼 붙여 쓴 날짜 방향도 같은 과거 범위로 판정한다.
+_DATE_DIRECTION = re.compile(r"\s*(이전|이후|전|후)(?:까지|부터)?(?:의|에|도|만|과|와)?(?=$|[^가-힣a-z0-9_./-]|대화|발언|기록|얘기|이야기|한\s*말)")
+_DIRECTION_WORD = re.compile(r"(?<![가-힣a-z0-9_./-])(?:이전|이후|전|후)(?:까지|부터)?(?:의|에|도|만|과|와)?(?![가-힣a-z0-9_./-])")
+_SINCE_RANGE = re.compile(r"\s*부터(?:\s*(?:지금|현재)\s*까지)?(?=$|[\s?!.,])")
 _BOUNDARY_TIMESTAMP = re.compile(r"-?[0-9]{1,20}\.[0-9]{1,9}")
 _UNITLESS_RANGE = re.compile(r"(?<![a-z0-9_./-])[0-9]+\s*~\s*[0-9]+\s*(?:월|일)")
 _RELATIVE_LABEL = r"오늘|어제|그제|올해|작년|이번\s*달|지난\s*달|이번\s*주|지난\s*주"
@@ -37,6 +41,8 @@ _CONNECTED_RELATIVES = re.compile(
 )
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _KST = ZoneInfo("Asia/Seoul")
+# 날짜 해석 자체는 일반형으로 두고 저장된 대화의 지원 하한만 공통으로 검사한다.
+STORED_HISTORY_START_TS = "1767193200.000000"
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,18 @@ def _analyze_live_query_period(question: str, before_ts: str) -> tuple[dict[str,
             if short:
                 start = first.start.replace(day=int(short.group("day")))
                 expressions.append(_DateExpression(short.start("day"), short.end(), start, start + timedelta(days=1), "date"))
+        directions = [_DATE_DIRECTION.match(text, item.last) for item in expressions]
+        if any(directions):
+            # '2026년 이전'을 2026년 한 해로 오독하지 않는다. 시작 없는 과거 범위는
+            # 저장 지원 하한으로 잘라낼 수 없으며 여러 날짜나 방향이 섞이면 먼저 닫는다.
+            if len(expressions) != 1:
+                return None, "ambiguous"
+            direction = directions[0]
+            if _DIRECTION_WORD.search(text[direction.end():]):
+                return None, "ambiguous"
+            return None, "unbounded_past" if direction.group(1) in {"이전", "전"} else "invalid"
+        if any(re.match(r"\s*(?:이전|이후)", text[item.last:]) for item in expressions):
+            return None, "invalid"
         if len(expressions) == 2 and _RANGE_JOIN.fullmatch(text[expressions[0].last:expressions[1].first]):
             first, last = expressions
             if first.start > last.start:
@@ -132,9 +150,16 @@ def _analyze_live_query_period(question: str, before_ts: str) -> tuple[dict[str,
             if len({(item.start, item.end) for item in expressions}) != 1:
                 return None, "ambiguous"
             first = expressions[0]
-            if _OPEN_RANGE.match(text, first.last):
+            since = _SINCE_RANGE.match(text, first.last) if len(expressions) == 1 else None
+            if since:
+                if _DIRECTION_WORD.search(text[since.end():]):
+                    return None, "ambiguous"
+                # 종료일을 생략한 '부터'는 질문일까지 열되 실제 발언은 원 질문 cutoff까지만 받는다.
+                start, end, kind = first.start, day + timedelta(days=1), "range"
+            elif _OPEN_RANGE.match(text, first.last):
                 return None, "invalid"
-            start, end, kind = first.start, first.end, first.kind
+            else:
+                start, end, kind = first.start, first.end, first.kind
         if start > asked_at:
             return None, "future"
     except (ValueError, OverflowError):
@@ -158,6 +183,17 @@ def live_query_period_error(question: str, before_ts: str) -> str | None:
     return _analyze_live_query_period(question, before_ts)[1]
 
 
+def is_supported_stored_period(period: Mapping[str, str] | None) -> bool:
+    """2026년 KST 시작 이전을 포함하는 기간은 일부만 잘라 조회하지 않고 거절한다."""
+    if not isinstance(period, Mapping):
+        return False
+    values = (period.get("startTs"), period.get("endTs"))
+    if any(not isinstance(value, str) or _BOUNDARY_TIMESTAMP.fullmatch(value) is None for value in values):
+        return False
+    start, end = (Decimal(value) for value in values)
+    return Decimal(STORED_HISTORY_START_TS) <= start < end
+
+
 def strip_live_query_period(question: str, before_ts: str) -> str:
     """유효한 기간 문구만 빼서 날짜 숫자가 원문 검색어로 남지 않게 한다."""
     if resolve_live_query_period(question, before_ts) is None:
@@ -170,6 +206,10 @@ def strip_live_query_period(question: str, before_ts: str) -> str:
         short = _SHORT_RANGE_END.match(text, matches[0].end())
         if short:
             spans = [(matches[0].start(), short.end())]
+        else:
+            since = _SINCE_RANGE.match(text, matches[0].end())
+            if since:
+                spans = [(matches[0].start(), since.end())]
     elif len(matches) == 2 and _RANGE_JOIN.fullmatch(text[matches[0].end():matches[1].start()]):
         spans = [(matches[0].start(), matches[1].end())]
     # 날짜 바로 뒤의 조사만 함께 제거하며 일반 본문, 버전과 제품 숫자는 그대로 둔다.
@@ -200,3 +240,44 @@ def wants_private_live_sources(question: str, author_ids: Sequence[str] = ()) ->
     )
     query = re.search(r"최근|요즘|요새|방금|오늘|어제|지난|마지막|조회|검색|찾|보여|알려|뭐|무슨|어떤|있", text)
     return bool(reference and (query or _EXPRESSION.search(text)))
+
+
+def wants_stored_history_sources(question: str, author_ids: Sequence[str] = ()) -> bool:
+    """기록이나 사람의 저장 사실을 묻는 질문만 고르고 이름이 들어간 일반 요청은 유지한다."""
+    if not isinstance(question, str):
+        return False
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", question).casefold())
+    # 현재 초안의 편집이나 창작 요청은 의문형으로 끝나도 저장 사실 조회로 바꾸지 않는다.
+    if re.search(
+        r"(?:(?:다듬어|고쳐|수정해|편집해|번역해|바꿔|줄여|늘려|써|작성해|만들어|놀려)"
+        r"(?:줘|주라|줄래|줄까|줄수있어|줄수있을까)|"
+        r"(?:다듬을|고칠|수정할|편집할|번역할|바꿀|줄일|늘릴|쓸|작성할|만들|놀릴)까)[?!.。！？]*$", text,
+    ):
+        return False
+    reference = re.search(r"슬랙|slack|대화|발언|얘기|이야기|(?:한|했던|하던|무슨)말", text)
+    lookup = re.search(
+        r"(?:(?:요약|정리|조회|검색|확인)(?:해(?:줘|줄래|줄수있어|줄수있을까)?|부탁해)?|"
+        r"(?:찾아|보여|알려)(?:줘|주라|줄래|줄수있어|줄수있을까|봐))[?!.。！？]*$", text,
+    )
+    # '대화하며 행운을 찾아보세요' 같은 서술은 조회 요청이 아니다. 조회 동사나
+    # 실제 의문형 발언 표현을 요구해 원문 편집과 팀 fun 문맥을 잘못 지우지 않는다.
+    spoken_question = re.search(
+        r"(?:뭐랬(?:어|지|니)|뭐라고(?:말)?했(?:어|지|니)|"
+        r"(?:무슨|어떤)(?:말|얘기|이야기).{0,20}(?:했|했었|하던)(?:어|지|니|는지)|"
+        r"(?:말|얘기|이야기)했(?:어|지|니))[?!.。！？]*$", text,
+    )
+    interrogative = re.search(r"뭐|무엇|무슨|어떤|누가|언제|어디|어떻게", text)
+    question_ending = re.search(r"(?:야|어|지|니|까|나요|예요|인지)[?!.。！？]*$|[?？]$", text)
+    explicit_question = interrogative and question_ending
+    # 날짜와 기록 이름만 적은 짧은 검색도 문장형 질문과 같은 DB 조회로 취급한다.
+    record_fragment = re.search(r"(?:(?:한|했던|하던)말|발언|대화)(?:기록|목록|내역)?[?!.。！？]*$", text)
+    if reference and (lookup or spoken_question or explicit_question or record_fragment):
+        return True
+    if not any(author_ids):
+        return False
+    if spoken_question:
+        return True
+    # 사람 이름만으로는 조회하지 않는다. 실제 저장 사실을 묻는 대상과 의문형이 함께 있어야 한다.
+    person_fact = re.search(r"사람|성격|성향|취향|선호|좋아하|싫어하|관심사|생일|입사|담당|직무|역할|업무", text)
+    about_person = re.search(r"에대해|에관해", text)
+    return bool((person_fact and (lookup or explicit_question)) or (about_person and lookup))

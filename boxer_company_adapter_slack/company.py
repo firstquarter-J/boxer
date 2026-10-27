@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import logging
 import os
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,6 +26,9 @@ from boxer_adapter_slack.context import (
     load_slack_thread_context_entries,
 )
 from boxer_company import settings as cs
+from boxer_company.memory.conversation_count import parse_conversation_count_query
+from boxer_company.memory.live_query import wants_stored_history_sources
+from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company.transport_contracts import (
     DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
     DEVICE_FILE_DOWNLOAD_ROUTE,
@@ -139,6 +143,21 @@ from boxer_company_adapter_slack.weekly_recordings_reporter import (
 _PROGRESS_OPERATION_ROUTES = frozenset(
     {"device_box_update", "device_agent_update", "device_power_off"}
 )
+
+
+def _is_stored_conversation_question(question: str, current_ts: str) -> bool:
+    from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
+
+    # 표시명은 신뢰하지 않고 API와 같은 멘션 ID·등록 별칭 경계로 사람 대상을 고른다.
+    mentioned = set(re.findall(r"<@([A-Z0-9]+)(?:\|[^<>]+)?>", question))
+    alias_question = re.sub(r"<@[^<>]*>", " ", question)
+    for profile in TEAM_MEMBER_PROFILES:
+        aliases = (str(profile.get("name") or ""), *profile.get("aliases", ()))
+        if matches_team_member_alias(alias_question, aliases):
+            mentioned.add(str(profile.get("user_id") or ""))
+    # 집계와 과거 대화 질문은 저장 DB만 사용하고 현재 스레드 원문도 새로 읽지 않는다.
+    return (parse_conversation_count_query(question, current_ts) is not None
+            or wants_stored_history_sources(question, tuple(mentioned - {""})))
 
 
 def _require_transport_only_remote_settings() -> None:
@@ -542,9 +561,12 @@ def create_app() -> App:
             return
 
         context_entries: tuple[ContextEntry, ...] | None = None
+        stored_conversation_question = False
 
         def get_context_entries() -> tuple[ContextEntry, ...]:
             nonlocal context_entries
+            if stored_conversation_question:
+                return ()
             if context_entries is None:
                 context_entries = tuple(
                     load_slack_thread_context_entries(
@@ -568,6 +590,8 @@ def create_app() -> App:
         operation_route = match_company_operation_route(
             operation_probe_request
         )
+        # 명시 operation의 필요한 스레드 문맥은 유지하고 일반 대화 기록 조회만 분리한다.
+        stored_conversation_question = operation_route is None and _is_stored_conversation_question(question, current_ts)
         operation_stage = (
             company_operation_legacy_stage(operation_probe_request)
             if operation_route is not None
@@ -932,7 +956,7 @@ def create_app() -> App:
             return True
 
         def handle_diagnostic_probe() -> bool:
-            if not question:
+            if not question or stored_conversation_question:
                 return False
             digest = hashlib.sha256(
                 operation_probe_request.request_id.encode("utf-8")
@@ -1093,6 +1117,18 @@ def create_app() -> App:
             _set_request_log_route(payload, "base_access")
             _set_request_log_status(payload, "denied")
             reply(BASE_ACCESS_DENIED_REPLY, thread=True)
+            return
+        if is_human_fun_trigger(payload) and _is_stored_conversation_question(
+                str(payload.get("raw_text") or ""), str(payload.get("current_ts") or "")):
+            # fun 호출어가 있어도 대화 기록 질문은 fun의 Slack 스레드 수집 전에 DB 경로로 보낸다.
+            request_payload = dict(payload)
+            request_payload["question"] = str(payload.get("raw_text") or "").strip()
+            request_payload["text"] = request_payload["question"]
+
+            def reply_stored(text: str, **_kwargs: Any) -> None:
+                reply(text, thread=True)
+
+            _handle_company_mention(request_payload, reply_stored, client, logger)
             return
         handle_fun_message(
             payload,

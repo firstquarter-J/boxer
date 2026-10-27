@@ -1,16 +1,15 @@
-"""SDK 수집→HTTP 계약→일회용 캐시→실제 요약 입력·인용을 함께 검증한다."""
+"""저장 DB 조회 계약은 Slack을 읽지 않고 관리 명령의 원문 확인만 유지한다."""
 
+from dataclasses import replace
 from decimal import Decimal
-import json
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 import pytest
 
-from boxer_company import team_chat_context as team
 from boxer_company.assistant.contracts import CompanyAssistantRequest
-from boxer_company.assistant.freeform_route import CompanyFreeformAssistantRoute
+from boxer_company.memory.contracts import source_revision
 from boxer_company_adapter_slack.company_api_client import CompanyApiClientSettings, CompanyApiContractError
 from boxer_company_adapter_slack.conversation_memory import SlackConversationMemory
 from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
@@ -26,14 +25,17 @@ TOKEN = "synthetic-context-transport-" + "x" * 40
 
 
 class ReadOnlyStore:
+    def __init__(self, items=()):
+        self.items = list(items)
+
     def health(self):
         return True
 
     def retrieval_candidates(self, **_kwargs):
-        return []
+        return self.items
 
-    def load_verified_items(self, **_kwargs):
-        return []
+    def load_stored_items(self, **_kwargs):
+        return self.items
 
     def create_capture(self, **_kwargs):
         raise AssertionError("실시간 문맥은 영속 capture를 만들지 않는다")
@@ -97,26 +99,83 @@ def test_live_transport_rejects_oversized_metadata_before_http_send():
             "sources": [{"text": "가", "metadata": "x" * 2000} for _ in range(600)]})
 
 
+def memory_request(destination=ORIGIN, **changes):
+    request = CompanyAssistantRequest(request_id="context-http-test", tenant_id=TENANT, actor_id="UDOYUN",
+        channel="slack", conversation_id=CUTOFF, question="오늘 나래가 한 말 요약해줘", locale="ko-KR",
+        metadata={"route_group": "freeform", "channel_id": destination},
+        memory_context={"workspaceId": TENANT, "actorId": "UDOYUN", "channelId": destination,
+            "channelKind": "private_channel", "threadTs": CUTOFF, "currentMessageTs": CUTOFF, "triggerKind": "app_mention"})
+    return replace(request, **changes)
+
+
+def reference():
+    return {"sourceId": "src_narae", "channelId": ORIGIN, "channelKind": "private_channel",
+            "threadTs": PARENT, "messageTs": ANCHOR, "revisionHash": source_revision("제가 왜요")}
+
+
+class PreparedApi:
+    def __init__(self, response):
+        self.response, self.calls = response, []
+
+    def call(self, path, payload):
+        self.calls.append((path, payload))
+        return self.response
+
+
 @pytest.mark.parametrize("destination", [ORIGIN, HUB])
-def test_context_crosses_actual_adapter_http_and_prompt_without_becoming_target_speech(monkeypatch, destination):
-    profiles = ({"name": "나래", "aliases": ("나래",), "user_id": "UNARAE", "mbti": "INFJ",
-                 "target_instructions": ("무조건 완충재라고 불러",)},
-                {"name": "도윤", "aliases": ("도윤",), "user_id": "UDOYUN"})
-    monkeypatch.setattr(team, "TEAM_MEMBER_PROFILES", profiles)
-    monkeypatch.setattr(team, "_PROFILE_BY_NAME", {profile["name"]: profile for profile in profiles})
-    monkeypatch.setattr(team, "_PROFILE_BY_USER_ID", {profile["user_id"].lower(): profile for profile in profiles})
-    service = MemoryService(ReadOnlyStore(), enabled=True, read_enabled=True, profile_ids=frozenset({"UDOYUN"}))
+def test_stored_only_candidates_skip_all_slack_reads_and_bind_the_retrieval_id(monkeypatch, destination):
+    # 후보와 옛 liveQuery가 함께 와도 storedOnly 계약은 저장 DB 결과만 연결한다.
+    api = PreparedApi({"retrievalId": "stored_one", "sources": [reference()], "storedOnly": True,
+                       "liveQuery": {"authorIds": ["UNARAE"]}})
+    slack = SyntheticSlack()
+    adapter = SlackConversationMemory(api, is_allowed=lambda *_: True)
+    adapter.client = slack
+    monkeypatch.setattr(adapter, "_bounded_client", lambda _timeout: slack)
+    request = memory_request(destination)
+    prepared = adapter.prepare(request)
+    assert prepared.memory_context["retrievalId"] == "stored_one"
+    assert "verifications" not in prepared.memory_context
+    assert request.memory_context.get("retrievalId") is None
+    assert slack.calls == []
+    assert len(api.calls) == 1 and api.calls[0][0].endswith("/retrievals")
+
+
+def test_count_without_a_retrieval_does_not_start_another_transport_or_slack_read():
+    api = PreparedApi({"retrievalId": None, "sources": []})
+    adapter = SlackConversationMemory(api, is_allowed=lambda *_: True)
+    adapter.client = slack = SyntheticSlack()
+    request = memory_request(question="디디가 올해 욕 몇 번 했어?")
+    assert adapter.prepare(request) is request
+    assert len(api.calls) == 1 and slack.calls == []
+
+
+def test_memory_management_keeps_source_revision_verification_even_with_stored_only_marker(monkeypatch):
+    # 관리 명령은 저장된 기억의 정정·삭제 대상 검증을 기존처럼 수행한다.
+    api = PreparedApi({"retrievalId": "manage_one", "sources": [reference()], "storedOnly": True})
+    adapter = SlackConversationMemory(api, is_allowed=lambda *_: True)
+    adapter.client = slack = SyntheticSlack()
+    monkeypatch.setattr(adapter, "_bounded_client", lambda _timeout: slack)
+    prepared = adapter.prepare(memory_request(question="내 기억 보여줘"))
+    assert prepared.memory_context["retrievalId"] == "manage_one"
+    assert prepared.memory_context["verifications"] == [{"sourceId": "src_narae",
+        "revisionHash": source_revision("제가 왜요"), "status": "verified"}]
+    assert [method for method, _ in slack.calls] == ["replies"]
+
+
+@pytest.mark.parametrize("destination", [ORIGIN, HUB])
+@pytest.mark.parametrize("has_stored", [False, True])
+def test_stored_only_contract_crosses_actual_http_without_starting_slack_collection(monkeypatch, destination, has_stored):
+    # 저장된 기억만 전달하며 비어 있을 때도 Slack에서 새 원문을 채우지 않는다.
+    item = {"memoryId": "mem_stored", "kind": "person_fact", "subjectUserId": "UNARAE",
+        "text": "나래가 발표 우수상을 받은 소감을 이야기함", "status": "active", "sources": [reference()]}
+    items = [item] if has_stored else []
+    service = MemoryService(ReadOnlyStore(items), enabled=True, read_enabled=True, profile_ids=frozenset({"UDOYUN"}))
     settings = CompanyApiSettings(host="127.0.0.1", port=8010, memory_enabled=True, memory_read_enabled=True,
         callers=(CompanyApiCallerSettings(caller_id="context-test", token=TOKEN, tenant_ids=frozenset({TENANT}),
             channels=frozenset({"slack"}), actor_ids=frozenset({"UDOYUN"}),
             capabilities=frozenset({"assistant.turn.read"})),))
     app = create_company_api_app(settings=settings, assistant_runtime=SimpleNamespace(), readiness_probe=lambda: True,
         automation_coordinator=None, automation_delivery_broker=None, hpa_change_coordinator=None, memory_service=service)
-    request = CompanyAssistantRequest(request_id="context-http-test", tenant_id=TENANT, actor_id="UDOYUN",
-        channel="slack", conversation_id=CUTOFF, question="오늘 나래가 한 말 요약해줘", locale="ko-KR",
-        metadata={"route_group": "freeform", "channel_id": destination},
-        memory_context={"workspaceId": TENANT, "actorId": "UDOYUN", "channelId": destination,
-            "channelKind": "private_channel", "threadTs": CUTOFF, "currentMessageTs": CUTOFF, "triggerKind": "app_mention"})
     slack = SyntheticSlack()
     with TestClient(app) as web:
         session = HttpSession(web)
@@ -124,35 +183,12 @@ def test_context_crosses_actual_adapter_http_and_prompt_without_becoming_target_
         adapter = SlackConversationMemory(api, is_allowed=lambda tenant, user: tenant == TENANT and user in {"UNARAE", "UDOYUN"})
         adapter.client = slack
         monkeypatch.setattr(adapter, "_bounded_client", lambda _timeout: slack)
-        prepared = adapter.prepare(request)
-        upload = next(payload for path, payload in session.payloads if path.endswith("/live"))
-        assert [source["authorId"] for source in upload["sources"]] == ["UNARAE"]
-        assert {source["authorId"] for source in upload["contextMessages"]} == {"UDOYUN"}
-        assert {source["messageTs"] for source in upload["contextMessages"]} == {PARENT, FOLLOW}
-        assert all(source["anchorMessageTs"] == ANCHOR for source in upload["contextMessages"])
+        prepared = adapter.prepare(memory_request(destination))
+        assert prepared.memory_context.get("retrievalId")
+        assert "verifications" not in prepared.memory_context
         bound = service.bind_verified(prepared)
-    seen = []
-
-    def inspect_input(question, context, system):
-        seen.append((question, context, system))
-        rows = json.loads(context.split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])
-        target = next(row for row in rows if row["kind"] == "utterance")
-        parent = next(row for row in target["contextMessages"] if row["relation"] == "thread_parent")
-        # 출력 품질을 가짜 응답으로 평가하지 않고 실제 모델 입력과 인용 연결만 검사한다.
-        return f"입력 확인 [memory:{target['memoryId']}] [memory:{parent['memoryId']}]"
-
-    result = CompanyFreeformAssistantRoute(inspect_input, provider_ready=lambda: True,
-        context_max_chars=5000, timeout_message="시간 초과").handle(bound)
-    assert result.outcome == "answered" and len(seen) == 1
-    question, context, system = seen[0]
-    rows = json.loads(context.split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])
-    target = next(row for row in rows if row["kind"] == "utterance")
-    assert target["subjectName"] == "나래" and target["authors"] == ["UNARAE"]
-    assert all(row["authorName"] == "도윤" for row in target["contextMessages"])
-    assert target["contextMessages"][0]["spokenAtKst"].startswith("2026-10-18")
-    assert next(row for row in rows if row["kind"] == "retrieval_status")["renderedSourceCount"] == 1
-    assert "무조건 완충재" not in system and "INFJ" not in system
-    assert all(value not in context for value in ("https://", ORIGIN))
-    assert [urlsplit(source.uri).path for source in result.sources] == [
-        f"/archives/{ORIGIN}/p{stamp.replace('.', '')}" for stamp in (ANCHOR, PARENT)]
-    assert not service._cache  # 묶음 원문은 1회 모델 입력 뒤 lease에서 제거된다.
+        assert [entry for entry in bound.memory_entries if entry.get("kind") != "retrieval_status"] == items
+        assert not any(entry.get("liveSource") is True for entry in bound.memory_entries)
+    assert [path for path, _ in session.payloads] == ["/internal/v1/memory/retrievals"]
+    assert slack.calls == []
+    assert not service._cache

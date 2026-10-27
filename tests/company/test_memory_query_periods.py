@@ -11,6 +11,7 @@ from boxer_company.memory.live_query import (
     resolve_live_query_period,
     strip_live_query_period,
     wants_private_live_sources,
+    wants_stored_history_sources,
 )
 
 KST = ZoneInfo("Asia/Seoul")
@@ -55,6 +56,12 @@ NOW = timestamp("2026-10-22T18:00:00+09:00", "123456789")
     ("10월 1일 ~ 10월 15일 발언", "2026-10-01", "2026-10-16", "range"),
     ("2025년12월부터2026년1월까지", "2025-12-01", "2026-02-01", "range"),
     ("어제부터오늘까지 대화", "2026-10-21", "2026-10-23", "range"),
+    ("2026년부터 대화", "2026-01-01", "2026-10-23", "range"),
+    ("2026년1월부터지금까지 대화", "2026-01-01", "2026-10-23", "range"),
+    ("2026년1월1일부터현재까지 발언", "2026-01-01", "2026-10-23", "range"),
+    ("2025년부터 지금까지 대화", "2025-01-01", "2026-10-23", "range"),
+    ("10월1일부터 현재까지 발언", "2026-10-01", "2026-10-23", "range"),
+    ("어제부터 대화", "2026-10-21", "2026-10-23", "range"),
 ])
 def test_calendar_periods_use_kst_midnights_and_inclusive_range_end(question, start, end, kind):
     period = resolve_live_query_period(question, NOW)
@@ -106,6 +113,21 @@ def test_recent_days_include_today_and_use_bounded_calendar_days(count, prefix):
     ("11월 발언", "future"),
     ("10월23일 발언", "future"),
     ("2026-11-01~2026-11-02 발언", "future"),
+    ("2027년부터지금까지 대화", "future"),
+    ("2026년 이전 대화", "unbounded_past"),
+    ("2026년1월1일 이전 대화", "unbounded_past"),
+    ("2025년 이전 대화", "unbounded_past"),
+    ("2026년 10월 이전 대화", "unbounded_past"),
+    ("2026년이전까지의 대화", "unbounded_past"),
+    ("2026년 전 대화", "unbounded_past"),
+    ("2027년 이전 대화", "unbounded_past"),
+    ("2026년 이후 대화", "invalid"),
+    ("2026년이전이후 대화", "invalid"),
+    ("2025년부터2026년 이전 대화", "ambiguous"),
+    ("2026년 이전과 이후 대화", "ambiguous"),
+    ("2026년 이전 2026년 대화", "ambiguous"),
+    ("2026년부터 지금까지 9월 대화", "ambiguous"),
+    ("2026년부터 이전 대화", "ambiguous"),
 ])
 def test_invalid_conflicting_and_future_dates_cannot_fall_back_to_recent(question, error):
     assert resolve_live_query_period(question, NOW) is None
@@ -150,7 +172,7 @@ def test_yearless_february_uses_question_year_instead_of_most_recent_leap_year()
 
 
 def test_current_natural_periods_keep_future_end_but_never_include_future_messages():
-    for question in ("올해", "이번달", "이번주", "최근7일"):
+    for question in ("올해", "이번달", "이번주", "최근7일", "2026년부터", "2026년1월부터지금까지"):
         period = resolve_live_query_period(question, NOW)
         assert is_within_live_query_period(NOW, period)
         assert is_within_live_query_period(NOW[:-1] + "8", period)
@@ -178,6 +200,10 @@ def test_repeated_same_date_is_unambiguous_and_before_epoch_calendar_boundary_is
     ("2026-09-01 ~ 2026-09-30 대화", "대화"),
     ("오늘의 디디 발언", "디디 발언"),
     ("최근 7일 대화", "대화"),
+    ("2026년부터 대화", "대화"),
+    ("2026년1월부터지금까지 디디 발언", "디디 발언"),
+    ("2026년1월1일부터현재까지 발언", "발언"),
+    ("2026년 이전 대화", "2026년 이전 대화"),
     ("Straße 9월 대화", "strasse 대화"),
     ("İ 9월 대화", "i\u0307 대화"),
     ("오늘날씨 v12.22.1", "오늘날씨 v12.22.1"),
@@ -192,3 +218,62 @@ def test_explicit_date_and_conversation_reference_select_live_lookup_without_que
     assert wants_private_live_sources("9월 대화 요약")
     assert wants_private_live_sources("작년 디디 발언")
     assert not wants_private_live_sources("9월 모델 버전")
+
+
+@pytest.mark.parametrize("question,authors", [
+    ("디디가최근뭐랬어?", ("UDD",)),
+    ("디디가 최근 뭐랬어", ("UDD",)),
+    ("<@UDD|디디>가 최근 뭐랬어?", ("UDD",)),
+    ("모대야 디디가 최근 뭐랬어?", ("UDD",)),
+    ("디디는어떤사람이야?", ("UDD",)),
+    ("디디는 어떤 사람이야", ("UDD",)),
+    ("디디에 대해 알려줘", ("UDD",)),
+    ("디디 생일이 언제야?", ("UDD",)),
+    ("디디가 어떤 업무를 담당하는지 알려줘", ("UDD",)),
+    ("2026년이전대화요약해줘", ()),
+    ("디디가 2025년에 한 말", ("UDD",)),
+    ("디디가 2025년12월31일부터2026년1월1일까지 한 말", ("UDD",)),
+    ("작년 디디 발언", ("UDD",)),
+    ("오늘디디가한말요약", ()),
+    ("저번대화찾아줘", ()),
+    ("2025년에한말은뭐야", ()),
+    ("2025년에 한 말은 뭐야?", ()),
+    ("2025년 대화는 뭐였어", ()),
+    ("2025년 대화에서 어떤 결정이 있었는지", ()),
+    ("지난 대화에서 무슨 얘기 했어", ()),
+    ("슬랙 발언을 보여줄래?", ()),
+    ("어제 대화 정리", ()),
+    ("２０２６년 대화 요약해줘", ()),
+])
+def test_stored_history_intent_requires_actual_record_or_person_fact_lookup(question, authors):
+    assert wants_stored_history_sources(question, authors)
+
+
+@pytest.mark.parametrize("question,authors", [
+    ("디디생일축하문구를더짧게다듬어줘", ("UDD",)),
+    ("모대 디디 생일축하 문구 다듬어줘", ("UDD",)),
+    ("디디 생일축하 문구를 어떻게 다듬어줄래?", ("UDD",)),
+    ("디디 생일축하 문구를 어떻게 고칠까?", ("UDD",)),
+    ("디디에 대한 생일축하 문구 써줘", ("UDD",)),
+    ("디디가 한 말 더 짧게 다듬어줘", ("UDD",)),
+    ("디디 대화 문장을 어떻게 번역해줄래?", ("UDD",)),
+    ("모대디디놀려줘", ("UDD",)),
+    ("디디 안녕", ("UDD",)),
+    ("디디 오늘도 힘내", ("UDD",)),
+    ("1992년생오늘은대화하며행운을찾아보세요.", ()),
+    ("1992년생 오늘은 대화하며 행운을 찾아보세요.", ("UDD",)),
+    ("오늘 대화에서는 먼저 웃어보세요.", ()),
+    ("대화하며 행운을 찾는 하루가 될 거예요.", ()),
+    ("오늘 날씨 알려줘", ()),
+    ("2026년 모델 버전 알려줘", ()),
+    ("생일 축하 문구 다듬어줘", ()),
+    ("안녕", ()), ("", ()), (None, ()),
+])
+def test_names_editing_fun_and_declarative_fortunes_do_not_request_stored_history(question, authors):
+    assert not wants_stored_history_sources(question, authors)
+
+
+def test_stored_history_intent_does_not_change_the_legacy_live_matcher():
+    question = "디디 생일축하 문구 다듬어줘"
+    assert wants_private_live_sources(question, ("UDD",))
+    assert not wants_stored_history_sources(question, ("UDD",))

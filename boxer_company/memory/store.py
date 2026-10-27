@@ -891,8 +891,24 @@ class MemoryStore:
     def load_verified_items(self, *, tenant_id: str, channel_id: str, candidates: Sequence[Mapping[str, Any]],
                             verified_sources: Sequence[Mapping[str, Any]], limit: int = 8,
                             actor_id: str | None = None) -> list[dict[str, Any]]:
-        verified = {str(source.get("sourceId") or ""): str(source.get("revisionHash") or "") for source in verified_sources if source.get("status") == "verified"}
+        return self._load_items(tenant_id=tenant_id, channel_id=channel_id, candidates=candidates,
+                                verified_sources=verified_sources, limit=limit, actor_id=actor_id)
+
+    def load_stored_items(self, *, tenant_id: str, channel_id: str, candidates: Sequence[Mapping[str, Any]],
+                          limit: int = 8, actor_id: str | None = None) -> list[dict[str, Any]]:
+        """현재 DB의 저장 근거만 검증한다. Slack 현재 원문을 확인했다는 의미는 아니다."""
+        return self._load_items(tenant_id=tenant_id, channel_id=channel_id, candidates=candidates,
+                                verified_sources=None, limit=limit, actor_id=actor_id)
+
+    def _load_items(self, *, tenant_id: str, channel_id: str, candidates: Sequence[Mapping[str, Any]],
+                    verified_sources: Sequence[Mapping[str, Any]] | None, limit: int,
+                    actor_id: str | None) -> list[dict[str, Any]]:
+        verified = ({str(source.get("sourceId") or ""): str(source.get("revisionHash") or "")
+                     for source in verified_sources if source.get("status") == "verified"}
+                    if verified_sources is not None else None)
         with self._connection() as connection:
+            # 버전, 출처 digest와 삭제 이력은 하나의 저장 스냅샷에서 비교한다.
+            connection.execute("BEGIN")
             result = []
             styles = {item["memoryId"]: item for item in self._personal_style_candidates(connection, tenant_id, actor_id or "")}
             for candidate in candidates[:8]:
@@ -908,7 +924,9 @@ class MemoryStore:
                     item = self._item(connection, row)
                 if item["deletionEpoch"] != candidate.get("deletionEpoch") or canonical_digest(item["sources"]) != canonical_digest(candidate.get("sources", [])):
                     continue
-                if not item["sources"] or any(source["state"] != "current" or verified.get(source["sourceId"]) != source["revisionHash"] for source in item["sources"]):
+                if not item["sources"] or any(source["state"] != "current" or (
+                        verified is not None and verified.get(source["sourceId"]) != source["revisionHash"])
+                        for source in item["sources"]):
                     continue
                 if candidate.get("styleOnly") is not True and any(
                     not can_read_memory_source(tenant_id, channel_id, source["channelId"], source["channelKind"])
@@ -919,6 +937,7 @@ class MemoryStore:
                 result.append({"kind": "personal_style", "topicKey": item["topicKey"], "value": item["styleValue"]} if candidate.get("styleOnly") is True else item)
                 if len(result) >= min(8, max(1, limit)):
                     break
+            connection.execute("COMMIT")
             return result
 
     def list_own_memories(self, tenant_id: str, channel_id: str, actor_id: str, category: str | None = None) -> list[dict[str, Any]]:

@@ -31,7 +31,7 @@ MEMORY_GUIDANCE = (
     "답변 선호는 길이·언어·결론 순서에 한해 표현 방식에 참고한다. "
     "personal_style은 현재 질문자 본인의 표준 답변 선호이며 현재 질문에서 지정한 형식이 우선한다. "
     "이 선호를 저장한 대화·채널·시점·원문을 추측하거나 설명하지 말고 표현 방식에만 적용해. "
-    "utterance는 이번 요청에서 Slack으로 읽은 실제 작성자의 발언이며 sourceTimes 순서로 최근 발언을 설명해. "
+    "utterance가 있으면 실제 작성자의 발언이며 sourceTimes 순서로 확인한 발언을 설명해. "
     "contextMessages는 대상 발언을 이해하기 위한 주변 원문이며 대상자의 발언 수에 포함하지 마. "
     "각 문맥의 authorName·authorId가 실제 작성자다. 다른 사람의 질문·평가를 대상자가 한 말로 바꾸지 마. "
     "conversationKey가 다른 발언은 서로 다른 대화이므로 하나의 감정 흐름이나 사건으로 이어 붙이지 마. "
@@ -45,7 +45,10 @@ MEMORY_GUIDANCE = (
     "partial이면 확인한 채널 범위에서 찾은 결과라고 설명하고 "
     "전체 기록의 마지막 발언이라고 단정하지 마. 조회는 상한이 있으므로 complete여도 하루 총 발언 수로 단정하지 마. "
     "숫자가 필요하면 최종 입력에 담긴 대상 발언 수 renderedSourceCount를 '확인한 N건'으로만 표현해. "
-    "unavailable이면 실시간 조회를 완료하지 못했다고 설명해. "
+    "unavailable이면 해당 근거를 확보하지 못했다고 설명해. "
+    "sourceMode가 stored이면 질문 때 Slack 원문을 새로 읽지 않고 DB에 저장된 기억과 짧은 근거 발췌만 조회한 결과야. "
+    "이때 unavailable은 저장된 근거를 찾지 못했거나 DB 조회를 완료하지 못한 것이며 실시간 조회 실패라고 설명하지 마. "
+    "저장된 요약과 발췌만으로 전체 발언 수나 전체 욕설 횟수를 계산하지 마. 대화 기록 조회는 2026년 1월 1일부터 지원해. "
     "조회 결과가 비어 있어도 Slack 전체 접근 권한이 없거나 발언 자체가 없다고 추측하지 마. "
     "과거 사실·결정 설명에 실제 사용한 기억만 문장 뒤에 [memory:기억ID]로 표시해. "
     "단순 답변 스타일 적용에는 출처 표시가 필요 없다. 원본 URL을 생성하지 마."
@@ -94,7 +97,10 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
     # 조회 결과가 없어도 모델이 실제 능력과 조사 범위를 과장하지 않도록 상태를 전달한다.
     for item in entries:
         if item.get("kind") == "retrieval_status" and item.get("coverage") in {"complete", "partial", "unavailable"}:
-            append_row({key: item.get(key) for key in ("kind", "coverage", "channelCount", "sourceCount", "scope")})
+            status = {key: item.get(key) for key in ("kind", "coverage", "channelCount", "sourceCount", "scope")}
+            if item.get("sourceMode") == "stored":
+                status.update(sourceMode="stored", supportedFrom="2026-01-01")
+            append_row(status)
             break
     live = [item for item in entries if item.get("liveSource") is True]
     stored = [item for item in entries if item.get("kind") != "retrieval_status" and item.get("liveSource") is not True][:8]
@@ -179,6 +185,10 @@ def render_memory(entries: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, 
             rendered_sources.update(str(source.get("sourceId")) for source in primary_sources)
     for row in rows:
         if row.get("kind") == "retrieval_status":
+            if row.get("sourceMode") == "stored":
+                # 저장 요약의 채택 건수를 실제 Slack 발언 수로 표시하지 않는다.
+                row["renderedMemoryCount"] = sum(item.get("kind") != "personal_style" for item in selected.values())
+                continue
             # 수집 성공 건수와 실제 모델에 들어간 대상 발언 수는 다를 수 있다.
             row["renderedSourceCount"] = len(rendered_sources)
             row["omittedSourceCount"] = max(0, int(row.get("sourceCount") or 0) - len(rendered_sources))

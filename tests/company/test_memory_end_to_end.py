@@ -18,6 +18,7 @@ from httpx import Response
 import pytest
 
 from boxer_company.assistant.freeform_route import CompanyFreeformAssistantRoute
+from boxer_company.memory.contracts import canonical_digest, source_revision
 from boxer_company.memory.extraction import MemoryExtractor, ProviderResult
 from boxer_company.memory.store import MemoryStore, initialize_memory_store
 from boxer_company.memory.worker import MemoryWorker
@@ -87,8 +88,11 @@ class Runtime:
     def answerer(self, question, context, system):
         self.inputs.append((question, context, system))
         if "retrieved_memory(JSON 참고 데이터):\n" in context:
-            memory = json.loads(context.split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])[0]
-            return "결론부터 짧게 답하는 걸 선호해 [memory:" + memory["memoryId"] + "]"
+            # 저장 조회 상태는 근거 항목과 구별하며 빈 DB의 상태만으로 인용하지 않는다.
+            rows = json.loads(context.split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])
+            memory = next((row for row in rows if row.get("memoryId")), None)
+            if memory is not None:
+                return "결론부터 짧게 답하는 걸 선호해 [memory:" + memory["memoryId"] + "]"
         return "결론부터 짧게 답할게"
 
     def answer_stage(self, request, stage, **kwargs):
@@ -177,7 +181,8 @@ class MemoryEndToEndTests(unittest.TestCase):
         result = self.turn("나는 어떤 답변을 좋아하지?", SECOND, through_rollout=True)
         self.assertIsNotNone(result)
         self.assertEqual(result.outcome, "answered")
-        self.assertEqual(len(self.runtime.requests[-1].memory_entries), 1)
+        evidence = [entry for entry in self.runtime.requests[-1].memory_entries if entry.get("kind") != "retrieval_status"]
+        self.assertEqual(len(evidence), 1)
         self.assertIn("결론부터 짧게", self.runtime.inputs[-1][1])
         self.assertTrue(result.sources)
         self.assertIn("/archives/C1/", result.sources[0].uri)
@@ -196,11 +201,13 @@ class MemoryEndToEndTests(unittest.TestCase):
     def test_other_channel_and_deleted_source_are_not_reused(self):
         self.seed()
         self.turn("내 답변 선호가 뭐였지?", SECOND, channel="C2")
-        self.assertEqual(self.runtime.requests[-1].memory_entries, ())
-        self.memory.source_event({"subtype": "message_deleted", "channel": "C1", "deleted_ts": FIRST},
-                                 {"team_id": "T1", "event_id": "Ev-delete"}, self.slack)
+        self.assertFalse([entry for entry in self.runtime.requests[-1].memory_entries if entry.get("kind") != "retrieval_status"])
+        self.assertTrue(self.memory.source_event({"subtype": "message_deleted", "channel": "C1", "deleted_ts": FIRST},
+                                 {"team_id": "T1", "event_id": "Ev-delete"}, self.slack))
+        with sqlite3.connect(self.store.path) as db:
+            self.assertEqual(db.execute("SELECT state FROM memory_sources WHERE message_ts=?", (FIRST,)).fetchone()[0], "deleted")
         self.turn("내 답변 선호가 뭐였지?", THIRD)
-        self.assertEqual(self.runtime.requests[-1].memory_entries, ())
+        self.assertFalse([entry for entry in self.runtime.requests[-1].memory_entries if entry.get("kind") != "retrieval_status"])
 
     def source_event(self, kind, *, identity="Ev-source", timestamp=FIRST, text="앞으로 자세히 답해줘"):
         event = {"subtype": "message_" + kind, "channel": "C1"}
@@ -337,19 +344,21 @@ class MemoryEndToEndTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT coverage FROM memory_threads").fetchone()[0], "partial")
 
 
-@pytest.mark.parametrize("destination,origin,private_destination,expected_live", [
+@pytest.mark.parametrize("destination,origin,private_destination,allowed_stored_scope", [
     ("C068FVD5V7Y", "CPRIVATE", True, True),
     ("COTHER", "CPRIVATE", True, False),
     ("COTHER", "COTHER", True, True),
     ("CPUBLIC", "CPRIVATE", False, False),
 ])
-def test_private_live_scope_reads_unstored_reply_through_real_http_and_sqlite(
-    tmp_path, monkeypatch, destination, origin, private_destination, expected_live,
+@pytest.mark.parametrize("has_stored", [False, True])
+def test_stored_scope_uses_only_existing_memory_without_reading_unstored_slack_reply(
+    tmp_path, monkeypatch, destination, origin, private_destination, allowed_stored_scope, has_stored,
 ):
     from boxer_company import team_chat_context
 
     tenant, author = "T19PA3EPL", "UMARU"
-    statement = "내일 회의에서는 안내문 문구부터 같이 정리하자"
+    statement = "나는 내일 회의에서 안내문 문구부터 정리할 거야"
+    stored_text = "회의에서는 안내문 문구부터 정리하자는 의견을 냄"
     monkeypatch.setattr(team_chat_context, "TEAM_MEMBER_PROFILES", (
         {"name": "Maru", "aliases": ("maru", "마루"), "user_id": author},
     ))
@@ -357,8 +366,7 @@ def test_private_live_scope_reads_unstored_reply_through_real_http_and_sqlite(
     class PrivateSlack(Slack):
         def __init__(self):
             super().__init__()
-            self.history_calls = []
-            self.list_calls = 0
+            self.raw_reads = []
             self.threads[(origin, FIRST)] = [
                 {"ts": FIRST, "thread_ts": FIRST, "user": "UA", "text": "회의 순서 얘기하자"},
                 {"ts": SECOND, "thread_ts": FIRST, "user": author, "text": statement},
@@ -369,44 +377,70 @@ def test_private_live_scope_reads_unstored_reply_through_real_http_and_sqlite(
                                            "is_member": True, "context_team_id": tenant}}
 
         def conversations_list(self, **kwargs):
-            self.list_calls += 1
-            return {"ok": True, "channels": [{"id": origin, "is_private": True, "is_member": True}],
-                    "response_metadata": {"next_cursor": ""}}
+            self.raw_reads.append("list")
+            raise AssertionError("저장 DB 조회는 Slack 채널 목록을 읽지 않는다")
 
-        def conversations_history(self, *, channel, **kwargs):
-            self.history_calls.append(channel)
-            if channel != origin:
-                return {"ok": True, "messages": [], "has_more": False}
-            return {"ok": True, "messages": [
-                {**self.threads[(origin, FIRST)][0], "reply_count": 1, "latest_reply": SECOND}], "has_more": False}
+        def conversations_history(self, **kwargs):
+            self.raw_reads.append("history")
+            raise AssertionError("저장 DB 조회는 Slack history를 읽지 않는다")
+
+        def conversations_replies(self, **kwargs):
+            self.raw_reads.append("replies")
+            raise AssertionError("저장 DB 조회는 Slack 댓글을 읽지 않는다")
+
+        def chat_getPermalink(self, **kwargs):
+            self.raw_reads.append("permalink")
+            raise AssertionError("저장 DB 조회는 Slack 원문 링크를 새로 만들지 않는다")
 
     path = tmp_path / "private" / "memory.db"
     initialize_memory_store(path)
     store = MemoryStore(path, debounce_seconds=0)
-    service = MemoryService(store, enabled=True, read_enabled=True, profile_ids=frozenset({"UA"}))
+    if has_stored:
+        # 조회 전에 정상 capture·추출 경로로 채택한 DB 기억을 준비한다. 조회 자체는 새 자료를 저장하지 않는다.
+        capture = store.create_capture(tenant_id=tenant, actor_id=author, channel_id=origin, thread_ts=FIRST,
+            current_message_ts=SECOND, channel_kind="private_channel", request_id="stored-scope-fixture", route="company_freeform")
+        sources = [{"messageTs": SECOND, "revisionHash": source_revision(statement), "authorId": author,
+            "authorKind": "human", "text": statement, "createdAt": SECOND, "editedAt": "",
+            "permalink": f"https://example.slack.com/archives/{origin}/p{SECOND.replace('.', '')}"}]
+        store.put_chunk(tenant_id=tenant, actor_id=author, capture_id=capture["captureId"], claim_token=capture["claimToken"],
+            chunk_no=0, sources=sources, coverage="complete", is_last=True, total_chunks=1,
+            input_digest=canonical_digest([canonical_digest(sources)]))
+
+        def extract(system, text):
+            source = json.loads(text)["sources"][0]
+            candidate = {"kind": "person", "category": "fact", "subjectUserId": author, "topicKey": "회의 준비",
+                "text": stored_text, "evidenceType": "self_statement", "sources": [{"sourceId": source["sourceId"],
+                "quote": statement, "relation": "supports"}], "subjects": [], "action": "add"}
+            return ProviderResult(json.dumps({"candidates": [candidate]}, ensure_ascii=False), "stub", 10, 10)
+
+        assert MemoryWorker(store, MemoryExtractor(extract)).run_once()["state"] == "succeeded"
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT count(*) FROM memory_items WHERE status='active'").fetchone()[0] == 1
+    memory_service = MemoryService(store, enabled=True, read_enabled=True, profile_ids=frozenset({"UA"}))
     inputs = []
+    expected_stored = has_stored and allowed_stored_scope
 
     def answerer(question, context, system):
         inputs.append((question, context, system))
-        if "retrieved_memory(JSON 참고 데이터):\n" not in context:
-            return "확인한 근거가 없어"
         rows = json.loads(context.split("retrieved_memory(JSON 참고 데이터):\n", 1)[1])
-        utterances = [row for row in rows if row.get("kind") == "utterance"]
-        if not utterances:
-            return "실시간 조회를 완료하지 못했어"
-        assert utterances[0]["sourceTimes"][0]["authorName"] == "Maru"
+        assert any(row.get("sourceMode") == "stored" for row in rows if row.get("kind") == "retrieval_status")
+        memories = [row for row in rows if row.get("memoryId")]
+        assert not any(row.get("kind") == "utterance" for row in memories)
+        if not memories:
+            return "저장된 근거가 없어"
+        assert memories[0]["text"] == stored_text
         assert '"referenceDateKst":"2026-10-16"' in system
-        return "마루는 안내문 문구부터 정리하자고 했어 [memory:" + utterances[0]["memoryId"] + "]"
+        return "저장된 기억에서 마루는 안내문 문구부터 정리하자고 했어 [memory:" + memories[0]["memoryId"] + "]"
 
     route = CompanyFreeformAssistantRoute(answerer, provider_ready=lambda: True,
         context_max_chars=5000, timeout_message="시간 초과")
-    runtime = type("HubRuntime", (), {"answer_stage": lambda _self, request, stage, **kwargs: route.handle(request)})()
+    runtime = type("StoredRuntime", (), {"answer_stage": lambda _self, request, stage, **kwargs: route.handle(request)})()
     settings = CompanyApiSettings(host="127.0.0.1", port=8010, memory_enabled=True, memory_read_enabled=True,
-        memory_state_path=str(path), callers=(CompanyApiCallerSettings(caller_id="hub", token=TOKEN,
+        memory_state_path=str(path), callers=(CompanyApiCallerSettings(caller_id="stored-scope", token=TOKEN,
             tenant_ids=frozenset({tenant}), channels=frozenset({"slack"}), actor_ids=frozenset({"UA"}),
             capabilities=frozenset({"assistant.turn.read"})),))
     app = create_company_api_app(settings=settings, assistant_runtime=runtime,
-        readiness_probe=lambda: True, memory_service=service)
+        readiness_probe=lambda: True, memory_service=memory_service)
     with TestClient(app) as web:
         session = LocalSession(web)
         client_settings = CompanyApiClientSettings(base_url="http://127.0.0.1:8010", token=TOKEN,
@@ -424,9 +458,9 @@ def test_private_live_scope_reads_unstored_reply_through_real_http_and_sqlite(
         request = build_company_assistant_request(payload)
         request = replace(request, memory_context=memory.context_for(payload))
 
-        # 수집기·HTTP·모델뿐 아니라 운영 Slack wrapper의 출처 검증과 최종 렌더링까지 연결한다.
-        service = CompanyFreeformApiRolloutService(None, api_client=api, logger=logging.getLogger(__name__))
-        result = service.answer(request)
+        # 실제 HTTP와 SQLite의 저장 조회 범위부터 Slack wrapper의 인용 렌더링까지 연결한다.
+        rollout = CompanyFreeformApiRolloutService(None, api_client=api, logger=logging.getLogger(__name__))
+        result = rollout.answer(request)
         assert result is not None
         reply = Mock()
         sent = render_company_assistant_result(result, reply=reply, actor_id="UA", client=None,
@@ -438,25 +472,20 @@ def test_private_live_scope_reads_unstored_reply_through_real_http_and_sqlite(
     rendered = reply.call_args.args[0]
     assert "일반 답변 서비스 상태를 확인할 수 없어" not in rendered
     assert "[memory:" not in rendered
-    assert bool(result.sources) is expected_live
-    assert slack.list_calls == int(destination == "C068FVD5V7Y")
-    assert slack.history_calls == ([origin] if destination == "C068FVD5V7Y"
-                                   else [destination] if private_destination else [])
-    if expected_live:
-        assert slack.history_calls == [origin]
-        assert statement in inputs[0][1]
-        assert "https://" not in inputs[0][1]
+    assert bool(result.sources) is expected_stored
+    assert slack.raw_reads == []
+    assert not any(path.endswith("/live") for path, _ in session.calls)
+    if expected_stored:
+        assert stored_text in inputs[0][1] and "https://" not in inputs[0][1]
         assert result.sources[0].uri.endswith("/p" + SECOND.replace(".", ""))
-        assert "안내문" in result.messages[0].body
         assert "안내문" in rendered
         assert "<" + result.sources[0].uri + "|이전 대화 근거>" in rendered
-        assert any(path.endswith("/live") for path, _ in session.calls)
     else:
         assert "https://" not in rendered
-        assert statement not in inputs[0][1]
-        assert any(path.endswith("/live") for path, _ in session.calls) is private_destination
+        assert stored_text not in inputs[0][1]
+        assert "저장된 근거가 없어" in rendered
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT count(*) FROM memory_sources").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM memory_sources").fetchone()[0] == int(has_stored)
         assert db.execute("SELECT count(*) FROM memory_job_inputs").fetchone()[0] == 0
 
 
