@@ -178,6 +178,10 @@ def test_only_explicit_profanity_message_count_intent_is_parsed(question):
     "디디가 올해 쓴 욕 표현 목록", "올해 디디가 한 욕 정리해줘", "디디가 올해 한 욕은 뭐야?",
     "디디가 올해 무슨 욕 했어?", "디디가 올해 어떤 욕을 했는지 알려줘",
     "모대야 디디가 올해 한 욕 보여줘", "<@UDD123>가 올해 한 욕 보여줘",
+    "디디가 올해 한 욕", "올해 디디가 했던 욕설", "디디가 올해 쓴 욕 표현",
+    "디디가 올해 욕한 메시지", "디디가 올해 욕했던 발언들", "디디가 올해 한 욕 기록",
+    "모대야 디디가 올해 한 욕", "<@UDD123>가 올해 한 욕", "디디가 올해 한 욕들?",
+    "디디가 올해 내뱉은 욕！", "디디가 올해 사용한 욕 표현\n",
 ])
 def test_spoken_profanity_lookup_uses_the_same_stored_message_contract(question):
     # 숫자를 묻지 않아도 발언 조회는 검색 상위 몇 건과 모델 추정으로 빠지면 안 된다.
@@ -202,6 +206,14 @@ def test_spoken_profanity_lookup_uses_the_same_stored_message_contract(question)
     "디디에게 할 욕설을 한 번 보여줘", "올해 욕을 한다면 어떤 표현인지 알려줘",
     "욕설을 한 달 배운 뒤 예시를 보여줘",
     "`디디가 올해 한 욕 보여줘`", "올해 디디가 욕한 장비를 업데이트해줘",
+    '"디디가 올해 한 욕"', "`디디가 올해 한 욕`", "> 디디가 올해 한 욕",
+    "디디가 올해 한 욕이라는 제목", "디디가 올해 한 욕 때문에 기분이 나빠",
+    "디디가 올해 한 욕구", "디디가 올해 한 욕심", "디디가 올해 한 욕설의 뜻",
+    "디디가 올해 한 욕을 소재로", "디디가 올해 한 욕 메시지를 삭제해줘",
+    "제목: 디디가 올해 한 욕", "문구는 디디가 올해 한 욕", "농담 소재는 디디가 올해 한 욕",
+    "예시 디디가 올해 한 욕", "문자열=디디가 올해 한 욕",
+    "제목을 디디가 올해 한 욕", "디디가 올해 안 한 욕", "디디가 올해 못 했던 욕",
+    "디디가 올해 쓰려고 한 욕", "디디가 올해 사용하기 위해 한 욕",
 ])
 def test_summary_general_words_and_policy_threshold_questions_are_not_count_requests(question):
     assert parse_conversation_count_query(question, NOW, ["UDD123"]) is None

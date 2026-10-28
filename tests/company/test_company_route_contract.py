@@ -562,6 +562,7 @@ class CompanyRouteContractTests(unittest.TestCase):
     def test_conversation_questions_skip_entry_slack_context_and_diagnostic_probe(self) -> None:
         # 실제 mention entry가 일반 문맥을 준비하기 전부터 저장 조회의 Slack 읽기를 차단한다.
         for question in ("디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘",
+                         "디디가 올해 한 욕",
                          "디디가 올해 어떤 욕 했어?", "오늘 디디가 한 말 요약해줘",
                          "디디가 최근 뭐랬어?", "<@UDD|디디>가 최근 뭐랬어?"):
             with self.subTest(question=question), patch.object(team_chat_context, "TEAM_MEMBER_PROFILES",
@@ -583,6 +584,7 @@ class CompanyRouteContractTests(unittest.TestCase):
     def test_fun_conversation_questions_reach_stored_read_before_fun_collects_context(self) -> None:
         # 모대 호출어가 붙어도 fun의 스레드 수집과 운영 probe를 건너뛰고 저장 조회로 전달한다.
         for question in ("모대야 디디가 올해 욕 몇 번 했어?", "모대야 디디가 올해 한 욕 보여줘",
+                         "모대야 디디가 올해 한 욕",
                          "모대야 오늘 디디가 한 말 요약해줘", "모대야 디디가 최근 뭐랬어?"):
             with (
                 self.subTest(question=question),

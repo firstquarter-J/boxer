@@ -71,6 +71,7 @@ def state(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("question", [
     "올해 디디가 한 욕 몇개야?", "디디가 올해 한 욕 보여줘", "디디가 올해 어떤 욕을 했는지 알려줘",
+    "디디가 올해 한 욕", "디디가 올해 욕한 메시지",
 ])
 @pytest.mark.parametrize("route_group", ["freeform", "fun", None])
 def test_existing_db_excerpts_are_counted_synchronously_without_new_state(state, question, route_group):
@@ -100,7 +101,7 @@ def test_existing_db_excerpts_are_counted_synchronously_without_new_state(state,
         assert not connection.execute("SELECT name FROM sqlite_master WHERE name LIKE 'memory_count_%'").fetchall()
 
 
-@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘"])
+@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘", "디디가 올해 한 욕"])
 def test_slack_client_and_rollout_return_db_answer_without_any_slack_sdk_call(state, question):
     from boxer_company_adapter_slack.company_api_client import (
         CompanyApiClientSettings,
@@ -138,6 +139,7 @@ def test_slack_client_and_rollout_return_db_answer_without_any_slack_sdk_call(st
                                      "2026년 1월 1일 이전 대화 요약해줘", "2025년 이전 대화 요약해줘",
                                      "2026년이전대화요약해줘", "2026년1월1일이전대화기록",
                                      "디디가 2025년에 한 욕 보여줘", "디디가 2026년 이전 어떤 욕 했어?",
+                                     "디디가 2025년에 한 욕", "디디가 2026년 이전에 한 욕",
                                      "디디가 2026년 이전 욕 몇 번 했어?", "디디가 2026년 10월 이전 욕 몇 번 했어?"])
 def test_before_supported_period_is_rejected_before_counting_or_model_call(state, monkeypatch, question):
     import boxer_company.memory.conversation_count_store as counting
@@ -187,7 +189,8 @@ def test_omitting_route_group_still_counts_supported_existing_db_excerpts(state,
 
 
 @pytest.mark.parametrize("question", ["누가 올해 욕 몇 번 했어?", "디디가 욕 몇 번 했어?", "디디가 2월 30일 욕 몇 번 했어?",
-                                     "올해 한 욕 보여줘", "디디가 한 욕 보여줘", "디디가 2월 30일에 한 욕 보여줘"])
+                                     "올해 한 욕 보여줘", "디디가 한 욕 보여줘", "디디가 2월 30일에 한 욕 보여줘",
+                                     "올해 한 욕", "디디가 한 욕", "디디가 2월 30일에 한 욕"])
 def test_missing_target_or_invalid_period_never_guesses_a_count(state, question):
     _, _, client = state
     response = client.post("/internal/v1/assistant/turns", headers=headers(), json=turn(request(question)))
@@ -195,7 +198,7 @@ def test_missing_target_or_invalid_period_never_guesses_a_count(state, question)
     assert response.json()["outcome"] == "needs_input" and response.json()["usedLlm"] is False
 
 
-@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘"])
+@pytest.mark.parametrize("question", ["디디가 올해 욕 몇 번 했어?", "디디가 올해 한 욕 보여줘", "디디가 올해 한 욕"])
 def test_missing_excerpt_is_unavailable_and_next_query_observes_db_deletion(state, question):
     _, store, client = state
     add_source(store, excerpt="", stamp="1792100001.000001")

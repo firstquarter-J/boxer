@@ -33,7 +33,19 @@ _QUERY_POLICY = re.compile(r"몇\s*(?:번|건|개|회).{0,20}(?:하면|해야|�
 _QUERY_SPOKEN_SUBJECT = re.compile(
     r"(?<![가-힣a-z0-9_])(?:한|했던|하던|했었던|쓴|썼던|내뱉은|사용한)\s*욕(?:설|\s*표현)?|"
     r"(?<![가-힣a-z0-9_])욕(?:설|\s*표현)?\s*(?:을|를)?\s*(?:한|했던|하던|쓴|썼던)"
-    r"\s*(?:메시지|발언|기록|목록|내역|모음|말|것|거)(?=$|[\s?!.,]|을|를|은|는)"
+    r"\s*(?:메시지|발언|기록|목록|내역|모음|말|것|거)(?=$|[\s?!.,]|들|을|를|은|는)"
+)
+# 검색창처럼 과거 발언 대상만 적은 명사구도 조회다. 전체 대안을 끝까지 닫아 뒤의 설명이나 명령은 선점하지 않는다.
+_QUERY_SPOKEN_NOUN_END = re.compile(
+    r"(?:" + _QUERY_SPOKEN_SUBJECT.pattern + r")"
+    r"(?:\s*(?:메시지|발언|기록|목록|내역|모음))?(?:들)?[?!.。！？]*\s*$"
+)
+# 닫힌 명사구라도 제목이나 예시로 제시한 텍스트는 실제 과거 발언 조회가 아니다.
+_QUERY_NOUN_META = re.compile(
+    r"(?<![가-힣a-z0-9_])(?:제목|문구|문장|문자열|소재|예시|예제|인용)(?=$|[\s:=]|은|는|이|가|을|를|로)"
+)
+_QUERY_NOUN_UNSPOKEN_PREFIX = re.compile(
+    r"(?:(?<![가-힣a-z0-9_])(?:안|못)|려(?:고|던)|고자|기\s*위해)\s*$"
 )
 _QUERY_LOOKUP_END = re.compile(
     r"(?:(?:보여|알려|찾아|정리해)\s*(?:줘|주라|줄래|주세요|줄\s*수\s*있(?:어|을까))|"
@@ -95,9 +107,14 @@ def parse_conversation_count_query(
     lookup_text = text
     for pattern in (_CODE, _QUOTED, _BLOCK_QUOTED):
         lookup_text = pattern.sub(" ", lookup_text)
+    # 명사구 앞의 부정과 계획은 실제로 한 발언과 구분한다. 기존 명령형의 판정은 유지한다.
+    noun = _QUERY_SPOKEN_NOUN_END.search(lookup_text)
+    noun_lookup = noun and not _QUERY_NOUN_META.search(lookup_text) and not _QUERY_NOUN_UNSPOKEN_PREFIX.search(
+        lookup_text[:noun.start()])
     lookup = not _QUERY_LOOKUP_TRANSFORM.search(lookup_text) and (
         (_QUERY_SPOKEN_SUBJECT.search(lookup_text) and _QUERY_LOOKUP_END.search(lookup_text))
         or _QUERY_SPOKEN_QUESTION.search(lookup_text)
+        or noun_lookup
     )
     if not _QUERY_SUBJECT.search(text) or not (count or lookup) or _QUERY_POLICY.search(text):
         return None
