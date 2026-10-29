@@ -32,6 +32,7 @@ class FakeS3:
     def __init__(self):
         self.objects = {}
         self.puts = []
+        self.gets = []
         self.deleted = []
 
     def put_object(self, **kwargs):
@@ -48,6 +49,7 @@ class FakeS3:
         return {}
 
     def get_object(self, **kwargs):
+        self.gets.append(kwargs)
         if kwargs["Key"] not in self.objects:
             raise S3Error("NoSuchKey")
         obj = self.objects[kwargs["Key"]]
@@ -504,3 +506,239 @@ def test_derived_journal_requires_fixed_scope_hash_and_never_contains_summary_te
     assert "지울 파생 요약" not in str(client.objects)
     with pytest.raises(MemoryBackupError, match="memory_deletion_event_invalid"):
         service.append_deletion({**event, "id": "bad-derived", "reasonCode": "not-a-hash"})
+
+
+class PendingDeletionStore:
+    def __init__(self, events):
+        self.events = events
+        self.marks = []
+
+    def deletion_events(self):
+        return self.events
+
+    def mark_deletion_durable(self, identity, sequence):
+        self.marks.append((identity, sequence))
+        for row in self.events:
+            if row["id"] == identity:
+                row["durabilityState"] = "durable"
+
+
+def batch_events(count=3):
+    return [{**event(f"batch-{index}"), "durabilityState": "pending"} for index in range(count)]
+
+
+def test_flush_511_pending_events_uses_one_head_commit_and_linear_s3_gets():
+    service, client = backup()
+    service.append_deletion(event("existing1"))
+    service.append_deletion(event("existing2"))
+    # 실제 적용과 같은 2개 scope marker와 509개 파생 item을 한 번에 내구화한다.
+    pending = [{"id": f"purge-{index}", "tenantId": "T", "scopeChannelId": "C1" if index % 2 == 0 else "C2",
+                "deletionKind": "derived_item", "reasonCode": "a" * 64, "durabilityState": "pending",
+                **({"eventType": "derived_purge_scope", "memoryId": None, "expectedItemCount": 255 if index == 0 else 254}
+                   if index < 2 else {"eventType": "derived_purge_item", "memoryId": f"item-{index}"})}
+               for index in range(511)]
+    store = PendingDeletionStore(pending)
+    client.gets.clear()
+    client.puts.clear()
+    assert service.flush_deletions(store) == 511
+    # 기존 2건을 두 번, 신규 511건을 한 번 읽고 고정 head 4회만 더 확인한다.
+    assert len(client.gets) == 511 + 2 * 2 + 4
+    assert len([row for row in client.puts if row["Key"] == "memory/journal/head.json"]) == 1
+    assert len(client.puts) == 512
+    assert store.marks == [(f"purge-{index}", index + 3) for index in range(511)]
+    before = len(client.gets), len(client.puts)
+    assert service.flush_deletions(store) == 0
+    assert (len(client.gets), len(client.puts)) == before
+    head, saved = service.verify_journal()
+    assert head["sequence"] == 513 and len(saved) == 513
+
+
+def test_batch_reuses_existing_event_sequence_and_deduplicates_identical_local_ids():
+    service, client = backup()
+    original = event("already-remote")
+    service.append_deletion(original)
+    pending = [dict(original), event("new"), dict(original)]
+    store = PendingDeletionStore(pending)
+    client.puts.clear()
+    assert service.flush_deletions(store) == 2
+    assert store.marks == [("already-remote", 1), ("new", 2)]
+    assert len([row for row in client.puts if "/events/" in row["Key"]]) == 1
+    assert service.verify_journal()[0]["sequence"] == 2
+
+
+@pytest.mark.parametrize("existing_remote", [False, True])
+def test_conflicting_event_id_fails_before_any_batch_upload_or_local_ack(existing_remote):
+    service, client = backup()
+    original = event("same-id")
+    altered = {**original, "subjectId": "different-subject"}
+    if existing_remote:
+        service.append_deletion(original)
+        pending = [event("new-before-conflict"), altered]
+    else:
+        pending = [event("new-before-conflict"), original, altered]
+    store = PendingDeletionStore(pending)
+    client.puts.clear()
+    with pytest.raises(MemoryBackupError, match="memory_deletion_event_conflict"):
+        service.flush_deletions(store)
+    assert not client.puts and not store.marks
+    assert all(row.get("durabilityState") != "durable" for row in store.events)
+
+
+@pytest.mark.parametrize("stale_part", ["head", "etag"])
+def test_batch_revalidates_head_and_etag_before_uploading_any_new_events(monkeypatch, stale_part):
+    service, client = backup()
+    stale = dict(client.objects["memory/journal/head.json"])
+    service.append_deletion(event("concurrent-earlier"))
+    get = client.get_object
+    injected = False
+    def read(**kwargs):
+        nonlocal injected
+        if kwargs["Key"] == "memory/journal/head.json" and not injected:
+            injected = True
+            if stale_part == "head":
+                return {**stale, "Body": io.BytesIO(stale["data"])}
+            return {**get(**kwargs), "ETag": "stale-etag"}
+        return get(**kwargs)
+    monkeypatch.setattr(client, "get_object", read)
+    store = PendingDeletionStore([event("new")])
+    assert service.flush_deletions(store) == 1
+    assert store.marks == [("new", 2)]
+    assert [row["event"]["id"] for row in service.verify_journal()[1]] == ["concurrent-earlier", "new"]
+
+
+@pytest.mark.parametrize("competitor_reuses_id", [False, True])
+def test_head_cas_race_rebuilds_batch_and_reuses_committed_ids_without_losing_either_writer(monkeypatch, competitor_reuses_id):
+    service, client = backup()
+    competitor = MemoryBackup(service.settings, client=client)
+    put = client.put_object
+    raced = False
+    def racing_put(**kwargs):
+        nonlocal raced
+        if kwargs["Key"] == "memory/journal/head.json" and kwargs.get("IfMatch") and not raced:
+            raced = True
+            competitor.append_deletion(event("batch-0" if competitor_reuses_id else "competitor"))
+        return put(**kwargs)
+    monkeypatch.setattr(client, "put_object", racing_put)
+    store = PendingDeletionStore(batch_events(2))
+    assert service.flush_deletions(store) == 2
+    head, saved = service.verify_journal()
+    expected = ["batch-0", "batch-1"] if competitor_reuses_id else ["competitor", "batch-0", "batch-1"]
+    assert head["sequence"] == len(expected)
+    assert [row["event"]["id"] for row in saved] == expected
+    assert store.marks == ([("batch-0", 1), ("batch-1", 2)] if competitor_reuses_id else [("batch-0", 2), ("batch-1", 3)])
+
+
+def test_repeated_conditional_head_conflict_is_bounded_to_five_attempts_and_keeps_local_pending(monkeypatch):
+    service, client = backup()
+    put = client.put_object
+    attempts = 0
+    def conflict(**kwargs):
+        nonlocal attempts
+        if kwargs["Key"] == "memory/journal/head.json" and kwargs.get("IfMatch"):
+            attempts += 1
+            raise S3Error("ConditionalRequestConflict")
+        return put(**kwargs)
+    monkeypatch.setattr(client, "put_object", conflict)
+    store = PendingDeletionStore(batch_events())
+    with pytest.raises(MemoryBackupError, match="memory_journal_write_conflict"):
+        service.flush_deletions(store)
+    assert attempts == 5 and not store.marks
+    assert service.verify_journal()[0]["sequence"] == 0
+
+
+@pytest.mark.parametrize("failure", ["partial_upload", "upload_response_lost", "commit_response_lost", "verification_read_lost"])
+def test_network_failure_never_marks_local_durable_and_restart_reuses_immutable_remote_events(monkeypatch, failure):
+    service, client = backup()
+    put, get = client.put_object, client.get_object
+    injected = False
+    committed = False
+    uploads = 0
+    def faulty_put(**kwargs):
+        nonlocal injected, committed, uploads
+        if "/events/" in kwargs["Key"]:
+            uploads += 1
+            if not injected and uploads == 2 and failure in {"partial_upload", "upload_response_lost"}:
+                injected = True
+                if failure == "upload_response_lost":
+                    put(**kwargs)
+                raise TimeoutError("synthetic upload response is unavailable")
+        result = put(**kwargs)
+        if kwargs["Key"] == "memory/journal/head.json" and kwargs.get("IfMatch"):
+            committed = True
+            if failure == "commit_response_lost" and not injected:
+                injected = True
+                raise TimeoutError("synthetic commit response is unavailable")
+        return result
+    def faulty_get(**kwargs):
+        nonlocal injected
+        if failure == "verification_read_lost" and committed and "/events/" in kwargs["Key"] and not injected:
+            injected = True
+            raise TimeoutError("synthetic verification response is unavailable")
+        return get(**kwargs)
+    monkeypatch.setattr(client, "put_object", faulty_put)
+    monkeypatch.setattr(client, "get_object", faulty_get)
+    store = PendingDeletionStore(batch_events())
+    with pytest.raises((TimeoutError, MemoryBackupError)):
+        service.flush_deletions(store)
+    assert injected and not store.marks
+    assert all(row["durabilityState"] == "pending" for row in store.events)
+    assert service.flush_deletions(store) == 3
+    assert store.marks == [("batch-0", 1), ("batch-1", 2), ("batch-2", 3)]
+    assert [row["event"]["id"] for row in service.verify_journal()[1]] == ["batch-0", "batch-1", "batch-2"]
+
+
+def test_immutable_event_collision_requires_identical_bytes_and_cannot_publish_corrupted_orphan():
+    service, client = backup()
+    payload = service._deletion_payload(event())
+    entry = {"version": 1, "sequence": 1, "previousHash": "", "event": payload}
+    key = "memory/journal/events/" + canonical_digest(entry) + ".json"
+    client.objects[key] = {"data": b"{}", "ETag": "different", "ServerSideEncryption": "aws:kms"}
+    store = PendingDeletionStore([event()])
+    with pytest.raises(MemoryBackupError, match="memory_journal_event_conflict"):
+        service.flush_deletions(store)
+    assert not store.marks and service.verify_journal()[0]["sequence"] == 0
+
+
+@pytest.mark.parametrize("failure", ["head_not_committed", "missing_remote_event", "verification_omits_event"])
+def test_successful_transport_without_verified_full_batch_keeps_every_local_event_pending(monkeypatch, failure):
+    service, client = backup()
+    put, verify = client.put_object, service.verify_journal
+    def incomplete_put(**kwargs):
+        if kwargs["Key"] == "memory/journal/head.json" and kwargs.get("IfMatch"):
+            if failure == "head_not_committed":
+                return {}
+            result = put(**kwargs)
+            if failure == "missing_remote_event":
+                key = next(key for key in client.objects if "/events/" in key)
+                del client.objects[key]
+            return result
+        return put(**kwargs)
+    verify_calls = 0
+    def incomplete_verify():
+        nonlocal verify_calls
+        verify_calls += 1
+        head, events = verify()
+        return (head, events[:-1]) if failure == "verification_omits_event" and verify_calls == 2 else (head, events)
+    monkeypatch.setattr(client, "put_object", incomplete_put)
+    monkeypatch.setattr(service, "verify_journal", incomplete_verify)
+    store = PendingDeletionStore(batch_events())
+    with pytest.raises(MemoryBackupError, match="memory_journal_(?:write_unverified|event_unavailable)"):
+        service.flush_deletions(store)
+    assert not store.marks and all(row["durabilityState"] == "pending" for row in store.events)
+
+
+@pytest.mark.parametrize("bad", [
+    {**event("invalid"), "deletionKind": []},
+    {**event("invalid"), "deletionKind": "derived_item", "reasonCode": "plain text"},
+    {**event("invalid"), "deletionKind": "derived_item", "reasonCode": int("1" * 64)},
+    {**event("invalid"), "deletionKind": "derived_item", "eventType": "derived_purge_scope", "reasonCode": "a" * 64, "expectedItemCount": True},
+    {**event("invalid"), "deletionKind": "raw_state", "reasonCode": "{}"},
+])
+def test_batch_validates_every_typed_payload_before_any_remote_read_or_write(bad):
+    service, client = backup()
+    client.gets.clear()
+    client.puts.clear()
+    store = PendingDeletionStore([event("valid"), bad])
+    with pytest.raises(MemoryBackupError, match="memory_deletion_event_invalid"):
+        service.flush_deletions(store)
+    assert not client.gets and not client.puts and not store.marks

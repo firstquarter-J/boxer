@@ -144,18 +144,26 @@ class MemoryBackup:
             raise MemoryBackupError("memory_journal_chain_invalid")
         return head, list(reversed(events))
 
-    def append_deletion(self, event: Mapping[str, Any]) -> int:
+    @staticmethod
+    def _deletion_payload(event: Mapping[str, Any]) -> dict[str, Any]:
         # 본문 없는 tombstone 필드만 journal에 나간다. 실수로 text가 섞여도 저장하지 않는다.
+        if not isinstance(event, Mapping):
+            raise MemoryBackupError("memory_deletion_event_invalid")
         allowed = {"id", "tenantId", "scopeChannelId", "memoryId", "sourceId", "eventType", "actorId", "requestId", "deletionKind", "subjectId", "topicKeyHash", "sourceMessageId", "cutoffAt", "reallowRequestId", "createdAt", "reasonCode", "expectedItemCount"}
         payload = {key: value for key, value in event.items() if key in allowed}
+        if not isinstance(payload.get("deletionKind"), str):
+            raise MemoryBackupError("memory_deletion_event_invalid")
         # 새 metadata 필드는 검증하는 두 전용 kind에만 허용해 기존 이벤트에 임의 본문이 섞이지 않게 한다.
         if payload.get("deletionKind") not in {"derived_item", "raw_state"}:
             payload.pop("reasonCode", None)
         if payload.get("deletionKind") != "derived_item" or payload.get("eventType") != "derived_purge_scope":
             payload.pop("expectedItemCount", None)
-        if not payload.get("id") or not payload.get("tenantId") or payload.get("deletionKind") not in {"item", "source", "source_revision", "source_redaction", "subject_topic", "derived_item", "raw_state"}:
+        if (any(not isinstance(payload.get(key), str) or not 0 < len(payload[key]) <= 256 for key in ("id", "tenantId"))
+                or not isinstance(payload.get("deletionKind"), str)
+                or payload["deletionKind"] not in {"item", "source", "source_revision", "source_redaction", "subject_topic", "derived_item", "raw_state"}):
             raise MemoryBackupError("memory_deletion_event_invalid")
-        if payload["deletionKind"] == "derived_item" and not re.fullmatch(r"[a-f0-9]{64}", str(payload.get("reasonCode") or "")):
+        if payload["deletionKind"] == "derived_item" and (not isinstance(payload.get("reasonCode"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", payload["reasonCode"])):
             raise MemoryBackupError("memory_deletion_event_invalid")
         if payload.get("eventType") == "derived_purge_scope" and (type(payload.get("expectedItemCount")) is not int
                 or not 0 <= payload["expectedItemCount"] < 2**63):
@@ -168,49 +176,104 @@ class MemoryBackup:
                 parse_raw_state_event(payload)
             except MemoryError as exc:
                 raise MemoryBackupError("memory_deletion_event_invalid") from exc
+        try:
+            # 호출 중 원본 mapping이 바뀌어도 영향을 받지 않는 고정 JSON으로 batch 전체를 먼저 검증한다.
+            return json.loads(_encode(payload))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MemoryBackupError("memory_deletion_event_invalid") from exc
+
+    @staticmethod
+    def _journal_events_by_id(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        result = {}
+        for entry in entries:
+            identity = entry["event"].get("id")
+            if not isinstance(identity, str) or not identity:
+                raise MemoryBackupError("memory_journal_event_invalid")
+            if identity in result:
+                # 같은 ID를 여러 sequence에 놓은 chain은 local sequence의 정본을 정할 수 없다.
+                raise MemoryBackupError("memory_deletion_event_conflict")
+            result[identity] = entry
+        return result
+
+    def _append_deletion_batch(self, events: list[Mapping[str, Any]]) -> dict[str, int]:
+        payloads: dict[str, dict[str, Any]] = {}
+        for event in events:
+            payload = self._deletion_payload(event)
+            if payload["id"] in payloads and payloads[payload["id"]] != payload:
+                raise MemoryBackupError("memory_deletion_event_conflict")
+            payloads[payload["id"]] = payload
+        if not payloads:
+            return {}
         for _ in range(5):
             head, etag = self._read_head()
             verified_head, existing = self.verify_journal()
-            if head != verified_head:
+            current_head, current_etag = self._read_head()
+            # batch 시작의 전체 chain은 한 번만 검증하고 같은 head/ETag의 CAS에 연결한다.
+            if head != verified_head or head != current_head or etag != current_etag:
                 continue
-            for previous in existing:
-                if previous["event"]["id"] == payload["id"]:
+            known = self._journal_events_by_id(existing)
+            expected: dict[str, dict[str, Any]] = {}
+            additions = []
+            next_sequence, previous_hash = head["sequence"], head["eventHash"]
+            for identity, payload in payloads.items():
+                previous = known.get(identity)
+                if previous:
                     if previous["event"] != payload:
                         raise MemoryBackupError("memory_deletion_event_conflict")
-                    return int(previous["sequence"])
-            entry = {"version": 1, "sequence": head["sequence"] + 1, "previousHash": head["eventHash"], "event": payload}
-            digest = canonical_digest(entry)
-            key = self._key("journal/events/" + digest + ".json")
-            try:
-                self._put(key, _encode(entry), create=True)
-            except Exception as exc:
-                if _error_code(exc) not in {"PreconditionFailed", "412"}:
-                    raise
-                stored, _ = self._get(key)
-                if stored != _encode(entry):
-                    raise MemoryBackupError("memory_journal_event_conflict") from exc
-            new_head = {"version": 1, "sequence": entry["sequence"], "eventHash": digest}
-            try:
-                self._put(self._key("journal/head.json"), _encode(new_head), expected_etag=etag)
-            except Exception as exc:
-                if _error_code(exc) in {"PreconditionFailed", "412", "ConditionalRequestConflict", "409"}:
+                    expected[identity] = previous
                     continue
-                raise
-            # ACK 전에 head와 hash chain을 다시 읽어 실제 내구성을 확인한다.
+                next_sequence += 1
+                entry = {"version": 1, "sequence": next_sequence, "previousHash": previous_hash, "event": payload}
+                digest = canonical_digest(entry)
+                additions.append((entry, digest))
+                expected[identity] = {**entry, "hash": digest}
+                previous_hash = digest
+            for entry, digest in additions:
+                key = self._key("journal/events/" + digest + ".json")
+                encoded = _encode(entry)
+                try:
+                    self._put(key, encoded, create=True)
+                except Exception as exc:
+                    if _error_code(exc) not in {"PreconditionFailed", "412", "ConditionalRequestConflict", "409"}:
+                        raise
+                    stored, _ = self._get(key)
+                    if stored != encoded:
+                        raise MemoryBackupError("memory_journal_event_conflict") from exc
+            if additions:
+                new_head = {"version": 1, "sequence": next_sequence, "eventHash": previous_hash}
+                try:
+                    # 불변 event 묶음은 마지막 head 한 번의 CAS로 함께 공개한다.
+                    self._put(self._key("journal/head.json"), _encode(new_head), expected_etag=etag)
+                except Exception as exc:
+                    if _error_code(exc) in {"PreconditionFailed", "412", "ConditionalRequestConflict", "409"}:
+                        continue
+                    # 응답이 불명확하면 이번 호출에서 ACK하지 않고 다음 ID 재검증으로만 복구한다.
+                    raise
+            # 전체 batch의 ACK 전에 head와 전체 chain을 한 번 더 확인한다.
             _, persisted = self.verify_journal()
-            if any(row["hash"] == digest for row in persisted):
-                return int(entry["sequence"])
+            persisted_by_id = self._journal_events_by_id(persisted)
+            if any(identity not in persisted_by_id or persisted_by_id[identity] != entry
+                   for identity, entry in expected.items()):
+                raise MemoryBackupError("memory_journal_write_unverified")
+            return {identity: int(entry["sequence"]) for identity, entry in expected.items()}
         raise MemoryBackupError("memory_journal_write_conflict")
 
+    def append_deletion(self, event: Mapping[str, Any]) -> int:
+        result = self._append_deletion_batch([event])
+        return next(iter(result.values()))
+
     def flush_deletions(self, store: Any) -> int:
-        count = 0
+        pending = []
         for event in store.deletion_events():
-            if event.get("durabilityState") == "durable":
-                continue
-            sequence = self.append_deletion(event)
-            store.mark_deletion_durable(event["id"], sequence)
-            count += 1
-        return count
+            if not isinstance(event, Mapping):
+                raise MemoryBackupError("memory_deletion_event_invalid")
+            if event.get("durabilityState") != "durable":
+                pending.append(event)
+        sequences = self._append_deletion_batch(pending)
+        # 네트워크, CAS와 검증 실패에서는 한 건도 local durable로 바꾸지 않는다.
+        for identity, sequence in sequences.items():
+            store.mark_deletion_durable(identity, sequence)
+        return len(sequences)
 
     def create_snapshot(self, store: Any, *, now: datetime | None = None) -> dict[str, Any]:
         self.flush_deletions(store)
