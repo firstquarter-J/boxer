@@ -171,6 +171,7 @@ def test_only_explicit_profanity_message_count_intent_is_parsed(question):
     assert query["authorIds"] == ["UDD123", "UMARU123"]
     assert query["period"] is not None
     assert query["periodError"] is None
+    assert query["includeDetails"] is False
 
 
 @pytest.mark.parametrize("question", [
@@ -182,6 +183,10 @@ def test_only_explicit_profanity_message_count_intent_is_parsed(question):
     "디디가 올해 욕한 메시지", "디디가 올해 욕했던 발언들", "디디가 올해 한 욕 기록",
     "모대야 디디가 올해 한 욕", "<@UDD123>가 올해 한 욕", "디디가 올해 한 욕들?",
     "디디가 올해 내뱉은 욕！", "디디가 올해 사용한 욕 표현\n",
+    "디디가 올해 한 욕 날짜순으로", "디디가 올해 한 욕 날짜랑 시간순으로 주제별로",
+    "디디가 올해 욕한 메시지 시간순서대로", "디디가 올해 한 욕 주제별로 보여줘",
+    "디디가 올해 한 욕을 시간순으로", "디디가 올해 한 욕을 날짜와 시간순으로 주제별로",
+    "디디가 올해 한 욕 목록도 날짜시간순으로 주제별로",
 ])
 def test_spoken_profanity_lookup_uses_the_same_stored_message_contract(question):
     # 숫자를 묻지 않아도 발언 조회는 검색 상위 몇 건과 모델 추정으로 빠지면 안 된다.
@@ -190,6 +195,7 @@ def test_spoken_profanity_lookup_uses_the_same_stored_message_contract(question)
     assert query["authorIds"] == ["UDD123"] and query["unit"] == "messages"
     assert query["period"]["startAtKst"] == "2026-01-01T00:00:00+09:00"
     assert query["periodError"] is None
+    assert query["includeDetails"] is True
 
 
 @pytest.mark.parametrize("question", [
@@ -214,6 +220,9 @@ def test_spoken_profanity_lookup_uses_the_same_stored_message_contract(question)
     "예시 디디가 올해 한 욕", "문자열=디디가 올해 한 욕",
     "제목을 디디가 올해 한 욕", "디디가 올해 안 한 욕", "디디가 올해 못 했던 욕",
     "디디가 올해 쓰려고 한 욕", "디디가 올해 사용하기 위해 한 욕",
+    "제목: 디디가 올해 한 욕 시간순으로", "디디가 올해 안 한 욕 주제별로",
+    "디디가 올해 쓰려고 한 욕 날짜순으로",
+    "제목: 디디가 올해 한 욕을 시간순으로", "디디가 올해 안 한 욕을 주제별로",
 ])
 def test_summary_general_words_and_policy_threshold_questions_are_not_count_requests(question):
     assert parse_conversation_count_query(question, NOW, ["UDD123"]) is None

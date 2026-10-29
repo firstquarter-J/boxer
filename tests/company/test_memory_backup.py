@@ -1,17 +1,25 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
 import sqlite3
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from boxer_company.memory.backup import MemoryBackup, MemoryBackupError, MemoryBackupSettings
-from boxer_company.memory.contracts import canonical_digest, source_revision
+from boxer_company.memory.backup import (
+    MemoryBackup,
+    MemoryBackupError,
+    MemoryBackupSettings,
+)
+from boxer_company.memory.contracts import (
+    canonical_digest,
+    source_revision,
+)
 from boxer_company.memory.store import MemoryStore, initialize_memory_store
 
 
@@ -58,6 +66,17 @@ def backup():
     result = MemoryBackup(MemoryBackupSettings("bucket", "memory", "kms-key"), client=client)
     result.initialize_journal()
     return result, client
+
+
+def archive_source_text(store, text):
+    # 별도 원문도 기존 source와 import의 tenant FK로 묶어 snapshot에 포함한다.
+    with store._connection(write=True) as connection:
+        source = connection.execute("SELECT * FROM memory_sources WHERE tenant_id='T1' LIMIT 1").fetchone()
+        connection.execute("INSERT INTO memory_raw_imports VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           ("raw1", "T1", source["channel_id"], source["author_id"], "UOP", source["message_ts"],
+                            source["message_ts"], canonical_digest("raw1"), "completed", store._clock()))
+        connection.execute("INSERT INTO memory_source_texts VALUES(?,?,?,?,?)",
+                           ("T1", source["id"], "raw1", text, store._clock()))
 
 
 def event(event_id="delete-1"):
@@ -115,13 +134,13 @@ def test_flush_marks_durable_only_after_verified_remote_head():
 def test_snapshot_restore_replays_deletions_and_discards_pending_inputs(tmp_path):
     service, _ = backup()
     tmp_path.chmod(0o700)
-    original = SimpleNamespace(deletion_events=lambda: [], snapshot=lambda path: Path(path).write_bytes(b"old snapshot"))
+    original = SimpleNamespace(deletion_events=list, snapshot=initialize_memory_store)
     metadata = service.create_snapshot(original)
     service.append_deletion(event())
     operations = []
 
     def factory(path):
-        assert path.read_bytes() == b"old snapshot"
+        assert MemoryStore(path).health()
         return SimpleNamespace(
             apply_deletion_event=lambda e: operations.append(("delete", e["id"])),
             mark_deletion_durable=lambda *args: operations.append(("durable", args)),
@@ -194,6 +213,7 @@ def test_real_sqlite_restore_replays_later_deletions_without_resurrection(tmp_pa
         source={"messageTs": "1000.000001", "authorId": "U1", "authorKind": "human", "text": text,
                 "revisionHash": source_revision(text), "permalink": "https://test.slack.com/archives/C1/p1000000001"},
     )
+    archive_source_text(store, text)
     snapshot = service.create_snapshot(store)
     if removal == "forget":
         store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U1", memory_id=item["memoryId"], request_id="forget")
@@ -209,12 +229,13 @@ def test_real_sqlite_restore_replays_later_deletions_without_resurrection(tmp_pa
         assert db.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM memory_sources WHERE excerpt!=''").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM memory_items WHERE text!=''").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM memory_source_texts").fetchone()[0] == 0
 
 
 def test_restore_does_not_remove_another_process_destination_on_create_race(tmp_path):
     service, _ = backup()
     tmp_path.chmod(0o700)
-    metadata = service.create_snapshot(SimpleNamespace(deletion_events=lambda: [], snapshot=lambda path: Path(path).write_bytes(b"snapshot")))
+    metadata = service.create_snapshot(SimpleNamespace(deletion_events=list, snapshot=initialize_memory_store))
     target = tmp_path / "race.db"
 
     def racing_snapshot(path):
@@ -230,7 +251,7 @@ def test_restore_does_not_remove_another_process_destination_on_create_race(tmp_
 def test_restore_refuses_to_publish_when_deletion_head_advances_during_restore(tmp_path):
     service, _ = backup()
     tmp_path.chmod(0o700)
-    metadata = service.create_snapshot(SimpleNamespace(deletion_events=lambda: [], snapshot=lambda path: Path(path).write_bytes(b"snapshot")))
+    metadata = service.create_snapshot(SimpleNamespace(deletion_events=list, snapshot=initialize_memory_store))
     target = tmp_path / "stale.db"
 
     def racing_snapshot(path):
@@ -287,6 +308,7 @@ def test_operator_cli_deletes_exact_item_and_reports_remote_durability(tmp_path,
     assert output["state"] == "hidden" and output["durability"] == "durable"
     assert store.list_own_memories("T1", "C1", "U1") == []
     assert service.verify_journal()[0]["sequence"] == 2
+    assert all(event["durabilityState"] == "durable" for event in store.deletion_events())
 
 
 def test_redaction_survives_snapshot_from_before_forgotten_item_was_created(tmp_path):
@@ -319,3 +341,166 @@ def test_redaction_survives_snapshot_from_before_forgotten_item_was_created(tmp_
         payloads = [row[0] for row in db.execute("SELECT payload FROM memory_job_inputs")]
         assert payloads and all(text not in payload for payload in payloads)
         assert db.execute("SELECT COUNT(*) FROM memory_events WHERE deletion_kind='source_redaction'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2])
+def test_legacy_snapshot_is_migrated_only_in_staging_before_deletion_replay(tmp_path, legacy_version):
+    tmp_path.chmod(0o700)
+    service, client = backup()
+    store = MemoryStore(initialize_memory_store(tmp_path / "original.db"))
+    text = "앞으로 짧게 답해줘"
+    item = store.set_own_preference(tenant_id="T1", channel_id="C1", actor_id="U1", thread_ts="1000.000001",
+        current_message_ts="1000.000001", request_id="remember", topic_key="response_length", text="짧은 답변 선호",
+        source={"messageTs": "1000.000001", "authorId": "U1", "authorKind": "human", "text": text,
+                "revisionHash": source_revision(text), "permalink": "https://test.slack.com/archives/C1/p1000000001"})
+
+    def legacy_snapshot(path):
+        store.snapshot(path)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("DROP TABLE memory_raw_event_states")
+            if legacy_version == 1:
+                connection.execute("DROP TABLE memory_source_texts")
+                connection.execute("DROP TABLE memory_raw_imports")
+            connection.execute(f"PRAGMA user_version={legacy_version}")
+
+    metadata = service.create_snapshot(SimpleNamespace(deletion_events=store.deletion_events, snapshot=legacy_snapshot))
+    original_bytes = client.objects[metadata["key"]]["data"]
+    store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U1", memory_id=item["memoryId"], request_id="forget")
+    service.flush_deletions(store)
+    observed = {}
+
+    def factory(path):
+        with sqlite3.connect(path) as connection:
+            observed["version"] = connection.execute("PRAGMA user_version").fetchone()[0]
+            observed["items"] = connection.execute("SELECT COUNT(*) FROM memory_items WHERE text!=''").fetchone()[0]
+            assert connection.execute("SELECT COUNT(*) FROM memory_source_texts").fetchone()[0] == 0
+        return MemoryStore(path)
+
+    target = tmp_path / "restored.db"
+    service.restore_snapshot(metadata["key"], target, store_factory=factory)
+    assert observed == {"version": 3, "items": 1}
+    assert client.objects[metadata["key"]]["data"] == original_bytes
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("SELECT COUNT(*) FROM memory_items WHERE text!=''").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_events WHERE deletion_kind IS NOT NULL").fetchone()[0] == 2
+
+
+def test_snapshot_hash_failure_prevents_schema_migration_or_store_factory(tmp_path, monkeypatch):
+    from boxer_company.memory import backup as module
+
+    tmp_path.chmod(0o700)
+    service, client = backup()
+    store = MemoryStore(initialize_memory_store(tmp_path / "original.db"))
+    metadata = service.create_snapshot(store)
+    client.objects[metadata["key"]]["data"] += b"changed"
+    monkeypatch.setattr(module, "initialize_memory_store", lambda _: pytest.fail("hash 검증 전에 migration하면 안 돼"))
+    with pytest.raises(MemoryBackupError, match="snapshot_hash_mismatch"):
+        service.restore_snapshot(metadata["key"], tmp_path / "restored.db",
+                                 store_factory=lambda _: pytest.fail("hash 검증 전에 store를 열면 안 돼"))
+    assert not list(tmp_path.glob("*.restore-*"))
+
+
+def test_journal_validation_failure_prevents_schema_migration_or_store_factory(tmp_path, monkeypatch):
+    from boxer_company.memory import backup as module
+
+    tmp_path.chmod(0o700)
+    service, client = backup()
+    metadata = service.create_snapshot(MemoryStore(initialize_memory_store(tmp_path / "original.db")))
+    client.objects.pop("memory/journal/head.json")
+    monkeypatch.setattr(module, "initialize_memory_store", lambda _: pytest.fail("journal 검증 전에 migration하면 안 돼"))
+    with pytest.raises(MemoryBackupError, match="head_unavailable"):
+        service.restore_snapshot(metadata["key"], tmp_path / "restored.db",
+                                 store_factory=lambda _: pytest.fail("journal 검증 전에 store를 열면 안 돼"))
+    assert not list(tmp_path.glob("*.restore-*"))
+
+
+@pytest.mark.parametrize("version", [0, 999])
+def test_unsupported_snapshot_schema_fails_without_publishing_or_leaking_staging(tmp_path, version):
+    tmp_path.chmod(0o700)
+    service, _ = backup()
+
+    def unknown_snapshot(path):
+        initialize_memory_store(path)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(f"PRAGMA user_version={version}")
+
+    metadata = service.create_snapshot(SimpleNamespace(deletion_events=list, snapshot=unknown_snapshot))
+    target = tmp_path / "restored.db"
+    with pytest.raises(MemoryBackupError, match="schema_unsupported"):
+        service.restore_snapshot(metadata["key"], target,
+                                 store_factory=lambda _: pytest.fail("알 수 없는 schema는 열면 안 돼"))
+    assert not target.exists() and not list(tmp_path.glob("*.restore-*"))
+
+
+def test_raw_snapshot_unknown_edit_tombstone_survives_restore_before_any_source_exists(tmp_path):
+    tmp_path.chmod(0o700)
+    service, _ = backup()
+    store = MemoryStore(initialize_memory_store(tmp_path / "original.db"))
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_raw_imports VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           ("raw1", "T1", "C1", "U1", "UOP", "1000.000001", "1001.000001",
+                            canonical_digest("raw1"), "collecting", store._clock()))
+    snapshot = service.create_snapshot(store)
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts="1000.000001", event_type="changed", event_id="before-source")
+    assert service.flush_deletions(store) == 1
+    target = tmp_path / "restored.db"
+    service.restore_snapshot(snapshot["key"], target, store_factory=MemoryStore)
+    restored = MemoryStore(target)
+    with restored._connection() as connection:
+        assert not connection.execute("SELECT * FROM memory_sources").fetchall()
+        assert restored._source_deleted(connection, "T1", "C1", "1000.000001")
+
+
+@pytest.mark.parametrize("snapshot_version", [2, 3])
+def test_derived_purge_journal_replays_old_snapshot_without_deleting_raw_or_sources(tmp_path, snapshot_version):
+    from boxer_company.memory.derived_purge import operator_purge_derived
+
+    tmp_path.chmod(0o700)
+    service, _ = backup()
+    store = MemoryStore(initialize_memory_store(tmp_path / "original.db"))
+    text = "앞으로 짧게 답해줘"
+    item = store.set_own_preference(tenant_id="T1", channel_id="C1", actor_id="U1", thread_ts="1000.000001",
+        current_message_ts="1000.000001", request_id="remember", topic_key="response_length", text="짧은 답변 선호",
+        source={"messageTs": "1000.000001", "authorId": "U1", "authorKind": "human", "text": text,
+                "revisionHash": source_revision(text), "permalink": "https://test.slack.com/archives/C1/p1000000001"})
+    source_id = item["sources"][0]["sourceId"]
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_raw_imports VALUES('raw1','T1','C1','U1','UOP','1000.000001','1001.000001',?,'completed',0)", ("a" * 64,))
+        connection.execute("INSERT INTO memory_source_texts VALUES('T1',?,'raw1',?,0)", (source_id, text))
+
+    def snapshot(path):
+        store.snapshot(path)
+        if snapshot_version == 2:
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("DROP TABLE memory_raw_event_states")
+                connection.execute("PRAGMA user_version=2")
+
+    old = service.create_snapshot(SimpleNamespace(deletion_events=store.deletion_events, snapshot=snapshot))
+    arguments = {"tenant_id": "T1", "channel_ids": ["C1"], "operator_id": "UOP", "request_id": "derived1"}
+    assert operator_purge_derived(store, **arguments)["purgedItemCount"] == 1
+    assert service.flush_deletions(store) == 2
+    target = tmp_path / "restored-derived.db"
+    service.restore_snapshot(old["key"], target, store_factory=MemoryStore)
+    restored = MemoryStore(target)
+    with restored._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert tuple(connection.execute("SELECT text,topic_key,subject_user_id,status FROM memory_items").fetchone()) == ("", "", None, "deleted")
+        assert connection.execute("SELECT text FROM memory_source_texts").fetchone()[0] == text
+        assert tuple(connection.execute("SELECT excerpt,state FROM memory_sources").fetchone()) == (text, "current")
+        assert connection.execute("SELECT COUNT(*) FROM memory_events WHERE deletion_kind='source_redaction'").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_subjects").fetchone()[0] == 0
+    assert operator_purge_derived(restored, **arguments)["durability"] == "durable"
+    with pytest.raises(Exception, match="memory_derived_request_conflict"):
+        operator_purge_derived(restored, **{**arguments, "channel_ids": ["C1", "C2"]})
+
+
+def test_derived_journal_requires_fixed_scope_hash_and_never_contains_summary_text():
+    service, client = backup()
+    event = {"id": "derived", "tenantId": "T1", "scopeChannelId": "C1", "memoryId": "item1",
+             "eventType": "derived_purge_item", "requestId": "request1", "deletionKind": "derived_item",
+             "reasonCode": "a" * 64, "text": "지울 파생 요약"}
+    assert service.append_deletion(event) == 1
+    assert "지울 파생 요약" not in str(client.objects)
+    with pytest.raises(MemoryBackupError, match="memory_deletion_event_invalid"):
+        service.append_deletion({**event, "id": "bad-derived", "reasonCode": "not-a-hash"})

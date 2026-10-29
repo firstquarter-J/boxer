@@ -7,12 +7,19 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import Field
 
-from boxer_company.memory.contracts import MemoryError
 from boxer_company.memory.commands import parse_memory_command
+from boxer_company.memory.contracts import MemoryError
 from boxer_company_api.auth import CallerRegistry
 from boxer_company_api.memory_schemas import (
-    Identifier, MemoryCheckpointInput, MemoryChunkInput, MemoryContextInput,
-    MemoryInput, MemoryLiveResultInput, MemoryPullInput, MemorySourceEventInput,
+    Identifier,
+    MemoryCheckpointInput,
+    MemoryChunkInput,
+    MemoryContextInput,
+    MemoryInput,
+    MemoryLiveResultInput,
+    MemoryPullInput,
+    MemoryRawEventInput,
+    MemorySourceEventInput,
 )
 from boxer_company_api.memory_service import MemoryService
 from boxer_company_api.policies import validate_request_id, validate_traceparent
@@ -130,5 +137,29 @@ def create_memory_router(*, service: MemoryService, caller_registry: CallerRegis
         # 저장소 eventId는 삭제 journal의 내부 ID이며 noop이면 None이다. 전송 ACK는
         # 적용된 원요청 ID를 돌려줘야 Slack이 해당 outbox 항목만 지울 수 있다.
         return {"eventId": body.eventId, "invalidatedCount": result["invalidatedCount"]}
+
+    @router.post("/sources/raw")
+    def raw_source(request: Request, body: MemoryRawEventInput):
+        request_id = authorize(request, body.tenantId, body.actorId)
+        # 원문은 API 소유 DB에만 저장하며 추출 queue나 답변 runtime에 넣지 않는다.
+        from boxer_company.memory.raw_live import ingest_raw_event
+
+        if body.source is not None and body.actorId not in service.profiles():
+            raise CompanyApiProblem(status=403, code="caller_not_allowed", request_id=request_id)
+        source = body.source.model_dump(exclude_none=True) if body.source is not None else None
+        if source is not None:
+            source.pop("segmentStart", None)
+            source.pop("segmentEnd", None)
+        result = invoke(request_id, ingest_raw_event, store=service.store,
+                        tenant_id=body.tenantId, channel_id=body.channelId,
+                        actor_id=body.actorId, message_ts=body.messageTs,
+                        event_id=body.eventId, event_ts=body.eventTs,
+                        event_type=body.eventType, source=source)
+        if body.eventType != "created" and result["status"] != "stale":
+            # DB뿐 아니라 이미 준비된 답변의 원본 lease도 닫아 철회된 본문 재사용을 막는다.
+            invoke(request_id, service.invalidate_live_source, tenant_id=body.tenantId,
+                   channel_id=body.channelId, message_ts=body.messageTs, event_type=body.eventType,
+                   revision_hash=body.source.revisionHash if body.source is not None else None)
+        return result
 
     return router

@@ -7,9 +7,11 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from boxer_company.memory.live_limits import (
-    LIVE_BUNDLE_MAX_BYTES, LIVE_SOURCE_MAX_CHARS, LIVE_TOTAL_MAX_CHARS, live_bundle_size,
+    LIVE_BUNDLE_MAX_BYTES,
+    LIVE_SOURCE_MAX_CHARS,
+    LIVE_TOTAL_MAX_CHARS,
+    live_bundle_size,
 )
-
 
 Identifier = Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$")]
 SlackTs = Annotated[str, Field(pattern=r"^\d{10,16}\.\d{6}$")]
@@ -165,6 +167,36 @@ class MemorySourceEventInput(MemoryInput):
     eventType: Literal["changed", "deleted", "unavailable"]
     eventId: Identifier
     revisionHash: Digest | None = None
+
+
+class MemoryRawSourceInput(MemorySourceInput):
+    """자동 추출과 분리한 사람 원문 한 건의 transport 계약이다."""
+    threadTs: SlackTs
+    text: str = Field(min_length=1, max_length=40000, repr=False)
+
+
+class MemoryRawEventInput(MemoryInput):
+    tenantId: Identifier
+    channelId: Identifier
+    actorId: Identifier | None = None
+    messageTs: SlackTs
+    eventId: Identifier
+    eventTs: SlackTs
+    eventType: Literal["created", "changed", "deleted", "unavailable"]
+    source: MemoryRawSourceInput | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def validate_identity(self):
+        # 서비스 무효화는 actor 없이 받지만 새 본문은 실제 작성자의 동일 메시지만 받는다.
+        if self.eventType in {"created", "changed"}:
+            if (self.source is None or self.actorId != self.source.authorId
+                    or self.messageTs != self.source.messageTs or self.source.authorKind != "human"
+                    or self.source.deliveryVerified or self.source.segmentStart is not None
+                    or self.source.segmentEnd is not None):
+                raise ValueError("invalid raw source identity")
+        elif self.source is not None:
+            raise ValueError("invalidation cannot include source text")
+        return self
 
 
 class MemoryAnswerPartOutput(MemoryInput):

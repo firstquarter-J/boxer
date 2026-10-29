@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+
 import pytest
 
-from boxer_company.memory.contracts import MemoryError, canonical_digest, source_revision
-from boxer_company.memory.store import MemoryStore, initialize_memory_store
+from boxer_company.memory.contracts import (
+    MEMORY_SCHEMA_VERSION,
+    MemoryError,
+    canonical_digest,
+    source_revision,
+)
 from boxer_company.memory.policy import is_allowed_conversation_source
 from boxer_company.memory.presentation import extract_memory_citations, render_memory
+from boxer_company.memory.store import MemoryStore, initialize_memory_store
 
 
 @pytest.fixture
@@ -792,3 +798,410 @@ def test_source_event_before_first_upload_invalidates_in_memory_capture(state, e
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+
+
+def raw_import(store, *, tenant="T1", channel="C1", state="collecting", name="raw1",
+               start="1799999999.000001", cutoff="1800000001.000001"):
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_raw_imports(id,tenant_id,channel_id,author_id,operator_id,start_ts,"
+                           "cutoff_ts,manifest_digest,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (name, tenant, channel, "U1", "UOP", start, cutoff, canonical_digest(name), state, store._clock()))
+
+
+def attach_raw_text(store, source_id, *, text="원문 조회 보존용 문장"):
+    raw_import(store)
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_source_texts(tenant_id,source_id,import_id,text,stored_at) VALUES(?,?,?,?,?)",
+                           ("T1", source_id, "raw1", text, store._clock()))
+
+
+def test_schema1_migration_preserves_all_existing_rows_and_is_explicit_idempotent(state):
+    store, _ = state
+    publish(store)
+    with store._connection(write=True) as connection:
+        connection.execute("DROP TABLE memory_raw_event_states")
+        connection.execute("DROP TABLE memory_source_texts")
+        connection.execute("DROP TABLE memory_raw_imports")
+        connection.execute("PRAGMA user_version=1")
+        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        before = {table: connection.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+    # runtime은 구버전 DB를 자동 migration하지 않고 닫힌다.
+    with pytest.raises(MemoryError, match="storage_unhealthy"):
+        MemoryStore(store.path)
+    initialize_memory_store(store.path)
+    initialize_memory_store(store.path)
+    with store._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == MEMORY_SCHEMA_VERSION == 3
+        assert {table: connection.execute(f"SELECT * FROM {table}").fetchall() for table in tables} == before
+        assert connection.execute("SELECT COUNT(*) FROM memory_source_texts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_raw_imports").fetchone()[0] == 0
+    assert MemoryStore(store.path).health()
+
+
+def test_schema1_migration_rolls_back_partial_ddl_and_version_on_failure(state, monkeypatch):
+    from boxer_company.memory import store as module
+
+    store, _ = state
+    publish(store)
+    with store._connection(write=True) as connection:
+        connection.execute("DROP TABLE memory_raw_event_states")
+        connection.execute("DROP TABLE memory_source_texts")
+        connection.execute("DROP TABLE memory_raw_imports")
+        connection.execute("PRAGMA user_version=1")
+        sources = connection.execute("SELECT * FROM memory_sources").fetchall()
+    monkeypatch.setattr(module, "_RAW_SCHEMA", module._RAW_SCHEMA + "CREATE TABLE broken (;")
+    with pytest.raises(sqlite3.OperationalError):
+        initialize_memory_store(store.path)
+    with store._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert not connection.execute("SELECT name FROM sqlite_master WHERE name LIKE 'memory_raw_%' OR name='memory_source_texts'").fetchall()
+        assert connection.execute("SELECT * FROM memory_sources").fetchall() == sources
+
+
+def test_schema1_migration_rejects_an_unknown_database_even_with_claimed_version(tmp_path):
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    path = directory / "unknown.db"
+    path.touch(mode=0o600)
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated (id TEXT)")
+        connection.execute("PRAGMA user_version=1")
+    with pytest.raises(MemoryError, match="schema_unsupported"):
+        initialize_memory_store(path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == [("unrelated",)]
+
+
+def test_raw_source_text_tenant_foreign_keys_cannot_link_another_tenant_or_import(state):
+    store, _ = state
+    publish(store)
+    source_id = store.list_own_memories("T1", "C1", "U1")[0]["sources"][0]["sourceId"]
+    raw_import(store, tenant="T2")
+    with pytest.raises(sqlite3.IntegrityError), store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_source_texts(tenant_id,source_id,import_id,text,stored_at) VALUES(?,?,?,?,?)",
+                           ("T1", source_id, "raw1", "다른 tenant import는 사용할 수 없어", store._clock()))
+
+
+@pytest.mark.parametrize("event_type", ["changed", "deleted", "unavailable"])
+def test_source_invalidation_deletes_raw_text_in_the_same_transaction(state, event_type):
+    store, _ = state
+    publish(store)
+    source_id = store.list_own_memories("T1", "C1", "U1")[0]["sources"][0]["sourceId"]
+    attach_raw_text(store, source_id)
+    store.source_event(tenant_id="T1", channel_id="C1", message_ts=source()["messageTs"],
+                       event_type=event_type, event_id="raw-change")
+    with store._connection() as connection:
+        assert not connection.execute("SELECT * FROM memory_source_texts").fetchall()
+
+
+def test_new_source_revision_and_forgetting_item_remove_raw_text(state):
+    store, _ = state
+    publish(store)
+    item = store.list_own_memories("T1", "C1", "U1")[0]
+    attach_raw_text(store, item["sources"][0]["sourceId"])
+    edited = source("앞으로 자세히 답해줘", edited="1800000002.000001")
+    publish(store, capture(store, request="edited-capture"), [edited], lambda row: candidate(row, text="자세한 답변 선호"))
+    with store._connection(write=True) as connection:
+        assert not connection.execute("SELECT * FROM memory_source_texts").fetchall()
+        latest = connection.execute("SELECT id FROM memory_sources WHERE state='current'").fetchone()[0]
+        connection.execute("INSERT INTO memory_source_texts VALUES(?,?,?,?,?)", ("T1", latest, "raw1", edited["text"], store._clock()))
+    own = store.list_own_memories("T1", "C1", "U1")[0]
+    store.forget_item(tenant_id="T1", channel_id="C1", actor_id="U1", memory_id=own["memoryId"], request_id="forget-raw")
+    with store._connection() as connection:
+        assert not connection.execute("SELECT * FROM memory_source_texts").fetchall()
+
+
+@pytest.mark.parametrize("kind", ["source", "source_revision", "source_redaction", "item", "subject_topic"])
+def test_deletion_replay_also_erases_raw_text(state, kind):
+    store, _ = state
+    publish(store)
+    item = store.list_own_memories("T1", "C1", "U1")[0]
+    source_id = item["sources"][0]["sourceId"]
+    attach_raw_text(store, source_id)
+    store.apply_deletion_event({"id": "raw-delete", "tenantId": "T1", "scopeChannelId": "C1",
+        "deletionKind": kind, "sourceMessageId": source()["messageTs"], "sourceId": source_id,
+        "memoryId": item["memoryId"], "subjectId": "U1", "topicKeyHash": canonical_digest("response_length")})
+    with store._connection() as connection:
+        assert not connection.execute("SELECT * FROM memory_source_texts").fetchall()
+
+
+@pytest.mark.parametrize("event_type,kind", [("changed", "source_redaction"), ("deleted", "source"), ("unavailable", "source_redaction")])
+def test_unknown_event_in_approved_raw_snapshot_blocks_later_import_idempotently(state, event_type, kind):
+    store, _ = state
+    raw_import(store)
+    arguments = {"tenant_id": "T1", "channel_id": "C1", "message_ts": source()["messageTs"],
+                 "event_type": event_type, "event_id": "raw-before-source"}
+    result = store.source_event(**arguments)
+    assert result["eventId"] and store.source_event(**arguments)["eventId"] == result["eventId"]
+    with store._connection() as connection:
+        event_row = connection.execute("SELECT * FROM memory_events WHERE id=?", (result["eventId"],)).fetchone()
+        assert event_row["deletion_kind"] == kind and event_row["durability_state"] == "pending"
+        assert not connection.execute("SELECT * FROM memory_sources").fetchall()
+    upload(store, capture(store), [source()])
+    with store._connection() as connection:
+        assert not connection.execute("SELECT * FROM memory_sources").fetchall()
+        assert all(json.loads(row[0]) == [] for row in connection.execute("SELECT payload FROM memory_job_inputs"))
+
+
+@pytest.mark.parametrize("change", [
+    {"tenant_id": "T2"}, {"channel_id": "C2"}, {"message_ts": "1799999999.000000999"},
+    {"message_ts": "1800000001.000001001"},
+])
+def test_unknown_event_outside_approved_raw_scope_does_not_create_tombstones(state, change):
+    store, _ = state
+    raw_import(store)
+    result = store.source_event(**{"tenant_id": "T1", "channel_id": "C1", "message_ts": source()["messageTs"],
+                                   "event_type": "deleted", "event_id": "outside", **change})
+    assert result["eventId"] is None
+    with store._connection() as connection:
+        assert not connection.execute("SELECT * FROM memory_events").fetchall()
+
+
+@pytest.mark.parametrize("import_state", ["failed", "cancelled", "completed"])
+def test_unknown_event_only_uses_collecting_raw_imports(state, import_state):
+    store, _ = state
+    raw_import(store, state=import_state)
+    assert store.source_event(tenant_id="T1", channel_id="C1", message_ts=source()["messageTs"],
+                              event_type="changed", event_id="inactive")["eventId"] is None
+
+
+@pytest.mark.parametrize("message_ts", ["1799999999.000001", "1800000001.000001"])
+def test_raw_snapshot_unknown_event_window_includes_exact_decimal_endpoints(state, message_ts):
+    store, _ = state
+    raw_import(store)
+    assert store.source_event(tenant_id="T1", channel_id="C1", message_ts=message_ts,
+                              event_type="deleted", event_id="endpoint")["eventId"]
+
+
+def test_same_revision_changed_event_preserves_already_collected_raw_text(state):
+    store, _ = state
+    publish(store)
+    item = store.list_own_memories("T1", "C1", "U1")[0]
+    attach_raw_text(store, item["sources"][0]["sourceId"])
+    assert store.source_event(tenant_id="T1", channel_id="C1", message_ts=source()["messageTs"], event_type="changed",
+                              event_id="same-revision", revision_hash=source()["revisionHash"])["eventId"] is None
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_source_texts").fetchone()[0] == 1
+
+
+def test_cleanup_keeps_valid_explicit_raw_text_beyond_excerpt_expiry_and_never_injects_it(state):
+    store, clock = state
+    publish(store)
+    item = store.list_own_memories("T1", "C1", "U1")[0]
+    hidden = "원문 전용 문장은 요약과 모델 입력으로 자동 주입하지 않아"
+    attach_raw_text(store, item["sources"][0]["sourceId"], text=hidden)
+    assert hidden not in json.dumps(store.retrieval_candidates("T1", "C1", "U1", "x", "답변"), ensure_ascii=False)
+    clock[0] += 100 * 86400
+    assert store.cleanup()["sourceTextsRemoved"] == 0
+    with store._connection(write=True) as connection:
+        assert connection.execute("SELECT text FROM memory_source_texts").fetchone()[0] == hidden
+        assert connection.execute("SELECT excerpt FROM memory_sources").fetchone()[0] == ""
+        connection.execute("UPDATE memory_sources SET state='unavailable'")
+    assert store.cleanup()["sourceTextsRemoved"] == 1
+
+
+@pytest.mark.parametrize("kind", ["source", "source_redaction", "source_revision"])
+def test_cleanup_deletes_raw_text_when_only_the_revocation_journal_is_present(state, kind):
+    store, _ = state
+    publish(store)
+    item = store.list_own_memories("T1", "C1", "U1")[0]
+    source_id = item["sources"][0]["sourceId"]
+    attach_raw_text(store, source_id)
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,event_type,request_id,deletion_kind,"
+                           "source_id,source_message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                           ("journal-only", "T1", "C1", "source_deleted", "event1", kind, source_id,
+                            source()["messageTs"], store._clock()))
+    assert store.cleanup()["sourceTextsRemoved"] == 1
+
+
+def test_schema2_migration_preserves_raw_rows_and_requires_explicit_upgrade(state):
+    store, _ = state
+    publish(store)
+    source_id = store.list_own_memories("T1", "C1", "U1")[0]["sources"][0]["sourceId"]
+    attach_raw_text(store, source_id)
+    with store._connection(write=True) as connection:
+        connection.execute("DROP TABLE memory_raw_event_states")
+        connection.execute("PRAGMA user_version=2")
+        before = {table: connection.execute(f"SELECT * FROM {table}").fetchall()
+                  for table in ("memory_sources", "memory_source_texts", "memory_raw_imports", "memory_items", "memory_events")}
+    with pytest.raises(MemoryError, match="storage_unhealthy"):
+        MemoryStore(store.path)
+    initialize_memory_store(store.path)
+    with store._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert {table: connection.execute(f"SELECT * FROM {table}").fetchall() for table in before} == before
+        assert connection.execute("SELECT COUNT(*) FROM memory_raw_event_states").fetchone()[0] == 0
+
+
+def test_schema2_migration_rolls_back_watermark_table_and_version_on_failure(state, monkeypatch):
+    from boxer_company.memory import store as module
+
+    store, _ = state
+    with store._connection(write=True) as connection:
+        connection.execute("DROP TABLE memory_raw_event_states")
+        connection.execute("PRAGMA user_version=2")
+    monkeypatch.setattr(module, "_RAW_EVENT_SCHEMA", module._RAW_EVENT_SCHEMA + "CREATE TABLE broken (;")
+    with pytest.raises(sqlite3.OperationalError):
+        initialize_memory_store(store.path)
+    with store._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert not connection.execute("SELECT 1 FROM sqlite_master WHERE name='memory_raw_event_states'").fetchone()
+
+
+def test_raw_watermark_schema_has_nonnull_columns_compound_identity_and_health_guard(state):
+    store, _ = state
+    with store._connection(write=True) as connection:
+        columns = connection.execute("PRAGMA table_info(memory_raw_event_states)").fetchall()
+        assert [row["name"] for row in columns] == ["tenant_id", "channel_id", "message_ts", "event_ts", "revision_hash", "state"]
+        assert all(row["notnull"] for row in columns)
+        assert [row["name"] for row in columns if row["pk"]] == ["tenant_id", "channel_id", "message_ts"]
+        connection.execute("DROP TABLE memory_raw_event_states")
+    assert not store.health()
+
+
+def test_raw_only_scope_rejects_new_automatic_capture_and_explicit_preference_before_writing(state):
+    from boxer_company.memory.raw_policy import RAW_ONLY_START_TS
+
+    store, _ = state
+    arguments = {"tenant_id": "T19PA3EPL", "channel_id": "C0621TL2HSB", "actor_id": "U1",
+                 "thread_ts": RAW_ONLY_START_TS, "current_message_ts": RAW_ONLY_START_TS, "request_id": "raw-only"}
+    with pytest.raises(MemoryError, match="memory_raw_only_scope"):
+        store.create_capture(**arguments, channel_kind="private_channel", route="freeform")
+    with pytest.raises(MemoryError, match="memory_raw_only_scope"):
+        store.set_own_preference(**arguments, topic_key="response_length", text="짧은 답변 선호", source={})
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 0
+
+
+def test_raw_only_policy_cancels_existing_ready_job_before_any_model_input_is_read(state, monkeypatch):
+    from boxer_company.memory import store as module
+
+    store, _ = state
+    cap = capture(store)
+    upload(store, cap, [source()])
+    monkeypatch.setattr(module, "_raw_only_channel", lambda tenant, channel: tenant == "T1" and channel == "C1")
+    assert store.claim_job("must-not-call-model") is None
+    with store._connection() as connection:
+        assert connection.execute("SELECT state FROM memory_jobs").fetchone()[0] == "canceled"
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("operation", ["inputs", "stage", "complete"])
+def test_raw_only_policy_blocks_already_running_job_at_every_read_and_publication_stage(state, monkeypatch, operation):
+    from boxer_company.memory import store as module
+
+    store, _ = state
+    cap = capture(store)
+    upload(store, cap, [source()])
+    job = store.claim_job("worker")
+    identity = {"tenant_id": "T1", "job_id": job["jobId"], "claim_token": job["claimToken"]}
+    monkeypatch.setattr(module, "_raw_only_channel", lambda tenant, channel: channel == "C1")
+    with pytest.raises(MemoryError, match="memory_raw_only_scope"):
+        if operation == "inputs":
+            store.inputs(**identity)
+        elif operation == "stage":
+            store.stage_candidates(**identity, chunk_no=0, candidates=[])
+        else:
+            store.complete(**identity)
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("event_type", ["changed", "unavailable", "deleted"])
+def test_unknown_raw_only_events_block_only_deletions_and_never_a_later_normal_edit(state, event_type):
+    from boxer_company.memory.policy import normalize_source
+    from boxer_company.memory.raw_policy import RAW_ONLY_START_TS
+
+    store, _ = state
+    tenant, channel, stamp = "T19PA3EPL", "C0621TL2HSB", RAW_ONLY_START_TS
+    event = store.source_event(tenant_id=tenant, channel_id=channel, message_ts=stamp,
+                               event_type=event_type, event_id="unknown-raw-event")
+    with store._connection(write=True) as connection:
+        if event_type == "deleted":
+            assert event["eventId"] and store._source_deleted(connection, tenant, channel, stamp)
+        else:
+            assert event["eventId"] is None
+            assert not connection.execute("SELECT 1 FROM memory_events WHERE deletion_kind='source_redaction'").fetchone()
+            thread = store._thread(connection, tenant, channel, stamp, "private_channel")
+            normalized = normalize_source(source("새 정상 편집 본문", ts=stamp, channel=channel),
+                tenant_id=tenant, channel_id=channel, thread_ts=stamp, current_message_ts=stamp)
+            assert store._register_source(connection, tenant, thread, normalized)
+
+
+@pytest.mark.parametrize("stamp", ["1788188400.000001", "1793458800.000000", "1893456000.000001"])
+@pytest.mark.parametrize("channel", ["C0621TL2HSB", "C068FVD5V7Y"])
+def test_raw_only_channel_never_restarts_derived_capture_or_preference_outside_october(state, stamp, channel):
+    store, _ = state
+    arguments = {"tenant_id": "T19PA3EPL", "channel_id": channel, "actor_id": "U1",
+                 "thread_ts": stamp, "current_message_ts": stamp, "request_id": "all-period-raw-only"}
+    with pytest.raises(MemoryError, match="memory_raw_only_scope"):
+        store.create_capture(**arguments, channel_kind="private_channel", route="freeform")
+    with pytest.raises(MemoryError, match="memory_raw_only_scope"):
+        store.set_own_preference(**arguments, topic_key="response_length", text="짧은 답변 선호", source={})
+    with store._connection() as connection:
+        for table in ("memory_jobs", "memory_sources", "memory_items"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("stamp", ["1788188400.000001", "1793458800.000001"])
+def test_old_snapshot_non_october_job_is_canceled_by_channel_policy_without_reading_model_inputs(state, monkeypatch, stamp):
+    from boxer_company.memory import store as module
+
+    store, _ = state
+    channel, tenant = "C0621TL2HSB", "T19PA3EPL"
+    channel_policy = module._raw_only_channel
+    # 정책 전 snapshot에는 다른 달의 ready job도 있을 수 있지만 재기동 시 다시 모델에 넘기지 않는다.
+    monkeypatch.setattr(module, "_raw_only_channel", lambda *_: False)
+    cap = store.create_capture(tenant_id=tenant, channel_id=channel, actor_id="U1", thread_ts=stamp,
+        current_message_ts=stamp, request_id="old-snapshot-job", channel_kind="private_channel", route="freeform")
+    upload(store, cap, [source(channel=channel, ts=stamp)])
+    snapshot = store.path.with_name("old-ready-snapshot.db")
+    store.snapshot(snapshot)
+    monkeypatch.setattr(module, "_raw_only_channel", channel_policy)
+    restored = MemoryStore(snapshot, clock=store._clock)
+    assert restored.claim_job("must-not-call-model") is None
+    with restored._connection() as connection:
+        assert connection.execute("SELECT state FROM memory_jobs").fetchone()[0] == "canceled"
+        assert connection.execute("SELECT COUNT(*) FROM memory_job_inputs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 1
+
+
+def test_raw_only_channel_final_publication_guard_also_rejects_non_october_sources(state):
+    from boxer_company.memory.policy import normalize_source
+
+    store, _ = state
+    tenant, channel, stamp = "T19PA3EPL", "C068FVD5V7Y", "1793458800.000001"
+    normalized = normalize_source(source(ts=stamp, channel=channel), tenant_id=tenant, channel_id=channel,
+                                  thread_ts=stamp, current_message_ts=stamp)
+    with store._connection(write=True) as connection:
+        thread = store._thread(connection, tenant, channel, stamp, "private_channel")
+        assert store._register_source(connection, tenant, thread, normalized)
+        assert not store._publish_candidate(connection, tenant, thread, candidate(normalized), "late-publication")
+        assert connection.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 0
+
+
+def test_neighbor_channel_keeps_existing_capture_and_explicit_preference_behavior(state):
+    store, _ = state
+    tenant, channel, stamp = "T19PA3EPL", "CNEIGHBOR", "1793458800.000001"
+    cap = store.create_capture(tenant_id=tenant, channel_id=channel, actor_id="U1", thread_ts=stamp,
+        current_message_ts=stamp, request_id="neighbor-capture", channel_kind="private_channel", route="freeform")
+    assert cap["state"] == "collecting"
+    result = store.set_own_preference(tenant_id=tenant, channel_id=channel, actor_id="U1", thread_ts=stamp,
+        current_message_ts=stamp, request_id="neighbor-preference", topic_key="response_length", text="짧은 답변 선호",
+        source=source(channel=channel, ts=stamp))
+    assert result["status"] == "active" and result["topicKey"] == "response_length"
+
+
+@pytest.mark.parametrize("event_type", ["changed", "deleted", "unavailable"])
+@pytest.mark.parametrize("stamp", ["1788188400.000001", "1793458800.000001"])
+def test_channel_derivative_policy_does_not_expand_unknown_source_event_collection_window(state, event_type, stamp):
+    store, _ = state
+    result = store.source_event(tenant_id="T19PA3EPL", channel_id="C0621TL2HSB", message_ts=stamp,
+        event_type=event_type, event_id="outside-october-source")
+    assert result["eventId"] is None
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0

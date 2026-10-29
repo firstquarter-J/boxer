@@ -1,17 +1,18 @@
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 from slack_bolt import App
 
 from boxer.core import settings as s
 from boxer.core.utils import _validate_tokens
-from boxer_adapter_slack import settings as ss
-from boxer_adapter_slack.utils import _extract_question, _format_reply_text
 from boxer.observability.request_log import (
     _initialize_request_log_storage,
     _save_request_log_record,
 )
+from boxer_adapter_slack import settings as ss
+from boxer_adapter_slack.utils import _extract_question, _format_reply_text
 
 _SLACK_USER_NAME_CACHE: dict[tuple[str, str], str | None] = {}
 
@@ -378,6 +379,7 @@ def create_slack_app(
     message_handler: MessageHandler | None = None,
     *,
     message_change_handler: Callable[[dict[str, Any], dict[str, Any], Any], None] | None = None,
+    message_observer: Callable[[dict[str, Any], dict[str, Any], Any], Any] | None = None,
 ) -> App:
     ss.validate_slack_tokens()
     _validate_tokens(include_llm=False, include_data_sources=False)
@@ -390,6 +392,15 @@ def create_slack_app(
             logger.warning("Failed to initialize request log storage", exc_info=True)
     app = App(token=ss.SLACK_BOT_TOKEN, signing_secret=ss.SLACK_SIGNING_SECRET)
 
+    def observe_message(event: dict[str, Any], body: dict[str, Any] | None, client: Any) -> None:
+        if message_observer is None:
+            return
+        # 수신 원문 관찰은 본문 정리·subtype 분기보다 먼저 실행하고 응답 처리와 실패를 격리한다.
+        try:
+            message_observer(event, body or {}, client)
+        except Exception as exc:  # noqa: BLE001 - 확장 observer의 실패와 원문을 응답 처리에서 격리한다.
+            logger.warning("Message observer failed error_type=%s", type(exc).__name__)
+
     @app.event("app_mention")
     def handle_app_mention(
         event: dict[str, Any],
@@ -398,6 +409,7 @@ def create_slack_app(
         body: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
     ) -> None:
+        observe_message(event, body, client)
         raw_text = event.get("text") or ""
         text = raw_text.lower()
         user_id = event.get("user")
@@ -488,6 +500,7 @@ def create_slack_app(
         client,
         body: dict[str, Any] | None = None,
     ) -> None:
+        observe_message(event, body, client)
         subtype = str(event.get("subtype") or "").strip()
         if subtype in {"message_changed", "message_deleted"} and message_change_handler is not None:
             # 원문 변경 observer는 응답 생성과 분리하며 실패가 event 처리를 막지 않는다.

@@ -2,28 +2,42 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from decimal import Decimal, InvalidOperation
 import json
 import logging
 import os
 import re
 import threading
 import time
-from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
 import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import replace
+from decimal import Decimal, InvalidOperation
+from typing import Any
+from urllib.parse import urlsplit
 
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.memory.access import can_read_memory_source
-from boxer_company.memory.contracts import MAX_CHUNK_CHARS, canonical_digest, source_revision
-from boxer_company.memory.policy import is_allowed_conversation_source, is_safe_memory_text
 from boxer_company.memory.commands import parse_memory_command
+from boxer_company.memory.contracts import (
+    MAX_CHUNK_CHARS,
+    canonical_digest,
+    source_revision,
+)
+from boxer_company.memory.policy import (
+    is_allowed_conversation_source,
+    is_safe_memory_text,
+)
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
-from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
-from boxer_company_adapter_slack.memory_event_outbox import MemoryEventOutboxError, MemorySourceEventOutbox
 from boxer_company_adapter_slack.company_api_client import _serialize_context_entries
-
+from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
+from boxer_company_adapter_slack.memory_event_outbox import (
+    MemoryEventOutboxError,
+    MemorySourceEventOutbox,
+)
+from boxer_company_adapter_slack.raw_memory_transport import (
+    RawMemoryTransport,
+    raw_event_scope,
+)
 
 _TS = re.compile(r"^\d{1,20}(?:\.\d{1,9})?$")
 _CAPTURE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -124,6 +138,8 @@ class SlackConversationMemory:
             str(profile.get("user_id") or "") for profile in TEAM_MEMBER_PROFILES
             if profile.get("user_id")
         }
+        self._raw_transport = RawMemoryTransport(api, is_allowed=is_allowed,
+            profile_ids=lambda: self._profile_ids, client=lambda: self._bounded_client(.75))
 
     def context_for(self, payload: Mapping[str, Any], *, manage: bool = False) -> dict[str, Any] | None:
         actor = str(payload.get("user_id") or "")
@@ -376,6 +392,9 @@ class SlackConversationMemory:
         self._wake.set()
 
     def source_event(self, event: Mapping[str, Any], body: Mapping[str, Any], client: Any) -> bool:
+        # 승인된 원문 범위의 편집은 일반 기억의 unknown-source 무효화 경로로 보내지 않는다.
+        if raw_event_scope(event, body):
+            return self.raw_event(event, body, client)
         del client
         subtype = event.get("subtype")
         if subtype not in {"message_changed", "message_deleted"}:
@@ -405,18 +424,52 @@ class SlackConversationMemory:
         self.drain_source_events(limit=1)
         return True
 
-    def drain_source_events(self, *, limit: int = 25) -> int:
+    def observe_message(self, event: Mapping[str, Any], body: Mapping[str, Any], client: Any) -> bool:
+        # 편집/삭제는 기존 change handler 한 곳이 처리해 동일 event를 두 번 전송하지 않는다.
+        if event.get("subtype") in {"message_changed", "message_deleted"}:
+            return False
+        return self.raw_event(event, body, client)
+
+    def raw_event(self, event: Mapping[str, Any], body: Mapping[str, Any], client: Any) -> bool:
+        try:
+            staged = self._raw_transport.stage(event, body, client)
+            if staged is None:
+                return False
+            receipt, source = staged
+            if self.event_outbox is None:
+                raise MemoryEventOutboxError("memory_event_outbox_missing")
+            # 본문은 이 호출의 임시 인수에만 두고 영속 receipt에는 식별자와 hash만 남긴다.
+            self.event_outbox.enqueue(receipt)
+            self._event_status = "pending"
+            self._wake.set()
+        except Exception as exc:  # noqa: BLE001 - observer 실패는 원문 없이 격리해 기존 응답을 보존한다.
+            self._event_status = "degraded"
+            self.logger.warning("Conversation memory raw_event state=degraded stage=enqueue error_type=%s error_code=%s",
+                                type(exc).__name__, _event_error_code(exc))
+            return False
+        self.drain_source_events(raw_sources={receipt["eventId"]: source})
+        return True
+
+    def drain_source_events(self, *, limit: int = 25,
+                            raw_sources: Mapping[str, Mapping[str, Any] | None] | None = None) -> int:
         if self.event_outbox is None or not self._event_delivery_lock.acquire(blocking=False):
             return 0
         acknowledged = 0
         try:
             for event in self.event_outbox.pending(limit=limit):
-                response = self.api.call(_PREFIX + "/sources/events", event)
-                # HTTP 성공만으로 지우지 않고 exact event의 적용 확인을 받아야 한다.
-                if (response.get("eventId") != event["eventId"]
-                        or type(response.get("invalidatedCount")) is not int
-                        or response["invalidatedCount"] < 0):
-                    raise MemoryEventOutboxError("memory_source_event_ack_invalid")
+                if "rawEventType" in event:
+                    provided = raw_sources is not None and event["eventId"] in raw_sources
+                    response = self._raw_transport.deliver(event,
+                        source=raw_sources[event["eventId"]] if provided else None, source_provided=provided)
+                    if response.get("receiptEventId") != event["eventId"]:
+                        raise MemoryEventOutboxError("memory_source_event_ack_invalid")
+                else:
+                    response = self.api.call(_PREFIX + "/sources/events", event)
+                    # HTTP 성공만으로 지우지 않고 exact event의 적용 확인을 받아야 한다.
+                    if (response.get("eventId") != event["eventId"]
+                            or type(response.get("invalidatedCount")) is not int
+                            or response["invalidatedCount"] < 0):
+                        raise MemoryEventOutboxError("memory_source_event_ack_invalid")
                 self.event_outbox.acknowledge(event)
                 acknowledged += 1
             pending = self.event_outbox.pending_count()

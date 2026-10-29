@@ -32,6 +32,7 @@ from boxer_company.memory.conversation_count import (
     format_conversation_count_answer,
     parse_conversation_count_query,
 )
+from boxer_company.memory.conversation_history import format_conversation_history_answer
 from boxer_company.memory.live_limits import (
     LIVE_CACHE_MAX_BYTES,
     LIVE_RETRIEVAL_LEASE_SECONDS,
@@ -86,6 +87,15 @@ class MemoryService:
         self._live_generation = 0
         self._lock = threading.Lock()
 
+    def profiles(self) -> frozenset[str]:
+        """수집 transport도 일반 기억과 같은 서버 팀원 registry를 사용한다."""
+        if self._profiles is not None:
+            return self._profiles
+        from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
+
+        return frozenset(str(profile.get("user_id") or "") for profile in TEAM_MEMBER_PROFILES
+                         if profile.get("user_id"))
+
     def _count_query(self, request: CompanyAssistantRequest) -> dict[str, Any] | None:
         memory = request.memory_context or {}
         return parse_conversation_count_query(request.question, str(memory.get("currentMessageTs") or ""),
@@ -121,14 +131,17 @@ class MemoryService:
 
             try:
                 result = count_stored_messages(self.store, tenant_id=request.tenant_id,
-                    channel_id=memory["channelId"], author_id=query["authorIds"][0], period=query["period"])
+                    channel_id=memory["channelId"], author_id=query["authorIds"][0], period=query["period"],
+                    include_messages=query["includeDetails"])
                 result["authorDisplayName"] = get_registered_team_member_name(query["authorIds"][0]) or ""
                 outcome = "answered"
             except Exception as exc:  # noqa: BLE001 - DB 장애를 실제 횟수 0건이나 모델 추정으로 대체하지 않는다.
                 _LOG.warning("stored_conversation_count_failed error_type=%s", type(exc).__name__)
                 outcome = "failed"
+        # 숫자 질문은 집계를 유지하고 발언 조회는 같은 근거의 시간순 목록과 저장된 주제로 표현한다.
+        formatter = format_conversation_history_answer if query["includeDetails"] else format_conversation_count_answer
         return CompanyAssistantResult(route="company_conversation_count", outcome=outcome,
-            messages=(AssistantMessage(body=notice or format_conversation_count_answer(result)),), used_llm=False)
+            messages=(AssistantMessage(body=notice or formatter(result)),), used_llm=False)
 
     def stored_history_response(self, request: CompanyAssistantRequest, *, route: str = "company_freeform") -> CompanyAssistantResult | None:
         if not self._eligible(request) or parse_memory_command(request.question) is not None:
@@ -202,12 +215,7 @@ class MemoryService:
             return "degraded"
 
     def _profiled(self, actor_id: str | None) -> bool:
-        if self._profiles is None:
-            from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
-            profiles = frozenset(str(profile.get("user_id") or "") for profile in TEAM_MEMBER_PROFILES)
-        else:
-            profiles = self._profiles
-        return bool(actor_id and actor_id in profiles)
+        return bool(actor_id and actor_id in self.profiles())
 
     def _eligible(self, request: CompanyAssistantRequest, *, management: bool = False) -> bool:
         memory = request.memory_context or {}
@@ -472,6 +480,11 @@ class MemoryService:
                 or not self._eligible(request) or not is_safe_memory_text(request.question)):
             return result
         memory = request.memory_context or {}
+        from boxer_company.memory.raw_policy import is_raw_only_channel
+
+        # 원문 시범 기간이 끝나도 두 채널의 요약 추출을 다시 켜지 않는다.
+        if is_raw_only_channel(request.tenant_id, str(memory.get("channelId") or "")):
+            return result
         try:
             parts = answer_parts if answer_parts is not None else tuple(
                 message.body for message in result.messages if message.delivery_scope == "conversation")
@@ -542,6 +555,10 @@ class MemoryService:
             if command.action == "choose_preference":
                 return reply("답변 선호는 짧게·자세히·한국어·영어·결론 먼저 중에서 지정해줘", "needs_input")
             if command.action == "set_preference":
+                from boxer_company.memory.raw_policy import is_raw_only_channel
+
+                if is_raw_only_channel(request.tenant_id, memory["channelId"]):
+                    return reply("현재 이 채널은 원문 보존 모드라 선호나 요약 기억을 새로 추출하지 않아.", "needs_input")
                 permalink = memory.get("currentMessagePermalink")
                 source_text = memory.get("currentMessageText")
                 edited_at = memory.get("currentMessageEditedAt") or ""

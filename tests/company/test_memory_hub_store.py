@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import sqlite3
+from copy import deepcopy
+from unittest.mock import patch
 
 import pytest
 
 from boxer_company.memory.contracts import canonical_digest, source_revision
 from boxer_company.memory.store import MemoryStore, initialize_memory_store
-
 
 TENANT = "T19PA3EPL"
 HUB = "C068FVD5V7Y"
@@ -22,6 +22,12 @@ def store(tmp_path):
 
 
 def publish(store, channel, kind="private_channel", *, tenant=TENANT, preference=False):
+    # 읽기 경계는 원문 전환 전의 기억을 검증한다. fixture 생성 때만 이전 쓰기 정책을 사용한다.
+    with patch("boxer_company.memory.raw_policy.is_raw_only_channel", return_value=False):
+        return _publish_legacy(store, channel, kind, tenant=tenant, preference=preference)
+
+
+def _publish_legacy(store, channel, kind="private_channel", *, tenant=TENANT, preference=False):
     # 실제 capture·추출 publish 경로로 원본 채널 종류와 tenant를 DB에 고정한다.
     text = "앞으로 짧게 답해줘" if preference else "내가 안내문 검토를 맡았어"
     cap = store.create_capture(

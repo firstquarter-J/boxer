@@ -51,6 +51,11 @@ _QUERY_LOOKUP_END = re.compile(
     r"(?:(?:보여|알려|찾아|정리해)\s*(?:줘|주라|줄래|주세요|줄\s*수\s*있(?:어|을까))|"
     r"목록|모음|내역|뭐야|뭐였어|무엇이야)[?!.。！？]*\s*$"
 )
+# 발언 대상을 이미 명시한 질문은 정렬이나 주제별 형식만 붙여도 같은 목록 조회로 처리한다.
+_QUERY_DETAIL_END = re.compile(
+    r"(?:(?:날짜(?:와|랑)?\s*)?시간\s*순(?:서)?(?:대로|으로|로)?|"
+    r"날짜\s*순(?:서)?(?:대로|으로|로)?|주제\s*별(?:로)?)[?!.。！？]*\s*$"
+)
 _QUERY_SPOKEN_QUESTION = re.compile(
     r"(?:무슨|어떤)\s*욕(?:설|\s*표현)?\s*(?:을|를)?\s*(?:했|썼|내뱉었|사용했)"
     r"(?:어|지|니|는지)(?:\s*(?:알려|보여)\s*(?:줘|줄래|주세요))?[?!.。！？]*\s*$"
@@ -107,10 +112,22 @@ def parse_conversation_count_query(
     lookup_text = text
     for pattern in (_CODE, _QUOTED, _BLOCK_QUOTED):
         lookup_text = pattern.sub(" ", lookup_text)
+    # 출력 형식만 덧붙인 질문도 같은 명사구 경계를 재사용해 제목, 부정과 계획을 우회하지 않게 한다.
+    noun_text = lookup_text
+    has_modifier = False
+    for _ in range(4):
+        modifier = _QUERY_DETAIL_END.search(noun_text)
+        if modifier is None:
+            break
+        has_modifier = True
+        noun_text = noun_text[:modifier.start()].rstrip(" ,，")
+    if has_modifier:
+        # '한 욕을 시간순으로'의 목적격 조사도 제거한 뒤 동일한 발언 대상 문법으로 확인한다.
+        noun_text = re.sub(r"(?:을|를|도|은|는|만)\s*$", "", noun_text).rstrip()
     # 명사구 앞의 부정과 계획은 실제로 한 발언과 구분한다. 기존 명령형의 판정은 유지한다.
-    noun = _QUERY_SPOKEN_NOUN_END.search(lookup_text)
+    noun = _QUERY_SPOKEN_NOUN_END.search(noun_text)
     noun_lookup = noun and not _QUERY_NOUN_META.search(lookup_text) and not _QUERY_NOUN_UNSPOKEN_PREFIX.search(
-        lookup_text[:noun.start()])
+        noun_text[:noun.start()])
     lookup = not _QUERY_LOOKUP_TRANSFORM.search(lookup_text) and (
         (_QUERY_SPOKEN_SUBJECT.search(lookup_text) and _QUERY_LOOKUP_END.search(lookup_text))
         or _QUERY_SPOKEN_QUESTION.search(lookup_text)
@@ -123,6 +140,7 @@ def parse_conversation_count_query(
     error = live_query_period_error(question, before_ts)
     authors = list(dict.fromkeys(value for value in author_ids if isinstance(value, str) and _AUTHOR_ID.fullmatch(value)))
     return {"kind": CONVERSATION_COUNT_KIND, "unit": "messages", "classifierVersion": PROFANITY_CLASSIFIER_VERSION,
+            "includeDetails": bool(lookup),
             "authorIds": authors, "period": period, "periodError": error}
 
 
@@ -231,6 +249,9 @@ def format_conversation_count_answer(result: Mapping[str, Any]) -> str:
             or sum(counts[:2]) > counts[2] or counts[2] + counts[3] != counts[4]):
         return failure
     matched, ambiguous, scanned, unavailable, _ = counts
+    raw_count = result.get("storedRawMessageCount", 0)
+    if type(raw_count) is not int or not 0 <= raw_count <= scanned:
+        return failure
     # 발췌 원문을 그대로 출력하지 않고 명확한 일치 수와 일관된 유한 표시값만 받아들인다.
     expressions = result.get("matchedExpressions")
     if (not isinstance(expressions, list)
@@ -241,11 +262,14 @@ def format_conversation_count_answer(result: Mapping[str, Any]) -> str:
     if scanned == 0:
         answer = f"{label}, {target}판정할 저장 발췌가 없어 욕 표현이 확인된 메시지 수를 확인할 수 없어. 0회라는 뜻은 아니야."
     else:
-        answer = (f"{label}, {target}저장된 발췌 {scanned}건 중 욕 표현이 확인된 메시지는 {matched}건이야. "
+        material = "저장 원문 및 발췌" if raw_count else "저장된 발췌"
+        answer = (f"{label}, {target}{material} {scanned}건 중 욕 표현이 확인된 메시지는 {matched}건이야. "
                   f"애매한 인용이나 설명 {ambiguous}건은 합계에서 제외했어. "
                   "한 메시지에 여러 표현이 있어도 1건으로 셌어. 전체 대화의 욕설 횟수는 아니야.")
     if matched:
         answer += "\n확인된 욕 표현: " + ", ".join(f"`{value}`" for value in sorted(set(expressions))) + "."
     if unavailable:
         answer += f" 판정에 쓸 수 있는 발췌가 없는 저장 메시지 {unavailable}건은 제외했어."
+    if raw_count:
+        answer += f" 명시적으로 보존한 원문 {raw_count}건을 포함했어."
     return answer

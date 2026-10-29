@@ -10,7 +10,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from boxer_company.memory.live_limits import LIVE_REQUEST_MAX_BYTES
 from boxer_company_api.problems import CompanyApiProblem, problem_response
 
-_LIVE_UPLOAD_PATH = re.compile(r"/internal/v1/memory/retrievals/[^/]+/live/?")
+_LIVE_UPLOAD_PATH = re.compile(r"/internal/v1/memory/(?:retrievals/[^/]+/live|sources/raw)/?")
 
 
 class MemoryLiveRequestBodyLimitMiddleware:

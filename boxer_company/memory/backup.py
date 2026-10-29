@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
+import sqlite3
 import tempfile
-from typing import Any, Callable, Mapping
 import uuid
+from contextlib import closing
+from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
-from .contracts import canonical_digest
+from .contracts import MEMORY_SCHEMA_VERSION, canonical_digest
+from .store import initialize_memory_store
 
 
 class MemoryBackupError(RuntimeError):
@@ -143,10 +146,28 @@ class MemoryBackup:
 
     def append_deletion(self, event: Mapping[str, Any]) -> int:
         # 본문 없는 tombstone 필드만 journal에 나간다. 실수로 text가 섞여도 저장하지 않는다.
-        allowed = {"id", "tenantId", "scopeChannelId", "memoryId", "sourceId", "eventType", "actorId", "requestId", "deletionKind", "subjectId", "topicKeyHash", "sourceMessageId", "cutoffAt", "reallowRequestId", "createdAt"}
+        allowed = {"id", "tenantId", "scopeChannelId", "memoryId", "sourceId", "eventType", "actorId", "requestId", "deletionKind", "subjectId", "topicKeyHash", "sourceMessageId", "cutoffAt", "reallowRequestId", "createdAt", "reasonCode", "expectedItemCount"}
         payload = {key: value for key, value in event.items() if key in allowed}
-        if not payload.get("id") or not payload.get("tenantId") or payload.get("deletionKind") not in {"item", "source", "source_revision", "source_redaction", "subject_topic"}:
+        # 새 metadata 필드는 검증하는 두 전용 kind에만 허용해 기존 이벤트에 임의 본문이 섞이지 않게 한다.
+        if payload.get("deletionKind") not in {"derived_item", "raw_state"}:
+            payload.pop("reasonCode", None)
+        if payload.get("deletionKind") != "derived_item" or payload.get("eventType") != "derived_purge_scope":
+            payload.pop("expectedItemCount", None)
+        if not payload.get("id") or not payload.get("tenantId") or payload.get("deletionKind") not in {"item", "source", "source_revision", "source_redaction", "subject_topic", "derived_item", "raw_state"}:
             raise MemoryBackupError("memory_deletion_event_invalid")
+        if payload["deletionKind"] == "derived_item" and not re.fullmatch(r"[a-f0-9]{64}", str(payload.get("reasonCode") or "")):
+            raise MemoryBackupError("memory_deletion_event_invalid")
+        if payload.get("eventType") == "derived_purge_scope" and (type(payload.get("expectedItemCount")) is not int
+                or not 0 <= payload["expectedItemCount"] < 2**63):
+            raise MemoryBackupError("memory_deletion_event_invalid")
+        if payload["deletionKind"] == "raw_state":
+            from .contracts import MemoryError
+            from .raw_state import parse_raw_state_event
+
+            try:
+                parse_raw_state_event(payload)
+            except MemoryError as exc:
+                raise MemoryBackupError("memory_deletion_event_invalid") from exc
         for _ in range(5):
             head, etag = self._read_head()
             verified_head, existing = self.verify_journal()
@@ -241,6 +262,11 @@ class MemoryBackup:
                 output.write(data)
                 output.flush()
                 os.fsync(output.fileno())
+            # 검증한 snapshot의 격리 사본만 명시 migration하고, 이후 삭제 journal을 재적용한다.
+            with closing(sqlite3.connect(staging.as_uri() + "?mode=rw", uri=True)) as connection:
+                if connection.execute("PRAGMA user_version").fetchone()[0] not in {1, 2, MEMORY_SCHEMA_VERSION}:
+                    raise MemoryBackupError("memory_snapshot_schema_unsupported")
+            initialize_memory_store(staging)
             store = store_factory(staging)
             for event in events:
                 store.apply_deletion_event(event["event"])

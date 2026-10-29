@@ -44,25 +44,28 @@ def add_source(store, *, excerpt="씨발 피곤하다", tenant=TENANT, channel=C
     return identity
 
 
-def add_item(store, source_id, *, text="회의 담당이야", name="item1"):
+def add_item(store, source_id, *, text="회의 담당이야", name="item1", topic="회의 담당",
+             span=None, status="active", valid_until=None):
     # 실제 채택 인용과 달리 요약 text는 집계 입력으로 쓰면 안 된다.
     with store._connection(write=True) as connection:
         source = connection.execute("SELECT * FROM memory_sources WHERE id=?", (source_id,)).fetchone()
         connection.execute("INSERT INTO memory_items(id,tenant_id,scope_channel_id,origin_thread_id,kind,category,subject_user_id,"
-                           "topic_key,text,evidence_type,valid_from,observed_at,updated_at,extractor_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           "topic_key,text,evidence_type,valid_from,observed_at,updated_at,extractor_version,status,valid_until) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (name, source["tenant_id"], source["channel_id"], source["thread_id"], "person", "fact", source["author_id"],
-                            "회의 담당", text, "self_statement", 0, 0, 0, "test"))
+                            topic, text, "self_statement", 0, 0, 0, "test", status, valid_until))
         connection.execute("INSERT INTO memory_item_sources(tenant_id,memory_id,source_id,relation,evidence_span) VALUES(?,?,?,'supports',?)",
-                           (source["tenant_id"], name, source_id, source["excerpt"]))
+                           (source["tenant_id"], name, source_id, source["excerpt"] if span is None else span))
         return store._item(connection, connection.execute("SELECT * FROM memory_items WHERE id=?", (name,)).fetchone())
 
 
-def count(store, *, tenant=TENANT, channel=CHANNEL, author=AUTHOR, period=None):
+def count(store, *, tenant=TENANT, channel=CHANNEL, author=AUTHOR, period=None, include_messages=False):
     return count_stored_messages(store, tenant_id=tenant, channel_id=channel, author_id=author,
-                                 period=PERIOD if period is None else period)
+                                 period=PERIOD if period is None else period, include_messages=include_messages)
 
 
-def test_count_reads_existing_tables_without_creating_state_or_writing_source_text(store, monkeypatch):
+@pytest.mark.parametrize("include_messages", [False, True])
+def test_count_reads_existing_tables_without_creating_state_or_writing_source_text(store, monkeypatch, include_messages):
     add_source(store)
     statements = []
     connect = sqlite3.connect
@@ -73,7 +76,7 @@ def test_count_reads_existing_tables_without_creating_state_or_writing_source_te
         return connection
 
     monkeypatch.setattr(sqlite3, "connect", traced)
-    result = count(store)
+    result = count(store, include_messages=include_messages)
     assert result["status"] == "stored" and result["scope"] == "stored_excerpts"
     assert result["matchedMessageCount"] == result["scannedMessageCount"] == 1
     assert result["matchedExpressions"] == ["씨발"]
@@ -291,3 +294,222 @@ def test_forgetting_one_item_preserves_other_confirmed_facts_from_the_same_sourc
     # 발췌의 재사용은 막아도 같은 출처를 공유하는 다른 확정 사실까지 잊지는 않는다.
     assert count(store)["eligibleStoredMessageCount"] == 0
     assert store.load_stored_items(tenant_id=TENANT, channel_id=CHANNEL, candidates=[remaining]) == [remaining]
+
+
+def test_message_details_are_opt_in_and_only_quote_actual_matched_stored_excerpt(store):
+    excerpt = "씨발 존나 회의 피곤하다"
+    source_id = add_source(store, excerpt=excerpt, raw="원문 전문은 저장하지 않아")
+    add_item(store, source_id, text="요약의 별도 표현인 지랄은 인용하지 않아", topic="회의")
+    add_source(store, excerpt='"개새끼"라는 단어의 뜻', stamp="1792100002.000001")
+    plain = count(store)
+    result = count(store, include_messages=True)
+    assert {key: value for key, value in result.items()
+            if key not in {"matchedMessages", "messageLimit", "messagesTruncated"}} == plain
+    assert result["matchedMessages"] == [{"messageTs": STAMP, "excerpt": excerpt,
+                                         "matchedExpressions": ["씨발", "존나"], "topic": "회의"}]
+    assert result["messageLimit"] == 20 and result["messagesTruncated"] is False
+
+
+def test_details_keep_decimal_time_and_separate_same_time_private_channels_in_stable_order(store):
+    tenant, hub = "T19PA3EPL", "C068FVD5V7Y"
+    # 삽입 순서와 문자열 정렬 대신 정확한 시각, 원채널, 출처 ID 순서를 사용한다.
+    for channel, stamp, excerpt in (("CZ", STAMP, "씨발 늦은 채널"),
+                                    ("CA", "1792100000.999999999", "존나 앞선 시각"),
+                                    ("CA", STAMP, "지랄 같은 시각")):
+        add_source(store, tenant=tenant, channel=channel, stamp=stamp, excerpt=excerpt)
+    result = count(store, tenant=tenant, channel=hub, include_messages=True)
+    assert [item["excerpt"] for item in result["matchedMessages"]] == [
+        "존나 앞선 시각", "지랄 같은 시각", "씨발 늦은 채널"]
+    assert result["matchedMessageCount"] == 3 and result["messagesTruncated"] is False
+
+
+def test_details_limit_is_applied_after_valid_matches_and_preserves_full_count(store):
+    for index in reversed(range(22)):
+        add_source(store, stamp=f"179210{index:04d}.000001", excerpt=f"씨발 회의 {index}")
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == 22 and result["messageLimit"] == 20
+    assert len(result["matchedMessages"]) == 20 and result["messagesTruncated"] is True
+    assert [item["messageTs"] for item in result["matchedMessages"]] == [
+        f"179210{index:04d}.000001" for index in range(20)]
+
+
+def test_unsafe_excerpt_is_omitted_from_details_without_changing_counts_and_safe_excerpt_is_bounded(store):
+    add_source(store, excerpt="씨발 비밀번호는 여기에 쓰지 마")
+    excerpt = "존나 피곤하다 " + "가" * 1100
+    add_source(store, excerpt=excerpt, stamp="1792100002.000001")
+    plain = count(store)
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == plain["matchedMessageCount"] == 2
+    assert len(result["matchedMessages"]) == 1 and result["messagesTruncated"] is True
+    assert result["matchedMessages"][0]["excerpt"] == excerpt[:1000]
+
+
+def test_long_excerpt_is_omitted_when_the_display_prefix_cannot_prove_every_matched_expression(store):
+    add_source(store, excerpt="씨발 " + "가" * 1000 + " 존나 피곤해")
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == 1 and result["matchedExpressions"] == ["씨발", "존나"]
+    assert result["matchedMessages"] == [] and result["messagesTruncated"] is True
+
+
+@pytest.mark.parametrize("status,until,expected", [
+    ("active", None, "회의"), ("resolved", None, "회의"), ("active", float(CUTOFF) + 1, "회의"),
+    ("active", float(CUTOFF), None), ("expired", None, None), ("conflicted", None, None),
+    ("observing", None, None), ("deleted", None, None),
+])
+def test_topic_only_uses_current_active_or_resolved_unexpired_items(store, status, until, expected):
+    add_item(store, add_source(store), topic="회의", status=status, valid_until=until)
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] == expected
+
+
+@pytest.mark.parametrize("span,topic", [
+    ("내일 회의야", "회의"), ("씨발 저장되지 않은 문장", "회의"), ("", "회의"),
+    ('"씨발"이라는 단어의 뜻', "회의"), ("씨발 피곤하다", "비밀번호"), ("씨발 피곤하다", "가" * 161),
+])
+def test_topic_requires_safe_matched_evidence_span_inside_the_actual_stored_excerpt(store, span, topic):
+    source = add_source(store, excerpt='씨발 피곤하다\n내일 회의야\n"씨발"이라는 단어의 뜻')
+    add_item(store, source, topic=topic, span=span, text="씨발 요약만으로 주제를 연결하지 않아")
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] is None
+
+
+def test_topic_requires_one_unique_candidate_even_when_multiple_items_share_the_source(store):
+    source = add_source(store)
+    add_item(store, source, name="item1", topic="회의")
+    add_item(store, source, name="item2", topic="회의")
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] == "회의"
+    add_item(store, source, name="item3", topic="퇴근")
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] is None
+
+
+def link_topic_source(store, source_id, *, name="item1", span=None):
+    with store._connection(write=True) as connection:
+        source = connection.execute("SELECT * FROM memory_sources WHERE id=?", (source_id,)).fetchone()
+        connection.execute("INSERT INTO memory_item_sources(tenant_id,memory_id,source_id,relation,evidence_span) "
+                           "VALUES(?,?,?,'supports',?)", (source["tenant_id"], name, source_id,
+                                                        source["excerpt"] if span is None else span))
+
+
+@pytest.mark.parametrize("other", [
+    {"channel": "COTHER"}, {"state": "deleted"}, {"state": "superseded"}, {"author_kind": "boxer"},
+    {"stamp": "1767193199.999999"}, {"stamp": "1792670000.000002"}, {"stamp": "1798729200.000000"},
+    {"edited": "1792670000.000002"}, {"excerpt": ""}, {"excerpt": "비밀번호는 쓰지 않아"},
+    {"stamp": "invalid-timestamp"},
+])
+def test_topic_is_rejected_when_any_other_related_source_breaks_scope_period_or_current_boundary(store, other):
+    source = add_source(store)
+    add_item(store, source, topic="회의")
+    related = add_source(store, **{"excerpt": "내일 회의야", "stamp": "1792100002.000001",
+                                 "author": "UOTHER", **other})
+    link_topic_source(store, related)
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == 1 and result["matchedMessages"][0]["topic"] is None
+
+
+@pytest.mark.parametrize("kind", ["source", "source_redaction", "source_revision"])
+def test_topic_cannot_reappear_through_another_source_with_a_journal_only_deletion(store, kind):
+    add_item(store, add_source(store), topic="회의")
+    related_stamp = "1792100002.000001"
+    related = add_source(store, excerpt="내일 회의야", stamp=related_stamp, author="UOTHER")
+    link_topic_source(store, related)
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,source_id,event_type,request_id,"
+                           "deletion_kind,source_message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                           ("evt1", TENANT, CHANNEL, related, "test", "event1", kind, related_stamp, 0))
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == 1 and result["matchedMessages"][0]["topic"] is None
+
+
+@pytest.mark.parametrize("kind", ["item", "subject_topic"])
+def test_topic_honors_item_and_subject_topic_deletion_journal_without_state_replay(store, kind):
+    add_item(store, add_source(store), topic="회의 담당")
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,memory_id,event_type,request_id,"
+                           "deletion_kind,subject_id,topic_key_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           ("evt1", TENANT, CHANNEL, "item1", "test", "event1", kind, AUTHOR,
+                            canonical_digest("회의담당"), 0))
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == 1 and result["matchedMessages"][0]["topic"] is None
+
+
+def test_topic_rejects_another_source_with_conflicting_current_decimal_revisions(store):
+    add_item(store, add_source(store), topic="회의")
+    related = add_source(store, excerpt="내일 회의야", stamp="1792100002.000001", author="UOTHER")
+    link_topic_source(store, related)
+    # 문자열은 달라도 같은 Decimal 시각의 충돌 revision이면 주제에 사용할 수 없다.
+    add_source(store, excerpt="회의는 취소야", stamp="1792100002.0000010", author="UOTHER")
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] is None
+
+
+def test_topic_revision_conflict_uses_the_same_final_journal_filter_as_message_counts(store):
+    add_item(store, add_source(store), topic="회의")
+    related = add_source(store, excerpt="내일 회의야", stamp="1792100002.000001", author="UOTHER")
+    link_topic_source(store, related)
+    old = add_source(store, excerpt="옛 회의 문장", stamp="1792100002.0000010", author="UOTHER")
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,source_id,event_type,request_id,"
+                           "deletion_kind,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                           ("evt1", TENANT, CHANNEL, old, "test", "event1", "source_revision", 0))
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] == "회의"
+
+
+def test_topic_does_not_cross_item_scope_or_a_corrupt_cross_tenant_source_link(store):
+    source = add_source(store)
+    add_item(store, add_source(store, channel="COTHER", excerpt="회의는 내일이야"), topic="다른 채널 주제")
+    link_topic_source(store, source)
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] is None
+    add_item(store, source, name="same-scope", topic="회의")
+    foreign = add_source(store, tenant="T2", excerpt="다른 회사 근거", author="UOTHER")
+    # 정상 FK로 만들 수 없는 옛 손상 관계도 tenant JOIN에서 누락시켜 주제만 거절한다.
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("INSERT INTO memory_item_sources(tenant_id,memory_id,source_id,relation,evidence_span) "
+                           "VALUES(?,?,?,'supports',?)", (TENANT, "same-scope", foreign, "다른 회사 근거"))
+    assert count(store, include_messages=True)["matchedMessages"][0]["topic"] is None
+
+
+@pytest.mark.parametrize("kind,expected", [("private_channel", "회의"), ("channel", None), ("dm", None), ("group_dm", None)])
+def test_hub_topic_checks_every_related_source_channel_kind(store, kind, expected):
+    tenant, hub = "T19PA3EPL", "C068FVD5V7Y"
+    add_item(store, add_source(store, tenant=tenant, channel=hub), topic="회의")
+    related = add_source(store, tenant=tenant, channel="COTHER", kind=kind, author="UOTHER", excerpt="회의는 내일이야")
+    link_topic_source(store, related)
+    assert count(store, tenant=tenant, channel=hub, include_messages=True)["matchedMessages"][0]["topic"] == expected
+
+
+def test_details_are_generated_after_conflicts_and_journal_deletions_are_final(store):
+    add_source(store)
+    add_source(store, excerpt="씨발 다른 revision", edited="1792100002.000001")
+    deleted = add_source(store, excerpt="존나 피곤하다", stamp="1792100003.000001")
+    with store._connection(write=True) as connection:
+        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,source_id,event_type,request_id,"
+                           "deletion_kind,source_message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                           ("evt1", TENANT, CHANNEL, deleted, "test", "event1", "source", "1792100003.000001", 0))
+    result = count(store, include_messages=True)
+    assert result["matchedMessageCount"] == 0 and result["matchedMessages"] == []
+    assert result["messagesTruncated"] is False
+
+
+def test_topic_relations_sources_and_journal_use_one_read_only_snapshot(store, monkeypatch):
+    add_item(store, add_source(store), topic="회의")
+    related = add_source(store, excerpt="회의는 내일이야", stamp="1792100002.000001", author="UOTHER")
+    link_topic_source(store, related)
+    connect = sqlite3.connect
+    statements, raced = [], False
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        def trace(statement):
+            nonlocal raced
+            statements.append(statement)
+            if not raced and statement.startswith("SELECT i.id AS memory_id"):
+                raced = True
+                executor.submit(store.source_event, tenant_id=TENANT, channel_id=CHANNEL,
+                                message_ts="1792100002.000001", event_type="deleted",
+                                event_id="topic-concurrent-delete").result(timeout=5)
+
+        def traced(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.set_trace_callback(trace)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", traced)
+        assert count(store, include_messages=True)["matchedMessages"][0]["topic"] == "회의"
+    assert raced and count(store, include_messages=True)["matchedMessages"][0]["topic"] is None
+    # 동시 삭제 writer 이외에 조회 자신은 쓰기나 요약 text 조회를 만들지 않는다.
+    assert not any("i.text" in statement for statement in statements)

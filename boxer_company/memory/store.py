@@ -17,12 +17,26 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .access import can_read_memory_source, is_private_memory_hub
 from .contracts import (
-    ELIGIBLE_ROUTES, EXTRACTOR_VERSION, MAX_CANDIDATES, MAX_CHUNK_CHARS,
-    MAX_CHUNK_SOURCES, MEMORY_SCHEMA_VERSION, PERSONAL_STYLE_TOPICS, MemoryError, canonical_digest,
+    ELIGIBLE_ROUTES,
+    EXTRACTOR_VERSION,
+    MAX_CANDIDATES,
+    MAX_CHUNK_CHARS,
+    MAX_CHUNK_SOURCES,
+    MEMORY_SCHEMA_VERSION,
+    PERSONAL_STYLE_TOPICS,
+    MemoryError,
+    canonical_digest,
 )
 from .live_query import is_within_live_query_period
-from .policy import (has_explicit_completion, is_safe_memory_text, normalize_source, normalize_topic_key,
-                     personal_style_text, standard_preference_value, validate_candidate)
+from .policy import (
+    has_explicit_completion,
+    is_safe_memory_text,
+    normalize_source,
+    normalize_topic_key,
+    personal_style_text,
+    standard_preference_value,
+    validate_candidate,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_threads (
@@ -106,6 +120,51 @@ CREATE INDEX IF NOT EXISTS memory_sources_message ON memory_sources(tenant_id,ch
 CREATE INDEX IF NOT EXISTS memory_jobs_due ON memory_jobs(state,next_attempt_at,lease_until);
 """
 
+# 명시 승인된 고정 범위의 조회 원문만 별도 보관한다. 요약과 추출 입력으로 사용하지 않는다.
+_RAW_SCHEMA = """
+-- 요약 테이블은 유지하고 승인된 조회 원문과 범위 manifest만 별도 연결한다.
+CREATE TABLE IF NOT EXISTS memory_raw_imports (
+ id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+ author_id TEXT NOT NULL, operator_id TEXT NOT NULL, start_ts TEXT NOT NULL, cutoff_ts TEXT NOT NULL,
+ manifest_digest TEXT NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL,
+ UNIQUE(tenant_id,id)
+);
+CREATE TABLE IF NOT EXISTS memory_source_texts (
+ tenant_id TEXT NOT NULL, source_id TEXT NOT NULL, import_id TEXT NOT NULL,
+ text TEXT NOT NULL, stored_at REAL NOT NULL,
+ PRIMARY KEY(tenant_id,source_id),
+ FOREIGN KEY(tenant_id,source_id) REFERENCES memory_sources(tenant_id,id),
+ FOREIGN KEY(tenant_id,import_id) REFERENCES memory_raw_imports(tenant_id,id)
+);
+CREATE INDEX IF NOT EXISTS memory_raw_imports_scope ON memory_raw_imports(tenant_id,channel_id,state);
+"""
+
+# 실시간 원문 이벤트의 최신 revision을 기록하되 추출 queue와 연결하지 않는다.
+_RAW_EVENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_raw_event_states (
+ tenant_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_ts TEXT NOT NULL,
+ event_ts TEXT NOT NULL, revision_hash TEXT NOT NULL, state TEXT NOT NULL,
+ PRIMARY KEY(tenant_id,channel_id,message_ts)
+);
+"""
+
+
+def _validate_legacy_schema(connection: sqlite3.Connection, version: int) -> None:
+    # user_version만 바꾼 다른 DB를 migration하지 않도록 기존 테이블과 tenant FK를 확인한다.
+    expected = sqlite3.connect(":memory:")
+    try:
+        forbidden = ("memory_raw_imports", "memory_source_texts", "memory_raw_event_states") if version == 1 else ("memory_raw_event_states",)
+        if any(connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+               for name in forbidden):
+            raise MemoryError("memory_schema_unsupported")
+        expected.executescript(_SCHEMA + (_RAW_SCHEMA if version == 2 else ""))
+        for (table,) in expected.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+            for pragma in ("table_info", "foreign_key_list"):
+                if connection.execute(f"PRAGMA {pragma}({table})").fetchall() != expected.execute(f"PRAGMA {pragma}({table})").fetchall():
+                    raise MemoryError("memory_schema_unsupported")
+    finally:
+        expected.close()
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -113,6 +172,19 @@ def _json(value: Any) -> str:
 
 def _iso(value: float) -> str:
     return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _raw_only_scope(tenant: str, channel: str, message_ts: str) -> bool:
+    # 원문 보존 정책은 회사 고정 범위만 판정하며 추출 모듈과의 import 순환을 피한다.
+    from .raw_policy import is_raw_only_scope
+
+    return is_raw_only_scope(tenant, channel, message_ts)
+
+
+def _raw_only_channel(tenant: str, channel: str) -> bool:
+    from .raw_policy import is_raw_only_channel
+
+    return is_raw_only_channel(tenant, channel)
 
 
 def _path(raw: str | Path, *, missing: bool = False) -> Path:
@@ -158,13 +230,19 @@ def initialize_memory_store(path: str | Path) -> Path:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {0, MEMORY_SCHEMA_VERSION}:
+        if version not in {0, 1, 2, MEMORY_SCHEMA_VERSION}:
             raise MemoryError("memory_schema_unsupported")
-        # 신규 파일과 이미 같은 schema인 파일만 허용하고 다른 SQLite를 덮지 않는다.
+        # 기존 v1/v2의 원문과 삭제 이력은 보존하고 실패하면 추가 DDL과 버전을 함께 되돌린다.
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if version == 0 and tables:
             raise MemoryError("memory_schema_unknown")
-        connection.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA + f"\nPRAGMA user_version={MEMORY_SCHEMA_VERSION};\nCOMMIT;")
+        if version in {1, 2}:
+            _validate_legacy_schema(connection, version)
+        connection.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA + _RAW_SCHEMA + _RAW_EVENT_SCHEMA + f"\nPRAGMA user_version={MEMORY_SCHEMA_VERSION};\nCOMMIT;")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
     finally:
         connection.close()
     return _path(target)
@@ -203,6 +281,10 @@ class MemoryStore:
     def health(self) -> bool:
         try:
             with self._connection() as connection:
+                # 런타임은 schema를 만들지 않는다. version만 올리고 빠뜨린 원문 테이블도 닫는다.
+                connection.execute("SELECT id,tenant_id,channel_id,author_id,operator_id,start_ts,cutoff_ts,manifest_digest,state,created_at FROM memory_raw_imports LIMIT 0")
+                connection.execute("SELECT tenant_id,source_id,import_id,text,stored_at FROM memory_source_texts LIMIT 0")
+                connection.execute("SELECT tenant_id,channel_id,message_ts,event_ts,revision_hash,state FROM memory_raw_event_states LIMIT 0")
                 return (connection.execute("PRAGMA user_version").fetchone()[0] == MEMORY_SCHEMA_VERSION
                         and connection.execute("PRAGMA quick_check").fetchone()[0] == "ok")
         except (OSError, sqlite3.Error, MemoryError):
@@ -270,6 +352,8 @@ class MemoryStore:
                 or not re.fullmatch(r"\d{1,20}\.\d{1,9}", current_message_ts)
                 or Decimal(current_message_ts) < Decimal(thread_ts)):
             raise MemoryError("capture_scope_invalid")
+        if _raw_only_channel(tenant_id, channel_id):
+            raise MemoryError("memory_raw_only_scope")
         now = self._clock()
         with self._connection(write=True) as connection:
             existing = connection.execute("SELECT * FROM memory_jobs WHERE tenant_id=? AND trigger_request_id=? AND extractor_version=?", (tenant_id, request_id, EXTRACTOR_VERSION)).fetchone()
@@ -307,6 +391,9 @@ class MemoryStore:
             rows = connection.execute("SELECT * FROM memory_jobs WHERE tenant_id=? AND state='collecting' AND lease_until<=? AND expires_at>? AND COALESCE(json_extract(metadata,'$.triggerKind'),'')!='history_import' ORDER BY created_at LIMIT ?", (tenant_id, now, now, min(50, max(1, limit)))).fetchall()
             results = []
             for row in rows:
+                if self._job_is_raw_only(connection, row):
+                    self._cancel_one_job(connection, row)
+                    continue
                 connection.execute("UPDATE memory_jobs SET lease_owner=?,claim_token=?,lease_until=? WHERE id=?", (worker_id, uuid.uuid4().hex, now + 120, row["id"]))
                 results.append(self._capture(connection, connection.execute("SELECT * FROM memory_jobs WHERE id=?", (row["id"],)).fetchone()))
             return results
@@ -321,7 +408,20 @@ class MemoryStore:
             raise MemoryError("memory_deletion_epoch_stale")
         if state == "running" and row["base_revision"] != thread["input_revision"]:
             raise MemoryError("memory_revision_stale")
+        if self._job_is_raw_only(connection, row):
+            raise MemoryError("memory_raw_only_scope")
         return row
+
+    def _job_is_raw_only(self, connection: sqlite3.Connection, job: sqlite3.Row) -> bool:
+        thread = connection.execute("SELECT channel_id FROM memory_threads WHERE tenant_id=? AND id=?",
+                                    (job["tenant_id"], job["thread_id"])).fetchone()
+        # 원문을 수집하지 않는 다른 달에도 같은 채널의 과거 job을 다시 추출하지 않는다.
+        return _raw_only_channel(job["tenant_id"], thread["channel_id"])
+
+    def _cancel_one_job(self, connection: sqlite3.Connection, job: sqlite3.Row) -> None:
+        connection.execute("UPDATE memory_jobs SET state='canceled',claim_token='',lease_until=0 WHERE id=?", (job["id"],))
+        connection.execute("DELETE FROM memory_job_inputs WHERE tenant_id=? AND capture_id=?", (job["tenant_id"], job["capture_id"]))
+        self._clear_job_context(connection, job["id"])
 
     def checkpoint(self, *, tenant_id: str, capture_id: str, claim_token: str, actor_id: str | None = None, cursor: str | None = None,
                    coverage: str | None = "partial", state: str | None = None, delivery_receipts: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
@@ -362,6 +462,8 @@ class MemoryStore:
             raw = connection.execute("SELECT * FROM memory_jobs WHERE tenant_id=? AND capture_id=?", (tenant_id, capture_id)).fetchone()
             if not raw or json.loads(raw["metadata"])["actorId"] != actor_id:
                 raise MemoryError("capture_actor_invalid")
+            if self._job_is_raw_only(connection, raw):
+                raise MemoryError("memory_raw_only_scope")
             prior = connection.execute("SELECT * FROM memory_job_inputs WHERE tenant_id=? AND capture_id=? AND chunk_no=?", (tenant_id, capture_id, chunk_no)).fetchone()
             if prior and prior["chunk_digest"] != digest:
                 raise MemoryError("memory_chunk_conflict")
@@ -379,6 +481,8 @@ class MemoryStore:
                 if normalized is None:
                     coverage = "partial"
                     continue
+                if _raw_only_channel(tenant_id, thread["channel_id"]):
+                    raise MemoryError("memory_raw_only_scope")
                 if normalized["authorKind"] == "boxer":
                     receipt = next((item for item in metadata["checkpoint"].get("deliveryReceipts", []) if item["messageTs"] == normalized["messageTs"] and item["authorId"] == normalized["authorId"] and item["textHash"] == canonical_digest(normalized["text"])), None)
                     if receipt is None:
@@ -493,9 +597,14 @@ class MemoryStore:
     def claim_job(self, worker_id: str, *, lease_seconds: int = 120) -> dict[str, Any] | None:
         now = self._clock()
         with self._connection(write=True) as connection:
-            row = connection.execute("SELECT j.* FROM memory_jobs j JOIN memory_threads t ON t.tenant_id=j.tenant_id AND t.id=j.thread_id WHERE j.expires_at>? AND j.attempts<3 AND j.deletion_epoch=t.deletion_epoch AND j.base_revision=t.input_revision AND ((j.state IN ('ready','retry') AND j.next_attempt_at<=?) OR (j.state='running' AND j.lease_until<=?)) ORDER BY j.created_at LIMIT 1", (now, now, now)).fetchone()
-            if not row:
-                return None
+            while True:
+                row = connection.execute("SELECT j.* FROM memory_jobs j JOIN memory_threads t ON t.tenant_id=j.tenant_id AND t.id=j.thread_id WHERE j.expires_at>? AND j.attempts<3 AND j.deletion_epoch=t.deletion_epoch AND j.base_revision=t.input_revision AND ((j.state IN ('ready','retry') AND j.next_attempt_at<=?) OR (j.state='running' AND j.lease_until<=?)) ORDER BY j.created_at LIMIT 1", (now, now, now)).fetchone()
+                if not row:
+                    return None
+                if not self._job_is_raw_only(connection, row):
+                    break
+                # 배포 전에 이미 대기하던 원문 전용 job도 모델 호출 전에 영구 취소한다.
+                self._cancel_one_job(connection, row)
             token = uuid.uuid4().hex
             connection.execute("UPDATE memory_jobs SET state='running',lease_owner=?,claim_token=?,lease_until=?,attempts=attempts+1 WHERE id=?", (worker_id, token, now + max(30, lease_seconds), row["id"]))
             capture = self._capture(connection, connection.execute("SELECT * FROM memory_jobs WHERE id=?", (row["id"],)).fetchone())
@@ -622,6 +731,8 @@ class MemoryStore:
         for ref in candidate["sources"]:
             source = connection.execute("SELECT * FROM memory_sources WHERE tenant_id=? AND id=? AND state='current'", (tenant, ref["sourceId"])).fetchone()
             if not source or source["channel_id"] != thread["channel_id"] or self._source_deleted(connection, tenant, thread["channel_id"], source["message_ts"]):
+                return False
+            if _raw_only_channel(tenant, source["channel_id"]):
                 return False
             source_rows.append(source)
         subject = candidate["subjectUserId"]
@@ -946,6 +1057,8 @@ class MemoryStore:
             return [self._item(connection, row) for row in rows]
 
     def _invalidate_source_items(self, connection: sqlite3.Connection, tenant: str, source_id: str, *, deleted: bool) -> int:
+        # 조회 원문은 출처 revision이 무효화되는 같은 transaction에서 제거한다.
+        connection.execute("DELETE FROM memory_source_texts WHERE tenant_id=? AND source_id=?", (tenant, source_id))
         ids = [row[0] for row in connection.execute("SELECT memory_id FROM memory_item_sources WHERE tenant_id=? AND source_id=?", (tenant, source_id))]
         for identity in ids:
             connection.execute("UPDATE memory_items SET status=?,text=CASE WHEN ? THEN '' ELSE text END,version=version+1,updated_at=? WHERE tenant_id=? AND id=?", ("deleted" if deleted else "conflicted", int(deleted), self._clock(), tenant, identity))
@@ -972,6 +1085,7 @@ class MemoryStore:
                     raise MemoryError("memory_event_scope_conflict")
                 return {"invalidatedCount": 0, "eventId": previous[0]["id"]}
             sources = connection.execute("SELECT * FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=?", (tenant_id, channel_id, message_ts)).fetchall()
+            known_message = bool(sources)
             if event_type == "changed" and revision_hash:
                 sources = [source for source in sources if source["revision_hash"] != revision_hash]
             pending = []
@@ -984,6 +1098,18 @@ class MemoryStore:
                 if collecting:
                     # 읽었지만 아직 전송하지 않은 원문도 오래된 capture token으로 저장하지 못한다.
                     self._cancel_scope_jobs(connection, tenant_id, channel_id)
+                raw_only = _raw_only_scope(tenant_id, channel_id, message_ts)
+                if not known_message and (raw_only or self._raw_import_covers(connection, tenant_id, channel_id, message_ts)):
+                    if raw_only and event_type != "deleted":
+                        # 새 편집 원문은 live writer가 최신 revision으로 보존한다. 메시지 전체 금지는 남기지 않는다.
+                        return {"invalidatedCount": 0, "eventId": None}
+                    # 원문 수집 전 도착한 수정/삭제도 승인 범위에만 기록해 옛 snapshot 재유입을 막는다.
+                    identity = "evt_" + uuid.uuid4().hex
+                    self._apply_event(connection, {"id": identity, "tenantId": tenant_id,
+                        "scopeChannelId": channel_id, "eventType": "source_" + event_type,
+                        "requestId": event_id, "deletionKind": "source" if event_type == "deleted" else "source_redaction",
+                        "sourceMessageId": message_ts, "cutoffAt": self._clock(), "durabilityState": "pending"})
+                    return {"invalidatedCount": 0, "eventId": identity}
                 # 이 endpoint는 새 source나 새 scope를 만드는 수집 경로가 아니다.
                 return {"invalidatedCount": 0, "eventId": None}
             count = 0
@@ -1000,6 +1126,15 @@ class MemoryStore:
             if pending or any(source["state"] == "current" for source in sources):
                 self._cancel_scope_jobs(connection, tenant_id, channel_id)
             return {"invalidatedCount": count, "eventId": identity}
+
+    def _raw_import_covers(self, connection: sqlite3.Connection, tenant: str, channel: str, message_ts: str) -> bool:
+        pattern = r"[0-9]{1,20}\.[0-9]{1,9}"
+        if not isinstance(message_ts, str) or not re.fullmatch(pattern, message_ts):
+            return False
+        stamp = Decimal(message_ts)
+        ranges = connection.execute("SELECT start_ts,cutoff_ts FROM memory_raw_imports WHERE tenant_id=? AND channel_id=? AND state='collecting'", (tenant, channel)).fetchall()
+        return any(re.fullmatch(pattern, row["start_ts"]) and re.fullmatch(pattern, row["cutoff_ts"])
+                   and Decimal(row["start_ts"]) <= stamp <= Decimal(row["cutoff_ts"]) for row in ranges)
 
     def _record_revision_invalidation(self, connection: sqlite3.Connection, source: Mapping[str, Any], request_id: str, *, event_type: str = "changed") -> str:
         identity = "evt_" + canonical_digest([source["tenant_id"], request_id, source["id"], event_type])
@@ -1064,6 +1199,8 @@ class MemoryStore:
                            current_message_ts: str, request_id: str, topic_key: str, text: str,
                            source: Mapping[str, Any]) -> dict[str, Any]:
         topic_key = normalize_topic_key(topic_key)
+        if _raw_only_channel(tenant_id, channel_id):
+            raise MemoryError("memory_raw_only_scope")
         if topic_key not in PERSONAL_STYLE_TOPICS or standard_preference_value(topic_key, text) is None or not is_safe_memory_text(text) or len(text) > 200:
             raise MemoryError("memory_preference_invalid")
         normalized = normalize_source(source, tenant_id=tenant_id, channel_id=channel_id, thread_ts=thread_ts, current_message_ts=current_message_ts)
@@ -1098,7 +1235,13 @@ class MemoryStore:
             return self._item(connection, row)
 
     def _event(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {"id": row["id"], "eventId": row["id"], "tenantId": row["tenant_id"], "scopeChannelId": row["scope_channel_id"], "memoryId": row["memory_id"], "sourceId": row["source_id"], "eventType": row["event_type"], "actorId": row["actor_id"], "requestId": row["request_id"], "deletionKind": row["deletion_kind"], "subjectId": row["subject_id"], "topicKeyHash": row["topic_key_hash"], "sourceMessageId": row["source_message_id"], "cutoffAt": row["cutoff_at"], "reallowRequestId": row["reallow_request_id"], "remoteSequence": row["remote_sequence"], "durabilityState": row["durability_state"], "createdAt": _iso(row["created_at"])}
+        result = {"id": row["id"], "eventId": row["id"], "tenantId": row["tenant_id"], "scopeChannelId": row["scope_channel_id"], "memoryId": row["memory_id"], "sourceId": row["source_id"], "eventType": row["event_type"], "actorId": row["actor_id"], "requestId": row["request_id"], "deletionKind": row["deletion_kind"], "subjectId": row["subject_id"], "topicKeyHash": row["topic_key_hash"], "sourceMessageId": row["source_message_id"], "cutoffAt": row["cutoff_at"], "reallowRequestId": row["reallow_request_id"], "remoteSequence": row["remote_sequence"], "durabilityState": row["durability_state"], "createdAt": _iso(row["created_at"])}
+        if row["deletion_kind"] in {"derived_item", "raw_state"}:
+            # 기존 journal payload는 바꾸지 않고 파생물 purge의 요청 범위 hash만 새 이벤트에 보존한다.
+            result["reasonCode"] = row["reason_code"]
+            if row["event_type"] == "derived_purge_scope":
+                result["expectedItemCount"] = row["from_version"]
+        return result
 
     def deletion_events(self, after_sequence: int = 0) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -1117,13 +1260,34 @@ class MemoryStore:
     def _apply_event(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> None:
         tenant, channel = str(event["tenantId"]), str(event["scopeChannelId"])
         identity = str(event.get("id") or event.get("eventId") or "")
-        if not identity or event.get("deletionKind") not in {"item", "subject_topic", "source", "source_revision", "source_redaction"}:
+        if not identity or event.get("deletionKind") not in {"item", "subject_topic", "source", "source_revision", "source_redaction", "derived_item", "raw_state"}:
             raise MemoryError("memory_deletion_event_invalid")
         existing = connection.execute("SELECT 1 FROM memory_events WHERE id=?", (identity,)).fetchone()
         if existing:
             return
-        if event["deletionKind"] == "source_redaction":
+        if event["deletionKind"] == "raw_state":
+            self._apply_raw_state(connection, event)
+        elif event["deletionKind"] == "derived_item":
+            if not re.fullmatch(r"[a-f0-9]{64}", str(event.get("reasonCode") or "")):
+                raise MemoryError("memory_derived_event_invalid")
+            if event.get("eventType") == "derived_purge_scope" and (type(event.get("expectedItemCount")) is not int
+                    or not 0 <= event["expectedItemCount"] < 2**63):
+                raise MemoryError("memory_derived_event_invalid")
+            memory_id = event.get("memoryId")
+            if memory_id is not None:
+                # 원문, source와 기존 명시 삭제 tombstone은 그대로 두고 파생된 값과 연결만 제거한다.
+                row = connection.execute("SELECT id FROM memory_items WHERE tenant_id=? AND scope_channel_id=? AND id=?",
+                                         (tenant, channel, memory_id)).fetchone()
+                if row:
+                    self._clear_derived_job_context(connection, tenant, memory_id)
+                    connection.execute("DELETE FROM memory_subjects WHERE tenant_id=? AND memory_id=?", (tenant, memory_id))
+                    connection.execute("DELETE FROM memory_item_sources WHERE tenant_id=? AND memory_id=?", (tenant, memory_id))
+                    connection.execute("UPDATE memory_items SET text='',topic_key='',subject_user_id=NULL,evidence_type='',status='deleted',version=version+1,updated_at=? WHERE tenant_id=? AND id=?",
+                                       (self._clock(), tenant, memory_id))
+            connection.execute("DELETE FROM memory_summaries WHERE tenant_id=? AND scope_channel_id=?", (tenant, channel))
+        elif event["deletionKind"] == "source_redaction":
             # 원본 재학습만 차단하며 같은 메시지에 근거한 다른 확정 사실은 보존한다.
+            connection.execute("DELETE FROM memory_source_texts WHERE tenant_id=? AND source_id IN (SELECT id FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=?)", (tenant, tenant, channel, event.get("sourceMessageId")))
             connection.execute("UPDATE memory_sources SET excerpt='' WHERE tenant_id=? AND channel_id=? AND message_ts=?", (tenant, channel, event.get("sourceMessageId")))
             connection.execute("UPDATE memory_item_sources SET evidence_span='' WHERE tenant_id=? AND source_id IN (SELECT id FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=?)", (tenant, tenant, channel, event.get("sourceMessageId")))
         elif event["deletionKind"] in {"source", "source_revision"}:
@@ -1147,12 +1311,60 @@ class MemoryStore:
                              "cutoffAt": event.get("cutoffAt", self._clock()), "durabilityState": event.get("durabilityState", "pending")}
                     self._apply_event(connection, child)
                 # 공유 source 전체를 지우지 않되, 잊은 문장이 포함될 수 있는 원문 snippet은 제거한다.
+                connection.execute("DELETE FROM memory_source_texts WHERE tenant_id=? AND source_id IN (SELECT source_id FROM memory_item_sources WHERE tenant_id=? AND memory_id=?)", (tenant, tenant, row["id"]))
                 connection.execute("UPDATE memory_sources SET excerpt='' WHERE tenant_id=? AND id IN (SELECT source_id FROM memory_item_sources WHERE tenant_id=? AND memory_id=?)", (tenant, tenant, row["id"]))
                 connection.execute("UPDATE memory_item_sources SET evidence_span='' WHERE tenant_id=? AND source_id IN (SELECT source_id FROM memory_item_sources WHERE tenant_id=? AND memory_id=?)", (tenant, tenant, row["id"]))
                 connection.execute("DELETE FROM memory_item_sources WHERE tenant_id=? AND memory_id=?", (tenant, row["id"]))
                 connection.execute("UPDATE memory_items SET text='',status='deleted',version=version+1,updated_at=? WHERE tenant_id=? AND id=?", (self._clock(), tenant, row["id"]))
-        self._cancel_scope_jobs(connection, tenant, channel)
-        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,memory_id,source_id,event_type,actor_id,request_id,deletion_kind,subject_id,topic_key_hash,source_message_id,cutoff_at,reallow_request_id,remote_sequence,durability_state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (identity, tenant, channel, event.get("memoryId"), event.get("sourceId"), str(event.get("eventType") or "restored_deletion"), event.get("actorId"), str(event.get("requestId") or identity), event["deletionKind"], event.get("subjectId"), event.get("topicKeyHash"), event.get("sourceMessageId"), event.get("cutoffAt", self._clock()), event.get("reallowRequestId"), event.get("remoteSequence"), str(event.get("durabilityState") or "durable"), self._clock()))
+        # scope marker를 먼저 재적용한 purge의 개별 item마다 전체 channel job을 반복 정리하지 않는다.
+        marker = event["deletionKind"] == "derived_item" and event.get("memoryId") is not None and connection.execute(
+            "SELECT 1 FROM memory_events WHERE tenant_id=? AND scope_channel_id=? AND request_id=? AND event_type='derived_purge_scope'",
+            (tenant, channel, event.get("requestId"))).fetchone()
+        if not marker:
+            self._cancel_scope_jobs(connection, tenant, channel)
+        connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,memory_id,source_id,event_type,actor_id,request_id,deletion_kind,subject_id,topic_key_hash,source_message_id,cutoff_at,reallow_request_id,remote_sequence,durability_state,created_at,reason_code,from_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (identity, tenant, channel, event.get("memoryId"), event.get("sourceId"), str(event.get("eventType") or "restored_deletion"), event.get("actorId"), str(event.get("requestId") or identity), event["deletionKind"], event.get("subjectId"), event.get("topicKeyHash"), event.get("sourceMessageId"), event.get("cutoffAt", self._clock()), event.get("reallowRequestId"), event.get("remoteSequence"), str(event.get("durabilityState") or "durable"), self._clock(), str(event.get("reasonCode") or ""), event.get("expectedItemCount")))
+
+    def _apply_raw_state(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> None:
+        from .raw_state import RAW_STATE_PRIORITY, parse_raw_state_event, raw_state_stamp
+
+        payload = parse_raw_state_event(event)
+        tenant, channel, message = event["tenantId"], event["scopeChannelId"], event["sourceMessageId"]
+        previous = connection.execute("SELECT * FROM memory_raw_event_states WHERE tenant_id=? AND channel_id=? AND message_ts=?",
+                                      (tenant, channel, message)).fetchone()
+        if previous:
+            prior_stamp = raw_state_stamp(previous["event_ts"])
+            incoming_stamp = raw_state_stamp(payload["eventTs"])
+            if (previous["state"] == "deleted" or incoming_stamp < prior_stamp
+                    or incoming_stamp == prior_stamp
+                    and (RAW_STATE_PRIORITY[payload["state"]] < RAW_STATE_PRIORITY[previous["state"]]
+                         or RAW_STATE_PRIORITY[payload["state"]] == RAW_STATE_PRIORITY[previous["state"]]
+                         and previous["revision_hash"] != payload["revisionHash"])):
+                return
+        sources = connection.execute("SELECT * FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=? AND state='current'",
+                                     (tenant, channel, message)).fetchall()
+        if any(raw_state_stamp(source["edited_at"] or source["message_ts"]) > raw_state_stamp(payload["eventTs"])
+               for source in sources):
+            # 더 최신 snapshot의 현재 본문과 watermark를 과거 journal 순서로 되돌리지 않는다.
+            return
+        for source in sources:
+            if payload["state"] == "current" and source["revision_hash"] == payload["revisionHash"]:
+                continue
+            # 새 본문은 journal에 저장하지 않는다. 일치하지 않는 이전 본문만 복원에서 제거한다.
+            deleted = payload["state"] == "deleted"
+            self._invalidate_source_items(connection, tenant, source["id"], deleted=deleted)
+            connection.execute("UPDATE memory_sources SET state=?,excerpt='' WHERE tenant_id=? AND id=?",
+                               ("deleted" if deleted else "unavailable", tenant, source["id"]))
+        connection.execute("""INSERT INTO memory_raw_event_states(tenant_id,channel_id,message_ts,event_ts,revision_hash,state)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(tenant_id,channel_id,message_ts) DO UPDATE SET
+            event_ts=excluded.event_ts,revision_hash=excluded.revision_hash,state=excluded.state""",
+            (tenant, channel, message, payload["eventTs"], payload["revisionHash"], payload["state"]))
+
+    def _clear_derived_job_context(self, connection: sqlite3.Connection, tenant: str, memory_id: str) -> None:
+        # 본인 선호가 다른 channel job의 이전 문맥에도 공유될 수 있어 그 사본까지 취소한다.
+        jobs = connection.execute("""SELECT DISTINCT j.* FROM memory_jobs j,json_each(j.metadata,'$.previousItems') p
+            WHERE j.tenant_id=? AND json_extract(p.value,'$.memoryId')=?""", (tenant, memory_id)).fetchall()
+        for job in jobs:
+            self._cancel_one_job(connection, job)
 
     def apply_deletion_event(self, event: Mapping[str, Any]) -> None:
         with self._connection(write=True) as connection:
@@ -1169,6 +1381,16 @@ class MemoryStore:
                 connection.execute("UPDATE memory_jobs SET state='canceled',claim_token='',lease_until=0 WHERE expires_at<=? AND state IN ('collecting','ready','running','retry')", (now,))
             snippets = connection.execute("UPDATE memory_sources SET excerpt='' WHERE last_verified_at<? AND excerpt!=''", (now - 90 * 86400,)).rowcount
             connection.execute("UPDATE memory_item_sources SET evidence_span='' WHERE source_id IN (SELECT id FROM memory_sources WHERE excerpt='')")
+            # 명시 보존 원문에는 발췌의 90일 만료를 적용하지 않는다. 철회된 출처만 정리한다.
+            source_texts = connection.execute(
+                "DELETE FROM memory_source_texts WHERE NOT EXISTS (SELECT 1 FROM memory_sources s "
+                "WHERE s.tenant_id=memory_source_texts.tenant_id AND s.id=memory_source_texts.source_id AND s.state='current') "
+                "OR EXISTS (SELECT 1 FROM memory_sources s JOIN memory_events e "
+                "ON e.tenant_id=s.tenant_id AND e.scope_channel_id=s.channel_id "
+                "WHERE s.tenant_id=memory_source_texts.tenant_id AND s.id=memory_source_texts.source_id "
+                "AND ((e.deletion_kind IN ('source','source_redaction') AND e.source_message_id=s.message_ts) "
+                "OR (e.deletion_kind='source_revision' AND e.source_id=s.id)))"
+            ).rowcount
             expired = connection.execute("UPDATE memory_items SET status='expired',version=version+1 WHERE status='active' AND valid_until IS NOT NULL AND valid_until<=?", (now,)).rowcount
             connection.execute("DELETE FROM memory_summaries WHERE updated_at<?", (now - 365 * 86400,))
             if expired or restored:
@@ -1178,7 +1400,8 @@ class MemoryStore:
         # checkpoint 이후 남는 page까지 즉시 완전 삭제됐다고 약속하지 않는다.
         with self._connection() as connection:
             connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        return {"payloadsRemoved": payloads, "snippetsRemoved": snippets, "itemsExpired": expired}
+        return {"payloadsRemoved": payloads, "snippetsRemoved": snippets, "itemsExpired": expired,
+                "sourceTextsRemoved": source_texts}
 
     def snapshot(self, destination: str | Path) -> Path:
         target = Path(destination)

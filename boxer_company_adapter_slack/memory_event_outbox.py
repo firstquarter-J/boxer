@@ -2,24 +2,25 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import fcntl
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import tempfile
 import threading
-from typing import Any, Mapping
+from collections.abc import Mapping
+from contextlib import contextmanager
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
 from boxer_company.memory.contracts import canonical_digest
 from boxer_company.protected_json import (
     ProtectedJsonFileError,
-    create_protected_json_file,
     _validate_protected_parent_chain,
+    create_protected_json_file,
 )
-
 
 _LOCK = threading.RLock()
 _MAX_EVENTS = 10_000
@@ -28,6 +29,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 _TIMESTAMP = re.compile(r"^\d{10,16}\.\d{6}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _EVENT_FIELDS = frozenset({"tenantId", "channelId", "messageTs", "eventId", "eventType", "revisionHash"})
+_RAW_FIELDS = frozenset({"rawEventType", "threadTs", "eventTs", "authorId"})
 
 
 class MemoryEventOutboxError(RuntimeError):
@@ -172,16 +174,37 @@ def _validate_file(metadata: os.stat_result) -> None:
 
 
 def _validated_event(event: Mapping[str, Any]) -> dict[str, str]:
-    if (not isinstance(event, Mapping) or not set(event) <= _EVENT_FIELDS
+    if (not isinstance(event, Mapping) or not set(event) <= _EVENT_FIELDS | _RAW_FIELDS
             or not (_EVENT_FIELDS - {"revisionHash"}) <= set(event)):
         raise MemoryEventOutboxError("memory_event_invalid")
     if (any(not isinstance(event[key], str) or not _IDENTIFIER.fullmatch(event[key])
             for key in ("tenantId", "channelId", "eventId"))
             or not isinstance(event["messageTs"], str) or not _TIMESTAMP.fullmatch(event["messageTs"])
-            or event["eventType"] not in {"changed", "deleted", "unavailable"}
+            or not isinstance(event["eventType"], str) or event["eventType"] not in {"changed", "deleted", "unavailable"}
             or ("revisionHash" in event and (not isinstance(event["revisionHash"], str)
                                            or not _DIGEST.fullmatch(event["revisionHash"])))):
         raise MemoryEventOutboxError("memory_event_invalid")
+    # 원문 수집 receipt도 같은 파일에 두되 본문과 링크 없이 재조회할 식별자만 허용한다.
+    if "rawEventType" in event:
+        raw_type = event["rawEventType"]
+        if not isinstance(raw_type, str):
+            raise MemoryEventOutboxError("memory_raw_event_invalid")
+        expected_base = "changed" if raw_type in {"created", "changed"} else raw_type
+        if (raw_type not in {"created", "changed", "deleted", "unavailable"}
+                or event["eventType"] != expected_base
+                or not event["eventId"].startswith("memory.raw_event:")
+                or not isinstance(event.get("threadTs"), str) or not _TIMESTAMP.fullmatch(event["threadTs"])
+                or not isinstance(event.get("eventTs"), str) or not _TIMESTAMP.fullmatch(event["eventTs"])
+                or Decimal(event["threadTs"]) > Decimal(event["messageTs"])
+                or Decimal(event["eventTs"]) < Decimal(event["messageTs"])
+                or (raw_type != "deleted" and "revisionHash" not in event)
+                or (raw_type in {"created", "changed"} and (not isinstance(event.get("authorId"), str)
+                    or not re.fullmatch(r"[UW][A-Z0-9]{1,127}", event["authorId"])))
+                or ("authorId" in event and (not isinstance(event["authorId"], str)
+                    or not re.fullmatch(r"[UW][A-Z0-9]{1,127}", event["authorId"])))):
+            raise MemoryEventOutboxError("memory_raw_event_invalid")
+    elif set(event) & _RAW_FIELDS:
+        raise MemoryEventOutboxError("memory_raw_event_invalid")
     return dict(event)
 
 

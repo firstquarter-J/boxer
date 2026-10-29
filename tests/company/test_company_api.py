@@ -4041,6 +4041,7 @@ class CompanyApiContractTests(unittest.TestCase):
                 "/internal/v1/memory/captures/{capture_id}/chunks",
                 "/internal/v1/memory/captures/{capture_id}/checkpoint",
                 "/internal/v1/memory/sources/events",
+                "/internal/v1/memory/sources/raw",
             },
         )
         with TestClient(app) as client:

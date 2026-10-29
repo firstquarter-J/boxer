@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import logging
 import os
 import re
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -28,6 +28,10 @@ from boxer_adapter_slack.context import (
 from boxer_company import settings as cs
 from boxer_company.memory.conversation_count import parse_conversation_count_query
 from boxer_company.memory.live_query import wants_stored_history_sources
+from boxer_company.operation_routing import (
+    company_operation_legacy_stage,
+    match_company_operation_route,
+)
 from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company.transport_contracts import (
     DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
@@ -40,10 +44,6 @@ from boxer_company.transport_contracts import (
     company_operation_route_names,
     needs_device_file_operation_context,
     resolve_device_file_operation_scope,
-)
-from boxer_company.operation_routing import (
-    company_operation_legacy_stage,
-    match_company_operation_route,
 )
 from boxer_company_adapter_slack.access_routes import (
     BASE_ACCESS_DENIED_REPLY,
@@ -67,10 +67,6 @@ from boxer_company_adapter_slack.company_api_client import (
     CompanyAssistantApiClient,
     load_company_api_client_settings,
 )
-from boxer_company_adapter_slack.conversation_memory import (
-    build_slack_conversation_memory,
-)
-from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
 from boxer_company_adapter_slack.company_api_rollout import (
     wrap_company_barcode_freeform_service,
     wrap_company_barcode_log_service,
@@ -89,8 +85,14 @@ from boxer_company_adapter_slack.company_api_rollout import (
     wrap_company_usage_help_service,
     wrap_company_weekly_summary_service,
 )
+from boxer_company_adapter_slack.conversation_memory import (
+    build_slack_conversation_memory,
+)
 from boxer_company_adapter_slack.daily_device_round_reporter import (
     attach_daily_device_round_reporter,
+)
+from boxer_company_adapter_slack.device_file_scope import (
+    lookup_device_file_scope_from_mda_recovery_thread,
 )
 from boxer_company_adapter_slack.device_health_alert_api import (
     DeviceHealthAlertApiBridge,
@@ -100,9 +102,6 @@ from boxer_company_adapter_slack.device_health_monitor_reporter import (
 )
 from boxer_company_adapter_slack.device_notification_alert_reporter import (
     attach_device_notification_alert_reporter,
-)
-from boxer_company_adapter_slack.device_file_scope import (
-    lookup_device_file_scope_from_mda_recovery_thread,
 )
 from boxer_company_adapter_slack.fun import (
     handle_fun_message,
@@ -123,6 +122,7 @@ from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRoutesDeps,
     _handle_hpa_change_request,
 )
+from boxer_company_adapter_slack.memory_api_client import CompanyMemoryApiClient
 from boxer_company_adapter_slack.security_review_routes import (
     SecurityReviewMessageContext,
     SecurityReviewRoutesContext,
@@ -138,7 +138,6 @@ from boxer_company_adapter_slack.thread_learning_routes import (
 from boxer_company_adapter_slack.weekly_recordings_reporter import (
     attach_weekly_recordings_reporter,
 )
-
 
 _PROGRESS_OPERATION_ROUTES = frozenset(
     {"device_box_update", "device_agent_update", "device_power_off"}
@@ -264,7 +263,7 @@ def create_app() -> App:
     company_api_client = CompanyAssistantApiClient(
         company_api_settings
     )
-    # 기본 off이며 membership 뒤의 명시 멘션만 기억 DTO를 갖는다.
+    # 기본 off이며 일반 기억 DTO는 명시 멘션, 승인된 원문 범위는 native event로 전송한다.
     conversation_memory = build_slack_conversation_memory(
         CompanyMemoryApiClient(company_api_settings),
         is_allowed=base_access_runtime.is_allowed,
@@ -1160,7 +1159,8 @@ def create_app() -> App:
     app = create_slack_app(
         _handle_company_mention,
         _handle_company_message,
-        **({"message_change_handler": conversation_memory.source_event} if conversation_memory is not None else {}),
+        **({"message_change_handler": conversation_memory.source_event,
+            "message_observer": conversation_memory.observe_message} if conversation_memory is not None else {}),
     )
     if conversation_memory is not None:
         conversation_memory.start(app.client, company_api_settings.automation_tenant_id)

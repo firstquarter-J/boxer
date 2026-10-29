@@ -11,7 +11,7 @@ from boxer_company.memory.store import MemoryStore, initialize_memory_store
 from boxer_company_api.app import create_company_api_app
 from boxer_company_api.memory_service import MemoryService
 from boxer_company_api.settings import CompanyApiCallerSettings, CompanyApiSettings
-from tests.company.test_memory_conversation_count_store import add_source
+from tests.company.test_memory_conversation_count_store import add_item, add_source
 
 TENANT, CHANNEL, ACTOR, DD = "T1", "C1", "UA", "UDD"
 NOW = "1792650000.000001"
@@ -223,3 +223,57 @@ def test_count_routes_are_absent_and_existing_caller_authentication_is_required(
     assert not any("/counts/" in route.path or route.path.endswith("/count-scope") for route in client.app.routes)
     denied = client.post("/internal/v1/assistant/turns", headers=headers(token="invalid"), json=turn(request()))
     assert denied.status_code == 401
+
+
+@pytest.mark.parametrize("question", ["디디가 올해 한 욕", "디디가 올해 한 욕 날짜랑 시간순으로 주제별로",
+                                     "디디가 올해 한 욕을 날짜와 시간순으로 주제별로"])
+@pytest.mark.parametrize("route_group", ["freeform", "fun", None])
+def test_stored_utterance_lookup_renders_chronology_and_supported_topics_without_model(state, question, route_group):
+    # 저장 시각과 삽입 순서 대신 실제 발언 시각으로 정렬하고 연결된 저장 주제만 보여준다.
+    _, store, client = state
+    newer = add_source(store, excerpt="씨발 배포가 또 실패했네", stamp="1792100002.000001")
+    older = add_source(store, excerpt="존나 야근 중이야", stamp="1792100001.000001")
+    add_item(store, newer, name="deploy-context")
+    add_item(store, older, name="work-context")
+    with store._connection(write=True) as connection:
+        connection.execute("UPDATE memory_items SET topic_key='배포 오류' WHERE id='deploy-context'")
+        connection.execute("UPDATE memory_items SET topic_key='야근' WHERE id='work-context'")
+    payload = turn(request(question))
+    if route_group is None:
+        payload.pop("routeGroup")
+    else:
+        payload["routeGroup"] = route_group
+    response = client.post("/internal/v1/assistant/turns", headers=headers(), json=payload)
+    assert response.status_code == 200, response.text
+    answer = response.json()
+    assert answer["route"] == "company_conversation_count" and answer["usedLlm"] is False
+    body = answer["messages"][0]["body"]
+    assert "날짜와 시간순 (KST)" in body and "저장된 주제별" in body
+    assert body.index("존나 야근 중이야") < body.index("씨발 배포가 또 실패했네")
+    assert "배포 오류" in body and "야근" in body
+    assert not answer.get("sources") and "memoryCapture" not in answer
+    # 숫자만 묻는 질문의 기존 집계에는 원문 목록을 추가하지 않는다.
+    count = client.post("/internal/v1/assistant/turns", headers=headers("numeric-only"),
+        json=turn(request("디디가 올해 욕 몇 번 했어?", request_id="numeric-only"))).json()
+    assert "메시지는 2건" in count["messages"][0]["body"]
+    assert "날짜와 시간순" not in count["messages"][0]["body"]
+    assert "배포가 또 실패했네" not in count["messages"][0]["body"]
+
+
+def test_deleted_utterance_and_its_topic_disappear_from_the_next_detail_response(state):
+    # 발언을 삭제한 뒤에는 문장뿐 아니라 연결 주제도 다음 HTTP 답변에 남기지 않는다.
+    _, store, client = state
+    identity = add_source(store, excerpt="씨발 배포가 또 실패했네", stamp="1792100001.000001")
+    add_item(store, identity, name="deleted-context")
+    with store._connection(write=True) as connection:
+        connection.execute("UPDATE memory_items SET topic_key='삭제될 주제' WHERE id='deleted-context'")
+    first = client.post("/internal/v1/assistant/turns", headers=headers(),
+        json=turn(request("디디가 올해 한 욕"))).json()
+    assert "씨발 배포가 또 실패했네" in first["messages"][0]["body"]
+    store.source_event(tenant_id=TENANT, channel_id=CHANNEL, message_ts="1792100001.000001",
+        event_type="deleted", event_id="delete-listed-utterance")
+    following = client.post("/internal/v1/assistant/turns", headers=headers("after-detail-delete"),
+        json=turn(request("디디가 올해 한 욕", request_id="after-detail-delete"))).json()
+    assert following["usedLlm"] is False
+    assert "씨발 배포가 또 실패했네" not in following["messages"][0]["body"]
+    assert "삭제될 주제" not in following["messages"][0]["body"]

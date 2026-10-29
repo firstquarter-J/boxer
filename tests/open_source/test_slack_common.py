@@ -21,6 +21,48 @@ class _FakeApp:
 
 
 class SlackCommonTests(unittest.TestCase):
+    def test_native_observer_receives_unmodified_events_before_subtype_or_empty_text_filter(self) -> None:
+        observed, changed, mentions = [], [], []
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(lambda payload, *_: mentions.append(payload),
+                message_observer=lambda event, body, client: observed.append((event, body, client)),
+                message_change_handler=lambda event, *_: changed.append(event))
+            client, body = object(), {"team_id": "T1"}
+            event = {"text": "  원문 공백\n", "user": "UA", "channel": "C1", "ts": "1792392600.000001"}
+            app.handlers["message"](event, lambda **_: None, client, body)
+            deleted = {"subtype": "message_deleted", "deleted_ts": event["ts"], "channel": "C1"}
+            app.handlers["message"](deleted, lambda **_: None, client, body)
+            app.handlers["app_mention"](event, lambda **_: None, client, body)
+        self.assertEqual([row[0] for row in observed], [event, deleted, event])
+        self.assertEqual(observed[0][0]["text"], "  원문 공백\n")
+        self.assertEqual(changed, [deleted])
+        self.assertEqual(mentions[0]["raw_text"], "  원문 공백\n")
+
+    def test_native_observer_failure_isolated_without_exception_body_logging(self) -> None:
+        mentions = []
+        def observer(*_args):
+            raise RuntimeError("private original must never enter logs")
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(lambda payload, *_: mentions.append(payload), message_observer=observer)
+            with self.assertLogs(common.__name__, level="WARNING") as logged:
+                app.handlers["app_mention"]({"text": "질문", "user": "UA", "channel": "C1",
+                    "ts": "1792392600.000001"}, lambda **_: None, object())
+        self.assertEqual(len(mentions), 1)
+        self.assertIn("RuntimeError", " ".join(logged.output))
+        self.assertNotIn("private original", " ".join(logged.output))
+
     def test_app_mention_uses_authorized_bot_identity_and_preserves_other_mentions(self) -> None:
         # 전처리된 질문만 봇 멘션을 빼고 raw 본문·스레드는 첨부/명령 수집에 그대로 넘긴다.
         cases = (

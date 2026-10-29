@@ -7,7 +7,7 @@ import json
 from typing import Any, Literal, TypedDict
 
 EXTRACTOR_VERSION = "memory-v1"
-MEMORY_SCHEMA_VERSION = 1
+MEMORY_SCHEMA_VERSION = 3
 ELIGIBLE_ROUTES = frozenset({"freeform", "team_fun", "fun", "team_chat", "company_freeform", "company_team_fun"})
 MAX_CHUNK_SOURCES = 100
 MAX_CHUNK_CHARS = 16_000
