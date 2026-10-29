@@ -49,7 +49,10 @@ from boxer_company.assistant.service import (
     RequestScopedRecordingsContext,
 )
 from boxer_company.notion_playbooks import (
+    _BARCODE_BLOCKING_POLICY_PAGE_ID,
+    _BARCODE_BLOCKING_POLICY_TITLE,
     _is_company_notion_configured,
+    _resolve_playbook_page_id,
     _select_notion_references,
 )
 from boxer_company.prompt_security import (
@@ -189,6 +192,13 @@ def build_notion_playbook_fallback(
             "• 결론: 관련 운영 문서를 찾지 못했어\n"
             "• 확인: 증상이나 키워드를 더 구체적으로 말해줘\n"
             "• 조치: 문서 제목이나 장애 증상을 같이 보내줘"
+        )
+
+    # 차단 정책은 일반 fallback의 세 줄 제한으로 예시와 설정 조합을 잃지 않게 한다.
+    if references[0].get("title") == _BARCODE_BLOCKING_POLICY_TITLE:
+        lines = [str(line).strip() for line in references[0].get("previewLines") or []]
+        return "**문서 기반 답변**\n\n" + "\n".join(
+            f"- {line}" for line in lines if line
         )
 
     preview_lines: list[str] = []
@@ -583,6 +593,15 @@ class NotionPlaybookQAAssistantRoute:
                 outcome="failed",
                 body="문서 기반 답변 중 오류가 발생했어. 잠시 후 다시 시도해줘",
                 fallback_reason="retrieval_error",
+            )
+
+        # 확정된 세 정책은 그대로 답해 예시, 설정 조합과 설명 제외 범위를 보존한다.
+        if references[0].get("pageId") == _resolve_playbook_page_id(_BARCODE_BLOCKING_POLICY_PAGE_ID):
+            return _result(
+                route=self.name,
+                outcome="answered",
+                body=fallback,
+                sources=sources,
             )
 
         result = self._deps.answer_composer.compose(

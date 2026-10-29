@@ -54,6 +54,20 @@ _LOW_SIGNAL_NOTION_TERMS = {
     "초음파",
     "확인",
 }
+_BARCODE_BLOCKING_POLICY_PAGE_ID = "local-playbook:pink-barcode-validation-policy"
+_BARCODE_BLOCKING_POLICY_TITLE = "바코드 차단 정책: 1년 차단, 핑크 차단, 핑크 기간 차단"
+# 라우터가 인정하는 정책 별칭도 띄어쓰기 유무와 관계없이 같은 로컬 근거를 선택한다.
+_BARCODE_BLOCKING_POLICY_ALIASES = (
+    "12개월 차단",
+    "12개월차단",
+    "일년 차단",
+    "일년차단",
+    "무료 차단",
+    "무료차단",
+    "무료 기간 차단",
+    "무료 기간차단",
+    "무료기간차단",
+)
 _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
     {
         "pageId": "local-playbook:mommybox-led-state-guide",
@@ -441,13 +455,23 @@ _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
             "조치 고객에게 앱 표시와 실제 사용 가능 여부가 다를 수 있다고 안내하고 추가 구매는 필요 없다고 설명해",
         ),
     },
+    # V2 0b97b5c의 검증 로직과 2026-10-29 확정한 설명 범위를 따른다.
+    # 세 정책과 예시, 기존 사용자 적용, 조합을 합성 입력의 다섯 줄 안에 보존한다.
     {
-        "pageId": "local-playbook:pink-barcode-validation-policy",
+        "pageId": _BARCODE_BLOCKING_POLICY_PAGE_ID,
         "section": "운영 정책",
         "kind": "policy",
         "priority": "high",
-        "title": "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지",
+        "title": _BARCODE_BLOCKING_POLICY_TITLE,
         "keywords": (
+            "바코드 차단 정책",
+            "바코드 차단",
+            *_BARCODE_BLOCKING_POLICY_ALIASES,
+            "1년 차단",
+            "핑크 차단",
+            "핑크 기간 차단",
+            "기간 차단",
+            "60일",
             "핑크 바코드",
             "핑크바코드",
             "무료 바코드",
@@ -476,12 +500,22 @@ _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
                 "유료화",
                 "미유료",
                 "바코드",
+                "핑크 차단",
+                "핑크차단",
+                "핑크 기간",
+                "핑크기간",
+                "1년 차단",
+                "1년차단",
+                *_BARCODE_BLOCKING_POLICY_ALIASES,
                 "박스",
                 "invalid barcode",
                 "invalid_barcode",
                 "ln_invalid_barcode",
             ),
             (
+                "차단",
+                "정책",
+                "규칙",
                 "검증",
                 "유효성 검사",
                 "유효성 검증",
@@ -494,12 +528,11 @@ _LOCAL_PLAYBOOKS: tuple[dict[str, Any], ...] = (
             ),
         ),
         "previewLines": (
-            "정책: 핑크 바코드만 따로 허용하거나 막는 설정은 없어",
-            "기능: 바코드 유효성 검사는 촬영 전에 이 바코드로 진행해도 되는지 먼저 확인하는 기능이야",
-            "예시: 무료 바코드나 환불 처리된 바코드처럼 사용하면 안 되는 바코드는 이 기능이 켜져 있으면 막혀야 해",
-            "운영 기준: 분만 병원에서 바코드 차단이 걸리게 하려면 바코드 유효성 검사가 켜져 있어야 해",
-            "전제: 바코드 유효성 검사를 끄면 이런 확인 없이 바로 녹화가 진행돼",
-            "제한: 특정 바코드만 예외로 두는 방식은 안 되고, 검사 전체를 켜거나 끄는 방식이야",
+            "1년 차단: 일반 바코드와 핑크바코드는 최초 등록 후 12개월이 지나면 새 녹화를 막아. 예: 2025년 10월 1일 등록 → 2026년 10월 1일 같은 시각부터 차단.",
+            "핑크 차단: 예외 승인된 번호를 제외한 핑크바코드는 사용 기간과 관계없이 막아. 예: 오늘 처음 사용하는 핑크바코드도 차단.",
+            "핑크 기간 차단: 핑크바코드만 최초 등록 후 설정한 일수가 지나면 막아. 기본은 60일이고 예외 승인된 번호는 제외돼. 예: 10월 1일 낮 12시 등록 → 11월 30일 낮 12시부터 차단.",
+            "기간 기준: 최초 병원 이력의 첫 영상 서버 등록 시점이야. 설정 전 사용자도 포함해 이미 기간이 지났으면 다음 스캔부터 막아. 설정이 반영된 장비의 새 녹화에 적용하고 기존 영상 조회와 진행 중인 녹화에는 영향이 없어.",
+            "설정 조합: 켜진 정책 중 하나라도 조건에 걸리면 차단돼. 핑크바코드를 60일 동안 허용하려면 핑크 차단은 끄고 핑크 기간 차단을 60일로 켜야 해. 1년 차단을 함께 켜면 일반은 12개월, 핑크는 60일 기준이야.",
         ),
     },
 )
@@ -560,6 +593,11 @@ _NOTION_QUERY_EXPANSIONS = (
     },
     {
         "tokens": (
+            "바코드 차단",
+            "1년 차단",
+            "핑크 차단",
+            "핑크 기간 차단",
+            *_BARCODE_BLOCKING_POLICY_ALIASES,
             "유효성 검사",
             "유효성 검증",
             "바코드 검증",
@@ -826,7 +864,7 @@ _NOTION_PLAYBOOK_TOPIC_RULES = (
             "ln_invalid_barcode",
         ),
         "titles": (
-            "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지",
+            _BARCODE_BLOCKING_POLICY_TITLE,
         ),
     },
     {
@@ -1365,6 +1403,16 @@ def _select_notion_references(
     seen_page_ids: set[str] = set()
     remote_failed = False
 
+    local_playbooks = _select_local_playbooks(
+        question,
+        evidence_payload=evidence_payload,
+        max_results=limit,
+    )
+    # 확정된 차단 정책에 예전 Notion 설명이나 일반 개요를 섞지 않는다.
+    # 로컬 정책만으로 답할 수 있어 원격 문서 장애도 이 답변을 지연시키지 않는다.
+    if local_playbooks and local_playbooks[0].get("pageId") == _resolve_playbook_page_id(_BARCODE_BLOCKING_POLICY_PAGE_ID):
+        return local_playbooks[:1]
+
     notion_configured = _is_company_notion_configured(target_root_page_id)
     if notion_configured and _is_notion_overview_query(question):
         try:
@@ -1378,11 +1426,6 @@ def _select_notion_references(
             seen_page_ids.add(overview_page_id)
             selected.append(overview_reference)
 
-    local_playbooks = _select_local_playbooks(
-        question,
-        evidence_payload=evidence_payload,
-        max_results=limit,
-    )
     for item in local_playbooks:
         if not isinstance(item, dict):
             continue

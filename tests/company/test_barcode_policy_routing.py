@@ -55,6 +55,19 @@ _POLICY_VARIANTS = (
     "12345678910 바코드 사용 기간 지나면 차단돼?",
     "12345678910 바코드 첫 녹화 삭제해도 무료 바코드 사용 가능해?",
 )
+_BLOCKING_POLICY_VARIANTS = (
+    "바코드 차단 정책 알려줘",
+    "바코드 차단은 어떻게 동작해? 예시로 설명해줘",
+    "1년 차단과 핑크 차단 차이 알려줘",
+    "핑크바코드 차단은 처음부터 막는 거야?",
+    "핑크 기간차단은 설정 전 사용자도 적용돼?",
+    "핑크바코드기간차단 설명해줘",
+    "핑크기간차단 어떻게 동작해?",
+    "1년차단 설명해줘",
+    "핑크바코드 차단과 기간 차단을 같이 켜면 어떻게 돼?",
+    "12345678910 핑크바코드를 10월 1일 처음 쓰고 10월 29일 기간 차단을 설정하면 언제부터 막혀?",
+)
+_BLOCKING_POLICY_TITLE = "바코드 차단 정책: 1년 차단, 핑크 차단, 핑크 기간 차단"
 
 
 def _request(question: str) -> CompanyAssistantRequest:
@@ -103,6 +116,18 @@ class BarcodePolicyRoutingTests(unittest.TestCase):
                     "notion_playbook_qa",
                 )
 
+    def test_blocking_policy_names_and_dated_examples_use_knowledge_route(self) -> None:
+        # 정책명만 있는 질문과 날짜/번호를 예시로 쓴 질문 모두 실제 조회를 실행하지 않는다.
+        for question in _BLOCKING_POLICY_VARIANTS:
+            with self.subTest(question=question):
+                request = _request(question)
+                self.assertTrue(looks_like_barcode_policy_question(question))
+                self.assertIsNone(_build_structured_query_match(request))
+                self.assertIsNone(match_structured_read_route(request))
+                self.assertIsNone(match_barcode_query_route(request))
+                self.assertIsNone(match_company_operation_route(request))
+                self.assertEqual(match_notion_playbook_route(request), "notion_playbook_qa")
+
     def test_actual_recording_queries_keep_structured_route(self) -> None:
         for question, count_only in (
             ("서울병원 2026-10-25 영상 목록 보여줘", False),
@@ -124,6 +149,7 @@ class BarcodePolicyRoutingTests(unittest.TestCase):
             "12345678910 바코드 유효성 검사 상태 확인해줘",
             "12345678910 바코드 유효기간 지난 상태야? 현재 차단 대상인지 확인해줘",
             "12345678910 바코드 첫 영상 삭제했는데 현재 사용 가능한지 차단 여부 확인해줘",
+            "12345678910 핑크바코드 기간차단 대상인지 현재 상태 확인해줘",
         ):
             with self.subTest(question=status_question):
                 self.assertFalse(looks_like_barcode_policy_question(status_question))
@@ -139,9 +165,50 @@ class BarcodePolicyRoutingTests(unittest.TestCase):
             "12345678910 바코드 첫영상을 삭제해줘",
             "12345678910 바코드 첫영상을 다른 곳으로 이전해줘",
             "바코드 만료 정책을 초기화해줘",
+            "바코드 차단 설정 바꿔줘",
+            "핑크바코드 기간차단 켜줄래?",
+            "핑크바코드 기간차단 켜줘",
+            "핑크 차단 꺼주세요",
+            "바코드 차단 정책을 변경해줘",
+            "핑크바코드 기간차단 60일로 설정해줘",
+            "핑크바코드 차단 적용해줘",
+            "12345678910 바코드 차단해줘",
         ):
             with self.subTest(question=question):
                 self.assertFalse(looks_like_barcode_policy_question(question))
+
+    def test_device_settings_and_actual_barcode_logs_are_not_policy_questions(self) -> None:
+        # 장비에 지금 저장된 설정과 실제 차단 로그는 정책 설명으로 대신 답하지 않는다.
+        for question in (
+            "MB2-X00001 현재 핑크바코드 차단 설정 확인해줘",
+            "MB2-X00001 핑크 기간차단 상태 조회해줘",
+            "12345678910 바코드 2026-10-29 차단 로그 분석해줘",
+            "12345678910 핑크바코드 차단돼?",
+            "MB2-X00001 바코드 차단 로그 분석해줘",
+            "바코드 차단 로그 확인해줘",
+            "MB2-X00001 핑크바코드 차단 설정 알려줘",
+            "12345678910 바코드 차단 로그 어떻게 나왔어?",
+            "12345678910 바코드 차단 로그 정리해줘",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(looks_like_barcode_policy_question(question))
+
+    def test_blocking_policy_reference_contains_examples_without_refund(self) -> None:
+        # 일반 차단 정책은 오래된 유효성 검사 일괄 설명 대신 세 정책을 근거로 삼는다.
+        with patch(
+            "boxer_company.notion_playbooks._is_company_notion_configured",
+            return_value=False,
+        ):
+            for question in _BLOCKING_POLICY_VARIANTS:
+                with self.subTest(question=question):
+                    references = _select_notion_references(question)
+                    self.assertTrue(references)
+                    self.assertEqual(references[0]["title"], _BLOCKING_POLICY_TITLE)
+                    preview = "\n".join(references[0]["previewLines"])
+                    for token in ("1년 차단", "핑크 차단", "핑크 기간 차단", "12개월", "60일", "11월 30일"):
+                        self.assertIn(token, preview)
+                    self.assertNotIn("환불", preview)
+                    self.assertNotIn("REFUND", preview)
 
     def test_local_policy_reference_keeps_conclusion_and_expiry_basis(self) -> None:
         policy = next(
@@ -230,7 +297,7 @@ class BarcodePolicyRoutingTests(unittest.TestCase):
                 "boxer_company.notion_playbooks._fetch_all_notion_blocks"
             ) as fetch_notion,
         ):
-            for question in (_POLICY_QUESTION, _POLICY_BODY):
+            for question in (_POLICY_QUESTION, _POLICY_BODY, *_BLOCKING_POLICY_VARIANTS):
                 with self.subTest(question=question):
                     result = service.answer(_request(question))
                     self.assertIsNotNone(result)
@@ -238,20 +305,52 @@ class BarcodePolicyRoutingTests(unittest.TestCase):
                     self.assertEqual(result.route, "notion_playbook_qa")
                     self.assertEqual(result.outcome, "answered")
                     self.assertFalse(result.used_llm)
-                    self.assertEqual(result.fallback_reason, "synthesis_disabled")
+                    self.assertEqual(
+                        result.fallback_reason,
+                        None if question in _BLOCKING_POLICY_VARIANTS else "synthesis_disabled",
+                    )
                     body = result.messages[0].body
                     self.assertNotIn("날짜 형식", body)
-                    for token in ("삭제", "이전", "초기화"):
-                        self.assertIn(token, body)
+                    if question in _BLOCKING_POLICY_VARIANTS:
+                        for token in ("1년 차단", "핑크 차단", "핑크 기간 차단", "12개월", "60일", "11월 30일", "기존"):
+                            self.assertIn(token, body)
+                        self.assertTrue("하나라도" in body or "함께" in body or "같이" in body)
+                        self.assertNotIn("환불", body)
+                        self.assertNotIn("REFUND", body)
+                    else:
+                        for token in ("삭제", "이전", "초기화"):
+                            self.assertIn(token, body)
             remote_notion.assert_not_called()
             fetch_notion.assert_not_called()
 
         self.assertEqual(
             [route_group for _, route_group in api_client.calls],
-            ["knowledge", "knowledge"],
+            ["knowledge"] * (2 + len(_BLOCKING_POLICY_VARIANTS)),
         )
         engine.answer.assert_not_called()
         recordings_loader.assert_not_called()
+
+    def test_blocking_policy_keeps_examples_and_scope_without_generated_rewrite(self) -> None:
+        # 합성이 가능한 운영 환경에서도 확정된 정책과 설명 제외 범위를 그대로 지킨다.
+        composer = Mock()
+        composer.compose.side_effect = AssertionError("정책을 LLM으로 재작성하면 안 돼")
+        route = NotionPlaybookQAAssistantRoute(
+            NotionPlaybookQARouteDeps(answer_composer=composer),
+        )
+        with patch("boxer_company.notion_playbooks._is_company_notion_configured", return_value=True):
+            result = route.handle(_request("마미박스 바코드 차단 정책 설명해줘"))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.outcome, "answered")
+        self.assertFalse(result.used_llm)
+        body = result.messages[0].body
+        for token in ("2026년 10월 1일", "11월 30일", "첫 영상 서버 등록", "다음 스캔", "핑크 차단은 끄고", "기존 영상 조회"):
+            self.assertIn(token, body)
+        self.assertNotIn("환불", body)
+        self.assertNotIn("REFUND", body)
+        self.assertNotIn("·", body)
+        composer.compose.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from boxer_company._operation_routing_common import (
 )
 from boxer_company._operation_routing_common import (
     _extract_barcode,
+    _extract_device_name_scope,
     window_assistant_context_entries,
 )
 from boxer_company._operation_routing_device import (
@@ -335,11 +336,16 @@ def _looks_like_thread_answer_instruction(question: str) -> bool:
 def looks_like_barcode_policy_question(question: str) -> bool:
     """바코드 조회나 변경 지시와 구분해 사용 정책과 가정형 사례를 판정한다."""
     text = re.sub(r"\s+", "", (question or "").lower())
-    if "바코드" not in text:
+    # 정책명만 부르는 질문도 같은 지식 경로를 사용한다. 공백 차이는 무시한다.
+    has_blocking_policy = bool(
+        re.search(r"(?:1년|일년|12개월)(?:지난)?(?:바코드)?차단|(?:핑크|무료)(?:바코드)?(?:기간)?차단", text)
+    ) or ("바코드" in text and "차단" in text)
+    if "바코드" not in text and not has_blocking_policy:
         return False
     # 실제 변경 요청은 정책 키워드가 함께 있어도 기존 operation 경계에 남긴다.
     if re.search(
-        r"(?:삭제|이전|변경|초기화|등록|해제|복구)(?:해줘|해주세요|해라)|옮겨줘|옮겨주세요",
+        r"(?:삭제|이전|변경|초기화|등록|해제|복구|설정|적용|저장|차단)(?:해줘|해주세요|해라|해줄래)"
+        r"|(?:켜|꺼|옮겨|바꿔)(?:줘|주세요|줄래)",
         text,
     ):
         return False
@@ -349,19 +355,43 @@ def looks_like_barcode_policy_question(question: str) -> bool:
     )
     has_hypothesis = any(
         token in text
-        for token in ("하면", "해도", "했을때", "한경우", "한다면", "하더라도")
+        for token in ("하면", "해도", "했을때", "한경우", "한다면", "하더라도", "켜면", "끄면", "켰을때", "껐을때")
     )
+    # 실제 로그를 묻는 문장은 '어떻게/정리'가 있어도 일반 정책 설명이 아니다.
+    if "로그" in text and not has_explicit_policy and not has_hypothesis:
+        return False
     barcode = _extract_barcode(question)
+    device_name = _extract_device_name_scope(question)
+    has_status_query = any(
+        token in text for token in ("현재", "지금", "상태", "여부", "대상인지", "확인", "조회")
+    )
+    has_explanation = any(
+        token in text for token in ("설명", "차이", "비교", "원리", "예시", "동작")
+    )
+    # 특정 장비의 '설정 알려줘'도 현재 값 조회다. 명시적인 정책/동작 설명만 분리한다.
+    if device_name is not None and not has_hypothesis and (
+        has_status_query or not (has_explicit_policy or has_explanation)
+    ):
+        return False
     # 실제 번호와 현재 상태 확인이 함께 있으면 유효기간 언급도 조회의 일부다.
     # '삭제했는데'처럼 이미 일어난 일은 조건문으로 보지 않는다.
     if (
         barcode is not None
         and not has_explicit_policy
         and not has_hypothesis
-        and any(token in text for token in ("현재", "지금", "상태", "여부", "대상인지", "확인", "조회"))
+        and has_status_query
     ):
         return False
     if has_explicit_policy or any(token in text for token in ("유효기간", "사용기간")):
+        return True
+
+    if has_blocking_policy:
+        # 특정 번호의 단순 차단 여부와 로그 분석은 기존 실데이터 경로에 맡긴다.
+        # 번호를 예시로 쓰는 설명/가정형 질문만 지식으로 처리한다.
+        if barcode is not None:
+            return has_hypothesis or any(
+                token in text for token in ("설명", "차이", "비교", "정리", "기준", "동작", "원리", "예시", "언제부터", "어떻게")
+            )
         return True
 
     has_lifecycle = any(

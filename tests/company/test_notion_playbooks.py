@@ -253,8 +253,8 @@ class NotionPlaybooksTests(unittest.TestCase):
         )
 
         self.assertTrue(references)
-        self.assertEqual(references[0]["title"], "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지")
-        self.assertIn("핑크 바코드만 따로 허용하거나 막는 설정은 없어", references[0]["previewLines"][0])
+        self.assertEqual(references[0]["title"], "바코드 차단 정책: 1년 차단, 핑크 차단, 핑크 기간 차단")
+        self.assertIn("사용 기간과 관계없이", references[0]["previewLines"][1])
 
     @patch("boxer_company.notion_playbooks._is_company_notion_configured", return_value=False)
     def test_local_validation_status_question_selects_validation_playbook_without_notion(self, _: object) -> None:
@@ -269,8 +269,52 @@ class NotionPlaybooksTests(unittest.TestCase):
         )
 
         self.assertTrue(references)
-        self.assertEqual(references[0]["title"], "바코드 검증: 핑크 바코드만 예외 허용할 수 있는지")
-        self.assertIn("촬영 전에 이 바코드로 진행해도 되는지", references[0]["previewLines"][1])
+        self.assertEqual(references[0]["title"], "바코드 차단 정책: 1년 차단, 핑크 차단, 핑크 기간 차단")
+        self.assertIn("새 녹화", references[0]["previewLines"][0])
+
+    def test_blocking_policy_excludes_stale_remote_documents_even_for_overview(self) -> None:
+        # 일반 개요 요청이어도 이미 확정한 정책에 과거 Notion 설명을 섞지 않는다.
+        with (
+            patch("boxer_company.notion_playbooks._is_company_notion_configured", return_value=True),
+            patch("boxer_company.notion_playbooks._build_notion_overview_reference") as overview,
+            patch("boxer_company.notion_playbooks._select_notion_playbooks") as remote,
+        ):
+            references = _select_notion_references("마미박스 바코드 차단 정책 설명해줘")
+
+        self.assertEqual(len(references), 1)
+        preview = "\n".join(references[0]["previewLines"])
+        self.assertIn("핑크 차단은 끄고", preview)
+        self.assertIn("설정 전 사용자도 포함", preview)
+        self.assertNotIn("환불", preview)
+        overview.assert_not_called()
+        remote.assert_not_called()
+
+    @patch("boxer_company.notion_playbooks._is_company_notion_configured", return_value=False)
+    def test_blocking_policy_aliases_select_same_local_reference(self, _: object) -> None:
+        # matcher가 허용한 다른 이름과 붙여쓰기가 근거 없음 응답으로 빠지지 않게 한다.
+        for question in (
+            "12개월 차단 설명해줘",
+            "12개월차단 설명해줘",
+            "일년 차단 설명해줘",
+            "일년차단 설명해줘",
+            "무료 차단 설명해줘",
+            "무료차단 설명해줘",
+            "무료 기간 차단 설명해줘",
+            "무료 기간차단 설명해줘",
+            "무료기간차단 설명해줘",
+        ):
+            for evidence in (None, {"route": "notion_playbook_qa", "request": {"question": question}}):
+                with self.subTest(question=question, evidence=evidence):
+                    references = _select_notion_references(question, evidence_payload=evidence)
+                    self.assertEqual(len(references), 1)
+                    self.assertEqual(
+                        references[0]["title"],
+                        "바코드 차단 정책: 1년 차단, 핑크 차단, 핑크 기간 차단",
+                    )
+                    preview = "\n".join(references[0]["previewLines"])
+                    for token in ("12개월", "60일", "11월 30일"):
+                        self.assertIn(token, preview)
+                    self.assertNotIn("환불", preview)
 
     @patch("boxer_company.notion_playbooks._is_company_notion_configured", return_value=False)
     def test_local_led_playbook_is_selected_without_notion(self, _: object) -> None:
