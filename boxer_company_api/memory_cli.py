@@ -16,7 +16,7 @@ from boxer_company_api.security import validate_company_api_runtime_security
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="대화 기억 SQLite와 삭제 journal을 관리해")
-    parser.add_argument("command", choices=("init", "migrate", "health", "init-journal", "flush-deletions", "snapshot", "restore", "cleanup", "compact", "prune", "delete-item", "purge-derived", "import-history", "begin-raw-import", "import-raw", "process-pending"))
+    parser.add_argument("command", choices=("init", "migrate", "health", "init-journal", "flush-deletions", "snapshot", "restore", "cleanup", "compact", "prune", "delete-item", "purge-derived", "import-history", "begin-raw-import", "import-raw", "process-pending", "reconcile-private-channel"))
     parser.add_argument("--path", default=os.environ.get("BOXER_COMPANY_API_MEMORY_STATE_PATH", "/var/lib/boxer-company-api/conversation_memory.db"))
     parser.add_argument("--snapshot-key")
     parser.add_argument("--tenant-id")
@@ -31,6 +31,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-ts")
     parser.add_argument("--confirm-authorized-purge", action="store_true")
     parser.add_argument("--confirm-authorized-import", action="store_true")
+    parser.add_argument("--confirm-authorized-reconcile", action="store_true")
+    parser.add_argument("--confirm-slack-private-channel", action="store_true")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--confirm-service-stopped", action="store_true")
     return parser
@@ -41,6 +43,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command in {"init", "migrate", "restore", "compact", "purge-derived"} and not args.confirm_service_stopped:
         parser.error("API와 기억 companion을 멈춘 뒤 --confirm-service-stopped가 필요해")
+    # 채널 종류만 정정하는 명령은 서비스 중지를 요구하지 않고 두 승인을 DB 접근 전에 확인한다.
+    if args.command == "reconcile-private-channel" and not all((args.tenant_id, args.channel_id,
+            args.operator_id, args.request_id, args.confirm_authorized_reconcile, args.confirm_slack_private_channel)):
+        parser.error("reconcile-private-channel에는 --tenant-id --channel-id --operator-id --request-id와 두 명시 확인이 필요해")
     path = Path(args.path).expanduser()
     try:
         validate_company_api_runtime_security()
@@ -66,7 +72,16 @@ def main(argv: list[str] | None = None) -> None:
                 result = backup.restore_snapshot(args.snapshot_key, path, store_factory=MemoryStore)
         else:
             store = MemoryStore(path)
-            if args.command == "process-pending":
+            if args.command == "reconcile-private-channel":
+                from boxer_company.memory.channel_scope import (
+                    operator_reconcile_private_channel,
+                )
+
+                # 고정된 비공개 채널 범위의 메타데이터만 정정하며 추출과 백업은 시작하지 않는다.
+                result = operator_reconcile_private_channel(store, tenant_id=args.tenant_id,
+                    channel_id=args.channel_id, operator_id=args.operator_id, request_id=args.request_id,
+                    confirm_slack_private_channel=args.confirm_slack_private_channel)
+            elif args.command == "process-pending":
                 if not 1 <= args.limit <= 1000:
                     parser.error("process-pending --limit은 1부터 1000까지야")
                 from collections import Counter
