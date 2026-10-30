@@ -15,6 +15,7 @@ from .policy import _valid_permalink
 from .raw_policy import RAW_ONLY_CUTOFF_TS, RAW_ONLY_START_TS, is_raw_only_scope
 from .raw_source_policy import normalize_raw_source
 from .raw_state import RAW_STATE_PRIORITY
+from .source_revalidation import is_source_revision_blocked
 
 if TYPE_CHECKING:
     import sqlite3
@@ -148,8 +149,7 @@ def ingest_raw_event(store: MemoryStore, *, tenant_id: str, channel_id: str, eve
         else:
             if store._source_deleted(connection, tenant_id, channel_id, message_ts):
                 return acknowledge("stale")
-            revoked = connection.execute("SELECT 1 FROM memory_events WHERE tenant_id=? AND scope_channel_id=? AND deletion_kind='source_revision' AND source_id=? LIMIT 1",
-                                         (tenant_id, channel_id, normalized["sourceId"])).fetchone()
+            revoked = is_source_revision_blocked(connection, tenant_id, channel_id, normalized["sourceId"])
             known = connection.execute("SELECT * FROM memory_sources WHERE tenant_id=? AND id=?", (tenant_id, normalized["sourceId"])).fetchone()
             current = connection.execute("SELECT * FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=? AND state='current'",
                                          (tenant_id, channel_id, message_ts)).fetchall()

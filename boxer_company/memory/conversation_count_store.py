@@ -14,6 +14,7 @@ from .live_query import is_supported_stored_period
 from .policy import is_safe_memory_text, normalize_topic_key
 from .raw_policy import is_raw_only_scope
 from .raw_presentation import is_safe_raw_display_text, raw_display_text
+from .source_revalidation import effective_revision_sql
 
 if TYPE_CHECKING:
     from sqlite3 import Row
@@ -122,10 +123,11 @@ def count_stored_messages(store: MemoryStore, *, tenant_id: str, channel_id: str
         if include_messages:
             event_kinds += ",'item','subject_topic'"
         events = connection.execute(
-            "SELECT scope_channel_id,source_id,source_message_id,deletion_kind,memory_id,subject_id,topic_key_hash "
-            "FROM memory_events "
-            "WHERE tenant_id=? AND (scope_channel_id=? OR ?) "
-            f"AND deletion_kind IN ({event_kinds})",
+            "SELECT e.scope_channel_id,e.source_id,e.source_message_id,e.deletion_kind,e.memory_id,e.subject_id,e.topic_key_hash "
+            "FROM memory_events e "
+            "WHERE e.tenant_id=? AND (e.scope_channel_id=? OR ?) "
+            f"AND e.deletion_kind IN ({event_kinds}) "
+            f"AND (e.deletion_kind!='source_revision' OR {effective_revision_sql('e')})",
             (tenant_id, channel_id, hub),
         ).fetchall()
         rows = connection.execute(

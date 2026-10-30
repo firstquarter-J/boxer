@@ -43,6 +43,11 @@ def parse_raw_state_event(event: Mapping[str, Any]) -> dict[str, str]:
         raise MemoryError("memory_raw_state_invalid")
     if json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) != reason:
         raise MemoryError("memory_raw_state_invalid")
+    if event.get("eventType") == "raw_source_revalidated":
+        from .source_revalidation import validate_revalidation_event
+
+        # 재허용은 운영자가 등록 후 재검증한 정확한 무효화 이벤트에만 연결한다.
+        validate_revalidation_event(event, payload)
     return payload
 
 

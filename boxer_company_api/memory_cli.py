@@ -9,7 +9,7 @@ import sqlite3
 from pathlib import Path
 
 from boxer_company.memory.backup import configured_memory_backup
-from boxer_company.memory.contracts import MEMORY_SCHEMA_VERSION
+from boxer_company.memory.contracts import MEMORY_SCHEMA_VERSION, MemoryError
 from boxer_company.memory.store import MemoryStore, initialize_memory_store
 from boxer_company_api.security import validate_company_api_runtime_security
 
@@ -31,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-ts")
     parser.add_argument("--confirm-authorized-purge", action="store_true")
     parser.add_argument("--confirm-authorized-import", action="store_true")
+    parser.add_argument("--confirm-current-source-revalidation", action="store_true")
     parser.add_argument("--confirm-authorized-reconcile", action="store_true")
     parser.add_argument("--confirm-slack-private-channel", action="store_true")
     parser.add_argument("--limit", type=int, default=100)
@@ -41,6 +42,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.confirm_current_source_revalidation and args.command not in {"begin-raw-import", "import-raw"}:
+        parser.error("현재 원본 재검증 확인은 begin-raw-import와 import-raw에서만 사용할 수 있습니다.")
     if args.command in {"init", "migrate", "restore", "compact", "purge-derived"} and not args.confirm_service_stopped:
         parser.error("API와 기억 companion을 멈춘 뒤 --confirm-service-stopped가 필요해")
     # 채널 종류만 정정하는 명령은 서비스 중지를 요구하지 않고 두 승인을 DB 접근 전에 확인한다.
@@ -104,11 +107,30 @@ def main(argv: list[str] | None = None) -> None:
                             len(args.author_id) == 1, args.confirm_authorized_import)):
                     parser.error("원문 적재에는 입력 파일, 운영자, tenant, channel, author 1명과 명시 확인이 필요해")
                 from boxer_company_api.memory_import import read_history_import
-                from boxer_company_api.memory_raw_import import import_raw_archive
+                from boxer_company_api.memory_raw_import import (
+                    import_raw_archive,
+                    revalidate_raw_archive,
+                )
                 # 수집 범위를 먼저 등록한 뒤 원본을 재검증하고 같은 파일을 게시한다.
-                result = import_raw_archive(store, read_history_import(args.input), tenant_id=args.tenant_id,
-                    channel_id=args.channel_id, author_id=args.author_id[0], operator_id=args.operator_id,
-                    begin_only=args.command == "begin-raw-import")
+                payload = read_history_import(args.input)
+                scope = {"tenant_id": args.tenant_id, "channel_id": args.channel_id,
+                         "author_id": args.author_id[0], "operator_id": args.operator_id}
+                if args.command == "import-raw" and args.confirm_current_source_revalidation:
+                    authorization = revalidate_raw_archive(store, payload, **scope)
+                    event_ids = set(authorization["reauthorizationEventIds"])
+                    if event_ids:
+                        # 원문은 journal 내구화를 확인한 뒤에만 일반 import로 게시한다.
+                        backup = configured_memory_backup()
+                        if backup is None:
+                            raise MemoryError("raw_import_revalidation_journal_required")
+                        backup.flush_deletions(store)
+                        durable = {event["id"] for event in store.deletion_events()
+                                   if event.get("durabilityState") == "durable"}
+                        if not event_ids <= durable:
+                            raise MemoryError("raw_import_revalidation_durability_pending")
+                result = import_raw_archive(store, payload, **scope,
+                    begin_only=args.command == "begin-raw-import",
+                    plan_revalidation=args.command == "begin-raw-import" and args.confirm_current_source_revalidation)
             elif args.command == "import-history":
                 if not all((args.input, args.operator_id, args.tenant_id, args.channel_id, args.author_id, args.confirm_authorized_import)):
                     parser.error("import-history에는 입력 파일·운영자·tenant·channel·허용 author와 명시 확인이 필요해")

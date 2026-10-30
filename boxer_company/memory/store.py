@@ -37,6 +37,12 @@ from .policy import (
     standard_preference_value,
     validate_candidate,
 )
+from .source_revalidation import (
+    effective_revision_sql,
+    is_raw_invalidation_event_revalidated,
+    is_revision_event_revalidated,
+    is_source_revision_blocked,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_threads (
@@ -491,7 +497,7 @@ class MemoryStore:
                 if self._source_deleted(connection, tenant_id, thread["channel_id"], normalized["messageTs"]):
                     coverage = "partial"
                     continue
-                invalidated = connection.execute("SELECT 1 FROM memory_events WHERE tenant_id=? AND scope_channel_id=? AND deletion_kind='source_revision' AND source_id=?", (tenant_id, thread["channel_id"], normalized["sourceId"])).fetchone()
+                invalidated = is_source_revision_blocked(connection, tenant_id, thread["channel_id"], normalized["sourceId"])
                 known = connection.execute("SELECT state FROM memory_sources WHERE tenant_id=? AND id=?", (tenant_id, normalized["sourceId"])).fetchone()
                 current_revisions = connection.execute("SELECT revision_hash,edited_at,message_ts FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=? AND state='current'", (tenant_id, thread["channel_id"], normalized["messageTs"])).fetchall()
                 stale = any(source["revision_hash"] != normalized["revisionHash"] and Decimal(source["edited_at"] or source["message_ts"]) >= Decimal(normalized["editedAt"] or normalized["messageTs"]) for source in current_revisions)
@@ -575,7 +581,7 @@ class MemoryStore:
         return connection.execute("SELECT 1 FROM memory_events WHERE tenant_id=? AND scope_channel_id=? AND deletion_kind IN ('source','source_redaction') AND source_message_id=? LIMIT 1", (tenant, channel, message)).fetchone() is not None
 
     def _register_source(self, connection: sqlite3.Connection, tenant: str, thread: sqlite3.Row, source: Mapping[str, Any]) -> bool:
-        blocked = connection.execute("SELECT 1 FROM memory_events WHERE tenant_id=? AND scope_channel_id=? AND deletion_kind='source_revision' AND source_id=? LIMIT 1", (tenant, thread["channel_id"], source["sourceId"])).fetchone()
+        blocked = is_source_revision_blocked(connection, tenant, thread["channel_id"], source["sourceId"])
         if blocked or self._source_deleted(connection, tenant, thread["channel_id"], source["messageTs"]):
             return False
         existing = connection.execute("SELECT state FROM memory_sources WHERE tenant_id=? AND id=?", (tenant, source["sourceId"])).fetchone()
@@ -1293,6 +1299,9 @@ class MemoryStore:
         elif event["deletionKind"] in {"source", "source_revision"}:
             if event["deletionKind"] == "source":
                 sources = connection.execute("SELECT id FROM memory_sources WHERE tenant_id=? AND channel_id=? AND message_ts=?", (tenant, channel, event.get("sourceMessageId"))).fetchall()
+            elif is_revision_event_revalidated(connection, event):
+                # 정확히 재검증된 과거 무효화는 이력으로 보존하고 새 본문에는 다시 적용하지 않는다.
+                sources = []
             else:
                 sources = connection.execute("SELECT id FROM memory_sources WHERE tenant_id=? AND channel_id=? AND id=?", (tenant, channel, event.get("sourceId"))).fetchall()
             for source in sources:
@@ -1325,9 +1334,22 @@ class MemoryStore:
         connection.execute("INSERT INTO memory_events(id,tenant_id,scope_channel_id,memory_id,source_id,event_type,actor_id,request_id,deletion_kind,subject_id,topic_key_hash,source_message_id,cutoff_at,reallow_request_id,remote_sequence,durability_state,created_at,reason_code,from_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (identity, tenant, channel, event.get("memoryId"), event.get("sourceId"), str(event.get("eventType") or "restored_deletion"), event.get("actorId"), str(event.get("requestId") or identity), event["deletionKind"], event.get("subjectId"), event.get("topicKeyHash"), event.get("sourceMessageId"), event.get("cutoffAt", self._clock()), event.get("reallowRequestId"), event.get("remoteSequence"), str(event.get("durabilityState") or "durable"), self._clock(), str(event.get("reasonCode") or ""), event.get("expectedItemCount")))
 
     def _apply_raw_state(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> None:
-        from .raw_state import RAW_STATE_PRIORITY, parse_raw_state_event, raw_state_stamp
+        from .raw_state import (
+            RAW_STATE_PRIORITY,
+            parse_raw_state_event,
+            raw_state_stamp,
+        )
 
         payload = parse_raw_state_event(event)
+        if event.get("eventType") == "raw_source_revalidated":
+            from .source_revalidation import apply_revalidation_metadata
+
+            # 운영자 재검증도 본문을 재생성하지 않는다. 새 본문은 별도 등록 import만 저장한다.
+            apply_revalidation_metadata(connection, event)
+            return
+        if is_raw_invalidation_event_revalidated(connection, event, payload):
+            # 같은 원인의 옛 watermark만 제외하고 새 무효화와 삭제는 그대로 적용한다.
+            return
         tenant, channel, message = event["tenantId"], event["scopeChannelId"], event["sourceMessageId"]
         previous = connection.execute("SELECT * FROM memory_raw_event_states WHERE tenant_id=? AND channel_id=? AND message_ts=?",
                                       (tenant, channel, message)).fetchone()
@@ -1389,7 +1411,7 @@ class MemoryStore:
                 "ON e.tenant_id=s.tenant_id AND e.scope_channel_id=s.channel_id "
                 "WHERE s.tenant_id=memory_source_texts.tenant_id AND s.id=memory_source_texts.source_id "
                 "AND ((e.deletion_kind IN ('source','source_redaction') AND e.source_message_id=s.message_ts) "
-                "OR (e.deletion_kind='source_revision' AND e.source_id=s.id)))"
+                f"OR (e.deletion_kind='source_revision' AND e.source_id=s.id AND {effective_revision_sql('e')})))"
             ).rowcount
             expired = connection.execute("UPDATE memory_items SET status='expired',version=version+1 WHERE status='active' AND valid_until IS NOT NULL AND valid_until<=?", (now,)).rowcount
             connection.execute("DELETE FROM memory_summaries WHERE updated_at<?", (now - 365 * 86400,))

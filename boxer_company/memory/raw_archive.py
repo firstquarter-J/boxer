@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from decimal import Decimal
 from typing import Any
 
 from .contracts import MemoryError, canonical_digest
 from .raw_source_policy import normalize_raw_source
+from .source_revalidation import is_source_revision_blocked
 from .store import MemoryStore
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -36,6 +38,25 @@ def _metadata(row: sqlite3.Row) -> dict[str, Any]:
     # 조회와 모델 입력에 원문이 섞이지 않도록 상태 응답은 식별자와 고정 범위만 담는다.
     return {"importId": row["id"], "state": row["state"], "startTs": row["start_ts"],
             "cutoffTs": row["cutoff_ts"], "manifestDigest": row["manifest_digest"]}
+
+
+def verified_raw_registration(store: MemoryStore, *, import_id: str, tenant_id: str,
+                              channel_id: str, author_id: str, operator_id: str,
+                              manifest_digest: str, verified_at: Any,
+                              now: float | None = None) -> sqlite3.Row:
+    """일반 게시와 명시 재검증이 같은 등록 이후 300초의 원본 확인 계약을 사용한다."""
+    clock = time.time() if now is None else now
+    if (not isinstance(verified_at, str) or not _TIMESTAMP.fullmatch(verified_at)
+            or not 0 <= Decimal(str(clock)) - Decimal(verified_at) <= 300):
+        raise MemoryError("raw_import_verification_stale")
+    with store._connection() as connection:
+        row = connection.execute("SELECT * FROM memory_raw_imports WHERE tenant_id=? AND id=?",
+                                 (tenant_id, import_id)).fetchone()
+        if (row is None or row["operator_id"] != operator_id or row["channel_id"] != channel_id
+                or row["author_id"] != author_id or row["manifest_digest"] != manifest_digest
+                or Decimal(str(row["created_at"])) > Decimal(verified_at)):
+            raise MemoryError("raw_import_registration_required")
+    return row
 
 
 def begin_raw_import(store: MemoryStore, *, import_id: str, tenant_id: str,
@@ -145,9 +166,7 @@ def _check_current_source(store: MemoryStore, connection: sqlite3.Connection, ro
         raise MemoryError("raw_import_source_stale")
     if store._source_deleted(connection, tenant, channel, source["messageTs"]):
         raise MemoryError("raw_import_source_stale")
-    invalidated = connection.execute("""SELECT 1 FROM memory_events WHERE tenant_id=?
-        AND scope_channel_id=? AND deletion_kind='source_revision' AND source_id=? LIMIT 1""",
-        (tenant, channel, source["sourceId"])).fetchone()
+    invalidated = is_source_revision_blocked(connection, tenant, channel, source["sourceId"])
     known = connection.execute("SELECT * FROM memory_sources WHERE tenant_id=? AND id=?",
                                (tenant, source["sourceId"])).fetchone()
     if invalidated or (known and known["state"] != "current"):
