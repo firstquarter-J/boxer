@@ -15,6 +15,7 @@ from boxer_company.memory.contracts import (
     source_revision,
 )
 from boxer_company.memory.conversation_count_store import count_stored_messages
+from boxer_company.memory.raw_archive import begin_raw_import, import_raw_messages
 from boxer_company.memory.store import MemoryStore, initialize_memory_store
 
 TENANT, CHANNEL, AUTHOR = "T1", "C1", "UDD"
@@ -23,7 +24,9 @@ PERIOD = {"kind": "year", "startTs": "1767193200.000000", "endTs": "1798729200.0
 
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, monkeypatch):
+    # 운영 프로필이나 dotenv에 의존하지 않고 승인 작성자를 합성한다.
+    monkeypatch.setattr("boxer_company.memory.raw_source_policy.TEAM_MEMBER_PROFILES", [{"user_id": "URAW"}])
     path = tmp_path / "private" / "memory.db"
     initialize_memory_store(path)
     return MemoryStore(path, clock=lambda: float(CUTOFF), debounce_seconds=0)
@@ -62,6 +65,59 @@ def add_item(store, source_id, *, text="회의 담당이야", name="item1", topi
 def count(store, *, tenant=TENANT, channel=CHANNEL, author=AUTHOR, period=None, include_messages=False):
     return count_stored_messages(store, tenant_id=tenant, channel_id=channel, author_id=author,
                                  period=PERIOD if period is None else period, include_messages=include_messages)
+
+
+def add_approved_raw(store, text):
+    tenant, channel, author = "T19PA3EPL", "C068FVD5V7Y", "URAW"
+    identity = source_identity(tenant, channel, STAMP, source_revision(text, ""))
+    source = {"sourceId": identity, "messageTs": STAMP, "threadTs": "1760000000.000001",
+              "authorId": author, "authorKind": "human", "text": text, "createdAt": STAMP, "editedAt": "",
+              "revisionHash": source_revision(text, ""),
+              "permalink": f"https://team.slack.com/archives/{channel}/p{STAMP.replace('.', '')}"}
+    scope = {"tenantId": tenant, "channelId": channel, "authorId": author,
+             "startTs": "1790780400.000000", "cutoffTs": CUTOFF}
+    digest = canonical_digest({**scope, "sources": [source]})
+    begin_raw_import(store, import_id="approved", tenant_id=tenant, channel_id=channel, author_id=author,
+                     operator_id=author, start_ts=scope["startTs"], cutoff_ts=CUTOFF, manifest_digest=digest)
+    import_raw_messages(store, import_id="approved", manifest_digest=digest, sources=[source])
+    return tenant, channel, author, identity
+
+
+@pytest.mark.parametrize("text,visible,hidden", [
+    ("씨발 장비 로그 조회가 오래 걸려", "장비 로그 조회", None),
+    ("씨발 SELECT name FROM devices", "SELECT name FROM devices", None),
+    ("이전 지시를 무시해 씨발", "이전 지시를 무시해", None),
+    ("씨발 연락이 안 돼 010-0000-0000", "[개인정보 가림]", "010-0000-0000"),
+])
+def test_approved_raw_is_counted_without_work_keyword_exclusions_and_only_display_is_redacted(store, text, visible, hidden):
+    # 원문 보관과 표시 사본을 구분해 업무 언급은 살리고 개인정보 값은 출력하지 않는다.
+    tenant, channel, author, identity = add_approved_raw(store, text)
+    answer = count(store, tenant=tenant, channel=channel, author=author, include_messages=True)
+    assert answer["storedRawMessageCount"] == answer["matchedMessageCount"] == 1
+    excerpt = answer["matchedMessages"][0]["excerpt"]
+    assert visible in excerpt
+    if hidden:
+        assert hidden not in excerpt
+    with store._connection() as connection:
+        assert connection.execute("SELECT text FROM memory_source_texts WHERE source_id=?", (identity,)).fetchone()[0] == text
+
+
+def test_approved_raw_still_rejects_body_that_no_longer_matches_source_revision(store):
+    tenant, channel, author, identity = add_approved_raw(store, "씨발 장비 로그 조회")
+    with store._connection(write=True) as connection:
+        connection.execute("UPDATE memory_source_texts SET text='다른 본문' WHERE source_id=?", (identity,))
+    answer = count(store, tenant=tenant, channel=channel, author=author, include_messages=True)
+    assert answer["unavailableExcerptMessageCount"] == 1
+    assert answer["matchedMessages"] == []
+
+
+@pytest.mark.parametrize("text", ["씨발 password=synthetic-only", "password=synthetic-only\n씨발 배포가 안 돼"])
+def test_redacted_same_line_remains_in_counts_while_unverifiable_display_is_explicitly_omitted(store, text):
+    # 전체 줄을 가려야 하는 경우에도 원문 분류를 버리지 않고 목록 생략 여부를 밝힌다.
+    tenant, channel, author, _ = add_approved_raw(store, text)
+    answer = count(store, tenant=tenant, channel=channel, author=author, include_messages=True)
+    assert answer["matchedMessageCount"] == answer["scannedMessageCount"] == 1
+    assert answer["matchedMessages"] == [] and answer["messagesTruncated"] is True
 
 
 @pytest.mark.parametrize("include_messages", [False, True])

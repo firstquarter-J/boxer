@@ -16,6 +16,7 @@ from boxer_company.memory.conversation_history import (
     MAX_HISTORY_ANSWER_CHARS,
     format_conversation_history_answer,
 )
+from boxer_company.memory.raw_presentation import raw_display_text
 
 
 def stamp(text):
@@ -43,6 +44,26 @@ def result(messages=None, **overrides):
              "messagesTruncated": False}
     value.update(overrides)
     return value
+
+
+def test_raw_history_displays_quoted_operation_and_masks_values_without_rejecting_the_whole_message():
+    text = raw_display_text("씨발 장비 로그 조회 010-0000-0000")
+    payload = result([message(text, topic=None)], storedRawMessageCount=1)
+    answer = format_conversation_history_answer(payload)
+    assert "장비 로그 조회" in answer and "개인정보 가림" in answer
+    assert "synthetic-only" not in answer and "010-0000-0000" not in answer
+    assert "목록 근거의 확인이 필요" not in answer
+
+
+@pytest.mark.parametrize("raw_count", [True, "1", -1, 2])
+def test_raw_history_requires_valid_raw_count_before_using_raw_display_policy(raw_count):
+    assert "목록 근거의 확인이 필요" in format_conversation_history_answer(result(storedRawMessageCount=raw_count))
+
+
+def test_raw_history_refuses_unmasked_values_even_when_result_claims_raw_provenance():
+    payload = result([message("씨발 전화해 010-0000-0000")], storedRawMessageCount=1)
+    answer = format_conversation_history_answer(payload)
+    assert "010-0000-0000" not in answer and "목록 근거의 확인이 필요" in answer
 
 
 def test_chronology_uses_source_timestamp_in_kst_then_topics_reference_stable_numbers():

@@ -18,6 +18,7 @@ from .conversation_count import (
 )
 from .live_query import is_supported_stored_period
 from .policy import is_safe_memory_text
+from .raw_presentation import is_safe_raw_display_text
 
 MAX_HISTORY_MESSAGES = 20
 MAX_HISTORY_ANSWER_CHARS = 16_000
@@ -37,11 +38,11 @@ _INVALID = "저장된 발췌의 발언 목록을 확인할 수 없어. 집계와
 _UNKNOWN_TOPIC = "주제 확인 어려움"
 
 
-def _safe_text(value: Any, limit: int) -> bool:
+def _safe_text(value: Any, limit: int, *, raw: bool = False) -> bool:
     return bool(
         isinstance(value, str) and value.strip() and len(value) <= limit
         and not any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in value)
-        and is_safe_memory_text(value)
+        and (is_safe_raw_display_text(value) if raw else is_safe_memory_text(value))
     )
 
 
@@ -61,6 +62,9 @@ def _valid_summary(result: Mapping[str, Any]) -> bool:
     if any(type(value) is not int or not 0 <= value < 2**63 for value in counts):
         return False
     matched, ambiguous, scanned, unavailable, eligible = counts
+    raw_count = result.get("storedRawMessageCount", 0)
+    if type(raw_count) is not int or not 0 <= raw_count <= scanned:
+        return False
     expressions = result.get("matchedExpressions")
     return bool(
         result.get("scope") == "stored_excerpts"
@@ -92,7 +96,7 @@ def _validated_messages(result: Mapping[str, Any]) -> list[Mapping[str, Any]] | 
         ))
         if (not isinstance(stamp, str) or _STAMP.fullmatch(stamp) is None or _timestamp(stamp) is None
                 or not start <= Decimal(stamp) < end or Decimal(stamp) > cutoff
-                or not _safe_text(excerpt, excerpt_limit)
+                or not _safe_text(excerpt, excerpt_limit, raw=bool(result.get("storedRawMessageCount")))
                 or not isinstance(expressions, list) or not expressions
                 or len(expressions) > len(PROFANITY_EXPRESSION_ALLOWLIST)
                 or any(not isinstance(value, str) or value not in PROFANITY_EXPRESSION_ALLOWLIST for value in expressions)

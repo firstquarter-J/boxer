@@ -12,6 +12,8 @@ from .contracts import MemoryError, canonical_digest, source_revision
 from .conversation_count import PROFANITY_CLASSIFIER_VERSION, classify_profanity_message
 from .live_query import is_supported_stored_period
 from .policy import is_safe_memory_text, normalize_topic_key
+from .raw_policy import is_raw_only_scope
+from .raw_presentation import is_safe_raw_display_text, raw_display_text
 
 if TYPE_CHECKING:
     from sqlite3 import Row
@@ -193,15 +195,19 @@ def count_stored_messages(store: MemoryStore, *, tenant_id: str, channel_id: str
         # 승인된 원문은 요약 발췌와 별도로 읽고 현재 revision의 실제 본문인지 다시 대조한다.
         raw = row.pop("raw_text")
         if raw is not None:
-            if (len(raw) <= 40000 and is_safe_memory_text(raw)
+            approved_raw = is_raw_only_scope(tenant_id, row["channel_id"], row["message_ts"])
+            if (len(raw) <= 40000 and (approved_raw or is_safe_memory_text(raw))
                     and source_revision(raw, row["edited_at"]) == revision):
-                row["excerpt"] = raw
+                # 보관용 원문은 검증하고, 집계와 응답에는 값만 가린 별도 사본을 쓴다.
+                row["excerpt"] = raw_display_text(raw) if approved_raw else raw
+                row["classification_text"] = raw
                 row["stored_raw"] = True
                 raw_messages.add(key)
             else:
                 row["excerpt"] = ""
         excerpt = row["excerpt"]
-        classified = classify_profanity_message(excerpt) if excerpt else None
+        # 가린 표시 사본 때문에 실제 발언 집계가 0건으로 바뀌지 않게 원문으로 판정한다.
+        classified = classify_profanity_message(row.get("classification_text", excerpt)) if excerpt else None
         classification = classified["classification"] if classified is not None else None
         expressions = (frozenset(classified["matchedExpressions"])
                        if classified is not None and classification == "matched" else frozenset())
@@ -236,7 +242,8 @@ def count_stored_messages(store: MemoryStore, *, tenant_id: str, channel_id: str
                 continue
             candidates = []
             for row in sorted(message_rows[key], key=lambda row: row["id"]):
-                if not is_safe_memory_text(row["excerpt"]):
+                if not (is_safe_raw_display_text(row["excerpt"]) if row.get("stored_raw")
+                        else is_safe_memory_text(row["excerpt"])):
                     continue
                 limit = 40000 if row.get("stored_raw") else 1000
                 classified = classify_profanity_message(row["excerpt"][:limit])

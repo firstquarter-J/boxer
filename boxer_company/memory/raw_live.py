@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING, Any
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
 
 from .contracts import MemoryError, canonical_digest, source_identity, source_revision
-from .policy import _valid_permalink, normalize_source
+from .policy import _valid_permalink
 from .raw_policy import RAW_ONLY_CUTOFF_TS, RAW_ONLY_START_TS, is_raw_only_scope
+from .raw_source_policy import normalize_raw_source
 from .raw_state import RAW_STATE_PRIORITY
 
 if TYPE_CHECKING:
@@ -56,9 +57,9 @@ def _source(source: Any, *, tenant: str, channel: str, actor: str | None, messag
     identity = source_identity(tenant, channel, message, revision)
     if source.get("sourceId") is not None and source["sourceId"] != identity:
         raise MemoryError("raw_event_source_invalid")
-    # provenance의 범위는 발언 생성 월이다. normalize cutoff는 eventTs라 11월 이후 편집도 대조한다.
-    normalized = normalize_source(source, tenant_id=tenant, channel_id=channel,
-                                  thread_ts=thread, current_message_ts=event_ts)
+    # 원문 보관의 내용 필터만 분리한다. 발언 생성 월과 11월 이후의 편집 시각 검증은 유지한다.
+    normalized = normalize_raw_source(source, tenant_id=tenant, channel_id=channel,
+                                      thread_ts=thread, current_message_ts=event_ts)
     return normalized, text, thread
 
 

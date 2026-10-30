@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from .contracts import MemoryError, canonical_digest
-from .policy import normalize_source
+from .raw_source_policy import normalize_raw_source
 from .store import MemoryStore
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -114,8 +114,14 @@ def _validate_sources(row: sqlite3.Row, sources: list[dict[str, Any]]) -> list[t
                 or not Decimal(row["start_ts"]) <= Decimal(message_ts) <= Decimal(row["cutoff_ts"])
                 or Decimal(message_ts) in seen_messages):
             raise MemoryError("raw_import_source_invalid")
-        normalized = normalize_source(source, tenant_id=row["tenant_id"], channel_id=row["channel_id"],
-                                      thread_ts=thread_ts, current_message_ts=row["cutoff_ts"])
+        # 승인된 고정 범위만 원문 내용 필터를 분리하고 출처 검증과 기존 오류 계약은 유지한다.
+        try:
+            normalized = normalize_raw_source(source, tenant_id=row["tenant_id"], channel_id=row["channel_id"],
+                                              thread_ts=thread_ts, current_message_ts=row["cutoff_ts"])
+        except MemoryError as error:
+            if error.code == "source_identity_mismatch":
+                raise MemoryError("raw_import_source_identity_invalid") from error
+            raise
         if normalized is None:
             raise MemoryError("raw_import_source_not_allowed")
         if source.get("sourceId", normalized["sourceId"]) != normalized["sourceId"]:

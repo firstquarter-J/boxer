@@ -8,14 +8,15 @@ from decimal import Decimal
 from typing import Any
 
 from boxer_company.memory.contracts import canonical_digest, source_revision
-from boxer_company.memory.policy import normalize_source
 from boxer_company.memory.raw_policy import is_raw_only_scope
+from boxer_company.memory.raw_source_policy import normalize_raw_source
 from boxer_company_adapter_slack.memory_event_outbox import _validated_event
 
 _STAMP = re.compile(r"[0-9]{10,16}\.[0-9]{6}")
 _PREFIX = "memory.raw_event:"
 _STATUSES = frozenset({"stored", "duplicate", "stale", "deleted", "unavailable"})
 _ENDPOINT = "/internal/v1/memory/sources/raw"
+_HUMAN_SUBTYPES = frozenset({"", "file_share", "me_message", "thread_broadcast"})
 
 
 class RawMemoryTransportError(RuntimeError):
@@ -71,8 +72,9 @@ class RawMemoryTransport:
         if not self._author_allowed(tenant, author):
             return None
         _require(str(message.get("thread_ts") or thread) == thread, "memory_raw_source_thread_changed")
+        # 승인 원문은 첨부와 내용 분류로 버리지 않고 사람의 메시지 텍스트만 보존한다.
         if (message.get("bot_id") or message.get("bot_profile") or message.get("app_id")
-                or message.get("subtype") or message.get("files") or message.get("attachments")
+                or str(message.get("subtype") or "") not in _HUMAN_SUBTYPES
                 or not isinstance(text, str) or not text.strip() or len(text) > 40_000):
             return None
         edited = str(_data(message.get("edited")).get("ts") or "")
@@ -82,18 +84,20 @@ class RawMemoryTransport:
         source = {"messageTs": stamp, "authorId": author, "authorKind": "human", "text": text,
             "revisionHash": source_revision(text, edited), "createdAt": stamp, "editedAt": edited,
             "permalink": "https://lifexio.slack.com/archives/" + channel + "/p" + stamp.replace(".", "")}
-        normalized = normalize_source(source, tenant_id=tenant, channel_id=channel,
-                                      thread_ts=thread, current_message_ts=stamp)
+        normalized = normalize_raw_source(source, tenant_id=tenant, channel_id=channel,
+            thread_ts=thread, current_message_ts=edited or stamp)
         return {**normalized, "text": text, "threadTs": thread} if normalized is not None else None
 
     def stage(self, event: Mapping[str, Any], body: Mapping[str, Any], client: Any) -> tuple[dict[str, str], dict[str, Any] | None] | None:
         if not raw_event_scope(event, body):
             return None
         subtype = str(event.get("subtype") or "")
-        if subtype and subtype not in {"message_changed", "message_deleted"}:
+        if subtype not in _HUMAN_SUBTYPES | {"message_changed", "message_deleted"}:
             return None
         deleted = subtype == "message_deleted"
-        message = _data(event.get("previous_message")) if deleted else (_data(event.get("message")) if subtype else event)
+        changed = subtype == "message_changed"
+        # 파일 공유와 /me도 일반 생성 event이며 message_changed만 중첩 message를 읽는다.
+        message = _data(event.get("previous_message")) if deleted else (_data(event.get("message")) if changed else event)
         tenant, channel = str(body.get("team_id") or event.get("team") or ""), str(event.get("channel") or "")
         stamp = str(event.get("deleted_ts") or message.get("ts") or event.get("ts") or "")
         thread = str(message.get("thread_ts") or stamp)
@@ -103,14 +107,14 @@ class RawMemoryTransport:
         bot = bool(message.get("bot_id") or message.get("bot_profile") or message.get("app_id")
                    or message.get("subtype") == "bot_message")
         allowed_author = False if deleted else self._author_allowed(tenant, author)
-        if not subtype and (not allowed_author or bot):
+        if not deleted and not changed and (not allowed_author or bot):
             return None
         # 채널 정보가 확인되기 전에는 durable 영수증도 생성하지 않는다.
         self._private(client, tenant, channel)
         edited = str(_data(message.get("edited")).get("ts") or "")
         source = (self._source(message, tenant=tenant, channel=channel, thread=thread, stamp=stamp)
                   if not deleted and allowed_author and not bot else None)
-        raw_type = "deleted" if deleted else "changed" if subtype else "created"
+        raw_type = "deleted" if deleted else "changed" if changed else "created"
         if source is None and not deleted:
             if raw_type == "created":
                 return None
@@ -173,7 +177,7 @@ class RawMemoryTransport:
             if not source_provided:
                 fresh_type, fresh_ts, revision, actual_source = self._refresh(receipt, client)
                 if revision != receipt.get("revisionHash") or fresh_type != raw_type:
-                    # 첨부 상태만 바뀌어 text hash가 같아도 원래 event ID의 payload를 바꾸지 않는다.
+                    # 본문 hash가 같아도 지원하는 사람 메시지 형식이 바뀌면 새 binding을 쓴다.
                     binding = revision if revision != receipt.get("revisionHash") else canonical_digest({
                         "revisionHash": revision, "eventType": fresh_type})
                     identity = _PREFIX + "refresh_" + canonical_digest([receipt["eventId"], binding])
