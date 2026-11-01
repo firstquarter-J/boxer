@@ -1197,11 +1197,38 @@ def test_neighbor_channel_keeps_existing_capture_and_explicit_preference_behavio
 
 
 @pytest.mark.parametrize("event_type", ["changed", "deleted", "unavailable"])
-@pytest.mark.parametrize("stamp", ["1788188400.000001", "1793458800.000001"])
-def test_channel_derivative_policy_does_not_expand_unknown_source_event_collection_window(state, event_type, stamp):
+@pytest.mark.parametrize("stamp,in_raw_scope", [("1788188400.000001", False), ("1793458800.000001", True)])
+def test_unknown_source_events_only_tombstone_deletions_inside_continuous_raw_scope(state, monkeypatch, event_type, stamp, in_raw_scope):
+    from boxer_company.memory import raw_live, raw_source_policy
+
     store, _ = state
-    result = store.source_event(tenant_id="T19PA3EPL", channel_id="C0621TL2HSB", message_ts=stamp,
-        event_type=event_type, event_id="outside-october-source")
-    assert result["eventId"] is None
+    tenant, channel = "T19PA3EPL", "C0621TL2HSB"
+    arguments = {"tenant_id": tenant, "channel_id": channel, "message_ts": stamp,
+        "event_type": event_type, "event_id": "unknown-source-event"}
+    result = store.source_event(**arguments)
+    # 9월은 범위 밖이고, 11월의 changed/unavailable도 원문 수집이나 전체 발언 금지를 만들지 않는다.
+    if not in_raw_scope or event_type != "deleted":
+        assert result == {"invalidatedCount": 0, "eventId": None}
+        with store._connection() as connection:
+            for table in ("memory_events", "memory_sources", "memory_source_texts", "memory_raw_imports"):
+                assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        return
+    # 미수집 11월 발언도 진짜 삭제는 정식 source tombstone으로 기록하고 재전송은 멱등 처리한다.
+    assert result["eventId"] and result["invalidatedCount"] == 0
+    assert store.source_event(**arguments) == result
     with store._connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0
+        events = connection.execute("SELECT * FROM memory_events").fetchall()
+        assert len(events) == 1
+        assert events[0]["id"] == result["eventId"]
+        assert (events[0]["event_type"], events[0]["deletion_kind"], events[0]["source_message_id"],
+            events[0]["durability_state"]) == ("source_deleted", "source", stamp, "pending")
+        assert store._source_deleted(connection, tenant, channel, stamp)
+    for module in (raw_live, raw_source_policy):
+        monkeypatch.setattr(module, "TEAM_MEMBER_PROFILES", ({"user_id": "U1"},))
+    late = raw_live.ingest_raw_event(store, tenant_id=tenant, channel_id=channel, message_ts=stamp,
+        actor_id="U1", event_id="late-created-after-unknown-delete", event_ts=stamp,
+        event_type="created", source=source(ts=stamp, channel=channel))
+    assert late["status"] == "stale" and late["stored"] is False
+    with store._connection() as connection:
+        for table in ("memory_sources", "memory_source_texts", "memory_raw_imports", "memory_items", "memory_jobs"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0

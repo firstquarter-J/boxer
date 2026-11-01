@@ -470,6 +470,81 @@ def test_effective_revision_sql_keeps_outer_event_when_alias_collides(case, alia
     assert {row["id"] for row in rows(case.store, statement)} == expected
 
 
+def test_november_archive_registers_normally_but_cannot_request_legacy_reauthorization(case):
+    # 지속 수집의 11월 허용이 운영자 재승인 대상까지 넓히지는 않는다.
+    message = "1793458800.000001"
+    case.clock.value = 1793462401.0
+    item = source(0)
+    item.update(messageTs=message, createdAt=message, threadTs=message,
+        sourceId=source_identity(TENANT, CHANNEL, message, item["revisionHash"]),
+        permalink=f"https://synthetic.slack.com/archives/{CHANNEL}/p{message.replace('.', '')}")
+    document = {**case.document, "importId": "november-registered", "startTs": "1793458800.000000",
+        "cutoffTs": "1793462400.000000", "sources": [item], "verifiedAt": format(case.clock.value, ".6f")}
+    document["manifestDigest"] = canonical_digest({key: document[key] for key in
+        ("tenantId", "channelId", "authorId", "startTs", "cutoffTs", "sources")})
+    assert import_raw_archive(case.store, document, tenant_id=TENANT, channel_id=CHANNEL,
+        author_id=AUTHOR, operator_id=OPERATOR, begin_only=True, now=case.clock.value)["state"] == "collecting"
+    with pytest.raises(MemoryError, match="revalidation_registration_required"):
+        case.module.prepare_revalidation_plan(case.store, import_id=document["importId"], tenant_id=TENANT,
+            channel_id=CHANNEL, author_id=AUTHOR, operator_id=OPERATOR,
+            manifest_digest=document["manifestDigest"], sources=document["sources"])
+    with pytest.raises(MemoryError, match="revalidation_registration_required"):
+        case.module.revalidate_registered_sources(case.store, document, tenant_id=TENANT,
+            channel_id=CHANNEL, author_id=AUTHOR, operator_id=OPERATOR, now=case.clock.value)
+
+
+def test_durable_october_release_cannot_be_reused_for_november_revision_in_common_sql(case):
+    prepared(case)
+    reauthorize(case)
+    case.service.flush_deletions(case.store)
+    item = case.items[0]
+    target = next(row for row in case.old_revisions if row["source_id"] == item["sourceId"])
+    assert not blocked(case, item)
+    # 합성 DB에서 두 행의 날짜를 함께 위조해도 legacy SQL의 월 경계는 차단을 유지한다.
+    with case.store._connection(write=True) as connection:
+        connection.execute("UPDATE memory_events SET source_message_id=? WHERE id=? OR reallow_request_id=?",
+            ("1793458800.000001", target["id"], target["id"]))
+    assert blocked(case, item)
+
+
+@pytest.mark.parametrize("message,legacy", [("1793458799.999999999", True), ("1793458800.000000000", False)])
+def test_month_end_nanosecond_reauthorization_agrees_in_python_journal_and_effective_sql(case, message, legacy):
+    from boxer_company.memory.raw_policy import is_legacy_raw_revalidation_scope
+
+    # 실제 domain 수집부터 시작해 SQL REAL 반올림으로 월말 marker가 무시되는 회귀를 잡는다.
+    case.clock.value = 1793462401.0
+    item = source(0)
+    item.update(messageTs=message, createdAt=message, threadTs=message,
+        sourceId=source_identity(TENANT, CHANNEL, message, item["revisionHash"]),
+        permalink=f"https://synthetic.slack.com/archives/{CHANNEL}/p{message.replace('.', '')}")
+    assert create_event(case.store, item, "boundary-created")["stored"]
+    assert unavailable_event(case.store, item, "boundary-unavailable")["status"] == "unavailable"
+    case.service.flush_deletions(case.store)
+    case.document = {**case.document, "importId": "boundary-revalidation", "sources": [item],
+        "startTs": RAW_ONLY_START_TS if legacy else "1793458800.000000",
+        "cutoffTs": message if legacy else "1793462400.000000", "verifiedAt": format(case.clock.value, ".6f")}
+    case.document["manifestDigest"] = canonical_digest({key: case.document[key] for key in
+        ("tenantId", "channelId", "authorId", "startTs", "cutoffTs", "sources")})
+    assert is_legacy_raw_revalidation_scope(TENANT, CHANNEL, message) is legacy
+    if not legacy:
+        register(case)
+        with pytest.raises(MemoryError, match="revalidation_registration_required"):
+            prepare(case)
+        assert blocked(case, item)
+        return
+    plan = prepared(case)
+    assert plan["targetCount"] == 1
+    assert reauthorize(case)["reauthorizedSourceCount"] == 1
+    assert blocked(case, item)
+    case.service.flush_deletions(case.store)
+    assert not blocked(case, item)
+    # 내구화한 marker도 실제 journal validator를 통과해야 SQL의 허용과 의미가 같다.
+    _, entries = case.service.verify_journal()
+    marker = next(entry["event"] for entry in entries if entry["event"]["eventType"] == "raw_source_revalidated")
+    assert marker["sourceMessageId"] == message
+    assert not raw_texts(case.store)
+
+
 def test_old_revalidation_metadata_cannot_rewind_a_newer_current_source_without_watermark_receipt(case):
     prepared(case)
     item = {**case.items[0], "text": "새 snapshot에만 있는 합성 최신 본문", "editedAt": "1792100004.000001"}

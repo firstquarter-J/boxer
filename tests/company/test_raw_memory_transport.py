@@ -213,8 +213,7 @@ class RawMemoryTransportTests(unittest.TestCase):
             {**event(), "bot_profile": {"id": "B1"}}, {**event(), "app_id": "A1"},
             {**event(), "user": "UOTHER"}, {**event(), "subtype": "channel_join"},
             {**event(), "subtype": "bot_message"}, {**event(), "subtype": "channel_topic"},
-            {**event(), "channel": "DPRIVATE"}, {**event(), "ts": "1790780399.999999"},
-            {**event(), "ts": "1793458800.000001"}]
+            {**event(), "channel": "DPRIVATE"}, {**event(), "ts": "1790780399.999999"}]
         for value in cases:
             with self.subTest(kind=value.get("bot_id") or value.get("channel")):
                 self.assertFalse(self.stage(value))
@@ -222,6 +221,39 @@ class RawMemoryTransportTests(unittest.TestCase):
         self.assertFalse(self.stage())
         self.assertEqual(self.memory.event_outbox.pending_count(), 0)
         self.assertEqual(self.api.calls, [])
+
+    def test_new_month_native_and_mention_are_coherent_and_idempotent(self):
+        # 생성 월이 바뀌어도 native와 mention은 같은 발언 ID와 원문 payload를 사용한다.
+        for stamp in ("1793458800.000000", "1798729200.000000"):
+            with self.subTest(stamp=stamp), patch.dict(globals(), {"STAMP": stamp, "LATER": stamp}):
+                self.slack.current = message()
+                self.assertTrue(self.stage())
+                self.assertTrue(self.stage({**event(), "type": "app_mention"}, identity="EvMention"))
+                self.assertEqual(self.api.calls[-1][1], self.api.calls[-2][1])
+                self.assertEqual(self.api.calls[-1][1]["source"]["createdAt"], stamp)
+                self.assertEqual(self.memory.event_outbox.pending_count(), 0)
+
+    def test_month_boundary_retry_preserves_payload_then_refreshes_new_revision(self):
+        with patch.dict(globals(), {"STAMP": "1796050799.999999", "LATER": "1796050800.000001"}):
+            self.slack.current = message()
+            self.api.offline = True
+            self.assertTrue(self.stage())
+            original = self.api.calls[-1][1]
+            self.api.offline = False
+            self.assertEqual(self.new_memory().drain_source_events(), 1)
+            self.assertEqual(self.api.calls[-1][1], original)
+            self.api.offline = True
+            self.stage(event("경계 이전 수정", edited="1796050800.000001"))
+            receipt = self.memory.event_outbox.pending()[0]
+            self.slack.current = message("다음 달 수정", edited="1796050801.000001")
+            self.api.offline = False
+            self.assertEqual(self.new_memory().drain_source_events(), 1)
+            refreshed = self.api.calls[-1][1]
+            self.assertEqual(refreshed["eventId"], "memory.raw_event:refresh_" + canonical_digest([
+                receipt["eventId"], source_revision("다음 달 수정", "1796050801.000001")]))
+            self.assertEqual(refreshed["eventTs"], "1796050801.000001")
+            self.assertEqual(self.memory.event_outbox.pending_count(), 0)
+            self.assertNotIn("다음 달 수정", self.path.read_text())
 
     def test_wrong_workspace_creation_is_excluded(self):
         self.assertFalse(self.memory.raw_event(event(), {"team_id": "TOTHER"}, self.slack))

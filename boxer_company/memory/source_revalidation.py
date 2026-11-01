@@ -22,8 +22,8 @@ from .raw_policy import (
     RAW_ONLY_END_TS,
     RAW_ONLY_START_TS,
     RAW_ONLY_TENANT_ID,
+    is_legacy_raw_revalidation_scope,
     is_raw_only_channel,
-    is_raw_only_scope,
 )
 
 if TYPE_CHECKING:
@@ -48,6 +48,7 @@ def _release_match_sql(alias: str, release_alias: str) -> str:
     if any(not isinstance(value, str) or not _SQL_ALIAS.fullmatch(value) for value in (alias, release_alias)):
         raise MemoryError("memory_raw_revalidation_alias_invalid")
     channels = ",".join("'" + channel + "'" for channel in sorted(RAW_ONLY_CHANNEL_IDS))
+    # 월 경계는 정수초이므로 INTEGER로 비교해 마지막 ns가 REAL에서 다음 달로 반올림되지 않게 한다.
     # 승인 범위와 정확한 옛 이벤트를 고정하며 pending journal은 차단을 해제하지 않는다.
     return f"""{release_alias}.tenant_id={alias}.tenant_id
         AND {release_alias}.scope_channel_id={alias}.scope_channel_id
@@ -59,8 +60,8 @@ def _release_match_sql(alias: str, release_alias: str) -> str:
         AND {alias}.deletion_kind='source_revision' AND {alias}.event_type='source_changed'
         AND substr({alias}.request_id,1,4)='raw:'
         AND {alias}.tenant_id='{RAW_ONLY_TENANT_ID}' AND {alias}.scope_channel_id IN ({channels})
-        AND CAST({alias}.source_message_id AS REAL)>=CAST('{RAW_ONLY_START_TS}' AS REAL)
-        AND CAST({alias}.source_message_id AS REAL)<CAST('{RAW_ONLY_END_TS}' AS REAL)"""
+        AND CAST({alias}.source_message_id AS INTEGER)>=CAST('{RAW_ONLY_START_TS}' AS INTEGER)
+        AND CAST({alias}.source_message_id AS INTEGER)<CAST('{RAW_ONLY_END_TS}' AS INTEGER)"""
 
 
 def _release_sql(alias: str) -> str:
@@ -113,7 +114,7 @@ def validate_revalidation_event(event: Mapping[str, Any], parsed_payload: Mappin
     tenant, channel, message = event.get("tenantId"), event.get("scopeChannelId"), event.get("sourceMessageId")
     revision = parsed_payload.get("revisionHash")
     if (event.get("deletionKind") != "raw_state" or event.get("eventType") != _EVENT_TYPE
-            or not is_raw_only_scope(tenant, channel, message)
+            or not is_legacy_raw_revalidation_scope(tenant, channel, message)
             or set(parsed_payload) != {"eventTs", "revisionHash", "state"}
             or parsed_payload.get("state") != "current" or not isinstance(revision, str)
             or not _DIGEST.fullmatch(revision)
@@ -202,8 +203,8 @@ def _registration(connection: sqlite3.Connection, *, import_id: str, tenant_id: 
     if (row is None or (row["tenant_id"], row["channel_id"], row["author_id"], row["operator_id"],
             row["manifest_digest"]) != (tenant_id, channel_id, author_id, operator_id, manifest_digest)
             or row["state"] not in {"collecting", "completed"}
-            or not is_raw_only_scope(tenant_id, channel_id, row["start_ts"])
-            or not is_raw_only_scope(tenant_id, channel_id, row["cutoff_ts"])):
+            or not is_legacy_raw_revalidation_scope(tenant_id, channel_id, row["start_ts"])
+            or not is_legacy_raw_revalidation_scope(tenant_id, channel_id, row["cutoff_ts"])):
         _fail("registration_required")
     if connection.execute("""SELECT 1 FROM memory_threads WHERE tenant_id=? AND channel_id=?
         AND channel_kind!='private_channel' LIMIT 1""", (tenant_id, channel_id)).fetchone():
@@ -312,7 +313,7 @@ def _targets(connection: sqlite3.Connection, row: sqlite3.Row,
     targets = []
     for thread, source, _ in normalized:
         tenant, channel, message = row["tenant_id"], row["channel_id"], source["messageTs"]
-        if not is_raw_only_scope(tenant, channel, message) or _hard_blocked(connection, tenant, channel, message):
+        if not is_legacy_raw_revalidation_scope(tenant, channel, message) or _hard_blocked(connection, tenant, channel, message):
             _fail("source_deleted")
         known = _known_identity(connection, row, thread, source)
         watermark = connection.execute("""SELECT * FROM memory_raw_event_states WHERE tenant_id=?

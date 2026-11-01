@@ -40,13 +40,13 @@ def state(tmp_path, monkeypatch):
         yield store, service, client
 
 
-def payload():
+def payload(stamp=STAMP):
     text = "  오늘 회의에서 일정 이야기를 했어.\n"
-    return {"tenantId": TENANT, "channelId": CHANNEL, "actorId": AUTHOR, "messageTs": STAMP,
-            "eventId": "raw-event-1", "eventTs": STAMP, "eventType": "created",
-            "source": {"threadTs": STAMP, "messageTs": STAMP, "authorId": AUTHOR, "authorKind": "human",
-                       "text": text, "revisionHash": source_revision(text), "createdAt": STAMP,
-                       "permalink": f"https://lifexio.slack.com/archives/{CHANNEL}/p{STAMP.replace('.', '')}"}}
+    return {"tenantId": TENANT, "channelId": CHANNEL, "actorId": AUTHOR, "messageTs": stamp,
+            "eventId": "raw-event-1", "eventTs": stamp, "eventType": "created",
+            "source": {"threadTs": stamp, "messageTs": stamp, "authorId": AUTHOR, "authorKind": "human",
+                       "text": text, "revisionHash": source_revision(text), "createdAt": stamp,
+                       "permalink": f"https://lifexio.slack.com/archives/{CHANNEL}/p{stamp.replace('.', '')}"}}
 
 
 def post(client, value, *, token=TOKEN):
@@ -96,18 +96,19 @@ def test_http_approved_content_creation_edit_and_delete_keep_raw_only_contract(s
 
 
 @pytest.mark.parametrize("change,status", [("token", 401), ("actor", 403), ("author", 422),
-    ("scope", 409), ("month", 409), ("bot", 422), ("body_extra", 422)])
-def test_auth_and_source_scope_fail_closed_without_body_reflection(state, change, status):
+    ("scope", 409), ("before_start", 409), ("bot", 422), ("body_extra", 422)])
+@pytest.mark.parametrize("stamp", [STAMP, "1793458800.000000"])
+def test_auth_and_source_scope_fail_closed_without_body_reflection(state, change, status, stamp):
     store, _, client = state
-    value = payload()
+    value = payload(stamp)
     if change == "actor":
         value["actorId"] = value["source"]["authorId"] = "UOTHER"
     elif change == "author":
         value["source"]["authorId"] = "UOTHER"
     elif change == "scope":
         value["channelId"] = "COTHER"
-    elif change == "month":
-        value["messageTs"] = value["source"]["messageTs"] = value["eventTs"] = "1793458800.000001"
+    elif change == "before_start":
+        value = payload("1790780399.999999")
     elif change == "bot":
         value["source"]["authorKind"] = "boxer"
     elif change == "body_extra":
@@ -117,6 +118,19 @@ def test_auth_and_source_scope_fail_closed_without_body_reflection(state, change
     assert "private-data" not in result.text and value["source"]["text"] not in result.text
     with store._connection() as connection:
         assert connection.execute("SELECT count(*) FROM memory_source_texts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("stamp", ["1793458800.000000", "1798729199.999999", "1798729200.000000"])
+def test_coherent_november_and_new_year_http_events_are_idempotent_without_derivatives(state, stamp):
+    # 전체 출처 필드를 같은 생성 시각으로 구성해 월 제한 해제 자체를 검증한다.
+    store, _, client = state
+    value = payload(stamp)
+    assert post(client, value).json()["status"] == "stored"
+    assert post(client, value).json()["status"] == "duplicate"
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_source_texts").fetchone()[0] == 1
+        for table in ("memory_jobs", "memory_job_inputs", "memory_items", "memory_summaries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
 def test_authorless_delete_can_only_invalidate_and_never_recreate(state):

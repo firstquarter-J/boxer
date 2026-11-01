@@ -233,7 +233,7 @@ def test_future_edit_uses_event_cutoff_while_provenance_keeps_october_message_sc
     {"actor_id": None}, {"source": None}, {"source": "invalid"},
     {"event_type": "other"}, {"event_type": []}, {"tenant_id": "OTHER"}, {"channel_id": "COTHER"},
     {"event_ts": "NaN"}, {"event_ts": "1792100000.000001"},
-    {"message_ts": "1793458800.000000"},
+    {"message_ts": "1790780399.999999999"},
 ])
 def test_invalid_scope_or_actor_never_writes(store, change):
     with pytest.raises(MemoryError):

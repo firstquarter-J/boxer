@@ -141,10 +141,22 @@ def test_reason_json_is_exact_canonical_and_rejects_duplicate_or_unknown_fields(
         parse_raw_state_event({**event(), "reasonCode": reason})
 
 
-@pytest.mark.parametrize("changes", [{"tenantId": "TOTHER"}, {"scopeChannelId": "COTHER"}, {"sourceMessageId": "1793458800.000000"}])
-def test_raw_state_is_fixed_to_approved_message_month_and_channels(changes):
+@pytest.mark.parametrize("changes", [{"tenantId": "TOTHER"}, {"scopeChannelId": "COTHER"}, {"sourceMessageId": "1790780399.999999999"}])
+def test_raw_state_is_fixed_to_approved_start_tenant_and_channels(changes):
     with pytest.raises(MemoryError, match="memory_raw_state_invalid"):
         parse_raw_state_event({**event(), **changes})
+
+
+@pytest.mark.parametrize("stamp", ["1793458800.000000000", "1798729200.000000000"])
+@pytest.mark.parametrize("mode", ["current", "unavailable", "deleted"])
+def test_raw_state_accepts_coherent_new_months_without_weakening_timestamp_order(stamp, mode):
+    # 생성 시각과 event 시각을 함께 바꿔 기존 날짜 불일치로 인한 거짓 통과를 막는다.
+    value = {**event(mode, revision="a" * 64, timestamp=stamp), "sourceMessageId": stamp}
+    assert parse_raw_state_event(value)["eventTs"] == stamp
+    invalid = {**value, "reasonCode": json.dumps({"eventTs": EVENT, "revisionHash": "a" * 64, "state": mode},
+        sort_keys=True, separators=(",", ":"))}
+    with pytest.raises(MemoryError, match="memory_raw_state_invalid"):
+        parse_raw_state_event(invalid)
 
 
 @pytest.mark.parametrize("snapshot_version", [1, 2, 3])

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from calendar import monthrange
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from boxer_company.team_chat_context import TEAM_MEMBER_PROFILES
 
@@ -27,12 +30,31 @@ _TIMESTAMP = re.compile(r"[0-9]{1,20}\.[0-9]{1,9}")
 _SOURCE_KEYS = frozenset({"sourceId", "messageTs", "threadTs", "revisionHash", "authorId", "authorKind", "text",
                           "permalink", "createdAt", "editedAt", "route", "deliveryVerified"})
 _MAX_TEXT_CHARS = 40_000
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _stamp(value: Any) -> Decimal:
     if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value) or not 0 <= Decimal(value) < 2**63:
         raise MemoryError("raw_event_timestamp_invalid")
     return Decimal(value)
+
+
+def _import_bounds(message_ts: str) -> tuple[str, str]:
+    """이벤트별 provenance는 유지하며 발언 생성월의 유한 범위만 기록한다."""
+    value = _stamp(message_ts)
+    if value < Decimal(RAW_ONLY_START_TS):
+        raise MemoryError("raw_event_timestamp_invalid")
+    if value <= Decimal(RAW_ONLY_CUTOFF_TS):
+        # 기존 10월 행과 같은 범위를 사용해 재시도와 옛 snapshot의 출처를 보존한다.
+        return RAW_ONLY_START_TS, RAW_ONLY_CUTOFF_TS
+    try:
+        instant = datetime.fromtimestamp(int(value), _KST)
+        start = instant.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=monthrange(start.year, start.month)[1])
+        # Slack에서 허용하는 소수 9자리의 월말 메시지도 범위에 포함한다.
+        return f"{int(start.timestamp())}.000000", format(Decimal(int(end.timestamp())) - Decimal("0.000000001"), "f")
+    except (OverflowError, OSError, ValueError) as exc:
+        raise MemoryError("raw_event_timestamp_invalid") from exc
 
 
 def _source(source: Any, *, tenant: str, channel: str, actor: str | None, message: str,
@@ -58,7 +80,7 @@ def _source(source: Any, *, tenant: str, channel: str, actor: str | None, messag
     identity = source_identity(tenant, channel, message, revision)
     if source.get("sourceId") is not None and source["sourceId"] != identity:
         raise MemoryError("raw_event_source_invalid")
-    # 원문 보관의 내용 필터만 분리한다. 발언 생성 월과 11월 이후의 편집 시각 검증은 유지한다.
+    # 원문 보관의 내용 필터만 분리하고 승인 범위와 원본의 편집 시각 검증은 유지한다.
     normalized = normalize_raw_source(source, tenant_id=tenant, channel_id=channel,
                                       thread_ts=thread, current_message_ts=event_ts)
     return normalized, text, thread
@@ -162,9 +184,10 @@ def ingest_raw_event(store: MemoryStore, *, tenant_id: str, channel_id: str, eve
                 raise MemoryError("raw_event_text_conflict")
             # 이벤트별 불변 provenance를 만들어 완료된 snapshot에 새 본문을 덧붙이지 않는다.
             import_id = "live_" + canonical_digest([tenant_id, event_id])
+            start_ts, cutoff_ts = _import_bounds(message_ts)
             connection.execute("INSERT INTO memory_raw_imports(id,tenant_id,channel_id,author_id,operator_id,start_ts,cutoff_ts,manifest_digest,state,created_at) VALUES(?,?,?,?,?,?,?,?,'completed',?)",
-                               (import_id, tenant_id, channel_id, actor_id, actor_id, RAW_ONLY_START_TS,
-                                RAW_ONLY_CUTOFF_TS, digest, store._clock()))
+                               (import_id, tenant_id, channel_id, actor_id, actor_id, start_ts,
+                                cutoff_ts, digest, store._clock()))
             metadata = store._thread(connection, tenant_id, channel_id, thread, "private_channel")
             if metadata["channel_kind"] != "private_channel":
                 raise MemoryError("raw_event_private_channel_required")

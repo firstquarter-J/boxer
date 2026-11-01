@@ -202,10 +202,9 @@ def test_approved_private_october_archive_keeps_complete_text_without_derivative
     ("TOTHER", "C0621TL2HSB", MESSAGE, True),
     (RAW_ONLY_TENANT_ID, "COTHER", MESSAGE, True),
     (RAW_ONLY_TENANT_ID, "C0621TL2HSB", "1790780399.999999", True),
-    (RAW_ONLY_TENANT_ID, "C0621TL2HSB", "1793458800.000001", True),
     (RAW_ONLY_TENANT_ID, "C0621TL2HSB", MESSAGE, False),
 ])
-def test_content_filter_exemption_cannot_expand_tenant_channel_month_or_team(store, monkeypatch, tenant, channel, stamp, profile):
+def test_content_filter_exemption_cannot_expand_tenant_channel_start_or_team(store, monkeypatch, tenant, channel, stamp, profile):
     from decimal import Decimal
 
     from boxer_company.memory import raw_source_policy
