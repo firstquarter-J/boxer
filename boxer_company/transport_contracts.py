@@ -208,6 +208,8 @@ def company_operation_route_names() -> frozenset[str]:
             "conversation_memory_manage",
             "security_review",
             "daily_auto_update_control",
+            # 영상 파일 재검사도 API operations의 공통 권한과 전송 계약을 사용한다.
+            "recording_media_diagnosis",
             DEVICE_HEALTH_ALERT_SMS_PREPARE_ROUTE,
             DEVICE_HEALTH_ALERT_SMS_ROUTE,
             DEVICE_HEALTH_ALERT_VOICE_ROUTE,

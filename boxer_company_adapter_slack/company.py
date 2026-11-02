@@ -32,6 +32,9 @@ from boxer_company.operation_routing import (
     company_operation_legacy_stage,
     match_company_operation_route,
 )
+from boxer_company.recording_media_scope import (
+    needs_recording_media_diagnosis_context,
+)
 from boxer_company.team_member_aliases import matches_team_member_alias
 from boxer_company.transport_contracts import (
     DEVICE_DIAGNOSTIC_FOLLOWUP_PROBE_ACTION,
@@ -582,7 +585,12 @@ def create_app() -> App:
             payload,
             context_entries=(
                 get_context_entries()
-                if needs_device_file_operation_context(question)
+                # 영상 알림의 후속 질문은 본문에 대상이 없어도 스레드의
+                # 장비, 바코드와 세션 시각을 API의 DB 대조용 문맥으로 보낸다.
+                if (
+                    needs_device_file_operation_context(question)
+                    or needs_recording_media_diagnosis_context(question)
+                )
                 else ()
             ),
         )

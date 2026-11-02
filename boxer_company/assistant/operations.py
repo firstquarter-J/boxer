@@ -43,6 +43,9 @@ from boxer_company.assistant.knowledge_write_route import (
 from boxer_company.assistant.private_admin_routes import (
     build_private_operations_routes,
 )
+from boxer_company.assistant.recording_media_diagnosis_route import (
+    RecordingMediaDiagnosisAssistantRoute,
+)
 from boxer_company.assistant.security_review_route import (
     SECURITY_REVIEW_ROUTE,
     SecurityReviewAssistantRoute,
@@ -56,6 +59,7 @@ from boxer_company.operation_routing import (
 from boxer_company.routers.device_file_probe import (
     _should_probe_device_files,
 )
+from boxer_company.recording_media_scope import RECORDING_MEDIA_DIAGNOSIS_ROUTE
 from boxer_company.routers.device_scanner_abi_patch import (
     DEVICE_SCANNER_ABI_PATCH_ROUTE,
 )
@@ -402,6 +406,11 @@ def build_company_operation_routes(
             ),
         ),
         exact(learning_route, frozenset({"thread_playbook_learning"})),
+        # 중앙 DB와 업로드 파일만 읽으며 MDA/SSH나 mutation guard로 확장하지 않는다.
+        exact(
+            RecordingMediaDiagnosisAssistantRoute(logger=logger),
+            frozenset({RECORDING_MEDIA_DIAGNOSIS_ROUTE}),
+        ),
         *(
             exact(route, frozenset({route.name}))
             for route in pre_device_private_routes

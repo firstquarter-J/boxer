@@ -7,6 +7,10 @@ from dataclasses import replace
 from typing import Any, Literal
 
 from boxer_company.memory.commands import MEMORY_MANAGE_ROUTE, parse_memory_command
+from boxer_company.recording_media_scope import (
+    RECORDING_MEDIA_DIAGNOSIS_ROUTE,
+    match_recording_media_diagnosis_route,
+)
 
 from boxer_company._operation_routing_automation import (
     DAILY_AUTO_UPDATE_ROUTE,
@@ -225,6 +229,11 @@ def match_company_operation_route(
     if learning_route is not None:
         return learning_route
 
+    # 현재 질문의 영상 검사 의도만 승격하고 thread의 명령 문구는 실행하지 않는다.
+    media_diagnosis = match_recording_media_diagnosis_route(scoped)
+    if media_diagnosis is not None:
+        return media_diagnosis
+
     private_route = match_private_operations_route(scoped)
     if private_route in _LEGACY_PRE_DEVICE_PRIVATE_ROUTES:
         # 기존 Slack의 admin route는 Notion·장비 route보다 먼저 실행됐다.
@@ -300,6 +309,7 @@ def company_operation_legacy_stage(
         {
             SECURITY_REVIEW_ROUTE,
             DAILY_AUTO_UPDATE_ROUTE,
+            RECORDING_MEDIA_DIAGNOSIS_ROUTE,
             "thread_playbook_learning",
         }
         | set(_LEGACY_PRE_DEVICE_PRIVATE_ROUTES)

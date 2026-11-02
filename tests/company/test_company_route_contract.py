@@ -106,6 +106,7 @@ class _Invocation:
     render: Mock
     render_download: Mock
     context_loader: Mock
+    operation_matcher: Mock
 
 
 class CompanyRouteContractTests(unittest.TestCase):
@@ -305,7 +306,7 @@ class CompanyRouteContractTests(unittest.TestCase):
                     return_value=False,
                 )
             )
-            stack.enter_context(
+            operation_matcher = stack.enter_context(
                 patch.object(
                     company,
                     "match_company_operation_route",
@@ -376,6 +377,7 @@ class CompanyRouteContractTests(unittest.TestCase):
             render=render,
             render_download=render_download,
             context_loader=context_loader,
+            operation_matcher=operation_matcher,
         )
 
     def test_membership_denial_is_terminal_before_remote_services(self) -> None:
@@ -642,6 +644,52 @@ class CompanyRouteContractTests(unittest.TestCase):
         slack.conversations_replies.assert_called_once()
         (request,) = invocation.operation_service.progress_calls
         self.assertEqual(request.context_entries[0]["text"], "이 장비를 업데이트하기로 했어")
+
+    def test_recording_media_question_loads_alert_context_before_route_matching(self) -> None:
+        # 식별자를 생략한 영상 질문도 최초 matcher와 API가 같은 알림 문맥을
+        # 받는다. 문맥은 조회 힌트이며 Slack에서 신뢰된 파일 대상으로 승격하지 않는다.
+        alert_text = (
+            "녹화 영상 이상 감지\n장비 MB2-B00164\n바코드 69421066701\n"
+            "세션 시작 2026-11-02 17:19:43 KST\n영상 디코딩 실패"
+        )
+        for question in ("영상은 정상인데 왜 디코딩 실패야?", "왜 그래?"):
+            with self.subTest(question=question):
+                slack = Mock()
+                slack.conversations_replies.return_value = {"messages": [{
+                    "ts": "1785311999.000001", "user": "UBOXER", "text": alert_text,
+                }]}
+                invocation = self._invoke_mention(
+                    question=question,
+                    operation_route="recording_media_diagnosis",
+                    operation_stage="device",
+                    operation_result=_result("recording_media_diagnosis"),
+                    slack_client=slack,
+                    use_real_context_loader=True,
+                )
+
+                invocation.context_loader.assert_called_once()
+                slack.conversations_replies.assert_called_once()
+                probe_request = invocation.operation_matcher.call_args.args[0]
+                (request,) = invocation.operation_service.answer_calls
+                self.assertEqual(probe_request.context_entries[0]["text"], alert_text)
+                self.assertEqual(request.context_entries, probe_request.context_entries)
+                self.assertNotIn("trusted_mda_recovery_scope", request.metadata)
+                slack.conversations_history.assert_not_called()
+                slack.conversations_list.assert_not_called()
+
+    def test_recording_media_question_denied_before_loading_alert_context(self) -> None:
+        # 영상 검사를 위한 스레드 수집도 기존 membership을 먼저 통과한다.
+        slack = Mock()
+        invocation = self._invoke_mention(
+            question="이 영상에 어떤 이상이 있는지 확인해줘",
+            access_allowed=False,
+            slack_client=slack,
+            use_real_context_loader=True,
+        )
+
+        invocation.context_loader.assert_not_called()
+        invocation.operation_matcher.assert_not_called()
+        slack.conversations_replies.assert_not_called()
 
     def test_operation_receipt_failure_keeps_slack_delivery_success(self) -> None:
         invocation = self._invoke_mention(
