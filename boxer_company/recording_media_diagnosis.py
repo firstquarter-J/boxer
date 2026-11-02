@@ -401,12 +401,14 @@ def _download_media_in_process(target: dict[str, Any], path: Path) -> None:
         total = 0
         with path.open("xb") as stream:
             os.chmod(path, 0o600)
-            while True:
+            # Content-Length를 채우면 urllib3가 socket을 정리하므로 EOF 확인을
+            # 위해 timeout을 다시 설정하지 않는다. 한 바이트 여유로 초과도 감지한다.
+            while total < length:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise _InspectionUnavailable("download_timeout")
                 body.set_socket_timeout(min(5, remaining))
-                chunk = body.read(min(1024 * 1024, _MAX_BYTES + 1 - total))
+                chunk = body.read(min(1024 * 1024, length - total + 1))
                 if not chunk:
                     break
                 total += len(chunk)

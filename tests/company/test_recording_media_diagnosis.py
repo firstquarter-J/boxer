@@ -373,6 +373,59 @@ def test_download_reads_only_exact_object_with_owner_and_restricts_file_mode(
     body.close.assert_called_once_with()
 
 
+def test_real_streaming_body_does_not_reset_socket_timeout_after_complete_http_body(
+    monkeypatch, tmp_path
+) -> None:
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    import urllib3
+    from botocore.response import StreamingBody
+
+    payload = b"synthetic-media"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *args) -> None:
+            pass
+
+    # 실제 urllib3는 Content-Length를 모두 읽으면 socket을 정리한다. 단순
+    # BytesIO mock으로 놓쳤던 SDK의 EOF 뒤 AttributeError를 그대로 재현한다.
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 2
+    worker = threading.Thread(target=server.handle_request, daemon=True)
+    worker.start()
+    pool = urllib3.PoolManager()
+    body = None
+    try:
+        response = pool.request(
+            "GET", f"http://127.0.0.1:{server.server_port}/",
+            preload_content=False, timeout=2, retries=False,
+        )
+        body = StreamingBody(response, len(payload))
+        socket_timeout = Mock(wraps=body.set_socket_timeout)
+        monkeypatch.setattr(body, "set_socket_timeout", socket_timeout)
+        client, _, _ = _s3(monkeypatch, payload)
+        client.get_object.return_value = {"Body": body, "ContentLength": len(payload)}
+        path = tmp_path / "recording.mp4"
+        media._download_media_in_process(_download_target(), path)
+        assert path.read_bytes() == payload
+        assert response.closed
+        assert socket_timeout.call_count == 1
+        client.close.assert_called_once_with()
+    finally:
+        if body is not None:
+            body.close()
+        pool.clear()
+        server.server_close()
+        worker.join(timeout=3)
+
+
 @pytest.mark.parametrize(
     ("data", "declared_size", "reason"),
     [
