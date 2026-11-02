@@ -131,6 +131,7 @@ class CompanyRouteContractTests(unittest.TestCase):
         channel_id: str = "C123456",
         message_event: bool = False,
         use_real_context_loader: bool = False,
+        thread_ts: str = "1785312000.000001",
     ) -> _Invocation:
         settings = CompanyApiClientSettings(
             base_url="http://127.0.0.1:8010",
@@ -172,7 +173,7 @@ class CompanyRouteContractTests(unittest.TestCase):
             "workspace_id": "T1",
             "channel_id": channel_id,
             "current_ts": current_ts,
-            "thread_ts": "1785312000.000001",
+            "thread_ts": thread_ts,
             "request_log": {
                 "request_key": "slack:T1:C123456:1785312000.000001",
                 "reply_count": 0,
@@ -665,9 +666,10 @@ class CompanyRouteContractTests(unittest.TestCase):
                     operation_result=_result("recording_media_diagnosis"),
                     slack_client=slack,
                     use_real_context_loader=True,
+                    thread_ts="1785311999.000001",
                 )
 
-                invocation.context_loader.assert_called_once()
+                invocation.context_loader.assert_not_called()
                 slack.conversations_replies.assert_called_once()
                 probe_request = invocation.operation_matcher.call_args.args[0]
                 (request,) = invocation.operation_service.answer_calls

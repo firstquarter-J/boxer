@@ -10,6 +10,10 @@ from typing import Any, Protocol
 
 RECORDING_MEDIA_DIAGNOSIS_ROUTE = "recording_media_diagnosis"
 _BARCODE = re.compile(r"(?<!\d)(\d{11})(?!\d)")
+_CARD_BARCODE_LABEL = re.compile(
+    r"(?m)^[ \t]*(?:(?:🏷\ufe0f?|:label:)[ \t]*)?"
+    r"(?:\*{1,2})?바코드(?:\*{1,2})?[ \t]*[:：]?[ \t]*(?P<value>[^\n]*)$"
+)
 _DEVICE = re.compile(
     r"(?<![A-Za-z0-9_-])(MB\d-[A-Za-z0-9-]+)(?![A-Za-z0-9_-])", re.IGNORECASE
 )
@@ -130,8 +134,14 @@ def _alert_texts(request: _Request) -> tuple[str, ...]:
     return tuple(
         str(entry.get("text") or "")[:20_000]
         for entry in request.context_entries[-50:]
-        if isinstance(entry, Mapping) and _ALERT.search(str(entry.get("text") or ""))
+        if isinstance(entry, Mapping)
+        and is_recording_media_alert_text(str(entry.get("text") or ""))
     )
+
+
+def is_recording_media_alert_text(text: str) -> bool:
+    """회사 adapter와 API가 같은 순수 알림 문구 판별을 사용한다."""
+    return bool(_ALERT.search(text))
 
 
 def match_recording_media_diagnosis_route(request: _Request) -> str | None:
@@ -153,9 +163,30 @@ def match_recording_media_diagnosis_route(request: _Request) -> str | None:
 def _parse_text_scope(
     text: str, *, alert: bool = False
 ) -> RecordingMediaDiagnosisScope:
+    barcodes = set(_BARCODE.findall(text))
+    if alert:
+        # 카드의 연락처도 11자리일 수 있다. 바코드 라벨이 있으면 그 field만
+        # 읽고, 빈 값이나 복수 라벨을 다른 숫자나 댓글로 보완하지 않는다.
+        fields = list(_CARD_BARCODE_LABEL.finditer(text))
+        if len(fields) > 1:
+            return RecordingMediaDiagnosisScope(reason="ambiguous_scope")
+        if fields:
+            field = fields[0]
+            value = field.group("value").strip()
+            if not value:
+                value = next((line.strip() for line in text[field.end():].splitlines() if line.strip()), "")
+            if re.fullmatch(r"[0-9]{11}", value):
+                barcodes = {value}
+            else:
+                wrapped = re.fullmatch(
+                    r"(?:`([0-9]{11})`|\*([0-9]{11})\*|\*\*([0-9]{11})\*\*)", value,
+                )
+                if wrapped is None:
+                    return RecordingMediaDiagnosisScope(reason="invalid_barcode")
+                barcodes = {next(item for item in wrapped.groups() if item is not None)}
     values = {
         "notification_id": {int(value) for value in _NOTIFICATION.findall(text)},
-        "barcode": set(_BARCODE.findall(text)),
+        "barcode": barcodes,
         "device_name": {value.upper() for value in _DEVICE.findall(text)},
         "file_id": set(_FILE.findall(text)),
     }
@@ -189,6 +220,25 @@ def _parse_text_scope(
     )
 
 
+def _canonical_alert_scope(scope: RecordingMediaDiagnosisScope) -> bool:
+    return bool(
+        scope.barcode and scope.device_name and (scope.recorded_at or scope.file_id)
+    )
+
+
+def _scope_agrees_with_alert(
+    partial: RecordingMediaDiagnosisScope, canonical: RecordingMediaDiagnosisScope,
+) -> bool:
+    # 이전 transport에 root 시각이 없어도 같은 대상의 일부 식별자만 다시 쓴
+    # 댓글은 다른 사건으로 세지 않는다. 다른 값이나 더 넓은 명시는 합치지 않는다.
+    return all(
+        getattr(partial, name) is None or getattr(partial, name) == getattr(canonical, name)
+        for name in (
+            "notification_id", "barcode", "device_name", "file_id", "log_date", "recorded_at",
+        )
+    )
+
+
 def resolve_recording_media_diagnosis_scope(
     request: _Request,
 ) -> RecordingMediaDiagnosisScope:
@@ -198,12 +248,33 @@ def resolve_recording_media_diagnosis_scope(
     if explicit.has_target:
         # 현재 질문의 대상을 이전 알림의 다른 장비나 바코드와 섞지 않는다.
         return explicit
+    conversation_id = str(getattr(request, "conversation_id", "") or "").strip()
+    roots = [
+        str(entry.get("text") or "")[:20_000]
+        for entry in request.context_entries
+        if isinstance(entry, Mapping) and conversation_id
+        and str(entry.get("created_at") or "") == conversation_id
+        and is_recording_media_alert_text(str(entry.get("text") or ""))
+    ]
+    if len(roots) > 1:
+        return RecordingMediaDiagnosisScope(reason="ambiguous_scope")
+    # Slack의 원본 알림이 특정되면 댓글의 식별자나 이전 답변으로 범위를 섞지
+    # 않는다. 이 문구도 권한이나 실행 대상이 아니라 DB 재검증용 힌트다.
+    alert_texts = tuple(roots) if roots else _alert_texts(request)
     candidates = set()
-    for text in _alert_texts(request):
+    for text in alert_texts:
         scope = _parse_text_scope(text, alert=True)
         # 일반 댓글은 사건 후보를 만들지 않는다. 명시된 잘못된 범위는 그대로 차단한다.
         if scope.reason or scope.has_target:
             candidates.add(scope)
+    if not roots:
+        full_cards = {scope for scope in candidates if not scope.reason and _canonical_alert_scope(scope)}
+        if len(full_cards) == 1:
+            canonical = next(iter(full_cards))
+            candidates = {
+                scope for scope in candidates
+                if scope == canonical or scope.reason or not _scope_agrees_with_alert(scope, canonical)
+            }
     if len(candidates) > 1:
         return RecordingMediaDiagnosisScope(reason="ambiguous_scope")
     if candidates:
@@ -224,6 +295,7 @@ def resolve_recording_media_diagnosis_scope(
 __all__ = [
     "RECORDING_MEDIA_DIAGNOSIS_ROUTE",
     "RecordingMediaDiagnosisScope",
+    "is_recording_media_alert_text",
     "match_recording_media_diagnosis_route",
     "needs_recording_media_diagnosis_context",
     "resolve_recording_media_diagnosis_scope",

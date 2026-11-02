@@ -11,6 +11,10 @@ from zoneinfo import ZoneInfo
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.slack_response import SlackResponse
 
+from boxer_adapter_slack.message_text import (
+    slack_block_visible_text as _daily_device_round_block_fallback_text,
+)
+
 from boxer_company_adapter_slack.automation_api_client import (
     CompanyAutomationApiClient,
 )
@@ -183,31 +187,6 @@ def _build_daily_device_round_chunk_text(
         if (text := _daily_device_round_block_fallback_text(block))
     )
     return f"{chunk_text}\n\n계속 {chunk_index + 1}/{chunk_count}"
-
-
-def _daily_device_round_block_fallback_text(block: dict[str, Any]) -> str:
-    """API가 만든 block의 text만 읽어 원래 순서대로 fallback에 담는다."""
-
-    parts: list[str] = []
-    text = block.get("text")
-    if isinstance(text, str):
-        parts.append(text)
-    elif isinstance(text, dict):
-        parts.append(_daily_device_round_block_fallback_text(text))
-    for key in ("elements", "fields"):
-        children = block.get(key)
-        if isinstance(children, list):
-            # rich_text_section 안의 text 조각은 한 문장이다. list/context의
-            # 각 항목은 줄을 나눠 표시하되 block 내용 자체는 바꾸지 않는다.
-            separator = "" if block.get("type") == "rich_text_section" else "\n"
-            parts.append(
-                separator.join(
-                    _daily_device_round_block_fallback_text(child)
-                    for child in children
-                    if isinstance(child, dict)
-                )
-            )
-    return "\n".join(part for part in parts if part)
 
 
 def _build_daily_device_round_window_title_text(

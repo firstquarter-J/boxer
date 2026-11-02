@@ -59,6 +59,9 @@ from boxer_company_adapter_slack.assistant_bridge import (
     render_company_assistant_result,
     render_device_file_download_delivery,
 )
+from boxer_company_adapter_slack.recording_media_context import (
+    load_recording_media_thread_context_entries,
+)
 from boxer_company_adapter_slack.automation_api_client import (
     CompanyAutomationApiClient,
 )
@@ -570,15 +573,19 @@ def create_app() -> App:
             if stored_conversation_question:
                 return ()
             if context_entries is None:
-                context_entries = tuple(
-                    load_slack_thread_context_entries(
+                if needs_recording_media_diagnosis_context(question):
+                    # 영상 알림의 식별 root만 별도로 보존해 짧은 fallback과 댓글 window에 의한 유실을 막는다.
+                    entries = load_recording_media_thread_context_entries(
                         client,
                         logger,
                         channel_id,
                         thread_ts,
                         current_ts,
+                        fallback_loader=load_slack_thread_context_entries,
                     )
-                )
+                else:
+                    entries = load_slack_thread_context_entries(client, logger, channel_id, thread_ts, current_ts)
+                context_entries = tuple(entries)
             return context_entries
 
         operation_probe_request = build_company_assistant_request(
