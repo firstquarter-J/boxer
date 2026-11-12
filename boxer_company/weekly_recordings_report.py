@@ -1,3 +1,5 @@
+
+from boxer_company.deployment import get_local_zone, get_timezone_label
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -13,7 +15,6 @@ from boxer_company.recordings_report_options import (
     RecordingsReportOptionsError,
 )
 
-_WEEKLY_RECORDINGS_REPORT_TIMEZONE = ZoneInfo("Asia/Seoul")
 _WEEKLY_RECORDINGS_REPORT_TITLE = "주간 초음파 촬영 요약"
 _WEEKLY_RECORDINGS_REPORT_TOP_HOSPITALS = 10
 _WEEKLY_RECORDINGS_REPORT_MAX_CHANGE_ROWS = 10
@@ -24,7 +25,7 @@ _WEEKLY_RECORDINGS_ROOM_DROP_MIN_DELTA = 3
 
 
 def _weekly_recordings_report_timezone() -> ZoneInfo:
-    return _WEEKLY_RECORDINGS_REPORT_TIMEZONE
+    return get_local_zone()
 
 
 def _coerce_weekly_recordings_report_now(now: datetime | None = None) -> datetime:
@@ -42,7 +43,7 @@ def _resolve_weekly_recordings_report_question_target_date(
     explicit_target_date: date | None,
     now: datetime | None = None,
 ) -> date | None:
-    """순수 계약에 기존 주입 가능한 weekly KST clock을 연결한다."""
+    """순수 계약에 기존 주입 가능한 weekly 현지 clock을 연결한다."""
 
     return _resolve_weekly_target_date_contract(
         question,
@@ -615,7 +616,7 @@ def _format_weekly_recordings_report(
     lines.extend(
         [
         f"• 기준 주간: `{current_week_label}` | 비교 주간: `{previous_week_label}`",
-        f"• 발송: `{local_now:%Y-%m-%d %H:%M:%S} KST`",
+        f"• 발송: `{local_now:%Y-%m-%d %H:%M:%S} {get_timezone_label()}`",
         f"• 전체 row: `{_format_weekly_recordings_report_count(total_count)}` | 병원: `{hospital_count:,}곳`",
         (
             "• 전주 대비: "

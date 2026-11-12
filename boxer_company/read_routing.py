@@ -6,12 +6,13 @@ SSH, Redis, Google, LLM provider를 import하거나 실행하지 않는다.
 
 from __future__ import annotations
 
+from boxer_company.deployment import get_deployment_profile, get_local_zone
+
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 import re
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 from boxer_company import settings as cs
 from boxer_company.recordings_report_options import has_recordings_report_options
@@ -920,11 +921,6 @@ def match_barcode_timeline_route(
 _BABY_MAGIC_RESULT_LINK_PATTERN = re.compile(
     r"<(https?://[^>|\s]+)\|([^>]*)>"
 )
-_BABY_MAGIC_SOURCE_HOST = (
-    urlsplit(cs.BABY_MAGIC_CDN_DEFAULT_BASE_URL).hostname or ""
-).lower()
-
-
 def is_safe_baby_magic_source_uri(value: object) -> bool:
     """고정 회사 CDN의 credential 없는 HTTPS 객체만 source로 허용한다."""
 
@@ -944,7 +940,10 @@ def is_safe_baby_magic_source_uri(value: object) -> bool:
     return bool(
         parsed.scheme.lower() == "https"
         and parsed.hostname is not None
-        and parsed.hostname.lower() == _BABY_MAGIC_SOURCE_HOST
+        # arbitrary CDN env는 신뢰하지 않고 배포 국가의 고정 host만 허용한다.
+        and parsed.hostname.lower() == (
+            urlsplit(get_deployment_profile().cdn_base_url).hostname or ""
+        ).lower()
         and port is None
         and parsed.username is None
         and parsed.password is None
@@ -1129,7 +1128,7 @@ def _resolve_weekly_recordings_report_question_target_date(
             "current week",
         )
     ):
-        report_tz = ZoneInfo("Asia/Seoul")
+        report_tz = get_local_zone()
         local_now = datetime.now(report_tz) if now is None else now
         if local_now.tzinfo is None:
             local_now = local_now.replace(tzinfo=report_tz)

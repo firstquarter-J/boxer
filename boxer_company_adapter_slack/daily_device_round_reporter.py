@@ -6,7 +6,7 @@ import re
 import threading
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.slack_response import SlackResponse
@@ -28,7 +28,6 @@ from boxer_company_adapter_slack.automation_reporter import (
     remember_automation_thread_receipt,
 )
 
-_KST = ZoneInfo("Asia/Seoul")
 _DAILY_DEVICE_ROUND_THREAD: threading.Thread | None = None
 _DAILY_DEVICE_ROUND_THREAD_LOCK = threading.Lock()
 # Slack의 전체 block 길이 거절을 피하기 위한 보수적인 transport 예산이다.
@@ -126,10 +125,10 @@ def _coerce_daily_device_round_now(
     now: datetime | None = None,
 ) -> datetime:
     if now is None:
-        return datetime.now(_KST)
+        return datetime.now(get_local_zone())
     if now.tzinfo is None:
-        return now.replace(tzinfo=_KST)
-    return now.astimezone(_KST)
+        return now.replace(tzinfo=get_local_zone())
+    return now.astimezone(get_local_zone())
 
 
 def _coerce_int(value: Any) -> int | None:

@@ -1,5 +1,7 @@
 """병원·병실의 녹화와 신규 바코드 추이를 네 개의 CommonMark 항목으로 표시한다."""
 
+
+from boxer_company.deployment import get_local_zone, get_timezone_label
 from collections import Counter
 from datetime import datetime
 from typing import Any
@@ -39,6 +41,8 @@ def _entity_block(row: dict[str, Any], *, group: str, unit: str) -> str:
 def format_recordings_trend(summary: dict[str, Any], *, now: datetime) -> tuple[str, ...]:
     """동일 기간의 네 지표를 각각 분석하고 연속 감소 요청만 대상 필터를 적용한다."""
 
+    # 표시 시각과 기간 비교는 서버의 현지 달력 기준으로 맞춘다.
+    now = now.replace(tzinfo=get_local_zone()) if now.tzinfo is None else now.astimezone(get_local_zone())
     weeks = summary["weeks"]
     names = summary["hospitalNames"]
     complete = [week for week in weeks if week["complete"]]
@@ -51,7 +55,7 @@ def format_recordings_trend(summary: dict[str, Any], *, now: datetime) -> tuple[
         for index, week in enumerate(weeks, 1)
     )
     header = (
-        f"**기간** `{summary['startDate']} ~ {summary['endDate']}` (KST, 양 끝 포함)\n"
+        f"**기간** `{summary['startDate']} ~ {summary['endDate']}` ({get_timezone_label()}, 양 끝 포함)\n"
         "**대상 병원** " + scope_label +
         "\n**수량 순서** " + periods +
         "\n부분 주·진행 중인 주는 수량만 표시하고 증감·연속 감소 판정에서 제외해."
@@ -101,6 +105,6 @@ def format_recordings_trend(summary: dict[str, Any], *, now: datetime) -> tuple[
             body += "\n해당 조건의 대상 없음."
         elif shown < len(rows):
             body += f"\n\n응답 길이 제한으로 분석 대상 {len(rows):,}곳 중 {shown:,}곳만 표시했어. 병원이나 기간을 좁히면 나머지 대상도 조회할 수 있어."
-        body += f"\n\n증감 원인은 이 집계만으로 확정할 수 없어. 조회: {now:%Y-%m-%d %H:%M:%S} KST"
+        body += f"\n\n증감 원인은 이 집계만으로 확정할 수 없어. 조회: {now:%Y-%m-%d %H:%M:%S} {get_timezone_label()}"
         sections.append(body)
     return tuple(sections)

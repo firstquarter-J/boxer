@@ -1,13 +1,13 @@
+
+from boxer_company.deployment import get_deployment_profile, get_local_zone, get_timezone_label, localize_wall_datetime
 from boxer_company._operation_routing_common import (
     _current_local_date,
 )
-import os
 import re
 import shlex
 import socket
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
 try:
     import paramiko
@@ -973,23 +973,14 @@ def _describe_recording_start_evidence(recovery_context: dict[str, Any] | None) 
     return ""
 
 
-def _to_local_datetime(value: object) -> datetime | None:
-    if not isinstance(value, datetime):
-        return None
-
-    try:
-        local_tz = ZoneInfo(os.getenv("TZ", "Asia/Seoul"))
-    except Exception:
-        local_tz = ZoneInfo("Asia/Seoul")
-
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(local_tz)
-
-
 def _datetime_to_local_seconds(value: object) -> int | None:
     local_dt = _to_local_datetime(value)
     if local_dt is None:
+        return None
+    try:
+        # UTC row가 명확해도 offset 없는 세션 시각과 연결할 때는 DST fold를 버릴 수 없다.
+        localize_wall_datetime(local_dt.replace(tzinfo=None))
+    except ValueError:
         return None
     return local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
 
@@ -998,6 +989,25 @@ def _session_time_bounds_seconds(session: dict[str, Any]) -> tuple[int | None, i
     start_seconds = _time_label_to_seconds(_display_value(session.get("start_time_label"), default=""))
     stop_seconds = _time_label_to_seconds(_display_value(session.get("stop_time_label"), default=""))
     return start_seconds, stop_seconds
+
+
+def _recording_row_has_ambiguous_session_time(row: dict[str, Any], session: dict[str, Any]) -> bool:
+    start, stop = _session_time_bounds_seconds(session)
+    if start is None:
+        return False
+    stop = stop if stop is not None else start
+    for key in ("createdAt", "recordedAt"):
+        local_dt = _to_local_datetime(row.get(key))
+        if local_dt is None:
+            continue
+        seconds = local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+        if not start - 180 <= seconds <= stop + 300:
+            continue
+        try:
+            localize_wall_datetime(local_dt.replace(tzinfo=None))
+        except ValueError:
+            return True
+    return False
 
 
 def _score_recording_row_for_session(
@@ -1009,6 +1019,9 @@ def _score_recording_row_for_session(
     row_file_id = str(row.get("fileId") or "").strip().lower()
     if session_file_id and row_file_id and session_file_id == row_file_id:
         return (0, 0)
+
+    if _recording_row_has_ambiguous_session_time(row, session):
+        return None
 
     start_seconds, stop_seconds = _session_time_bounds_seconds(session)
     if start_seconds is None:
@@ -1044,6 +1057,9 @@ def _match_recordings_rows_to_sessions(
         index: []
         for index in range(1, len(sessions) + 1)
     }
+    # 같은 세션 목록을 다시 분석할 때도 이번 조회의 불확실성만 표시한다.
+    for session in sessions:
+        session.pop("recordings_time_ambiguous", None)
     rows = recordings_on_date_rows or []
     if not sessions or not rows:
         return matched_rows
@@ -1055,12 +1071,19 @@ def _match_recordings_rows_to_sessions(
 
     for row in rows:
         candidates: list[tuple[tuple[int, int], int]] = []
+        ambiguous_indexes: list[int] = []
         for index, session in enumerate(sessions, start=1):
             score = _score_recording_row_for_session(row, session, recovery_contexts.get(index))
             if score is None:
+                if _recording_row_has_ambiguous_session_time(row, session):
+                    ambiguous_indexes.append(index)
                 continue
             candidates.append((score, index))
 
+        if not any(score[0] == 0 for score, _ in candidates):
+            # exact fileId 근거가 없는 중복 시각을 첫 세션에 몰아넣거나 0건으로 단정하지 않는다.
+            for index in ambiguous_indexes:
+                sessions[index - 1]["recordings_time_ambiguous"] = True
         if not candidates:
             continue
 
@@ -1903,6 +1926,8 @@ def _build_session_recording_result_text(
         if has_stop
         else None
     )
+    if session.get("recordings_time_ambiguous"):
+        return "세션과 DB 영상 연결 확인 불가 (서머타임 중복 시각, fileId 근거 확인 필요)", recovery_context, post_stop_context
     pre_recording_stop_context = _find_pre_recording_stop_context(
         session,
         session_motion_events or [],
@@ -2203,8 +2228,8 @@ def _is_non_recording_network_error_line(content: str) -> bool:
         "sendscreenshotbase64",
         "senddailylog",
         "getaddrinfo eai_again",
-        "status.kr.mmtalkbox.com",
-        "stream.kr.mmtalkbox.com",
+        # 배포 국가의 상태/업로드 host를 판정해 미국 통신 오류도 놓치지 않는다.
+        *get_deployment_profile().network_service_hosts,
         "couldn't be sent",
         "throttling:",
     )
@@ -2233,7 +2258,7 @@ def _describe_non_recording_network_error_context(error_lines: list[tuple[int, s
             has_jwt = True
         if any(token in lowered for token in ("send status", "sendscreenshotbase64", "sendcurrentframesnapbase64", "senddailylog")):
             has_status = True
-        if "couldn't be sent" in lowered or "stream.kr.mmtalkbox.com" in lowered or "throttling:" in lowered:
+        if "couldn't be sent" in lowered or get_deployment_profile().uploader_host in lowered or "throttling:" in lowered:
             has_upload = True
 
     parts: list[str] = []
@@ -2259,7 +2284,7 @@ def _has_uploader_network_error(error_lines: list[tuple[int, str]]) -> bool:
         combined = " ".join(part for part in (component, message, raw) if part)
         if component != "uploader":
             continue
-        if any(token in combined for token in ("couldn't be sent", "throttling:", "stream.kr.mmtalkbox.com", "getaddrinfo eai_again")):
+        if any(token in combined for token in ("couldn't be sent", "throttling:", get_deployment_profile().uploader_host, "getaddrinfo eai_again")):
             return True
     return False
 
@@ -2646,7 +2671,8 @@ def _build_log_analysis_record(
             "scanEventCount": len(_serialize_scan_events_for_evidence(session_scan_events)),
             "motionEventCount": len(_serialize_motion_events_for_evidence(session_motion_events)),
             "motionStatus": _display_value(motion_outcome.get("label"), default=""),
-            "sessionRecordingsCount": len(session_recordings_rows),
+            "sessionRecordingsCount": None if session.get("recordings_time_ambiguous") else len(session_recordings_rows),
+            **({"recordingsMatchAmbiguous": True} if session.get("recordings_time_ambiguous") else {}),
             "errorLineCount": len(session_error_items),
             "errorGroups": _build_error_groups(session_error_items),
             "firstFfmpegError": session_first_ffmpeg_error or {},
@@ -2932,7 +2958,10 @@ def _append_session_card(
     lines.append(f"• 영상 상태: {session_context['videoStatus']}")
     lines.append(f"• 핵심 이상 징후: {session_context['anomalyText']}")
     if recordings_on_date_count is not None:
-        lines.append(f"• DB 영상 기록(세션 기준): `{len(session_recordings_rows)}개`")
+        if session.get("recordings_time_ambiguous"):
+            lines.append("• DB 영상 기록(세션 기준): 확인 불가 (서머타임 중복 시각)")
+        else:
+            lines.append(f"• DB 영상 기록(세션 기준): `{len(session_recordings_rows)}개`")
     video_length_line = _build_recordings_video_length_line(session_recordings_rows)
     if video_length_line:
         lines.append(video_length_line)
@@ -3070,11 +3099,8 @@ def _to_local_date(value: object) -> date | None:
     if not isinstance(value, datetime):
         return None
 
-    tz_name = os.getenv("TZ", "Asia/Seoul")
-    try:
-        local_tz = ZoneInfo(tz_name)
-    except Exception:
-        local_tz = ZoneInfo("Asia/Seoul")
+    # 로그 날짜와 DB UTC 시각은 같은 배포 시간대로 연결한다.
+    local_tz = get_local_zone()
 
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
@@ -3085,11 +3111,8 @@ def _to_local_datetime(value: object) -> datetime | None:
     if not isinstance(value, datetime):
         return None
 
-    tz_name = os.getenv("TZ", "Asia/Seoul")
-    try:
-        local_tz = ZoneInfo(tz_name)
-    except Exception:
-        local_tz = ZoneInfo("Asia/Seoul")
+    # 로그 날짜와 DB UTC 시각은 같은 배포 시간대로 연결한다.
+    local_tz = get_local_zone()
 
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
@@ -3110,7 +3133,7 @@ def _build_phase2_scope_request_message(
             "• 2차 조회를 위해 아래 3가지를 같이 입력해줘:",
             "- 병원명 (MDA에 표시된 정확한 이름)",
             "- 병실명 (MDA에 표시된 정확한 이름)",
-            "- 날짜(KST, YYYY-MM-DD)",
+            f"- 날짜({get_timezone_label()}, YYYY-MM-DD)",
             f"예: `{barcode} 병원명 개발실 병실명 개발진료실 날짜 2023-10-24 {example_action}`",
         ]
     )
@@ -3138,7 +3161,7 @@ def _build_recent_recording_hint_lines(
         return []
 
     return [
-        f"• 참고: recordings 기준 최근 영상 시각은 `{local_dt:%Y-%m-%d %H:%M:%S}` KST야",
+        f"• 참고: recordings 기준 최근 영상 시각은 `{local_dt:%Y-%m-%d %H:%M:%S}` {get_timezone_label()}야",
         f"• 힌트: `{last_recorded_date:%Y-%m-%d} 로그`로 다시 보면 실제 세션이 나올 수 있어",
     ]
 
@@ -3500,7 +3523,7 @@ def _analyze_barcode_log_phase1_window(
     lines = [
         title,
         f"• 바코드: `{barcode}`",
-        f"• 분석 범위(KST): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)",
+        f"• 분석 범위({get_timezone_label()}): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)",
         f"• 매핑 장비: `{mapped_device_count}개`",
     ]
     if used_expanded_scope:
@@ -3641,7 +3664,7 @@ def _analyze_barcode_log_phase1_window(
         result_lines = [
             title,
             f"• 바코드: `{barcode}`",
-            f"• 분석 범위(KST): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)",
+            f"• 분석 범위({get_timezone_label()}): `{start_date:%Y-%m-%d}` ~ `{end_date:%Y-%m-%d}` (`{day_span}일`)",
             f"• 매핑 장비: `{mapped_device_count}개`",
         ]
         if used_expanded_scope:

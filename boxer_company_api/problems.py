@@ -20,6 +20,7 @@ _DEFAULT_TITLES = {
     "invalid_traceparent": "Invalid trace context",
     "authentication_failed": "Authentication failed",
     "caller_not_allowed": "Caller is not allowed",
+    "deployment_country_mismatch": "Deployment country does not match",
     "validation_failed": "Request validation failed",
     "request_id_conflict": "Request ID conflicts with an earlier request",
     "operation_in_progress": "Operation is already in progress",

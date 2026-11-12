@@ -10,6 +10,8 @@ import tempfile
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from boxer_company.deployment import load_deployment_profile, validate_deployment_settings
+
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8010
@@ -124,6 +126,10 @@ class CompanyApiSettings:
     memory_enabled: bool = False
     memory_read_enabled: bool = False
     memory_state_path: str = "/var/lib/boxer-company-api/conversation_memory.db"
+    # app admission도 같은 env snapshot을 사용해 명시 주입 설정과 os.environ이 갈라지지 않는다.
+    deployment_country: str = "kr"
+    deployment_aws_region: str = "ap-northeast-2"
+    deployment_timezone_name: str = "Asia/Seoul"
 
     @property
     def authentication_configured(self) -> bool:
@@ -136,6 +142,21 @@ def load_company_api_settings(
     """환경변수의 caller registry를 검증하고 오류 상세 없이 fail closed한다."""
 
     source = env if env is not None else os.environ
+    # provider 조립 전에 국가 경계를 검증하고 환경값을 오류 응답에 싣지 않는다.
+    try:
+        deployment_profile = validate_deployment_settings(source, role="api")
+        deployment_error = None
+    except ValueError:
+        deployment_error = "company_deployment_configuration_invalid"
+        try:
+            deployment_profile = load_deployment_profile(source)
+        except ValueError:
+            deployment_profile = None
+    deployment_options = {
+        "deployment_country": deployment_profile.country if deployment_profile else "",
+        "deployment_aws_region": deployment_profile.aws_region if deployment_profile else "",
+        "deployment_timezone_name": deployment_profile.timezone_name if deployment_profile else "",
+    }
     memory_options = {
         "memory_enabled": str(source.get("BOXER_COMPANY_API_MEMORY_ENABLED", "false")).strip().lower() in _TRUE_VALUES,
         "memory_read_enabled": str(source.get("BOXER_COMPANY_API_MEMORY_READ_ENABLED", "false")).strip().lower() in _TRUE_VALUES,
@@ -192,7 +213,8 @@ def load_company_api_settings(
             port=port,
             callers=(),
             configuration_error=(
-                server_error
+                deployment_error
+                or server_error
                 or live_device_error
                 or operations_error
                 or request_log_error
@@ -217,6 +239,7 @@ def load_company_api_settings(
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
             **memory_options,
+            **deployment_options,
         )
 
     try:
@@ -228,7 +251,8 @@ def load_company_api_settings(
             port=port,
             callers=(),
             configuration_error=(
-                server_error
+                deployment_error
+                or server_error
                 or live_device_error
                 or operations_error
                 or request_log_error
@@ -253,6 +277,7 @@ def load_company_api_settings(
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
             **memory_options,
+            **deployment_options,
         )
 
     automation_caller_error = (
@@ -274,7 +299,8 @@ def load_company_api_settings(
     )
 
     if (
-        server_error is not None
+        deployment_error is not None
+        or server_error is not None
         or live_device_error is not None
         or operations_error is not None
         or request_log_error is not None
@@ -290,7 +316,8 @@ def load_company_api_settings(
             port=port,
             callers=(),
             configuration_error=(
-                server_error
+                deployment_error
+                or server_error
                 or live_device_error
                 or operations_error
                 or request_log_error
@@ -317,6 +344,7 @@ def load_company_api_settings(
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
             **memory_options,
+            **deployment_options,
         )
     return CompanyApiSettings(
         host=host,
@@ -338,6 +366,7 @@ def load_company_api_settings(
         automation_enabled_cycles=automation_enabled_cycles,
         automation_scheduler_enabled=automation_scheduler_enabled,
         **memory_options,
+        **deployment_options,
     )
 
 

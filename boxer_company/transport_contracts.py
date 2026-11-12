@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from boxer_company.deployment import get_local_zone
+
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
 import re
 from typing import Any, Mapping, Protocol
-from zoneinfo import ZoneInfo
 
 DEVICE_LOG_UPLOAD_ROUTE = "device_log_upload"
 DEVICE_FILE_LOOKUP_ROUTE = "device_file_lookup"
@@ -319,9 +320,9 @@ def _extract_explicit_log_date(question: str) -> str | None:
                 relative = {"오늘": 0, "어제": -1}.get(text.strip())
                 if relative is None:
                     return None
-                today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+                today = datetime.now(get_local_zone()).date()
                 return (today + timedelta(days=relative)).isoformat()
-            year = int(korean.group(1) or datetime.now(ZoneInfo("Asia/Seoul")).year)
+            year = int(korean.group(1) or datetime.now(get_local_zone()).year)
             values = (year, int(korean.group(2)), int(korean.group(3)))
     else:
         values = tuple(int(matched.group(index)) for index in (1, 2, 3))

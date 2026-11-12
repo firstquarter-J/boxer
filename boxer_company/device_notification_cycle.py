@@ -8,7 +8,7 @@ import logging
 import math
 import re
 from typing import Any, Callable, Mapping, Sequence
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone, get_timezone_label
 
 from boxer.core import settings as core_settings
 from boxer.retrieval.connectors.db import _create_db_connection
@@ -50,6 +50,7 @@ from boxer_company.sms_delivery import (
     _SMS_DELIVERY_NOT_SENT,
     _SMS_DELIVERY_REQUEST_FAILED,
 )
+from boxer_company.sms_policy import sms_sending_enabled
 from boxer_company.sms_delivery_cycle import (
     acquire_automatic_sms_runtime_claim,
     build_automatic_sms_runtime_claim_key,
@@ -109,7 +110,6 @@ _CAPTUREBOARD_INCIDENT_CODES = {
     _CAPTUREBOARD_CONNECTION_ERROR,
     _RECORDING_CRITICALLY_STALLED,
 }
-_KST = ZoneInfo("Asia/Seoul")
 _RECORDING_STALL_MIN_DURATION_SECONDS = 120
 _RECORDING_STALL_MAX_EVENT_GAP_SECONDS = 300
 _DEVICE_NOTIFICATION_BATCH_SIZE = 200
@@ -990,7 +990,7 @@ class DeviceNotificationAlertCycleHandler:
                 and event["details"].get("mediaType") == "video"
             )
         )
-        if event["code"] in _AUTO_SMS_EXCLUDED_CODES:
+        if event["code"] in _AUTO_SMS_EXCLUDED_CODES and sms_sending_enabled():
             # 완성 영상의 수동 버튼을 열어도 자동 문자는 발송하지 않는다.
             sms_receipt = {
                 "attempted": False,
@@ -1050,6 +1050,15 @@ class DeviceNotificationAlertCycleHandler:
         alert_summary: dict[str, Any],
         alert_item: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        # 문자 비활성화는 Slack 알림과 음성, 완료 작업을 유지하며 연락처와 claim만 건너뛴다.
+        if not sms_sending_enabled():
+            receipt = {
+                "attempted": False, "status": "disabled", "ok": False,
+                "contactActionEnabled": False, "deliveryStatus": _SMS_DELIVERY_NOT_SENT,
+            }
+            summary, item, receipt = _apply_sms_receipt(alert_summary, alert_item, receipt)
+            summary["deviceResults"][0]["smsEnabled"] = False
+            return summary, item, receipt
         target = DeviceHealthAlertActionTarget(
             hospital_seq=max(0, _coerce_int(event.get("hospitalSeq"))),
             hospital_name=str(event.get("hospitalName") or "병원 미확인"),
@@ -2754,7 +2763,7 @@ def _format_occurred_at(value: Any) -> str:
     parsed = _parse_event_datetime(value)
     if parsed is None:
         return str(value or "미확인")
-    return parsed.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    return parsed.astimezone(get_local_zone()).strftime("%Y-%m-%d %H:%M:%S") + " " + get_timezone_label()
 
 
 def _format_issue(issue: str, occurred_at: Any) -> str:

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import json
 from typing import Any, Mapping, Self, Sequence
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -655,6 +656,30 @@ def test_current_device_lookup_uses_bound_names_and_keeps_exclusion_filters(
     assert "COALESCE(d.installFlag, 1) = 1" in sql
     assert result == [_device()]
     assert calls["closed"] is True
+
+
+def test_sms_disabled_keeps_led_delivery_without_provider_or_sms_claim(monkeypatch) -> None:
+    # 미국과 같은 문자 off 배포에서도 두 번 확인한 LED 장애는 Slack으로 전달한다.
+    monkeypatch.setenv("BOXER_COMPANY_SMS_ENABLED", "false")
+    calls: dict[str, Any] = {}
+    claim = Mock()
+    remember = Mock()
+    deps = _deps(calls=calls, claim_sms=claim, remember_sms=remember)
+    first = run_device_health_monitor_cycle(
+        request_id="health:sms-off:1", now=_NOW, cursor=_seed_cursor(), deps=deps,
+    )
+    second = run_device_health_monitor_cycle(
+        request_id="health:sms-off:2", now=_NOW + timedelta(minutes=1),
+        cursor=first.cursor, deps=deps,
+    )
+
+    delivery, = second.deliveries
+    assert delivery.payload["alert"]["smsEnabled"] is False
+    assert delivery.payload["alert"]["smsContactActionEnabled"] is False
+    assert calls.get("sms", []) == []
+    claim.assert_not_called()
+    remember.assert_not_called()
+    assert second.cursor["alertFingerprints"]
 
 
 def test_cycle_confirms_hardware_twice_then_preserves_legacy_contact_card() -> None:

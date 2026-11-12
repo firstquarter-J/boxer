@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from boxer_company.deployment import get_local_zone
+
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Literal, cast
-from zoneinfo import ZoneInfo
 
 
 AutomationScheduleCycle = Literal[
@@ -37,7 +38,7 @@ class AutomationScheduleConfig:
     """환경변수와 분리된 API-owned automation 일정 설정이다."""
 
     timezone: tzinfo = field(
-        default_factory=lambda: ZoneInfo("Asia/Seoul")
+        default_factory=get_local_zone
     )
     weekly_hour: int = 9
     weekly_minute: int = 0

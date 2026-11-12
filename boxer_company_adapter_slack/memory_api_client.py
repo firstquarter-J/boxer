@@ -14,6 +14,7 @@ from boxer_company_adapter_slack.company_api_client import (
     CompanyApiContractError,
     _create_traceparent,
     _validate_client_settings,
+    _validate_response_country,
 )
 
 
@@ -40,6 +41,7 @@ class CompanyMemoryApiClient:
             json=dict(payload),
             headers={
                 "Authorization": f"Bearer {self._settings.token}",
+                "X-Boxer-Country": self._settings.deployment_country,
                 "X-Request-ID": "memory:" + secrets.token_hex(16),
                 "traceparent": _create_traceparent(),
                 "Accept": "application/json",
@@ -47,6 +49,7 @@ class CompanyMemoryApiClient:
             timeout=(min(self._settings.connect_timeout_sec, 2), 5),
             allow_redirects=False,
         )
+        _validate_response_country(response, expected_country=self._settings.deployment_country)
         if (
             response.status_code != 200
             or len(response.content) > 1_048_576

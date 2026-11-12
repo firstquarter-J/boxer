@@ -51,6 +51,7 @@ from boxer_company.sms_delivery import (
 from boxer_company.sms_delivery_cycle import (
     remember_sms_delivery_sheet_record,
 )
+from boxer_company.sms_policy import sms_sending_enabled
 from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX,
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
@@ -220,6 +221,15 @@ class DeviceHealthAlertActionAssistantRoute:
                 outcome="denied",
                 body="실행 요청자를 확인할 수 없어 작업하지 않았어",
                 fallback_reason="missing_operation_actor",
+            )
+
+        # 과거 카드나 직접 API 요청도 비활성 배포의 연락처 조회와 문자 발송을 열지 못한다.
+        if action.name == DEVICE_HEALTH_ALERT_SMS_ACTION and not sms_sending_enabled():
+            return _result(
+                route=route,
+                outcome="denied",
+                body="이 배포에서는 문자 발송 기능이 비활성화되어 있습니다.",
+                fallback_reason="sms_sending_disabled",
             )
 
         try:
@@ -1072,6 +1082,9 @@ def _send_device_health_alert_sms(
 ) -> dict[str, Any]:
     """설정된 provider를 한 번만 호출하고 불명 응답은 재시도하지 않는다."""
 
+    # 수동 action 외의 producer도 provider 경계 직전에 같은 발송 정책을 재검사한다.
+    if not sms_sending_enabled():
+        return {"status": "disabled", "ok": False}
     provider = str(company_settings.DEVICE_HEALTH_MONITOR_SMS_PROVIDER or "").strip().lower()
     if provider == "solapi":
         return _send_device_health_alert_solapi_sms(payload, logger=logger)
@@ -1139,6 +1152,9 @@ def _send_device_health_alert_solapi_sms(
     *,
     logger: logging.Logger,
 ) -> dict[str, Any]:
+    # 내부 helper를 직접 호출하는 경로에서도 비활성 배포의 발송을 차단한다.
+    if not sms_sending_enabled():
+        return {"status": "disabled", "ok": False}
     if not (
         company_settings.SOLAPI_API_KEY
         and company_settings.SOLAPI_API_SECRET

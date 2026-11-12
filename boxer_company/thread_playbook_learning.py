@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone, get_timezone_label
 
 from boxer.core import settings as s
 from boxer.core.llm import _ask_claude, _ask_ollama_chat
@@ -382,7 +382,7 @@ def _build_playbook_page_children(
     thread_permalink: str | None,
     learned_by_user_id: str | None,
 ) -> list[dict[str, Any]]:
-    now_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S KST")
+    now_kst = datetime.now(get_local_zone()).strftime("%Y-%m-%d %H:%M:%S") + " " + get_timezone_label()
     children: list[dict[str, Any]] = [
         _paragraph(f"Slack 스레드에서 학습한 운영 플레이북이야. 생성 시각: {now_kst}"),
         _heading_2("증상"),

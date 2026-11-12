@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,18 @@ def _check(payload):
 
 
 class NetworkDateProbeTests(unittest.TestCase):
+    def setUp(self):
+        # 원격 script의 libc 시간대도 실제 명령의 TZ 환경과 같은 한국 기준으로 고정한다.
+        self._environment = patch.dict(os.environ, {"BOXER_COMPANY_COUNTRY": "kr", "AWS_REGION": "ap-northeast-2",
+            "BOXER_COMPANY_TIMEZONE": "Asia/Seoul", "TZ": "Asia/Seoul"})
+        self._environment.start()
+        time.tzset()
+        self.addCleanup(self._restore_environment)
+
+    def _restore_environment(self):
+        self._environment.stop()
+        time.tzset()
+
     def test_today_relative_and_explicit_today_end_at_request_time(self):
         with patch.dict(os.environ, {"TZ": "UTC"}):
             for question in ("", "오늘", "금일", "2026-10-22", "10월 22일"):
@@ -87,7 +100,8 @@ class NetworkDateProbeTests(unittest.TestCase):
     def test_all_remote_fragments_keep_python36_grammar(self):
         for script in (network._REMOTE_STATE, network._REMOTE_LINK_HISTORY, network._REMOTE_APP_HISTORY):
             ast.parse(network._REMOTE_COMMON + script, feature_version=(3, 6))
-        self.assertIn("datetime.datetime.now(KST)", network._REMOTE_COMMON)
+        self.assertIn("datetime.datetime.now().astimezone()", network._REMOTE_COMMON)
+        self.assertIn("TZ=Asia/Seoul", network._remote_command("def main(): pass"))
 
     def test_journal_filters_half_open_range_even_when_journal_returns_outside_rows(self):
         window = network.resolve_network_window("어제", NOW)

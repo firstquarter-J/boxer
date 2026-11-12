@@ -6,7 +6,7 @@ import re
 import threading
 from datetime import date, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone
 
 from boxer_company.assistant.recordings_report_format import (
     format_recordings_report_sections,
@@ -23,7 +23,6 @@ from boxer_company_adapter_slack.automation_reporter import (
     remember_automation_delivery,
 )
 
-_KST = ZoneInfo("Asia/Seoul")
 _WEEKLY_RECORDINGS_REPORT_TITLE = "주간 초음파 촬영 요약"
 _WEEKLY_ACTIVITY_REPORT_TITLE = "주간 초음파 녹화 & 신규 바코드 요약"
 _SLACK_SECTION_TEXT_LIMIT = 3000
@@ -43,10 +42,10 @@ def _coerce_weekly_recordings_report_now(
     now: datetime | None = None,
 ) -> datetime:
     if now is None:
-        return datetime.now(_KST)
+        return datetime.now(get_local_zone())
     if now.tzinfo is None:
-        return now.replace(tzinfo=_KST)
-    return now.astimezone(_KST)
+        return now.replace(tzinfo=get_local_zone())
+    return now.astimezone(get_local_zone())
 
 
 def _format_weekly_recordings_report(

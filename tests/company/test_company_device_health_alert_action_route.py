@@ -111,6 +111,26 @@ def _exact_target() -> dict[str, object]:
 
 
 class DeviceHealthAlertActionRouteTests(unittest.TestCase):
+    def test_disabled_sms_rejects_preparation_and_execution_before_target_lookup(self) -> None:
+        # 이전 Slack 카드나 직접 API 요청도 비활성 문자 연락처와 provider를 열지 못한다.
+        load_target = Mock(return_value=_exact_target())
+        send_sms = Mock()
+        route = DeviceHealthAlertActionAssistantRoute(replace(
+            DeviceHealthAlertActionRouteDeps(),
+            load_exact_target=load_target,
+            send_sms=send_sms,
+        ))
+        for execute in (False, True):
+            with self.subTest(execute=execute), patch.object(
+                action_route, "sms_sending_enabled", return_value=False,
+            ):
+                result = route.handle(_request(DEVICE_HEALTH_ALERT_SMS_ACTION, include_sms=execute))
+                self.assertIsNotNone(result)
+                self.assertEqual(result.outcome, "denied")
+                self.assertEqual(result.fallback_reason, "sms_sending_disabled")
+        load_target.assert_not_called()
+        send_sms.assert_not_called()
+
     def test_recording_video_buttons_execute_through_existing_api_actions(self) -> None:
         # 영상 알림의 세 버튼을 실제 route에 넣고 외부 발송·상태 기록만 mock한다.
         now = datetime(2026, 9, 21, tzinfo=UTC)

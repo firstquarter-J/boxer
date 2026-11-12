@@ -1,4 +1,5 @@
-import os
+
+from boxer_company.deployment import get_local_zone, get_timezone_label
 import socket
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -26,11 +27,8 @@ from boxer_company.routers.device_ssh_security import (
 
 
 def _local_zone() -> ZoneInfo:
-    tz_name = os.getenv("TZ", "Asia/Seoul")
-    try:
-        return ZoneInfo(tz_name)
-    except Exception:
-        return ZoneInfo("Asia/Seoul")
+    # 잘못된 배포 시간대를 한국으로 대체해 다른 날짜를 조회하지 않는다.
+    return get_local_zone()
 
 
 def _local_date_to_utc_range(target_date: str) -> tuple[datetime, datetime]:
@@ -535,7 +533,7 @@ def _query_recordings_list_by_barcode(
         lines.extend(
             [
                 f"- {index}.",
-                f"  날짜(KST): `{time_label}`",
+                f"  날짜({get_timezone_label()}): `{time_label}`",
                 f"  병원: `{hospital_name}`",
                 f"  병실: `{room_name}`",
                 f"  streamingStatus: `{streaming_status}`",
@@ -625,7 +623,7 @@ def _query_baby_ai_list_by_barcode(barcode: str, target_date: str | None = None)
     if total_rows <= 0 or not rows:
         result_line = "• 결과: 베이비매직 기록이 없어"
         if target_date:
-            result_line = f"• 결과: `{target_date}` createdAt(KST) 기준 베이비매직 기록이 없어"
+            result_line = f"• 결과: `{target_date}` createdAt({get_timezone_label()}) 기준 베이비매직 기록이 없어"
         return (
             "*바코드 베이비매직 목록 조회 결과*\n"
             f"• 바코드: `{barcode}`\n"
@@ -638,7 +636,7 @@ def _query_baby_ai_list_by_barcode(barcode: str, target_date: str | None = None)
         f"• baby_ai row 수: *{total_rows}개*",
     ]
     if target_date:
-        lines.append(f"• createdAt 날짜(KST): `{target_date}`")
+        lines.append(f"• createdAt 날짜({get_timezone_label()}): `{target_date}`")
     lines.append(
         "• 베이비매직 목록(최근순):",
     )
@@ -658,7 +656,7 @@ def _query_baby_ai_list_by_barcode(barcode: str, target_date: str | None = None)
             webhook_status = f"성공 (`{_format_recorded_at_local(webhook_sent_at)}`)"
         lines.extend(
             [
-                f"- {index}. createdAt(KST): `{created_at_label}` | 병원: `{hospital_name}` | 병실: `{room_name}` | 장비: `{device_name}`",
+                f"- {index}. createdAt({get_timezone_label()}): `{created_at_label}` | 병원: `{hospital_name}` | 병실: `{room_name}` | 장비: `{device_name}`",
                 f"  공개 상태: `{visible_flag}` | 앱 발송: {webhook_status}",
                 f"  결과 링크: {baby_magic_link}",
                 f"  regenerationReason: `{regeneration_reason}`",
@@ -712,8 +710,8 @@ def _query_recordings_detail_by_barcode(
         lines.extend(
             [
                 f"- {index}.",
-                f"  recordedAt(KST): `{recorded_at_label}`",
-                f"  createdAt(KST): `{created_at_label}`",
+                f"  recordedAt({get_timezone_label()}): `{recorded_at_label}`",
+                f"  createdAt({get_timezone_label()}): `{created_at_label}`",
                 f"  videoLength: `{length_label}`",
                 f"  streamingStatus: `{streaming_status}`",
                 f"  병원: `{hospital_name}`",
@@ -773,7 +771,7 @@ def _query_recordings_length_by_barcode(
         length_label = _format_video_length(row.get("videoLength"))
         streaming_status = _display_value(row.get("streamingStatus"), default="미확인")
         lines.append(
-            f"- {index}. {time_key}(KST): `{time_label}` | videoLength: `{length_label}` | streamingStatus: `{streaming_status}` | 병원: `{hospital_name}` | 병실: `{room_name}`"
+            f"- {index}. {time_key}({get_timezone_label()}): `{time_label}` | videoLength: `{length_label}` | streamingStatus: `{streaming_status}` | 병원: `{hospital_name}` | 병실: `{room_name}`"
         )
 
     if has_more:
@@ -842,7 +840,7 @@ def _query_last_recorded_at_by_barcode(
         "*바코드 마지막 녹화 날짜 조회 결과*\n"
         f"• 바코드: `{barcode}`\n"
         f"• recordings row 수: *{count}개*\n"
-        f"• 마지막 recordedAt(KST): *{_format_recorded_at_local(last_recorded_at)}*"
+        f"• 마지막 recordedAt({get_timezone_label()}): *{_format_recorded_at_local(last_recorded_at)}*"
     )
 
 
@@ -877,11 +875,11 @@ def _query_recordings_on_date_by_barcode(
         [
             "*바코드 날짜별 녹화 여부 조회 결과*\n"
             f"• 바코드: `{barcode}`\n"
-            f"• 날짜(KST): `{target_date}`\n"
+            f"• 날짜({get_timezone_label()}): `{target_date}`\n"
             f"• 조회 범위(UTC): `{utc_start:%Y-%m-%d %H:%M:%S}` ~ `{utc_end:%Y-%m-%d %H:%M:%S}`\n"
             f"• recordings row 수: *{count}개*\n"
-            f"• 첫 recordedAt(KST): `{_format_recorded_at_local(first_recorded_at)}`\n"
-            f"• 마지막 recordedAt(KST): `{_format_recorded_at_local(last_recorded_at)}`"
+            f"• 첫 recordedAt({get_timezone_label()}): `{_format_recorded_at_local(first_recorded_at)}`\n"
+            f"• 마지막 recordedAt({get_timezone_label()}): `{_format_recorded_at_local(last_recorded_at)}`"
         ]
     )
 
@@ -954,7 +952,7 @@ def _query_recordings_length_on_date_by_barcode(
         lines = [
             "*바코드 날짜별 영상 길이 조회 결과*",
             f"• 바코드: `{barcode}`",
-            f"• 날짜(KST): `{target_date}`",
+            f"• 날짜({get_timezone_label()}): `{target_date}`",
             "• 결과: recordedAt 기준 녹화 기록이 없어",
         ]
         if has_more:
@@ -964,7 +962,7 @@ def _query_recordings_length_on_date_by_barcode(
     lines = [
         "*바코드 날짜별 영상 길이 조회 결과*",
         f"• 바코드: `{barcode}`",
-        f"• 날짜(KST): `{target_date}`",
+        f"• 날짜({get_timezone_label()}): `{target_date}`",
         f"• recordings row 수: *{len(matched_rows)}개*",
         "• 영상 길이 목록:",
     ]
@@ -986,7 +984,7 @@ def _query_recordings_length_on_date_by_barcode(
         length_label = _format_video_length(row.get("videoLength"))
         streaming_status = _display_value(row.get("streamingStatus"), default="미확인")
         lines.append(
-            f"- {index}. {time_key}(KST): `{time_label}` | videoLength: `{length_label}` | streamingStatus: `{streaming_status}` | 병원: `{hospital_name}` | 병실: `{room_name}`"
+            f"- {index}. {time_key}({get_timezone_label()}): `{time_label}` | videoLength: `{length_label}` | streamingStatus: `{streaming_status}` | 병원: `{hospital_name}` | 병실: `{room_name}`"
         )
 
     if has_more:
@@ -1039,10 +1037,10 @@ def _query_all_recorded_dates_by_barcode(
         "*바코드 전체 녹화 날짜 조회 결과*",
         f"• 바코드: `{barcode}`",
         f"• recordings row 수: *{total_rows}개*",
-        f"• recordedAt 날짜 수(KST): *{len(unique_dates)}일*",
-        f"• 첫 날짜(KST): `{unique_dates[0]}`",
-        f"• 마지막 날짜(KST): `{unique_dates[-1]}`",
-        "• 날짜 목록(KST):",
+        f"• recordedAt 날짜 수({get_timezone_label()}): *{len(unique_dates)}일*",
+        f"• 첫 날짜({get_timezone_label()}): `{unique_dates[0]}`",
+        f"• 마지막 날짜({get_timezone_label()}): `{unique_dates[-1]}`",
+        f"• 날짜 목록({get_timezone_label()}):",
     ]
     for label in display_dates:
         lines.append(f"- `{label}`")
@@ -1197,9 +1195,9 @@ def _query_recordings_by_filters(
     if normalized_barcode:
         lines.append(f"• 바코드: `{normalized_barcode}`")
     if target_date:
-        lines.append(f"• 날짜(KST): `{target_date}`")
+        lines.append(f"• 날짜({get_timezone_label()}): `{target_date}`")
     elif target_year is not None:
-        lines.append(f"• 연도(KST): `{target_year}`")
+        lines.append(f"• 연도({get_timezone_label()}): `{target_year}`")
     if normalized_hospital_name:
         lines.append(f"• 병원: `{normalized_hospital_name}`")
     if normalized_room_name:
@@ -1224,7 +1222,7 @@ def _query_recordings_by_filters(
             [
                 f"- {index}.",
                 f"  바코드: `{barcode_label}`",
-                f"  recordedAt(KST): `{_format_recorded_at_local(row.get('recordedAt'))}`",
+                f"  recordedAt({get_timezone_label()}): `{_format_recorded_at_local(row.get('recordedAt'))}`",
                 f"  fileId: `{_display_value(row.get('fileId'), default='미확인')}`",
                 f"  streamingStatus: `{_display_value(row.get('streamingStatus'), default='미확인')}`",
                 f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
@@ -1367,9 +1365,9 @@ def _query_ultrasound_captures_by_filters(
     if normalized_barcode:
         lines.append(f"• 바코드: `{normalized_barcode}`")
     if target_date:
-        lines.append(f"• 날짜(KST): `{target_date}`")
+        lines.append(f"• 날짜({get_timezone_label()}): `{target_date}`")
     elif target_year is not None:
-        lines.append(f"• 연도(KST): `{target_year}`")
+        lines.append(f"• 연도({get_timezone_label()}): `{target_year}`")
     if normalized_hospital_name:
         lines.append(f"• 병원: `{normalized_hospital_name}`")
     if normalized_room_name:
@@ -1393,7 +1391,7 @@ def _query_ultrasound_captures_by_filters(
             [
                 f"- {index}.",
                 f"  바코드: `{_format_barcode_label(row.get('barcode'))}`",
-                f"  capturedAt(KST): `{_format_recorded_at_local(row.get('capturedAt'))}`",
+                f"  capturedAt({get_timezone_label()}): `{_format_recorded_at_local(row.get('capturedAt'))}`",
                 f"  fileId: `{_display_value(row.get('fileId'), default='미확인')}`",
                 f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
                 f"  병실: `{_display_value(row.get('roomName'), default='미확인')}`",
@@ -1498,9 +1496,9 @@ def _query_hospitals_by_filters(
     if hospital_seq is not None:
         lines.append(f"• hospitalSeq: `{hospital_seq}`")
     if target_date:
-        lines.append(f"• 병원 생성일(KST): `{target_date}`")
+        lines.append(f"• 병원 생성일({get_timezone_label()}): `{target_date}`")
     elif target_year is not None:
-        lines.append(f"• 병원 생성연도(KST): `{target_year}`")
+        lines.append(f"• 병원 생성연도({get_timezone_label()}): `{target_year}`")
     lines.append(f"• hospitals row 수: *{total_count}개*")
 
     if count_only:
@@ -1536,8 +1534,8 @@ def _query_hospitals_by_filters(
                 f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
                 f"  지역: `{region}`",
                 f"  전화번호: `{_display_value(row.get('telephone'), default='미확인')}`",
-                f"  병원 생성일(KST): `{_format_recorded_at_local(row.get('createdAt'))}`",
-                f"  updatedAt(KST): `{_format_recorded_at_local(row.get('updatedAt'))}`",
+                f"  병원 생성일({get_timezone_label()}): `{_format_recorded_at_local(row.get('createdAt'))}`",
+                f"  updatedAt({get_timezone_label()}): `{_format_recorded_at_local(row.get('updatedAt'))}`",
                 f"  상태: `{' | '.join(status_parts)}`",
                 "",
             ]
@@ -1659,8 +1657,8 @@ def _query_hospital_rooms_by_filters(
                 f"  병원: `{_display_value(row.get('hospitalName'), default='미확인')}`",
                 f"  병실: `{_display_value(row.get('roomName'), default='미확인')}`",
                 f"  담당의: `{_display_value(row.get('doctorName'), default='미확인')}`",
-                f"  병실 생성일(KST): `{_format_recorded_at_local(row.get('createdAt'))}`",
-                f"  updatedAt(KST): `{_format_recorded_at_local(row.get('updatedAt'))}`",
+                f"  병실 생성일({get_timezone_label()}): `{_format_recorded_at_local(row.get('createdAt'))}`",
+                f"  updatedAt({get_timezone_label()}): `{_format_recorded_at_local(row.get('updatedAt'))}`",
                 f"  상태: `activeFlag={status}`",
                 "",
             ]

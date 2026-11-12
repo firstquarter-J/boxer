@@ -3,6 +3,11 @@ import re
 from pathlib import Path
 
 from boxer.core import settings as core_settings
+from boxer_company.deployment import get_deployment_profile
+
+
+# 국가 주소 기본값은 회사 배포 계약 하나로 정하고 공개 core에는 전파하지 않는다.
+_DEPLOYMENT_PROFILE = get_deployment_profile()
 
 
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -129,8 +134,9 @@ APP_USER_API_TIMEOUT_SEC = int(os.getenv("APP_USER_API_TIMEOUT_SEC", "8"))
 MDA_GRAPHQL_URL = os.getenv("MDA_GRAPHQL_URL", "").strip()
 MDA_ADMIN_USER_PASSWORD = os.getenv("MDA_ADMIN_USER_PASSWORD", "").strip()
 MDA_SSH_OPEN_HOST = os.getenv("MDA_SSH_OPEN_HOST", "remotes.mmtalkbox.com").strip()
-MDA_GRAPHQL_ORIGIN = os.getenv("MDA_GRAPHQL_ORIGIN", "https://mda.kr.mmtalkbox.com").strip()
-MDA_GRAPHQL_REFERER = os.getenv("MDA_GRAPHQL_REFERER", "https://mda.kr.mmtalkbox.com/").strip()
+MDA_UI_BASE_URL = os.getenv("MDA_UI_BASE_URL", _DEPLOYMENT_PROFILE.mda_ui_base_url).strip().rstrip("/")
+MDA_GRAPHQL_ORIGIN = os.getenv("MDA_GRAPHQL_ORIGIN", MDA_UI_BASE_URL).strip()
+MDA_GRAPHQL_REFERER = os.getenv("MDA_GRAPHQL_REFERER", MDA_UI_BASE_URL + "/").strip()
 MDA_GRAPHQL_USER_AGENT = os.getenv(
     "MDA_GRAPHQL_USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -175,7 +181,7 @@ DEVICE_FILE_RECOVERY_ENABLED = (
 )
 BOX_UPLOADER_BASE_URL = os.getenv(
     "BOX_UPLOADER_BASE_URL",
-    "https://stream.kr.mmtalkbox.com",
+    _DEPLOYMENT_PROFILE.uploader_base_url,
 ).strip().rstrip("/")
 BOX_UPLOADER_RECORDING_PATH = os.getenv(
     "BOX_UPLOADER_RECORDING_PATH",
@@ -227,7 +233,7 @@ DEVICE_FILE_DOWNLOAD_PREFIX = os.getenv("DEVICE_FILE_DOWNLOAD_PREFIX", "temp").s
 DEVICE_FILE_DOWNLOAD_PRESIGNED_EXPIRES_SEC = int(
     os.getenv("DEVICE_FILE_DOWNLOAD_PRESIGNED_EXPIRES_SEC", "3600")
 )
-BABY_MAGIC_CDN_DEFAULT_BASE_URL = "https://cdn-kr.mmtalkbox.com/"
+BABY_MAGIC_CDN_DEFAULT_BASE_URL = _DEPLOYMENT_PROFILE.cdn_base_url + "/"
 BABY_MAGIC_CDN_BASE_URL = os.getenv(
     "BABY_MAGIC_CDN_BASE_URL",
     BABY_MAGIC_CDN_DEFAULT_BASE_URL,

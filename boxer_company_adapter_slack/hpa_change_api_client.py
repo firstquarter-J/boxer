@@ -24,6 +24,7 @@ from boxer_company_adapter_slack.company_api_client import (
     CompanyApiContractError,
     CompanyApiPolicyError,
     _validate_base_url,
+    _validate_response_country,
 )
 from boxer_company_adapter_slack.hpa_change_routes import (
     HpaChangeRequest,
@@ -130,6 +131,7 @@ class HpaChangeApiClient:
     ) -> None:
         self._base_url = _validate_base_url(settings.base_url).rstrip("/")
         self._token = settings.token
+        self._country = settings.deployment_country
         self._workspace_id = str(workspace_id or "").strip()
         self._connect_timeout_sec = float(settings.connect_timeout_sec)
         self._read_timeout_sec = float(settings.operations_read_timeout_sec)
@@ -311,6 +313,7 @@ class HpaChangeApiClient:
             raise CompanyApiContractError("company_api_hpa_request_id_invalid")
         headers = {
             "Authorization": f"Bearer {self._token}",
+            "X-Boxer-Country": self._country,
             "X-Request-ID": request_id,
             "traceparent": f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01",
             "Accept": "application/json, application/problem+json",
@@ -345,6 +348,7 @@ class HpaChangeApiClient:
                 code="transport_error",
                 request_id=request_id,
             ) from exc
+        _validate_response_country(response, request_id, expected_country=self._country)
         status = int(getattr(response, "status_code", 0) or 0)
         try:
             body = response.json()

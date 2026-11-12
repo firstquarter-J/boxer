@@ -5,7 +5,7 @@ import logging
 import re
 import threading
 from typing import Any, Mapping
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone
 
 from boxer_company_adapter_slack.automation_api_client import (
     CompanyAutomationApiClient,
@@ -22,7 +22,6 @@ from boxer_company_adapter_slack.device_alert_slack import (
 )
 
 
-_KST = ZoneInfo("Asia/Seoul")
 _SLACK_CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
 _DEVICE_NOTIFICATION_ALERT_THREAD: threading.Thread | None = None
 _DEVICE_NOTIFICATION_ALERT_THREAD_LOCK = threading.Lock()
@@ -30,10 +29,10 @@ _DEVICE_NOTIFICATION_ALERT_THREAD_LOCK = threading.Lock()
 
 def _coerce_now(now: datetime | None = None) -> datetime:
     if now is None:
-        return datetime.now(_KST)
+        return datetime.now(get_local_zone())
     if now.tzinfo is None:
-        return now.replace(tzinfo=_KST)
-    return now.astimezone(_KST)
+        return now.replace(tzinfo=get_local_zone())
+    return now.astimezone(get_local_zone())
 
 
 def _run_device_notification_alert_once(

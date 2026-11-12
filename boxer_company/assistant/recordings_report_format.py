@@ -1,5 +1,7 @@
 """병원·진료실의 녹화와 신규 바코드를 네 개의 CommonMark 메시지로 표시한다."""
 
+
+from boxer_company.deployment import get_local_zone, get_timezone_label
 import re
 from datetime import datetime
 from typing import Any
@@ -34,6 +36,8 @@ def format_recordings_report_sections(
 ) -> tuple[str, ...]:
     """주간과 명시 기간 모두 실제 날짜 범위와 직전 동일 일수 비교를 보여준다."""
 
+    # 표시 시각과 기간 비교는 서버의 현지 달력 기준으로 맞춘다.
+    now = now.replace(tzinfo=get_local_zone()) if now.tzinfo is None else now.astimezone(get_local_zone())
     period = (
         f"**기간** `{summary['weekStartDate']} ~ {summary['weekEndDate']}`\n"
         f"**비교 기간** `{summary['previousWeekStartDate']} ~ "
@@ -50,7 +54,7 @@ def format_recordings_report_sections(
 
     def drop_criteria(unit: str, minimum: int = minimum_drop) -> str:
         return f"직전 기간 대비 {drop_percent}% 이상 · 감소량 {minimum:,}{unit} 이상"
-    footer = f"조회: {now:%Y-%m-%d %H:%M:%S} KST"
+    footer = f"조회: {now:%Y-%m-%d %H:%M:%S} {get_timezone_label()}"
     if summary["weekEndDate"] >= now.date().isoformat():
         footer += "\n※ 종료되지 않은 기간이므로 현재까지의 집계야."
 

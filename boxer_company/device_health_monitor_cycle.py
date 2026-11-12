@@ -64,6 +64,7 @@ from boxer_company.sms_delivery_cycle import (
     remember_sms_delivery_sheet_record,
     wait_for_automatic_sms_runtime_claim,
 )
+from boxer_company.sms_policy import sms_sending_enabled
 
 
 _MONITOR_OPTION_KEYS: frozenset[str] = frozenset()
@@ -1610,6 +1611,9 @@ def _apply_automatic_sms_once(
         # 같은 장애의 reminder도 coordinator에서 새 delivery로 식별되게 한다.
         "alertOccurrenceAt": now.isoformat(),
     }
+    # LED Slack 알림은 유지하면서 문자 guide, claim과 provider 경로만 건너뛴다.
+    if not sms_sending_enabled():
+        return {**result, "smsEnabled": False, "smsContactActionEnabled": False}
     phone_number = _normalize_phone_number(item.get("deviceAlertPhone"))
     target = DeviceHealthAlertActionTarget(
         hospital_seq=_positive_int(item.get("hospitalSeq")) or 0,
@@ -1909,6 +1913,7 @@ def _delivery_payload(
                 if item.get("alertCategory") == "led" else ""
             ),
             "smsStatusText": _text(item.get("smsStatusText")),
+            "smsEnabled": item.get("smsEnabled", True) is True,
             "smsContactActionEnabled": bool(item.get("smsContactActionEnabled", True)),
             "smsDeliveryStatus": _text(item.get("smsDeliveryStatus")),
             "smsAcceptedAt": _text(item.get("smsAcceptedAt")),

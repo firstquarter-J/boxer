@@ -1,5 +1,7 @@
 """채팅과 같은 조회 스냅샷의 전체 분석 행을 수식 없는 엑셀로 내보낸다."""
 
+
+from boxer_company.deployment import get_local_zone, get_timezone_label
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -43,6 +45,8 @@ def _header(sheet: Any, row: int) -> None:
 
 
 def build_recordings_trend_excel(summary: dict[str, Any], *, now: datetime) -> AssistantFile:
+    # 채팅과 파일의 표시 시각도 같은 배포 시간대를 사용한다.
+    now = now.replace(tzinfo=get_local_zone()) if now.tzinfo is None else now.astimezone(get_local_zone())
     workbook = Workbook()
     info = workbook.active
     info.title = "조회 조건"
@@ -50,8 +54,8 @@ def build_recordings_trend_excel(summary: dict[str, Any], *, now: datetime) -> A
     required = summary["declineWeeks"]
     metadata = [
         ["항목", "내용"],
-        ["조회 기간 (KST)", f"{summary['startDate']} ~ {summary['endDate']}"],
-        ["조회 시각 (KST)", now.strftime("%Y-%m-%d %H:%M:%S")],
+        [f"조회 기간 ({get_timezone_label()})", f"{summary['startDate']} ~ {summary['endDate']}"],
+        [f"조회 시각 ({get_timezone_label()})", now.strftime("%Y-%m-%d %H:%M:%S")],
         ["대상 병원", ", ".join(summary["hospitalNames"]) or "전체"],
         ["연속 감소 조건", f"마지막 완료 주까지 {required}주 이상" if required else "없음 (증가·유지 포함)"],
         ["매주 감소 기준", f"{summary['dropPercent']:g}% 이상, {summary['minimumDrop']}건/개 이상 (보합 제외)"],

@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone
 
 from boxer_company.utils import _display_value
 from boxer_company import settings as cs
@@ -19,7 +19,6 @@ from boxer_company.sms_delivery import (
 _GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 _GOOGLE_SHEETS_API_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 _GOOGLE_SHEETS_SERIAL_EPOCH = datetime(1899, 12, 30)
-_KST = ZoneInfo("Asia/Seoul")
 _NON_DEVICE_PROBLEM_COMPONENTS = {"용량", "storage", "디스크", "저장공간", "trashcan"}
 _CAPTUREBOARD_INCIDENT_ISSUE_MARKERS = (
     "녹화 파일 증가 정지",
@@ -57,7 +56,7 @@ def _build_device_health_sheet_authorized_session() -> Any:
 
 
 def _device_health_sheet_serial_datetime(value: datetime) -> float:
-    local_value = value.astimezone(_KST) if value.tzinfo is not None else value.replace(tzinfo=_KST)
+    local_value = value.astimezone(get_local_zone()) if value.tzinfo is not None else value.replace(tzinfo=get_local_zone())
     local_naive = local_value.replace(tzinfo=None)
     return (local_naive - _GOOGLE_SHEETS_SERIAL_EPOCH).total_seconds() / 86400
 
@@ -130,7 +129,7 @@ def _device_health_sheet_sms_tracking_time(
         except ValueError:
             accepted_at = detected_at
     if accepted_at.tzinfo is None:
-        accepted_at = accepted_at.replace(tzinfo=_KST)
+        accepted_at = accepted_at.replace(tzinfo=get_local_zone())
     # 숨김 메타데이터를 작게 유지하면서도 만료 판단에 필요한 초 단위 시각을 보존한다.
     return (
         accepted_at.astimezone(timezone.utc)

@@ -11,8 +11,10 @@ import re
 import threading
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode, urlsplit
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone, get_timezone_label
 
+from boxer_company.deployment import get_deployment_profile
+from boxer_company.sms_policy import sms_sending_enabled
 from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
     DEVICE_HEALTH_ALERT_SMS_ACTION,
@@ -28,7 +30,6 @@ from boxer_company_adapter_slack.device_health_alert_api import (
 )
 
 
-_KST = ZoneInfo("Asia/Seoul")
 DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL = (
     DEVICE_HEALTH_ALERT_SMS_ACTION
 )
@@ -74,7 +75,6 @@ _MARK_DONE_MESSAGE_LOCK_STRIPES = 64
 _MARK_DONE_STATUS_PREFIX = "✅ *확인 완료*"
 _MARK_DONE_RECEIPT_PREFIX = "담당자 <@"
 _MARK_DONE_TIME_PREFIX = "🕒 *처리 시간*"
-_MDA_MONITORING_URL = "https://mda.kr.mmtalkbox.com/monitoring"
 _CATEGORY_TITLES = {
     "recording": "녹화 상태 확인 필요",
     "recording_processing": "녹화 파일 처리 확인 필요",
@@ -668,6 +668,19 @@ def _alert_item_blocks(
             identity_fields.append({"type": "mrkdwn", "text": f"{label}\n{value}"})
     # 병원 번호와 action 원본은 유지하고 제목의 #만 병원 아이콘으로 바꾼다.
     hospital_title = item["hospital"].removeprefix("#")
+    contact_fields = [
+        {
+            "type": "mrkdwn",
+            "text": f"📞 *전화*\n{_text(item.get('telephone'), '미확인')}",
+        },
+    ]
+    # API가 닫은 문자 표시는 카드와 접근성 본문에서 함께 제외한다.
+    sms_enabled = item.get("smsEnabled", True) is True
+    if sms_enabled:
+        contact_fields.append({
+            "type": "mrkdwn",
+            "text": f"💬 *문자*\n{_sms_contact_text(item)}",
+        })
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
@@ -679,16 +692,7 @@ def _alert_item_blocks(
         detail_block,
         {
             "type": "section",
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"📞 *전화*\n{_text(item.get('telephone'), '미확인')}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"💬 *문자*\n{_sms_contact_text(item)}",
-                },
-            ],
+            "fields": contact_fields,
         },
     ]
     if not include_actions:
@@ -698,15 +702,15 @@ def _alert_item_blocks(
     # 제한과 자동문자 본문 노출을 피한다.
     value = _alert_action_value(item)
     # 미완료 알림의 실행 버튼은 초록색으로 강조하고 동작별 아이콘으로 구분한다.
-    action_elements = [
-        {
+    action_elements = []
+    if sms_enabled:
+        action_elements.append({
             "type": "button",
             "action_id": DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL,
             "text": {"type": "plain_text", "text": "✉️ 병원 문자 보내기"},
             "value": value,
             "style": "primary",
-        }
-    ]
+        })
     if include_device_voice_action:
         action_elements.append(
             {
@@ -973,7 +977,8 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
     if not _is_safe_https_url(mda_url) and hospital_seq and device:
         # MDA 장비 검색과 동일하게 병원 선택과 장비 focus를 함께 전달한다.
         # 공통 카드에서 만들면 알림 종류·구형 pending의 URL 누락과 무관하게 적용된다.
-        mda_url = f"{_MDA_MONITORING_URL}?{urlencode({'hospitalSeq': hospital_seq, 'focusDevice': device})}"
+        monitoring_url = f"{get_deployment_profile().mda_ui_base_url}/monitoring"
+        mda_url = f"{monitoring_url}?{urlencode({'hospitalSeq': hospital_seq, 'focusDevice': device})}"
     return {
         "hospitalSeq": hospital_seq or 0,
         "hospitalName": hospital_name,
@@ -990,6 +995,8 @@ def _normalize_alert_item(raw: Mapping[str, Any]) -> dict[str, Any]:
             "",
         ),
         "smsPhoneNumber": _text(raw.get("smsPhoneNumber"), ""),
+        # 새 API의 false는 보존하고 이전 delivery도 현재 배포의 표시 정책을 따른다.
+        "smsEnabled": sms_sending_enabled() and raw.get("smsEnabled", True) is True,
         "mdaUrl": mda_url,
         "barcode": _text(raw.get("barcode"), ""),
         "sessionAtLabel": _text(raw.get("sessionAtLabel"), ""),
@@ -1133,7 +1140,7 @@ def _open_sms_modal(
             mode="send",
             message_ts=identity["messageTs"],
             thread_ts=identity["threadTs"],
-            occurred_at=datetime.now(_KST).isoformat(),
+            occurred_at=datetime.now(get_local_zone()).isoformat(),
             status=status,
             ok=status == "modal_opened",
             error_type=error_type,
@@ -1313,11 +1320,11 @@ def _mark_done_receipt(
         or not isinstance(created, bool)
     ):
         return None
-    return actor_user_id, acknowledged_at.astimezone(_KST), created
+    return actor_user_id, acknowledged_at.astimezone(get_local_zone()), created
 
 
 def _mark_done_time_text(completed_at: datetime) -> str:
-    return completed_at.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    return completed_at.astimezone(get_local_zone()).strftime("%Y-%m-%d %H:%M:%S") + " " + get_timezone_label()
 
 
 def _normalize_status_emoji(text: str) -> str:

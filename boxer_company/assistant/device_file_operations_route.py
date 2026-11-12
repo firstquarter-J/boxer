@@ -464,7 +464,7 @@ class DeviceFileOperationsAssistantRoute:
         if not download:
             rendered_body = slack_mrkdwn_to_commonmark(result_text)
             mda_search_uri = (
-                f"https://mda.kr.mmtalkbox.com/cs?search={barcode}"
+                f"{cs.MDA_UI_BASE_URL}/cs?search={barcode}"
             )
             # 복구 성공 결과의 legacy `열기` 링크는 source allowlist에도
             # 등록해야 Slack renderer가 클릭 가능한 링크로 보존한다.
@@ -772,7 +772,7 @@ def _download_delivered_result(
                 SourceReference(
                     source_id="mda-cs-activity",
                     title="CS 처리내역 엿보기",
-                    uri="https://mda.kr.mmtalkbox.com/cs",
+                    uri=f"{cs.MDA_UI_BASE_URL}/cs",
                 ),
             )
             if activity_logged
@@ -1002,7 +1002,7 @@ def _render_device_download_thread_notice(
             (
                 "",
                 "• 다운로드 내역 기록되었습니다. 🎣 "
-                "[CS 처리내역 엿보기](https://mda.kr.mmtalkbox.com/cs)",
+                f"[CS 처리내역 엿보기]({cs.MDA_UI_BASE_URL}/cs)",
             )
         )
     return "\n".join(lines)

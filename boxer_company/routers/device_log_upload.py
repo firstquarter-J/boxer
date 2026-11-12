@@ -1,13 +1,14 @@
+
+from boxer_company.deployment import get_local_zone
 from datetime import datetime
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
 DeviceCommandDispatcher = Callable[[str, str], dict[str, Any]]
 
 def _current_kst_date() -> str:
-    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    return datetime.now(get_local_zone()).strftime("%Y-%m-%d")
 
 
 def _check_and_request_device_log_upload(

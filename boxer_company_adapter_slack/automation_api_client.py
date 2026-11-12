@@ -20,6 +20,7 @@ from boxer_company_adapter_slack.company_api_client import (
     CompanyApiContractError,
     CompanyApiPolicyError,
     _IDENTIFIER_PATTERN,
+    _validate_response_country,
     _validate_client_settings,
 )
 
@@ -119,6 +120,7 @@ class CompanyAutomationApiClient:
         # token, timeout 및 concrete tenant 검증을 통과해야 한다.
         self._base_url = _validate_client_settings(settings).rstrip("/")
         self._token = settings.token
+        self._country = settings.deployment_country
         self._tenant_id = str(
             settings.automation_tenant_id or ""
         ).strip()
@@ -239,6 +241,7 @@ class CompanyAutomationApiClient:
 
         headers = {
             "Authorization": f"Bearer {self._token}",
+            "X-Boxer-Country": self._country,
             "X-Request-ID": request_id,
             "traceparent": _create_traceparent(),
             "Accept": "application/json, application/problem+json",
@@ -307,6 +310,7 @@ class CompanyAutomationApiClient:
                 request_id=request_id,
             ) from exc
 
+        _validate_response_country(response, request_id, expected_country=self._country)
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 200:
             return response

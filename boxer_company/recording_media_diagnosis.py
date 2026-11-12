@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from boxer_company.deployment import get_local_zone, localize_wall_datetime
+
 import json
 import math
 import os
@@ -16,7 +18,6 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from boxer.core import settings as core_settings
 from boxer.retrieval.connectors.db import _create_db_connection
@@ -155,7 +156,7 @@ def _load_media_target(
     if log_date is not None:
         try:
             start = datetime.strptime(log_date, "%Y-%m-%d").replace(
-                tzinfo=ZoneInfo("Asia/Seoul")
+                tzinfo=get_local_zone()
             )
         except (ValueError, TypeError):
             return {"status": "needs_input", "reason": "invalid_target"}
@@ -165,10 +166,8 @@ def _load_media_target(
         )
     if recorded_at is not None:
         try:
-            # 카드에 표시한 KST 세션 시작의 초 단위 범위만 사용한다.
-            session_start = datetime.strptime(recorded_at, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=ZoneInfo("Asia/Seoul")
-            )
+            # 카드에 표시한 배포 현지 세션 시작의 초 단위 범위만 사용한다.
+            session_start = localize_wall_datetime(datetime.strptime(recorded_at, "%Y-%m-%d %H:%M:%S"))
         except (ValueError, TypeError):
             return {"status": "needs_input", "reason": "invalid_target"}
         session_bounds = tuple(

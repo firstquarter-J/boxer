@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from boxer_company.deployment import load_deployment_profile
+
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -327,6 +329,21 @@ def load_automation_scheduler_settings(
     """기존 reporter env를 API-owned scheduler 계약으로 엄격히 읽는다."""
 
     source = env if env is not None else os.environ
+    profile = load_deployment_profile(source)
+    # 새 설정은 지역 시각임을 드러낸다. 한국의 기존 KST 키만 읽기 alias로 유지한다.
+    clock_source = dict(source)
+    for local_key, legacy_key in (
+        ("WEEKLY_RECORDINGS_REPORT_HOUR_LOCAL", "WEEKLY_RECORDINGS_REPORT_HOUR_KST"),
+        ("WEEKLY_RECORDINGS_REPORT_MINUTE_LOCAL", "WEEKLY_RECORDINGS_REPORT_MINUTE_KST"),
+        ("DAILY_DEVICE_ROUND_HOUR_LOCAL", "DAILY_DEVICE_ROUND_HOUR_KST"),
+        ("DAILY_DEVICE_ROUND_MINUTE_LOCAL", "DAILY_DEVICE_ROUND_MINUTE_KST"),
+        ("DAILY_DEVICE_ROUND_END_HOUR_LOCAL", "DAILY_DEVICE_ROUND_END_HOUR_KST"),
+        ("DAILY_DEVICE_ROUND_END_MINUTE_LOCAL", "DAILY_DEVICE_ROUND_END_MINUTE_KST"),
+    ):
+        if str(source.get(local_key, "")).strip():
+            clock_source[legacy_key] = source[local_key]
+        elif profile.country != "kr" and str(source.get(legacy_key, "")).strip():
+            raise ValueError("country schedule must use local clock settings")
     if not _read_bool(
         source,
         "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED",
@@ -358,44 +375,46 @@ def load_automation_scheduler_settings(
         if "SMS_DELIVERY_REPORTER_POLL_INTERVAL_SEC" in source
         else "SOLAPI_DELIVERY_REPORT_POLL_INTERVAL_SEC"
     )
+    # loader에 주입한 환경과 process 환경이 서로 다른 국가가 되지 않게 한다.
     schedule = AutomationScheduleConfig(
+        timezone=profile.timezone,
         weekly_hour=_read_int(
-            source,
+            clock_source,
             "WEEKLY_RECORDINGS_REPORT_HOUR_KST",
             default=9,
             minimum=0,
             maximum=23,
         ),
         weekly_minute=_read_int(
-            source,
+            clock_source,
             "WEEKLY_RECORDINGS_REPORT_MINUTE_KST",
             default=0,
             minimum=0,
             maximum=59,
         ),
         daily_start_hour=_read_int(
-            source,
+            clock_source,
             "DAILY_DEVICE_ROUND_HOUR_KST",
             default=22,
             minimum=0,
             maximum=23,
         ),
         daily_start_minute=_read_int(
-            source,
+            clock_source,
             "DAILY_DEVICE_ROUND_MINUTE_KST",
             default=0,
             minimum=0,
             maximum=59,
         ),
         daily_end_hour=_read_int(
-            source,
+            clock_source,
             "DAILY_DEVICE_ROUND_END_HOUR_KST",
             default=6,
             minimum=0,
             maximum=23,
         ),
         daily_end_minute=_read_int(
-            source,
+            clock_source,
             "DAILY_DEVICE_ROUND_END_MINUTE_KST",
             default=0,
             minimum=0,

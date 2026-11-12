@@ -6,7 +6,7 @@ import logging
 import re
 import threading
 from typing import Any, Callable, Mapping
-from zoneinfo import ZoneInfo
+from boxer_company.deployment import get_local_zone
 
 from boxer_company_adapter_slack.automation_api_client import (
     CompanyAutomationApiClient,
@@ -27,7 +27,6 @@ from boxer_company_adapter_slack.device_health_alert_api import (
 )
 
 
-_KST = ZoneInfo("Asia/Seoul")
 _SLACK_CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
 _DEVICE_HEALTH_MONITOR_THREAD: threading.Thread | None = None
 _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
@@ -35,10 +34,10 @@ _DEVICE_HEALTH_MONITOR_THREAD_LOCK = threading.Lock()
 
 def _coerce_now(now: datetime | None = None) -> datetime:
     if now is None:
-        return datetime.now(_KST)
+        return datetime.now(get_local_zone())
     if now.tzinfo is None:
-        return now.replace(tzinfo=_KST)
-    return now.astimezone(_KST)
+        return now.replace(tzinfo=get_local_zone())
+    return now.astimezone(get_local_zone())
 
 
 def _run_device_health_monitor_once(
@@ -188,6 +187,7 @@ def _build_remote_device_health_alert_device_result(
         "telephone": str(raw.get("telephone") or "").strip(),
         "deviceAlertPhone": str(raw.get("deviceAlertPhone") or "").strip(),
         "smsPhoneNumber": str(raw.get("smsPhoneNumber") or "").strip(),
+        "smsEnabled": raw.get("smsEnabled", True) is True,
         "alertCategory": str(
             raw.get("alertCategory") or "device_connection"
         ).strip(),

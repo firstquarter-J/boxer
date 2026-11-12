@@ -1,14 +1,13 @@
-"""네트워크 진단에만 적용하는 한국 시간 하루 조회 범위다."""
+"""네트워크 진단에만 적용하는 배포 현지 시간 하루 조회 범위다."""
 
 import math
 import re
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from boxer_company import _operation_routing_common as dates
+from boxer_company.deployment import get_local_zone, get_timezone_label
 
-KST = ZoneInfo("Asia/Seoul")
 _VERSION_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9.])(?:v\s*\d+(?:\.\d+){1,3}|\d\.\d+\.\d+)(?:[-+][A-Za-z0-9.-]+)?(?![A-Za-z0-9.])"
     r"|(?:버전(?:은|는|이|의)?|version|node(?:\.js)?)\s*[:=]?\s*v?\s*\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?(?![A-Za-z0-9.])",
@@ -79,17 +78,18 @@ def _reject_unsupported_period(question: str, expressions: list[str]) -> None:
 def _window(start: datetime, end: datetime, current_day: bool) -> dict[str, Any]:
     return {
         "startEpoch": start.timestamp(), "endEpoch": end.timestamp(),
-        "date": start.date().isoformat(), "timezone": "Asia/Seoul",
-        "label": start.strftime("%Y-%m-%d %H:%M:%S") + " ~ " + end.strftime("%Y-%m-%d %H:%M:%S") + " KST",
+        "date": start.date().isoformat(), "timezone": get_local_zone().key,
+        "label": start.strftime("%Y-%m-%d %H:%M:%S") + " ~ " + end.strftime("%Y-%m-%d %H:%M:%S") + " " + get_timezone_label(),
         "mode": "today" if current_day else "date", "isCurrentDay": current_day,
     }
 
 
 def resolve_network_window(question: str, now: datetime | None = None) -> dict[str, Any]:
-    reference = now or datetime.now(KST)
+    local_zone = get_local_zone()
+    reference = now or datetime.now(local_zone)
     if not isinstance(reference, datetime):
         raise NetworkDateWindowError("조회 기준 시각을 확인해줘")
-    reference = reference.replace(tzinfo=KST) if reference.tzinfo is None else reference.astimezone(KST)
+    reference = reference.replace(tzinfo=local_zone) if reference.tzinfo is None else reference.astimezone(local_zone)
     # 명백한 버전 토큰만 제외한다. 2026.10.21/26.10.21 같은 날짜는 그대로 파싱한다.
     text = _VERSION_TOKEN_PATTERN.sub(" ", str(question or "").strip())
     try:
@@ -102,7 +102,7 @@ def resolve_network_window(question: str, now: datetime | None = None) -> dict[s
         if len(expressions) > 1 or len(offsets) > 1 or len(requested) > 1:
             raise NetworkDateWindowError("네트워크 로그는 날짜를 하루만 지정해줘")
         day, _ = dates._extract_log_date_with_presence(text, reference_date=reference.date())
-        selected = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=KST)
+        selected = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=local_zone)
     except NetworkDateWindowError:
         raise
     except ValueError as error:
@@ -120,12 +120,15 @@ def validate_network_window(window: dict[str, Any]) -> dict[str, Any]:
     start_epoch, end_epoch = window.get("startEpoch"), window.get("endEpoch")
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in (start_epoch, end_epoch)):
         raise NetworkDateWindowError("조회 날짜 범위를 확인해줘")
-    if not 0 <= end_epoch - start_epoch <= 86400:
+    # 서머타임 전환일도 현지 하루만 허용한다. 절대 24시간 상한은 25시간인 날을 잘라낸다.
+    if not 0 <= end_epoch - start_epoch <= 26 * 3600:
         raise NetworkDateWindowError("조회 날짜 범위를 확인해줘")
     try:
-        start, end = (datetime.fromtimestamp(value, KST) for value in (start_epoch, end_epoch))
+        start, end = (datetime.fromtimestamp(value, get_local_zone()) for value in (start_epoch, end_epoch))
     except (ValueError, OverflowError, OSError) as error:
         raise NetworkDateWindowError("조회 날짜 범위를 확인해줘") from error
     if start != start.replace(hour=0, minute=0, second=0, microsecond=0):
+        raise NetworkDateWindowError("조회 날짜 범위를 확인해줘")
+    if end_epoch > (start + timedelta(days=1)).timestamp():
         raise NetworkDateWindowError("조회 날짜 범위를 확인해줘")
     return _window(start, end, window.get("isCurrentDay") is True)

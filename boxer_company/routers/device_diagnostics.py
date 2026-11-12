@@ -1,9 +1,10 @@
+
+from boxer_company.deployment import get_local_zone
 import re
 import threading
 import time
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from boxer.core.utils import _truncate_text
 from boxer_company import settings as cs
@@ -176,7 +177,7 @@ def _build_device_diagnostic_device_required_message() -> str:
 
 
 def _device_diagnostic_now() -> str:
-    return datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds")
+    return datetime.now(get_local_zone()).isoformat(timespec="seconds")
 
 
 def _device_diagnostic_snapshot_key(workspace_id: str, channel_id: str, thread_ts: str) -> str:
@@ -804,7 +805,7 @@ def _build_device_diagnostic_followup_fallback(
         lines.append("• 추가 조사: 질문상 실시간 장비 로그 조회가 필요하진 않아 기존 스냅샷을 사용했어")
 
     if not bool(ssh.get("ready")):
-        lines.append(f"• 결론: SSH 접속이 안 돼서 앱/시스템 로그까지는 못 봤어")
+        lines.append("• 결론: SSH 접속이 안 돼서 앱/시스템 로그까지는 못 봤어")
         lines.append(f"• 근거: {_display_device_status_probe_reason(_display_value(ssh.get('reason'), default=''))}")
         return "\n".join(lines)
 

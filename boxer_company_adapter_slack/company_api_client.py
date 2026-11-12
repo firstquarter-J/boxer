@@ -17,6 +17,8 @@ from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
+from boxer_company.deployment import get_deployment_profile, load_deployment_profile
+
 from boxer_company.memory.commands import parse_memory_command
 
 from boxer_company.assistant.contracts import (
@@ -95,6 +97,7 @@ _PROBLEM_CODES = frozenset(
         "invalid_traceparent",
         "authentication_failed",
         "caller_not_allowed",
+        "deployment_country_mismatch",
         "validation_failed",
         "request_id_conflict",
         "operation_in_progress",
@@ -311,6 +314,8 @@ class CompanyApiClientSettings:
     operations_read_timeout_sec: float = 1_300.0
     max_retries: int = 1
     automation_tenant_id: str = ""
+    deployment_country: str = field(default_factory=lambda: get_deployment_profile().country)
+    deployment_timezone_name: str = field(default_factory=lambda: get_deployment_profile().timezone_name)
 
 
 def load_company_api_client_settings(
@@ -319,6 +324,7 @@ def load_company_api_client_settings(
     """Slack이 공통 API와 receipt journal에 필요한 설정만 읽는다."""
 
     source = os.environ if env is None else env
+    deployment_profile = load_deployment_profile(source)
     raw_base_url = str(
         source.get("BOXER_COMPANY_API_BASE_URL", "")
     ).strip()
@@ -375,6 +381,8 @@ def load_company_api_client_settings(
     return CompanyApiClientSettings(
         base_url=base_url,
         token=token,
+        deployment_country=deployment_profile.country,
+        deployment_timezone_name=deployment_profile.timezone_name,
         connect_timeout_sec=connect_timeout_sec,
         read_timeout_sec=read_timeout_sec,
         operations_read_timeout_sec=operations_read_timeout_sec,
@@ -475,6 +483,7 @@ class CompanyAssistantApiClient:
         )
         headers = {
             "Authorization": f"Bearer {self._settings.token}",
+            "X-Boxer-Country": self._settings.deployment_country,
             "X-Request-ID": request_id,
             "traceparent": traceparent,
             "Accept": "application/json, application/problem+json",
@@ -566,6 +575,7 @@ class CompanyAssistantApiClient:
                     request_id=request_id,
                 ) from exc
 
+            _validate_response_country(response, request_id, expected_country=self._settings.deployment_country)
             status = _response_status(response)
             if status == 200:
                 return _deserialize_result(response, request_id)
@@ -634,6 +644,7 @@ class CompanyAssistantApiClient:
             )
         headers = {
             "Authorization": f"Bearer {self._settings.token}",
+            "X-Boxer-Country": self._settings.deployment_country,
             "X-Request-ID": request_id,
             "traceparent": traceparent,
             "Accept": (
@@ -698,6 +709,7 @@ class CompanyAssistantApiClient:
             ) from exc
 
         try:
+            _validate_response_country(response, request_id, expected_country=self._settings.deployment_country)
             status = _response_status(response)
             if status != 200:
                 problem = _deserialize_problem(response, request_id)
@@ -978,12 +990,57 @@ def _validate_base_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def validate_company_api_deployment(
+    settings: CompanyApiClientSettings,
+    *,
+    session: Any | None = None,
+) -> None:
+    """미국 Slack은 원격 API의 국가와 시간대를 확인한 뒤 이벤트 수신을 시작한다."""
+
+    if settings.deployment_country == "kr":
+        # 기존 한국 설치에는 신규 외부 네트워크 기동 조건을 추가하지 않는다.
+        return
+    base_url = _validate_client_settings(settings)
+    client = session or requests.Session()
+    if session is None:
+        client.trust_env = False
+    try:
+        response = client.get(
+            base_url + "/health/ready",
+            headers={"X-Boxer-Country": settings.deployment_country,
+                     "Accept": "application/json"},
+            timeout=(min(settings.connect_timeout_sec, 2), 5),
+            allow_redirects=False,
+        )
+        _validate_response_country(response, expected_country=settings.deployment_country)
+        if (
+            _response_status(response) != 200
+            or str(response.headers.get("X-Boxer-Timezone",
+                                         response.headers.get("x-boxer-timezone", "")))
+            != settings.deployment_timezone_name
+        ):
+            raise CompanyApiContractError("company_api_deployment_preflight_failed")
+    except requests.exceptions.RequestException:
+        # transport 원문과 credential은 startup 오류에도 노출하지 않는다.
+        raise CompanyApiContractError("company_api_deployment_preflight_failed") from None
+    finally:
+        if session is None:
+            client.close()
+
+
 def _validate_client_settings(
     settings: CompanyApiClientSettings,
 ) -> str:
     # client 객체에는 rollout 선택지가 없다. remote endpoint와 transport
     # 안전값만 검증해 모든 호출을 같은 프로세스 경계에 고정한다.
     base_url = _validate_base_url(str(settings.base_url))
+    try:
+        load_deployment_profile({
+            "BOXER_COMPANY_COUNTRY": settings.deployment_country,
+            "BOXER_COMPANY_TIMEZONE": settings.deployment_timezone_name,
+        })
+    except ValueError:
+        raise CompanyApiContractError("company_api_deployment_configuration_invalid") from None
     token = settings.token
     if (
         not isinstance(token, str)
@@ -2098,6 +2155,27 @@ def _is_valid_traceparent(value: Any) -> bool:
 
 def _retry_delay(attempt: int) -> float:
     return min(0.1 * (2**max(0, attempt)), 0.5)
+
+
+def _validate_response_country(
+    response: Any,
+    request_id: str | None = None,
+    *,
+    expected_country: str | None = None,
+) -> None:
+    """응답도 배포 국가와 대조하고 옛 한국 API의 header 누락만 rollout 중 허용한다."""
+
+    expected = expected_country or get_deployment_profile().country
+    headers = getattr(response, "headers", {}) or {}
+    supplied = headers.get("X-Boxer-Country", headers.get("x-boxer-country"))
+    if supplied is None and expected == "kr":
+        return
+    if supplied != expected:
+        raise CompanyApiContractError(
+            "company_api_deployment_country_mismatch",
+            code="deployment_country_mismatch",
+            request_id=request_id,
+        )
 
 
 def _response_status(response: Any) -> int:

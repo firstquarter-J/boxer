@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from boxer_company import settings as cs
+from boxer_company.deployment import get_deployment_profile
 from boxer.core.utils import _truncate_text
 from boxer_company.utils import _display_value
 
@@ -28,8 +29,8 @@ _NETWORK_ERROR_HINTS = (
     "sendscreenshotbase64",
     "senddailylog",
     "getaddrinfo eai_again",
-    "status.kr.mmtalkbox.com",
-    "stream.kr.mmtalkbox.com",
+    # 로그의 국가별 서비스 host도 같은 네트워크 오류 범주로 판정한다.
+    *get_deployment_profile().network_service_hosts,
     "couldn't be sent",
     "throttling:",
 )

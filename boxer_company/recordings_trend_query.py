@@ -1,10 +1,11 @@
 """녹화 추이의 기간과 연속 감소 조건을 해석하는 provider-free 계약."""
 
+
+from boxer_company.deployment import get_local_zone
 import calendar
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from boxer_company.recordings_report_options import RecordingsReportOptionsError
 
@@ -71,10 +72,10 @@ def _date_token(value: str, *, today: date, end: bool) -> date:
 
 
 def parse_recordings_trend_query(question: str, *, now: datetime) -> RecordingsTrendQuery:
-    """최근 N주, 월/날짜부터 현재, 날짜 범위를 KST 주별 집계 기간으로 정규화한다."""
+    """최근 N주, 월/날짜부터 현재, 날짜 범위를 배포 시간대의 주별 집계 기간으로 정규화한다."""
 
     text = question.replace("`", "")
-    tz = ZoneInfo("Asia/Seoul")
+    tz = get_local_zone()
     today = (now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)).date()
     monday = today - timedelta(days=today.weekday())
     declines = list(_DECLINE.finditer(text))

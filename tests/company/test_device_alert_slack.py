@@ -386,6 +386,27 @@ def _rendered_message(
     return deepcopy(client.chat_postMessage.call_args.kwargs)
 
 
+@pytest.mark.parametrize(("deployment_enabled", "api_enabled"), [
+    ("false", True),
+    ("true", False),
+])
+def test_sms_disabled_hides_sms_field_and_button_without_hiding_other_actions(
+    monkeypatch, deployment_enabled: str, api_enabled: bool,
+) -> None:
+    # API의 off 힌트와 현재 배포의 off 모두 이전 알림의 문자 UI를 다시 열지 못한다.
+    monkeypatch.setenv("BOXER_COMPANY_SMS_ENABLED", deployment_enabled)
+    item = {**_item(), "smsEnabled": api_enabled, "smsPhoneNumber": "01099998888"}
+    message = _rendered_message(item)
+    serialized = json.dumps(message, ensure_ascii=False)
+
+    assert "💬 *문자*" not in serialized
+    assert "01099998888" not in serialized
+    assert alert.DEVICE_HEALTH_ALERT_ACTION_CONTACT_HOSPITAL not in serialized
+    assert alert.DEVICE_HEALTH_ALERT_ACTION_DEVICE_VOICE_GUIDE in serialized
+    assert alert.DEVICE_HEALTH_ALERT_ACTION_MARK_DONE in serialized
+    assert "📞 *전화*" in serialized
+
+
 def _rendered_action_body(
     message: dict[str, object],
     *,

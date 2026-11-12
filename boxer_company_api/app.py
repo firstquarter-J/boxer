@@ -76,6 +76,7 @@ from boxer_company_api.policies import (
 from boxer_company_api.problems import (
     CompanyApiProblem,
     install_problem_handlers,
+    problem_response,
 )
 from boxer_company_api.request_guard import MutationRequestGuard
 from boxer_company_api.schemas import (
@@ -183,6 +184,19 @@ def create_company_api_app(
     """내부 인증 경계와 채널 중립 assistant runtime을 조립한다."""
 
     api_settings = settings or load_company_api_settings()
+    from boxer_company.deployment import load_deployment_profile
+
+    # 요청 header는 국가를 선택하는 값이 아니라 고정 배포 국가의 일치 증명이다.
+    # 잘못된 설정에서도 health/readiness는 기동해 안전한 503을 제공한다.
+    try:
+        deployment_profile = load_deployment_profile({
+            "BOXER_COMPANY_COUNTRY": api_settings.deployment_country,
+            "AWS_REGION": api_settings.deployment_aws_region,
+            "BOXER_COMPANY_TIMEZONE": api_settings.deployment_timezone_name,
+        })
+    except ValueError:
+        deployment_profile = None
+    default_providers_allowed = _deployment_matches_process(api_settings)
     runtime, default_runtime_ready = _resolve_runtime(
         api_settings,
         assistant_runtime,
@@ -192,10 +206,14 @@ def create_company_api_app(
         default_runtime_ready=default_runtime_ready,
     )
     caller_registry = CallerRegistry(api_settings)
-    memory_runtime = memory_service or _create_memory_service(api_settings)
+    memory_runtime = memory_service or (
+        _create_memory_service(api_settings)
+        if default_providers_allowed
+        else MemoryService(None, enabled=False, read_enabled=False)
+    )
     if hpa_change_coordinator is _HPA_CHANGE_UNSET:
         hpa_change_runtime: HpaChangeCoordinator | None = (
-            create_hpa_change_coordinator()
+            create_hpa_change_coordinator() if default_providers_allowed else None
         )
     else:
         hpa_change_runtime = cast(
@@ -204,7 +222,7 @@ def create_company_api_app(
         )
     automation_state_store = (
         JsonAutomationCycleStateStore(api_settings.automation_state_path)
-        if api_settings.automation_storage_required
+        if api_settings.automation_storage_required and default_providers_allowed
         else None
     )
     if automation_coordinator is _AUTOMATION_UNSET:
@@ -251,7 +269,7 @@ def create_company_api_app(
         "ready": _initialize_request_log_readiness(
             enabled=api_settings.request_log_enabled,
             db_path=api_settings.request_log_path,
-        ),
+        ) if default_providers_allowed else not api_settings.request_log_enabled,
     }
     app = FastAPI(
         title="Boxer Company API",
@@ -265,7 +283,8 @@ def create_company_api_app(
 
     def is_ready() -> bool:
         if (
-            not api_settings.authentication_configured
+            deployment_profile is None
+            or not api_settings.authentication_configured
             or runtime is None
             or api_settings.configuration_error is not None
             or not request_log_state["ready"]
@@ -310,9 +329,34 @@ def create_company_api_app(
             )
             else uuid4().hex
         )
-        response = await call_next(request)
+        supplied_country = request.headers.get("X-Boxer-Country")
+        if request.url.path.startswith("/internal/") and (
+            deployment_profile is None
+            or (
+                supplied_country is not None
+                and supplied_country != deployment_profile.country
+            )
+            or (
+                deployment_profile.country == "us"
+                and supplied_country is None
+            )
+        ):
+            # 인증, payload 해석과 mutation 전에 거부해 잘못 연결된 봇의 실행을 막는다.
+            response = problem_response(
+                CompanyApiProblem(
+                    status=403 if deployment_profile is not None else 503,
+                    code=("deployment_country_mismatch" if deployment_profile is not None
+                          else "service_not_ready"),
+                    request_id=request.state.request_id,
+                )
+            )
+        else:
+            response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers["Cache-Control"] = "no-store"
+        if deployment_profile is not None:
+            response.headers["X-Boxer-Country"] = deployment_profile.country
+            response.headers["X-Boxer-Timezone"] = deployment_profile.timezone_name
         traceparent = getattr(request.state, "traceparent", None)
         if isinstance(traceparent, str) and traceparent:
             response.headers["traceparent"] = traceparent
@@ -1699,6 +1743,9 @@ def _resolve_runtime(
         return cast(_AssistantRuntime | None, supplied_runtime), True
     if not settings.authentication_configured:
         return None, False
+    if not _deployment_matches_process(settings):
+        # 명시 주입된 설정과 process-global provider의 국가가 다르면 조립하지 않는다.
+        return None, False
 
     try:
         from boxer.core.utils import _validate_tokens
@@ -1775,6 +1822,41 @@ def _resolve_runtime(
             status=503,
         )
         return None, False
+
+
+def _deployment_matches_process(settings: CompanyApiSettings) -> bool:
+    """설정 snapshot과 실제 env, import된 회사 provider snapshot의 일치를 검증한다."""
+
+    from boxer_company.deployment import get_deployment_profile
+
+    expected = (
+        settings.deployment_country,
+        settings.deployment_aws_region,
+        settings.deployment_timezone_name,
+    )
+    try:
+        current = get_deployment_profile()
+        current_values = (current.country, current.aws_region, current.timezone_name)
+        if current_values != expected:
+            return False
+        from boxer_company import settings as company_settings
+
+        loaded = company_settings._DEPLOYMENT_PROFILE
+        if (loaded.country, loaded.aws_region, loaded.timezone_name) != expected:
+            return False
+        if current.country == "us":
+            from boxer.core import settings as core_settings
+
+            # import 후 env만 바꾼 경우도 미국 source를 가리킨다는 증거가 될 수 없다.
+            if (
+                core_settings.AWS_REGION != current.aws_region
+                or core_settings.DB_HOST != os.environ.get("DB_HOST", "").strip()
+                or company_settings.MDA_GRAPHQL_URL != os.environ.get("MDA_GRAPHQL_URL", "").strip()
+            ):
+                return False
+        return True
+    except (AttributeError, ValueError):
+        return False
 
 
 def _create_memory_service(settings: CompanyApiSettings) -> MemoryService:

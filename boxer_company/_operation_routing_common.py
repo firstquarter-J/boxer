@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import os
+from boxer_company.deployment import get_local_zone
+
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo
 
 from boxer.context.entries import ContextEntry
 from boxer.context.windowing import window_context_entries
@@ -173,14 +173,8 @@ _TOMORROW_HINTS = ("내일", "tomorrow")
 
 
 def _current_local_date() -> datetime.date:
-    tz_name = os.getenv("TZ", "Asia/Seoul")
-    try:
-        return datetime.now(ZoneInfo(tz_name)).date()
-    except Exception:
-        try:
-            return datetime.now(ZoneInfo("Asia/Seoul")).date()
-        except Exception:
-            return datetime.utcnow().date()
+    # 상대 날짜도 조회와 같은 배포 시간대를 사용한다.
+    return datetime.now(get_local_zone()).date()
 
 
 def _normalize_year(raw_year: int) -> int:

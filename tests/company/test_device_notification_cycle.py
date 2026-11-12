@@ -171,6 +171,25 @@ def _initialized_cursor(last_seen_id: int = 11) -> dict:
     }
 
 
+def test_sms_disabled_keeps_notification_actions_without_sms_claim(monkeypatch) -> None:
+    # 문자 off는 캡처보드 Slack 알림과 음성, 확인 완료 작업의 전달을 유지한다.
+    monkeypatch.setenv("BOXER_COMPANY_SMS_ENABLED", "false")
+    deps, mocks = _deps(next_result=(12, _captureboard_event()))
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor()),
+    )
+
+    delivery, = result.deliveries
+    assert delivery.payload["alertSummary"]["deviceResults"][0]["smsEnabled"] is False
+    assert delivery.payload["render"]["includeActions"] is True
+    assert delivery.payload["render"]["includeDeviceVoiceAction"] is True
+    assert delivery.payload["smsReceipt"]["status"] == "disabled"
+    assert delivery.payload["smsReceipt"]["contactActionEnabled"] is False
+    for name in ("send_sms", "claim_sms", "remember_sms"):
+        mocks[name].assert_not_called()
+
+
 def _recording_incident_key(
     device_name: str,
     file_id: str,

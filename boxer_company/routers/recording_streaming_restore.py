@@ -1,3 +1,5 @@
+
+from boxer_company.deployment import get_timezone_label
 from boxer_company._operation_routing_file import (
     _extract_recording_streaming_restore_month,
 )
@@ -543,7 +545,7 @@ def _format_recording_streaming_restore_result(result: RecordingStreamingRestore
     lines = [
         "*스트리밍 종료 영상 복원 결과*",
         f"• 바코드: `{result.barcode}`",
-        f"• 대상 월(KST): `{target_month_label}`",
+        f"• 대상 월({get_timezone_label()}): `{target_month_label}`",
         f"• DB 대상 recordings: `{result.db_target_count}개`",
         status_line,
     ]

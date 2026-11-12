@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from boxer_company.deployment import get_local_zone
+
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -15,7 +17,6 @@ import tempfile
 import threading
 from typing import Any, Callable, Iterator, Literal, Mapping, TypeVar
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -53,7 +54,6 @@ _DAILY_OPTION_KEYS = (
     "autoCleanupTrashCan",
     "autoPowerOff",
 )
-_KST = ZoneInfo("Asia/Seoul")
 
 
 class _StrictModel(BaseModel):
@@ -1058,7 +1058,7 @@ def validate_automation_trigger_admission(
             )
         return
 
-    local_scheduled_at = trigger.scheduled_at.astimezone(_KST)
+    local_scheduled_at = trigger.scheduled_at.astimezone(get_local_zone())
     if trigger.cycle == "weekly_recordings":
         current_week_start = local_scheduled_at.date() - timedelta(
             days=local_scheduled_at.weekday()

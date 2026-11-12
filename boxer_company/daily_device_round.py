@@ -1,3 +1,5 @@
+
+from boxer_company.deployment import get_local_zone, get_timezone_label
 from collections.abc import Callable
 from datetime import datetime, time, timezone
 from typing import Any
@@ -21,7 +23,6 @@ from boxer_company.routers.device_update import (
     _resolve_agent_runtime_version,
 )
 
-_DAILY_DEVICE_ROUND_TIMEZONE = ZoneInfo("Asia/Seoul")
 _DAILY_DEVICE_ROUND_TITLE = "마미박스 일일 순회 업데이트"
 _DAILY_DEVICE_ROUND_COMPONENT_NAMES = {
     "audio": "오디오",
@@ -49,7 +50,7 @@ _DailyDeviceRoundProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 def _daily_device_round_timezone() -> ZoneInfo:
-    return _DAILY_DEVICE_ROUND_TIMEZONE
+    return get_local_zone()
 
 
 def _normalize_daily_device_round_hospital_scope(value: Any) -> str:
@@ -1603,17 +1604,13 @@ def _format_daily_device_round_report(
     if include_title:
         lines.append(f"*{_build_daily_device_round_title_text(report_summary)}*")
 
-    hospital_detail = _format_daily_device_round_hospital_label(
-        report_summary.get("hospitalName"),
-        hospital_seq,
-    )
     lines.extend(
         [
             _build_daily_device_round_hospital_heading_text(
                 report_summary.get("hospitalName"),
                 hospital_seq,
             ),
-            f"• 실행: `{local_now:%Y-%m-%d %H:%M:%S} KST`",
+            f"• 실행: `{local_now:%Y-%m-%d %H:%M:%S} {get_timezone_label()}`",
             (
                 f"• 장비: `{int(report_summary.get('deviceCount') or 0)}대` "
                 f"(후보 `{int(report_summary.get('scheduledDeviceCount') or 0)}대`)"
@@ -1682,7 +1679,7 @@ def _build_daily_device_round_blocks(
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": f"발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | 장비 `{int(report_summary.get('deviceCount') or 0)}대`",
+                        "text": f"발송 `{local_now:%Y-%m-%d %H:%M:%S} {get_timezone_label()}` | 장비 `{int(report_summary.get('deviceCount') or 0)}대`",
                     }
                 ],
             }
@@ -1695,7 +1692,7 @@ def _build_daily_device_round_blocks(
                     {
                         "type": "mrkdwn",
                         "text": (
-                            f"병원 *{hospital_label}* | 발송 `{local_now:%Y-%m-%d %H:%M:%S} KST` | "
+                            f"병원 *{hospital_label}* | 발송 `{local_now:%Y-%m-%d %H:%M:%S} {get_timezone_label()}` | "
                             f"장비 `{int(report_summary.get('deviceCount') or 0)}대`"
                         ),
                     }

@@ -1,3 +1,5 @@
+
+from boxer_company.deployment import get_local_zone
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,10 +20,7 @@ def _normalize_special_barcode_type(value: Any) -> str:
 
 
 def _local_zone() -> ZoneInfo:
-    try:
-        return ZoneInfo("Asia/Seoul")
-    except Exception:
-        return ZoneInfo("UTC")
+    return get_local_zone()
 
 
 def _parse_db_datetime(value: Any) -> datetime | None:

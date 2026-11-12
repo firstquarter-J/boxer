@@ -254,10 +254,18 @@ def _build_remote_read_service(
 
 
 def create_app() -> App:
+    from boxer_company.deployment import validate_deployment_settings
+
+    # 미국 Slack도 국가/feature 설정을 먼저 검증하고 외부 연결을 시작한다.
+    validate_deployment_settings(role="slack")
     _validate_ec2_runtime_aws_env()
     app_logger = logging.getLogger(__name__)
     company_api_settings = load_company_api_client_settings()
     _require_transport_only_remote_settings()
+    from boxer_company_adapter_slack.company_api_client import validate_company_api_deployment
+
+    # 미국은 옛 한국 API와 token이 함께 복사된 경우에도 첫 mutation 전에 닫힌다.
+    validate_company_api_deployment(company_api_settings)
     # 구 no-batch receipt는 poll loop가 시작되기 전에 읽기 전용으로 차단한다.
     validate_automation_delivery_journal_preflight(
         state_path=cs.AUTOMATION_DELIVERY_STATE_PATH,

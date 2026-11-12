@@ -3,9 +3,10 @@
 import json
 import re
 import shlex
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
+from boxer_company.deployment import get_deployment_profile, get_local_zone, get_timezone_label, localize_wall_datetime
 from boxer_company.routers.device_network_window import (
     NetworkDateWindowError as NetworkDateWindowError,  # noqa: PLC0414 - 기존 import 경계에 예외를 공개한다.
 )
@@ -27,7 +28,8 @@ import shutil
 import subprocess
 import time
 
-KST = datetime.timezone(datetime.timedelta(hours=9))
+_TZ_NAME = globals().get("_TZ_NAME", "Asia/Seoul")
+_TZ_LABEL = globals().get("_TZ_LABEL", "KST")
 _FIXED_START = globals().get("_FIXED_START")
 _FIXED_END = globals().get("_FIXED_END")
 _BOUNDS = None
@@ -36,18 +38,19 @@ def window_bounds():
     global _BOUNDS
     if _BOUNDS is None:
         now = time.time()
-        today = datetime.datetime.fromtimestamp(now, KST).replace(hour=0, minute=0, second=0, microsecond=0)
+        # TZ는 서버가 명령 환경에 고정한다. naive 자정의 timestamp는 libc가 DST 경계를 변환한다.
+        today = datetime.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
         _BOUNDS = (today.timestamp(), now) if _FIXED_START is None else (float(_FIXED_START), float(_FIXED_END))
     return _BOUNDS
 
 def window_metadata():
     start, end = window_bounds()
-    first = datetime.datetime.fromtimestamp(start, KST)
-    last = datetime.datetime.fromtimestamp(end, KST)
-    current = first.date() == datetime.datetime.now(KST).date()
+    first = datetime.datetime.fromtimestamp(start).astimezone()
+    last = datetime.datetime.fromtimestamp(end).astimezone()
+    current = first.date() == datetime.datetime.now().date()
     return {"startEpoch": start, "endEpoch": end, "date": first.date().isoformat(),
-            "timezone": "Asia/Seoul", "mode": "today" if current else "date", "isCurrentDay": current,
-            "label": first.strftime("%Y-%m-%d %H:%M:%S") + " ~ " + last.strftime("%Y-%m-%d %H:%M:%S") + " KST"}
+            "timezone": _TZ_NAME, "mode": "today" if current else "date", "isCurrentDay": current,
+            "label": first.strftime("%Y-%m-%d %H:%M:%S") + " ~ " + last.strftime("%Y-%m-%d %H:%M:%S") + " " + _TZ_LABEL}
 
 def emit(value):
     value["networkWindow"] = window_metadata()
@@ -81,7 +84,32 @@ def safe_iface(value):
     return name
 
 def clock_stamp():
-    return datetime.datetime.now(KST).isoformat(timespec="seconds")
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+def local_wall_stamp(value):
+    # offset 없는 앱 시각이 DST 경계에서 여러 epoch를 뜻하면 근거에서 제외한다.
+    candidates = set()
+    for is_dst in (0, 1, -1):
+        try:
+            instant = time.mktime(value.timetuple()[:8] + (is_dst,))
+            if datetime.datetime.fromtimestamp(instant) == value:
+                candidates.add(instant)
+        except (OverflowError, ValueError, OSError):
+            continue
+    return datetime.datetime.fromtimestamp(next(iter(candidates))).astimezone() if len(candidates) == 1 else None
+
+def device_log_timezone_matches():
+    # 장비 OS와 배포 zone이 다르면 파일 날짜나 offset 없는 로그를 추측하지 않는다.
+    try:
+        with open("/etc/timezone") as stream:
+            zone = stream.read(128).strip()
+        if zone:
+            return zone == _TZ_NAME
+    except (OSError, IOError):
+        pass
+    resolved = os.path.realpath("/etc/localtime")
+    marker = "/zoneinfo/"
+    return marker in resolved and resolved.split(marker, 1)[1] == _TZ_NAME
 '''
 
 _REMOTE_STATE = r'''
@@ -193,8 +221,8 @@ def main():
                 boot = str(row.get("_BOOT_ID", ""))
                 micros = int(row.get("__REALTIME_TIMESTAMP", 0))
                 if micros and re.match(r"^[0-9a-f]{32}$", boot):
-                    stamp = datetime.datetime.fromtimestamp(micros / 1000000.0, KST).isoformat(timespec="seconds")
-                    events.append({"timestamp": stamp, "source": "system_lifecycle", "interface": "", "state": "shutdown", "boot": boot, "transition": "shutdown"})
+                    stamp = datetime.datetime.fromtimestamp(micros / 1000000.0).astimezone().isoformat(timespec="seconds")
+                    events.append({"timestamp": stamp, "_epoch": micros / 1000000.0, "source": "system_lifecycle", "interface": "", "state": "shutdown", "boot": boot, "transition": "shutdown"})
                 continue
             if source not in ("kernel", "systemd-networkd.service", "NetworkManager.service"):
                 continue
@@ -214,23 +242,23 @@ def main():
             if not micros:
                 invalid = True
                 continue
-            stamp = datetime.datetime.fromtimestamp(micros / 1000000.0, KST).isoformat(timespec="seconds")
+            stamp = datetime.datetime.fromtimestamp(micros / 1000000.0).astimezone().isoformat(timespec="seconds")
             boot = str(row.get("_BOOT_ID", ""))
             if not re.match(r"^[0-9a-f]{32}$", boot):
                 invalid = True
                 continue
-            events.append({"timestamp": stamp, "source": source, "interface": interface,
+            events.append({"timestamp": stamp, "_epoch": micros / 1000000.0, "source": source, "interface": interface,
                            "state": state, "boot": boot,
                            "bootElapsedSeconds": int(row.get("__MONOTONIC_TIMESTAMP", 0)) // 1000000,
                            "transition": "manager_state" if manager_change else ("lost_carrier" if "lost carrier" in transition else "link_" + state)})
         except Exception:
             invalid = True
-    events.sort(key=lambda item: item["timestamp"])
+    events.sort(key=lambda item: item["_epoch"])
     compact = []
     for event in events:
         previous = compact[-1] if compact else None
         # 커널과 networkd의 같은 전이를 합쳐 과거 단절이 출력 상한 밖으로 밀리지 않게 한다.
-        duplicate = previous and previous["boot"] == event["boot"] and previous["interface"] == event["interface"] and previous["state"] == event["state"] and previous["source"] != event["source"] and abs((datetime.datetime.strptime(previous["timestamp"][:19], "%Y-%m-%dT%H:%M:%S") - datetime.datetime.strptime(event["timestamp"][:19], "%Y-%m-%dT%H:%M:%S")).total_seconds()) <= 2
+        duplicate = previous and previous["boot"] == event["boot"] and previous["interface"] == event["interface"] and previous["state"] == event["state"] and previous["source"] != event["source"] and abs(previous["_epoch"] - event["_epoch"]) <= 2
         if duplicate:
             if event.get("transition") == "lost_carrier" or (event["state"] == "up" and event["source"] == "kernel"):
                 compact[-1] = event
@@ -239,7 +267,8 @@ def main():
     events = compact
     limited = len(events) > 32 or len(records) >= 401
     emit({"status": "partial" if limited or invalid else ("ok" if records else "empty"),
-          "eventsTruncated": limited, "eventCount": len(events), "events": events[-32:]})
+          "eventsTruncated": limited, "eventCount": len(events),
+          "events": [{key: value for key, value in event.items() if key != "_epoch"} for event in events[-32:]]})
 '''
 
 _REMOTE_APP_HISTORY = r'''
@@ -255,12 +284,15 @@ APP_PATTERNS = (
 )
 
 def main():
+    if globals().get("_REQUIRE_DEVICE_LOG_TIMEZONE", False) and not device_log_timezone_matches():
+        emit({"status": "timezone_mismatch", "filesRead": 0, "events": []})
+        return
     paths = []
     seen_files = set()
     permission_error = False
     start_epoch, end_epoch = window_bounds()
-    # 앱 일별 파일도 KST 하루만 연다. 장비 OS의 시간대와 무관하게 선택한다.
-    for date in (datetime.datetime.fromtimestamp(start_epoch, KST).date().isoformat(),):
+    # 앱 일별 파일도 설정한 현지 하루만 연다. 서버가 명령의 TZ를 고정한다.
+    for date in (datetime.datetime.fromtimestamp(start_epoch).date().isoformat(),):
         for directory in ("logs", "Logs"):
             path = os.path.expanduser("~/AppData/" + directory + "/log-" + date + ".log")
             try:
@@ -299,12 +331,22 @@ def main():
             continue
         # 앱 원문에서 시각과 고정 이벤트 종류만 뽑는다. URL, 환자, 바코드, 토큰은 반환하지 않는다.
         for line in text.splitlines():
-            match = re.search(r"(20\d\d-\d\d-\d\d)[T_ ](\d\d:\d\d:\d\d)(?:\.\d+)?", line)
+            match = re.search(r"(20\d\d-\d\d-\d\d)[T_ ](\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:?\d\d)?", line)
             if not match:
                 continue
             try:
-                stamp_value = datetime.datetime.strptime(match.group(1) + "T" + match.group(2), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=KST)
+                wall_text = match.group(1) + "T" + match.group(2)
+                offset = match.group(3)
+                # Winston ISO 시각의 offset은 장비 timezone보다 우선하는 실제 instant다.
+                if offset:
+                    suffix = "+0000" if offset == "Z" else offset.replace(":", "")
+                    stamp_value = datetime.datetime.strptime(wall_text + suffix, "%Y-%m-%dT%H:%M:%S%z").astimezone()
+                else:
+                    stamp_value = local_wall_stamp(datetime.datetime.strptime(wall_text, "%Y-%m-%dT%H:%M:%S"))
             except ValueError:
+                continue
+            if stamp_value is None:
+                limited = True
                 continue
             if not start_epoch <= stamp_value.timestamp() < end_epoch:
                 continue
@@ -312,18 +354,16 @@ def main():
                 if pattern.search(line):
                     stamp = stamp_value.isoformat(timespec="seconds")
                     counts[kind] = counts.get(kind, 0) + 1
-                    events.append({"timestamp": stamp, "source": "app_daily_log", "kind": kind})
+                    events.append({"timestamp": stamp, "_epoch": stamp_value.timestamp(), "source": "app_daily_log", "kind": kind})
                     break
-    events.sort(key=lambda item: item["timestamp"])
+    events.sort(key=lambda item: item["_epoch"])
     # 같은 오류의 재시도 묶음은 첫 시각과 마지막 시각을 남겨 장애 시작을 보존한다.
     groups = []
     latest = {}
     for event in events:
         kind = event["kind"]
         previous = latest.get(kind)
-        current_time = datetime.datetime.strptime(event["timestamp"][:19], "%Y-%m-%dT%H:%M:%S")
-        previous_time = datetime.datetime.strptime(previous["last"]["timestamp"][:19], "%Y-%m-%dT%H:%M:%S") if previous else None
-        if previous_time is not None and (current_time - previous_time).total_seconds() <= 300:
+        if previous is not None and event["_epoch"] - previous["last"]["_epoch"] <= 300:
             previous["last"] = event
         else:
             group = {"first": event, "last": event}
@@ -342,19 +382,24 @@ def main():
         grouped.append(group["first"])
         if group["last"]["timestamp"] != group["first"]["timestamp"]:
             grouped.append(group["last"])
-    grouped.sort(key=lambda item: item["timestamp"])
+    grouped.sort(key=lambda item: item["_epoch"])
     limited = limited or len(groups) > len(selected) or len(paths) > 8
     status = "permission_denied" if permission_error and not files_read else ("partial" if limited or permission_error else "ok")
     emit({"status": status, "filesRead": files_read,
-          "eventsTruncated": limited, "counts": counts, "events": grouped})
+          "eventsTruncated": limited, "counts": counts,
+          "events": [{key: value for key, value in event.items() if key != "_epoch"} for event in grouped]})
 '''
 
 
 def _remote_command(script: str, window: dict[str, Any] | None = None) -> str:
     fixed = validate_network_window(window) if window is not None else None
-    prefix = "" if fixed is None else "_FIXED_START = " + repr(fixed["startEpoch"]) + "\n_FIXED_END = " + repr(fixed["endEpoch"]) + "\n"
+    # Python 3.6 장비에서도 zoneinfo 추가 설치 없이 배포 시간대의 DST를 적용한다.
+    prefix = "_TZ_NAME = " + repr(get_local_zone().key) + "\n_TZ_LABEL = " + repr(get_timezone_label()) + "\n"
+    prefix += "_REQUIRE_DEVICE_LOG_TIMEZONE = " + repr(get_deployment_profile().country != "kr") + "\n"
+    if fixed is not None:
+        prefix += "_FIXED_START = " + repr(fixed["startEpoch"]) + "\n_FIXED_END = " + repr(fixed["endEpoch"]) + "\n"
     body = prefix + _REMOTE_COMMON + script + "\ntry:\n    main()\nexcept Exception:\n    emit({\"status\": \"query_failed\"})\n"
-    invocation = "python3 -c " + shlex.quote(body)
+    invocation = "TZ=" + shlex.quote(get_local_zone().key) + " python3 -c " + shlex.quote(body)
     missing = shlex.quote('{"status":"tool_missing","reason":"python3_missing"}')
     return "sh -lc " + shlex.quote(
         "if command -v python3 >/dev/null 2>&1; then " + invocation + "; else printf '%s\\n' " + missing + "; fi"
@@ -363,9 +408,9 @@ def _remote_command(script: str, window: dict[str, Any] | None = None) -> str:
 
 NETWORK_COMMAND_KEYS = ("network_state", "network_link_history", "network_app_history")
 def build_network_command_specs(window: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
-    # 기본 registry는 import 시각을 고정하지 않고 원격 실행 때의 KST 오늘을 사용한다.
+    # 기본 registry는 import 시각을 고정하지 않고 원격 실행 때의 현지 오늘을 사용한다.
     fixed = validate_network_window(window) if window is not None else None
-    label = fixed["label"] if fixed else "오늘 KST 00:00부터 현재까지"
+    label = fixed["label"] if fixed else f"오늘 {get_timezone_label()} 00:00부터 현재까지"
     return {
         "network_state": {"summary": "현재 연결 인터페이스와 경로, DNS 확인", "timeout_sec": 22, "command": _remote_command(_REMOTE_STATE, fixed)},
         "network_link_history": {"summary": label + " 링크 이력 확인", "timeout_sec": 18, "command": _remote_command(_REMOTE_LINK_HISTORY, fixed)},
@@ -383,6 +428,7 @@ _APP_LABELS = {
 }
 _APP_ERRORS = set(_APP_LABELS) - {"socket_connected", "socket_disconnected", "app_lifecycle"}
 _FAILURE_LABELS = {
+    "timezone_mismatch": "장비 로그 시간대 확인 필요",
     "permission_denied": "조회 권한 부족", "tool_missing": "필수 도구 없음", "empty": "조회 기록 없음",
     "timeout": "조회 시간 초과", "partial": "일부 기록만 조회", "missing": "미수집",
     "query_failed": "조회 실패", "parse_failed": "응답 해석 실패",
@@ -433,7 +479,7 @@ def _link_failures(payload: dict[str, Any], interface: str) -> list[dict[str, st
     previous: dict[tuple[str, str], str] = {}
     events = payload.get("events") if isinstance(payload.get("events"), list) else []
     shutdowns = [row for row in events if isinstance(row, dict) and row.get("transition") == "shutdown" and _timestamp(row.get("timestamp"))]
-    for event in sorted((row for row in events if isinstance(row, dict)), key=lambda row: str(row.get("timestamp", ""))):
+    for event in sorted((row for row in events if isinstance(row, dict)), key=lambda row: _timestamp_epoch(row.get("timestamp")) or 0):
         source = str(event.get("source") or "")
         stamp = _timestamp(event.get("timestamp"))
         boot = str(event.get("boot") or "")
@@ -457,11 +503,18 @@ def _link_failures(payload: dict[str, Any], interface: str) -> list[dict[str, st
     return failures
 
 
-def _time_distance(left: str, right: str) -> float | None:
+def _timestamp_epoch(value: Any) -> float | None:
+    """offset 있는 근거는 그대로 쓰고 불명확한 현지 시각은 원인 근거에서 제외한다."""
+
     try:
-        return (datetime.fromisoformat(left) - datetime.fromisoformat(right)).total_seconds()
+        return localize_wall_datetime(datetime.fromisoformat(str(value))).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def _time_distance(left: str, right: str) -> float | None:
+    left_epoch, right_epoch = _timestamp_epoch(left), _timestamp_epoch(right)
+    return None if left_epoch is None or right_epoch is None else left_epoch - right_epoch
 
 
 def _event_in_window(event: Any, window: dict[str, Any]) -> bool:
@@ -471,10 +524,8 @@ def _event_in_window(event: Any, window: dict[str, Any]) -> bool:
     if not stamp:
         return False
     try:
-        parsed = datetime.fromisoformat(stamp)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=9)))
-        return window["startEpoch"] <= parsed.timestamp() < window["endEpoch"]
+        instant = _timestamp_epoch(stamp)
+        return instant is not None and window["startEpoch"] <= instant < window["endEpoch"]
     except (ValueError, OverflowError, OSError):
         return False
 

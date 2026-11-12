@@ -1,3 +1,5 @@
+
+from boxer_company.deployment import localize_wall_datetime
 from boxer_company._operation_routing_file import (
     _DEVICE_FILE_DOWNLOAD_HINTS,
     _DEVICE_FILE_ID_HINTS,
@@ -17,7 +19,6 @@ import threading
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
-from zoneinfo import ZoneInfo
 
 try:
     import paramiko
@@ -424,9 +425,8 @@ def _build_uploader_recorded_at_ms(log_date: str, *time_labels: str) -> str:
         if not normalized:
             continue
         try:
-            dt = datetime.strptime(f"{log_date} {normalized}", "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=ZoneInfo("Asia/Seoul")
-            )
+            # 복구 업로드에 중복되거나 존재하지 않는 DST 시각을 임의로 넣지 않는다.
+            dt = localize_wall_datetime(datetime.strptime(f"{log_date} {normalized}", "%Y-%m-%d %H:%M:%S"))
         except ValueError:
             continue
         return str(int(dt.timestamp() * 1000))
@@ -612,7 +612,7 @@ def _upload_device_files_to_uploader(
                         "sourceFileName": target["sourceName"],
                         "uploadedFileId": target["fileId"],
                         "ultrasoundSeq": _display_value(data.get("ultrasoundSeq"), default=""),
-                        "mdaUrl": f"https://mda.kr.mmtalkbox.com/cs?search={barcode}",
+                        "mdaUrl": f"{cs.MDA_UI_BASE_URL}/cs?search={barcode}",
                         "message": _display_value(payload.get("message"), default=""),
                     }
                 )
@@ -1121,7 +1121,7 @@ def _render_file_candidate_result(
                 for item in upload_items:
                     status = _display_value(item.get("status"), default="unknown")
                     lines.append(f"  - `{item['fileName']}` | `{status}`")
-                lines.append(f"• MDA URL: 🎣 <https://mda.kr.mmtalkbox.com/cs?search={barcode}|열기>")
+                lines.append(f"• MDA URL: 🎣 <{cs.MDA_UI_BASE_URL}/cs?search={barcode}|열기>")
             elif upload_failures:
                 lines.append(f"• 복구 업로드: 실패 ({', '.join(upload_failures)})")
             else:
@@ -1204,7 +1204,7 @@ def _render_file_candidate_result(
                         joined_names = ", ".join(f"`{_display_value(name, default='')}`" for name in file_names) or "`파일`"
                         status = _display_value(item.get("status"), default="unknown")
                         lines.append(f"  - {joined_names} | `{status}`")
-                    lines.append(f"• MDA URL: 🎣 <https://mda.kr.mmtalkbox.com/cs?search={barcode}|열기>")
+                    lines.append(f"• MDA URL: 🎣 <{cs.MDA_UI_BASE_URL}/cs?search={barcode}|열기>")
                 else:
                     reason = _display_device_probe_reason(upload.get("reason"))
                     lines.append(f"• 복구 업로드: 실패 ({reason})")
