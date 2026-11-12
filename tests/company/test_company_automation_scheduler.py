@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -424,9 +425,79 @@ def test_settings_require_targets_only_for_slack_delivery_cycles() -> None:
     assert new_key_wins.schedule.sms_delivery_interval == timedelta(seconds=23)
 
 
+def test_us_idle_scheduler_keeps_transport_owner_without_delivery_targets() -> None:
+    # 미국 조회 초기 검증은 모든 domain cycle을 끄고 API transport 소유권만 유지한다.
+    settings = load_automation_scheduler_settings({
+        "BOXER_COMPANY_COUNTRY": "us", "AWS_REGION": "us-east-1",
+        "BOXER_COMPANY_TIMEZONE": "America/Los_Angeles",
+        "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true",
+        "BOXER_COMPANY_API_AUTOMATION_TENANT_ID": "T1",
+        "BOXER_COMPANY_API_AUTOMATION_STATE_PATH": "/tmp/state.json",
+    })
+    assert settings.enabled_cycles == ()
+    assert settings.delivery_targets == {}
+    assert settings.schedule.timezone == ZoneInfo("America/Los_Angeles")
+    assert settings.daily_options == _DAILY_OPTIONS
+
+
+def test_idle_scheduler_waits_without_state_or_domain_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from boxer_company_api import automation_scheduler as module
+
+    # poll과 daemon 유지 모두 state/provider를 읽거나 실행하지 않으며 stop으로 종료한다.
+    store, run_cycle, planner = Mock(), Mock(), Mock()
+    monkeypatch.setattr(module, "plan_automation_cycle", planner)
+    scheduler = AutomationScheduler(_settings(tmp_path), store, run_cycle)
+    assert scheduler.run_once(now=datetime(2026, 11, 12, 12, tzinfo=_KST)).attempted == ()
+    stop, entered = threading.Event(), threading.Event()
+    original_wait = stop.wait
+
+    def observed_wait(timeout: float | None = None) -> bool:
+        entered.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(stop, "wait", observed_wait)
+    runner = threading.Thread(target=scheduler.run_forever, args=(stop,))
+    runner.start()
+    try:
+        assert entered.wait(timeout=1)
+        assert runner.is_alive()
+        assert store.mock_calls == []
+        run_cycle.assert_not_called()
+        planner.assert_not_called()
+    finally:
+        stop.set()
+        runner.join(timeout=2)
+    assert not runner.is_alive()
+    with pytest.raises(ValueError, match="not enabled"):
+        scheduler.run_cycle_once("weekly_recordings")
+
+
+def test_idle_main_does_not_construct_domain_provider_or_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from boxer_company_api import automation_scheduler as module
+
+    settings = _settings(tmp_path)
+    providers, coordinator, forever = Mock(), Mock(), Mock()
+    monkeypatch.setattr(module, "validate_company_api_runtime_security", lambda: None)
+    monkeypatch.setattr(module, "load_automation_scheduler_settings", lambda: settings)
+    monkeypatch.setattr(module, "build_default_automation_cycle_service", providers)
+    monkeypatch.setattr(module, "DurableAutomationCycleCoordinator", coordinator)
+    monkeypatch.setattr(AutomationScheduler, "run_forever", forever)
+    module.main()
+    providers.assert_not_called()
+    coordinator.assert_not_called()
+    forever.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     "env_patch",
     (
+        {"BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "false"},
+        {"BOXER_COMPANY_API_AUTOMATION_TENANT_ID": ""},
+        {"BOXER_COMPANY_API_AUTOMATION_STATE_PATH": "relative/state.json"},
         {"DEVICE_HEALTH_MONITOR_ENABLED": "sometimes"},
         {
             "DEVICE_HEALTH_MONITOR_ENABLED": "true",

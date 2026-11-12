@@ -282,6 +282,11 @@ class AutomationScheduler:
 
     def run_forever(self, stop_event: threading.Event | None = None) -> None:
         stopper = stop_event or threading.Event()
+        if not self._settings.enabled_cycles:
+            # 조회 전용 배포도 API가 transport를 소유한다. 활성 cycle이 없으면
+            # domain worker를 만들지 않고 종료 신호만 기다려 companion을 유지한다.
+            stopper.wait()
+            return
         # 일일 장비 순회가 수십 분 걸려도 LED·notification·SMS poll이
         # 멈추지 않도록 cycle마다 독립 fixed-delay worker를 둔다.
         workers = [
@@ -355,8 +360,7 @@ def load_automation_scheduler_settings(
         for cycle in _CYCLE_ORDER
         if _read_bool(source, _CYCLE_FLAGS[cycle], default=False)
     )
-    if not enabled:
-        raise ValueError("automation scheduler has no enabled cycles")
+    # transport 소유권과 tenant/state 검증은 유지하고 cycle이 없는 초기 배포도 허용한다.
     tenant_id = str(
         source.get("BOXER_COMPANY_API_AUTOMATION_TENANT_ID", "")
     ).strip()
@@ -494,12 +498,19 @@ def main() -> None:
     settings = load_automation_scheduler_settings()
     logging.basicConfig(level=logging.INFO)
     state_store = JsonAutomationCycleStateStore(settings.state_path)
-    coordinator = DurableAutomationCycleCoordinator(
-        build_default_automation_cycle_service(),
-        state_store,
+    # idle companion은 provider factory도 조립하지 않아 외부 domain 접근이 없다.
+    coordinator = (
+        DurableAutomationCycleCoordinator(
+            build_default_automation_cycle_service(),
+            state_store,
+        )
+        if settings.enabled_cycles
+        else None
     )
 
     def run_cycle(scheduled: ScheduledAutomationRun) -> Any:
+        if coordinator is None:
+            raise ValueError("automation scheduler cycle is not enabled")
         target = scheduled.delivery_target
         return coordinator.run(
             AutomationCycleTrigger(
