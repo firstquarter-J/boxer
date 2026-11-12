@@ -43,7 +43,8 @@ def _parse_db_datetime(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
-def _format_kst(value: Any) -> str:
+def _format_local_datetime(value: Any) -> str:
+    # DB UTC 저장 시각을 현재 국가의 현지 시각으로 표시한다.
     parsed = _parse_db_datetime(value)
     if parsed is None:
         return "없음"
@@ -274,8 +275,8 @@ def _query_barcode_pink_classification_reason(barcode: str) -> str:
         and pink_activity_created_at > created_at
     ):
         reason_lines = [
-            f"병원의 핑크바코드 설정은 `{_format_kst(pink_activity_created_at)}`에 첫 녹화 이후 변경됐어",
-            f"현재 적용일은 `{_format_kst(hospital_pink_at)}`로 보이지만, 나중에 소급 입력된 값이야",
+            f"병원의 핑크바코드 설정은 `{_format_local_datetime(pink_activity_created_at)}`에 첫 녹화 이후 변경됐어",
+            f"현재 적용일은 `{_format_local_datetime(hospital_pink_at)}`로 보이지만, 나중에 소급 입력된 값이야",
             "기존 바코드 backfill이 없어 `special_barcodes`에 생성되지 않았어",
         ]
     elif hospital_pink_at is None:
@@ -298,23 +299,23 @@ def _query_barcode_pink_classification_reason(barcode: str) -> str:
         (
             "",
             "*근거*",
-            f"• 첫 녹화: `{_format_kst(recorded_at)}`",
+            f"• 첫 녹화: `{_format_local_datetime(recorded_at)}`",
             f"• 첫 녹화 병원/장비: `{_display_value(first_recording.get('hospitalName'), default='미확인')}`"
             f" / `{_display_value(first_recording.get('deviceName'), default='미확인')}`",
-            f"• 업로드 기록 생성: `{_format_kst(created_at)}`",
-            f"• 병원 현재 핑크 적용일: `{_format_kst(hospital_pink_at)}`",
+            f"• 업로드 기록 생성: `{_format_local_datetime(created_at)}`",
+            f"• 병원 현재 핑크 적용일: `{_format_local_datetime(hospital_pink_at)}`",
         )
     )
     if first_history and is_history_before_pink:
         lines.append(
             f"• 최초 병원 매핑: `{_display_value(first_history.get('hospitalName'), default='미확인')}`"
-            f" / `{_format_kst(history_created_at)}`"
+            f" / `{_format_local_datetime(history_created_at)}`"
         )
 
     if first_pink_activity:
         lines.extend(
             (
-                f"• 핑크 설정 변경: `{_format_kst(pink_activity_created_at)}`",
+                f"• 핑크 설정 변경: `{_format_local_datetime(pink_activity_created_at)}`",
                 f"• 변경 내용: `{_format_pink_activity_change(first_pink_activity.get('description'))}`",
             )
         )

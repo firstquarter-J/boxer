@@ -2161,16 +2161,16 @@ def _validate_response_country(
     response: Any,
     request_id: str | None = None,
     *,
-    expected_country: str | None = None,
+    expected_country: str,
 ) -> None:
     """응답도 배포 국가와 대조하고 옛 한국 API의 header 누락만 rollout 중 허용한다."""
 
-    expected = expected_country or get_deployment_profile().country
+    # 요청을 보낸 client의 설정을 그대로 대조하고 프로세스 env를 다시 읽지 않는다.
     headers = getattr(response, "headers", {}) or {}
     supplied = headers.get("X-Boxer-Country", headers.get("x-boxer-country"))
-    if supplied is None and expected == "kr":
+    if supplied is None and expected_country == "kr":
         return
-    if supplied != expected:
+    if supplied != expected_country:
         raise CompanyApiContractError(
             "company_api_deployment_country_mismatch",
             code="deployment_country_mismatch",

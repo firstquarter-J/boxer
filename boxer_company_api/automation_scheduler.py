@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from boxer_company.deployment import load_deployment_profile
+from boxer_company.deployment import load_deployment_profile, validate_deployment_settings
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -495,6 +495,9 @@ def main() -> None:
     """FastAPI worker와 분리된 단일 scheduler companion을 실행한다."""
 
     validate_company_api_runtime_security()
+    # API readiness와 독립된 companion도 국가별 금지 기능과 데이터 경계를
+    # provider 조립 전에 검사해 잘못 복사한 미국 설정으로 cycle을 실행하지 않는다.
+    validate_deployment_settings(role="api")
     settings = load_automation_scheduler_settings()
     logging.basicConfig(level=logging.INFO)
     state_store = JsonAutomationCycleStateStore(settings.state_path)

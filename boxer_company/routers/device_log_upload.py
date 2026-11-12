@@ -1,13 +1,13 @@
-
-from boxer_company.deployment import get_local_zone
 from datetime import datetime
 from typing import Any, Callable
 
+from boxer_company.deployment import get_local_zone
 from boxer_company.routers.s3_domain import _fetch_s3_device_log_lines
 
 DeviceCommandDispatcher = Callable[[str, str], dict[str, Any]]
 
-def _current_kst_date() -> str:
+def _current_local_date() -> str:
+    # 오늘 로그와 과거 로그의 업로드 명령을 배포 현지 날짜로 구분한다.
     return datetime.now(get_local_zone()).strftime("%Y-%m-%d")
 
 
@@ -27,7 +27,7 @@ def _check_and_request_device_log_upload(
     if not normalized_log_date:
         raise ValueError("날짜를 확인해줘")
 
-    resolved_today_date = str(today_date or "").strip() or _current_kst_date()
+    resolved_today_date = str(today_date or "").strip() or _current_local_date()
     log_data = _fetch_s3_device_log_lines(
         s3_client,
         normalized_device_name,

@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from boxer_company.sms_policy import sms_sending_enabled
+from boxer_company.deployment import sms_sending_enabled
 
 
 @pytest.mark.parametrize(("env", "enabled"), [

@@ -111,13 +111,29 @@ def localize_wall_datetime(value: datetime) -> datetime:
     return next(iter(candidates.values()))
 
 
-def _enabled(env: Mapping[str, str], key: str) -> bool:
-    raw = str(env.get(key, "false")).strip().lower() or "false"
+def _parse_boolean(raw: str) -> bool:
     if raw in _TRUE_VALUES:
         return True
     if raw in _FALSE_VALUES:
         return False
     raise ValueError("company_deployment_configuration_invalid")
+
+
+def _enabled(env: Mapping[str, str], key: str) -> bool:
+    return _parse_boolean(str(env.get(key, "false")).strip().lower() or "false")
+
+
+def _sms_sending_enabled(env: Mapping[str, str], profile: DeploymentProfile) -> bool:
+    # 문자 기본값과 시작 검증은 같은 국가 정책을 사용하며 명시된 빈 값도 거부한다.
+    default = "true" if profile.country == "kr" else "false"
+    return _parse_boolean(str(env.get("BOXER_COMPANY_SMS_ENABLED", default)).strip().lower())
+
+
+def sms_sending_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """신규 문자 발송은 한국 기본 켜짐, 미국 기본 꺼짐으로 판정한다."""
+
+    source = env if env is not None else os.environ
+    return _sms_sending_enabled(source, load_deployment_profile(source))
 
 
 def _safe_host(value: str) -> str:
@@ -152,9 +168,7 @@ def validate_deployment_settings(
     if role not in {"api", "slack"}:
         raise ValueError("company_deployment_configuration_invalid")
     # 신규 flag는 한국에서도 오타를 거부하되 기존 설치의 기본값을 유지한다.
-    from boxer_company.sms_policy import sms_sending_enabled
-
-    sms_enabled = sms_sending_enabled(source)
+    sms_enabled = _sms_sending_enabled(source, profile)
     if profile.country == "kr":
         return profile
 

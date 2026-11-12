@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
+from boxer_company.deployment import validate_deployment_settings
 from boxer_company.hpa_change_coordinator import (
     HpaChangeCoordinator,
     create_hpa_change_coordinator,
@@ -49,6 +50,8 @@ class HpaChangeCoordinatorRunner:
 def main() -> None:
     # FastAPI/automation companion과 같은 EC2 credential 경계를 기동 전에 적용한다.
     validate_company_api_runtime_security()
+    # API가 열리지 않더라도 별도 프로세스가 미국 HPA 기능을 조립하지 못하게 한다.
+    validate_deployment_settings(role="api")
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("boxer.company_api.hpa_change_coordinator")
     coordinator = create_hpa_change_coordinator(logger=logger)

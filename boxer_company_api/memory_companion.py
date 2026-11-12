@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Callable
 
+from boxer_company.deployment import validate_deployment_settings
 from boxer_company.memory.backup import MemoryBackup, configured_memory_backup
 from boxer_company.memory.extraction import build_configured_extractor
 from boxer_company.memory.store import MemoryStore
@@ -82,6 +83,8 @@ def main() -> None:
     if enabled not in {"true", "1", "yes", "on"}:
         raise SystemExit("대화 기억 기능이 꺼져 있어")
     validate_company_api_runtime_security()
+    # 별도 worker 역시 국가 정책을 통과한 뒤에만 기억 DB와 외부 provider를 연다.
+    validate_deployment_settings(role="api")
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("boxer.company_api.memory")
     # 누락된 DB는 만들지 않는다. operator의 명시 초기화·migration이 선행돼야 한다.

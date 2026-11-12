@@ -183,7 +183,6 @@ def _health_deps(
         },
         verify_device=verify,
         ssh_verification_configured=lambda: True,
-        load_captureboard_incidents=lambda: {},
         send_sms=send_sms,
         claim_sms_delivery=claim_sms,
         hold_sms_delivery_claim=lambda *args, **kwargs: True,

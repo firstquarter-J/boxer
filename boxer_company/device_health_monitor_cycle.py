@@ -28,7 +28,6 @@ from boxer_company.daily_device_round import (
 )
 from boxer_company.device_health_sheet import (
     _append_device_health_sheet_alerts,
-    _load_device_health_sheet_captureboard_incidents,
 )
 from boxer_company.device_health_fingerprint import (
     canonical_device_health_alert_fingerprint,
@@ -64,7 +63,7 @@ from boxer_company.sms_delivery_cycle import (
     remember_sms_delivery_sheet_record,
     wait_for_automatic_sms_runtime_claim,
 )
-from boxer_company.sms_policy import sms_sending_enabled
+from boxer_company.deployment import sms_sending_enabled
 
 
 _MONITOR_OPTION_KEYS: frozenset[str] = frozenset()
@@ -89,7 +88,6 @@ _COMPONENT_CATEGORIES = {
     "captureboard": "video_signal",
     "led": "led",
 }
-_CAPTUREBOARD_OPEN_STATUSES = frozenset({"대기", "처리중", "진행중"})
 _STANDBY_REDIS_STATUSES = frozenset({"NOSESS", "STANDBY"})
 
 
@@ -135,9 +133,6 @@ class DeviceHealthMonitorCycleDeps:
         and company_settings.MDA_ADMIN_USER_PASSWORD
         and company_settings.DEVICE_SSH_PASSWORD
     )
-    load_captureboard_incidents: Callable[
-        [], Mapping[str, Mapping[str, Any]] | None
-    ] = lambda: _load_device_health_sheet_captureboard_incidents()
     send_sms: Callable[
         [Mapping[str, Any], logging.Logger], Mapping[str, Any]
     ] = lambda payload, logger: _send_device_health_alert_sms(
@@ -453,75 +448,9 @@ def run_device_health_monitor_cycle(
         delivery_enabled=alert_delivery_enabled,
     )
 
+    # LED 주기는 캡처보드 시트 사건을 조회하지 않는다. 기존 metrics와
+    # ACK 이후의 Sheet 기록/실패 복구 계약은 그대로 유지한다.
     sheet_read_status = "not_needed"
-    if any(
-        _alert_fingerprint(item) in alertable
-        and _suppressible_captureboard(item)
-        for item in alert_items
-    ):
-        try:
-            incidents = actual_deps.load_captureboard_incidents()
-            sheet_read_status = "disabled" if incidents is None else "completed"
-            pre_sheet_alertable = set(alertable)
-            alertable, next_alerts, next_pending = _suppress_open_sheet_incidents(
-                alert_items,
-                alertable,
-                next_alerts,
-                next_pending,
-                previous_state=state,
-                incidents=incidents or {},
-                now=local_now,
-            )
-            suppressed_fingerprints = pre_sheet_alertable - alertable
-            if suppressed_fingerprints:
-                _write_health_event_best_effort(
-                    "captureboard_sheet_alert_suppressed",
-                    local_now,
-                    {
-                        "suppressedCount": len(suppressed_fingerprints),
-                        "incidents": [
-                            {
-                                "device": _text(item.get("device")),
-                                "status": _text(
-                                    (
-                                        incidents.get(
-                                            _text(item.get("device")),
-                                            {},
-                                        )
-                                        or {}
-                                    ).get("status")
-                                ),
-                            }
-                            for item in alert_items
-                            if _alert_fingerprint(item)
-                            in suppressed_fingerprints
-                        ],
-                    },
-                    deps=actual_deps,
-                    logger=actual_logger,
-                )
-        except Exception as exc:
-            # 운영 시트 장애는 실제 장비 이상을 숨기지 않는 기존 fail-open 정책을 유지한다.
-            sheet_read_status = "failed"
-            actual_logger.warning(
-                "Device health sheet read failed error_type=%s",
-                type(exc).__name__,
-            )
-            _write_health_event_best_effort(
-                "captureboard_sheet_status_read_failed",
-                local_now,
-                {
-                    "candidateCount": sum(
-                        1
-                        for item in alert_items
-                        if _alert_fingerprint(item) in alertable
-                        and _suppressible_captureboard(item)
-                    ),
-                    "errorType": type(exc).__name__,
-                },
-                deps=actual_deps,
-                logger=actual_logger,
-            )
 
     unavailable_event_state = _record_health_run_events(
         device_results=device_results,
@@ -1552,52 +1481,6 @@ def _collect_alert_updates(
     return alertable, next_alerts, next_pending
 
 
-def _suppress_open_sheet_incidents(
-    items: Sequence[Mapping[str, Any]],
-    alertable: set[str],
-    next_alerts: dict[str, dict[str, Any]],
-    next_pending: dict[str, dict[str, Any]],
-    *,
-    previous_state: Mapping[str, Any],
-    incidents: Mapping[str, Mapping[str, Any]],
-    now: datetime,
-) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    item_by_fingerprint = {_alert_fingerprint(item): item for item in items}
-    previous_alerts = _normalize_fingerprint_state(previous_state.get("alertFingerprints"))
-    previous_pending = _normalize_fingerprint_state(
-        previous_state.get("pendingAlertFingerprints"),
-        timestamp_key="firstSeenAt",
-    )
-    filtered = set(alertable)
-    for fingerprint in tuple(alertable):
-        item = item_by_fingerprint.get(fingerprint, {})
-        components = set(item.get("problemComponents") or [])
-        if components != {"캡처보드"}:
-            continue
-        incident = incidents.get(_text(item.get("device")))
-        status = _text((incident or {}).get("status")).replace(" ", "")
-        if status not in _CAPTUREBOARD_OPEN_STATUSES:
-            continue
-        filtered.discard(fingerprint)
-        previous = previous_alerts.get(fingerprint, {})
-        if _parse_datetime(previous.get("lastAlertedAt")):
-            next_alerts[fingerprint] = {
-                **previous,
-                "lastSeenAt": now.isoformat(),
-                "count": max(0, int(previous.get("count") or 0)) + 1,
-            }
-            next_pending.pop(fingerprint, None)
-        else:
-            pending = previous_pending.get(fingerprint, {})
-            next_alerts.pop(fingerprint, None)
-            next_pending[fingerprint] = {
-                "firstSeenAt": str(pending.get("firstSeenAt") or now.isoformat()),
-                "lastSeenAt": now.isoformat(),
-                "count": max(1, int(pending.get("count") or 0) + 1),
-            }
-    return filtered, next_alerts, next_pending
-
-
 def _apply_automatic_sms_once(
     item: Mapping[str, Any],
     *,
@@ -2616,10 +2499,6 @@ def _status_counts(items: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 def _alert_fingerprint(item: Mapping[str, Any]) -> str:
     return canonical_device_health_alert_fingerprint(item)
-
-
-def _suppressible_captureboard(item: Mapping[str, Any]) -> bool:
-    return set(item.get("problemComponents") or []) == {"캡처보드"}
 
 
 def _alert_category(components: Sequence[str], issue: str) -> str:

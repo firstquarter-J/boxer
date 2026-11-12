@@ -50,7 +50,7 @@ from boxer_company.sms_delivery import (
     _SMS_DELIVERY_NOT_SENT,
     _SMS_DELIVERY_REQUEST_FAILED,
 )
-from boxer_company.sms_policy import sms_sending_enabled
+from boxer_company.deployment import sms_sending_enabled
 from boxer_company.sms_delivery_cycle import (
     acquire_automatic_sms_runtime_claim,
     build_automatic_sms_runtime_claim_key,

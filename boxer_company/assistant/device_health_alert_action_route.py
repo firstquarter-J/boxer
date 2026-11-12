@@ -51,7 +51,7 @@ from boxer_company.sms_delivery import (
 from boxer_company.sms_delivery_cycle import (
     remember_sms_delivery_sheet_record,
 )
-from boxer_company.sms_policy import sms_sending_enabled
+from boxer_company.deployment import sms_sending_enabled
 from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_ACK_REQUEST_ID_PREFIX,
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,

@@ -14,7 +14,7 @@ from urllib.parse import urlencode, urlsplit
 from boxer_company.deployment import get_local_zone, get_timezone_label
 
 from boxer_company.deployment import get_deployment_profile
-from boxer_company.sms_policy import sms_sending_enabled
+from boxer_company.deployment import sms_sending_enabled
 from boxer_company.transport_contracts import (
     DEVICE_HEALTH_ALERT_MARK_DONE_ACTION,
     DEVICE_HEALTH_ALERT_SMS_ACTION,

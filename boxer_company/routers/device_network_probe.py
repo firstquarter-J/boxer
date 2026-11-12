@@ -20,6 +20,7 @@ from boxer_company.routers.device_network_window import (
 _REMOTE_COMMON = r'''
 import datetime
 import glob
+import hashlib
 import ipaddress
 import json
 import os
@@ -98,18 +99,43 @@ def local_wall_stamp(value):
             continue
     return datetime.datetime.fromtimestamp(next(iter(candidates))).astimezone() if len(candidates) == 1 else None
 
+def timezone_files_match(actual_path, expected_path):
+    # Python 3.6 장비에는 zoneinfo가 없어도 설치된 TZif 전체로 alias를 검증할 수 있다.
+    # 현재 UTC offset만 같다는 이유로 전환 규칙이 다른 지역을 허용하지 않는다.
+    try:
+        if not os.path.isfile(actual_path) or not os.path.isfile(expected_path):
+            return False
+        with open(expected_path, "rb") as stream:
+            expected = stream.read(1024 * 1024 + 1)
+        if not expected.startswith(b"TZif") or len(expected) > 1024 * 1024:
+            return False
+        if os.path.realpath(actual_path) == os.path.realpath(expected_path):
+            return True
+        with open(actual_path, "rb") as stream:
+            actual = stream.read(1024 * 1024 + 1)
+        return (actual.startswith(b"TZif") and len(actual) <= 1024 * 1024
+                and hashlib.sha256(actual).digest() == hashlib.sha256(expected).digest())
+    except (OSError, IOError):
+        return False
+
 def device_log_timezone_matches():
-    # 장비 OS와 배포 zone이 다르면 파일 날짜나 offset 없는 로그를 추측하지 않는다.
+    # 실제 OS 시계의 정본은 localtime이다. 오래된 timezone 이름만으로 다른
+    # 파일 날짜나 offset 없는 로그를 배포 시간대로 해석하지 않는다.
+    expected_path = "/usr/share/zoneinfo/" + _TZ_NAME
+    if not timezone_files_match("/etc/localtime", expected_path):
+        return False
     try:
         with open("/etc/timezone") as stream:
             zone = stream.read(128).strip()
         if zone:
-            return zone == _TZ_NAME
+            if zone == _TZ_NAME:
+                return True
+            if not re.match(r"^[A-Za-z0-9_+/-]+$", zone) or zone.startswith("/"):
+                return False
+            return timezone_files_match("/usr/share/zoneinfo/" + zone, expected_path)
     except (OSError, IOError):
         pass
-    resolved = os.path.realpath("/etc/localtime")
-    marker = "/zoneinfo/"
-    return marker in resolved and resolved.split(marker, 1)[1] == _TZ_NAME
+    return True
 '''
 
 _REMOTE_STATE = r'''

@@ -277,7 +277,6 @@ def _deps(
             or _verified_abnormal(device, now)
         ),
         ssh_verification_configured=lambda: True,
-        load_captureboard_incidents=lambda: {},
         send_sms=_send_sms,
         # 일반 cycle 테스트는 공통 claim/outbox의 파일 I/O와 분리하고,
         # 전용 안전성 테스트에서 실제 원자 파일 동작을 검증한다.
@@ -1269,7 +1268,6 @@ def test_redis_failure_does_not_fallback_to_mda_or_ssh() -> None:
         load_redis_snapshot=_redis_failure,
         verify_device=deps.verify_device,
         ssh_verification_configured=deps.ssh_verification_configured,
-        load_captureboard_incidents=deps.load_captureboard_incidents,
         send_sms=deps.send_sms,
         claim_sms_delivery=deps.claim_sms_delivery,
         hold_sms_delivery_claim=deps.hold_sms_delivery_claim,

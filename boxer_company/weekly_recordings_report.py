@@ -25,6 +25,7 @@ _WEEKLY_RECORDINGS_ROOM_DROP_MIN_DELTA = 3
 
 
 def _weekly_recordings_report_timezone() -> ZoneInfo:
+    # 집계 경계와 출력 날짜가 같은 배포 현지 달력을 사용한다.
     return get_local_zone()
 
 
@@ -43,7 +44,7 @@ def _resolve_weekly_recordings_report_question_target_date(
     explicit_target_date: date | None,
     now: datetime | None = None,
 ) -> date | None:
-    """순수 계약에 기존 주입 가능한 weekly 현지 clock을 연결한다."""
+    """순수 기간 계약에 테스트에서 주입할 수 있는 현지 기준 시각을 연결한다."""
 
     return _resolve_weekly_target_date_contract(
         question,

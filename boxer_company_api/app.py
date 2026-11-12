@@ -196,7 +196,12 @@ def create_company_api_app(
         })
     except ValueError:
         deployment_profile = None
-    default_providers_allowed = _deployment_matches_process(api_settings)
+    # 국가 정책이나 caller 설정이 틀리면 readiness뿐 아니라 보조 provider와
+    # 상태 저장소의 조립도 닫는다. 명시 주입된 테스트 provider는 그대로 사용한다.
+    default_providers_allowed = (
+        api_settings.authentication_configured
+        and _deployment_matches_process(api_settings)
+    )
     runtime, default_runtime_ready = _resolve_runtime(
         api_settings,
         assistant_runtime,

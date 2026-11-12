@@ -1,5 +1,6 @@
 """국가별 달력과 DST 경계가 조회, 원격 수집과 답변까지 같은 범위를 유지한다."""
 
+import io
 import json
 import os
 import subprocess
@@ -196,3 +197,82 @@ def test_us_remote_app_timezone_mismatch_never_reads_logs_or_reports_pass(us_pro
         "network_app_history": {"ok": True, "output": json.dumps(result)},
     }, window)
     assert summary["status"] != "pass" and "장비 로그 시간대 확인 필요" in summary["summary"]
+
+
+def _remote_timezone_namespace():
+    # 제품이 SSH로 보내는 standalone 소스 자체를 격리된 namespace에서 실행한다.
+    namespace = {"_TZ_NAME": "America/Los_Angeles", "_TZ_LABEL": "America/Los_Angeles"}
+    exec(device_network_probe._REMOTE_COMMON, namespace)  # noqa: S102
+    return namespace
+
+
+def test_remote_timezone_accepts_realpath_alias_without_hashing_twice(tmp_path):
+    namespace = _remote_timezone_namespace()
+    expected = tmp_path / "Los_Angeles"
+    expected.write_bytes(b"TZif\x00same-transition-rules")
+    alias = tmp_path / "Pacific"
+    alias.symlink_to(expected)
+    # symlink는 같은 실제 파일이라는 근거로 인정하며 이름 문자열에 의존하지 않는다.
+    with patch.object(namespace["hashlib"], "sha256", side_effect=AssertionError("hash not needed")):
+        assert namespace["timezone_files_match"](str(alias), str(expected)) is True
+
+
+def test_remote_timezone_compares_entire_copied_tzif_and_rejects_other_rules(tmp_path):
+    namespace = _remote_timezone_namespace()
+    expected = tmp_path / "Los_Angeles"
+    expected.write_bytes(b"TZif\x00same-header-and-historical-rules\x00future-dst-rule-A")
+    alias = tmp_path / "Pacific"
+    alias.write_bytes(expected.read_bytes())
+    assert namespace["timezone_files_match"](str(alias), str(expected)) is True
+    # 현재 offset/앞부분이 같아도 미래 전환 규칙이 다르면 별도 시간대다.
+    alias.write_bytes(b"TZif\x00same-header-and-historical-rules\x00future-dst-rule-B")
+    assert namespace["timezone_files_match"](str(alias), str(expected)) is False
+
+
+def test_remote_timezone_unreadable_missing_and_non_tzif_files_fail_closed(tmp_path):
+    namespace = _remote_timezone_namespace()
+    expected = tmp_path / "Los_Angeles"
+    expected.write_bytes(b"TZif\x00expected")
+    actual = tmp_path / "Pacific"
+    assert namespace["timezone_files_match"](str(actual), str(expected)) is False
+    actual.write_bytes(b"not-a-timezone")
+    assert namespace["timezone_files_match"](str(actual), str(expected)) is False
+    actual.write_bytes(expected.read_bytes())
+    def deny_timezone_read(*args, **kwargs):
+        raise PermissionError()
+
+    namespace["open"] = deny_timezone_read
+    assert namespace["timezone_files_match"](str(actual), str(expected)) is False
+
+
+@pytest.mark.parametrize("reported_zone", ("US/Pacific", "America/Los_Angeles", None))
+def test_remote_device_zone_alias_uses_file_proof_with_or_without_etc_timezone(tmp_path, reported_zone):
+    namespace = _remote_timezone_namespace()
+    expected = tmp_path / "Los_Angeles"
+    expected.write_bytes(b"TZif\x00same-transition-rules")
+    alias = tmp_path / "Pacific"
+    alias.write_bytes(expected.read_bytes())
+    actual = tmp_path / "localtime"
+    actual.write_bytes(expected.read_bytes())
+    match = namespace["timezone_files_match"]
+    paths = {"/usr/share/zoneinfo/America/Los_Angeles": str(expected),
+        "/usr/share/zoneinfo/US/Pacific": str(alias), "/etc/localtime": str(actual)}
+    namespace["timezone_files_match"] = lambda left, right: match(paths[left], paths[right])
+
+    def read_timezone(path, *args, **kwargs):
+        if path == "/etc/timezone":
+            if reported_zone is None:
+                raise FileNotFoundError()
+            return io.StringIO(reported_zone + "\n")
+        return open(path, *args, **kwargs)
+
+    namespace["open"] = read_timezone
+    assert namespace["device_log_timezone_matches"]() is True
+    # stale alias뿐 아니라 정확한 LA 이름도 실제 localtime이 다른 zone이면 거부한다.
+    actual.write_bytes(b"TZif\x00different-transition-rules")
+    assert namespace["device_log_timezone_matches"]() is False
+    actual.write_bytes(expected.read_bytes())
+    if reported_zone == "US/Pacific":
+        # 실제 localtime이 맞더라도 명시된 alias가 다른 규칙이면 정합성을 인정하지 않는다.
+        alias.write_bytes(b"TZif\x00different-transition-rules")
+        assert namespace["device_log_timezone_matches"]() is False
