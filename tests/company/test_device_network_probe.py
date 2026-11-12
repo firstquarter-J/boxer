@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +16,14 @@ from boxer_company.routers import device_network_probe as network
 _BOOT = "a" * 32
 _STAMP = "2026-10-22T09:15:42+09:00"
 _NOW = datetime.datetime.fromisoformat("2026-10-22T12:30:00.500000+09:00")
-_WINDOW = network.resolve_network_window("", _NOW)
+_TEST_DEPLOYMENT = {
+    "BOXER_COMPANY_COUNTRY": "kr",
+    "AWS_REGION": "ap-northeast-2",
+    "BOXER_COMPANY_TIMEZONE": "Asia/Seoul",
+}
+# 이 fixture의 사건은 한국 장비 기준이다. CI host의 TZ를 조회 날짜 설정으로 쓰지 않는다.
+with patch.dict(os.environ, _TEST_DEPLOYMENT):
+    _WINDOW = network.resolve_network_window("", _NOW)
 
 
 def _check(value):
@@ -42,15 +50,35 @@ def _checks(events=None, app_events=None, **state):
 
 
 def _remote_namespace(script):
-    namespace = {"_FIXED_START": _WINDOW["startEpoch"], "_FIXED_END": _WINDOW["endEpoch"]}
+    namespace = {"_FIXED_START": _WINDOW["startEpoch"], "_FIXED_END": _WINDOW["endEpoch"],
+        "_TZ_NAME": _WINDOW["timezone"], "_TZ_LABEL": "KST"}
     # 사용자 입력 없이 제품의 고정 원격 스크립트만 격리된 namespace에서 검증한다.
     exec(network._REMOTE_COMMON + script, namespace)  # noqa: S102
     results = []
     namespace["emit"] = results.append
+    main = namespace["main"]
+
+    def main_in_deployment_timezone():
+        # 실제 명령의 TZ=... python3 실행과 같게 libc도 전환하고 오류 시에도 복원한다.
+        try:
+            with patch.dict(os.environ, {"TZ": namespace["_TZ_NAME"]}):
+                time.tzset()
+                return main()
+        finally:
+            time.tzset()
+
+    namespace["main"] = main_in_deployment_timezone
     return namespace, results
 
 
-class NetworkSummaryTests(unittest.TestCase):
+class _KoreanDeploymentTestCase(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, _TEST_DEPLOYMENT)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+
+class NetworkSummaryTests(_KoreanDeploymentTestCase):
     def test_c00330_link_loss_precedes_app_errors_and_current_recovery(self):
         # 실제 장애의 09:15 단절, 09:16 소켓 timeout, 09:32 재부팅 복구를 재현한다.
         events = [
@@ -199,7 +227,26 @@ class NetworkSummaryTests(unittest.TestCase):
         self.assertFalse(result["correlation"]["linkBeforeAppError"])
 
 
-class NetworkRemoteCollectorTests(unittest.TestCase):
+class NetworkRemoteCollectorTests(_KoreanDeploymentTestCase):
+    def test_remote_fixture_pins_and_restores_host_timezone_even_after_error(self):
+        # UTC CI에서도 수집은 한국 시각을 쓰며 다음 테스트에 libc 설정을 남기지 않는다.
+        try:
+            with patch.dict(os.environ, {"TZ": "UTC"}):
+                time.tzset()
+                namespace, output = _remote_namespace(
+                    "def main(): emit({'zone':os.environ['TZ'],'hour':datetime.datetime.fromtimestamp(0).hour})")
+                namespace["main"]()
+                self.assertEqual(output, [{"zone": "Asia/Seoul", "hour": 9}])
+                self.assertEqual(os.environ["TZ"], "UTC")
+                self.assertEqual(time.localtime(0).tm_hour, 0)
+                namespace, _ = _remote_namespace("def main(): raise RuntimeError('fixture error')")
+                with self.assertRaises(RuntimeError):
+                    namespace["main"]()
+                self.assertEqual(os.environ["TZ"], "UTC")
+                self.assertEqual(time.localtime(0).tm_hour, 0)
+        finally:
+            time.tzset()
+
     def test_remote_scripts_parse_with_python36_grammar_and_shell_syntax(self):
         # 원격 장비의 오래된 Python과 고정 명령 quoting을 실제 파서로 확인한다.
         for script in (network._REMOTE_STATE, network._REMOTE_LINK_HISTORY, network._REMOTE_APP_HISTORY):
