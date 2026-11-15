@@ -19,6 +19,7 @@ from boxer_company.routers.device_update import (
     _build_device_update_activity_input,
     _DeviceSshOpenBudget,
     _dispatch_device_agent_install_script,
+    _parse_agent_installer_result,
     _parse_agent_repo_state,
     _query_device_update_status,
     _read_agent_runtime_state,
@@ -783,6 +784,53 @@ class AgentInstallerContractTests(unittest.TestCase):
     def ready() -> dict:
         return {"ok": True, "exitStatus": 0, "output": json.dumps({"phase": "idle", "setupReady": True})}
 
+    def test_installer_stdout_is_strict_and_only_legacy_results_fall_back(self) -> None:
+        receipt = {"phase": "ready", "setupReady": True, "cli": _AGENT_INSTALLER_CLI}
+        stdout = json.dumps(receipt)
+        self.assertEqual(_parse_agent_installer_result({"stdout": stdout, "output": stdout + "\nwarning"}), receipt)
+        self.assertEqual(_parse_agent_installer_result({"output": stdout}), receipt)
+        for invalid in (None, b"{}", {}, [], 0, "", "warning\n" + stdout, stdout + "\nwarning", stdout + "\n" + stdout):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(_parse_agent_installer_result({"stdout": invalid, "stderr": stdout, "output": stdout}))
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_setup_json_with_sudo_prompt_still_dispatches_update(self, mock_open, mock_run) -> None:
+        client = MagicMock()
+        mock_open.return_value = ({"deviceName": "MB2-U00044"}, {"ready": True}, client)
+        prompt = "[sudo] password for mommytalk:"
+        receipts = [
+            {"installerMissing": True},
+            {"phase": "ready", "setupReady": True, "cli": _AGENT_INSTALLER_CLI},
+            {"accepted": True, "phase": "queued", "request": self.REQUEST},
+        ]
+        mock_run.side_effect = [{"ok": True, "exitStatus": 0, "stdout": json.dumps(value), "stderr": prompt,
+                                 "output": json.dumps(value) + "\n" + prompt} for value in receipts]
+        result = _dispatch_device_agent_install_script("MB2-U00044")
+        self.assertTrue(result["status"])
+        self.assertEqual(result["requestId"], self.REQUEST)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(mock_run.call_args_list[1].kwargs["command"], _AGENT_INSTALLER_SETUP_COMMAND)
+        self.assertEqual(mock_run.call_args_list[2].kwargs["command"], _AGENT_INSTALL_SCRIPT_COMMAND)
+        client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_matching_commit_uses_stdout_receipt_with_stderr_prompt(self, mock_open, mock_run) -> None:
+        client = MagicMock()
+        mock_open.return_value = ({"deviceName": "MB2-U00044"}, {"ready": True}, client)
+        receipt = {"request": self.REQUEST, "phase": "committed", "version": "2.0.4", "revision": self.REVISION}
+        stdout = json.dumps(receipt)
+        mock_run.side_effect = [
+            {"ok": True, "exitStatus": 0, "stdout": stdout, "stderr": "[sudo] password for mommytalk:",
+             "output": stdout + "\n[sudo] password for mommytalk:"},
+            {"ok": True, "output": "[]"}, {"ok": True, "output": "repo_missing"},
+        ]
+        result = _wait_for_agent_update_completion("MB2-U00044", update_request_id=self.REQUEST)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["installer"], receipt)
+        self.assertEqual(mock_run.call_count, 3)
+
     @patch("boxer_company.routers.device_update._run_remote_ssh_command")
     @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
     def test_dispatch_accepts_only_valid_common_installer_receipts(self, mock_open, mock_run) -> None:
@@ -893,11 +941,13 @@ class AgentInstallerContractTests(unittest.TestCase):
         failures = [
             {"ok": False, "exitStatus": None, "reason": "timeout", "output": ""},
             {"ok": False, "exitStatus": 1, "output": json.dumps(correct)},
+            {"ok": False, "exitStatus": 1, "stdout": json.dumps(correct), "output": json.dumps(correct)},
             {"ok": True, "exitStatus": None, "output": json.dumps(correct)},
             {"ok": True, "exitStatus": 0, "output": json.dumps({**correct, "cli": "/tmp/untrusted.js"})},
             {"ok": True, "exitStatus": 0, "output": json.dumps({**correct, "setupReady": 1})},
             {"ok": True, "exitStatus": 0, "output": json.dumps({**correct, "error": "failed"})},
             {"ok": True, "exitStatus": 0, "output": "{broken"},
+            {"ok": True, "exitStatus": 0, "stdout": "notice\n" + json.dumps(correct), "output": json.dumps(correct)},
         ]
         for failure in failures:
             with self.subTest(failure=failure):
@@ -1197,6 +1247,9 @@ class DeviceUpdateSshLifecycleTests(unittest.TestCase):
         self.assertNotIn(secret, str(result))
         self.assertNotIn(secret, str(client.exec_command.call_args))
         self.assertIn("[REDACTED]", result["output"])
+        self.assertEqual(result["stdout"], "ready [REDACTED]")
+        self.assertEqual(result["stderr"], "echo [REDACTED]")
+        self.assertEqual(result["output"], "ready [REDACTED]\necho [REDACTED]")
         stdin.close.assert_called_once()
         self.assertTrue(stdout.closed and stderr.closed)
 

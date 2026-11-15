@@ -238,6 +238,8 @@ def _run_remote_ssh_command(
             "ok": exit_status == 0,
             "exitStatus": exit_status,
             "output": combined,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
             "reason": "" if exit_status == 0 else f"ssh_exit_{exit_status}",
         }
     except Exception as exc:  # pragma: no cover - network/remote dependent
@@ -245,6 +247,8 @@ def _run_remote_ssh_command(
             "ok": False,
             "exitStatus": None,
             "output": "",
+            "stdout": "",
+            "stderr": "",
             "reason": "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__.lower(),
         }
     finally:
@@ -398,6 +402,18 @@ def _parse_agent_installer_response(output: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _parse_agent_installer_result(result: dict[str, Any]) -> dict[str, Any] | None:
+    # sudo 안내는 stderr에 있어도 정상 명령을 실패시키지 않는다. 영수증은 stdout 전체 하나만 검증한다.
+    if "stdout" in result:
+        output = result["stdout"]
+        if not isinstance(output, str):
+            return None
+    else:
+        # 분리 출력이 없는 기존 provider와 mock만 기존 output 계약을 읽는다.
+        output = result.get("output", "")
+    return _parse_agent_installer_response(output)
+
+
 def _agent_installer_release_valid(value: dict[str, Any]) -> bool:
     return bool(
         isinstance(value.get("version"), str)
@@ -412,7 +428,7 @@ def _agent_installer_preflight_state(result: dict[str, Any]) -> str:
     exit_status = result.get("exitStatus")
     if type(exit_status) is not int or result.get("reason") == "timeout":
         return "unknown"
-    value = _parse_agent_installer_response(result.get("output", ""))
+    value = _parse_agent_installer_result(result)
     if result.get("ok") is True and exit_status == 0 and value:
         if value.get("setupReady") is True:
             return "ready"
@@ -514,7 +530,7 @@ def _read_agent_runtime_state(
                 timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
             )
             state["installerCommand"] = installer_result
-            installer = _parse_agent_installer_response(installer_result.get("output", "")) if installer_result.get("ok") else None
+            installer = _parse_agent_installer_result(installer_result) if installer_result.get("ok") else None
             state["installer"] = installer
             matching = isinstance(installer, dict) and installer.get("request") == update_request_id
             phase = installer.get("phase") if matching and isinstance(installer.get("phase"), str) else ""
@@ -542,7 +558,7 @@ def _read_agent_runtime_state(
                 timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
             )
             state["installerCommand"] = installer_result
-            installer = _parse_agent_installer_response(installer_result.get("output", "")) if installer_result.get("ok") else None
+            installer = _parse_agent_installer_result(installer_result) if installer_result.get("ok") else None
             if installer == {"installerMissing": True}:
                 state["installerStatus"] = {"available": False, "reason": "installer_missing"}
             elif (
@@ -977,7 +993,7 @@ def _dispatch_device_agent_install_script(
                 stdin_text=password + "\n",
             )
             dispatch_payload["setup"] = setup_result
-            setup_receipt = _parse_agent_installer_response(setup_result.get("output", ""))
+            setup_receipt = _parse_agent_installer_result(setup_result)
             if not (
                 setup_result.get("ok") is True and type(setup_result.get("exitStatus")) is int
                 and setup_result["exitStatus"] == 0
@@ -998,7 +1014,7 @@ def _dispatch_device_agent_install_script(
         client.close()
 
     dispatch_payload["result"] = install_result
-    receipt = _parse_agent_installer_response(install_result.get("output", "")) if install_result.get("ok") else None
+    receipt = _parse_agent_installer_result(install_result) if install_result.get("ok") else None
     queued = bool(
         receipt and receipt.get("accepted") is True and receipt.get("phase") == "queued"
         and isinstance(receipt.get("request"), str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(receipt["request"])
