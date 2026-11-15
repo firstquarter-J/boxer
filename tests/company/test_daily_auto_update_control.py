@@ -44,6 +44,7 @@ from boxer_company_api.automation_scheduler import (
 from boxer_company_api.daily_auto_update import (
     DailyAutoUpdateController,
     _control_key,
+    load_daily_auto_update_defaults,
     resolve_daily_auto_update_options,
 )
 from boxer_company_api.settings import CompanyApiCallerSettings, CompanyApiSettings
@@ -273,6 +274,62 @@ def test_scheduler_reads_latest_settings_without_restart(state_path: Path) -> No
         )
         == options
     )
+
+
+@pytest.mark.parametrize("target", ("box_free", "box_paid"))
+def test_us_agent_override_is_effective_but_box_enable_never_writes(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
+) -> None:
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", "us")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("BOXER_COMPANY_TIMEZONE", "America/Los_Angeles")
+    defaults = {"agent": True, "box_free": False, "box_paid": False}
+    control = DailyAutoUpdateController(
+        JsonAutomationCycleStateStore(state_path), tenant_id="T1", defaults=defaults, daily_enabled=True,
+    )
+    control.set_enabled(_request("", "agent-off"), "agent", False)
+    assert control.read(_request("")).enabled == {**defaults, "agent": False}
+    options = {"autoUpdateAgent": True, "autoUpdateBoxFree": False, "autoUpdateBoxPaid": False,
+               "autoCleanupTrashCan": False, "autoPowerOff": False}
+    assert resolve_daily_auto_update_options(JsonAutomationCycleStateStore(state_path), "T1", options) == {
+        **options, "autoUpdateAgent": False,
+    }
+    before = state_path.read_bytes()
+    with pytest.raises(ValueError, match="configuration_invalid"):
+        control.set_enabled(_request("", "box-on"), target, True)
+    assert state_path.read_bytes() == before
+    control.set_enabled(_request("", "agent-on"), "agent", True)
+    assert control.read(_request("")).enabled == defaults
+
+
+@pytest.mark.parametrize("target", ("box_free", "box_paid"))
+def test_us_existing_box_override_blocks_read_and_resolution_without_overwrite(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
+) -> None:
+    # 과거 한국 설정이나 순회가 꺼진 동안 저장된 override도 미국 실행을 열지 못한다.
+    with patch.dict(os.environ, {"BOXER_COMPANY_COUNTRY": "kr"}, clear=True):
+        _controller(state_path).set_enabled(_request(""), target, True)
+    before = state_path.read_bytes()
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", "us")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("BOXER_COMPANY_TIMEZONE", "America/Los_Angeles")
+    control = DailyAutoUpdateController(
+        JsonAutomationCycleStateStore(state_path), tenant_id="T1",
+        defaults={"agent": True, "box_free": False, "box_paid": False}, daily_enabled=True,
+    )
+    with pytest.raises(ValueError, match="configuration_invalid"):
+        control.read(_request(""))
+    with pytest.raises(ValueError, match="configuration_invalid"):
+        resolve_daily_auto_update_options(JsonAutomationCycleStateStore(state_path), "T1", {})
+    assert state_path.read_bytes() == before
+
+
+def test_us_defaults_use_injected_profile_and_reject_box_updates() -> None:
+    env = {"BOXER_COMPANY_COUNTRY": "us", "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT": "true"}
+    assert load_daily_auto_update_defaults(env) == {"agent": True, "box_free": False, "box_paid": False}
+    for key in ("DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID"):
+        with pytest.raises(ValueError, match="configuration_invalid"):
+            load_daily_auto_update_defaults({**env, key: "true"})
 
 
 @pytest.mark.parametrize(

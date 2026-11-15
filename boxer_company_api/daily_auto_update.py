@@ -11,6 +11,10 @@ from typing import Any
 from boxer_company._operation_routing_automation import AUTO_UPDATE_OPTION_KEYS
 from boxer_company.assistant.contracts import CompanyAssistantRequest
 from boxer_company.assistant.daily_auto_update_route import DailyAutoUpdateStatus
+from boxer_company.deployment import (
+    load_deployment_profile,
+    validate_daily_device_round_options,
+)
 from boxer_company_api.automation import (
     AutomationCycleContractError,
     JsonAutomationCycleStateStore,
@@ -34,6 +38,10 @@ def load_daily_auto_update_defaults(
         if raw not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
             raise ValueError("daily auto update default is invalid")
         values[target] = raw in {"1", "true", "yes", "on"}
+    validate_daily_device_round_options(
+        {AUTO_UPDATE_OPTION_KEYS[target]: value for target, value in values.items()},
+        profile=load_deployment_profile(source),
+    )
     return values
 
 
@@ -101,6 +109,8 @@ def resolve_daily_auto_update_options(
     options = dict(defaults)
     for target, row in _read_overrides(store, tenant_id).items():
         options[AUTO_UPDATE_OPTION_KEYS[target]] = row["enabled"]
+    # 이전 상태 파일의 금지 옵션도 env 기본값을 우회해 실행되지 않게 한다.
+    validate_daily_device_round_options(options)
     return options
 
 
@@ -136,11 +146,15 @@ class DailyAutoUpdateController:
             raise ValueError("daily auto update scope is invalid")
 
     def _status(self, overrides: Mapping[str, Any]) -> DailyAutoUpdateStatus:
+        enabled = {
+            target: overrides.get(target, {}).get("enabled", default)
+            for target, default in self._defaults.items()
+        }
+        validate_daily_device_round_options(
+            {AUTO_UPDATE_OPTION_KEYS[target]: value for target, value in enabled.items()}
+        )
         return DailyAutoUpdateStatus(
-            enabled={
-                target: overrides.get(target, {}).get("enabled", default)
-                for target, default in self._defaults.items()
-            },
+            enabled=enabled,
             daily_enabled=self._daily_enabled,
         )
 
@@ -157,6 +171,8 @@ class DailyAutoUpdateController:
         self._check_request(request)
         if target not in AUTO_UPDATE_OPTION_KEYS or type(enabled) is not bool:
             raise ValueError("daily auto update target is invalid")
+        # 저장 전에 검사해 거부된 미국 앱 업데이트 요청은 상태 파일도 바꾸지 않는다.
+        validate_daily_device_round_options({AUTO_UPDATE_OPTION_KEYS[target]: enabled})
         key = _control_key(self._tenant_id)
 
         def update(

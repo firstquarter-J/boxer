@@ -17,6 +17,13 @@ _COUNTRY_DEFAULTS = {
     "kr": ("ap-northeast-2", "Asia/Seoul"),
     "us": ("us-east-1", "America/Los_Angeles"),
 }
+_DAILY_OPTION_ENV_KEYS = {
+    "autoUpdateAgent": "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT",
+    "autoUpdateBoxFree": "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE",
+    "autoUpdateBoxPaid": "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID",
+    "autoCleanupTrashCan": "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN",
+    "autoPowerOff": "DAILY_DEVICE_ROUND_AUTO_POWER_OFF",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +99,21 @@ def get_local_zone() -> ZoneInfo:
 
 def get_timezone_label() -> str:
     return get_deployment_profile().timezone_label
+
+
+def validate_daily_device_round_options(
+    options: Mapping[str, bool],
+    *,
+    profile: DeploymentProfile | None = None,
+) -> None:
+    """미국 순회는 에이전트 업데이트만 허용하고 한국의 기존 선택은 유지한다."""
+
+    if (profile or get_deployment_profile()).country == "us" and any(
+        options.get(key, False)
+        for key in _DAILY_OPTION_ENV_KEYS
+        if key != "autoUpdateAgent"
+    ):
+        raise ValueError("company_deployment_configuration_invalid")
 
 
 def localize_wall_datetime(value: datetime) -> datetime:
@@ -172,18 +194,18 @@ def validate_deployment_settings(
     if profile.country == "kr":
         return profile
 
-    # 미국은 승인된 초기 운영 범위만 연다. 질문이나 client flag로 확대하지 않는다.
+    # env, 저장된 override와 실행 handler가 같은 에이전트 전용 정책을 쓴다.
+    _enabled(source, "DAILY_DEVICE_ROUND_ENABLED")
+    validate_daily_device_round_options(
+        {option: _enabled(source, key) for option, key in _DAILY_OPTION_ENV_KEYS.items()},
+        profile=profile,
+    )
+    # 미국은 승인된 운영 범위만 연다. 질문이나 client flag로 확대하지 않는다.
     forbidden_flags = (
         "BOXER_COMPANY_API_MEMORY_ENABLED",
         "BOXER_COMPANY_API_MEMORY_READ_ENABLED",
         "BOXER_COMPANY_SLACK_MEMORY_ENABLED",
         "HPA_CHANGE_REQUEST_ENABLED",
-        "DAILY_DEVICE_ROUND_ENABLED",
-        "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT",
-        "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE",
-        "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID",
-        "DAILY_DEVICE_ROUND_AUTO_POWER_OFF",
-        "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN",
         "SMS_DELIVERY_REPORTER_ENABLED",
     )
     if sms_enabled or any(_enabled(source, key) for key in forbidden_flags):
@@ -203,6 +225,7 @@ def validate_deployment_settings(
         _enabled(source, key)
         for key in (
             "WEEKLY_RECORDINGS_REPORT_ENABLED",
+            "DAILY_DEVICE_ROUND_ENABLED",
             "DEVICE_HEALTH_MONITOR_ENABLED",
             "DEVICE_NOTIFICATION_ALERT_ENABLED",
             "BOXER_COMPANY_API_OPERATIONS_ENABLED",

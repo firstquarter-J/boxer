@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
@@ -12,8 +14,11 @@ from boxer_company.deployment import (
     get_local_zone,
     get_timezone_label,
     load_deployment_profile,
+    validate_daily_device_round_options,
     validate_deployment_settings,
 )
+from boxer_company.automation_schedule import plan_automation_cycle
+from boxer_company_api.automation_scheduler import load_automation_scheduler_settings
 from boxer_company_api.app import (
     _RUNTIME_UNSET,
     _deployment_matches_process,
@@ -134,7 +139,6 @@ class DeploymentProfileTests(unittest.TestCase):
             "BOXER_COMPANY_SMS_ENABLED", "SMS_DELIVERY_REPORTER_ENABLED",
             "BOXER_COMPANY_API_MEMORY_ENABLED", "BOXER_COMPANY_API_MEMORY_READ_ENABLED",
             "BOXER_COMPANY_SLACK_MEMORY_ENABLED", "HPA_CHANGE_REQUEST_ENABLED",
-            "DAILY_DEVICE_ROUND_ENABLED", "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT",
             "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_PAID",
             "DAILY_DEVICE_ROUND_AUTO_POWER_OFF", "DAILY_DEVICE_ROUND_AUTO_CLEANUP_TRASHCAN",
         ):
@@ -143,6 +147,57 @@ class DeploymentProfileTests(unittest.TestCase):
         # provider만 남은 설정도 발송 가능성이 있으므로 미국 startup을 닫는다.
         with self.assertRaisesRegex(ValueError, "configuration_invalid"):
             validate_deployment_settings(self._us_env(DEVICE_HEALTH_MONITOR_SMS_PROVIDER="solapi"), role="api")
+
+    def test_us_daily_agent_only_is_allowed_and_still_requires_us_data(self) -> None:
+        env = self._us_env(
+            DAILY_DEVICE_ROUND_ENABLED="true", DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT="true",
+            DB_HOST="cluster.cluster-ro-example.us-east-1.rds.amazonaws.com",
+        )
+        for role in ("api", "slack"):
+            with self.subTest(role=role):
+                self.assertEqual(validate_deployment_settings(env, role=role).country, "us")
+        with self.assertRaisesRegex(ValueError, "configuration_invalid"):
+            validate_deployment_settings({**env, "DB_HOST": ""}, role="api")
+        for key in ("DAILY_DEVICE_ROUND_ENABLED", "DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "configuration_invalid"):
+                validate_deployment_settings({**env, key: "typo"}, role="api")
+
+    def test_korean_daily_policy_keeps_all_existing_mutation_options(self) -> None:
+        validate_daily_device_round_options(
+            {key: True for key in (
+                "autoUpdateAgent", "autoUpdateBoxFree", "autoUpdateBoxPaid",
+                "autoCleanupTrashCan", "autoPowerOff",
+            )},
+            profile=load_deployment_profile({}),
+        )
+
+    def test_us_daily_uses_existing_la_overnight_window_across_dst(self) -> None:
+        settings = load_automation_scheduler_settings(self._us_env(
+            BOXER_COMPANY_TIMEZONE="America/Los_Angeles",
+            BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED="true",
+            BOXER_COMPANY_API_AUTOMATION_TENANT_ID="T1",
+            DAILY_DEVICE_ROUND_ENABLED="true", DAILY_DEVICE_ROUND_AUTO_UPDATE_AGENT="true",
+            DAILY_DEVICE_ROUND_CHANNEL_ID="C0CGU9T9EGP",
+            DAILY_DEVICE_ROUND_HOUR_LOCAL="22", DAILY_DEVICE_ROUND_MINUTE_LOCAL="0",
+            DAILY_DEVICE_ROUND_END_HOUR_LOCAL="6", DAILY_DEVICE_ROUND_END_MINUTE_LOCAL="0",
+        ))
+        zone = ZoneInfo("America/Los_Angeles")
+        for instant, due, key in (
+            (datetime(2026, 10, 31, 21, 59, tzinfo=zone), False, None),
+            (datetime(2026, 10, 31, 22, 0, tzinfo=zone), True, "daily:2026-10-31"),
+            (datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0), True, "daily:2026-10-31"),
+            (datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1), True, "daily:2026-10-31"),
+            (datetime(2026, 11, 1, 6, 0, tzinfo=zone), False, None),
+            (datetime(2026, 3, 8, 3, 30, tzinfo=zone), True, "daily:2026-03-07"),
+        ):
+            with self.subTest(instant=instant):
+                decision = plan_automation_cycle("daily_device_round", now=instant, config=settings.schedule)
+                self.assertEqual((decision.due, decision.cycle_key), (due, key))
+        self.assertEqual(settings.delivery_targets["daily_device_round"].channel_id, "C0CGU9T9EGP")
+        self.assertEqual(settings.daily_options, {
+            "autoUpdateAgent": True, "autoUpdateBoxFree": False, "autoUpdateBoxPaid": False,
+            "autoCleanupTrashCan": False, "autoPowerOff": False,
+        })
 
     def test_api_settings_report_safe_deployment_error(self) -> None:
         # caller token과 잘못된 endpoint는 응답/오류 문자열에 포함되지 않는다.

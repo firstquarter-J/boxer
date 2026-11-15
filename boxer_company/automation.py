@@ -29,6 +29,7 @@ from boxer_company.daily_device_round import (
     _build_daily_device_round_summary,
     _format_daily_device_round_report,
 )
+from boxer_company.deployment import validate_daily_device_round_options
 from boxer_company.device_health_monitor_cycle import (
     DeviceHealthMonitorCycleDeps,
     acknowledge_device_health_monitor_deliveries,
@@ -284,6 +285,8 @@ class DailyDeviceRoundCycleHandler:
             )
         for key in self._OPTION_KEYS:
             _require_bool_option(request.options, key)
+        # scheduler나 저장된 옵션을 우회한 요청도 장비 작업 직전에 같은 정책으로 막는다.
+        validate_daily_device_round_options(request.options)
         # 회차 식별자가 훼손되면 이전 delivery ID로 장비 작업을 반복하지 않는다.
         round_number = request.cursor.get("roundNumber", 1)
         if (

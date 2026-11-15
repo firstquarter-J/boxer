@@ -12,7 +12,7 @@ from boxer_company_api.memory_service import MemoryService
 from boxer_company_api.settings import CompanyApiCallerSettings, CompanyApiSettings
 
 _COMPANIONS = (
-    ("automation_scheduler", "DAILY_DEVICE_ROUND_ENABLED", "build_default_automation_cycle_service"),
+    ("automation_scheduler", "DAILY_DEVICE_ROUND_AUTO_UPDATE_BOX_FREE", "build_default_automation_cycle_service"),
     ("hpa_change_coordinator_runner", "HPA_CHANGE_REQUEST_ENABLED", "create_hpa_change_coordinator"),
     ("memory_companion", "BOXER_COMPANY_API_MEMORY_ENABLED", "MemoryStore"),
 )

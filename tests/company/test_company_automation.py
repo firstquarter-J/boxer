@@ -198,9 +198,13 @@ def test_weekly_database_auth_failure_is_not_retried(monkeypatch: pytest.MonkeyP
         WeeklyRecordingsCycleHandler().run(_request("weekly_recordings"))
 
 
+@pytest.mark.parametrize("country", ("kr", "us"))
 def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, country: str,
 ) -> None:
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", country)
+    monkeypatch.setenv("AWS_REGION", "us-east-1" if country == "us" else "ap-northeast-2")
+    monkeypatch.setenv("BOXER_COMPANY_TIMEZONE", "America/Los_Angeles" if country == "us" else "Asia/Seoul")
     calls: list[dict[str, Any]] = []
 
     def _fake_summary(**kwargs: Any) -> dict[str, Any]:
@@ -301,7 +305,7 @@ def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
                 "autoUpdateAgent": True,
                 "autoUpdateBoxFree": False,
                 "autoUpdateBoxPaid": False,
-                "autoCleanupTrashCan": True,
+                "autoCleanupTrashCan": country == "kr",
                 "autoPowerOff": False,
             },
         )
@@ -311,7 +315,8 @@ def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
     assert calls[0]["auto_update_agent"] is True
     assert calls[0]["auto_update_box_free"] is False
     assert calls[0]["auto_update_box_paid"] is False
-    assert calls[0]["auto_cleanup_trashcan"] is True
+    assert calls[0]["auto_cleanup_trashcan"] is (country == "kr")
+    assert calls[0]["auto_power_off"] is False
     assert result.cursor["processedHospitalSeqs"] == [21, 22]
     assert result.cursor["windowCompletedAt"] == (
         "2026-08-10T09:00:00+09:00"
@@ -467,6 +472,24 @@ def test_daily_cycle_rejects_non_boolean_mutation_option(
 
     # 잘못된 mutation 설정은 어떤 장비 호출보다 먼저 차단한다.
     assert called is False
+
+
+@pytest.mark.parametrize("option", (
+    "autoUpdateBoxFree", "autoUpdateBoxPaid", "autoCleanupTrashCan", "autoPowerOff",
+))
+def test_us_daily_cycle_rejects_forbidden_work_before_device_calls(
+    monkeypatch: pytest.MonkeyPatch, option: str,
+) -> None:
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", "us")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("BOXER_COMPANY_TIMEZONE", "America/Los_Angeles")
+    calls = []
+    monkeypatch.setattr(automation, "_build_daily_device_round_summary", lambda **kwargs: calls.append(kwargs))
+    options = {"autoUpdateAgent": True, "autoUpdateBoxFree": False, "autoUpdateBoxPaid": False,
+               "autoCleanupTrashCan": False, "autoPowerOff": False}
+    with pytest.raises(ValueError, match="configuration_invalid"):
+        DailyDeviceRoundCycleHandler().run(_request("daily_device_round", options={**options, option: True}))
+    assert not calls
 
 
 def test_default_service_registers_channel_neutral_company_cycles() -> None:
