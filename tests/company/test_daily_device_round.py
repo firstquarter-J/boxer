@@ -288,6 +288,111 @@ class DailyDeviceRoundSelectionTests(unittest.TestCase):
 
 
 class DailyDeviceRoundExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        source = patch("boxer_company.daily_device_round._get_mda_device_detail", side_effect=lambda name: {
+            "deviceName": name, "isConnected": True, "version": "3.2.0",
+        })
+        self.device_detail = source.start()
+        self.addCleanup(source.stop)
+
+    def test_agent_only_offline_and_exhausted_ssh_failure_do_not_attempt_installation(self) -> None:
+        for connected in (False, True):
+            with self.subTest(connected=connected), \
+                    patch("boxer_company.routers.device_update._read_agent_runtime_state") as read_agent, \
+                    patch("boxer_company.routers.device_update._read_box_runtime_state") as read_box, \
+                    patch("boxer_company.routers.device_update._get_mda_latest_device_version") as latest_box, \
+                    patch("boxer_company.daily_device_round._collect_runtime_checks") as storage, \
+                    patch("boxer_company.daily_device_round._request_device_agent_update") as install:
+                self.device_detail.side_effect = None
+                self.device_detail.return_value = {"deviceName": "MB2-C00419", "isConnected": connected}
+                read_agent.return_value = {"device": self.device_detail.return_value,
+                                           "ssh": {"ready": False, "reason": "connect_failed"}}
+                result = rounder._run_daily_device_round_for_device("MB2-C00419", auto_update_agent=True)
+                self.assertEqual(read_agent.call_count, int(connected))
+                if connected:
+                    self.assertTrue(read_agent.call_args.kwargs["recover_stale_ssh"])
+                    self.assertNotIn("resend_ssh_open", read_agent.call_args.kwargs)
+                for unused in (read_box, latest_box, storage, install):
+                    unused.assert_not_called()
+                self.assertEqual(result["overallLabel"], "점검 불가")
+                self.assertFalse(result["initialPlan"]["agent"]["shouldUpdate"])
+                self.assertFalse(result["finalPlan"]["agent"]["isLatest"])
+                self.assertFalse(result["finalPlan"]["agent"]["isHealthy"])
+                self.assertIsNone(result["agentAction"])
+
+    def test_agent_only_reuses_runtime_and_keeps_receipt_separate_from_repo_observations(self) -> None:
+        initial = _build_update_payload(box_version="3.2.0", latest_box_version="3.2.10",
+                                        agent_version="2.0.3", agent_latest=False)["agentRuntime"]
+        initial["device"] = {"deviceName": "MB2-C00419", "isConnected": True}
+        final = {**initial, "process": {**initial["process"], "version": "2.0.4"},
+                 "repo": {**initial["repo"], "head": "a" * 40, "originMain": "b" * 40, "latest": False}}
+        receipt = {"request": "c" * 32, "phase": "committed", "version": "2.0.4", "revision": "a" * 40}
+        with patch("boxer_company.routers.device_update._read_agent_runtime_state", return_value=initial) as read_agent, \
+                patch("boxer_company.routers.device_update._read_box_runtime_state") as read_box, \
+                patch("boxer_company.routers.device_update._get_mda_latest_device_version") as latest_box, \
+                patch("boxer_company.daily_device_round._collect_runtime_checks") as storage, \
+                patch("boxer_company.daily_device_round._request_device_agent_update", return_value=("confirmed", {
+                    "route": "device_agent_update", "dispatch": {"status": True},
+                    "wait": {"ok": True, "status": "completed", "runtime": final, "installer": receipt},
+                })) as install:
+            result = rounder._run_daily_device_round_for_device("MB2-C00419", auto_update_agent=True)
+        read_agent.assert_called_once()
+        self.assertIs(install.call_args.kwargs["prechecked_runtime"], initial)
+        self.assertNotIn("resend_ssh_open", install.call_args.kwargs)
+        for unused in (read_box, latest_box, storage):
+            unused.assert_not_called()
+        self.assertEqual(result["finalUpdateStatusPayload"]["agentRuntime"], final)
+        self.assertEqual(result["finalUpdateStatusPayload"]["agentUpdateReceipt"], receipt)
+        self.assertFalse(result["finalPlan"]["agent"]["isLatest"])
+        self.assertTrue(result["agentAction"]["ok"])
+        self.assertEqual(result["componentLabels"]["storage"], "미점검")
+        self.assertEqual(result["statusPayload"]["request"]["component"], "agent")
+        self.assertEqual(result["finalPlan"]["box"]["reason"], "앱 업데이트 점검 생략")
+
+    def test_receipt_does_not_relabel_old_process_or_unknown_final_repo(self) -> None:
+        old = {"device": {"deviceName": "MB2-C00419", "isConnected": True},
+               "ssh": {"ready": True}, "process": {"pid": 123, "status": "online", "version": "1.2.0"}}
+        receipt = {"phase": "already_latest", "version": "2.0.4", "revision": "a" * 40}
+        result = rounder._reuse_daily_agent_update_status({"agentRuntime": old}, {
+            "precheck": old, "wait": {"ok": True, "installer": receipt},
+        })
+        self.assertEqual(result["agentRuntime"], old)
+        self.assertNotIn("repo", result["agentRuntime"])
+        self.assertEqual(result["agentUpdateReceipt"], receipt)
+
+    def test_undispatched_request_is_not_an_installation_failure(self) -> None:
+        runtime = {"device": {"deviceName": "MB2-C00419", "isConnected": True},
+                   "ssh": {"ready": True}, "process": {"status": "online", "version": "1.2.0"}}
+        with patch("boxer_company.routers.device_update._read_agent_runtime_state", return_value=runtime), \
+                patch("boxer_company.daily_device_round._request_device_agent_update", return_value=("not requested", {
+                    "route": "device_agent_update", "precheck": runtime, "dispatch": None, "wait": None,
+                })):
+            result = rounder._run_daily_device_round_for_device("MB2-C00419", auto_update_agent=True)
+        self.assertIsNone(result["agentAction"])
+
+    def test_agent_only_prefers_fresh_disconnect_during_tunnel_recovery(self) -> None:
+        fresh = _build_update_payload(box_version="3.2.0", latest_box_version="3.2.10",
+                                      agent_version="2.0.4", agent_latest=True)["agentRuntime"]
+        fresh["device"] = {"deviceName": "MB2-C00419", "isConnected": False}
+        with patch("boxer_company.routers.device_update._read_agent_runtime_state", return_value=fresh) as read_agent, \
+                patch("boxer_company.daily_device_round._request_device_agent_update") as install:
+            result = rounder._run_daily_device_round_for_device("MB2-C00419", auto_update_agent=True)
+            for invalid in ({"deviceName": "MB2-C00420", "isConnected": False},
+                            {"deviceName": "MB2-C00419", "isConnected": "false"}):
+                read_agent.return_value = {**fresh, "device": invalid}
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    rounder._run_daily_device_round_for_device("MB2-C00419", auto_update_agent=True)
+        install.assert_not_called()
+        self.assertFalse(result["finalUpdateStatusPayload"]["device"]["isConnected"])
+        for key in ("connected", "isHealthy", "isLatest", "shouldUpdate"):
+            self.assertFalse(result["finalPlan"]["agent"][key])
+        self.assertEqual(result["overallLabel"], "확인 필요")
+        self.assertIsNone(result["agentAction"])
+        reused = rounder._reuse_daily_agent_update_status({
+            "device": {"deviceName": "MB2-C00419", "isConnected": True},
+        }, {"device": {"deviceName": "MB2-C00419", "isConnected": True}, "wait": {"runtime": fresh}})
+        self.assertFalse(reused["device"]["isConnected"])
+
     def test_storage_component_probe_uses_only_cleanup_commands(self) -> None:
         # 야간 순회 유지보수는 하드웨어 이상 감지 명령 없이 용량 판단 명령만 실행해야 해.
         self.assertEqual(
@@ -719,10 +824,11 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
             auto_update_box=True,
         )
 
-        mock_request_device_agent_update.assert_called_once_with(
-            "MB2-C00419 에이전트 업데이트",
-            device_name="MB2-C00419",
-        )
+        mock_request_device_agent_update.assert_called_once()
+        self.assertEqual(mock_request_device_agent_update.call_args.args, ("MB2-C00419 에이전트 업데이트",))
+        self.assertNotIn("resend_ssh_open", mock_request_device_agent_update.call_args.kwargs)
+        self.assertEqual(mock_request_device_agent_update.call_args.kwargs["prechecked_runtime"]["process"]["version"], "1.9.0")
+        self.assertEqual(mock_query_device_update_status.call_count, 3)
         mock_request_device_box_update.assert_called_once_with(
             "MB2-C00419 장비 업데이트",
             device_name="MB2-C00419",
@@ -897,10 +1003,10 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
             auto_update_box=False,
         )
 
-        mock_request_device_agent_update.assert_called_once_with(
-            "MB2-C00819 에이전트 업데이트",
-            device_name="MB2-C00819",
-        )
+        mock_request_device_agent_update.assert_called_once()
+        self.assertEqual(mock_request_device_agent_update.call_args.args, ("MB2-C00819 에이전트 업데이트",))
+        self.assertNotIn("resend_ssh_open", mock_request_device_agent_update.call_args.kwargs)
+        self.assertEqual(mock_request_device_agent_update.call_args.kwargs["prechecked_runtime"]["process"]["version"], "1.5.0")
         self.assertTrue(result["initialPlan"]["agent"]["shouldUpdate"])
         self.assertEqual(result["initialPlan"]["agent"]["reason"], "에이전트 1.5.0 업데이트 필요")
         self.assertTrue(result["agentAction"]["ok"])

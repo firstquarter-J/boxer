@@ -15,6 +15,8 @@ from boxer_company.routers.device_status_probe import (
     _run_device_trashcan_cleanup,
 )
 from boxer_company.routers.device_update import (
+    _agent_installer_release_valid,
+    _merge_device_snapshot,
     _describe_agent_box_update_gate,
     _query_device_update_status,
     _request_device_agent_update,
@@ -22,6 +24,7 @@ from boxer_company.routers.device_update import (
     _request_device_power_off,
     _resolve_agent_runtime_version,
 )
+from boxer_company.routers.mda_graphql import _get_mda_device_detail
 
 _DAILY_DEVICE_ROUND_TITLE = "마미박스 일일 순회 업데이트"
 _DAILY_DEVICE_ROUND_COMPONENT_NAMES = {
@@ -350,6 +353,10 @@ def _daily_device_round_status_label(status_payload: dict[str, Any]) -> str:
     ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
     if not ssh_payload.get("ready"):
         return "점검 불가"
+    if status_payload.get("agentOnly"):
+        if (status_payload.get("device") or {}).get("isConnected") is False:
+            return "확인 필요"
+        return "정상" if (status_payload.get("overview", {}).get("pm2") or {}).get("status") == "pass" else "확인 필요"
 
     overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
     worst_rank = 0
@@ -379,7 +386,7 @@ def _format_daily_device_round_component_names(keys: list[str]) -> str:
 def _build_daily_device_round_priority(status_payload: dict[str, Any]) -> dict[str, Any]:
     maintenance_only = (
         _display_value(status_payload.get("route"), default="")
-        == "daily_device_round_maintenance_probe"
+        in {"daily_device_round_maintenance_probe", "daily_device_round_agent_probe"}
     )
     ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
     if not ssh_payload.get("ready"):
@@ -394,6 +401,10 @@ def _build_daily_device_round_priority(status_payload: dict[str, Any]) -> dict[s
                 else "네트워크 연결 불가로 이상 징후 판단 보류"
             ),
         }
+
+    if status_payload.get("agentOnly"):
+        return {"eligible": True, "score": 0, "label": "정상",
+                "reason": "에이전트 전용 순회로 용량 점검 생략"}
 
     overview = status_payload.get("overview") if isinstance(status_payload.get("overview"), dict) else {}
     failed_keys: list[str] = []
@@ -492,24 +503,37 @@ def _normalize_daily_device_round_maintenance_storage_summary(storage_summary: d
     return normalized
 
 
-def _build_daily_device_round_maintenance_status(device_name: str) -> tuple[str, dict[str, Any]]:
+def _build_daily_device_round_maintenance_status(
+    device_name: str,
+    *,
+    agent_runtime: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명이 비어 있어")
 
     # 야간 순회는 이상 감지와 분리됐으므로 업데이트/용량 정리에 필요한 스토리지 근거만 수집해.
-    status_payload, _device_info, checks = _collect_runtime_checks(normalized_device_name, "storage")
-    status_payload["route"] = "daily_device_round_maintenance_probe"
-    status_payload["source"] = "mda_graphql+ssh_storage_commands"
+    if agent_runtime is None:
+        status_payload, _device_info, checks = _collect_runtime_checks(normalized_device_name, "storage")
+    else:
+        # 전용 순회와 오프라인 단락은 기존 보고서 구조를 쓰되 미점검을 정상 용량으로 표시하지 않는다.
+        status_payload = {"device": agent_runtime.get("device", {}), "ssh": agent_runtime.get("ssh", {}),
+                          "agentOnly": True}
+        checks = {}
+    status_payload["route"] = "daily_device_round_maintenance_probe" if agent_runtime is None else "daily_device_round_agent_probe"
+    status_payload["source"] = "mda_graphql+ssh_storage_commands" if agent_runtime is None else "mda_graphql+agent_runtime"
     status_payload["request"] = {
         "deviceName": normalized_device_name,
-        "component": "storage",
-        "purpose": "nightly_update_and_cleanup",
+        "component": "storage" if agent_runtime is None else "agent",
+        "purpose": "nightly_update_and_cleanup" if agent_runtime is None else "nightly_agent_update",
     }
     status_payload["checks"] = checks
 
     ssh_payload = status_payload.get("ssh") if isinstance(status_payload.get("ssh"), dict) else {}
-    if ssh_payload.get("ready"):
+    if agent_runtime is not None and ssh_payload.get("ready"):
+        storage_summary = {"status": "pass", "label": "미점검", "diskLabel": "미점검",
+                           "trashcanLabel": "미점검", "summary": "에이전트 전용 순회로 용량 점검 생략"}
+    elif ssh_payload.get("ready"):
         storage_summary = _normalize_daily_device_round_maintenance_storage_summary(
             _build_trashcan_storage_summary_from_checks(
                 checks,
@@ -521,6 +545,8 @@ def _build_daily_device_round_maintenance_status(device_name: str) -> tuple[str,
         storage_summary = _build_daily_device_round_storage_unavailable_summary(status_payload)
 
     skipped_summary = _build_daily_device_round_skipped_component_summary()
+    if agent_runtime is not None:
+        skipped_summary = {"status": "pass", "label": "미점검", "summary": "에이전트 전용 순회로 점검 생략"}
     status_payload["overview"] = {
         "audio": dict(skipped_summary),
         "pm2": dict(skipped_summary),
@@ -528,6 +554,11 @@ def _build_daily_device_round_maintenance_status(device_name: str) -> tuple[str,
         "captureboard": dict(skipped_summary),
         "led": dict(skipped_summary),
     }
+    if agent_runtime is not None:
+        online = (agent_runtime.get("process") or {}).get("status") == "online"
+        status_payload["overview"]["pm2"] = {
+            "status": "pass" if online else "check_needed", "label": "정상" if online else "확인 필요",
+        }
 
     storage_label = _display_value(storage_summary.get("label"), default="확인 필요")
     storage_detail = _display_value(
@@ -535,6 +566,8 @@ def _build_daily_device_round_maintenance_status(device_name: str) -> tuple[str,
         default=_display_value(storage_summary.get("overviewDetail"), default=storage_summary.get("summary")),
     )
     status_text = f"*야간 순회 유지보수 점검*\n• 장비: `{normalized_device_name}`\n• 용량: *{storage_label}*"
+    if agent_runtime is not None:
+        status_text = f"*야간 에이전트 순회 점검*\n• 장비: `{normalized_device_name}`\n• 용량: 점검 생략"
     if storage_detail:
         status_text = f"{status_text} | {storage_detail}"
     return status_text, status_payload
@@ -553,6 +586,7 @@ def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dic
     agent_repo = agent_runtime.get("repo") if isinstance(agent_runtime.get("repo"), dict) else {}
     agent_process = agent_runtime.get("process") if isinstance(agent_runtime.get("process"), dict) else {}
     device_connected = bool(device_payload.get("isConnected"))
+    ssh_unavailable = (agent_runtime.get("ssh") or {}).get("ready") is False
 
     current_box_version = _display_value(
         box_process.get("version"),
@@ -569,14 +603,16 @@ def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dic
     agent_box_ready = bool(agent_gate.get("ok"))
     # agent는 항상 origin/main 기준 최신 checkout을 유지해야 한다. 그래서 PM2가 online이고
     # 박스 업데이트 최소 버전을 만족해도, repo 최신 여부가 확인되지 않으면 업데이트 대상으로 둔다.
-    agent_healthy = bool(device_connected and agent_runtime_status == "online" and agent_box_ready)
+    agent_healthy = bool(device_connected and not ssh_unavailable and agent_runtime_status == "online" and agent_box_ready)
     agent_latest = bool(agent_healthy and agent_repo_confirmed_latest)
-    agent_should_update = bool(device_connected and (not agent_healthy or agent_repo_needs_update))
+    agent_should_update = bool(device_connected and not ssh_unavailable and (not agent_healthy or agent_repo_needs_update))
     box_already_latest = bool(latest_box_version and current_box_version == latest_box_version)
     agent_gate_version = _display_value(agent_gate.get("version"), default="")
 
     if not device_connected:
         agent_reason = "장비 agent 연결 끊김"
+    elif ssh_unavailable:
+        agent_reason = "SSH 연결 불가로 에이전트 업데이트 판단 보류"
     elif agent_runtime_status != "online":
         agent_reason = (
             f"에이전트 {current_agent_version} 실행 상태 확인 필요"
@@ -629,10 +665,34 @@ def _build_daily_device_round_update_plan(update_payload: dict[str, Any]) -> dic
             "alreadyLatest": box_already_latest,
             "gateOk": bool(agent_gate.get("ok")),
             "shouldUpdate": bool(device_connected and latest_box_version and not box_already_latest and agent_gate.get("ok")),
-            "reason": box_reason,
+            "reason": "앱 업데이트 점검 생략" if update_payload.get("agentOnly") else box_reason,
             "runtimeStatus": _display_value(box_process.get("status"), default=""),
         },
     }
+
+
+def _reuse_daily_agent_update_status(
+    update_payload: dict[str, Any], result_payload: dict[str, Any],
+) -> dict[str, Any]:
+    # 에이전트 작업은 앱을 바꾸지 않는다. 기존 앱 근거와 같은 요청의 최종 런타임을 합친다.
+    wait = result_payload.get("wait") or {}
+    runtime = wait.get("runtime") or result_payload.get("precheck") or update_payload.get("agentRuntime") or {}
+    runtime = dict(runtime)
+    receipt = wait.get("installer") or {}
+    # 설치 확정과 현재 repo 최신 여부는 서로 다른 근거다. 영수증으로 실제 관측값을 만들지 않는다.
+    confirmed = bool(wait.get("ok") and receipt.get("phase") in {"committed", "already_latest"}
+                     and _agent_installer_release_valid(receipt))
+    dispatch = result_payload.get("dispatch") or {}
+    if (dispatch.get("ssh") or {}).get("ready") is False:
+        runtime["ssh"] = dict(dispatch["ssh"])
+    device = dict(update_payload.get("device") or {})
+    device_name = device.get("deviceName") or (runtime.get("device") or {}).get("deviceName")
+    for observed in ((result_payload.get("precheck") or {}).get("device"), result_payload.get("device"),
+                     (wait.get("runtime") or {}).get("device")):
+        if observed is not None:
+            device = _merge_device_snapshot(device_name, device, observed)
+    return {**update_payload, "device": device, "agentRuntime": runtime, "agentGate": _describe_agent_box_update_gate(runtime),
+            "agentUpdateReceipt": receipt if confirmed else {}}
 
 
 def _build_daily_device_round_action_result(
@@ -647,6 +707,11 @@ def _build_daily_device_round_action_result(
     if not status:
         status = "dispatch_failed" if dispatch_payload and not dispatch_payload.get("status") else "not_requested"
     ok = bool(wait_payload.get("ok")) or status == "already_latest"
+    receipt = wait_payload.get("installer") or {}
+    confirmed_version = (
+        receipt["version"] if ok and receipt.get("phase") in {"committed", "already_latest"}
+        and _agent_installer_release_valid(receipt) else ""
+    )
     return {
         "route": route,
         "text": result_text,
@@ -654,6 +719,7 @@ def _build_daily_device_round_action_result(
         "dispatchStatus": bool(dispatch_payload.get("status")),
         "status": status,
         "ok": ok,
+        "confirmedVersion": confirmed_version,
     }
 
 
@@ -786,6 +852,8 @@ def _describe_daily_device_round_route_summary(
         if action:
             status = _display_value(action.get("status"), default="")
             if status in {"completed", "already_latest"} and action.get("ok"):
+                if action.get("confirmedVersion"):
+                    return "success", "업데이트 완료", f"설치 확정 버전 `{action['confirmedVersion']}`"
                 if previous_version and current_version and previous_version != current_version:
                     return "success", "업데이트 완료", f"`{previous_version}` -> `{current_version}`"
                 return "success", "업데이트 완료", f"버전 `{current_version or '미확인'}`"
@@ -1181,7 +1249,17 @@ def _run_daily_device_round_for_device(
     auto_cleanup_trashcan: bool = False,
     auto_power_off: bool = False,
 ) -> dict[str, Any]:
-    status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
+    device_info = _get_mda_device_detail(device_name) or {}
+    agent_only = auto_update_agent and not (auto_update_box or auto_cleanup_trashcan or auto_power_off)
+    if agent_only or not device_info.get("isConnected"):
+        update_status_text, update_status_payload = _query_device_update_status(
+            device_name, agent_only=agent_only, device_info=device_info,
+        )
+        status_text, status_payload = _build_daily_device_round_maintenance_status(
+            device_name, agent_runtime=update_status_payload.get("agentRuntime") or {},
+        )
+    else:
+        status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
     trashcan_cleanup = _run_device_trashcan_cleanup(
         status_payload,
         execute=auto_cleanup_trashcan,
@@ -1191,7 +1269,11 @@ def _run_daily_device_round_for_device(
     if trashcan_cleanup.get("executed"):
         status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
 
-    update_status_text, update_status_payload = _query_device_update_status(device_name)
+    if not agent_only and device_info.get("isConnected"):
+        update_status_text, update_status_payload = _query_device_update_status(
+            device_name, device_info=device_info,
+            unavailable_ssh=None if (status_payload.get("ssh") or {}).get("ready") else status_payload.get("ssh") or {"ready": False},
+        )
     initial_update_status_text = update_status_text
     initial_plan = _build_daily_device_round_update_plan(update_status_payload)
 
@@ -1200,12 +1282,19 @@ def _run_daily_device_round_for_device(
         agent_text, agent_payload = _request_device_agent_update(
             f"{device_name} 에이전트 업데이트",
             device_name=device_name,
+            prechecked_runtime=update_status_payload.get("agentRuntime"),
         )
-        agent_action = _build_daily_device_round_action_result(
-            result_text=agent_text,
-            result_payload=agent_payload,
-        )
-        update_status_text, update_status_payload = _query_device_update_status(device_name)
+        dispatch = agent_payload.get("dispatch") or {}
+        if dispatch and (dispatch.get("ssh") or {}).get("ready") is not False:
+            agent_action = _build_daily_device_round_action_result(result_text=agent_text, result_payload=agent_payload)
+        if agent_only:
+            update_status_payload = _reuse_daily_agent_update_status(update_status_payload, agent_payload)
+            update_status_text = agent_text
+            status_text, status_payload = _build_daily_device_round_maintenance_status(
+                device_name, agent_runtime={**update_status_payload["agentRuntime"], "device": update_status_payload["device"]},
+            )
+        else:
+            update_status_text, update_status_payload = _query_device_update_status(device_name)
 
     box_plan = _build_daily_device_round_update_plan(update_status_payload)
     box_action = None

@@ -47,7 +47,7 @@ _PRESENTATION_VERSION_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
 )
 _DAILY_STATUS_LABELS = frozenset(
-    {"정상", "확인 필요", "이상", "점검 불가"}
+    {"정상", "확인 필요", "이상", "점검 불가", "미점검"}
 )
 _DAILY_COMPONENT_NAMES = {
     "audio": "오디오",
@@ -885,7 +885,8 @@ def _project_daily_update_presentation(
 
     if action:
         if ok and status in {"completed", "already_latest"}:
-            summary = _build_daily_version_summary(
+            confirmed = _safe_presentation_version(action.get("confirmedVersion")) if route_kind == "agent" else ""
+            summary = f"설치 확정 버전 `{confirmed}`" if confirmed else _build_daily_version_summary(
                 previous_version,
                 final_version,
             )

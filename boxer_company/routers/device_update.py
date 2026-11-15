@@ -18,7 +18,7 @@ from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.device_ssh_security import (
     _mark_company_api_mutation_attempted,
 )
-from boxer_company.routers.device_status_probe import _parse_pm2_processes
+from boxer_company.routers.device_status_probe import _connect_runtime_probe, _parse_pm2_processes
 from boxer_company.routers.mda_graphql import (
     _get_mda_device_agent_ssh,
     _get_mda_device_detail,
@@ -183,6 +183,16 @@ def _build_device_snapshot(device_name: str, device_info: dict[str, Any] | None)
         "roomName": _display_value(info.get("roomName"), default=""),
         "isConnected": bool(info.get("isConnected")),
     }
+
+
+def _merge_device_snapshot(
+    device_name: str, current: dict[str, Any], observed: Any,
+) -> dict[str, Any]:
+    # 같은 장비에서 실제로 읽은 bool 연결 상태만 이전 스냅샷보다 우선한다.
+    if (not isinstance(observed, dict) or observed.get("deviceName") != device_name
+            or type(observed.get("isConnected")) is not bool):
+        raise ValueError("사전 확인한 장비 정보가 조회 대상과 달라")
+    return {**current, **observed}
 
 
 def _connection_label(is_connected: bool) -> str:
@@ -465,12 +475,17 @@ def _read_agent_runtime_state(
     resend_ssh_open: bool = True,
     ssh_open_budget: _DeviceSshOpenBudget | None = None,
     update_request_id: str | None = None,
+    recover_stale_ssh: bool = False,
 ) -> dict[str, Any]:
-    device_info, ssh_state, client = _open_device_ssh_for_update(
-        device_name,
-        resend_ssh_open=resend_ssh_open,
-        ssh_open_budget=ssh_open_budget,
-    )
+    if recover_stale_ssh:
+        # 전용 순회도 기존 스토리지 점검과 같은 터널 복구와 활성 연결 보호를 유지한다.
+        probe, device_info, connection = _connect_runtime_probe(device_name, "agent", resend_ssh_open=resend_ssh_open)
+        ssh_state = probe.get("ssh") or {"ready": False, "reason": "ssh_not_ready"}
+        client = connection.get("client") if connection.get("ok") else None
+    else:
+        device_info, ssh_state, client = _open_device_ssh_for_update(
+            device_name, resend_ssh_open=resend_ssh_open, ssh_open_budget=ssh_open_budget,
+        )
     state: dict[str, Any] = {
         "device": _build_device_snapshot(device_name, device_info),
         "ssh": ssh_state,
@@ -491,6 +506,24 @@ def _read_agent_runtime_state(
         return state
 
     try:
+        if isinstance(update_request_id, str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(update_request_id):
+            # 완료 poll은 영수증부터 읽는다. 준비 중에는 PM2와 Git 조회를 반복하지 않는다.
+            installer_result = _run_remote_ssh_command(
+                client,
+                command=_AGENT_INSTALLER_STATUS_COMMAND + update_request_id,
+                timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+            )
+            state["installerCommand"] = installer_result
+            installer = _parse_agent_installer_response(installer_result.get("output", "")) if installer_result.get("ok") else None
+            state["installer"] = installer
+            matching = isinstance(installer, dict) and installer.get("request") == update_request_id
+            phase = installer.get("phase") if matching and isinstance(installer.get("phase"), str) else ""
+            terminal = matching and (
+                phase in {"rolled_back", "failed", "rollback_failed", "prepare_failed"}
+                or phase in {"committed", "already_latest"} and _agent_installer_release_valid(installer)
+            )
+            if not terminal:
+                return state
         pm2_result = _run_remote_ssh_command(
             client,
             command=_PM2_JLIST_COMMAND,
@@ -501,17 +534,7 @@ def _read_agent_runtime_state(
             command=_AGENT_GIT_STATUS_COMMAND,
             timeout_sec=max(20, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
         )
-        if isinstance(update_request_id, str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(update_request_id):
-            # 기존 SSH 연결 안에서 조회해 추가 reverse SSH open을 만들지 않는다.
-            installer_result = _run_remote_ssh_command(
-                client,
-                command=_AGENT_INSTALLER_STATUS_COMMAND + update_request_id,
-                timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
-            )
-            state["installerCommand"] = installer_result
-            if installer_result.get("ok"):
-                state["installer"] = _parse_agent_installer_response(installer_result.get("output", ""))
-        elif update_request_id is None:
+        if update_request_id is None:
             # 요청 ID가 없는 재조회도 같은 SSH 연결에서 활성 설치 요청을 확인한다.
             installer_result = _run_remote_ssh_command(
                 client,
@@ -1241,12 +1264,17 @@ def _request_device_agent_update(
     on_dispatched: _DeviceUpdateDispatchNoticeFn | None = None,
     *,
     resend_ssh_open: bool = True,
+    prechecked_runtime: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     normalized_device_name = _resolve_update_device_name(question, device_name)
     if _extract_requested_update_version(question):
         raise ValueError("에이전트 업데이트는 최신만 지원해. 예: `MB2-C00419 에이전트 업데이트`")
 
-    device_info = _get_mda_device_detail(normalized_device_name)
+    # 순회가 방금 확인한 같은 장비의 결과만 재사용하며 수동 요청의 기본 조회는 유지한다.
+    if prechecked_runtime is not None:
+        device_info = _merge_device_snapshot(normalized_device_name, {}, prechecked_runtime.get("device"))
+    else:
+        device_info = _get_mda_device_detail(normalized_device_name)
     snapshot = _build_device_snapshot(normalized_device_name, device_info)
     # 재전송 제한 호출만 precheck·dispatch·poll을 한 open 예산으로 묶는다.
     ssh_open_budget = (
@@ -1260,9 +1288,8 @@ def _request_device_agent_update(
             "ssh_open_budget": ssh_open_budget,
         }
     )
-    precheck_runtime = _read_agent_runtime_state(
-        normalized_device_name,
-        **ssh_options,
+    precheck_runtime = prechecked_runtime if prechecked_runtime is not None else _read_agent_runtime_state(
+        normalized_device_name, **ssh_options,
     )
     payload: dict[str, Any] = {
         "route": "device_agent_update",
@@ -1305,6 +1332,11 @@ def _request_device_agent_update(
         lines.append("• 안내: 장비 agent 연결이 끊겨 있어. 장비 온라인 상태를 먼저 확인해")
         return "\n".join(lines), payload
 
+    if prechecked_runtime is not None and not (precheck_runtime.get("ssh") or {}).get("ready"):
+        lines.append("• 결과: *판단 보류*")
+        lines.append("• 안내: 앞선 SSH 연결 확인이 실패해 설치 요청을 보내지 않았어")
+        return "\n".join(lines), payload
+
     dispatch_result = _dispatch_device_agent_install_script(
         normalized_device_name,
         **ssh_options,
@@ -1338,7 +1370,7 @@ def _request_device_agent_update(
     lines.append(f"• 설치 요청: `{_display_value(dispatch_result.get('requestId'), default='미확인')}`")
     lines.append(f"• 공통 설치기 상태: `{_display_value(installer.get('phase'), default='확정 대기 중')}`")
     lines.append(
-        f"• SSH 완료 확인: `{_format_pm2_process_line(wait_runtime.get('process'), 'mommybox-agent 미감지')}`"
+        f"• SSH 완료 확인: `{_format_pm2_process_line(wait_runtime.get('process'), 'mommybox-agent 상태 미확인' if 'pm2' not in wait_runtime else 'mommybox-agent 미감지')}`"
     )
     lines.append(f"• 에이전트 repo 완료 확인: `{_format_agent_repo_line(wait_repo)}`")
     if wait_result.get("ok"):
@@ -1498,13 +1530,21 @@ def _query_device_update_status(
     device_name: str,
     *,
     resend_ssh_open: bool = True,
+    agent_only: bool = False,
+    device_info: dict[str, Any] | None = None,
+    unavailable_ssh: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     normalized_device_name = str(device_name or "").strip()
     if not normalized_device_name:
         raise ValueError("장비명을 같이 입력해줘. 예: `MB2-C00419 업데이트 상태`")
 
-    device_info = _get_mda_device_detail(normalized_device_name)
-    latest_device_version = _get_mda_latest_device_version()
+    nightly = device_info is not None
+    if nightly:
+        device_info = _merge_device_snapshot(normalized_device_name, {}, device_info)
+    device_info = device_info if nightly else _get_mda_device_detail(normalized_device_name)
+    if nightly and not bool((device_info or {}).get("isConnected")):
+        unavailable_ssh = {"ready": False, "reason": "device_offline"}
+    latest_device_version = {} if agent_only or unavailable_ssh is not None else _get_mda_latest_device_version()
     latest_version = _display_value(latest_device_version.get("versionName"), default="")
     # 재전송 제한 호출만 두 runtime 조회가 한 open 예산을 공유한다.
     ssh_open_budget = (
@@ -1518,14 +1558,23 @@ def _query_device_update_status(
             "ssh_open_budget": ssh_open_budget,
         }
     )
-    box_runtime = _read_box_runtime_state(
-        normalized_device_name,
-        **ssh_options,
-    )
-    agent_runtime = _read_agent_runtime_state(
-        normalized_device_name,
-        **ssh_options,
-    )
+    box_runtime: dict[str, Any] = {}
+    if unavailable_ssh is None and not agent_only:
+        box_runtime = _read_box_runtime_state(normalized_device_name, **ssh_options)
+        if nightly and not (box_runtime.get("ssh") or {}).get("ready"):
+            unavailable_ssh = box_runtime.get("ssh") or {"ready": False, "reason": "ssh_not_ready"}
+    if unavailable_ssh is not None:
+        # 순회의 첫 실패 뒤에는 같은 장비의 SSH 개방과 60초 대기를 반복하지 않는다.
+        agent_runtime = {"device": _build_device_snapshot(normalized_device_name, device_info),
+                         "ssh": dict(unavailable_ssh), "process": None,
+                         "repo": {"available": False, "reason": "ssh_not_ready", "latest": False}}
+    else:
+        agent_runtime = _read_agent_runtime_state(
+            normalized_device_name,
+            **({**ssh_options, "recover_stale_ssh": True} if nightly and agent_only else ssh_options),
+        )
+    if nightly and agent_only and agent_runtime.get("device") is not None:
+        device_info = _merge_device_snapshot(normalized_device_name, device_info, agent_runtime["device"])
     agent_gate = _describe_agent_box_update_gate(agent_runtime)
     payload = {
         "route": "device_update_status",
@@ -1538,6 +1587,7 @@ def _query_device_update_status(
         "boxRuntime": box_runtime,
         "agentRuntime": agent_runtime,
         "agentGate": agent_gate,
+        "agentOnly": agent_only,
     }
     return (
         _render_device_update_status_result(

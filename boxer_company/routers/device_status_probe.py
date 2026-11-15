@@ -3072,14 +3072,15 @@ def _connect_runtime_ssh_endpoint(
     return agent_ssh, _connect_device_ssh_client(host, port)
 
 
-def _collect_runtime_checks(
+def _connect_runtime_probe(
     device_name: str,
     component: str,
     *,
     resend_ssh_open: bool = True,
     allow_force_reopen: bool = True,
     network_window: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    # 성공한 client는 호출자가 기존 추적 래퍼의 close까지 책임진다.
     evidence_payload, device_info = _build_runtime_probe_payload(
         device_name=device_name,
         component=component,
@@ -3088,7 +3089,7 @@ def _collect_runtime_checks(
     if network_window is not None:
         evidence_payload["networkWindow"] = dict(network_window)
     if not evidence_payload["ssh"]["ready"]:
-        return evidence_payload, device_info, {}
+        return evidence_payload, device_info, {"ok": False}
 
     agent_ssh, connection = _connect_runtime_ssh_endpoint(evidence_payload)
     retry_attempted = False
@@ -3243,7 +3244,7 @@ def _collect_runtime_checks(
             final_reason,
             retry_attempted,
         )
-        return evidence_payload, device_info, {}
+        return evidence_payload, device_info, {"ok": False}
 
     if retry_attempted:
         evidence_payload["ssh"] = {
@@ -3260,6 +3261,24 @@ def _collect_runtime_checks(
             device_name,
             bool(agent_ssh.get("forceReopened")),
         )
+
+    return evidence_payload, device_info, connection
+
+
+def _collect_runtime_checks(
+    device_name: str,
+    component: str,
+    *,
+    resend_ssh_open: bool = True,
+    allow_force_reopen: bool = True,
+    network_window: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    evidence_payload, device_info, connection = _connect_runtime_probe(
+        device_name, component, resend_ssh_open=resend_ssh_open,
+        allow_force_reopen=allow_force_reopen, network_window=network_window,
+    )
+    if not connection.get("ok"):
+        return evidence_payload, device_info, {}
 
     client = connection["client"]
     keys = _PROBE_COMPONENT_COMMAND_KEYS[component]
