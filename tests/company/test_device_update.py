@@ -1,3 +1,5 @@
+import json
+import shlex
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -10,14 +12,22 @@ from boxer_company.operation_routing import (
 )
 from boxer_company.routers.device_update import (
     _AGENT_GIT_STATUS_COMMAND,
-    _DeviceSshOpenBudget,
+    _AGENT_INSTALL_SCRIPT_COMMAND,
+    _AGENT_INSTALLER_ACTIVE_STATUS_COMMAND,
+    _AGENT_INSTALLER_CLI,
+    _AGENT_INSTALLER_SETUP_COMMAND,
     _build_device_update_activity_input,
+    _DeviceSshOpenBudget,
+    _dispatch_device_agent_install_script,
     _parse_agent_repo_state,
     _query_device_update_status,
+    _read_agent_runtime_state,
+    _render_device_update_status_result,
     _request_device_agent_update,
     _request_device_box_update,
     _request_device_power_off,
     _run_remote_ssh_command,
+    _wait_for_agent_update_completion,
     _wait_for_device_update_ssh,
 )
 
@@ -358,12 +368,14 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "최신만 지원"):
             _request_device_box_update("MB2-C00419 박스 업데이트 2.11.296")
 
+    @patch("boxer_company.routers.device_update._dispatch_device_agent_install_script")
     @patch("boxer_company.routers.device_update._read_agent_runtime_state")
     @patch("boxer_company.routers.device_update._get_mda_device_detail")
-    def test_skips_agent_dispatch_when_already_latest(
+    def test_delegates_latest_check_to_common_installer(
         self,
         mock_get_device_detail,
         mock_read_agent_runtime_state,
+        mock_dispatch,
     ) -> None:
         mock_get_device_detail.return_value = {
             "deviceName": "MB2-C00419",
@@ -390,12 +402,17 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             },
         }
 
+        mock_dispatch.return_value = {
+            "status": True, "phase": "already_latest",
+            "receipt": {"phase": "already_latest", "version": "2.0.3", "revision": "b" * 40},
+        }
         result_text, payload = _request_device_agent_update("MB2-C00419 에이전트 업데이트")
 
         self.assertIn("생략", result_text)
         self.assertIn("이미 최신", result_text)
         self.assertEqual(payload["wait"]["status"], "already_latest")
-        self.assertIsNone(payload["dispatch"])
+        mock_dispatch.assert_called_once_with("MB2-C00419")
+        self.assertIsNotNone(payload["dispatch"])
 
     def test_rejects_explicit_agent_version_request(self) -> None:
         with self.assertRaisesRegex(ValueError, "최신만 지원"):
@@ -441,10 +458,13 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             "status": True,
             "message": "install-agent 스크립트 실행 완료",
             "method": "ssh_install_script",
+            "phase": "queued",
+            "requestId": "a" * 32,
         }
         mock_wait_for_agent_update_completion.return_value = {
             "ok": True,
             "status": "completed",
+            "installer": {"request": "a" * 32, "phase": "committed", "version": "2.0.3", "revision": "b" * 40},
             "runtime": {
                 "process": {
                     "name": "mommybox-v2-agent",
@@ -479,11 +499,12 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         mock_wait_for_agent_update_completion.assert_called_once_with(
             "MB2-C00819",
             baseline_runtime=mock_read_agent_runtime_state.return_value,
+            update_request_id="a" * 32,
             resend_ssh_open=False,
             ssh_open_budget=agent_budget,
         )
-        self.assertIn("install-agent.sh -f 1", result_text)
-        self.assertIn("SSH 스크립트", result_text)
+        self.assertIn("safe_agent.js update --version latest", result_text)
+        self.assertIn("공통 설치기", result_text)
         self.assertEqual(payload["dispatch"]["method"], "ssh_install_script")
         self.assertEqual(payload["source"], "mda_graphql+ssh_install_script")
 
@@ -527,6 +548,8 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
             "status": True,
             "message": "install-agent 스크립트 실행 완료",
             "method": "ssh_install_script",
+            "phase": "queued",
+            "requestId": "a" * 32,
         }
         mock_wait_for_agent_update_completion.return_value = {
             "ok": True,
@@ -595,6 +618,8 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
                 "packageVersion": "1.2.0",
                 "latest": True,
             },
+            "installer": {"request": "a" * 32, "phase": "rolled_back", "error": "ssh_verification_failed"},
+            "installerStatus": {"available": True, "reason": "ready"},
         }
 
         result_text, payload = _query_device_update_status(
@@ -606,6 +631,9 @@ class DeviceUpdateExecutionTests(unittest.TestCase):
         self.assertIn("최신 박스 버전", result_text)
         self.assertIn("에이전트 repo 상태", result_text)
         self.assertIn("박스 업데이트 선행조건", result_text)
+        self.assertIn("자동 업데이트 요청: `" + "a" * 32 + "`", result_text)
+        self.assertIn("자동 업데이트 상태: `rolled_back`", result_text)
+        self.assertIn("설치기 오류: `ssh_verification_failed`", result_text)
         self.assertEqual(payload["route"], "device_update_status")
         self.assertEqual(payload["latestVersion"], "2.11.302")
         self.assertFalse(payload["agentGate"]["ok"])
@@ -742,7 +770,367 @@ class _NeverReadySshClient:
         return None, stdout, stderr
 
 
+class AgentInstallerContractTests(unittest.TestCase):
+    REQUEST = "a" * 32
+    REVISION = "b" * 40
+
+    def setUp(self) -> None:
+        password = patch("boxer_company.routers.device_update.cs.DEVICE_SSH_PASSWORD", "synthetic-setup-password")
+        password.start()
+        self.addCleanup(password.stop)
+
+    @staticmethod
+    def ready() -> dict:
+        return {"ok": True, "exitStatus": 0, "output": json.dumps({"phase": "idle", "setupReady": True})}
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_dispatch_accepts_only_valid_common_installer_receipts(self, mock_open, mock_run) -> None:
+        # 프로세스 실행 성공과 업데이트 접수 성공은 다르다. 기존 텍스트 응답도 거부한다.
+        cases = [
+            ({"accepted": True, "request": self.REQUEST, "phase": "queued"}, True, 1),
+            ({"accepted": True, "request": "not-a-request", "phase": "queued"}, False, 0),
+            ({"accepted": False, "request": self.REQUEST, "phase": "queued"}, False, 0),
+            ({"accepted": True, "request": self.REQUEST, "phase": "committed"}, False, 0),
+            ({"accepted": False, "needsUpdate": False, "phase": "already_latest", "version": "2.0.3", "revision": self.REVISION}, True, 0),
+            ({"accepted": False, "needsUpdate": False, "phase": "already_latest", "version": "2.0.3", "revision": "short"}, False, 0),
+            ("install-agent 스크립트 실행 완료", False, 0),
+            ([], False, 0),
+        ]
+        for receipt, expected, affected in cases:
+            with self.subTest(receipt=receipt):
+                client = MagicMock()
+                mock_open.return_value = ({"deviceName": "MB2-U00044"}, {"ready": True}, client)
+                mock_run.side_effect = [self.ready(), {"ok": True, "exitStatus": 0, "output": json.dumps(receipt)}]
+                result = _dispatch_device_agent_install_script("MB2-U00044")
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(result["affected"], affected)
+                client.close.assert_called_once()
+                self.assertTrue(mock_run.call_args.kwargs["mutation"])
+                if affected:
+                    self.assertEqual(result["requestId"], self.REQUEST)
+                    self.assertIn("확정 대기", result["message"])
+                    self.assertNotIn("완료", result["message"])
+        mock_run.side_effect = [self.ready(), {"ok": False, "exitStatus": 1, "reason": "ssh_exit_1", "output": json.dumps(cases[0][0])}]
+        self.assertFalse(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+        for malformed in ["{broken", json.dumps(cases[0][0]) + "\nwarning"]:
+            mock_run.side_effect = [self.ready(), {"ok": True, "exitStatus": 0, "output": malformed}]
+            self.assertFalse(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+        self.assertEqual(_AGENT_INSTALL_SCRIPT_COMMAND, "LC_ALL=C sudo -n -- /usr/bin/node " + _AGENT_INSTALLER_CLI + " update --version latest")
+        self.assertNotIn("--force", _AGENT_INSTALL_SCRIPT_COMMAND)
+
+    def test_setup_executes_only_root_owned_download_with_fixed_environment(self) -> None:
+        shell = shlex.split(_AGENT_INSTALLER_SETUP_COMMAND)
+        self.assertEqual(shell[:-1], ["LC_ALL=C", "sudo", "-S", "-p", "", "--", "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "/bin/bash", "-c"])
+        self.assertIn('umask 077; BOXER_AGENT_INSTALLER_DIR="$(mktemp -d /tmp/boxer-agent-installer.XXXXXXXX)"', shell[-1])
+        self.assertIn('trap \'find "$BOXER_AGENT_INSTALLER_DIR" -depth -delete\' EXIT', shell[-1])
+        self.assertIn('bash "$BOXER_AGENT_INSTALLER_DIR/install-agent.sh" --safe setup', shell[-1])
+        self.assertIn("https://mommybox-release.s3.ap-northeast-2.amazonaws.com/agent/installer/install-agent.sh", shell[-1])
+        self.assertNotIn("synthetic-setup-password", _AGENT_INSTALLER_SETUP_COMMAND)
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_initial_setup_then_update_once_on_same_connection(self, mock_open, mock_run) -> None:
+        setup = {"ok": True, "exitStatus": 0, "output": json.dumps({"phase": "ready", "setupReady": True, "cli": _AGENT_INSTALLER_CLI})}
+        accepted = {"ok": True, "exitStatus": 0, "output": json.dumps({"accepted": True, "phase": "queued", "request": self.REQUEST})}
+        preflights = [
+            {"ok": True, "exitStatus": 0, "output": '{"installerMissing":true}'},
+            {"ok": True, "exitStatus": 0, "output": '{"phase":"idle"}'},
+            {"ok": True, "exitStatus": 0, "output": '{"phase":"idle","setupReady":false}'},
+            {"ok": False, "exitStatus": 1, "reason": "ssh_exit_1", "output": "sudo: a password is required"},
+        ]
+        for preflight in preflights:
+            with self.subTest(preflight=preflight):
+                mock_open.reset_mock()
+                mock_run.reset_mock()
+                client = MagicMock()
+                mock_open.return_value = ({}, {"ready": True}, client)
+                mock_run.side_effect = [preflight, setup, accepted]
+                budget = _DeviceSshOpenBudget()
+                result = _dispatch_device_agent_install_script("MB2-U00044", resend_ssh_open=False, ssh_open_budget=budget)
+                self.assertTrue(result["status"])
+                self.assertEqual(result["requestId"], self.REQUEST)
+                mock_open.assert_called_once_with("MB2-U00044", resend_ssh_open=False, ssh_open_budget=budget)
+                calls = mock_run.call_args_list
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(all(call.args[0] is client for call in calls))
+                self.assertEqual([call.kwargs["command"] for call in calls], [_AGENT_INSTALLER_ACTIVE_STATUS_COMMAND, _AGENT_INSTALLER_SETUP_COMMAND, _AGENT_INSTALL_SCRIPT_COMMAND])
+                self.assertNotIn("mutation", calls[0].kwargs)
+                self.assertEqual(calls[1].kwargs["stdin_text"], "synthetic-setup-password\n")
+                self.assertTrue(calls[1].kwargs["mutation"])
+                self.assertTrue(calls[2].kwargs["mutation"])
+                self.assertNotIn("stdin_text", calls[2].kwargs)
+                self.assertNotIn("synthetic-setup-password", str(result))
+                client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_ambiguous_preflight_never_mutates(self, mock_open, mock_run) -> None:
+        cases = [
+            {"ok": False, "exitStatus": None, "reason": "timeout", "output": ""},
+            {"ok": False, "exitStatus": None, "output": "sudo: a password is required"},
+            {"ok": False, "exitStatus": 1, "reason": "timeout", "output": "sudo: a password is required"},
+            {"ok": True, "exitStatus": 0, "output": "{broken"},
+            {"ok": True, "exitStatus": 0, "output": '{"setupReady":"true","phase":"idle"}'},
+            {"ok": True, "exitStatus": 0, "output": '{"phase":[]}'},
+            {"ok": False, "exitStatus": 1, "output": "unrelated command failure"},
+        ]
+        for preflight in cases:
+            with self.subTest(preflight=preflight):
+                mock_run.reset_mock()
+                client = MagicMock()
+                mock_open.return_value = ({}, {"ready": True}, client)
+                mock_run.side_effect = [preflight]
+                self.assertFalse(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+                self.assertEqual(mock_run.call_count, 1)
+                self.assertNotIn("mutation", mock_run.call_args.kwargs)
+                client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_setup_failure_or_invalid_receipt_never_dispatches_update(self, mock_open, mock_run) -> None:
+        correct = {"phase": "ready", "setupReady": True, "cli": _AGENT_INSTALLER_CLI}
+        failures = [
+            {"ok": False, "exitStatus": None, "reason": "timeout", "output": ""},
+            {"ok": False, "exitStatus": 1, "output": json.dumps(correct)},
+            {"ok": True, "exitStatus": None, "output": json.dumps(correct)},
+            {"ok": True, "exitStatus": 0, "output": json.dumps({**correct, "cli": "/tmp/untrusted.js"})},
+            {"ok": True, "exitStatus": 0, "output": json.dumps({**correct, "setupReady": 1})},
+            {"ok": True, "exitStatus": 0, "output": json.dumps({**correct, "error": "failed"})},
+            {"ok": True, "exitStatus": 0, "output": "{broken"},
+        ]
+        for failure in failures:
+            with self.subTest(failure=failure):
+                mock_run.reset_mock()
+                client = MagicMock()
+                mock_open.return_value = ({}, {"ready": True}, client)
+                mock_run.side_effect = [{"ok": True, "exitStatus": 0, "output": '{"installerMissing":true}'}, failure]
+                result = _dispatch_device_agent_install_script("MB2-U00044")
+                self.assertFalse(result["status"])
+                self.assertEqual(mock_run.call_count, 2)
+                self.assertEqual(mock_run.call_args.kwargs["command"], _AGENT_INSTALLER_SETUP_COMMAND)
+                client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_update_failure_never_retries_setup_or_dispatch(self, mock_open, mock_run) -> None:
+        failure = {"ok": False, "exitStatus": None, "reason": "timeout", "output": ""}
+        for initial in [False, True]:
+            with self.subTest(initial=initial):
+                client = MagicMock()
+                mock_open.return_value = ({}, {"ready": True}, client)
+                responses = [self.ready()]
+                if initial:
+                    responses = [
+                        {"ok": False, "exitStatus": 1, "output": "sudo: a password is required"},
+                        {"ok": True, "exitStatus": 0, "output": json.dumps({"phase": "ready", "setupReady": True, "cli": _AGENT_INSTALLER_CLI})},
+                    ]
+                mock_run.reset_mock()
+                mock_run.side_effect = responses + [failure]
+                self.assertFalse(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+                self.assertEqual(mock_run.call_count, len(responses) + 1)
+                self.assertEqual(mock_run.call_args.kwargs["command"], _AGENT_INSTALL_SCRIPT_COMMAND)
+                client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update.cs.DEVICE_SSH_PASSWORD", "")
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_setup_requires_password_but_ready_cli_does_not(self, mock_open, mock_run) -> None:
+        client = MagicMock()
+        mock_open.return_value = ({}, {"ready": True}, client)
+        mock_run.side_effect = [{"ok": True, "exitStatus": 0, "output": '{"installerMissing":true}'}]
+        self.assertFalse(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+        self.assertEqual(mock_run.call_count, 1)
+        mock_run.reset_mock()
+        mock_run.side_effect = [self.ready(), {"ok": True, "exitStatus": 0, "output": json.dumps({"accepted": True, "phase": "queued", "request": self.REQUEST})}]
+        self.assertTrue(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertTrue(all("stdin_text" not in call.kwargs for call in mock_run.call_args_list))
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_reads_request_status_on_existing_runtime_connection(self, mock_open, mock_run) -> None:
+        client = MagicMock()
+        mock_open.return_value = ({}, {"ready": True}, client)
+        status = {"request": self.REQUEST, "phase": "trial"}
+        mock_run.side_effect = [
+            {"ok": True, "output": "[]"},
+            {"ok": True, "output": "repo_missing"},
+            {"ok": True, "output": json.dumps(status)},
+        ]
+        budget = _DeviceSshOpenBudget()
+        runtime = _read_agent_runtime_state("MB2-U00044", resend_ssh_open=False, ssh_open_budget=budget, update_request_id=self.REQUEST)
+        mock_open.assert_called_once_with("MB2-U00044", resend_ssh_open=False, ssh_open_budget=budget)
+        client.close.assert_called_once()
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(runtime["installer"], status)
+        self.assertEqual(mock_run.call_args.kwargs["command"], "LC_ALL=C sudo -n -- /usr/bin/node /opt/mommybox-agent-installer/current/safe_agent.js status --request " + self.REQUEST)
+        self.assertNotIn("mutation", mock_run.call_args.kwargs)
+
+        mock_run.reset_mock(side_effect=True)
+        client.reset_mock()
+        mock_run.side_effect = [
+            {"ok": True, "output": "[]"},
+            {"ok": True, "output": "repo_missing"},
+            {"ok": True, "output": json.dumps(status)},
+        ]
+        runtime = _read_agent_runtime_state("MB2-U00044")
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(runtime["installer"], status)
+        self.assertEqual(runtime["installerStatus"], {"available": True, "reason": "ready"})
+        self.assertIn("if [ -f /opt/mommybox-agent-installer/current/safe_agent.js ]", mock_run.call_args.kwargs["command"])
+        self.assertIn("status --active", mock_run.call_args.kwargs["command"])
+        self.assertNotIn("mutation", mock_run.call_args.kwargs)
+        client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_preserves_runtime_when_active_installer_is_missing_or_unreadable(self, mock_open, mock_run) -> None:
+        cases = [
+            ({"ok": True, "output": '{"installerMissing":true}'}, False, "installer_missing"),
+            ({"ok": False, "reason": "ssh_exit_1", "output": "failure"}, None, "status_unavailable"),
+            ({"ok": True, "output": "{broken"}, None, "status_unavailable"),
+            ({"ok": True, "output": '{"phase":"committed","request":"bad"}'}, None, "status_unavailable"),
+        ]
+        for result, available, reason in cases:
+            with self.subTest(result=result):
+                client = MagicMock()
+                mock_open.return_value = ({}, {"ready": True}, client)
+                mock_run.side_effect = [
+                    {"ok": True, "output": json.dumps([{"name": "mommybox-v2-agent", "pid": 99, "pm2_env": {"status": "online", "version": "1.2.0"}}])},
+                    {"ok": True, "output": "HEAD=abcdef0\nORIGIN_MAIN=abcdef0\nBRANCH=main\nPKG_VERSION=1.2.0"},
+                    result,
+                ]
+                runtime = _read_agent_runtime_state("MB2-U00044")
+                self.assertEqual(runtime["installerStatus"], {"available": available, "reason": reason})
+                self.assertNotIn("installer", runtime)
+                self.assertEqual(runtime["process"]["status"], "online")
+                self.assertTrue(runtime["repo"]["latest"])
+                client.close.assert_called_once()
+
+    def test_renders_missing_and_unknown_automatic_update_status_separately(self) -> None:
+        cases = [
+            ({"installerStatus": {"available": False, "reason": "installer_missing"}}, "없음 (안전 설치기 미설치)"),
+            ({"installer": {"phase": "idle"}, "installerStatus": {"available": True, "reason": "ready"}}, "없음 (요청 기록 없음)"),
+            ({"installerStatus": {"available": None, "reason": "status_unavailable"}}, "미확인 (`status_unavailable`)"),
+        ]
+        for installer_state, expected in cases:
+            with self.subTest(installer_state=installer_state):
+                runtime = {"ssh": {"ready": True}, "process": {"name": "mommybox-v2-agent", "status": "online", "version": "1.2.0"}, **installer_state}
+                rendered = _render_device_update_status_result(
+                    device_name="MB2-U00044", device_info={"deviceName": "MB2-U00044"},
+                    latest_box_version="2.11.315", box_runtime={}, agent_runtime=runtime,
+                )
+                self.assertIn(expected, rendered)
+                self.assertIn("에이전트 repo 상태", rendered)
+                self.assertIn("online", rendered)
+
+    @patch("boxer_company.routers.device_update.time.sleep")
+    @patch("boxer_company.routers.device_update.time.monotonic", side_effect=[0, 1, 2])
+    @patch("boxer_company.routers.device_update._read_agent_runtime_state")
+    def test_waits_for_matching_commit_even_when_old_process_is_online(self, mock_read, mock_clock, mock_sleep) -> None:
+        def state(phase: str) -> dict:
+            return {"process": {"status": "online", "version": "2.0.0", "pid": 99},
+                    "installer": {"request": self.REQUEST, "phase": phase, "version": "2.0.3", "revision": self.REVISION}}
+        mock_read.side_effect = [state("queued"), state("trial"), state("committed")]
+        budget = _DeviceSshOpenBudget()
+        result = _wait_for_agent_update_completion("MB2-U00044", update_request_id=self.REQUEST, resend_ssh_open=False, ssh_open_budget=budget)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(result["observedVersion"], "2.0.3")
+        for call in mock_read.call_args_list:
+            self.assertEqual(call.kwargs["update_request_id"], self.REQUEST)
+            self.assertIs(call.kwargs["ssh_open_budget"], budget)
+            self.assertFalse(call.kwargs["resend_ssh_open"])
+
+    @patch("boxer_company.routers.device_update.time.sleep")
+    @patch("boxer_company.routers.device_update.time.monotonic", side_effect=[0, 10000])
+    @patch("boxer_company.routers.device_update._read_agent_runtime_state")
+    def test_rejects_other_request_commit(self, mock_read, mock_clock, mock_sleep) -> None:
+        mock_read.return_value = {"process": {"status": "online", "version": "2.0.3"},
+                                  "installer": {"request": "c" * 32, "phase": "committed", "version": "2.0.3", "revision": self.REVISION}}
+        result = _wait_for_agent_update_completion("MB2-U00044", update_request_id=self.REQUEST)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "timed_out")
+        mock_sleep.assert_not_called()
+
+    @patch("boxer_company.routers.device_update.time.sleep")
+    @patch("boxer_company.routers.device_update.time.monotonic")
+    @patch("boxer_company.routers.device_update._read_agent_runtime_state")
+    def test_does_not_complete_from_online_or_malformed_status(self, mock_read, mock_clock, mock_sleep) -> None:
+        for installer in [None, {"request": self.REQUEST, "phase": []}, {"request": self.REQUEST, "phase": "committed", "version": "2.0.3"}]:
+            with self.subTest(installer=installer):
+                mock_clock.side_effect = [0, 10000]
+                mock_read.return_value = {"process": {"status": "online", "version": "2.0.3"}, "installer": installer}
+                result = _wait_for_agent_update_completion("MB2-U00044", update_request_id=self.REQUEST)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], "timed_out")
+        mock_sleep.assert_not_called()
+
+    @patch("boxer_company.routers.device_update.time.sleep")
+    @patch("boxer_company.routers.device_update._read_agent_runtime_state")
+    def test_stops_wait_immediately_on_installer_failure(self, mock_read, mock_sleep) -> None:
+        for phase in ["rolled_back", "failed"]:
+            with self.subTest(phase=phase):
+                mock_read.return_value = {"process": {"status": "online", "version": "2.0.3"},
+                                          "installer": {"request": self.REQUEST, "phase": phase, "error": "probe_failed"}}
+                result = _wait_for_agent_update_completion("MB2-U00044", update_request_id=self.REQUEST)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], phase)
+                self.assertEqual(result["attempts"], 1)
+        mock_sleep.assert_not_called()
+
+    @patch("boxer_company.routers.device_update._read_agent_runtime_state")
+    def test_accepts_matching_already_latest_status_and_rejects_invalid_request(self, mock_read) -> None:
+        mock_read.return_value = {"installer": {"request": self.REQUEST, "phase": "already_latest", "version": "2.0.3", "revision": self.REVISION}}
+        result = _wait_for_agent_update_completion("MB2-U00044", update_request_id=self.REQUEST)
+        self.assertTrue(result["ok"])
+        mock_read.reset_mock()
+        self.assertFalse(_wait_for_agent_update_completion("MB2-U00044", update_request_id="bad;command")["ok"])
+        mock_read.assert_not_called()
+
+
 class DeviceUpdateSshLifecycleTests(unittest.TestCase):
+    @patch("boxer_company.routers.device_update._wait_for_ssh_exit_status")
+    @patch("boxer_company.routers.device_update._mark_company_api_mutation_attempted")
+    def test_sends_secret_only_to_stdin_before_wait_and_redacts_remote_echo(self, mock_mark, mock_wait) -> None:
+        # 합성 비밀번호의 echo가 돌아와도 결과 payload에 남기지 않는다.
+        secret = "synthetic-stdin-secret"
+        events = []
+        stdin = MagicMock()
+        stdin.write.side_effect = lambda value: events.append(("write", value))
+        stdin.flush.side_effect = lambda: events.append(("flush",))
+        stdin.channel.shutdown_write.side_effect = lambda: events.append(("eof",))
+        stdout = _FakeSshStream("ready " + secret, 0)
+        stderr = _FakeSshStream("echo " + secret, 0)
+        client = MagicMock()
+        client.exec_command.side_effect = lambda *args, **kwargs: events.append(("exec",)) or (stdin, stdout, stderr)
+        mock_mark.side_effect = lambda: events.append(("mutation",))
+        mock_wait.side_effect = lambda *args, **kwargs: events.append(("wait",)) or 0
+
+        result = _run_remote_ssh_command(client, command=_AGENT_INSTALLER_SETUP_COMMAND, timeout_sec=120, mutation=True, stdin_text=secret + "\n")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, [("mutation",), ("exec",), ("write", secret + "\n"), ("flush",), ("eof",), ("wait",)])
+        self.assertNotIn(secret, str(result))
+        self.assertNotIn(secret, str(client.exec_command.call_args))
+        self.assertIn("[REDACTED]", result["output"])
+        stdin.close.assert_called_once()
+        self.assertTrue(stdout.closed and stderr.closed)
+
+    @patch("boxer_company.routers.device_update._wait_for_ssh_exit_status")
+    def test_secret_write_failure_is_ambiguous_and_never_echoes_exception_text(self, mock_wait) -> None:
+        stdin = MagicMock()
+        stdin.write.side_effect = OSError("synthetic-stdin-secret")
+        client = MagicMock()
+        client.exec_command.return_value = (stdin, _FakeSshStream("", 0), _FakeSshStream("", 0))
+        result = _run_remote_ssh_command(client, command=_AGENT_INSTALLER_SETUP_COMMAND, timeout_sec=120, stdin_text="synthetic-stdin-secret\n")
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["exitStatus"])
+        self.assertNotIn("synthetic-stdin-secret", str(result))
+        mock_wait.assert_not_called()
+        stdin.close.assert_called_once()
+
     def test_closes_ssh_streams_after_command(self) -> None:
         client = _FakeSshClient(
             [

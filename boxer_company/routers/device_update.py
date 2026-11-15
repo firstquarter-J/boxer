@@ -57,12 +57,30 @@ _AGENT_GIT_STATUS_COMMAND = (
     "| sed \"s/^/ORIGIN_PKG_VERSION=/\"; "
     "else echo repo_missing; fi'"
 )
-_AGENT_INSTALL_SCRIPT_URL = "https://mmb-release.s3.ap-northeast-2.amazonaws.com/provision/install-agent.sh"
-_AGENT_INSTALL_SCRIPT_COMMAND = (
-    "bash -lc '"
-    f"cd /tmp && rm -f install-agent.sh && curl -fsSL -o install-agent.sh {_AGENT_INSTALL_SCRIPT_URL} && "
-    "bash install-agent.sh -f 1'"
+_AGENT_INSTALL_SCRIPT_URL = "https://mommybox-release.s3.ap-northeast-2.amazonaws.com/agent/installer/install-agent.sh"
+_AGENT_INSTALLER_CLI = "/opt/mommybox-agent-installer/current/safe_agent.js"
+_AGENT_INSTALLER_COMMAND = f"LC_ALL=C sudo -n -- /usr/bin/node {_AGENT_INSTALLER_CLI}"
+_AGENT_INSTALL_SCRIPT_COMMAND = _AGENT_INSTALLER_COMMAND + " update --version latest"
+_AGENT_INSTALLER_SETUP_COMMAND = (
+    "LC_ALL=C sudo -S -p '' -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -c "
+    + shlex.quote(
+        # 최초 배치만 관리자 권한으로 수행한다. 일반 사용자의 다운로드 파일은 실행하지 않는다.
+        'set -eu; umask 077; BOXER_AGENT_INSTALLER_DIR="$(mktemp -d /tmp/boxer-agent-installer.XXXXXXXX)"; '
+        'trap \'find "$BOXER_AGENT_INSTALLER_DIR" -depth -delete\' EXIT; '
+        'curl --fail --silent --show-error --location --proto =https --proto-redir =https '
+        '--connect-timeout 15 --max-time 60 '
+        f'--output "$BOXER_AGENT_INSTALLER_DIR/install-agent.sh" {_AGENT_INSTALL_SCRIPT_URL}; '
+        'bash "$BOXER_AGENT_INSTALLER_DIR/install-agent.sh" --safe setup'
+    )
 )
+_AGENT_INSTALLER_STATUS_COMMAND = _AGENT_INSTALLER_COMMAND + " status --request "
+_AGENT_INSTALLER_ACTIVE_STATUS_COMMAND = (
+    f"if [ -f {_AGENT_INSTALLER_CLI} ]; then "
+    f"{_AGENT_INSTALLER_COMMAND} status --active; "
+    "else printf '%s\\n' '{\"installerMissing\":true}'; fi"
+)
+_AGENT_UPDATE_REQUEST_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+_AGENT_UPDATE_REVISION_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 _BOX_UPDATE_WAIT_TIMEOUT_SEC = 300
 _AGENT_UPDATE_WAIT_TIMEOUT_SEC = max(300, int(cs.DEVICE_AGENT_UPDATE_WAIT_TIMEOUT_SEC or 600))
 _AGENT_INSTALL_SCRIPT_TIMEOUT_SEC = max(120, _AGENT_UPDATE_WAIT_TIMEOUT_SEC)
@@ -177,6 +195,7 @@ def _run_remote_ssh_command(
     command: str,
     timeout_sec: int,
     mutation: bool = False,
+    stdin_text: str | None = None,
 ) -> dict[str, Any]:
     normalized_command = str(command or "").strip()
     actual_timeout = max(1, int(timeout_sec or cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10))
@@ -188,9 +207,18 @@ def _run_remote_ssh_command(
             # command/timeout preflight를 끝낸 뒤 실제 remote exec 직전에 표시한다.
             _mark_company_api_mutation_attempted()
         stdin, stdout, stderr = client.exec_command(normalized_command, timeout=actual_timeout)
+        if stdin_text is not None:
+            # 비밀번호는 명령/환경에 넣지 않고 EOF까지 보낸 뒤 원격 종료를 기다린다.
+            stdin.write(stdin_text)
+            stdin.flush()
+            stdin.channel.shutdown_write()
         exit_status = _wait_for_ssh_exit_status(stdout, stderr, timeout_sec=actual_timeout)
         stdout_text = (stdout.read() or b"").decode("utf-8", errors="replace").strip()
         stderr_text = (stderr.read() or b"").decode("utf-8", errors="replace").strip()
+        if stdin_text:
+            for supplied in {stdin_text, stdin_text.rstrip("\r\n")} - {""}:
+                stdout_text = stdout_text.replace(supplied, "[REDACTED]")
+                stderr_text = stderr_text.replace(supplied, "[REDACTED]")
         combined = stdout_text
         if stderr_text:
             combined = combined or stderr_text
@@ -351,6 +379,53 @@ def _parse_agent_repo_state(output: str) -> dict[str, Any]:
     }
 
 
+def _parse_agent_installer_response(output: str) -> dict[str, Any] | None:
+    # 접수와 완료는 공통 설치기의 단일 JSON 응답으로만 판정한다.
+    try:
+        value = json.loads(str(output or ""))
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _agent_installer_release_valid(value: dict[str, Any]) -> bool:
+    return bool(
+        isinstance(value.get("version"), str)
+        and re.fullmatch(r"\d+\.\d+\.\d+", value["version"])
+        and isinstance(value.get("revision"), str)
+        and _AGENT_UPDATE_REVISION_PATTERN.fullmatch(value["revision"])
+    )
+
+
+def _agent_installer_preflight_state(result: dict[str, Any]) -> str:
+    # 확인된 미설치/구형 응답과 sudo 권한 오류만 관리자 배치를 허용한다.
+    exit_status = result.get("exitStatus")
+    if type(exit_status) is not int or result.get("reason") == "timeout":
+        return "unknown"
+    value = _parse_agent_installer_response(result.get("output", ""))
+    if result.get("ok") is True and exit_status == 0 and value:
+        if value.get("setupReady") is True:
+            return "ready"
+        if value.get("installerMissing") is True or value.get("setupReady") is False:
+            return "setup"
+        if "setupReady" not in value and isinstance(value.get("phase"), str) and value["phase"] in {
+            "idle", "queued", "preparing", "prepared", "armed", "activating", "trial",
+            "committing", "committed", "rolling_back", "rolled_back", "rollback_failed",
+            "failed", "prepare_failed", "already_latest",
+        }:
+            return "setup"
+    if result.get("ok") is False and exit_status == 1:
+        output = str(result.get("output") or "").lower()
+        if re.search(
+            r"(?:^|\n)(?:sudo: (?:a password is required|a terminal is required to read the password|"
+            r"no tty present and no askpass program specified)|(?:sudo: )?sorry, user [^\n]+ "
+            r"is not allowed to execute|(?:sudo: )?[^\n]+ is not in the sudoers file)",
+            output,
+        ):
+            return "setup"
+    return "unknown"
+
+
 def _read_box_runtime_state(
     device_name: str,
     *,
@@ -389,6 +464,7 @@ def _read_agent_runtime_state(
     *,
     resend_ssh_open: bool = True,
     ssh_open_budget: _DeviceSshOpenBudget | None = None,
+    update_request_id: str | None = None,
 ) -> dict[str, Any]:
     device_info, ssh_state, client = _open_device_ssh_for_update(
         device_name,
@@ -399,6 +475,7 @@ def _read_agent_runtime_state(
         "device": _build_device_snapshot(device_name, device_info),
         "ssh": ssh_state,
         "process": None,
+        "installerStatus": {"available": None, "reason": "ssh_not_ready" if not ssh_state.get("ready") else "unknown"},
         "repo": {
             "available": False,
             "reason": "ssh_not_ready" if not ssh_state.get("ready") else "unknown",
@@ -424,6 +501,40 @@ def _read_agent_runtime_state(
             command=_AGENT_GIT_STATUS_COMMAND,
             timeout_sec=max(20, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
         )
+        if isinstance(update_request_id, str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(update_request_id):
+            # 기존 SSH 연결 안에서 조회해 추가 reverse SSH open을 만들지 않는다.
+            installer_result = _run_remote_ssh_command(
+                client,
+                command=_AGENT_INSTALLER_STATUS_COMMAND + update_request_id,
+                timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+            )
+            state["installerCommand"] = installer_result
+            if installer_result.get("ok"):
+                state["installer"] = _parse_agent_installer_response(installer_result.get("output", ""))
+        elif update_request_id is None:
+            # 요청 ID가 없는 재조회도 같은 SSH 연결에서 활성 설치 요청을 확인한다.
+            installer_result = _run_remote_ssh_command(
+                client,
+                command=_AGENT_INSTALLER_ACTIVE_STATUS_COMMAND,
+                timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+            )
+            state["installerCommand"] = installer_result
+            installer = _parse_agent_installer_response(installer_result.get("output", "")) if installer_result.get("ok") else None
+            if installer == {"installerMissing": True}:
+                state["installerStatus"] = {"available": False, "reason": "installer_missing"}
+            elif (
+                isinstance(installer, dict)
+                and isinstance(installer.get("phase"), str)
+                and (
+                    "request" not in installer
+                    or isinstance(installer["request"], str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(installer["request"])
+                )
+            ):
+                state["installer"] = installer
+                state["installerStatus"] = {"available": True, "reason": "ready"}
+            else:
+                # 미설치와 조회 실패를 구분하고 기존 PM2와 repo 결과는 유지한다.
+                state["installerStatus"] = {"available": None, "reason": "status_unavailable"}
     finally:
         client.close()
 
@@ -593,38 +704,49 @@ def _wait_for_agent_update_completion(
     device_name: str,
     *,
     baseline_runtime: dict[str, Any] | None = None,
+    update_request_id: str | None = None,
     resend_ssh_open: bool = True,
     ssh_open_budget: _DeviceSshOpenBudget | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + _AGENT_UPDATE_WAIT_TIMEOUT_SEC
     attempts = 0
     last_state: dict[str, Any] = {}
-    baseline_parts = _parse_semver_parts(_resolve_agent_runtime_version(baseline_runtime or {}))
+    if not isinstance(update_request_id, str) or not _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(update_request_id):
+        return {"ok": False, "status": "invalid_request", "attempts": 0, "runtime": {}}
     while True:
         attempts += 1
         last_state = _read_agent_runtime_state(
             device_name,
             resend_ssh_open=resend_ssh_open,
             ssh_open_budget=ssh_open_budget,
+            update_request_id=update_request_id,
         )
         process = last_state.get("process") if isinstance(last_state.get("process"), dict) else {}
         status = _display_value((process or {}).get("status"), default="").strip().lower()
         current_version = _resolve_agent_runtime_version(last_state)
-        current_parts = _parse_semver_parts(current_version)
-        gate = _describe_agent_box_update_gate(last_state)
-        # install-agent 스크립트는 zip 재설치라 repo 최신 여부보다 PM2 online과 실행 가능 버전을 우선 본다.
-        ready = status == "online" and (
-            bool(gate.get("ok"))
-            if baseline_parts is None or baseline_parts < _AGENT_MINIMUM_FOR_BOX_UPDATE
-            else bool(current_parts)
-        )
-        if ready:
+        installer = last_state.get("installer")
+        installer = installer if isinstance(installer, dict) else {}
+        phase = installer.get("phase") if isinstance(installer.get("phase"), str) else ""
+        # 이전 PID나 버전의 online은 성공 근거가 아니다. 같은 요청의 확정만 인정한다.
+        matching_request = installer.get("request") == update_request_id
+        if matching_request and phase in {"committed", "already_latest"} and _agent_installer_release_valid(installer):
             return {
                 "ok": True,
                 "status": "completed",
                 "attempts": attempts,
                 "observedStatus": status,
+                "observedVersion": installer["version"],
+                "installer": installer,
+                "runtime": last_state,
+            }
+        if matching_request and phase in {"rolled_back", "failed", "rollback_failed", "prepare_failed"}:
+            return {
+                "ok": False,
+                "status": phase,
+                "attempts": attempts,
+                "observedStatus": status,
                 "observedVersion": current_version,
+                "installer": installer,
                 "runtime": last_state,
             }
         if time.monotonic() >= deadline:
@@ -638,6 +760,7 @@ def _wait_for_agent_update_completion(
         "attempts": attempts,
         "observedStatus": _display_value((process or {}).get("status"), default=""),
         "observedVersion": _display_value((process or {}).get("version"), default=""),
+        "installer": installer if matching_request else {},
         "runtime": last_state,
     }
 
@@ -799,7 +922,7 @@ def _dispatch_device_agent_install_script(
         "method": "ssh_install_script",
         "device": _build_device_snapshot(device_name, device_info),
         "ssh": ssh_state,
-        "command": "install-agent.sh -f 1",
+        "command": "safe_agent.js update --version latest",
     }
     if client is None:
         dispatch_payload["message"] = (
@@ -808,6 +931,40 @@ def _dispatch_device_agent_install_script(
         return dispatch_payload
 
     try:
+        preflight = _run_remote_ssh_command(
+            client,
+            command=_AGENT_INSTALLER_ACTIVE_STATUS_COMMAND,
+            timeout_sec=max(12, int(cs.DEVICE_SSH_COMMAND_TIMEOUT_SEC or 10)),
+        )
+        dispatch_payload["setupPreflight"] = preflight
+        readiness = _agent_installer_preflight_state(preflight)
+        if readiness == "unknown":
+            dispatch_payload["message"] = "공통 설치기 준비 상태를 명확히 확인하지 못해 변경을 멈췄어"
+            return dispatch_payload
+        if readiness == "setup":
+            password = cs.DEVICE_SSH_PASSWORD
+            if not isinstance(password, str) or not password or any(value in password for value in ("\n", "\r", "\0")):
+                dispatch_payload["message"] = "공통 설치기 최초 설정에 필요한 관리자 인증정보가 없어"
+                return dispatch_payload
+            setup_result = _run_remote_ssh_command(
+                client,
+                command=_AGENT_INSTALLER_SETUP_COMMAND,
+                timeout_sec=_AGENT_INSTALL_SCRIPT_TIMEOUT_SEC,
+                mutation=True,
+                stdin_text=password + "\n",
+            )
+            dispatch_payload["setup"] = setup_result
+            setup_receipt = _parse_agent_installer_response(setup_result.get("output", ""))
+            if not (
+                setup_result.get("ok") is True and type(setup_result.get("exitStatus")) is int
+                and setup_result["exitStatus"] == 0
+                and setup_receipt and set(setup_receipt) == {"phase", "setupReady", "cli"}
+                and setup_receipt.get("phase") == "ready" and setup_receipt.get("setupReady") is True
+                and setup_receipt.get("cli") == _AGENT_INSTALLER_CLI
+            ):
+                dispatch_payload["message"] = "공통 설치기 최초 설정을 확인하지 못해 업데이트를 요청하지 않았어"
+                return dispatch_payload
+        # setup 이후 업데이트는 정확히 한 번만 보낸다. 실패/불명확 응답 뒤 재배치하지 않는다.
         install_result = _run_remote_ssh_command(
             client,
             command=_AGENT_INSTALL_SCRIPT_COMMAND,
@@ -818,13 +975,26 @@ def _dispatch_device_agent_install_script(
         client.close()
 
     dispatch_payload["result"] = install_result
-    dispatch_payload["status"] = bool(install_result.get("ok"))
-    dispatch_payload["affected"] = 1 if dispatch_payload["status"] else 0
-    if dispatch_payload["status"]:
-        dispatch_payload["message"] = "install-agent 스크립트 실행 완료"
+    receipt = _parse_agent_installer_response(install_result.get("output", "")) if install_result.get("ok") else None
+    queued = bool(
+        receipt and receipt.get("accepted") is True and receipt.get("phase") == "queued"
+        and isinstance(receipt.get("request"), str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(receipt["request"])
+    )
+    already_latest = bool(
+        receipt and receipt.get("accepted") is False and receipt.get("needsUpdate") is False
+        and receipt.get("phase") == "already_latest" and _agent_installer_release_valid(receipt)
+    )
+    dispatch_payload["status"] = queued or already_latest
+    dispatch_payload["affected"] = 1 if queued else 0
+    if queued or already_latest:
+        dispatch_payload["receipt"] = receipt
+        dispatch_payload["phase"] = receipt["phase"]
+        dispatch_payload["requestId"] = receipt.get("request")
+        dispatch_payload["message"] = "공통 설치기 업데이트 요청 접수, 확정 대기 중" if queued else "공통 설치기에서 이미 최신 버전임을 확인했어"
     else:
+        reason = _display_value(install_result.get("reason"), default="unknown") if not install_result.get("ok") else "invalid_installer_receipt"
         dispatch_payload["message"] = (
-            f"install-agent 스크립트 실행 실패 (`{_display_value(install_result.get('reason'), default='unknown')}`)"
+            f"install-agent 요청 접수 실패 (`{reason}`)"
         )
     return dispatch_payload
 
@@ -869,6 +1039,20 @@ def _render_device_update_status_result(
         )
         repo = agent_runtime.get("repo") if isinstance(agent_runtime.get("repo"), dict) else {}
         lines.append(f"• 에이전트 repo 상태: `{_format_agent_repo_line(repo)}`")
+    installer = agent_runtime.get("installer") if isinstance(agent_runtime.get("installer"), dict) else {}
+    installer_status = agent_runtime.get("installerStatus") if isinstance(agent_runtime.get("installerStatus"), dict) else {}
+    request_id = installer.get("request")
+    if isinstance(request_id, str) and _AGENT_UPDATE_REQUEST_PATTERN.fullmatch(request_id):
+        lines.append(f"• 자동 업데이트 요청: `{request_id}`")
+        lines.append(f"• 자동 업데이트 상태: `{_display_value(installer.get('phase'), default='미확인')}`")
+        if installer.get("error"):
+            lines.append(f"• 설치기 오류: `{_display_value(installer['error'], default='미확인')}`")
+    elif installer_status.get("available") is False:
+        lines.append("• 자동 업데이트 요청: 없음 (안전 설치기 미설치)")
+    elif installer_status.get("available") is True and isinstance(installer.get("phase"), str):
+        lines.append("• 자동 업데이트 요청: 없음 (요청 기록 없음)")
+    else:
+        lines.append(f"• 자동 업데이트 상태: 미확인 (`{_display_value(installer_status.get('reason'), default='unknown')}`)")
     agent_gate = _describe_agent_box_update_gate(agent_runtime)
     lines.append(
         f"• 박스 업데이트 선행조건: *{'충족' if agent_gate.get('ok') else '미충족'}* | "
@@ -1113,15 +1297,8 @@ def _request_device_agent_update(
     pre_repo = precheck_runtime.get("repo") if isinstance(precheck_runtime.get("repo"), dict) else {}
     if pre_repo:
         lines.append(f"• 에이전트 repo 사전 확인: `{_format_agent_repo_line(pre_repo)}`")
-    # 에이전트 업데이트는 install-agent 스크립트를 표준 실행 경로로 통일한다.
-    lines.append("• 실행 경로: `install-agent.sh -f 1`")
-
-    pre_process = precheck_runtime.get("process") if isinstance(precheck_runtime.get("process"), dict) else {}
-    if bool(pre_repo.get("latest")) and _display_value((pre_process or {}).get("status"), default="").strip().lower() == "online":
-        payload["wait"] = {"status": "already_latest", "ok": True, "runtime": precheck_runtime}
-        lines.append("• 결과: *생략*")
-        lines.append("• 안내: 이미 최신 repo 기준으로 online 상태야")
-        return "\n".join(lines), payload
+    # 최신 여부도 공통 설치기가 판정해 박서만의 업데이트 우회를 없앤다.
+    lines.append("• 실행 경로: `safe_agent.js update --version latest`")
 
     if not snapshot.get("isConnected"):
         lines.append("• 결과: *요청 불가*")
@@ -1138,33 +1315,44 @@ def _request_device_agent_update(
         lines.append(f"• SSH 스크립트 결과: {_display_value(dispatch_result.get('message'), default='미확인')}")
         return "\n".join(lines), payload
 
+    if dispatch_result.get("phase") == "already_latest":
+        receipt = dispatch_result["receipt"]
+        payload["wait"] = {"status": "already_latest", "ok": True, "installer": receipt, "runtime": precheck_runtime}
+        lines.append("• 결과: *생략*")
+        lines.append(f"• 안내: 공통 설치기에서 이미 최신 버전 `{receipt['version']}`임을 확인했어")
+        return "\n".join(lines), payload
+
     if on_dispatched is not None:
         on_dispatched(_build_device_update_started_notice(payload))
 
     wait_result = _wait_for_agent_update_completion(
         normalized_device_name,
         baseline_runtime=precheck_runtime,
+        update_request_id=dispatch_result.get("requestId"),
         **ssh_options,
     )
     payload["wait"] = wait_result
     wait_runtime = wait_result.get("runtime") if isinstance(wait_result.get("runtime"), dict) else {}
     wait_repo = wait_runtime.get("repo") if isinstance(wait_runtime.get("repo"), dict) else {}
-    wait_gate = _describe_agent_box_update_gate(wait_runtime)
-    lines.append("• SSH 스크립트: install-agent 스크립트 실행 완료")
+    installer = wait_result.get("installer") if isinstance(wait_result.get("installer"), dict) else {}
+    lines.append(f"• 설치 요청: `{_display_value(dispatch_result.get('requestId'), default='미확인')}`")
+    lines.append(f"• 공통 설치기 상태: `{_display_value(installer.get('phase'), default='확정 대기 중')}`")
     lines.append(
         f"• SSH 완료 확인: `{_format_pm2_process_line(wait_runtime.get('process'), 'mommybox-agent 미감지')}`"
     )
     lines.append(f"• 에이전트 repo 완료 확인: `{_format_agent_repo_line(wait_repo)}`")
     if wait_result.get("ok"):
         lines.append("• 결과: *완료*")
-        if wait_gate.get("ok"):
-            lines.append("• 안내: SSH 기준 agent가 online이고 박스 업데이트 가능한 버전이 확인됐어")
-        else:
-            lines.append("• 안내: SSH 기준 agent가 online이고 실행 버전이 확인됐어")
+        lines.append(f"• 안내: 공통 설치기가 같은 요청의 버전 `{installer.get('version', '')}` 설치를 확정했어")
+    elif wait_result.get("status") in {"rolled_back", "failed", "rollback_failed", "prepare_failed"}:
+        lines.append("• 결과: *업데이트 실패*")
+        lines.append(f"• 안내: 공통 설치기가 `{wait_result['status']}` 상태를 보고했어")
+        if installer.get("error"):
+            lines.append(f"• 설치기 오류: `{_display_value(installer['error'], default='미확인')}`")
     else:
         lines.append("• 결과: *확인 필요*")
         lines.append(
-            f"• 안내: {_AGENT_UPDATE_WAIT_TIMEOUT_SEC}초 안에 `online + 실행 버전 확인` 상태까지는 못 봤어. "
+            f"• 안내: {_AGENT_UPDATE_WAIT_TIMEOUT_SEC}초 안에 공통 설치기의 요청 확정 상태까지는 못 봤어. "
             f"`{normalized_device_name} 업데이트 상태`나 `{normalized_device_name} pm2 상태`로 다시 확인해"
         )
     return "\n".join(lines), payload
