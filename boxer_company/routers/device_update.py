@@ -4,6 +4,7 @@ from boxer_company._operation_routing_device import (
     _normalize_device_update_question,
 )
 import json
+import logging
 import re
 import shlex
 import time
@@ -13,6 +14,7 @@ from typing import Any
 
 from boxer_company.utils import _display_value
 from boxer_company import settings as cs
+from boxer_company.hpa_change_workflow import redact_sensitive_text
 from boxer_company.read_routing import _extract_device_name_scope
 from boxer_company.routers.device_file_probe import _connect_device_ssh_client
 from boxer_company.routers.device_ssh_security import (
@@ -111,6 +113,27 @@ _AGENT_MINIMUM_FOR_BOX_UPDATE = (2, 0, 0)
 _BOX_PM2_NAMES = {"mommybox-v2"}
 _AGENT_PM2_NAMES = {"mommybox-v2-agent", "mommybox-agent"}
 _DeviceUpdateDispatchNoticeFn = Callable[[str], None]
+
+
+def _log_agent_installer_failure(
+    device_name: str, stage: str, result: dict[str, Any], *, reason: str,
+) -> None:
+    # 요약에서 사라지는 실패 근거만 기존 운영 로그에 남긴다. 전체 값을 가린 뒤 축약한다.
+    def safe_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        password = cs.DEVICE_SSH_PASSWORD
+        if password:
+            text = text.replace(password, "[REDACTED]")
+        return " ".join(redact_sensitive_text(text).split())[:limit]
+
+    exit_status = result.get("exitStatus")
+    logging.getLogger(__name__).warning(
+        "Agent installer failed deviceName=%s stage=%s exitStatus=%s reason=%s stderr=%s",
+        safe_text(device_name, 100), stage,
+        exit_status if type(exit_status) is int else None,
+        safe_text(result.get("reason") or reason, 100),
+        safe_text(result.get("stderr"), 500),
+    )
 
 
 @dataclass
@@ -978,6 +1001,7 @@ def _dispatch_device_agent_install_script(
         dispatch_payload["setupPreflight"] = preflight
         readiness = _agent_installer_preflight_state(preflight)
         if readiness == "unknown":
+            _log_agent_installer_failure(device_name, "preflight", preflight, reason="invalid_installer_status")
             dispatch_payload["message"] = "공통 설치기 준비 상태를 명확히 확인하지 못해 변경을 멈췄어"
             return dispatch_payload
         if readiness == "setup":
@@ -1001,6 +1025,7 @@ def _dispatch_device_agent_install_script(
                 and setup_receipt.get("phase") == "ready" and setup_receipt.get("setupReady") is True
                 and setup_receipt.get("cli") == _AGENT_INSTALLER_CLI
             ):
+                _log_agent_installer_failure(device_name, "setup", setup_result, reason="invalid_setup_receipt")
                 dispatch_payload["message"] = "공통 설치기 최초 설정을 확인하지 못해 업데이트를 요청하지 않았어"
                 return dispatch_payload
         # setup 이후 업데이트는 정확히 한 번만 보낸다. 실패/불명확 응답 뒤 재배치하지 않는다.
@@ -1032,6 +1057,7 @@ def _dispatch_device_agent_install_script(
         dispatch_payload["message"] = "공통 설치기 업데이트 요청 접수, 확정 대기 중" if queued else "공통 설치기에서 이미 최신 버전임을 확인했어"
     else:
         reason = _display_value(install_result.get("reason"), default="unknown") if not install_result.get("ok") else "invalid_installer_receipt"
+        _log_agent_installer_failure(device_name, "update", install_result, reason=reason)
         dispatch_payload["message"] = (
             f"install-agent 요청 접수 실패 (`{reason}`)"
         )

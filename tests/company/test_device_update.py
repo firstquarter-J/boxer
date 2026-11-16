@@ -806,7 +806,8 @@ class AgentInstallerContractTests(unittest.TestCase):
         ]
         mock_run.side_effect = [{"ok": True, "exitStatus": 0, "stdout": json.dumps(value), "stderr": prompt,
                                  "output": json.dumps(value) + "\n" + prompt} for value in receipts]
-        result = _dispatch_device_agent_install_script("MB2-U00044")
+        with self.assertNoLogs("boxer_company.routers.device_update", level="WARNING"):
+            result = _dispatch_device_agent_install_script("MB2-U00044")
         self.assertTrue(result["status"])
         self.assertEqual(result["requestId"], self.REQUEST)
         self.assertEqual(mock_run.call_count, 3)
@@ -875,6 +876,52 @@ class AgentInstallerContractTests(unittest.TestCase):
         self.assertIn('bash "$BOXER_AGENT_INSTALLER_DIR/install-agent.sh" --safe setup', shell[-1])
         self.assertIn("https://mommybox-release.s3.ap-northeast-2.amazonaws.com/agent/installer/install-agent.sh", shell[-1])
         self.assertNotIn("synthetic-setup-password", _AGENT_INSTALLER_SETUP_COMMAND)
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_failed_installer_stage_logs_once_without_retry(self, mock_open, mock_run) -> None:
+        # 자동 보고가 상세 결과를 버려도 실패 위치와 원격 오류는 운영 로그에 남는다.
+        failure = {"ok": False, "exitStatus": 22, "reason": "ssh_exit_22", "stderr": "curl: (22) HTTP 403"}
+        cases = [
+            ("preflight", []),
+            ("setup", [{"ok": True, "exitStatus": 0, "output": '{"installerMissing":true}'}]),
+            ("update", [self.ready()]),
+        ]
+        for stage, prefix in cases:
+            with self.subTest(stage=stage):
+                mock_run.reset_mock()
+                client = MagicMock()
+                mock_open.return_value = ({}, {"ready": True}, client)
+                mock_run.side_effect = prefix + [failure]
+                with self.assertLogs("boxer_company.routers.device_update", level="WARNING") as logs:
+                    result = _dispatch_device_agent_install_script("MB2-U00044")
+                self.assertFalse(result["status"])
+                self.assertEqual(mock_run.call_count, len(prefix) + 1)
+                self.assertEqual(len(logs.records), 1)
+                message = logs.records[0].getMessage()
+                for expected in ("deviceName=MB2-U00044", "stage=" + stage, "exitStatus=22", "reason=ssh_exit_22", "curl: (22) HTTP 403"):
+                    self.assertIn(expected, message)
+                client.close.assert_called_once()
+
+    @patch("boxer_company.routers.device_update._run_remote_ssh_command")
+    @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
+    def test_installer_failure_log_redacts_before_shortening_and_stays_one_line(self, mock_open, mock_run) -> None:
+        # 잘리는 경계에 긴 비밀값이 있어도 일부가 노출되지 않으며 stdout은 저장하지 않는다.
+        secrets = ["synthetic-setup-password", "synthetic-bearer-token", "ghp_" + "a" * 30, "synthetic-api-key", "q" * 600]
+        stderr = "curl: (22) failed\n" + " ".join((secrets[0], "Bearer " + secrets[1], secrets[2], "api_key=" + secrets[3], "password=" + secrets[4]))
+        stderr += "\n" + "x" * 800
+        mock_open.return_value = ({}, {"ready": True}, MagicMock())
+        mock_run.side_effect = [
+            {"ok": True, "exitStatus": 0, "output": '{"installerMissing":true}'},
+            {"ok": False, "exitStatus": 1, "reason": "ssh_exit_1", "stderr": stderr, "stdout": "synthetic-private-stdout"},
+        ]
+        with self.assertLogs("boxer_company.routers.device_update", level="WARNING") as logs:
+            self.assertFalse(_dispatch_device_agent_install_script("MB2-U00044")["status"])
+        message = logs.records[0].getMessage()
+        for secret in secrets + ["q" * 10, "synthetic-private-stdout", "\n", "\r"]:
+            self.assertNotIn(secret, message)
+        self.assertIn("[REDACTED]", message)
+        self.assertEqual(len(message.split(" stderr=", 1)[1]), 500)
 
     @patch("boxer_company.routers.device_update._run_remote_ssh_command")
     @patch("boxer_company.routers.device_update._open_device_ssh_for_update")
