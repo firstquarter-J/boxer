@@ -20,6 +20,7 @@ from boxer_company.recording_media_scope import (
 )
 from boxer_company.recording_media_timeline import bounded_seconds, format_time
 from boxer_company.recording_video_summary import (
+    format_recording_flicker_summary,
     format_recording_freeze_summary,
     format_recording_video_summary,
     normalize_recording_video_details,
@@ -46,6 +47,7 @@ _DIAGNOSTICS = {
 _ISSUES = {
     "video_frozen": "연속 화면 정지",
     "video_uniform_color": "연속 단색 화면",
+    "video_flicker": "반복 깜빡임",
     "video_decode_failed": "영상 디코딩 실패",
     "video_no_decodable_frames": "디코딩된 영상 프레임 없음",
     "video_metadata_unreadable": "영상 재생 정보 읽기 실패",
@@ -128,6 +130,8 @@ def _format_evidence(evidence: Mapping[str, Any]) -> str:
                 summaries.append(f"최장 연속 화면 정지: {format_time(longest)}")
         if "video_uniform_color" in issues:
             summaries.append(format_recording_video_summary(details))
+        if "video_flicker" in issues:
+            summaries.append(format_recording_flicker_summary(details))
         if any(
             item in issues
             for item in ("audio_decode_failed", "audio_duration_mismatch")

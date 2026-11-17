@@ -323,6 +323,79 @@ def _media_quality_event(
     }
 
 
+def _flicker_event(notification_id: int = 90) -> dict:
+    event = _media_quality_event(notification_id, issues=["video_flicker"])
+    event["details"]["video"]["visualAnalysis"]["flicker"] = {
+        "status": "complete", "detected": True, "windowSec": 10,
+        "minFlashes": 6, "minBlackRatio": 0.2, "minFlashDurationSec": 0.05,
+        "maxFlashDurationSec": 0.8, "blackPixelThreshold": 32,
+        "blackFrameThresholdPct": 95, "firstDetectedAtSec": 101.2,
+        "window": {"startSec": 100, "endSec": 110, "flashCount": 10,
+                   "blackDurationSec": 2, "blackRatio": 0.2},
+    }
+    return event
+
+
+def test_flicker_window_is_independent_of_long_freeze_policy_after_reload() -> None:
+    # 영상의 0.33%인 짧은 반복 창도 전용 기준으로 알리고 50% 미만 정지는 제외한다.
+    event = _flicker_event()
+    event["details"]["issues"].append("video_frozen")
+    event["details"]["video"]["visualAnalysis"]["freeze"]["maxDurationSec"] = 1
+    restored = json.loads(json.dumps(cycle._normalize_event(event), allow_nan=False))
+    deps, mocks = _deps()
+    handler = DeviceNotificationAlertCycleHandler(deps)
+    result = handler.run(_request(cursor={
+        **_initialized_cursor(90), "pendingEvents": [restored],
+    }))
+    delivery, = result.deliveries
+    item = delivery.payload["alertSummary"]["deviceResults"][0]
+    issue = item["priorityReason"]
+    assert item["alertCategory"] == "recording_video"
+    assert item["componentLabels"] == {}
+    assert "반복 깜빡임 감지" in issue and "감지 창 내 깜빡임 10회" in issue
+    assert "감지 창 내 검은 화면 00:02 (창의 20.0%)" in issue
+    assert "정지" not in issue and "50%" not in issue
+    assert result.cursor["pendingEvents"][0]["details"]["issues"] == ["video_flicker", "video_frozen"]
+    acknowledged = handler.acknowledge(_request(cursor=dict(result.cursor)), (
+        AutomationDeliveryReceipt(delivery_id=delivery.delivery_id, status="sent",
+                                  external_message_id="1710000000.090", delivered_at=_NOW),
+    ))
+    assert acknowledged["pendingEvents"] == []
+    mocks["send_sms"].assert_not_called()
+    mocks["verify_video"].assert_not_called()
+
+
+@pytest.mark.parametrize("value", [None, {}, {"status": "unavailable", "detected": True}])
+def test_flicker_without_complete_measurements_is_consumed_without_alert(value: object) -> None:
+    event = _flicker_event()
+    event["details"]["video"]["visualAnalysis"]["flicker"] = value
+    deps, mocks = _deps(next_result=(90, event))
+    result = DeviceNotificationAlertCycleHandler(deps).run(_request(cursor=_initialized_cursor(89)))
+    assert result.deliveries == () and result.cursor["pendingEvents"] == []
+    mocks["media_session"].assert_not_called()
+
+
+def test_same_recording_flicker_and_audio_have_separate_delivery_receipts() -> None:
+    # 깜빡임 도입 뒤에도 같은 파일의 오디오 이상은 별도 알림과 ACK를 유지한다.
+    video = _flicker_event(90)
+    audio = _media_quality_event(91, media_type="audio", issues=["audio_duration_mismatch"])
+    cursor = {**_initialized_cursor(91), "pendingEvents": [video, audio]}
+    deps, mocks = _deps()
+    for notification_id, label in ((90, "반복 깜빡임 감지"), (91, "오디오")):
+        handler = DeviceNotificationAlertCycleHandler(deps)
+        result = handler.run(_request(cursor=json.loads(json.dumps(cursor))))
+        delivery, = result.deliveries
+        assert delivery.delivery_id == f"device_notification:{notification_id}"
+        assert label in delivery.payload["alertSummary"]["deviceResults"][0]["priorityReason"]
+        cursor = handler.acknowledge(_request(cursor=dict(result.cursor)), (
+            AutomationDeliveryReceipt(delivery_id=delivery.delivery_id, status="sent",
+                                      external_message_id=f"1710000000.{notification_id}", delivered_at=_NOW),
+        ))
+    assert cursor["pendingEvents"] == []
+    assert mocks["append_sheet"].call_count == 2
+    mocks["send_sms"].assert_not_called()
+
+
 @pytest.mark.parametrize("batch", [True, False])
 def test_media_quality_is_selected_from_notification_db(
     monkeypatch: pytest.MonkeyPatch, batch: bool,

@@ -37,6 +37,7 @@ from boxer_company.recording_audio_summary import (
 )
 from boxer_company.recording_issue_explanation import format_recording_issue_explanation
 from boxer_company.recording_video_summary import (
+    format_recording_flicker_summary,
     format_recording_freeze_summary,
     format_recording_video_length,
     format_recording_video_summary,
@@ -86,6 +87,7 @@ _MEDIA_ISSUE_LABELS = {
     "video_no_decodable_frames": "재생 가능한 영상 프레임 없음",
     "video_frozen": "화면 정지 구간 감지",
     "video_uniform_color": "단색 화면 구간 감지",
+    "video_flicker": "반복 깜빡임 감지",
     "audio_stream_missing": "오디오 트랙 없음",
     "audio_decode_failed": "오디오 디코딩 실패",
     "audio_duration_mismatch": "영상 길이 대비 오디오 길이 부족",
@@ -1816,6 +1818,9 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
         if media_type == "video":
             # 실측 지표와 허용된 원인 코드만 재시작·ACK 뒤에도 유지한다.
             safe_details.update(normalize_recording_video_details(details))
+            # 깜빡임은 전체 영상의 50%가 아니라 완료된 짧은 반복 창으로 판정한다.
+            if safe_details["video"]["visualAnalysis"]["flicker"] is None:
+                safe_details["issues"] = [issue for issue in safe_details["issues"] if issue != "video_flicker"]
         if media_type == "audio":
             # 재시작·ACK에도 구간과 전체 합계를 유지하되 원본 로그는 저장하지 않는다.
             safe_details.update(normalize_recording_audio_details(details))
@@ -2256,6 +2261,8 @@ def _build_root_alert(
             issue += "\n" + format_recording_video_length(details)
         if "video_frozen" in details.get("issues", []):
             issue += "\n" + format_recording_freeze_summary(details)
+        if "video_flicker" in details.get("issues", []):
+            issue += "\n" + format_recording_flicker_summary(details)
         issue += "\n" + format_recording_issue_explanation(details)
         alert_category = f"recording_{media_type}"
         # 파일 이상만으로 캡처보드·스피커 고장을 단정하지 않는다.

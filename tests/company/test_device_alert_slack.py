@@ -74,6 +74,26 @@ def test_audio_alert_uses_same_detail_layout_as_video() -> None:
     assert target["issue"] == item["issue"]
 
 
+def test_flicker_card_labels_window_metrics_without_whole_video_ratio() -> None:
+    # 알림의 20%는 10초 감지 창에만 해당하며 영상 전체 비율로 바꾸지 않는다.
+    item = {**_item(), "alertCategory": "recording_video", "problemComponents": [], "issue": (
+        "녹화 파일 영상 이상: 반복 깜빡임 감지, 영상 디코딩 실패 (발생 2026-11-17 14:39:08 KST)\n"
+        "영상 길이 10:00\n깜빡임 감지 창: 01:40~01:50 (영상 시작 기준)\n"
+        "감지 창 내 깜빡임 10회\n감지 창 내 검은 화면 00:02 (창의 20.0%)\n"
+        "깜빡임 감지 기준: 10초 안에 0.05~0.8초 검은 화면 6회 이상, 창의 20% 이상"
+    )}
+    message = _rendered_message(item)
+    text = alert._alert_issue_mrkdwn(item)
+    assert "반복 깜빡임 *10회* (감지 창 기준)" in text
+    assert "감지 창 내 검은 화면 *2초* (창의 20.0%)" in text
+    assert "깜빡임 감지 창 01:40~01:50 (영상 시작 기준)" in text
+    assert "영상 전체 *10분*" in text and "*영상 디코딩 실패*" in text
+    assert "영상 전체의 20" not in text and "합계" not in text
+    assert text in message["text"]
+    target = json.loads(message["blocks"][-1]["elements"][0]["value"])
+    assert target["issue"] == item["issue"]
+
+
 @pytest.mark.parametrize(("length", "expected"), [
     ("00:59.999", "1분"), ("01:59.95", "2분"), ("00:34.25", "34.3초"),
     ("00:00", "0초"), ("확인 필요", "확인 필요"),

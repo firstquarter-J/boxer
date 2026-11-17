@@ -580,6 +580,15 @@ def _recording_media_issue_sections(issue: str) -> dict[str, list[str]]:
             summarized_reasons.add("단색 화면 구간 감지")
         elif line.startswith("단색 감지 구간: "):
             sections["분석 구간"].append("단색 구간 " + line.removeprefix("단색 감지 구간: ") + " (영상 시작 기준)")
+        elif (match := re.fullmatch(r"감지 창 내 깜빡임 (\d+)회", line)):
+            headline.append(f"반복 깜빡임 *{match[1]}회* (감지 창 기준)")
+            summarized_reasons.add("반복 깜빡임 감지")
+        elif (match := re.fullmatch(r"감지 창 내 검은 화면 (\S+) \(창의 ([^)]+)\)", line)):
+            comparisons.append(f"감지 창 내 검은 화면 *{duration(match[1])}* (창의 {match[2]})")
+        elif line.startswith("깜빡임 감지 창: "):
+            sections["분석 구간"].append("깜빡임 감지 창 " + line.removeprefix("깜빡임 감지 창: "))
+        elif line.startswith("깜빡임 감지 기준: "):
+            sections["감지 기준"].append("깜빡임: " + line.removeprefix("깜빡임 감지 기준: "))
         elif line.startswith(("정지 알림 기준: ", "단색 알림 기준: ")):
             # 새 비율 정책은 고정 초 기준과 구분하며, 이전 카드의 시간 문구도 계속 읽는다.
             kind, criterion = line.split(" 알림 기준: ", 1)

@@ -243,6 +243,28 @@ def test_existing_visual_metrics_are_labeled_as_original_device_analysis() -> No
     assert "이번 재검사 범위는 영상 디코딩" in body
 
 
+def test_existing_flicker_window_does_not_claim_current_decode_retested_flicker() -> None:
+    # 재진단은 영상 디코딩만 실행하므로 깜빡임 수치는 기존 장비 검사로 분리한다.
+    evidence = _evidence("completed", "unknown")
+    evidence.update({
+        "notificationIssues": ["video_flicker"],
+        "notificationDetails": {"durationSec": 600, "video": {"visualAnalysis": {"flicker": {
+            "status": "complete", "detected": True, "windowSec": 10,
+            "minFlashes": 6, "minBlackRatio": 0.2, "minFlashDurationSec": 0.05,
+            "maxFlashDurationSec": 0.8, "blackPixelThreshold": 32,
+            "blackFrameThresholdPct": 95, "firstDetectedAtSec": 101.2,
+            "window": {"startSec": 100, "endSec": 110, "flashCount": 10,
+                       "blackDurationSec": 2, "blackRatio": 0.2},
+        }}}},
+    })
+    body = (RecordingMediaDiagnosisAssistantRoute(Mock(return_value=evidence))
+            .handle(_request("영상 오류 확인", _ALERT)).messages[0].body)
+    assert "기존 장비 알림: 반복 깜빡임" in body
+    assert "기존 장비 검사 결과:" in body and "감지 창 내 깜빡임 10회" in body
+    assert "창의 20.0%" in body and "전체의 20.0%" not in body
+    assert "이번 재검사 범위는 영상 디코딩" in body
+
+
 @pytest.mark.parametrize(
     "question,context",
     [

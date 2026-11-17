@@ -46,6 +46,7 @@ _ISSUES = frozenset(
         "video_no_decodable_frames",
         "video_frozen",
         "video_uniform_color",
+        "video_flicker",
         "audio_stream_missing",
         "audio_decode_failed",
         "audio_duration_mismatch",
@@ -319,6 +320,10 @@ def _notification_evidence(notification: dict[str, Any]) -> dict[str, Any]:
         "issues": issues,
         "mediaType": "audio" if details.get("mediaType") == "audio" else "video",
     }
+    # 알림 재조회도 cycle과 같은 실측 창 검증을 거쳐 과거 원인을 설명한다.
+    if safe_details["video"]["visualAnalysis"]["flicker"] is None:
+        issues = [issue for issue in issues if issue != "video_flicker"]
+        safe_details["issues"] = issues
     return {
         "notificationId": notification["id"],
         "notificationIssues": issues,

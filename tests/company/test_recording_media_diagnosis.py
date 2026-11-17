@@ -312,6 +312,26 @@ def test_notification_evidence_removes_paths_raw_errors_and_unknown_fields(
     assert "private-secret" not in encoded and "/private/" not in encoded
 
 
+@pytest.mark.parametrize("complete", [True, False])
+def test_original_flicker_evidence_uses_same_completed_window_validation(complete: bool) -> None:
+    # 과거 알림을 다시 읽을 때도 미완료 지표를 확정된 깜빡임으로 소개하지 않는다.
+    result = media._notification_evidence(_notification(details={
+        "mediaType": "video", "issues": ["video_flicker"], "durationSec": 600,
+        "video": {"visualAnalysis": {"flicker": {
+            "status": "complete" if complete else "unavailable", "detected": True,
+            "windowSec": 10, "minFlashes": 6, "minBlackRatio": 0.2,
+            "minFlashDurationSec": 0.05, "maxFlashDurationSec": 0.8,
+            "blackPixelThreshold": 32, "blackFrameThresholdPct": 95,
+            "firstDetectedAtSec": 101.2,
+            "window": {"startSec": 100, "endSec": 110, "flashCount": 10,
+                       "blackDurationSec": 2, "blackRatio": 0.2},
+        }}},
+    }))
+    assert result["notificationIssues"] == (["video_flicker"] if complete else [])
+    flicker = result["notificationDetails"]["video"]["visualAnalysis"]["flicker"]
+    assert (flicker is not None) is complete
+
+
 @pytest.mark.parametrize(
     "invalid_row",
     [

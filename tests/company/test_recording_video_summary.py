@@ -3,10 +3,64 @@ import json
 import pytest
 
 from boxer_company.recording_video_summary import (
+    format_recording_flicker_summary,
     format_recording_freeze_summary,
     format_recording_video_summary,
     normalize_recording_video_details,
 )
+
+
+def flicker_details() -> dict:
+    return {"durationSec": 600, "video": {"visualAnalysis": {"flicker": {
+        "status": "complete", "detected": True, "windowSec": 10,
+        "minFlashes": 6, "minBlackRatio": 0.2, "minFlashDurationSec": 0.05,
+        "maxFlashDurationSec": 0.8, "blackPixelThreshold": 32,
+        "blackFrameThresholdPct": 95, "firstDetectedAtSec": 101.2,
+        "stderr": "private-log", "window": {"startSec": 100, "endSec": 110,
+        "flashCount": 10, "blackDurationSec": 2, "blackRatio": 0.2,
+        "path": "/private/video.mp4"},
+    }}}}
+
+
+def test_flicker_window_survives_reload_without_claiming_whole_video_totals() -> None:
+    # 기준을 넘긴 같은 10초 창의 횟수와 비율을 묶어 보존한다.
+    normalized = normalize_recording_video_details(flicker_details())
+    restored = json.loads(json.dumps(normalized, allow_nan=False))
+    assert normalize_recording_video_details(restored) == normalized
+    text = format_recording_flicker_summary(restored)
+    assert "깜빡임 감지 창: 01:40~01:50 (영상 시작 기준)" in text
+    assert "감지 창 내 깜빡임 10회" in text
+    assert "감지 창 내 검은 화면 00:02 (창의 20.0%)" in text
+    assert "전체" not in text
+    assert "private" not in json.dumps(restored)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("status", "unavailable"), ("status", "unsupported"), ("detected", False),
+    ("windowSec", 1), ("minFlashes", True), ("minBlackRatio", 0.01),
+    ("blackPixelThreshold", "32"), ("blackFrameThresholdPct", 0),
+    ("firstDetectedAtSec", 99), ("firstDetectedAtSec", 110),
+    ("firstDetectedAtSec", float("nan")), ("window", None),
+])
+def test_unfinished_or_changed_flicker_contract_never_claims_detection(key: str, value: object) -> None:
+    details = flicker_details()
+    details["video"]["visualAnalysis"]["flicker"][key] = value
+    assert normalize_recording_video_details(details)["video"]["visualAnalysis"]["flicker"] is None
+    assert "확인 필요" in format_recording_flicker_summary(details)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("startSec", -1), ("endSec", 601), ("endSec", 109),
+    ("flashCount", 5), ("flashCount", True), ("flashCount", 10.0), ("flashCount", 201),
+    ("blackDurationSec", 1.9), ("blackDurationSec", 9),
+    ("blackRatio", 0.9), ("blackRatio", float("inf")),
+])
+def test_inconsistent_flicker_window_is_not_displayed(key: str, value: object) -> None:
+    details = flicker_details()
+    details["video"]["visualAnalysis"]["flicker"]["window"][key] = value
+    normalized = normalize_recording_video_details(details)
+    assert normalized["video"]["visualAnalysis"]["flicker"] is None
+    json.dumps(normalized, allow_nan=False)
 
 
 def test_freeze_preserves_first_detection_and_threshold_without_inventing_ranges() -> None:
