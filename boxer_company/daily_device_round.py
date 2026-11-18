@@ -1,6 +1,7 @@
 
 from boxer_company.deployment import get_local_zone, get_timezone_label
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping
 from datetime import datetime, time, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -50,6 +51,7 @@ _DAILY_DEVICE_ROUND_HOSPITAL_SCOPE_LABELS = {
     "all": "all_active_installed_hospitals",
 }
 _DailyDeviceRoundProgressCallback = Callable[[str, dict[str, Any]], None]
+_AGENT_UPDATE_FAILURE_STATUSES = {"dispatch_failed", "rolled_back", "failed", "rollback_failed", "prepare_failed"}
 
 
 def _daily_device_round_timezone() -> ZoneInfo:
@@ -712,6 +714,9 @@ def _build_daily_device_round_action_result(
         receipt["version"] if ok and receipt.get("phase") in {"committed", "already_latest"}
         and _agent_installer_release_valid(receipt) else ""
     )
+    # 설치 완료 폴링도 이미 최신인 요청을 completed로 반환할 수 있다.
+    if route == "device_agent_update" and confirmed_version and receipt.get("phase") == "already_latest":
+        status = "already_latest"
     return {
         "route": route,
         "text": result_text,
@@ -723,32 +728,54 @@ def _build_daily_device_round_action_result(
     }
 
 
+def _daily_device_round_agent_outcome(
+    plan: Mapping[str, Any],
+    action: Mapping[str, Any] | None,
+) -> str:
+    # 실행 중인 에이전트도 최신 확인이 필요하다. 설치기 생략 영수증은 설치 성공과 구분한다.
+    if action:
+        status = _display_value(action.get("status"), default="")
+        if action.get("ok") and status == "already_latest":
+            return "latest"
+        if action.get("ok") and status == "completed":
+            return "success"
+        if status in _AGENT_UPDATE_FAILURE_STATUSES:
+            return "failed"
+        return "check"
+    if plan.get("shouldUpdate"):
+        return "pending"
+    if plan.get("isLatest"):
+        return "latest"
+    return "check"
+
+
 def _describe_daily_device_round_action(
     action: dict[str, Any] | None,
     *,
     route_kind: str,
     plan: dict[str, Any],
 ) -> str:
+    if route_kind == "agent":
+        outcome = _daily_device_round_agent_outcome(plan, action)
+        if outcome == "latest":
+            return "에이전트 최신"
+        if outcome == "success":
+            return "에이전트 업데이트 완료"
+        if outcome == "failed":
+            return "에이전트 업데이트 실패"
+        if outcome == "pending":
+            return "에이전트 업데이트 후보"
+        if action:
+            return "에이전트 업데이트 확인 필요"
+        return _display_value(plan.get("reason"), default="에이전트 확인 필요")
+
     if action:
         status = _display_value(action.get("status"), default="")
-        if route_kind == "agent":
-            if status in {"completed", "already_latest"} and action.get("ok"):
-                return "에이전트 업데이트 완료"
-            if status == "dispatch_failed":
-                return "에이전트 업데이트 실패"
-            return "에이전트 업데이트 확인 필요"
         if status in {"completed", "already_latest"} and action.get("ok"):
             return "박스 업데이트 완료"
         if status == "dispatch_failed":
             return "박스 업데이트 실패"
         return "박스 업데이트 확인 필요"
-
-    if route_kind == "agent":
-        if plan.get("shouldUpdate"):
-            return "에이전트 업데이트 후보"
-        if plan.get("isHealthy") or plan.get("isLatest"):
-            return "에이전트 정상"
-        return _display_value(plan.get("reason"), default="에이전트 확인 필요")
 
     if plan.get("alreadyLatest"):
         return "박스 최신"
@@ -823,6 +850,9 @@ def _describe_daily_device_round_route_summary(
     *,
     route_kind: str,
 ) -> tuple[str, str, str]:
+    if route_kind == "box" and device_result.get("agentOnly") is True:
+        return "skipped", "", ""
+
     final_plan = device_result.get("finalPlan") if isinstance(device_result.get("finalPlan"), dict) else {}
     plan = final_plan.get(route_kind) if isinstance(final_plan.get(route_kind), dict) else {}
     action = device_result.get(f"{route_kind}Action") if isinstance(device_result.get(f"{route_kind}Action"), dict) else None
@@ -849,22 +879,29 @@ def _describe_daily_device_round_route_summary(
         )
 
     if route_kind == "agent":
+        outcome = _daily_device_round_agent_outcome(plan, action)
+        confirmed_version = (action or {}).get("confirmedVersion")
+        version = f"버전 `{current_version or '미확인'}`"
+        reason = _display_value(plan.get("reason"), default="에이전트 상태 확인 필요")
+        if outcome == "latest":
+            detail = f"설치기 확인 버전 `{confirmed_version}`" if confirmed_version else version
+            return outcome, "업데이트 불필요", detail
+        if outcome == "success":
+            if confirmed_version:
+                return outcome, "업데이트 완료", f"설치 확정 버전 `{confirmed_version}`"
+            if previous_version and current_version and previous_version != current_version:
+                return outcome, "업데이트 완료", f"`{previous_version}` -> `{current_version}`"
+            return outcome, "업데이트 완료", version
+        if outcome == "failed":
+            detail = "업데이트 요청 실패" if action and action.get("status") == "dispatch_failed" else "설치기에서 업데이트 실패 확인"
+            return outcome, "업데이트 실패", f"{version} | {detail}"
+        if outcome == "pending":
+            return outcome, "업데이트 필요", reason
         if action:
-            status = _display_value(action.get("status"), default="")
-            if status in {"completed", "already_latest"} and action.get("ok"):
-                if action.get("confirmedVersion"):
-                    return "success", "업데이트 완료", f"설치 확정 버전 `{action['confirmedVersion']}`"
-                if previous_version and current_version and previous_version != current_version:
-                    return "success", "업데이트 완료", f"`{previous_version}` -> `{current_version}`"
-                return "success", "업데이트 완료", f"버전 `{current_version or '미확인'}`"
-            if status == "dispatch_failed":
-                return "failed", "업데이트 실패", _display_value(plan.get("reason"), default="업데이트 실패")
-            return "check", "확인 필요", _display_value(plan.get("reason"), default="업데이트 확인 필요")
-        if plan.get("isHealthy") or plan.get("isLatest"):
-            return "latest", "업데이트 불필요", f"버전 `{current_version or '미확인'}`"
-        if plan.get("shouldUpdate"):
-            return "pending", "업데이트 필요", _display_value(plan.get("reason"), default="업데이트 후보")
-        return "check", "확인 필요", _display_value(plan.get("reason"), default="상태 확인 필요")
+            return outcome, "확인 필요", f"{version} | 설치 완료 여부 확인 필요"
+        if device_result.get("agentOnly") is True and device_result.get("overallLabel") == "점검 불가":
+            return outcome, "점검 불가", reason
+        return outcome, "확인 필요", reason
 
     if action:
         status = _display_value(action.get("status"), default="")
@@ -920,6 +957,20 @@ def _format_daily_device_round_percent(value: Any) -> str:
 def _build_daily_device_round_summary_lines(
     report_summary: dict[str, Any],
 ) -> list[str]:
+    device_results = report_summary.get("deviceResults") or []
+    agent_results = [item for item in device_results if isinstance(item, dict) and item.get("agentOnly") is True]
+    if agent_results:
+        # 전용 순회에서는 장비 상태 대신 에이전트 결과를 같은 판정으로 집계한다.
+        counts = Counter(
+            _describe_daily_device_round_route_summary(item, route_kind="agent")[1]
+            for item in agent_results
+        )
+        return [
+            f"• 에이전트 {label} `{counts[label]}대`"
+            for label in ("업데이트 불필요", "업데이트 완료", "업데이트 실패", "업데이트 필요", "확인 필요", "점검 불가")
+            if counts[label]
+        ]
+
     status_counts = report_summary.get("statusCounts") if isinstance(report_summary.get("statusCounts"), dict) else {}
     update_counts = report_summary.get("updateCounts") if isinstance(report_summary.get("updateCounts"), dict) else {}
     cleanup_counts = report_summary.get("cleanupCounts") if isinstance(report_summary.get("cleanupCounts"), dict) else {}
@@ -1037,6 +1088,8 @@ def _is_daily_device_round_ssh_unavailable(device_result: dict[str, Any]) -> boo
 
 
 def _is_daily_device_round_cleanup_actionable(device_result: dict[str, Any]) -> bool:
+    if device_result.get("agentOnly") is True:
+        return False
     cleanup = device_result.get("trashcanCleanup") if isinstance(device_result.get("trashcanCleanup"), dict) else {}
     if cleanup.get("required") or cleanup.get("executed"):
         return True
@@ -1056,7 +1109,7 @@ def _is_daily_device_round_route_actionable(
         device_result,
         route_kind=route_kind,
     )
-    if status_kind == "latest":
+    if status_kind in {"latest", "skipped"}:
         return False
     if status_kind in {"success", "pending", "failed", "check"}:
         return True
@@ -1082,14 +1135,16 @@ def _is_daily_device_round_actionable_device(device_result: dict[str, Any]) -> b
     return False
 
 
-def _collect_daily_device_round_actionable_device_results(
+def _collect_daily_device_round_report_devices(
     device_results: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    # Slack 본문 길이를 줄이기 위해 확인이 필요하거나 실제 작업이 있었던 장비만 남겨.
+    # 에이전트 전용 보고서는 최신 장비도 버전과 점검 결과를 보여준다.
     return [
         item
         for item in device_results
-        if isinstance(item, dict) and _is_daily_device_round_actionable_device(item)
+        if isinstance(item, dict) and (
+            item.get("agentOnly") is True or _is_daily_device_round_actionable_device(item)
+        )
     ]
 
 
@@ -1161,7 +1216,7 @@ def _build_daily_device_round_issue_summary(device_result: dict[str, Any]) -> st
     issues: list[str] = []
     for key in ("audio", "pm2", "storage", "captureboard", "led"):
         label = _display_value(component_labels.get(key), default="")
-        if not label or label == "정상":
+        if not label or label in {"정상", "미점검"}:
             continue
         issue_text = _build_daily_device_round_component_issue_text(
             device_result,
@@ -1192,21 +1247,20 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
         device_result,
         route_kind="agent",
     )
-    box_status_kind, box_status_label, box_detail = _describe_daily_device_round_route_summary(
-        device_result,
-        route_kind="box",
-    )
-    power_status_kind, power_status_label, power_detail = _describe_daily_device_round_power_summary(device_result)
-    cleanup_status, cleanup_detail = _describe_daily_device_round_trashcan_cleanup(device_result)
     room_name = _display_value(device_result.get("roomName"), default="")
     device_name = _display_value(device_result.get("deviceName"), default="미확인")
     header_parts: list[str] = []
     if room_name and room_name != "미확인":
         header_parts.append(f"*{room_name}*")
     header_parts.append(f"*{device_name}*")
-    header_parts.append(_format_daily_device_round_status_badge(overall_label))
     header = f"• {'  |  '.join(header_parts)}"
 
+    # 전체 장비 상태 대신 이번 순회로 확인한 에이전트 결과만 표시한다.
+    if device_result.get("agentOnly") is True:
+        agent_badge = _format_daily_device_round_update_badge(agent_status_kind, agent_status_label)
+        return f"{header}\n  *에이전트 업데이트*  {agent_badge} | {agent_detail}"
+
+    header += f"  |  {_format_daily_device_round_status_badge(overall_label)}"
     if _is_daily_device_round_ssh_unavailable(device_result):
         return "\n".join(
             [
@@ -1225,15 +1279,20 @@ def _build_daily_device_round_device_line(device_result: dict[str, Any]) -> str:
             f"  *{detail_label}*  {_display_value(device_result.get('priorityReason'), default='상세 확인 필요')}"
         )
     if _is_daily_device_round_cleanup_actionable(device_result):
+        cleanup_status, cleanup_detail = _describe_daily_device_round_trashcan_cleanup(device_result)
         lines.append(f"  *디스크 정리*  *{cleanup_status}* | {cleanup_detail}")
     if _is_daily_device_round_route_actionable(device_result, route_kind="agent"):
         lines.append(
             f"  *에이전트 업데이트*  {_format_daily_device_round_update_badge(agent_status_kind, agent_status_label)} | {agent_detail}"
         )
     if _is_daily_device_round_route_actionable(device_result, route_kind="box"):
+        box_status_kind, box_status_label, box_detail = _describe_daily_device_round_route_summary(
+            device_result, route_kind="box",
+        )
         lines.append(
             f"  *박스 업데이트*  {_format_daily_device_round_update_badge(box_status_kind, box_status_label)} | {box_detail}"
         )
+    power_status_kind, power_status_label, power_detail = _describe_daily_device_round_power_summary(device_result)
     if power_status_kind:
         lines.append(
             f"  *장비 종료*  {_format_daily_device_round_update_badge(power_status_kind, power_status_label)} | {power_detail}"
@@ -1260,12 +1319,15 @@ def _run_daily_device_round_for_device(
         )
     else:
         status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
-    trashcan_cleanup = _run_device_trashcan_cleanup(
-        status_payload,
-        execute=auto_cleanup_trashcan,
-        cleanup_threshold_percent=cs.DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT,
-        cleanup_age_days=cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS,
-    )
+    # 전용 순회에서 조회하지 않은 용량을 정리 실패로 해석하지 않는다.
+    trashcan_cleanup = {}
+    if not agent_only:
+        trashcan_cleanup = _run_device_trashcan_cleanup(
+            status_payload,
+            execute=auto_cleanup_trashcan,
+            cleanup_threshold_percent=cs.DAILY_DEVICE_ROUND_TRASHCAN_USAGE_THRESHOLD_PERCENT,
+            cleanup_age_days=cs.DAILY_DEVICE_ROUND_TRASHCAN_DELETE_AGE_DAYS,
+        )
     if trashcan_cleanup.get("executed"):
         status_text, status_payload = _build_daily_device_round_maintenance_status(device_name)
 
@@ -1335,6 +1397,7 @@ def _run_daily_device_round_for_device(
     priority = _build_daily_device_round_priority(status_payload)
 
     return {
+        "agentOnly": agent_only,
         "deviceName": _display_value(device_payload.get("deviceName"), default=device_name),
         "hospitalName": _display_value(device_payload.get("hospitalName"), default="미확인"),
         "roomName": _display_value(device_payload.get("roomName"), default="미확인"),
@@ -1373,10 +1436,13 @@ def _run_daily_device_round_for_device(
 def _build_daily_device_round_error_result(
     device_context: dict[str, Any],
     exc: Exception,
+    *,
+    agent_only: bool = False,
 ) -> dict[str, Any]:
     # 장비별 처리 예외도 야간 유지보수 실패로 분류해서 이상 감지 문구와 섞이지 않게 해.
     priority = _build_daily_device_round_priority({"route": "daily_device_round_maintenance_probe"})
     return {
+        "agentOnly": agent_only,
         "deviceName": _display_value(device_context.get("deviceName"), default="미확인"),
         "hospitalName": _display_value(device_context.get("hospitalName"), default="미확인"),
         "roomName": _display_value(device_context.get("roomName"), default="미확인"),
@@ -1526,6 +1592,7 @@ def _build_daily_device_round_summary(
         auto_cleanup_trashcan and hospital_is_free_barcode
     )
     hospital_auto_power_off = bool(auto_power_off and hospital_is_free_barcode)
+    agent_only = auto_update_agent and not (auto_update_box or hospital_auto_cleanup_trashcan or hospital_auto_power_off)
 
     devices = _load_daily_device_round_devices(int(hospital["hospitalSeq"]))
     if progress_callback is not None:
@@ -1565,7 +1632,7 @@ def _build_daily_device_round_summary(
                 )
             )
         except Exception as exc:
-            device_results.append(_build_daily_device_round_error_result(device, exc))
+            device_results.append(_build_daily_device_round_error_result(device, exc, agent_only=agent_only))
 
     finished_at = _coerce_daily_device_round_now(now)
     status_counts = {
@@ -1599,20 +1666,21 @@ def _build_daily_device_round_summary(
 
         initial_plan = item.get("initialPlan") if isinstance(item.get("initialPlan"), dict) else {}
         final_plan = item.get("finalPlan") if isinstance(item.get("finalPlan"), dict) else {}
-        if bool(((initial_plan.get("agent") or {}) if isinstance(initial_plan.get("agent"), dict) else {}).get("shouldUpdate")):
+        initial_agent_plan = initial_plan.get("agent") if isinstance(initial_plan.get("agent"), dict) else {}
+        agent_action = item.get("agentAction") if isinstance(item.get("agentAction"), dict) else {}
+        agent_outcome = _daily_device_round_agent_outcome(initial_agent_plan, agent_action)
+        if initial_agent_plan.get("shouldUpdate") and agent_outcome != "latest":
             update_counts["agentCandidates"] += 1
         if bool(((initial_plan.get("box") or {}) if isinstance(initial_plan.get("box"), dict) else {}).get("shouldUpdate")) or bool(
             ((final_plan.get("box") or {}) if isinstance(final_plan.get("box"), dict) else {}).get("shouldUpdate")
         ):
             update_counts["boxCandidates"] += 1
 
-        agent_action = item.get("agentAction") if isinstance(item.get("agentAction"), dict) else {}
         box_action = item.get("boxAction") if isinstance(item.get("boxAction"), dict) else {}
-        if agent_action:
-            if agent_action.get("ok"):
-                update_counts["agentUpdated"] += 1
-            else:
-                update_counts["agentUpdateFailed"] += 1
+        if agent_outcome == "success":
+            update_counts["agentUpdated"] += 1
+        elif agent_outcome == "failed":
+            update_counts["agentUpdateFailed"] += 1
         if box_action:
             if box_action.get("ok"):
                 update_counts["boxUpdated"] += 1
@@ -1687,7 +1755,7 @@ def _format_daily_device_round_report(
     local_now = _coerce_daily_device_round_now(now)
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     device_results = report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
-    actionable_device_results = _collect_daily_device_round_actionable_device_results(device_results)
+    report_devices = _collect_daily_device_round_report_devices(device_results)
 
     lines: list[str] = []
     if include_title:
@@ -1713,13 +1781,14 @@ def _format_daily_device_round_report(
 
     lines.extend(_build_daily_device_round_summary_lines(report_summary))
 
-    if not actionable_device_results:
+    if not report_devices:
         lines.append("• 결과: 확인하거나 작업한 장비가 없어")
         return "\n".join(lines)
 
     lines.append("")
-    lines.append("*확인/작업 장비*")
-    for index, item in enumerate(actionable_device_results):
+    heading = "에이전트 점검 결과" if any(item.get("agentOnly") is True for item in report_devices) else "확인/작업 장비"
+    lines.append(f"*{heading}*")
+    for index, item in enumerate(report_devices):
         if index > 0:
             lines.append("")
         lines.append(_build_daily_device_round_device_line(item))
@@ -1737,7 +1806,7 @@ def _build_daily_device_round_blocks(
     hospital_seq = _coerce_int(report_summary.get("hospitalSeq"))
     hospital_name = _display_value(report_summary.get("hospitalName"), default="미선정")
     device_results = report_summary.get("deviceResults") if isinstance(report_summary.get("deviceResults"), list) else []
-    actionable_device_results = _collect_daily_device_round_actionable_device_results(device_results)
+    report_devices = _collect_daily_device_round_report_devices(device_results)
 
     blocks: list[dict[str, Any]] = []
     if include_header:
@@ -1803,7 +1872,7 @@ def _build_daily_device_round_blocks(
 
     blocks.append(_build_daily_device_round_summary_rich_text_block(report_summary))
 
-    if not actionable_device_results:
+    if not report_devices:
         blocks.append(
             {
                 "type": "section",
@@ -1816,7 +1885,7 @@ def _build_daily_device_round_blocks(
         return blocks
 
     blocks.append({"type": "divider"})
-    for item in actionable_device_results:
+    for item in report_devices:
         blocks.append(
             {
                 "type": "section",

@@ -372,6 +372,109 @@ def test_daily_cycle_reuses_sync_domain_once_and_redacts_raw_error(
         assert forbidden not in serialized
 
 
+@pytest.mark.parametrize(
+    ("agent_is_latest", "agent_action", "expected_kind", "expected_label"),
+    (
+        (True, None, "latest", "업데이트 불필요"),
+        (False, None, "pending", "업데이트 필요"),
+        (
+            False,
+            {"status": "already_latest", "ok": True, "confirmedVersion": "2.0.4"},
+            "latest",
+            "업데이트 불필요",
+        ),
+    ),
+    ids=("latest", "healthy-but-outdated", "installer-confirmed-no-change"),
+)
+def test_daily_agent_only_presentation_reports_agent_without_skipped_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_is_latest: bool,
+    agent_action: dict[str, Any] | None,
+    expected_kind: str,
+    expected_label: str,
+) -> None:
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", "us")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("BOXER_COMPANY_TIMEZONE", "America/Los_Angeles")
+    skipped_components = ("audio", "storage", "captureboard", "led")
+    # 실행 중인 에이전트도 최신 버전이 아닐 수 있다. 설치기가 이미 최신이라고
+    # 답하면 실제 설치 완료와 구분하고 영수증에서 확인한 버전을 보여준다.
+    current_version = "2.0.4" if agent_is_latest else "2.0.3"
+    device = {
+        "deviceName": "MB2-TEST",
+        "roomName": "테스트 진료실",
+        "agentOnly": True,
+        "overallLabel": "정상",
+        "componentLabels": {
+            **dict.fromkeys(skipped_components, "미점검"),
+            "pm2": "정상",
+        },
+        "statusPayload": {
+            "ssh": {"ready": True},
+            "overview": {
+                key: {"label": "미점검", "summary": "에이전트 전용 순회로 점검 생략"}
+                for key in skipped_components
+            },
+        },
+        "trashcanCleanup": {
+            "status": "unavailable",
+            "label": "실행 불가",
+            "detail": "TrashCan 용량 계산이 불완전해서 정리를 보류했어",
+        },
+        "finalPlan": {
+            "agent": {
+                "connected": True,
+                "currentVersion": current_version,
+                "isHealthy": True,
+                "isLatest": agent_is_latest,
+                "shouldUpdate": not agent_is_latest,
+                "reason": "에이전트 정상" if agent_is_latest else "에이전트 2.0.3 -> 2.0.4",
+            },
+            "box": {"reason": "앱 업데이트 점검 생략"},
+        },
+        "agentAction": agent_action,
+    }
+    summary = {
+        "hospitalSeq": 355,
+        "hospitalName": "테스트병원",
+        "deviceCount": 1,
+        "scheduledDeviceCount": 1,
+        "autoUpdateAgent": True,
+        "autoUpdateBox": False,
+        "autoCleanupTrashCan": False,
+        "autoPowerOff": False,
+        "statusCounts": {"정상": 1},
+        "deviceResults": [device],
+    }
+    payload = automation._project_daily_device_round_presentation(
+        summary,
+        scheduled_at=datetime(
+            2026, 11, 17, 2, 12, tzinfo=ZoneInfo("America/Los_Angeles"),
+        ),
+    )
+
+    for rendered in (
+        payload["fallbackText"],
+        json.dumps(payload["messageBlocks"], ensure_ascii=False),
+    ):
+        assert "MB2-TEST" in rendered
+        assert "에이전트 업데이트" in rendered
+        assert expected_label in rendered
+        assert "2.0.4" in rendered
+        assert "업데이트 완료" not in rendered
+        assert "점검 생략" not in rendered
+        assert "디스크 정리" not in rendered
+        assert "박스 업데이트" not in rendered
+    projected_device, = payload["deviceResults"]
+    assert "agentOnly" not in projected_device
+    assert projected_device["issueSummary"] == ""
+    assert projected_device["cleanup"]["visible"] is False
+    assert projected_device["boxUpdate"]["actionable"] is False
+    assert projected_device["boxUpdate"]["statusKind"] == "skipped"
+    assert projected_device["agentUpdate"]["actionable"] is (expected_kind == "pending")
+    assert projected_device["agentUpdate"]["statusKind"] == expected_kind
+
+
 def test_daily_cycle_checkpoints_each_legacy_progress_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

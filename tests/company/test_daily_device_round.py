@@ -302,6 +302,7 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
                     patch("boxer_company.routers.device_update._read_box_runtime_state") as read_box, \
                     patch("boxer_company.routers.device_update._get_mda_latest_device_version") as latest_box, \
                     patch("boxer_company.daily_device_round._collect_runtime_checks") as storage, \
+                    patch("boxer_company.daily_device_round._run_device_trashcan_cleanup") as cleanup, \
                     patch("boxer_company.daily_device_round._request_device_agent_update") as install:
                 self.device_detail.side_effect = None
                 self.device_detail.return_value = {"deviceName": "MB2-C00419", "isConnected": connected}
@@ -312,13 +313,20 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
                 if connected:
                     self.assertTrue(read_agent.call_args.kwargs["recover_stale_ssh"])
                     self.assertNotIn("resend_ssh_open", read_agent.call_args.kwargs)
-                for unused in (read_box, latest_box, storage, install):
+                for unused in (read_box, latest_box, storage, cleanup, install):
                     unused.assert_not_called()
                 self.assertEqual(result["overallLabel"], "점검 불가")
                 self.assertFalse(result["initialPlan"]["agent"]["shouldUpdate"])
                 self.assertFalse(result["finalPlan"]["agent"]["isLatest"])
                 self.assertFalse(result["finalPlan"]["agent"]["isHealthy"])
                 self.assertIsNone(result["agentAction"])
+                # 연결이 막힌 장비에서도 에이전트 점검 불가 이유를 표시한다.
+                line = rounder._build_daily_device_round_device_line(result)
+                self.assertIn("*에이전트 업데이트*", line)
+                self.assertIn("*점검 불가*", line)
+                self.assertIn("SSH 연결 불가" if connected else "연결 끊김", line)
+                self.assertNotIn("디스크 정리", line)
+                self.assertNotIn("박스 업데이트", line)
 
     def test_agent_only_reuses_runtime_and_keeps_receipt_separate_from_repo_observations(self) -> None:
         initial = _build_update_payload(box_version="3.2.0", latest_box_version="3.2.10",
@@ -348,6 +356,27 @@ class DailyDeviceRoundExecutionTests(unittest.TestCase):
         self.assertEqual(result["componentLabels"]["storage"], "미점검")
         self.assertEqual(result["statusPayload"]["request"]["component"], "agent")
         self.assertEqual(result["finalPlan"]["box"]["reason"], "앱 업데이트 점검 생략")
+        self.assertIn("*업데이트 완료* | 설치 확정 버전 `2.0.4`", rounder._build_daily_device_round_device_line(result))
+
+    def test_agent_receipt_latest_does_not_report_an_install(self) -> None:
+        # 완료 폴링은 이미 최신인 요청에도 completed를 반환한다.
+        action = rounder._build_daily_device_round_action_result(
+            result_text="설치기 확인",
+            result_payload={
+                "route": "device_agent_update",
+                "wait": {
+                    "ok": True,
+                    "status": "completed",
+                    "installer": {"phase": "already_latest", "version": "2.0.4", "revision": "a" * 40},
+                },
+            },
+        )
+        report_line = rounder._build_daily_device_round_device_line({
+            "agentOnly": True,
+            "finalPlan": {"agent": {"currentVersion": "2.0.3", "shouldUpdate": True}},
+            "agentAction": action,
+        })
+        self.assertIn("*업데이트 불필요* | 설치기 확인 버전 `2.0.4`", report_line)
 
     def test_receipt_does_not_relabel_old_process_or_unknown_final_repo(self) -> None:
         old = {"device": {"deviceName": "MB2-C00419", "isConnected": True},

@@ -27,6 +27,7 @@ from boxer_company.automation_contracts import (
 from boxer_company.daily_device_round import (
     _build_daily_device_round_blocks,
     _build_daily_device_round_summary,
+    _daily_device_round_agent_outcome,
     _format_daily_device_round_report,
 )
 from boxer_company.deployment import validate_daily_device_round_options
@@ -686,6 +687,7 @@ def _project_daily_device_round_presentation(
 def _project_daily_device_presentation(
     item: Mapping[str, Any],
 ) -> dict[str, Any]:
+    agent_only = item.get("agentOnly") is True
     component_labels = _project_daily_component_labels(
         item.get("componentLabels")
     )
@@ -727,14 +729,15 @@ def _project_daily_device_presentation(
         ),
         "overallLabel": overall_label,
         "networkUnavailable": network_unavailable,
-        "issueSummary": _build_daily_issue_presentation(
+        # 전용 보고서의 연결 및 실행 상태는 에이전트 결과에 담긴다.
+        "issueSummary": "" if agent_only else _build_daily_issue_presentation(
             component_labels,
             overall_label=overall_label,
             network_unavailable=network_unavailable,
         ),
         "storage": _project_daily_storage_presentation(storage),
         "cleanup": _project_daily_cleanup_presentation(
-            item.get("trashcanCleanup")
+            None if agent_only else item.get("trashcanCleanup")
         ),
         "agentUpdate": _project_daily_update_presentation(
             item,
@@ -846,6 +849,10 @@ def _project_daily_update_presentation(
     *,
     route_kind: Literal["agent", "box"],
 ) -> dict[str, Any]:
+    # Slack의 기존 DTO 키는 유지하면서 범위 밖 작업을 표시 대상에서 제외한다.
+    if route_kind == "box" and item.get("agentOnly") is True:
+        return {"actionable": False, "statusKind": "skipped", "label": "미점검", "summary": ""}
+
     final_plan = (
         item.get("finalPlan")
         if isinstance(item.get("finalPlan"), Mapping)
@@ -883,18 +890,43 @@ def _project_daily_update_presentation(
     )
     final_version = current_version or latest_version
 
+    if route_kind == "agent":
+        outcome = _daily_device_round_agent_outcome(plan, action)
+        confirmed = _safe_presentation_version(action.get("confirmedVersion"))
+        if outcome == "latest":
+            label = "업데이트 불필요"
+            summary = _build_daily_version_summary("", confirmed or current_version)
+        elif outcome == "success":
+            label = "업데이트 완료"
+            summary = f"설치 확정 버전 `{confirmed}`" if confirmed else _build_daily_version_summary(
+                previous_version, final_version,
+            )
+        elif outcome == "failed":
+            label = "업데이트 실패"
+            summary = "업데이트 요청 실패" if status == "dispatch_failed" else "설치기에서 업데이트 실패 확인"
+        elif outcome == "pending":
+            label = "업데이트 필요"
+            summary = _build_daily_version_summary(current_version, latest_version)
+        elif item.get("agentOnly") is True and item.get("overallLabel") == "점검 불가" and not action:
+            label = "점검 불가"
+            summary = "장비 또는 SSH 연결 확인 필요"
+        else:
+            label = "확인 필요"
+            summary = "업데이트 상태 재확인 필요"
+        return {
+            "actionable": outcome != "latest",
+            "statusKind": outcome,
+            "label": label,
+            "summary": summary,
+        }
+
     if action:
         if ok and status in {"completed", "already_latest"}:
-            confirmed = _safe_presentation_version(action.get("confirmedVersion")) if route_kind == "agent" else ""
-            summary = f"설치 확정 버전 `{confirmed}`" if confirmed else _build_daily_version_summary(
-                previous_version,
-                final_version,
-            )
             return {
                 "actionable": True,
                 "statusKind": "success",
                 "label": "업데이트 완료",
-                "summary": summary,
+                "summary": _build_daily_version_summary(previous_version, final_version),
             }
         if status == "dispatch_failed":
             return {
@@ -910,12 +942,7 @@ def _project_daily_update_presentation(
             "summary": "업데이트 상태 재확인 필요",
         }
 
-    is_latest = bool(
-        plan.get("isHealthy")
-        or plan.get("isLatest")
-        or plan.get("alreadyLatest")
-    )
-    if is_latest:
+    if plan.get("alreadyLatest"):
         return {
             "actionable": False,
             "statusKind": "latest",
@@ -991,7 +1018,7 @@ def _build_daily_issue_presentation(
     issues = [
         f"{_DAILY_COMPONENT_NAMES[key]} {label}"
         for key, label in component_labels.items()
-        if label != "정상"
+        if label not in {"정상", "미점검"}
     ]
     if issues:
         return " / ".join(issues)
