@@ -320,7 +320,7 @@ def _notification_evidence(notification: dict[str, Any]) -> dict[str, Any]:
         "issues": issues,
         "mediaType": "audio" if details.get("mediaType") == "audio" else "video",
     }
-    # 알림 재조회도 cycle과 같은 실측 창 검증을 거쳐 과거 원인을 설명한다.
+    # 과거 깜빡임 감지 결과는 실측 창이 유효할 때만 진단에 사용한다.
     if safe_details["video"]["visualAnalysis"]["flicker"] is None:
         issues = [issue for issue in issues if issue != "video_flicker"]
         safe_details["issues"] = issues
