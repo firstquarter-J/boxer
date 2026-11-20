@@ -13,6 +13,7 @@ from boxer_company.assistant import (
     SourceReference,
 )
 from boxer_company_adapter_slack import company_api_rollout
+from boxer_company_adapter_slack.company import _build_remote_read_service
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiAvailabilityError,
     CompanyApiContractError,
@@ -27,6 +28,7 @@ from boxer_company_adapter_slack.company_api_rollout import (
     CompanyDeviceDbDetailApiRolloutService,
     CompanyDeviceFilterApiRolloutService,
     CompanyFreeformApiRolloutService,
+    CompanyNaturalLanguageReadApiRolloutService,
     CompanyNotionApiRolloutService,
     CompanyOperationsApiRolloutService,
     CompanyPlaybookApiRolloutService,
@@ -338,6 +340,71 @@ class CompanyApiRemoteRolloutTests(unittest.TestCase):
         self.assertIs(service.answer(request), precedence)
         self.assertEqual(next_service.requests, [request])
         self.assertEqual(api.calls, [])
+
+    def test_natural_language_read_runs_only_after_existing_knowledge_routes(self) -> None:
+        # 명시 플레이북과 비활성 환경이 새 API 호출을 만들지 않는지 확인한다.
+        cases = (
+            (True, "녹화 취소 음성 운영 문서로 알려줘", True, "notion_playbook_qa", "knowledge"),
+            (True, "올라온 컷이 도합 얼마야?", True, "barcode_video_count", "natural_language_read"),
+            (True, "올라온 컷이 도합 얼마야?", False, "company_freeform", "freeform"),
+            (False, "올라온 컷이 도합 얼마야?", True, "company_freeform", "freeform"),
+        )
+        for enabled, question, eligible, result_route, request_group in cases:
+            with self.subTest(enabled=enabled, question=question, eligible=eligible):
+                result = _result(result_route)
+                api = _ApiClient(result)
+                services = _build_remote_read_service(
+                    api, self.logger, natural_language_read_enabled=enabled,
+                )
+                request = replace(
+                    _request(question), metadata={"natural_language_read_eligible": eligible},
+                )
+                self.assertIs(services["knowledge"].answer(request), result)
+                self.assertEqual(api.calls, [(request, request_group)])
+
+    def test_natural_language_read_falls_through_only_on_exact_no_match(self) -> None:
+        request = replace(
+            _request("올라온 컷이 도합 얼마야?"), metadata={"natural_language_read_eligible": True},
+        )
+        no_match = replace(_result("unhandled"), outcome="no_evidence", fallback_reason="no_matching_route")
+        freeform = _result("company_freeform", used_llm=True)
+        freeform_client = _ApiClient(freeform)
+        for result, expected in (
+            (no_match, freeform),
+            (replace(_result("natural_language_read"), outcome="needs_input"), None),
+            (replace(_result("notion_playbook_qa"), outcome="no_evidence"), None),
+            (replace(_result("natural_language_read"), outcome="denied"), None),
+        ):
+            with self.subTest(route=result.route, outcome=result.outcome):
+                read_client = _ApiClient(result)
+                natural_read = CompanyNaturalLanguageReadApiRolloutService(
+                    api_client=read_client, logger=self.logger,
+                )
+                service = CompanyFreeformApiRolloutService(
+                    natural_read, api_client=freeform_client, logger=self.logger,
+                )
+                self.assertIs(service.answer(request), expected or result)
+                self.assertEqual(read_client.calls, [(request, "natural_language_read")])
+        self.assertEqual(freeform_client.calls, [(request, "freeform")])
+
+    def test_natural_language_read_rejects_unsafe_results_without_falling_through(self) -> None:
+        request = replace(
+            _request("올라온 컷이 도합 얼마야?"), metadata={"natural_language_read_eligible": True},
+        )
+        for result, reason in (
+            (_result("device_detail"), "unexpected_route"),
+            (_result("barcode_video_count", delivery_scope="requester"), "unsafe_message_scope"),
+            (replace(_result("barcode_video_count"), operation_result={}), "unsafe_read_result"),
+            (_result("notion_playbook_qa", sources=(_memory_source(),)), "unsafe_source_host"),
+            (replace(_result("unhandled"), outcome="no_evidence"), "invalid_no_match"),
+        ):
+            with self.subTest(reason=reason):
+                service = CompanyNaturalLanguageReadApiRolloutService(
+                    api_client=_ApiClient(result), logger=self.logger,
+                )
+                failure = service.answer(request)
+                self.assertEqual(failure.outcome, "failed")
+                self.assertEqual(failure.fallback_reason, f"company_api_{reason}")
 
     def test_freeform_preserves_verified_slack_memory_citations_on_any_channel(self) -> None:
         # API가 정상 생성한 저장/실시간 기억 인용을 최종 Slack 전송 가드에서 버리지 않는다.

@@ -41,6 +41,7 @@ from boxer_company.assistant.knowledge_routes import (
     CompanyReadOnlyKnowledgeRouteDeps,
     build_company_read_only_knowledge_routes,
 )
+from boxer_company.assistant.natural_language_read import NATURAL_LANGUAGE_READ_TIMEOUT_SEC
 from boxer_company.assistant.notion_route import (
     CompanyNotionAssistantRouteDeps,
 )
@@ -263,6 +264,7 @@ def create_company_assistant_runtime(
         DeviceHealthAlertActionRouteDeps | None
     ) = None,
     daily_auto_update_control: DailyAutoUpdateControl | None = None,
+    natural_language_read_enabled: bool = False,
     logger: logging.Logger | None = None,
 ) -> CompanyAssistantRuntime:
     """Slack/Web adapter 없이 회사 내부 assistant runtime을 조립한다."""
@@ -308,6 +310,22 @@ def create_company_assistant_runtime(
         provider_client=claude_client,
         logger=app_logger,
     )
+    natural_language_read_engine = None
+    if natural_language_read_enabled:
+        # 해석만 짧은 응답 대기와 재시도 금지를 적용한다. 근거 답변은
+        # 기존 provider client의 시간 제한과 호출 정책을 공유한다.
+        interpretation_client = (
+            claude_client.with_options(
+                timeout=NATURAL_LANGUAGE_READ_TIMEOUT_SEC, max_retries=0
+            )
+            if claude_client is not None
+            else None
+        )
+        natural_language_read_engine = AnswerEngine(
+            provider=provider,
+            provider_client=interpretation_client,
+            logger=app_logger,
+        )
     operation_answer_composer = CompanyEvidenceAnswerComposer(
         CompanyEvidenceAnswerComposerDeps(
             answer_engine=answer_engine,
@@ -393,6 +411,7 @@ def create_company_assistant_runtime(
     return CompanyAssistantRuntime(
         CompanyAssistantRuntimeDeps(
             answer_engine=answer_engine,
+            natural_language_read_engine=natural_language_read_engine,
             synthesis_enabled=core_settings.LLM_SYNTHESIS_ENABLED,
             provider_ready=provider_ready,
             get_s3_client=get_s3_client,

@@ -80,6 +80,16 @@ _ALLOWED_BARCODE_RESIDUAL_ROUTES = frozenset(
 )
 _ALLOWED_BARCODE_TIMELINE_ROUTES = BARCODE_TIMELINE_ROUTES
 _ALLOWED_PLAYBOOK_ROUTES = frozenset({"notion_playbook_qa"})
+_ALLOWED_NATURAL_LANGUAGE_READ_ROUTES = frozenset(
+    {
+        "barcode last recordedAt",
+        "barcode recordedAt-on-date",
+        "barcode_video_count",
+        "natural_language_read",
+        "notion_playbook_qa",
+        "unhandled",
+    }
+)
 _ALLOWED_BARCODE_FREEFORM_ROUTES = frozenset(
     {"barcode_evidence_freeform"}
 )
@@ -657,6 +667,40 @@ class CompanyBarcodeFreeformApiRolloutService(
         )
 
 
+class CompanyNaturalLanguageReadApiRolloutService(_CompanyApiRemoteService):
+    def __init__(
+        self,
+        *,
+        api_client: CompanyAssistantApiClient,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__(
+            None,
+            profile=_RemoteProfile(
+                log_label="Company Natural Language Read API",
+                matches_request=lambda request: (
+                    request.metadata.get("natural_language_read_eligible") is True
+                ),
+                validate_result=_validate_remote_natural_language_read_result,
+                failure_route="natural_language_read",
+                failure_body=(
+                    "질문의 조회 의도를 확인하는 중 문제가 생겼어. "
+                    "잠시 후 다시 시도해줘"
+                ),
+                route_group="natural_language_read",
+            ),
+            api_client=api_client,
+            logger=logger,
+        )
+
+    def answer(self, request: CompanyAssistantRequest) -> CompanyAssistantResult | None:
+        result = super().answer(request)
+        # 검증된 미매칭만 일반 답변으로 넘기고 실제 결과와 장애는 이 단계에서 마감한다.
+        if result is not None and result.route == "unhandled":
+            return None
+        return result
+
+
 class CompanyFreeformApiRolloutService(
     _CompanyApiRemoteService
 ):
@@ -1199,6 +1243,38 @@ def _validate_remote_barcode_freeform_result(
     )
 
 
+def _validate_remote_natural_language_read_result(
+    result: CompanyAssistantResult | None,
+) -> _RemoteResultValidation:
+    validation = _validate_remote_result_base(
+        result, _ALLOWED_NATURAL_LANGUAGE_READ_ROUTES,
+    )
+    if not validation.accepted:
+        return validation
+    assert result is not None
+    if (
+        result.operation_result is not None
+        or result.memory_capture is not None
+        or result.files
+        or any(message.private_links for message in result.messages)
+    ):
+        return _RemoteResultValidation(False, "unsafe_read_result")
+    if result.route == "unhandled" and (
+        result.outcome != "no_evidence"
+        or result.fallback_reason != "no_matching_route"
+        or result.used_llm
+        or len(result.messages) != 1
+    ):
+        return _RemoteResultValidation(False, "invalid_no_match")
+    if result.route in _ALLOWED_PLAYBOOK_ROUTES:
+        return _validate_remote_playbook_result(result)
+    if result.sources:
+        return _RemoteResultValidation(False, "unexpected_sources")
+    if result.route == "natural_language_read" and result.outcome == "answered":
+        return _RemoteResultValidation(False, "unexpected_outcome")
+    return _RemoteResultValidation(True)
+
+
 def _validate_remote_freeform_result(
     result: CompanyAssistantResult | None,
 ) -> _RemoteResultValidation:
@@ -1408,6 +1484,7 @@ __all__ = [
     "CompanyDeviceDbDetailApiRolloutService",
     "CompanyDeviceFilterApiRolloutService",
     "CompanyFreeformApiRolloutService",
+    "CompanyNaturalLanguageReadApiRolloutService",
     "CompanyNotionApiRolloutService",
     "CompanyOperationsApiRolloutService",
     "CompanyPlaybookApiRolloutService",

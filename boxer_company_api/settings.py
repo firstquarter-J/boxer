@@ -114,6 +114,7 @@ class CompanyApiSettings:
     # 명시적으로 true를 받기 전까지 이 경계를 false로 덮어쓴다.
     live_device_enabled: bool = True
     operations_enabled: bool = True
+    natural_language_read_enabled: bool = False
     request_log_enabled: bool = False
     request_log_path: str = _DEFAULT_REQUEST_LOG_SQLITE_PATH
     # 운영 점검이 reporter flag의 resolved 집합을 원문 env 없이 볼 수 있게
@@ -157,7 +158,11 @@ def load_company_api_settings(
         "deployment_aws_region": deployment_profile.aws_region if deployment_profile else "",
         "deployment_timezone_name": deployment_profile.timezone_name if deployment_profile else "",
     }
-    memory_options = {
+    assistant_options = {
+        # API와 Slack의 단계별 전개를 위해 명시적으로 켠 프로세스만 사용한다.
+        "natural_language_read_enabled": str(
+            source.get("BOXER_COMPANY_NATURAL_LANGUAGE_READ_ENABLED", "false")
+        ).strip().lower() in _TRUE_VALUES,
         "memory_enabled": str(source.get("BOXER_COMPANY_API_MEMORY_ENABLED", "false")).strip().lower() in _TRUE_VALUES,
         "memory_read_enabled": str(source.get("BOXER_COMPANY_API_MEMORY_READ_ENABLED", "false")).strip().lower() in _TRUE_VALUES,
         "memory_state_path": str(source.get("BOXER_COMPANY_API_MEMORY_STATE_PATH", "/var/lib/boxer-company-api/conversation_memory.db")).strip(),
@@ -238,7 +243,7 @@ def load_company_api_settings(
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
-            **memory_options,
+            **assistant_options,
             **deployment_options,
         )
 
@@ -276,7 +281,7 @@ def load_company_api_settings(
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
-            **memory_options,
+            **assistant_options,
             **deployment_options,
         )
 
@@ -343,7 +348,7 @@ def load_company_api_settings(
             request_log_path=request_log_path,
             automation_enabled_cycles=automation_enabled_cycles,
             automation_scheduler_enabled=automation_scheduler_enabled,
-            **memory_options,
+            **assistant_options,
             **deployment_options,
         )
     return CompanyApiSettings(
@@ -365,7 +370,7 @@ def load_company_api_settings(
         request_log_path=request_log_path,
         automation_enabled_cycles=automation_enabled_cycles,
         automation_scheduler_enabled=automation_scheduler_enabled,
-        **memory_options,
+        **assistant_options,
         **deployment_options,
     )
 

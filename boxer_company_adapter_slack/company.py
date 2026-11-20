@@ -74,6 +74,7 @@ from boxer_company_adapter_slack.company_api_client import (
     load_company_api_client_settings,
 )
 from boxer_company_adapter_slack.company_api_rollout import (
+    CompanyNaturalLanguageReadApiRolloutService,
     wrap_company_barcode_freeform_service,
     wrap_company_barcode_log_service,
     wrap_company_barcode_residual_service,
@@ -183,6 +184,8 @@ def _require_transport_only_remote_settings() -> None:
 def _build_remote_read_service(
     api_client: CompanyAssistantApiClient,
     logger: logging.Logger,
+    *,
+    natural_language_read_enabled: bool = False,
 ) -> dict[str, Any]:
     """기존 operation/read 우선순위를 보존하는 remote stage들을 만든다."""
 
@@ -221,7 +224,17 @@ def _build_remote_read_service(
         logger,
     )
 
-    knowledge = wrap_company_playbook_service(None, api_client, logger)
+    # 기존 플레이북까지 매칭되지 않은 요청만 자연어 API에 보내고, 미매칭은 일반 답변으로 연결한다.
+    natural_language_read = (
+        CompanyNaturalLanguageReadApiRolloutService(
+            api_client=api_client, logger=logger,
+        )
+        if natural_language_read_enabled
+        else None
+    )
+    knowledge = wrap_company_playbook_service(
+        natural_language_read, api_client, logger,
+    )
     knowledge = wrap_company_barcode_freeform_service(
         knowledge,
         api_client,
@@ -289,9 +302,13 @@ def create_app() -> App:
         company_api_settings,
         logger=app_logger,
     )
+    natural_language_read_enabled = os.getenv(
+        "BOXER_COMPANY_NATURAL_LANGUAGE_READ_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     remote_read_services = _build_remote_read_service(
         company_api_client,
         app_logger,
+        natural_language_read_enabled=natural_language_read_enabled,
     )
     remote_operation_service = wrap_company_operations_service(
         None,
@@ -1048,9 +1065,22 @@ def create_app() -> App:
 
         # read wrapper는 matcher만 Slack에서 판정하고 근거 조회는 API에
         # 맡긴다. operation gate를 stage 사이에 그대로 둔다.
+        # 기존 대화 조회와 작업 명령은 자연어 읽기 단계에 전달하지 않는다.
+        natural_language_read_eligible = (
+            natural_language_read_enabled
+            and bool(question and user_id)
+            and not payload.get("is_bot")
+            and operation_route is None
+            and not stored_conversation_question
+        )
         request = build_company_assistant_request(
             payload,
             context_entries=get_context_entries(),
+            metadata=(
+                {"natural_language_read_eligible": True}
+                if natural_language_read_eligible
+                else None
+            ),
         )
         if conversation_memory is not None:
             request = replace(request, memory_context=conversation_memory.context_for(payload))

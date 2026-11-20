@@ -237,6 +237,7 @@ _RouteGroup = Literal[
     "structured",
     "barcode",
     "knowledge",
+    "natural_language_read",
     "freeform",
     "health",
     "fun",
@@ -252,6 +253,7 @@ _ROUTE_GROUPS = frozenset(
         "structured",
         "barcode",
         "knowledge",
+        "natural_language_read",
         "freeform",
         "health",
         "fun",
@@ -491,11 +493,11 @@ class CompanyAssistantApiClient:
         }
         url = f"{self._base_url}{_TURN_PATH}"
 
-        # mutation을 포함할 수 있는 route는 연결 timeout이나 503
-        # 뒤에도 같은 HTTP 요청을 다시 보내지 않는다.
+        # 장비 작업과 유료 자연어 해석은 연결 timeout이나 503 뒤에도
+        # 같은 HTTP 요청을 다시 보내지 않는다.
         retry_limit = (
             0
-            if route_group in {"device_detail", "operations"}
+            if route_group in {"device_detail", "operations", "natural_language_read"}
             else self._settings.max_retries
         )
         for attempt in range(retry_limit + 1):
