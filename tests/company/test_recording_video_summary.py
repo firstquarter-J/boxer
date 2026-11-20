@@ -22,6 +22,19 @@ def flicker_details() -> dict:
     }}}}
 
 
+def conservative_flicker_details() -> dict:
+    details = flicker_details()
+    details["video"]["visualAnalysis"]["flicker"].update({
+        "policyVersion": 2,
+        "minFlashes": 10,
+        "minFlashDurationSec": 0.15,
+        "nearBlackFrameThresholdPct": 99,
+        "recoveryFrameThresholdPct": 90,
+        "minRecoveryDurationSec": 0.1,
+    })
+    return details
+
+
 def test_flicker_window_survives_reload_without_claiming_whole_video_totals() -> None:
     # 기준을 넘긴 같은 10초 창의 횟수와 비율을 묶어 보존한다.
     normalized = normalize_recording_video_details(flicker_details())
@@ -31,7 +44,23 @@ def test_flicker_window_survives_reload_without_claiming_whole_video_totals() ->
     assert "깜빡임 감지 창: 01:40~01:50 (영상 시작 기준)" in text
     assert "감지 창 내 깜빡임 10회" in text
     assert "감지 창 내 검은 화면 00:02 (창의 20.0%)" in text
+    assert "0.05~0.8초 검은 화면 6회 이상" in text
+    assert "policyVersion" not in restored["video"]["visualAnalysis"]["flicker"]
     assert "전체" not in text
+    assert "private" not in json.dumps(restored)
+
+
+def test_conservative_flicker_preserves_its_policy_after_reload() -> None:
+    normalized = normalize_recording_video_details(conservative_flicker_details())
+    restored = json.loads(json.dumps(normalized, allow_nan=False))
+    assert normalize_recording_video_details(restored) == normalized
+    assert restored["video"]["visualAnalysis"]["flicker"]["policyVersion"] == 2
+    text = format_recording_flicker_summary(restored)
+    assert "깜빡임 감지 창: 01:40~01:50 (영상 시작 기준)" in text
+    assert "감지 창 내 검은 화면 00:02 (창의 20.0%)" in text
+    assert "0.15~0.8초 검은 화면 10회 이상" in text
+    assert "검은 픽셀 95% 이상인 구간에서 99% 이상이 0.15초 이상 연속" in text
+    assert "90% 이하로 0.1초 이상 연속 복귀" in text
     assert "private" not in json.dumps(restored)
 
 
@@ -41,12 +70,46 @@ def test_flicker_window_survives_reload_without_claiming_whole_video_totals() ->
     ("blackPixelThreshold", "32"), ("blackFrameThresholdPct", 0),
     ("firstDetectedAtSec", 99), ("firstDetectedAtSec", 110),
     ("firstDetectedAtSec", float("nan")), ("window", None),
+    ("policyVersion", None), ("policyVersion", 2),
+    ("nearBlackFrameThresholdPct", 99), ("recoveryFrameThresholdPct", 90),
+    ("minRecoveryDurationSec", 0.1),
 ])
 def test_unfinished_or_changed_flicker_contract_never_claims_detection(key: str, value: object) -> None:
     details = flicker_details()
     details["video"]["visualAnalysis"]["flicker"][key] = value
     assert normalize_recording_video_details(details)["video"]["visualAnalysis"]["flicker"] is None
     assert "확인 필요" in format_recording_flicker_summary(details)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("policyVersion", 1), ("policyVersion", 3), ("policyVersion", "2"),
+    ("policyVersion", 2.0), ("policyVersion", True),
+    ("minFlashes", 6), ("minFlashDurationSec", 0.05),
+    ("nearBlackFrameThresholdPct", 95), ("recoveryFrameThresholdPct", 91),
+    ("minRecoveryDurationSec", None),
+])
+def test_conservative_flicker_rejects_unknown_version_and_changed_policy(key: str, value: object) -> None:
+    details = conservative_flicker_details()
+    details["video"]["visualAnalysis"]["flicker"][key] = value
+    assert normalize_recording_video_details(details)["video"]["visualAnalysis"]["flicker"] is None
+
+
+def test_conservative_flicker_requires_its_policy_version() -> None:
+    details = conservative_flicker_details()
+    del details["video"]["visualAnalysis"]["flicker"]["policyVersion"]
+    assert normalize_recording_video_details(details)["video"]["visualAnalysis"]["flicker"] is None
+
+
+@pytest.mark.parametrize(("first_detected", "valid"), [(101.1, True), (101.2, False)])
+def test_conservative_flicker_window_must_fit_blackouts_and_between_recoveries(
+    first_detected: float, valid: bool,
+) -> None:
+    # 열 번의 0.8초 암전과 아홉 번의 0.1초 복귀는 8.9초가 필요하다.
+    details = conservative_flicker_details()
+    flicker = details["video"]["visualAnalysis"]["flicker"]
+    flicker["firstDetectedAtSec"] = first_detected
+    flicker["window"].update(blackDurationSec=8, blackRatio=0.8)
+    assert (normalize_recording_video_details(details)["video"]["visualAnalysis"]["flicker"] is not None) is valid
 
 
 @pytest.mark.parametrize(("key", "value"), [

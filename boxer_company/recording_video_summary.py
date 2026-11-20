@@ -39,21 +39,38 @@ _FLICKER_THRESHOLDS = {
     "minFlashDurationSec": 0.05, "maxFlashDurationSec": 0.8,
     "blackPixelThreshold": 32, "blackFrameThresholdPct": 95,
 }
+_FLICKER_V2_THRESHOLDS = {
+    **_FLICKER_THRESHOLDS,
+    "policyVersion": 2, "minFlashes": 10, "minFlashDurationSec": 0.15,
+    "nearBlackFrameThresholdPct": 99, "recoveryFrameThresholdPct": 90,
+    "minRecoveryDurationSec": 0.1,
+}
+_FLICKER_V2_ONLY_FIELDS = _FLICKER_V2_THRESHOLDS.keys() - _FLICKER_THRESHOLDS.keys()
 
 
 def _flicker(value: Any, duration: float | None) -> dict[str, Any] | None:
-    # 첫 감지 창의 측정값만 보존한다. 미완료 검사나 낮춰 보낸 기준으로 알림을 만들지 않는다.
+    # 검사가 완료되고 그 버전의 기준을 충족한 첫 감지 창만 진단에 표시한다.
     value = _mapping(value)
     if not duration or value.get("status") != "complete" or value.get("detected") is not True:
         return None
+    # 버전이 없는 기존 기록과 복귀 조건이 추가된 기록은 각자의 정확한 기준을 쓴다.
+    if "policyVersion" in value:
+        version = value["policyVersion"]
+        if type(version) is not int or version != _FLICKER_V2_THRESHOLDS["policyVersion"]:
+            return None
+        thresholds = _FLICKER_V2_THRESHOLDS
+    else:
+        if any(key in value for key in _FLICKER_V2_ONLY_FIELDS):
+            return None
+        thresholds = _FLICKER_THRESHOLDS
     if any(type(value.get(key)) not in (int, float) or value[key] != expected
-           for key, expected in _FLICKER_THRESHOLDS.items()):
+           for key, expected in thresholds.items()):
         return None
     # 수치 검증과 안내 문구가 같은 판정 기준을 참조하게 한다.
-    window_sec = _FLICKER_THRESHOLDS["windowSec"]
-    min_flash_sec = _FLICKER_THRESHOLDS["minFlashDurationSec"]
-    max_flash_sec = _FLICKER_THRESHOLDS["maxFlashDurationSec"]
-    min_black_ratio = _FLICKER_THRESHOLDS["minBlackRatio"]
+    window_sec = thresholds["windowSec"]
+    min_flash_sec = thresholds["minFlashDurationSec"]
+    max_flash_sec = thresholds["maxFlashDurationSec"]
+    min_black_ratio = thresholds["minBlackRatio"]
     window = _mapping(value.get("window"))
     start = bounded_seconds(window.get("startSec"), maximum=duration)
     end = bounded_seconds(window.get("endSec"), maximum=duration)
@@ -64,13 +81,17 @@ def _flicker(value: Any, duration: float | None) -> dict[str, Any] | None:
     if (start is None or end is None or first is None or black is None or ratio is None
             or abs(end - start - window_sec) > 0.002 or not start <= first < end
             or type(count) is not int
-            or not _FLICKER_THRESHOLDS["minFlashes"] <= count <= window_sec / min_flash_sec
+            or not thresholds["minFlashes"] <= count <= window_sec / min_flash_sec
             or black < window_sec * min_black_ratio - 0.001 or ratio < min_black_ratio - 0.0001
             or abs(ratio - black / window_sec) > 0.001
             or black < count * min_flash_sec - 0.002 or black > count * max_flash_sec + 0.002):
         return None
+    # 마지막 암전 뒤 복귀는 창 밖에서 확인할 수 있어 암전 사이 복귀만 합산한다.
+    recovery = thresholds.get("minRecoveryDurationSec")
+    if recovery and black + (count - 1) * recovery > end - first + 0.002:
+        return None
     return {
-        "status": "complete", "detected": True, **_FLICKER_THRESHOLDS,
+        "status": "complete", "detected": True, **thresholds,
         "firstDetectedAtSec": first,
         "window": {"startSec": start, "endSec": end, "flashCount": count,
                    "blackDurationSec": black, "blackRatio": ratio},
@@ -113,15 +134,25 @@ def format_recording_flicker_summary(details: Mapping[str, Any]) -> str:
     if flicker is None:
         return "깜빡임 감지 구간: 확인 필요 (완료된 구간 분석 없음)"
     window = flicker["window"]
-    thresholds = _FLICKER_THRESHOLDS
+    criterion = (
+        f"깜빡임 감지 기준: {flicker['windowSec']:g}초 안에 "
+        f"{flicker['minFlashDurationSec']:g}~{flicker['maxFlashDurationSec']:g}초 검은 화면 "
+        f"{flicker['minFlashes']:g}회 이상, 창의 {flicker['minBlackRatio'] * 100:g}% 이상"
+    )
+    if "policyVersion" in flicker:
+        criterion += (
+            f", 검은 픽셀 {flicker['blackFrameThresholdPct']:g}% 이상인 구간에서 "
+            f"{flicker['nearBlackFrameThresholdPct']:g}% 이상이 "
+            f"{flicker['minFlashDurationSec']:g}초 이상 연속, "
+            f"{flicker['recoveryFrameThresholdPct']:g}% 이하로 "
+            f"{flicker['minRecoveryDurationSec']:g}초 이상 연속 복귀"
+        )
     # 10초 창의 비율을 전체 영상 비율이나 모든 깜빡임의 합계로 표현하지 않는다.
     return "\n".join([
         f"깜빡임 감지 창: {format_time(window['startSec'])}~{format_time(window['endSec'])} (영상 시작 기준)",
         f"감지 창 내 깜빡임 {window['flashCount']}회",
         f"감지 창 내 검은 화면 {format_time(window['blackDurationSec'])} (창의 {window['blackRatio'] * 100:.1f}%)",
-        f"깜빡임 감지 기준: {thresholds['windowSec']:g}초 안에 "
-        f"{thresholds['minFlashDurationSec']:g}~{thresholds['maxFlashDurationSec']:g}초 검은 화면 "
-        f"{thresholds['minFlashes']:g}회 이상, 창의 {thresholds['minBlackRatio'] * 100:g}% 이상",
+        criterion,
     ])
 
 
