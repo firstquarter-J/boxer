@@ -143,7 +143,12 @@ def is_notion_playbook_exfiltration_attempt(
         or _has_notion_playbook_context(context_text)
     ):
         return False
-    return any(pattern.search(text) for pattern in _NOTION_EXFILTRATION_PATTERNS)
+    return has_notion_playbook_exfiltration_pattern(text)
+
+
+def has_notion_playbook_exfiltration_pattern(question: str) -> bool:
+    # 문서 경로가 확정된 뒤에는 자연어 질문에 기존 문서 키워드가 없어도 보호한다.
+    return any(pattern.search(question) for pattern in _NOTION_EXFILTRATION_PATTERNS)
 
 
 def sanitize_notion_playbook_references(
@@ -520,10 +525,29 @@ class NotionPlaybookQAAssistantRoute:
             context_text=context_text,
         ) is None:
             return None
+        return self._answer_playbook_question(
+            request, context_text, confirmed_without_matcher=False
+        )
 
-        if self._deps.is_exfiltration_attempt(
-            request.question,
-            context_text,
+    def answer_playbook_question(
+        self,
+        request: CompanyAssistantRequest,
+    ) -> CompanyAssistantResult:
+        # 서버가 문서 조회 의도를 확정한 요청도 조회 전 보호와 근거 처리 과정을 다시 거친다.
+        return self._answer_playbook_question(
+            request, _request_context_text(request), confirmed_without_matcher=True
+        )
+
+    def _answer_playbook_question(
+        self,
+        request: CompanyAssistantRequest,
+        context_text: str,
+        *,
+        confirmed_without_matcher: bool,
+    ) -> CompanyAssistantResult:
+        if self._deps.is_exfiltration_attempt(request.question, context_text) or (
+            confirmed_without_matcher
+            and has_notion_playbook_exfiltration_pattern(request.question)
         ):
             return _result(
                 route=self.name,
@@ -918,6 +942,7 @@ __all__ = [
     "build_notion_playbook_fallback",
     "build_company_read_only_knowledge_routes",
     "build_notion_playbook_query",
+    "has_notion_playbook_exfiltration_pattern",
     "is_notion_playbook_exfiltration_attempt",
     "sanitize_notion_playbook_references",
 ]

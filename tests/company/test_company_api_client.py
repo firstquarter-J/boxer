@@ -1456,11 +1456,11 @@ class CompanyApiClientContractTests(unittest.TestCase):
             {_TRACEPARENT},
         )
 
-    def test_mutating_turn_never_retries_transport_or_503(
+    def test_operations_and_natural_language_read_never_retry_transport_or_503(
         self,
     ) -> None:
-        # mutation 수행 여부가 불명확한 모든 실패와 명시적
-        # 503도 두 번째 POST로 이어지지 않는다.
+        # 장비 작업과 자연어 해석은 전송 결과가 불명확하거나 503이어도
+        # 같은 요청을 두 번째 POST로 다시 보내지 않는다.
         request = replace(
             _request(),
             question="MB2-C00419 장비 정보",
@@ -1490,7 +1490,7 @@ class CompanyApiClientContractTests(unittest.TestCase):
                 CompanyApiAvailabilityError,
             ),
         )
-        for route_group in ("device_detail", "operations"):
+        for route_group in ("device_detail", "operations", "natural_language_read"):
             for first_result, error_type in cases:
                 with self.subTest(
                     route_group=route_group,

@@ -132,6 +132,8 @@ class CompanyRouteContractTests(unittest.TestCase):
         message_event: bool = False,
         use_real_context_loader: bool = False,
         thread_ts: str = "1785312000.000001",
+        natural_language_read_enabled: bool = False,
+        is_bot: bool = False,
     ) -> _Invocation:
         settings = CompanyApiClientSettings(
             base_url="http://127.0.0.1:8010",
@@ -179,6 +181,8 @@ class CompanyRouteContractTests(unittest.TestCase):
                 "reply_count": 0,
             },
         }
+        if is_bot:
+            payload["is_bot"] = True
 
         def reply(text: str, **kwargs: Any) -> None:
             replies.append((text, kwargs))
@@ -216,7 +220,12 @@ class CompanyRouteContractTests(unittest.TestCase):
             stack.enter_context(
                 patch.dict(
                     os.environ,
-                    {"BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true"},
+                    {
+                        "BOXER_COMPANY_API_AUTOMATION_SCHEDULER_ENABLED": "true",
+                        "BOXER_COMPANY_NATURAL_LANGUAGE_READ_ENABLED": (
+                            "true" if natural_language_read_enabled else "false"
+                        ),
+                    },
                     clear=False,
                 )
             )
@@ -561,6 +570,34 @@ class CompanyRouteContractTests(unittest.TestCase):
         self.assertEqual(len(invocation.operation_service.answer_calls), 1)
         invocation.context_loader.assert_called_once()
         self.assertEqual(invocation.replies[-1][0], "API 답변")
+
+    def test_natural_language_read_eligibility_uses_enabled_human_read_requests(self) -> None:
+        # 기존 지식 경로에 전달하는 요청에서도 저장 대화, 봇과 빈 질문은 추가 분류를 피한다.
+        for enabled, is_bot, question, expected in (
+            (True, False, "올라온 컷이 도합 얼마야?", True),
+            (False, False, "올라온 컷이 도합 얼마야?", False),
+            (True, True, "올라온 컷이 도합 얼마야?", False),
+            (True, False, "디디가 올해 한 욕", False),
+            (True, False, "", False),
+        ):
+            with (
+                self.subTest(enabled=enabled, is_bot=is_bot, question=question),
+                patch.object(team_chat_context, "TEAM_MEMBER_PROFILES", (
+                    {"name": "디디", "aliases": ("DD",), "user_id": "UDD"},
+                )),
+            ):
+                invocation = self._invoke_mention(
+                    question=question,
+                    read_stage="knowledge",
+                    read_result=_result("company_freeform"),
+                    natural_language_read_enabled=enabled,
+                    is_bot=is_bot,
+                )
+                (request,) = invocation.read_services["knowledge"].calls
+                self.assertEqual(
+                    request.metadata.get("natural_language_read_eligible", False),
+                    expected,
+                )
 
     def test_conversation_questions_skip_entry_slack_context_and_diagnostic_probe(self) -> None:
         # 실제 mention entry가 일반 문맥을 준비하기 전부터 저장 조회의 Slack 읽기를 차단한다.

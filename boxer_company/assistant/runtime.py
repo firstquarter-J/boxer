@@ -32,6 +32,12 @@ from boxer_company.assistant.device_led_routes import (
     DeviceLedPatternGuideAssistantRoute,
     NotionReferenceLoader,
 )
+from boxer_company.assistant.knowledge_routes import NotionPlaybookQAAssistantRoute
+from boxer_company.assistant.natural_language_read import (
+    NaturalLanguageReadDecision,
+    NaturalLanguageReadError,
+    NaturalLanguageReadInterpreter,
+)
 from boxer_company.assistant.notion_route import (
     CompanyNotionAssistantRoute,
     CompanyNotionAssistantRouteDeps,
@@ -51,6 +57,10 @@ from boxer_company.assistant.structured_route import (
     StructuredAssistantRoute,
 )
 from boxer_company.notion_playbooks import _select_notion_references
+from boxer_company.prompt_security import (
+    build_prompt_security_refusal,
+    is_prompt_exfiltration_attempt,
+)
 from boxer_company.read_routing import (
     AssistantRequestScopeMismatch,
     _extract_barcode,
@@ -167,6 +177,7 @@ class CompanyAssistantRuntimeDeps:
     structured_device_live_enrichment_enabled: bool = True
     log_analysis_live_enrichment_enabled: bool = False
     log_analysis_explicit_date_required: bool = False
+    natural_language_read_engine: AnswerEngine | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +308,15 @@ class CompanyAssistantRuntime:
         return self.start_turn(request).answer_stage(
             stage,
             on_partial_result=on_partial_result,
+        )
+
+    def answer_natural_language_read(
+        self,
+        request: CompanyAssistantRequest,
+    ) -> CompanyAssistantResult | None:
+        # 명시적으로 요청된 읽기 단계만 사용하고 모델에는 보강 전 요청을 준다.
+        return self.start_turn(request).answer_natural_language_read(
+            request, self._deps.natural_language_read_engine
         )
 
     def _build_route_groups(
@@ -566,6 +586,108 @@ class CompanyAssistantTurn:
             on_partial_result,
         )
 
+    def answer_natural_language_read(
+        self,
+        original_request: CompanyAssistantRequest,
+        engine: AnswerEngine | None,
+    ) -> CompanyAssistantResult | None:
+        guard_result = self._request_guard_result or self._scope_mismatch_result
+        if guard_result is not None:
+            return replace(guard_result, route="natural_language_read")
+        if is_prompt_exfiltration_attempt(original_request.question):
+            return _natural_language_read_message(
+                build_prompt_security_refusal(), reason="security_refusal", outcome="denied"
+            )
+        if engine is None:
+            return _natural_language_read_message(
+                "지금은 질문 해석을 사용할 수 없어. 잠시 후 다시 시도해줘",
+                reason="provider_unavailable",
+            )
+        try:
+            decision = NaturalLanguageReadInterpreter(engine).interpret(original_request)
+        except NaturalLanguageReadError as exc:
+            return _natural_language_read_message(
+                "질문을 해석하지 못했어. 잠시 후 다시 시도해줘",
+                reason=exc.reason,
+            )
+        if decision is None:
+            return None
+
+        result = self._answer_interpreted_read(decision)
+        if result is None:
+            result = _natural_language_read_message(
+                "지금은 녹화 날짜를 확인할 수 없어",
+                reason="recorded_date_unavailable",
+            )
+        # 영상 개수처럼 기존 실행 함수가 모델 없이 답해도 해석 호출은 기록한다.
+        return replace(result, used_llm=result.used_llm or decision.used_llm)
+
+    def _answer_interpreted_read(
+        self,
+        decision: NaturalLanguageReadDecision,
+    ) -> CompanyAssistantResult | None:
+        """검증한 조회 인자로 고정된 읽기 실행 함수만 호출한다."""
+        if decision.intent == "clarify":
+            return _natural_language_read_message(
+                decision.clarification or "어떤 정보를 확인할지 조금 더 알려줘",
+                reason="ambiguous_request",
+                outcome="needs_input",
+            )
+        if decision.intent == "playbook":
+            playbook = next(
+                (
+                    route for route in self._route_groups["knowledge"]
+                    if isinstance(route, NotionPlaybookQAAssistantRoute)
+                ),
+                None,
+            )
+            if playbook is None:
+                return _natural_language_read_message(
+                    "지금은 운영 문서 조회를 사용할 수 없어",
+                    reason="playbook_unavailable",
+                )
+            return playbook.answer_playbook_question(self.request)
+
+        # 해석 단계가 가리킨 번호는 원본과 기존 스코프 파서가 확정한 요청 캐시와
+        # 일치해야 한다. 동의 표현이 조회 대상을 변경하는 통로가 되지 않게 한다.
+        barcode = decision.barcode
+        if not barcode or barcode != self.recordings.barcode:
+            return _natural_language_read_message(
+                "어느 바코드로 조회할지 번호를 알려줘",
+                reason="barcode_confirmation_required",
+                outcome="needs_input",
+            )
+        requested_scope = resolve_assistant_request_scope(self.request)
+        if requested_scope.hospital_name or requested_scope.room_name or requested_scope.device_name:
+            # 영상 조회 함수가 적용하지 않는 대상 조건을 조용히 버리지 않는다.
+            return _natural_language_read_message(
+                "이 조회는 바코드 기준이야. 병원, 병실이나 장비 조건을 빼고 다시 물어봐줘",
+                reason="unsupported_recordings_scope",
+                outcome="needs_input",
+            )
+        barcode_route = self._route_groups["barcode"][0]
+        assert isinstance(barcode_route, BarcodeQueryAssistantRoute)
+        if decision.intent == "video_count" and decision.target_date is None:
+            return barcode_route.answer_video_count(self.request, barcode)
+        if decision.intent == "last_recorded_at" and decision.target_date is None:
+            return barcode_route.answer_last_recorded_at(self.request, barcode)
+        if decision.intent == "recorded_on_date":
+            if decision.target_date is not None:
+                return barcode_route.answer_recorded_on_date(
+                    self.request, barcode, decision.target_date
+                )
+            return _natural_language_read_message(
+                "확인할 녹화 날짜를 하루로 지정해줘",
+                reason="date_confirmation_required",
+                outcome="needs_input",
+            )
+        # 기존 전체 개수/마지막 녹화일 함수는 기간 조건을 받지 않는다.
+        return _natural_language_read_message(
+            "전체 영상 개수나 마지막 녹화일을 보려면 날짜 없이 물어봐줘. 특정 날짜는 그날 녹화됐는지 확인할 수 있어",
+            reason="unsupported_date_scope",
+            outcome="needs_input",
+        )
+
     def answer(
         self,
         *,
@@ -580,6 +702,20 @@ class CompanyAssistantTurn:
             if result is not None:
                 return result
         return None
+
+
+def _natural_language_read_message(
+    body: str,
+    *,
+    reason: str,
+    outcome: Literal["denied", "failed", "needs_input"] = "failed",
+) -> CompanyAssistantResult:
+    return CompanyAssistantResult(
+        route="natural_language_read",
+        outcome=outcome,
+        messages=(AssistantMessage(body=body),),
+        fallback_reason=reason,
+    )
 
 
 def _normalize_turn_request(

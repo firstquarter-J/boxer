@@ -120,6 +120,9 @@ class _AssistantRuntime(Protocol):
     ) -> Any:
         ...
 
+    def answer_natural_language_read(self, request: Any) -> Any:
+        ...
+
 
 class _AutomationCoordinator(Protocol):
     def run(self, trigger: Any) -> Any:
@@ -685,6 +688,15 @@ def create_company_api_app(
                 with company_api_device_ssh_context() as device_ssh_state:
                     if memory_result is not None:
                         result = memory_result
+                    elif turn.routeGroup == "natural_language_read":
+                        # 이 진입점만 읽기 의도 해석을 실행한다. 명시 stage 없는
+                        # 기존 요청과 저장된 대화 질문의 처리 경로는 공유하지 않는다.
+                        result = (
+                            typed_runtime.answer_natural_language_read(domain_request)
+                            if api_settings.natural_language_read_enabled
+                            and not memory_runtime.is_stored_history_request(domain_request)
+                            else None
+                        )
                     elif turn.routeGroup is None:
                         result = (
                             typed_runtime.answer(
@@ -806,6 +818,10 @@ def create_company_api_app(
                     mutation_request_guard.mark_uncertain(reservation)
             should_persist_request_log = (
                 not delivery_receipt
+                # 미매칭은 이어지는 기존 일반 답변이 같은 요청 ID로 기록한다.
+                and not (
+                    turn.routeGroup == "natural_language_read" and result is None
+                )
                 and not (
                     getattr(turn.operationAction, "name", None)
                     == "device_diagnostic_followup_probe"
@@ -1311,6 +1327,10 @@ def _persist_turn_request_log(
     if turn.routeGroup == "operations":
         request_text = "[민감 operations 요청]"
         normalized_question: str | None = request_text
+    elif turn.routeGroup == "natural_language_read":
+        # 분류로 처음 들어온 발화가 별도 원문 감사 기록을 늘리지 않게 한다.
+        request_text = "[자연어 읽기 요청]"
+        normalized_question = request_text
     elif turn.question:
         request_text = turn.question
         normalized_question = request_text
@@ -1796,6 +1816,7 @@ def _resolve_runtime(
             )
 
         return create_company_assistant_runtime(
+            natural_language_read_enabled=settings.natural_language_read_enabled,
             # Slack은 설정 파일에 접근하지 않는다. API와 companion만 동일한
             # 보호 상태 파일을 읽고 scheduler tenant의 override를 적용한다.
             daily_auto_update_control=(

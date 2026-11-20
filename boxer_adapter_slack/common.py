@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Protocol, TypedDict
+from typing import Any, NotRequired, Protocol, TypedDict
 
 from slack_bolt import App
 
@@ -46,6 +46,7 @@ class MentionPayload(TypedDict):
     current_ts: str
     thread_ts: str
     request_log: SlackRequestLogContext
+    is_bot: NotRequired[bool]
 
 
 class MessagePayload(TypedDict):
@@ -434,6 +435,13 @@ def create_slack_app(
                 "status": "handled",
             },
         }
+        # 사람 요청만 받는 멘션 handler가 봇 이벤트를 확인할 수 있게 한다.
+        if (
+            event.get("bot_id")
+            or event.get("app_id")
+            or event.get("subtype") == "bot_message"
+        ):
+            payload["is_bot"] = True
         # Slack 본문에는 코드나 비밀값이 포함될 수 있어 운영 로그에는 내용 대신 길이만 남긴다.
         logger.info("Received app_mention: user=%s text_length=%s", user_id, len(raw_text))
 

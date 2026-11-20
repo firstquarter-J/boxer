@@ -26,6 +26,7 @@ from boxer_company.operation_routing import (
 
 import logging
 import re
+from datetime import date
 from typing import Callable
 
 import pymysql
@@ -125,18 +126,8 @@ class BarcodeQueryAssistantRoute:
             # 복원은 7단계 action API 대상이므로 기존 정책 가드와 Slack 경로에 남긴다.
             return None
 
-        if _is_barcode_video_count_request(question, barcode):
-            return self._run_query(
-                route="barcode_video_count",
-                query=lambda: _query_recordings_count_by_barcode(
-                    barcode or "",
-                    recordings_context=self._recordings.get(),
-                ),
-                format_error_prefix="영상 개수 조회 요청 형식 오류",
-                dependency_error="영상 개수 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
-                retry_error="영상 개수 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
-                request_id=request.request_id,
-            )
+        if barcode and _is_barcode_video_count_request(question, barcode):
+            return self.answer_video_count(request, barcode)
 
         if _is_baby_ai_list_request_without_barcode(question, barcode):
             return _result(
@@ -229,27 +220,12 @@ class BarcodeQueryAssistantRoute:
                 request_id=request.request_id,
             )
 
-        if _is_barcode_last_recorded_at_request(question, barcode):
-            return self._run_composed_recordings_query(
-                request,
-                route="barcode last recordedAt",
-                evidence_route="barcode_last_recorded_at",
-                query=lambda context: _query_last_recorded_at_by_barcode(
-                    barcode or "",
-                    recordings_context=context,
-                ),
-                request_evidence={
-                    "barcode": barcode,
-                    "question": question,
-                },
-                format_error_prefix="마지막 녹화 날짜 조회 요청 형식 오류",
-                dependency_error="마지막 녹화 날짜 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
-                retry_error="마지막 녹화 날짜 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
-            )
+        if barcode and _is_barcode_last_recorded_at_request(question, barcode):
+            return self.answer_last_recorded_at(request, barcode)
 
-        if _is_barcode_video_recorded_on_date_request(question, barcode):
+        if barcode and _is_barcode_video_recorded_on_date_request(question, barcode):
             try:
-                target_date = _extract_log_date(question)
+                target_date = date.fromisoformat(_extract_log_date(question))
             except ValueError as exc:
                 return _result(
                     route="barcode recordedAt-on-date",
@@ -257,30 +233,83 @@ class BarcodeQueryAssistantRoute:
                     body=f"영상 날짜 조회 요청 형식 오류: {exc}",
                     fallback_reason="invalid_request",
                 )
-            return self._run_composed_recordings_query(
-                request,
-                route="barcode recordedAt-on-date",
-                evidence_route="barcode_recorded_on_date",
-                query=lambda context: _query_recordings_on_date_by_barcode(
-                    barcode or "",
-                    target_date,
-                    recordings_context=context,
-                ),
-                request_evidence={
-                    "barcode": barcode,
-                    "question": question,
-                    "targetDate": target_date,
-                },
-                format_error_prefix="영상 날짜 조회 요청 형식 오류",
-                dependency_error="날짜별 녹화 여부 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
-                retry_error="날짜별 녹화 여부 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
-            )
+            return self.answer_recorded_on_date(request, barcode, target_date)
         return None
+
+    # 규칙 경로와 서버가 승인한 자연어 경로에서 같은 조회 및 응답 계약을 사용한다.
+    def answer_video_count(
+        self,
+        request: CompanyAssistantRequest,
+        barcode: str,
+    ) -> CompanyAssistantResult:
+        return self._run_query(
+            route="barcode_video_count",
+            query=lambda: _query_recordings_count_by_barcode(
+                barcode,
+                recordings_context=self._recordings.get(requested_barcode=barcode),
+            ),
+            format_error_prefix="영상 개수 조회 요청 형식 오류",
+            dependency_error="영상 개수 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
+            retry_error="영상 개수 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
+            request_id=request.request_id,
+        )
+
+    def answer_last_recorded_at(
+        self,
+        request: CompanyAssistantRequest,
+        barcode: str,
+    ) -> CompanyAssistantResult | None:
+        return self._run_composed_recordings_query(
+            request,
+            barcode=barcode,
+            route="barcode last recordedAt",
+            evidence_route="barcode_last_recorded_at",
+            query=lambda context: _query_last_recorded_at_by_barcode(
+                barcode,
+                recordings_context=context,
+            ),
+            request_evidence={
+                "barcode": barcode,
+                "question": request.question,
+            },
+            format_error_prefix="마지막 녹화 날짜 조회 요청 형식 오류",
+            dependency_error="마지막 녹화 날짜 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
+            retry_error="마지막 녹화 날짜 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
+        )
+
+    def answer_recorded_on_date(
+        self,
+        request: CompanyAssistantRequest,
+        barcode: str,
+        target_date: date,
+    ) -> CompanyAssistantResult | None:
+        # 날짜 검증은 호출자가 처리하고 기존 DB 조회 및 evidence 형식은 유지한다.
+        date_string = target_date.isoformat()
+        return self._run_composed_recordings_query(
+            request,
+            barcode=barcode,
+            route="barcode recordedAt-on-date",
+            evidence_route="barcode_recorded_on_date",
+            query=lambda context: _query_recordings_on_date_by_barcode(
+                barcode,
+                date_string,
+                recordings_context=context,
+            ),
+            request_evidence={
+                "barcode": barcode,
+                "question": request.question,
+                "targetDate": date_string,
+            },
+            format_error_prefix="영상 날짜 조회 요청 형식 오류",
+            dependency_error="날짜별 녹화 여부 조회 중 오류가 발생했어. DB 연결 정보와 네트워크 상태를 확인해줘",
+            retry_error="날짜별 녹화 여부 조회 중 오류가 발생했어. 잠시 후 다시 시도해줘",
+        )
 
     def _run_composed_recordings_query(
         self,
         request: CompanyAssistantRequest,
         *,
+        barcode: str,
         route: str,
         evidence_route: str,
         query: Callable[[dict], str],
@@ -293,7 +322,7 @@ class BarcodeQueryAssistantRoute:
             # 전환 중인 adapter는 composer가 없는 경우 기존 handler로 안전하게 내려간다.
             return None
         try:
-            recordings_context = self._recordings.get()
+            recordings_context = self._recordings.get(requested_barcode=barcode)
             fallback_text = _to_commonmark(query(recordings_context))
             evidence_payload = {
                 "route": evidence_route,

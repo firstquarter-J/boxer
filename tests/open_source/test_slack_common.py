@@ -110,6 +110,28 @@ class SlackCommonTests(unittest.TestCase):
                 "channel": "C1", "team": "T1", "ts": "1792392600.000001"}, lambda **_kwargs: None, object())
         self.assertEqual(payloads[0]["question"], "<@UTARGET> 발언 요약")
 
+    def test_app_mention_preserves_bot_origin_on_the_payload(self) -> None:
+        # 봇 이벤트에도 user가 있을 수 있으므로 사람 멘션과 구분한다.
+        payloads = []
+        with (
+            patch.object(common.ss, "validate_slack_tokens"),
+            patch.object(common, "_validate_tokens"),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_ENABLED", False),
+            patch.object(common.s, "REQUEST_LOG_SQLITE_INIT_ON_STARTUP", False),
+            patch.object(common, "App", _FakeApp),
+        ):
+            app = common.create_slack_app(lambda payload, *_args: payloads.append(payload))
+            event = {
+                "text": "질문", "user": "UACTOR", "channel": "C1",
+                "team": "T1", "ts": "1792392600.000001",
+            }
+            app.handlers["app_mention"](event, lambda **_kwargs: None, object())
+            app.handlers["app_mention"](
+                {**event, "bot_id": "BAPP"}, lambda **_kwargs: None, object(),
+            )
+        self.assertNotIn("is_bot", payloads[0])
+        self.assertIs(payloads[1]["is_bot"], True)
+
     def test_app_mention_honors_request_log_skip_persist(self) -> None:
         def mention_handler(payload, reply, client, logger) -> None:
             # 원격 실행 계층이 정본 감사 로그를 남기는 요청을 재현한다.

@@ -893,6 +893,7 @@ class AssistantTurnInput(_StrictInputModel):
         "structured",
         "barcode",
         "knowledge",
+        "natural_language_read",
         "freeform",
         "health",
         "fun",
