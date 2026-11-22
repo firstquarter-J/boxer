@@ -144,6 +144,7 @@ def _deps(
             "sessionAt": "2026-08-14 09:49:00 KST",
         }),
         "stall_barcode": Mock(return_value="81000000000"),
+        "notification_barcode": Mock(return_value="00000000123"),
     }
     return (
         DeviceNotificationCycleDeps(
@@ -158,6 +159,7 @@ def _deps(
             hold_sms_delivery_claim=Mock(return_value=True),
             clock=clock or (lambda: _NOW),
             remember_sms_delivery=mocks["remember_sms"],
+            load_notification_barcode=mocks["notification_barcode"],
         ),
         mocks,
     )
@@ -292,16 +294,14 @@ def test_production_batch_query_includes_video_duration_mismatch(
     connection.close.assert_called_once_with()
 
 
-def _watched_barcode_scan_event(
-    *, masked_barcode: str = "*******0123", occurred_at: str = "2026-08-14T00:59:00Z"
-) -> dict:
+def _watched_barcode_scan_event() -> dict:
     return {
         **_captureboard_event(12),
         "code": "watched_barcode_scanned",
-        "occurredAt": occurred_at,
-        "message": "81000000123",
-        "barcode": "81000000123",
-        "details": {"maskedBarcode": masked_barcode, "barcode": "81000000123"},
+        "occurredAt": "2026-08-14T00:59:00Z",
+        "message": "00000000123",
+        "barcode": "00000000123",
+        "details": {"barcode": "00000000123"},
     }
 
 
@@ -350,15 +350,23 @@ def test_watched_barcode_scan_reaches_history_channel_and_uses_exact_ack(
     deps, mocks = _deps()
     handler = DeviceNotificationAlertCycleHandler(deps)
 
-    result = handler.run(_request(cursor={
+    mocks["notification_barcode"].side_effect = [TimeoutError(), "00000000123"]
+    retryable = handler.run(_request(cursor={
         **_initialized_cursor(12), "pendingEvents": [restored],
     }))
+    assert retryable.deliveries == ()
+    assert retryable.cursor["pendingEvents"] == [restored]
+    result = handler.run(_request(cursor=dict(retryable.cursor)))
 
     delivery, = result.deliveries
     assert delivery.kind == "watched_barcode_scanned"
     assert delivery.delivery_id == "device_notification:12"
-    assert "81000000123" not in json.dumps(result.cursor)
-    assert "81000000123" not in json.dumps(delivery.payload)
+    assert [call.args for call in mocks["notification_barcode"].call_args_list] == [
+        (12, "watched_barcode_scanned"),
+        (12, "watched_barcode_scanned"),
+    ]
+    assert "00000000123" not in json.dumps(result.cursor)
+    assert delivery.payload["barcode"] == "00000000123"
     assert "hospitalDeviceAlertPhone" not in json.dumps(result.cursor)
     client = Mock()
     client.chat_postMessage.return_value = {"ts": "1710000000.012"}
@@ -382,9 +390,8 @@ def test_watched_barcode_scan_reaches_history_channel_and_uses_exact_ack(
     assert slack_args["mrkdwn"] is False
     assert slack_args["client_msg_id"]
     assert slack_args["text"].splitlines()[0] == "관찰 대상 바코드 스캔"
-    assert "*******0123" in slack_args["text"]
+    assert "바코드 00000000123" in slack_args["text"].splitlines()
     assert "2026-08-14 09:59:00 KST" in slack_args["text"]
-    assert "81000000123" not in slack_args["text"]
     assert "blocks" not in slack_args
     remember.assert_called_once()
     assert remember.call_args.kwargs["batch"] is batch
@@ -410,20 +417,21 @@ def test_watched_barcode_scan_reaches_history_channel_and_uses_exact_ack(
 
 
 @pytest.mark.parametrize(
-    ("country", "masked_barcode"),
-    [("kr", "81000000123"), ("us", "*******0123")],
+    ("country", "barcode"),
+    [("kr", "*******0123"), ("kr", "미확인"), ("us", "00000000123")],
 )
 def test_watched_barcode_consumes_out_of_scope_or_invalid_event(
     monkeypatch: pytest.MonkeyPatch,
     country: str,
-    masked_barcode: str,
+    barcode: str,
 ) -> None:
     monkeypatch.setenv("BOXER_COMPANY_COUNTRY", country)
     monkeypatch.delenv("AWS_REGION", raising=False)
     monkeypatch.delenv("BOXER_COMPANY_TIMEZONE", raising=False)
     monkeypatch.delenv("TZ", raising=False)
-    event = _watched_barcode_scan_event(masked_barcode=masked_barcode)
+    event = _watched_barcode_scan_event()
     deps, mocks = _deps(next_result=(12, event))
+    mocks["notification_barcode"].return_value = barcode
 
     result = DeviceNotificationAlertCycleHandler(deps).run(
         _request(cursor=_initialized_cursor())
@@ -432,6 +440,8 @@ def test_watched_barcode_consumes_out_of_scope_or_invalid_event(
     assert result.deliveries == ()
     assert result.cursor["lastSeenId"] == 12
     assert result.cursor["pendingEvents"] == []
+    if country == "us":
+        mocks["notification_barcode"].assert_not_called()
     mocks["send_sms"].assert_not_called()
     mocks["append_sheet"].assert_not_called()
 
@@ -1985,6 +1995,18 @@ def test_stall_barcode_reads_only_the_original_notification(
     assert params == (90, "recording_critically_stalled")
     assert cursor.execute.call_count == 1
     connection.close.assert_called_once_with()
+
+
+def test_watched_barcode_reads_the_exact_notification_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {"barcode": "00000000123"}
+    monkeypatch.setattr(cycle, "_create_db_connection", Mock(return_value=connection))
+
+    assert cycle._load_notification_barcode(12, "watched_barcode_scanned") == "00000000123"
+    sql, params = cursor.execute.call_args.args
+    assert "WHERE id = %s AND code = %s LIMIT 1" in sql
+    assert params == (12, "watched_barcode_scanned")
 
 
 def test_stall_barcode_survives_pending_reload_and_reaches_slack() -> None:

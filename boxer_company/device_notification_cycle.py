@@ -72,7 +72,7 @@ _SEGMENTED_RECORDINGS_MERGE_ERROR = "segmented_recordings_merge_error"
 _VIDEO_DURATION_MISMATCH = "video_duration_mismatch"
 _RECORDING_MEDIA_QUALITY_ISSUE = "recording_media_quality_issue"
 _WATCHED_BARCODE_SCANNED = "watched_barcode_scanned"
-_MASKED_BARCODE_PATTERN = re.compile(r"\*{7}[0-9]{4}")
+_BARCODE_PATTERN = re.compile(r"[0-9]{11}")
 _RECORDING_VISUAL_ALERT_MIN_RATIO = 0.5
 _SUPPORTED_CODES = (
     _CAPTUREBOARD_CONNECTION_ERROR,
@@ -493,8 +493,8 @@ def _verify_video_duration_mismatch(
     )
 
 
-def _load_recording_stall_barcode(notification_id: int) -> str:
-    """정체가 발생한 원본 알림의 바코드만 읽고 다른 세션으로 보완하지 않는다."""
+def _load_notification_barcode(notification_id: int, code: str) -> str:
+    """발송할 원본 알림의 바코드를 ID와 코드로 확인한다."""
 
     connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
     try:
@@ -502,7 +502,7 @@ def _load_recording_stall_barcode(notification_id: int) -> str:
             cursor.execute(
                 "SELECT barcode, details FROM device_notification "
                 "WHERE id = %s AND code = %s LIMIT 1",
-                (notification_id, _RECORDING_CRITICALLY_STALLED),
+                (notification_id, code),
             )
             row = cursor.fetchone() or {}
     finally:
@@ -510,9 +510,13 @@ def _load_recording_stall_barcode(notification_id: int) -> str:
     details = _normalize_json_object(row.get("details"))
     for candidate in (row.get("barcode"), details.get("barcode")):
         barcode = str(candidate or "").strip()
-        if re.fullmatch(r"[0-9]{11}", barcode):
+        if _BARCODE_PATTERN.fullmatch(barcode):
             return barcode
     return "미확인"
+
+
+def _load_recording_stall_barcode(notification_id: int) -> str:
+    return _load_notification_barcode(notification_id, _RECORDING_CRITICALLY_STALLED)
 
 
 def _load_recording_media_session(notification_id: int) -> dict[str, str]:
@@ -575,6 +579,11 @@ class DeviceNotificationCycleDeps:
     remember_sms_delivery: Callable[..., bool] = (
         remember_sms_delivery_sheet_record
     )
+    load_notification_barcode: Callable[[int, str], str] = _load_notification_barcode
+
+
+class _WatchedBarcodeLookupError(RuntimeError):
+    pass
 
 
 class DeviceNotificationAlertCycleHandler:
@@ -771,11 +780,11 @@ class DeviceNotificationAlertCycleHandler:
                 processed_count=processed_count + 1,
             )
 
-        delivery, context = self._build_delivery(
-            request,
-            state,
-            event,
-        )
+        try:
+            delivery, context = self._build_delivery(request, state, event)
+        except _WatchedBarcodeLookupError:
+            # 조회 오류로 정상 스캔을 소비하지 않고 다음 주기에 다시 읽는다.
+            return _cycle_result(state, deliveries=(), processed_count=processed_count)
         if delivery is None or context is None:
             _consume_pending_event(state, event["notificationId"])
             return _cycle_result(
@@ -904,13 +913,21 @@ class DeviceNotificationAlertCycleHandler:
         event: dict[str, Any],
     ) -> tuple[AutomationDelivery | None, dict[str, Any] | None]:
         if event["code"] == _WATCHED_BARCODE_SCANNED:
-            if (
-                get_deployment_profile().country != "kr"
-                or not event["details"]["maskedBarcode"]
-                or not event["occurredAt"]
-            ):
+            if get_deployment_profile().country != "kr" or not event["occurredAt"]:
                 return None, None
             notification_id = event["notificationId"]
+            try:
+                barcode = self._deps.load_notification_barcode(
+                    notification_id, _WATCHED_BARCODE_SCANNED
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "Watched barcode lookup failed notification_id=%s error_type=%s",
+                    notification_id, type(exc).__name__,
+                )
+                raise _WatchedBarcodeLookupError from exc
+            if not _BARCODE_PATTERN.fullmatch(barcode):
+                return None, None
             return AutomationDelivery(
                 delivery_id=f"device_notification:{notification_id}",
                 kind=_WATCHED_BARCODE_SCANNED,
@@ -920,7 +937,7 @@ class DeviceNotificationAlertCycleHandler:
                     "hospitalName": event["hospitalName"],
                     "roomName": event["roomName"],
                     "occurredAt": _format_occurred_at(event["occurredAt"]),
-                    "maskedBarcode": event["details"]["maskedBarcode"],
+                    "barcode": barcode,
                 },
             ), {"kind": _WATCHED_BARCODE_SCANNED, "notificationId": notification_id}
 
@@ -1808,10 +1825,8 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
     if notification_id <= 0 or not device_name:
         return None
     if code == _WATCHED_BARCODE_SCANNED:
-        details = _normalize_json_object(value.get("details"))
-        masked_barcode = str(details.get("maskedBarcode") or "")
         occurred_at = _parse_event_datetime(value.get("occurredAt"))
-        # 대기 중에도 알림에 쓸 마스킹 값과 표시 항목만 보존한다.
+        # 대기 중에는 알림의 식별자와 표시 정보만 보존한다.
         return {
             "notificationId": notification_id,
             "deviceName": device_name,
@@ -1819,11 +1834,7 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
             "hospitalName": str(value.get("hospitalName") or "").strip(),
             "roomName": str(value.get("roomName") or "").strip(),
             "occurredAt": occurred_at.isoformat() if occurred_at else "",
-            "details": {
-                "maskedBarcode": (
-                    masked_barcode if _MASKED_BARCODE_PATTERN.fullmatch(masked_barcode) else ""
-                ),
-            },
+            "details": {},
         }
     if code not in _SUPPORTED_CODES:
         return None

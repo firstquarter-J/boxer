@@ -23,7 +23,7 @@ from boxer_company_adapter_slack.device_alert_slack import (
 
 
 _SLACK_CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
-_MASKED_BARCODE_PATTERN = re.compile(r"\*{7}[0-9]{4}")
+_BARCODE_PATTERN = re.compile(r"[0-9]{11}")
 _DEVICE_NOTIFICATION_ALERT_THREAD: threading.Thread | None = None
 _DEVICE_NOTIFICATION_ALERT_THREAD_LOCK = threading.Lock()
 
@@ -194,11 +194,12 @@ def _post_watched_barcode_scan(
         key: " ".join(str(payload.get(key) or "").split())
         for key in ("deviceName", "hospitalName", "roomName", "occurredAt")
     }
-    masked_barcode = str(payload.get("maskedBarcode") or "")
+    barcode = payload.get("barcode")
     if not (
         values["deviceName"]
         and values["occurredAt"]
-        and _MASKED_BARCODE_PATTERN.fullmatch(masked_barcode)
+        and isinstance(barcode, str)
+        and _BARCODE_PATTERN.fullmatch(barcode)
     ):
         raise RuntimeError("관찰 대상 바코드 스캔 알림 데이터가 올바르지 않아")
     response = client.chat_postMessage(
@@ -206,7 +207,7 @@ def _post_watched_barcode_scan(
         text="\n".join(
             (
                 "관찰 대상 바코드 스캔",
-                f"바코드 {masked_barcode}",
+                f"바코드 {barcode}",
                 f"발생 시각 {values['occurredAt']}",
                 f"장비 {values['deviceName']}",
                 f"병원 {values['hospitalName'] or '미확인'}",
