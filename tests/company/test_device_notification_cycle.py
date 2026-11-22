@@ -286,9 +286,154 @@ def test_production_batch_query_includes_video_duration_mismatch(
     assert next_cursor == 80
     assert [item["code"] for item in events] == ["video_duration_mismatch"]
     sql, params = cursor.execute.call_args_list[1].args
-    assert "n.code IN (%s, %s, %s, %s, %s)" in sql
+    assert "n.code IN (" in sql
+    assert sql.count("%s") == len(params)
     assert "video_duration_mismatch" in params
     connection.close.assert_called_once_with()
+
+
+def _watched_barcode_scan_event(
+    *, masked_barcode: str = "*******0123", occurred_at: str = "2026-08-14T00:59:00Z"
+) -> dict:
+    return {
+        **_captureboard_event(12),
+        "code": "watched_barcode_scanned",
+        "occurredAt": occurred_at,
+        "message": "81000000123",
+        "barcode": "81000000123",
+        "details": {"maskedBarcode": masked_barcode, "barcode": "81000000123"},
+    }
+
+
+@pytest.mark.parametrize("country", ["kr", "us"])
+@pytest.mark.parametrize("batch", [True, False])
+def test_notification_queries_scope_watched_barcode_to_kr(
+    monkeypatch: pytest.MonkeyPatch,
+    country: str,
+    batch: bool,
+) -> None:
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", country)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("BOXER_COMPANY_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [{"latestId": 12}, None]
+    cursor.fetchall.return_value = []
+    monkeypatch.setattr(cycle, "_create_db_connection", Mock(return_value=connection))
+
+    loader = cycle._load_device_notification_batch if batch else cycle._load_next_device_notification
+    next_cursor, _ = loader(11)
+
+    assert next_cursor == 12
+    sql, params = cursor.execute.call_args_list[1].args
+    assert sql.count("%s") == len(params)
+    assert ("watched_barcode_scanned" in params) == (country == "kr")
+    assert params[:2] == (11, 12)
+
+
+def test_watched_barcode_scan_reaches_history_channel_and_uses_exact_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from boxer_company_adapter_slack import device_notification_alert_reporter as reporter
+
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", "kr")
+    monkeypatch.setenv("BOXER_COMPANY_TIMEZONE", "Asia/Seoul")
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    event = _watched_barcode_scan_event()
+    normalized = cycle._normalize_event(event)
+    assert normalized is not None
+    restored = json.loads(json.dumps(normalized))
+    assert cycle._normalize_event(restored) == normalized
+    deps, mocks = _deps()
+    handler = DeviceNotificationAlertCycleHandler(deps)
+
+    result = handler.run(_request(cursor={
+        **_initialized_cursor(12), "pendingEvents": [restored],
+    }))
+
+    delivery, = result.deliveries
+    assert delivery.kind == "watched_barcode_scanned"
+    assert delivery.delivery_id == "device_notification:12"
+    assert "81000000123" not in json.dumps(result.cursor)
+    assert "81000000123" not in json.dumps(delivery.payload)
+    assert "hospitalDeviceAlertPhone" not in json.dumps(result.cursor)
+    client = Mock()
+    client.chat_postMessage.return_value = {"ts": "1710000000.012"}
+    transport = Mock()
+    batch = SimpleNamespace(
+        cycle="device_notification_alert",
+        cycle_key="device_notification_alert:continuation",
+        channel_id="C02ABCDEFGH",
+        deliveries=(delivery,),
+    )
+    transport.pull_pending.return_value = batch
+    remember = Mock()
+    monkeypatch.setattr(reporter, "flush_automation_deliveries", Mock())
+    monkeypatch.setattr(reporter, "remember_automation_delivery", remember)
+    assert reporter._run_device_notification_alert_once(
+        client, logging.getLogger(__name__), now=_NOW, automation_client=transport,
+    )
+    client.chat_postMessage.assert_called_once()
+    slack_args = client.chat_postMessage.call_args.kwargs
+    assert slack_args["channel"] == "C02ABCDEFGH"
+    assert slack_args["mrkdwn"] is False
+    assert slack_args["client_msg_id"]
+    assert slack_args["text"].splitlines()[0] == "관찰 대상 바코드 스캔"
+    assert "*******0123" in slack_args["text"]
+    assert "2026-08-14 09:59:00 KST" in slack_args["text"]
+    assert "81000000123" not in slack_args["text"]
+    assert "blocks" not in slack_args
+    remember.assert_called_once()
+    assert remember.call_args.kwargs["batch"] is batch
+    receipt = remember.call_args.kwargs["delivery"]
+    assert receipt.delivery_id == delivery.delivery_id
+    assert receipt.external_message_id == "1710000000.012"
+    assert receipt.permalink == ""
+
+    acknowledged = handler.acknowledge(
+        _request(cursor=dict(result.cursor)),
+        (AutomationDeliveryReceipt(
+            delivery_id=delivery.delivery_id,
+            status="sent",
+            external_message_id=receipt.external_message_id,
+            delivered_at=_NOW,
+        ),),
+    )
+    assert acknowledged["pendingEvents"] == []
+    assert acknowledged["pendingDeliveryContexts"] == {}
+    assert acknowledged["lastSentNotificationId"] == 12
+    for key in ("append_sheet", "send_sms", "claim_sms", "remember_sms"):
+        mocks[key].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("country", "masked_barcode"),
+    [("kr", "81000000123"), ("us", "*******0123")],
+)
+def test_watched_barcode_consumes_out_of_scope_or_invalid_event(
+    monkeypatch: pytest.MonkeyPatch,
+    country: str,
+    masked_barcode: str,
+) -> None:
+    monkeypatch.setenv("BOXER_COMPANY_COUNTRY", country)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("BOXER_COMPANY_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    event = _watched_barcode_scan_event(masked_barcode=masked_barcode)
+    deps, mocks = _deps(next_result=(12, event))
+
+    result = DeviceNotificationAlertCycleHandler(deps).run(
+        _request(cursor=_initialized_cursor())
+    )
+
+    assert result.deliveries == ()
+    assert result.cursor["lastSeenId"] == 12
+    assert result.cursor["pendingEvents"] == []
+    mocks["send_sms"].assert_not_called()
+    mocks["append_sheet"].assert_not_called()
 
 
 def _media_quality_event(

@@ -8,7 +8,11 @@ import logging
 import math
 import re
 from typing import Any, Callable, Mapping, Sequence
-from boxer_company.deployment import get_local_zone, get_timezone_label
+from boxer_company.deployment import (
+    get_deployment_profile,
+    get_local_zone,
+    get_timezone_label,
+)
 
 from boxer.core import settings as core_settings
 from boxer.retrieval.connectors.db import _create_db_connection
@@ -67,6 +71,8 @@ _RECORDING_CRITICALLY_STALLED = "recording_critically_stalled"
 _SEGMENTED_RECORDINGS_MERGE_ERROR = "segmented_recordings_merge_error"
 _VIDEO_DURATION_MISMATCH = "video_duration_mismatch"
 _RECORDING_MEDIA_QUALITY_ISSUE = "recording_media_quality_issue"
+_WATCHED_BARCODE_SCANNED = "watched_barcode_scanned"
+_MASKED_BARCODE_PATTERN = re.compile(r"\*{7}[0-9]{4}")
 _RECORDING_VISUAL_ALERT_MIN_RATIO = 0.5
 _SUPPORTED_CODES = (
     _CAPTUREBOARD_CONNECTION_ERROR,
@@ -155,12 +161,20 @@ def _load_latest_device_notification_id() -> int:
     return max(0, _coerce_int(row.get("latestId")))
 
 
+def _device_notification_query_codes() -> tuple[str, ...]:
+    if get_deployment_profile().country == "kr":
+        return (*_SUPPORTED_CODES, _WATCHED_BARCODE_SCANNED)
+    return _SUPPORTED_CODES
+
+
 def _load_next_device_notification(
     last_seen_id: int,
 ) -> tuple[int, dict[str, Any] | None]:
     """고정한 상한 안에서 지원 이벤트 한 건만 읽어 ack 순서를 보존한다."""
 
     normalized_last_seen_id = max(0, _coerce_int(last_seen_id))
+    codes = _device_notification_query_codes()
+    code_placeholders = ", ".join("%s" for _ in codes)
     connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
     try:
         with connection.cursor() as cursor:
@@ -199,17 +213,13 @@ def _load_next_device_notification(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s, %s, %s, %s) "
+                f"AND n.code IN ({code_placeholders}) "
                 "ORDER BY n.id ASC "
                 "LIMIT 1",
                 (
                     normalized_last_seen_id,
                     latest_id,
-                    _CAPTUREBOARD_CONNECTION_ERROR,
-                    _RECORDING_CRITICALLY_STALLED,
-                    _SEGMENTED_RECORDINGS_MERGE_ERROR,
-                    _VIDEO_DURATION_MISMATCH,
-                    _RECORDING_MEDIA_QUALITY_ISSUE,
+                    *codes,
                 ),
             )
             row = cursor.fetchone() or None
@@ -233,6 +243,8 @@ def _load_device_notification_batch(
 
     normalized_last_seen_id = max(0, _coerce_int(last_seen_id))
     normalized_batch_size = max(1, min(500, _coerce_int(batch_size)))
+    codes = _device_notification_query_codes()
+    code_placeholders = ", ".join("%s" for _ in codes)
     connection = _create_db_connection(core_settings.DB_QUERY_TIMEOUT_SEC)
     try:
         with connection.cursor() as cursor:
@@ -268,17 +280,13 @@ def _load_device_notification_batch(
                 "LEFT JOIN hospital_rooms hr ON d.hospitalRoomSeq = hr.seq "
                 "WHERE n.id > %s "
                 "AND n.id <= %s "
-                "AND n.code IN (%s, %s, %s, %s, %s) "
+                f"AND n.code IN ({code_placeholders}) "
                 "ORDER BY n.id ASC "
                 "LIMIT %s",
                 (
                     normalized_last_seen_id,
                     latest_id,
-                    _CAPTUREBOARD_CONNECTION_ERROR,
-                    _RECORDING_CRITICALLY_STALLED,
-                    _SEGMENTED_RECORDINGS_MERGE_ERROR,
-                    _VIDEO_DURATION_MISMATCH,
-                    _RECORDING_MEDIA_QUALITY_ISSUE,
+                    *codes,
                     normalized_batch_size,
                 ),
             )
@@ -895,6 +903,27 @@ class DeviceNotificationAlertCycleHandler:
         state: dict[str, Any],
         event: dict[str, Any],
     ) -> tuple[AutomationDelivery | None, dict[str, Any] | None]:
+        if event["code"] == _WATCHED_BARCODE_SCANNED:
+            if (
+                get_deployment_profile().country != "kr"
+                or not event["details"]["maskedBarcode"]
+                or not event["occurredAt"]
+            ):
+                return None, None
+            notification_id = event["notificationId"]
+            return AutomationDelivery(
+                delivery_id=f"device_notification:{notification_id}",
+                kind=_WATCHED_BARCODE_SCANNED,
+                payload={
+                    "notificationId": notification_id,
+                    "deviceName": event["deviceName"],
+                    "hospitalName": event["hospitalName"],
+                    "roomName": event["roomName"],
+                    "occurredAt": _format_occurred_at(event["occurredAt"]),
+                    "maskedBarcode": event["details"]["maskedBarcode"],
+                },
+            ), {"kind": _WATCHED_BARCODE_SCANNED, "notificationId": notification_id}
+
         if event["code"] == _RECORDING_MEDIA_QUALITY_ISSUE:
             details = event["details"]
             for issue_code, metric in (("video_frozen", "freeze"), ("video_uniform_color", "uniformColor")):
@@ -1776,7 +1805,27 @@ def _normalize_event(value: Any) -> dict[str, Any] | None:
     notification_id = _coerce_int(value.get("notificationId"))
     code = str(value.get("code") or "").strip()
     device_name = str(value.get("deviceName") or "").strip()
-    if notification_id <= 0 or code not in _SUPPORTED_CODES or not device_name:
+    if notification_id <= 0 or not device_name:
+        return None
+    if code == _WATCHED_BARCODE_SCANNED:
+        details = _normalize_json_object(value.get("details"))
+        masked_barcode = str(details.get("maskedBarcode") or "")
+        occurred_at = _parse_event_datetime(value.get("occurredAt"))
+        # 대기 중에도 알림에 쓸 마스킹 값과 표시 항목만 보존한다.
+        return {
+            "notificationId": notification_id,
+            "deviceName": device_name,
+            "code": code,
+            "hospitalName": str(value.get("hospitalName") or "").strip(),
+            "roomName": str(value.get("roomName") or "").strip(),
+            "occurredAt": occurred_at.isoformat() if occurred_at else "",
+            "details": {
+                "maskedBarcode": (
+                    masked_barcode if _MASKED_BARCODE_PATTERN.fullmatch(masked_barcode) else ""
+                ),
+            },
+        }
+    if code not in _SUPPORTED_CODES:
         return None
     details = _normalize_json_object(value.get("details"))
     error_detail = str(

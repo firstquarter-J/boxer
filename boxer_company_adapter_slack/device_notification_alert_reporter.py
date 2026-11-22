@@ -23,6 +23,7 @@ from boxer_company_adapter_slack.device_alert_slack import (
 
 
 _SLACK_CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,31}$")
+_MASKED_BARCODE_PATTERN = re.compile(r"\*{7}[0-9]{4}")
 _DEVICE_NOTIFICATION_ALERT_THREAD: threading.Thread | None = None
 _DEVICE_NOTIFICATION_ALERT_THREAD_LOCK = threading.Lock()
 
@@ -113,6 +114,7 @@ def _validate_notification_batch(batch: Any) -> None:
     if delivery.kind not in {
         "device_notification_alert",
         "device_notification_thread_reply",
+        "watched_barcode_scanned",
     } or not isinstance(delivery.payload, Mapping):
         raise RuntimeError("장비 notification delivery 계약이 올바르지 않아")
 
@@ -128,6 +130,18 @@ def _post_remote_device_notification_delivery(
     """검증된 API presentation만 Slack 메시지로 바꾼다."""
 
     payload = delivery.payload
+    if delivery.kind == "watched_barcode_scanned":
+        return _post_watched_barcode_scan(
+            client,
+            payload,
+            channel_id=channel_id,
+            client_msg_id=build_automation_delivery_client_msg_id(
+                cycle="device_notification_alert",
+                cycle_key=cycle_key,
+                delivery_id=delivery.delivery_id,
+                part="alert",
+            ),
+        )
     if delivery.kind == "device_notification_thread_reply":
         return _post_remote_recording_stall_thread_reply(
             client,
@@ -167,6 +181,47 @@ def _post_remote_device_notification_delivery(
             part="alert",
         ),
     )
+
+
+def _post_watched_barcode_scan(
+    client: Any,
+    payload: Mapping[str, Any],
+    *,
+    channel_id: str,
+    client_msg_id: str,
+) -> dict[str, str]:
+    values = {
+        key: " ".join(str(payload.get(key) or "").split())
+        for key in ("deviceName", "hospitalName", "roomName", "occurredAt")
+    }
+    masked_barcode = str(payload.get("maskedBarcode") or "")
+    if not (
+        values["deviceName"]
+        and values["occurredAt"]
+        and _MASKED_BARCODE_PATTERN.fullmatch(masked_barcode)
+    ):
+        raise RuntimeError("관찰 대상 바코드 스캔 알림 데이터가 올바르지 않아")
+    response = client.chat_postMessage(
+        channel=channel_id,
+        text="\n".join(
+            (
+                "관찰 대상 바코드 스캔",
+                f"바코드 {masked_barcode}",
+                f"발생 시각 {values['occurredAt']}",
+                f"장비 {values['deviceName']}",
+                f"병원 {values['hospitalName'] or '미확인'}",
+                f"병실 {values['roomName'] or '미확인'}",
+            )
+        ),
+        mrkdwn=False,
+        unfurl_links=False,
+        unfurl_media=False,
+        client_msg_id=client_msg_id,
+    )
+    message_ts = _response_value(response, "ts")
+    if not message_ts:
+        raise RuntimeError("관찰 대상 바코드 스캔 알림 Slack ts를 받지 못했어")
+    return {"messageTs": message_ts, "permalink": ""}
 
 
 def _post_remote_recording_stall_thread_reply(
