@@ -99,6 +99,7 @@ from boxer_company_adapter_slack.daily_device_round_reporter import (
     attach_daily_device_round_reporter,
 )
 from boxer_company_adapter_slack.device_file_scope import (
+    lookup_alert_download_scope,
     lookup_device_file_scope_from_mda_recovery_thread,
 )
 from boxer_company_adapter_slack.device_health_alert_api import (
@@ -145,6 +146,12 @@ from boxer_company_adapter_slack.thread_learning_routes import (
 from boxer_company_adapter_slack.weekly_recordings_reporter import (
     attach_weekly_recordings_reporter,
 )
+
+_ALERT_DOWNLOAD_REQUEST = re.compile(
+    r"(?:(?:이\s*)?(?:영상|동영상|파일)\s*)?다운로드"
+    r"(?:\s*(?:해\s*줘|해\s*주세요|부탁(?:해(?:요)?)?))?[.!?。！？]*"
+)
+
 
 _PROGRESS_OPERATION_ROUTES = frozenset(
     {"device_box_update", "device_agent_update", "device_power_off"}
@@ -590,12 +597,25 @@ def create_app() -> App:
         ):
             return
 
+        # 대상 없이 다운로드만 요청한 답글은 검증된 알림 root의 식별값으로 보강한다.
+        alert_download_scope = (
+            lookup_alert_download_scope(
+                client=client,
+                logger=logger,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                current_ts=current_ts,
+            )
+            if not payload.get("is_bot") and _ALERT_DOWNLOAD_REQUEST.fullmatch(question)
+            else None
+        )
         context_entries: tuple[ContextEntry, ...] | None = None
         stored_conversation_question = False
 
         def get_context_entries() -> tuple[ContextEntry, ...]:
             nonlocal context_entries
-            if stored_conversation_question:
+            # 다운로드 대상이 확정되면 별도 댓글 조회 없이 원문 식별값을 쓴다.
+            if stored_conversation_question or alert_download_scope is not None:
                 return ()
             if context_entries is None:
                 if needs_recording_media_diagnosis_context(question):
@@ -626,6 +646,14 @@ def create_app() -> App:
                 else ()
             ),
         )
+        if alert_download_scope is not None:
+            operation_probe_request = replace(
+                operation_probe_request,
+                question=(
+                    f"{alert_download_scope.barcode} {alert_download_scope.log_date} "
+                    f"장비명 {alert_download_scope.device_name} {question}"
+                ),
+            )
         operation_route = match_company_operation_route(
             operation_probe_request
         )
@@ -908,7 +936,7 @@ def create_app() -> App:
                     user_id or "",
                     logger,
                 )
-            if operation_route in {
+            if alert_download_scope is None and operation_route in {
                 DEVICE_FILE_LOOKUP_ROUTE,
                 DEVICE_FILE_DOWNLOAD_ROUTE,
                 DEVICE_FILE_RECOVERY_ROUTE,
@@ -937,10 +965,10 @@ def create_app() -> App:
                                 device_context=trusted_contexts[0],
                             )
                         )
-            request = build_company_assistant_request(
-                payload,
+            request = replace(
+                operation_probe_request,
                 context_entries=execution_context,
-                metadata=metadata,
+                metadata={**operation_probe_request.metadata, **metadata},
             )
             if conversation_memory is not None and operation_route == "conversation_memory_manage":
                 request = replace(request, memory_context=conversation_memory.context_for(payload, manage=True))

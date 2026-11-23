@@ -11,13 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
-from boxer_company import team_chat_context
-from boxer_company.assistant import (
-    AssistantMessage,
-    CompanyAssistantResult,
-)
 from boxer_company.base_access import BaseAccessSeedMember, LocalFileBaseAccessStore
-from boxer_company_adapter_slack import company
 from boxer_company_adapter_slack.access_routes import (
     BASE_ACCESS_DENIED_REPLY,
     BASE_ACCESS_HELP_REPLY,
@@ -26,6 +20,14 @@ from boxer_company_adapter_slack.access_routes import (
 from boxer_company_adapter_slack.company_api_client import (
     CompanyApiClientSettings,
 )
+from boxer_company_adapter_slack.device_alert_slack import post_device_alert_summary
+
+from boxer_company import team_chat_context
+from boxer_company.assistant import (
+    AssistantMessage,
+    CompanyAssistantResult,
+)
+from boxer_company_adapter_slack import company
 
 _TOKEN = "service-token-" + ("x" * 40)
 _READ_STAGES = (
@@ -54,6 +56,56 @@ def _result(
         fallback_reason=fallback_reason,
         operation_result=operation_result,
     )
+
+
+def _slack_with_upload_failure_alert(channel_id: str, root_ts: str) -> Mock:
+    alert_client = Mock()
+    alert_client.chat_postMessage.return_value = {"ts": root_ts}
+    alert_client.chat_getPermalink.return_value = {"permalink": ""}
+    post_device_alert_summary(
+        alert_client,
+        {
+            "deviceResults": [
+                {
+                    "hospitalSeq": 1,
+                    "hospitalName": "테스트병원",
+                    "room": "정밀초음파실",
+                    "device": "MB2-X00001",
+                    "alertCategory": "upload",
+                    "issue": "영상 업로드가 확인되지 않았어",
+                    "barcode": "81000000000",
+                    "sessionAtLabel": "세션 시작(추정)",
+                    "sessionAt": "2026-08-14 08:50:00 KST",
+                }
+            ]
+        },
+        channel_id=channel_id,
+        logger=logging.getLogger(__name__),
+        include_actions=False,
+        client_msg_id="11111111-1111-1111-1111-111111111111",
+    )
+    alert_message = alert_client.chat_postMessage.call_args.kwargs
+    slack = Mock()
+    slack.auth_test.return_value = {
+        "ok": True,
+        "user_id": "UBOXER",
+        "bot_id": "BBOXER",
+    }
+    # 접근성 본문이 짧아져도 기존 카드의 Block Kit 식별 항목으로 대상을 찾는다.
+    slack.conversations_replies.return_value = {
+        "messages": [
+            {
+                "type": "message",
+                "subtype": "bot_message",
+                "ts": root_ts,
+                "user": "UBOXER",
+                "bot_id": "BBOXER",
+                "text": "업로드 실패 영상 감지",
+                "blocks": alert_message["blocks"],
+            }
+        ]
+    }
+    return slack
 
 
 class _ReadService:
@@ -131,6 +183,7 @@ class CompanyRouteContractTests(unittest.TestCase):
         channel_id: str = "C123456",
         message_event: bool = False,
         use_real_context_loader: bool = False,
+        use_real_operation_routing: bool = False,
         thread_ts: str = "1785312000.000001",
         natural_language_read_enabled: bool = False,
         is_bot: bool = False,
@@ -148,6 +201,8 @@ class CompanyRouteContractTests(unittest.TestCase):
         }
         operation_service = _OperationService(operation_result)
         api_client = Mock(name="company_api_client")
+        api_client.answer.return_value = operation_result
+        api_client.answer_with_progress.return_value = operation_result
         api_client.acknowledge_request_log_delivery.return_value = _result(
             "request_log_delivery"
         )
@@ -261,13 +316,14 @@ class CompanyRouteContractTests(unittest.TestCase):
                     return_value=read_services,
                 )
             )
-            stack.enter_context(
-                patch.object(
-                    company,
-                    "wrap_company_operations_service",
-                    return_value=operation_service,
+            if not use_real_operation_routing:
+                stack.enter_context(
+                    patch.object(
+                        company,
+                        "wrap_company_operations_service",
+                        return_value=operation_service,
+                    )
                 )
-            )
             stack.enter_context(
                 patch.object(company, "DeviceHealthAlertApiBridge")
             )
@@ -313,21 +369,33 @@ class CompanyRouteContractTests(unittest.TestCase):
                 patch.object(
                     company,
                     "needs_device_file_operation_context",
-                    return_value=False,
+                    **(
+                        {"wraps": company.needs_device_file_operation_context}
+                        if use_real_operation_routing
+                        else {"return_value": False}
+                    ),
                 )
             )
             operation_matcher = stack.enter_context(
                 patch.object(
                     company,
                     "match_company_operation_route",
-                    return_value=operation_route,
+                    **(
+                        {"wraps": company.match_company_operation_route}
+                        if use_real_operation_routing
+                        else {"return_value": operation_route}
+                    ),
                 )
             )
             stack.enter_context(
                 patch.object(
                     company,
                     "company_operation_legacy_stage",
-                    return_value=operation_stage,
+                    **(
+                        {"wraps": company.company_operation_legacy_stage}
+                        if use_real_operation_routing
+                        else {"return_value": operation_stage}
+                    ),
                 )
             )
             context_loader = stack.enter_context(
@@ -729,6 +797,68 @@ class CompanyRouteContractTests(unittest.TestCase):
         invocation.context_loader.assert_not_called()
         invocation.operation_matcher.assert_not_called()
         slack.conversations_replies.assert_not_called()
+
+    def test_download_reply_uses_current_boxer_upload_alert_root(self) -> None:
+        channel_id = "C123456"
+        root_ts = "1786665600.000001"
+        slack = _slack_with_upload_failure_alert(channel_id, root_ts)
+
+        with patch.object(
+            company.cs, "DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", channel_id
+        ):
+            invocation = self._invoke_mention(
+                question="영상 다운로드",
+                raw_text="<@UBOXER> 영상 다운로드",
+                operation_result=_result("device_file_download", body="다운로드 결과"),
+                slack_client=slack,
+                channel_id=channel_id,
+                use_real_context_loader=True,
+                use_real_operation_routing=True,
+                thread_ts=root_ts,
+                current_ts="1786665660.000001",
+            )
+
+        invocation.api_client.answer.assert_called_once()
+        request = invocation.api_client.answer.call_args.args[0]
+        self.assertEqual(
+            invocation.api_client.answer.call_args.kwargs["route_group"],
+            "operations",
+        )
+        self.assertEqual(request.actor_id, "U1")
+        self.assertEqual(request.conversation_id, root_ts)
+        for value in ("81000000000", "2026-08-14", "MB2-X00001", "영상 다운로드"):
+            self.assertIn(value, request.question)
+        slack.conversations_replies.assert_called_once_with(
+            channel=channel_id, ts=root_ts, limit=1, inclusive=True
+        )
+        invocation.context_loader.assert_not_called()
+        self.assertFalse(invocation.read_services["structured"].calls)
+        self.assertEqual(invocation.replies[0][0], "다운로드 결과")
+
+    def test_explicit_download_keeps_its_own_scope_in_an_upload_alert_thread(self) -> None:
+        # 명시한 대상과 원본 알림이 다르면 기존 다운로드 요청을 그대로 실행한다.
+        channel_id = "C123456"
+        root_ts = "1786665600.000001"
+        question = "82000000000 2026-08-13 장비명 MB2-X00002 영상 다운로드"
+        slack = _slack_with_upload_failure_alert(channel_id, root_ts)
+
+        with patch.object(
+            company.cs, "DEVICE_NOTIFICATION_ALERT_CHANNEL_ID", channel_id
+        ):
+            invocation = self._invoke_mention(
+                question=question,
+                operation_result=_result("device_file_download"),
+                slack_client=slack,
+                channel_id=channel_id,
+                use_real_operation_routing=True,
+                thread_ts=root_ts,
+                current_ts="1786665660.000001",
+            )
+
+        invocation.api_client.answer.assert_called_once()
+        request = invocation.api_client.answer.call_args.args[0]
+        self.assertEqual(request.question, question)
+        self.assertNotIn("trusted_mda_recovery_scope", request.metadata)
 
     def test_operation_receipt_failure_keeps_slack_delivery_success(self) -> None:
         invocation = self._invoke_mention(
